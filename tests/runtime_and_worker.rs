@@ -202,7 +202,7 @@ fn bot_command_service_idempotent_stop() {
 }
 
 #[test]
-fn worker_pipeline_marks_failed_and_sets_error_message() {
+fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure() {
     let mut store = InMemoryMeetingStore::new();
     store.insert(StoredMeeting {
         id: "m1".to_owned(),

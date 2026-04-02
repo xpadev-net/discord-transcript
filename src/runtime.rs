@@ -155,19 +155,75 @@ pub fn merge_user_chunks_to_mixdown(
             chunk_files.push(path);
         }
     }
-    chunk_files.sort();
 
     if chunk_files.is_empty() {
         return Err("no audio chunks found for meeting".to_owned());
     }
 
-    // Read all PCM data from WAV chunks, strip 44-byte headers
-    let mut all_pcm = Vec::new();
+    // Sort by (sequence, user_id) to interleave users within each time window.
+    // Filenames follow the pattern {user_id}_{sequence}.wav
+    chunk_files.sort_by(|a, b| {
+        let parse = |p: &PathBuf| -> (u64, String) {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(pos) = stem.rfind('_') {
+                let seq = stem[pos + 1..].parse::<u64>().unwrap_or(0);
+                let user = stem[..pos].to_owned();
+                (seq, user)
+            } else {
+                (0, stem.to_owned())
+            }
+        };
+        let (seq_a, user_a) = parse(a);
+        let (seq_b, user_b) = parse(b);
+        seq_a.cmp(&seq_b).then(user_a.cmp(&user_b))
+    });
+
+    // Read PCM from each chunk and mix same-sequence chunks by summing samples
+    let mut sequence_groups: Vec<(u64, Vec<(String, Vec<u8>)>)> = Vec::new();
     for chunk_path in &chunk_files {
+        let stem = chunk_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let seq = stem
+            .rfind('_')
+            .and_then(|pos| stem[pos + 1..].parse::<u64>().ok())
+            .unwrap_or(0);
+
         let data = fs::read(chunk_path)
             .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
-        if data.len() > 44 {
-            all_pcm.extend_from_slice(&data[44..]);
+        let pcm = if data.len() > 44 { data[44..].to_vec() } else { continue };
+
+        match sequence_groups.last_mut() {
+            Some((last_seq, group)) if *last_seq == seq => {
+                group.push((stem.to_owned(), pcm));
+            }
+            _ => {
+                sequence_groups.push((seq, vec![(stem.to_owned(), pcm)]));
+            }
+        }
+    }
+
+    // Mix each sequence group: sum i16 samples with clipping
+    let mut all_pcm = Vec::new();
+    for (_seq, group) in &sequence_groups {
+        if group.len() == 1 {
+            all_pcm.extend_from_slice(&group[0].1);
+            continue;
+        }
+        // Find max length, then sum samples
+        let max_len = group.iter().map(|(_, pcm)| pcm.len()).max().unwrap_or(0);
+        let sample_count = max_len / 2;
+        let mut mixed = vec![0i32; sample_count];
+        for (_, pcm) in group {
+            for i in 0..pcm.len() / 2 {
+                let sample = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as i32;
+                mixed[i] += sample;
+            }
+        }
+        for sample in &mixed {
+            let clamped = (*sample).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            all_pcm.extend_from_slice(&clamped.to_le_bytes());
         }
     }
 
@@ -623,18 +679,37 @@ impl ScaffoldHandler {
             .map_err(|err| err.to_string())?;
         drop(service);
 
-        let voice_channel_id_u64 =
-            voice_channel_id_u64.ok_or_else(|| "user is not in a voice channel".to_owned())?;
+        // voice_channel_id_u64 is guaranteed Some here because record_start
+        // already validated user_voice_channel_id via CommandError::UserNotInVoice.
+        let voice_channel_id_u64 = voice_channel_id_u64
+            .expect("voice_channel_id should be validated by record_start");
 
         let manager = songbird::get(ctx)
             .await
             .ok_or_else(|| "songbird not initialized".to_owned())?;
+        // Insert session BEFORE joining VC so voice events aren't dropped
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(
+                guild_id.get().to_string(),
+                RecordingSession::new(
+                    meeting_id.clone(),
+                    LocalChunkStorage::new(&self.chunk_storage_dir),
+                    ReceiverConfig::default(),
+                    48_000,
+                ),
+            );
+        }
+
         let call_lock = match manager
             .join(guild_id, ChannelId::new(voice_channel_id_u64))
             .await
         {
             Ok(call) => call,
             Err(err) => {
+                let mut sessions = self.sessions.lock().await;
+                sessions.remove(&guild_id.get().to_string());
+                drop(sessions);
                 let mut service = self.service.lock().await;
                 let _ = service
                     .store
@@ -670,16 +745,6 @@ impl ScaffoldHandler {
             "recording started"
         );
 
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(
-            guild_id.get().to_string(),
-            RecordingSession::new(
-                meeting_id,
-                LocalChunkStorage::new(&self.chunk_storage_dir),
-                ReceiverConfig::default(),
-                48_000,
-            ),
-        );
         Ok(response)
     }
 
@@ -802,15 +867,8 @@ impl ScaffoldHandler {
                 Ok(())
             }
             Err(err) => {
-                {
-                    let mut service = self.service.lock().await;
-                    let _ = service
-                        .store
-                        .set_meeting_status(meeting_id, MeetingStatus::Failed);
-                    let _ = service
-                        .store
-                        .set_error_message(meeting_id, Some(err.clone()));
-                }
+                // process_enqueued_summary_job already handles Failed/retry status.
+                // Only post failure notification here.
                 let _ =
                     post_failure_to_report_channel(http, report_channel_id, meeting_id, &err).await;
                 Err(err)
@@ -905,16 +963,18 @@ impl ScaffoldHandler {
         let transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
-                let mut service = self.service.lock().await;
-                let _ = service
-                    .store
-                    .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed);
-                let _ = service
-                    .store
-                    .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
-                drop(service);
                 let mut queue = self.queue.lock().await;
-                let _ = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                drop(queue);
+                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                    let mut service = self.service.lock().await;
+                    let _ = service
+                        .store
+                        .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed);
+                    let _ = service
+                        .store
+                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                }
                 return Err(err.to_string());
             }
         };
@@ -936,16 +996,18 @@ impl ScaffoldHandler {
         let markdown = match markdown {
             Ok(m) => m,
             Err(err) => {
-                let mut service = self.service.lock().await;
-                let _ = service
-                    .store
-                    .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed);
-                let _ = service
-                    .store
-                    .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
-                drop(service);
                 let mut queue = self.queue.lock().await;
-                let _ = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                drop(queue);
+                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                    let mut service = self.service.lock().await;
+                    let _ = service
+                        .store
+                        .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed);
+                    let _ = service
+                        .store
+                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                }
                 return Err(err.to_string());
             }
         };

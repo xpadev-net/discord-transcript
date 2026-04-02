@@ -250,6 +250,26 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         Ok(())
     }
 
+    fn create_meeting_as_recording(
+        &mut self,
+        request: CreateMeetingRequest,
+    ) -> Result<(), StoreError> {
+        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'recording')";
+        self.executor
+            .execute(
+                sql,
+                &[
+                    request.id,
+                    request.guild_id,
+                    request.voice_channel_id,
+                    request.report_channel_id,
+                    request.started_by_user_id,
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
     fn set_meeting_status(
         &mut self,
         meeting_id: &str,

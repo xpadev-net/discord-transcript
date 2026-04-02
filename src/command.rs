@@ -1,6 +1,5 @@
 use crate::domain::StopReason;
 use crate::stop::{StopMeetingError, StopOutcome, stop_meeting};
-use crate::domain::MeetingStatus;
 use crate::storage::{CreateMeetingRequest, MeetingStore, StoreError};
 use std::fmt::{Display, Formatter};
 
@@ -100,15 +99,13 @@ pub fn record_start<S: MeetingStore>(
         });
     }
 
-    store.create_scheduled_meeting(CreateMeetingRequest {
+    store.create_meeting_as_recording(CreateMeetingRequest {
         id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),
         voice_channel_id: voice_channel_id.clone(),
         report_channel_id: request.command_channel_id.clone(),
         started_by_user_id: request.started_by_user_id,
     })?;
-
-    store.set_meeting_status(&request.meeting_id, MeetingStatus::Recording)?;
 
     Ok(RecordStartResult {
         meeting_id: request.meeting_id,

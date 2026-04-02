@@ -48,6 +48,9 @@ pub trait MeetingStore {
     fn create_scheduled_meeting(&mut self, request: CreateMeetingRequest)
     -> Result<(), StoreError>;
 
+    fn create_meeting_as_recording(&mut self, request: CreateMeetingRequest)
+    -> Result<(), StoreError>;
+
     fn set_meeting_status(
         &mut self,
         meeting_id: &str,
@@ -159,6 +162,31 @@ impl MeetingStore for InMemoryMeetingStore {
             started_by_user_id: request.started_by_user_id,
             title: None,
             status: MeetingStatus::Scheduled,
+            stop_reason: None,
+            error_message: None,
+        };
+        self.meetings.insert(request.id, meeting);
+        Ok(())
+    }
+
+    fn create_meeting_as_recording(
+        &mut self,
+        request: CreateMeetingRequest,
+    ) -> Result<(), StoreError> {
+        if self.meetings.contains_key(&request.id) {
+            return Err(StoreError::AlreadyExists {
+                meeting_id: request.id,
+            });
+        }
+
+        let meeting = StoredMeeting {
+            id: request.id.clone(),
+            guild_id: request.guild_id,
+            voice_channel_id: request.voice_channel_id,
+            report_channel_id: request.report_channel_id,
+            started_by_user_id: request.started_by_user_id,
+            title: None,
+            status: MeetingStatus::Recording,
             stop_reason: None,
             error_message: None,
         };
