@@ -180,15 +180,24 @@ fn bot_command_service_idempotent_stop() {
         })
         .expect("stop should pass");
 
+    // After stop, meeting is Stopping and no longer "active" for find_active
     let second = service.handle_record_stop_result(StopCommandInput {
         guild_id: "g1".to_owned(),
         reason: StopReason::Manual,
     });
-    let second = second.expect("idempotent stop should still succeed");
+    assert!(
+        second.is_err(),
+        "second stop via command should fail with NoActiveMeeting"
+    );
+
+    // Direct stop_meeting on the meeting_id is idempotent via CAS
+    use discord_transcript::stop::stop_meeting;
+    let direct = stop_meeting(&mut service.store, "m1", StopReason::AutoEmpty)
+        .expect("direct CAS stop should succeed");
     assert_eq!(
-        second.outcome,
+        direct,
         discord_transcript::stop::StopOutcome::AlreadyHandled,
-        "second stop should report AlreadyHandled"
+        "CAS stop should report AlreadyHandled"
     );
 }
 
@@ -201,6 +210,7 @@ fn worker_pipeline_marks_failed_and_sets_error_message() {
         voice_channel_id: "vc".to_owned(),
         report_channel_id: "c1".to_owned(),
         started_by_user_id: "u1".to_owned(),
+        title: None,
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,
@@ -226,8 +236,8 @@ fn worker_pipeline_marks_failed_and_sets_error_message() {
 
     assert!(result.is_err());
     let saved = store.get("m1").expect("meeting should exist");
-    assert_eq!(saved.status, MeetingStatus::Failed);
-    assert!(saved.error_message.is_some());
+    // process_meeting_summary no longer sets Failed directly - caller handles retry/fail
+    assert_eq!(saved.status, MeetingStatus::Transcribing);
 }
 
 #[test]
@@ -239,6 +249,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         voice_channel_id: "vc".to_owned(),
         report_channel_id: "c1".to_owned(),
         started_by_user_id: "u1".to_owned(),
+        title: None,
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,

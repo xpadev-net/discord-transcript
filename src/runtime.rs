@@ -20,8 +20,8 @@ use crate::storage::MeetingStore;
 use crate::storage_fs::LocalChunkStorage;
 use crate::worker::enqueue_summary_job;
 use serenity::all::{
-    ChannelId, CommandDataOptionValue, CommandInteraction, CommandOptionType, CreateCommand,
-    CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
+    ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
+    CreateInteractionResponse, CreateInteractionResponseMessage,
     GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
 };
 use serenity::async_trait;
@@ -67,19 +67,7 @@ pub fn create_serenity_commands() -> Vec<CreateCommand> {
         .into_iter()
         .map(|spec| match spec.name {
             RECORD_START_COMMAND => CreateCommand::new(spec.name).description(spec.description),
-            RECORD_STOP_COMMAND => CreateCommand::new(spec.name)
-                .description(spec.description)
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "reason",
-                        "manual | auto_empty | client_disconnect | error",
-                    )
-                    .add_string_choice("manual", "manual")
-                    .add_string_choice("auto_empty", "auto_empty")
-                    .add_string_choice("client_disconnect", "client_disconnect")
-                    .add_string_choice("error", "error"),
-                ),
+            RECORD_STOP_COMMAND => CreateCommand::new(spec.name).description(spec.description),
             _ => CreateCommand::new(spec.name).description(spec.description),
         })
         .collect()
@@ -137,12 +125,57 @@ where
     Ok(stop_result)
 }
 
+pub fn meeting_audio_dir(base_dir: &str, meeting_id: &str) -> PathBuf {
+    PathBuf::from(base_dir).join(meeting_id)
+}
+
 pub fn meeting_audio_path(base_dir: &str, meeting_id: &str) -> String {
-    PathBuf::from(base_dir)
-        .join(meeting_id)
+    meeting_audio_dir(base_dir, meeting_id)
         .join("mixdown.wav")
         .to_string_lossy()
         .to_string()
+}
+
+pub fn merge_user_chunks_to_mixdown(
+    meeting_dir: &std::path::Path,
+) -> Result<String, String> {
+    use crate::audio::build_wav_bytes_raw;
+
+    let mixdown_path = meeting_dir.join("mixdown.wav");
+
+    let mut chunk_files: Vec<PathBuf> = Vec::new();
+    let entries = fs::read_dir(meeting_dir)
+        .map_err(|err| format!("failed to read meeting dir: {err}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("wav")
+            && path.file_name() != Some(std::ffi::OsStr::new("mixdown.wav"))
+        {
+            chunk_files.push(path);
+        }
+    }
+    chunk_files.sort();
+
+    if chunk_files.is_empty() {
+        return Err("no audio chunks found for meeting".to_owned());
+    }
+
+    // Read all PCM data from WAV chunks, strip 44-byte headers
+    let mut all_pcm = Vec::new();
+    for chunk_path in &chunk_files {
+        let data = fs::read(chunk_path)
+            .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
+        if data.len() > 44 {
+            all_pcm.extend_from_slice(&data[44..]);
+        }
+    }
+
+    let wav_bytes = build_wav_bytes_raw(&all_pcm, 48_000, 1, 16);
+    fs::write(&mixdown_path, &wav_bytes)
+        .map_err(|err| format!("failed to write mixdown: {err}"))?;
+
+    Ok(mixdown_path.to_string_lossy().to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +377,23 @@ impl EventHandler for ScaffoldHandler {
                 if !trigger {
                     return;
                 }
+                // Flush remaining audio before stopping
+                {
+                    let mut sessions = handler.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&guild_for_task) {
+                        if let Err(err) = session.flush_all() {
+                            warn!(guild_id = %guild_for_task, error = %err, "failed to flush remaining audio on auto-stop");
+                        }
+                    }
+                    sessions.remove(&guild_for_task);
+                }
+                {
+                    let mut states = handler.auto_stop_states.lock().await;
+                    states.remove(&guild_for_task);
+                }
+                if let Some(manager) = songbird::get(&ctx_for_task).await {
+                    let _ = manager.leave(handler.guild_id).await;
+                }
                 let stop_result = {
                     let mut service = handler.service.lock().await;
                     let mut queue = handler.queue.lock().await;
@@ -354,17 +404,6 @@ impl EventHandler for ScaffoldHandler {
                         StopReason::AutoEmpty,
                     )
                 };
-                if let Some(manager) = songbird::get(&ctx_for_task).await {
-                    let _ = manager.leave(handler.guild_id).await;
-                }
-                {
-                    let mut sessions = handler.sessions.lock().await;
-                    sessions.remove(&guild_for_task);
-                }
-                {
-                    let mut states = handler.auto_stop_states.lock().await;
-                    states.remove(&guild_for_task);
-                }
                 match stop_result {
                     Ok(result) => {
                         info!(
@@ -373,6 +412,10 @@ impl EventHandler for ScaffoldHandler {
                             "auto stop triggered due to empty voice channel"
                         );
                         if result.outcome == StopOutcome::Owner {
+                            let meeting_dir = meeting_audio_dir(&handler.chunk_storage_dir, &result.meeting_id);
+                            if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+                                warn!(meeting_id = %result.meeting_id, error = %err, "failed to merge audio chunks on auto-stop");
+                            }
                             if let Err(err) = handler
                                 .run_summary_and_notify(&ctx_for_task.http, &result.meeting_id)
                                 .await
@@ -383,21 +426,6 @@ impl EventHandler for ScaffoldHandler {
                                     error = %err,
                                     "failed to process summary after auto stop"
                                 );
-                                if let Err(post_err) = handler
-                                    .post_failure_for_meeting(
-                                        &ctx_for_task.http,
-                                        &result.meeting_id,
-                                        &format!("自動停止後の要約処理に失敗しました: {err}"),
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        guild_id = %guild_for_task,
-                                        meeting_id = %result.meeting_id,
-                                        error = %post_err,
-                                        "failed to notify auto-stop summary failure"
-                                    );
-                                }
                             }
                         }
                     }
@@ -441,11 +469,17 @@ impl ScaffoldHandler {
         };
 
         for snapshot in snapshots {
-            let has_recording_file = fs::metadata(meeting_audio_path(
-                &self.chunk_storage_dir,
-                &snapshot.meeting_id,
-            ))
-            .is_ok();
+            let meeting_dir = meeting_audio_dir(&self.chunk_storage_dir, &snapshot.meeting_id);
+            let has_recording_file = meeting_dir.is_dir()
+                && fs::read_dir(&meeting_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .any(|e| {
+                                e.path().extension().and_then(|ext| ext.to_str()) == Some("wav")
+                            })
+                    })
+                    .unwrap_or(false);
             let voice_connected = snapshot
                 .voice_channel_id
                 .and_then(|voice_channel_id| {
@@ -472,6 +506,10 @@ impl ScaffoldHandler {
             match effect {
                 RecoveryEffect::SummaryRequeued { .. }
                 | RecoveryEffect::StopConfirmedClientDisconnect { .. } => {
+                    // Merge per-user chunks into mixdown before ASR
+                    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+                        warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
+                    }
                     let job_id = format!("summary-{}", snapshot.meeting_id);
                     {
                         let mut queue = self.queue.lock().await;
@@ -491,20 +529,6 @@ impl ScaffoldHandler {
                             error = %err,
                             "failed to process summary during startup recovery"
                         );
-                        if let Err(post_err) = self
-                            .post_failure_for_meeting(
-                                &ctx.http,
-                                &snapshot.meeting_id,
-                                &format!("復旧後の要約処理に失敗しました: {err}"),
-                            )
-                            .await
-                        {
-                            warn!(
-                                meeting_id = %snapshot.meeting_id,
-                                error = %post_err,
-                                "failed to post recovery summary failure notification"
-                            );
-                        }
                     }
                 }
                 RecoveryEffect::MarkedFailed { meeting_id } => {
@@ -667,23 +691,16 @@ impl ScaffoldHandler {
         let guild_id = command
             .guild_id
             .ok_or_else(|| "guild_id is required for this command".to_owned())?;
-        let reason = stop_reason_from_interaction(command)?;
         let guild_key = guild_id.get().to_string();
-        let stop_result = {
-            let mut service = self.service.lock().await;
-            service
-                .handle_record_stop_result(StopCommandInput {
-                    guild_id: guild_key.clone(),
-                    reason,
-                })
-                .map_err(|err| err.to_string())?
-        };
-        let meeting_id = stop_result.meeting_id.clone();
-        let outcome = stop_result.outcome;
-        let response = stop_result.message;
 
+        // Flush remaining audio before stopping
         {
             let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&guild_key) {
+                if let Err(err) = session.flush_all() {
+                    warn!(guild_id = %guild_key, error = %err, "failed to flush remaining audio on stop");
+                }
+            }
             sessions.remove(&guild_key);
         }
         {
@@ -695,44 +712,48 @@ impl ScaffoldHandler {
             let _ = manager.leave(guild_id).await;
         }
 
-        if outcome == StopOutcome::Owner {
-            {
-                let mut queue = self.queue.lock().await;
-                let job_id = format!("summary-{meeting_id}");
-                enqueue_summary_job(&mut *queue, &job_id, &meeting_id)
-                    .map_err(|err| err.to_string())?;
-                info!(meeting_id = %meeting_id, job_id = %job_id, "summary job enqueued");
-            }
-            if let Err(err) = self.run_summary_and_notify(&ctx.http, &meeting_id).await {
-                warn!(
-                    meeting_id = %meeting_id,
-                    error = %err,
-                    "failed to enqueue/process summary job"
-                );
-                if let Err(post_err) = self
-                    .post_failure_for_meeting(
-                        &ctx.http,
-                        &meeting_id,
-                        &format!("手動停止後の要約処理に失敗しました: {err}"),
-                    )
-                    .await
-                {
-                    warn!(
-                        meeting_id = %meeting_id,
-                        error = %post_err,
-                        "failed to notify manual-stop summary failure"
-                    );
-                }
-            }
-        }
+        let stop_result = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
+            stop_and_enqueue_summary_job(
+                &mut service,
+                &mut *queue,
+                &guild_key,
+                StopReason::Manual,
+            )
+        };
 
-        info!(
-            guild_id = %guild_key,
-            meeting_id = %meeting_id,
-            outcome = ?outcome,
-            "recording stop handled"
-        );
-        Ok(response)
+        match stop_result {
+            Ok(result) => {
+                let meeting_id = result.meeting_id.clone();
+                let outcome = result.outcome;
+
+                if outcome == StopOutcome::Owner {
+                    // Merge chunks into mixdown before ASR
+                    let meeting_dir = meeting_audio_dir(&self.chunk_storage_dir, &meeting_id);
+                    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+                        warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
+                    }
+
+                    if let Err(err) = self.run_summary_and_notify(&ctx.http, &meeting_id).await {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "failed to process summary after manual stop"
+                        );
+                    }
+                }
+
+                info!(
+                    guild_id = %guild_key,
+                    meeting_id = %meeting_id,
+                    outcome = ?outcome,
+                    "recording stop handled"
+                );
+                Ok(result.message)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn run_summary_and_notify(&self, http: &Http, meeting_id: &str) -> Result<(), String> {
@@ -982,12 +1003,29 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
             }
             EventContext::ClientDisconnect(evt) => {
                 let user_id_u64 = evt.user_id.0;
-                warn!(user_id = user_id_u64, "voice client disconnected");
-                if user_id_u64 == self.bot_user_id {
+                if user_id_u64 != self.bot_user_id {
+                    return None;
+                }
+                warn!(user_id = user_id_u64, "bot voice client disconnected");
+                {
                     let runtime = self.runtime.clone();
                     let guild_key = self.guild_id.clone();
                     let http = Arc::clone(&self.http);
                     tokio::spawn(async move {
+                        // Flush remaining audio and clean up session
+                        {
+                            let mut sessions = runtime.sessions.lock().await;
+                            if let Some(session) = sessions.get_mut(&guild_key) {
+                                if let Err(err) = session.flush_all() {
+                                    warn!(guild_id = %guild_key, error = %err, "failed to flush audio on client disconnect");
+                                }
+                            }
+                            sessions.remove(&guild_key);
+                        }
+                        {
+                            let mut states = runtime.auto_stop_states.lock().await;
+                            states.remove(&guild_key);
+                        }
                         let stop_result = {
                             let mut service = runtime.service.lock().await;
                             let mut queue = runtime.queue.lock().await;
@@ -1001,6 +1039,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         match stop_result {
                             Ok(result) => {
                                 if result.outcome == StopOutcome::Owner {
+                                    let meeting_dir = meeting_audio_dir(&runtime.chunk_storage_dir, &result.meeting_id);
+                                    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+                                        warn!(meeting_id = %result.meeting_id, error = %err, "failed to merge audio chunks on client disconnect");
+                                    }
                                     if let Err(err) = runtime
                                         .run_summary_and_notify(&http, &result.meeting_id)
                                         .await
@@ -1011,23 +1053,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             error = %err,
                                             "failed to process summary after client disconnect"
                                         );
-                                        if let Err(post_err) = runtime
-                                            .post_failure_for_meeting(
-                                                &http,
-                                                &result.meeting_id,
-                                                &format!(
-                                                    "ClientDisconnect 後の要約処理に失敗しました: {err}"
-                                                ),
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                guild_id = %guild_key,
-                                                meeting_id = %result.meeting_id,
-                                                error = %post_err,
-                                                "failed to notify client-disconnect summary failure"
-                                            );
-                                        }
                                     }
                                 }
                             }

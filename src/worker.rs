@@ -79,8 +79,6 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
     let transcription = match run_transcription(whisper, &request) {
         Ok(value) => value,
         Err(err) => {
-            store.set_meeting_status(&input.meeting_id, MeetingStatus::Failed)?;
-            store.set_error_message(&input.meeting_id, Some(err.to_string()))?;
             error!(meeting_id = %input.meeting_id, error = %err, "transcription failed");
             return Err(WorkerError::from(err));
         }
@@ -91,8 +89,6 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
     let markdown = match claude.summarize(&prompt) {
         Ok(value) => value,
         Err(err) => {
-            store.set_meeting_status(&input.meeting_id, MeetingStatus::Failed)?;
-            store.set_error_message(&input.meeting_id, Some(err.to_string()))?;
             error!(meeting_id = %input.meeting_id, error = %err, "summarization failed");
             return Err(WorkerError::from(err));
         }
@@ -158,16 +154,17 @@ where
             let status = queue.retry(&job.id, err.to_string(), max_retries)?;
             if status == JobStatus::Failed {
                 store.set_meeting_status(&job.meeting_id, MeetingStatus::Failed)?;
+                store.set_error_message(&job.meeting_id, Some(err.to_string()))?;
                 warn!(
                     job_id = %job.id,
                     meeting_id = %job.meeting_id,
                     "summary job exhausted retries"
                 );
             } else {
-                warn!(
+                info!(
                     job_id = %job.id,
                     meeting_id = %job.meeting_id,
-                    "summary job retried"
+                    "summary job queued for retry"
                 );
             }
             Err(err)

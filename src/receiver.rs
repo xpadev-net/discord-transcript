@@ -109,6 +109,17 @@ impl ReceiverState {
         }
         out
     }
+
+    pub fn flush_all_chunks(&mut self) -> Vec<UserChunkCandidate> {
+        let user_ids: Vec<String> = self.per_user.keys().cloned().collect();
+        let mut out = Vec::new();
+        for user_id in user_ids {
+            if let Some(frames) = self.take_user_chunk(&user_id) {
+                out.push(UserChunkCandidate { user_id, frames });
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

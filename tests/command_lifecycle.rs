@@ -62,6 +62,7 @@ fn record_start_rejects_if_active_meeting_exists() {
         voice_channel_id: "vc-1".to_owned(),
         report_channel_id: "report-chan".to_owned(),
         started_by_user_id: "u1".to_owned(),
+        title: None,
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,
@@ -87,6 +88,8 @@ fn record_start_rejects_if_active_meeting_exists() {
 
 #[test]
 fn record_stop_is_idempotent_for_same_meeting() {
+    use discord_transcript::stop::stop_meeting;
+
     let mut store = InMemoryMeetingStore::new();
     store.insert(StoredMeeting {
         id: "m1".to_owned(),
@@ -94,11 +97,13 @@ fn record_stop_is_idempotent_for_same_meeting() {
         voice_channel_id: "vc-1".to_owned(),
         report_channel_id: "report-chan".to_owned(),
         started_by_user_id: "u1".to_owned(),
+        title: None,
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,
     });
 
+    // First stop via command should succeed
     let first = record_stop(
         &mut store,
         RecordStopRequest {
@@ -107,17 +112,29 @@ fn record_stop_is_idempotent_for_same_meeting() {
         },
     )
     .expect("first stop should pass");
+    assert_eq!(first.outcome, StopOutcome::Owner);
+
+    // After stop, meeting is in Stopping and no longer "active" for find_active
     let second = record_stop(
         &mut store,
         RecordStopRequest {
             guild_id: "g1".to_owned(),
             reason: StopReason::AutoEmpty,
         },
-    )
-    .expect("second stop should pass");
+    );
+    assert!(
+        matches!(second, Err(CommandError::NoActiveMeeting)),
+        "second stop via command should return NoActiveMeeting"
+    );
 
-    assert_eq!(first.outcome, StopOutcome::Owner);
-    assert_eq!(second.outcome, StopOutcome::AlreadyHandled);
+    // Direct stop_meeting on the same meeting_id is idempotent via CAS
+    let direct = stop_meeting(&mut store, "m1", StopReason::AutoEmpty)
+        .expect("direct stop should pass");
+    assert_eq!(direct, StopOutcome::AlreadyHandled);
+
+    // Verify original stop_reason was preserved
+    let saved = store.get("m1").expect("meeting should exist");
+    assert_eq!(saved.stop_reason, Some(StopReason::Manual));
 }
 
 #[test]

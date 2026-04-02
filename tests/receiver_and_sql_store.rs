@@ -73,6 +73,7 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
             voice_channel_id: "vc1".to_owned(),
             report_channel_id: "c1".to_owned(),
             started_by_user_id: "u1".to_owned(),
+        title: None,
             status: MeetingStatus::Recording,
             stop_reason: None,
             error_message: None,

@@ -46,10 +46,21 @@ impl LocalChunkStorage {
     }
 
     fn chunk_file_path(&self, meeting_id: &str, user_id: &str, sequence: u64) -> PathBuf {
+        let safe_meeting_id = sanitize_path_component(meeting_id);
+        let safe_user_id = sanitize_path_component(user_id);
         self.base_dir
-            .join(meeting_id)
-            .join(format!("{}_{}.wav", user_id, sequence))
+            .join(safe_meeting_id)
+            .join(format!("{}_{}.wav", safe_user_id, sequence))
     }
+}
+
+fn sanitize_path_component(input: &str) -> String {
+    input
+        .replace(['/', '\\'], "_")
+        .replace("..", "_")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect()
 }
 
 impl ChunkStorage for LocalChunkStorage {
@@ -61,9 +72,11 @@ impl ChunkStorage for LocalChunkStorage {
         bytes: &[u8],
     ) -> Result<SavedChunk, ChunkStorageError> {
         let file_path = self.chunk_file_path(meeting_id, user_id, sequence);
-        let dir = file_path
-            .parent()
-            .expect("chunk path should always have parent directory");
+        let Some(dir) = file_path.parent() else {
+            return Err(ChunkStorageError::Io(
+                "chunk path has no parent directory".to_owned(),
+            ));
+        };
         fs::create_dir_all(dir).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
         fs::write(&file_path, bytes).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
 

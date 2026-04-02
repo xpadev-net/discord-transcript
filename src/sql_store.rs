@@ -265,12 +265,18 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             MeetingStatus::Failed => "failed",
             MeetingStatus::Aborted => "aborted",
         };
-        self.executor
+        let affected = self
+            .executor
             .execute(
                 "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2",
                 &[status_value.to_owned(), meeting_id.to_owned()],
             )
             .map_err(StoreError::Backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -279,12 +285,18 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         meeting_id: &str,
         error_message: Option<String>,
     ) -> Result<(), StoreError> {
-        self.executor
+        let affected = self
+            .executor
             .execute(
                 "UPDATE meetings SET error_message=NULLIF($1, ''), updated_at=NOW() WHERE id=$2",
                 &[error_message.unwrap_or_default(), meeting_id.to_owned()],
             )
             .map_err(StoreError::Backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
         Ok(())
     }
 }
@@ -378,7 +390,7 @@ impl SqlExecutor for PgSqlExecutor {
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping','transcribing','summarizing') ORDER BY started_at DESC LIMIT 1";
+        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, title, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording') ORDER BY started_at DESC LIMIT 1";
         let client = self.client()?;
         let runtime = self.runtime()?;
         std::thread::scope(|s| {
@@ -459,6 +471,7 @@ fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
         voice_channel_id: row.get("voice_channel_id"),
         report_channel_id: row.get("report_channel_id"),
         started_by_user_id: row.get("started_by_user_id"),
+        title: row.get("title"),
         status,
         stop_reason,
         error_message: row.get("error_message"),

@@ -68,6 +68,7 @@ pub struct StoredMeeting {
     pub voice_channel_id: String,
     pub report_channel_id: String,
     pub started_by_user_id: String,
+    pub title: Option<String>,
     pub status: MeetingStatus,
     pub stop_reason: Option<StopReason>,
     pub error_message: Option<String>,
@@ -103,11 +104,7 @@ impl InMemoryMeetingStore {
     fn is_active(status: MeetingStatus) -> bool {
         matches!(
             status,
-            MeetingStatus::Scheduled
-                | MeetingStatus::Recording
-                | MeetingStatus::Stopping
-                | MeetingStatus::Transcribing
-                | MeetingStatus::Summarizing
+            MeetingStatus::Scheduled | MeetingStatus::Recording
         )
     }
 }
@@ -160,6 +157,7 @@ impl MeetingStore for InMemoryMeetingStore {
             voice_channel_id: request.voice_channel_id,
             report_channel_id: request.report_channel_id,
             started_by_user_id: request.started_by_user_id,
+            title: None,
             status: MeetingStatus::Scheduled,
             stop_reason: None,
             error_message: None,

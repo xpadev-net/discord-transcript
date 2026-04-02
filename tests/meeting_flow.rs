@@ -27,6 +27,7 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
         voice_channel_id: "vc1".to_owned(),
         report_channel_id: "tc1".to_owned(),
         started_by_user_id: "u1".to_owned(),
+        title: None,
         status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,

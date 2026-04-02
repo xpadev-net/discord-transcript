@@ -58,6 +58,13 @@ impl RecorderEngine {
             .collect()
     }
 
+    pub fn flush_all(&mut self) -> Result<Vec<RecorderOutputChunk>, RecorderError> {
+        let all = self.receiver.flush_all_chunks();
+        all.into_iter()
+            .map(|candidate| self.build_chunk(candidate))
+            .collect()
+    }
+
     fn build_chunk(
         &self,
         candidate: UserChunkCandidate,

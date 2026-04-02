@@ -1,9 +1,11 @@
 pub const DISCORD_MESSAGE_LIMIT: usize = 2_000;
 
 pub fn split_discord_message(text: &str, limit: usize) -> Vec<String> {
-    assert!(limit > 0, "limit must be greater than zero");
+    if limit == 0 {
+        return vec![text.to_owned()];
+    }
     if text.is_empty() {
-        return vec![String::new()];
+        return vec![];
     }
 
     let mut chunks = Vec::new();

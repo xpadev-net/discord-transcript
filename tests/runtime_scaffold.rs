@@ -110,11 +110,13 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
 
     let first = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
         .expect("first stop should succeed");
-    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
-        .expect("second stop should succeed");
     assert_eq!(first.meeting_id, "m1");
-    assert_eq!(second.meeting_id, "m1");
 
+    // After stop, meeting is Stopping and no longer found by find_active_meeting_by_guild
+    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual);
+    assert!(second.is_err(), "second stop should fail with no active meeting");
+
+    // Only one job should be enqueued
     let first_job = queue
         .claim_next(JobType::Summarize)
         .expect("first claim should succeed");

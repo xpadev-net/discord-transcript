@@ -89,6 +89,28 @@ impl<S: ChunkStorage> RecordingSession<S> {
         Ok(persisted)
     }
 
+    pub fn flush_all(&mut self) -> Result<Vec<PersistedChunk>, RecordingSessionError> {
+        let chunks = self.recorder.flush_all()?;
+        let mut persisted = Vec::with_capacity(chunks.len());
+
+        for chunk in chunks {
+            let sequence = self.next_sequence(&chunk.user_id);
+            let saved = self.storage.save_chunk(
+                &self.meeting_id,
+                &chunk.user_id,
+                sequence,
+                &chunk.wav.bytes,
+            )?;
+            persisted.push(PersistedChunk {
+                user_id: chunk.user_id,
+                sequence,
+                saved,
+            });
+        }
+
+        Ok(persisted)
+    }
+
     fn next_sequence(&mut self, user_id: &str) -> u64 {
         let seq = self.per_user_seq.entry(user_id.to_owned()).or_insert(0);
         *seq += 1;

@@ -78,8 +78,23 @@ pub fn mask_pii(input: &str) -> MaskedText {
         &mut phone_counter,
         &mut stats.phone_replacements,
         |caps| {
-            let raw = caps.get(0).expect("full match should exist").as_str();
-            count_digits(raw) >= 10
+            let m = caps.get(0).expect("full match should exist");
+            let raw = m.as_str();
+            if count_digits(raw) < 10 {
+                return false;
+            }
+            // Exclude timestamp patterns like [123-456] used in transcript format
+            let start = m.start();
+            let end = m.end();
+            let bytes = value.as_bytes();
+            if start > 0
+                && end < bytes.len()
+                && bytes[start - 1] == b'['
+                && bytes[end] == b']'
+            {
+                return false;
+            }
+            true
         },
     );
 

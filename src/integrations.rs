@@ -82,10 +82,24 @@ pub struct ClaudeCliSummaryClient {
 impl ClaudeSummaryClient for ClaudeCliSummaryClient {
     fn summarize(&self, prompt: &str) -> Result<String, SummaryError> {
         retry_with_backoff(self.retry_policy, |_| {
-            let output = Command::new(&self.command_path)
+            use std::io::Write;
+            let mut child = Command::new(&self.command_path)
                 .arg("-p")
-                .arg(prompt)
-                .output()
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(prompt.as_bytes())
+                    .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+            }
+
+            let output = child
+                .wait_with_output()
                 .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
 
             if !output.status.success() {

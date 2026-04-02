@@ -39,6 +39,15 @@ pub fn build_wav_chunk(frames: &[BufferedFrame], sample_rate: u32) -> Result<Wav
     Ok(WavChunk { bytes: wav })
 }
 
+pub fn build_wav_bytes_raw(
+    pcm_16le: &[u8],
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+) -> Vec<u8> {
+    build_wav_bytes(pcm_16le, sample_rate, channels, bits_per_sample)
+}
+
 fn build_wav_bytes(
     pcm_16le: &[u8],
     sample_rate: u32,

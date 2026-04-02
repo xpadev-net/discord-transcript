@@ -99,7 +99,9 @@ pub fn parse_whisper_response(body: &str) -> Result<WhisperTranscriptionResult, 
 }
 
 fn seconds_to_ms(value: f32) -> u64 {
-    if value.is_sign_negative() {
+    if value.is_nan() || value.is_sign_negative() {
+        0
+    } else if value.is_infinite() {
         0
     } else {
         (value * 1_000.0).round() as u64
