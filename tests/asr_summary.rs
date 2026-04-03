@@ -45,6 +45,11 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
     assert_eq!(normalized.len(), 1);
     assert_eq!(normalized[0].text, "hello world next");
     assert!(normalized[0].is_noisy);
+    // merged_count should be the sum of the input segments' merged_count values
+    assert_eq!(normalized[0].merged_count, 2);
+    // confidence should be the weighted average: (0.9*1 + 0.4*1) / 2 = 0.65
+    let conf = normalized[0].confidence.expect("confidence should be Some");
+    assert!((conf - 0.65).abs() < 1e-5, "expected ~0.65, got {conf}");
 }
 
 #[test]

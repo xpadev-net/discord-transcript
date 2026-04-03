@@ -48,7 +48,7 @@ pub fn normalize_segments(
                 || segment
                     .confidence
                     .is_some_and(|value| value < config.min_confidence_for_clean),
-            merged_count: 1,
+            merged_count: segment.merged_count,
         };
 
         if let Some(prev) = normalized.last_mut()

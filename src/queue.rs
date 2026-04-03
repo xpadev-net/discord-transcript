@@ -17,6 +17,13 @@ pub enum QueueError {
     Backend(String),
     AlreadyExists { job_id: String },
     NotFound { job_id: String },
+    /// Job exists but is not in the expected state (e.g. not `Running`
+    /// when `mark_done`/`mark_failed`/`retry` is called).
+    InvalidState {
+        job_id: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl Display for QueueError {
@@ -25,6 +32,14 @@ impl Display for QueueError {
             Self::Backend(err) => write!(f, "queue backend error: {err}"),
             Self::AlreadyExists { job_id } => write!(f, "job already exists: {job_id}"),
             Self::NotFound { job_id } => write!(f, "job not found: {job_id}"),
+            Self::InvalidState {
+                job_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "job {job_id} in wrong state: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -102,8 +117,10 @@ impl JobQueue for InMemoryJobQueue {
             });
         };
         if job.status != JobStatus::Running {
-            return Err(QueueError::NotFound {
+            return Err(QueueError::InvalidState {
                 job_id: job_id.to_owned(),
+                expected: "running".to_owned(),
+                actual: job.status.as_str().to_owned(),
             });
         }
         job.status = JobStatus::Done;
@@ -118,8 +135,10 @@ impl JobQueue for InMemoryJobQueue {
             });
         };
         if job.status != JobStatus::Running {
-            return Err(QueueError::NotFound {
+            return Err(QueueError::InvalidState {
                 job_id: job_id.to_owned(),
+                expected: "running".to_owned(),
+                actual: job.status.as_str().to_owned(),
             });
         }
         job.status = JobStatus::Failed;
@@ -139,8 +158,10 @@ impl JobQueue for InMemoryJobQueue {
             });
         };
         if job.status != JobStatus::Running {
-            return Err(QueueError::NotFound {
+            return Err(QueueError::InvalidState {
                 job_id: job_id.to_owned(),
+                expected: "running".to_owned(),
+                actual: job.status.as_str().to_owned(),
             });
         }
         job.retry_count += 1;

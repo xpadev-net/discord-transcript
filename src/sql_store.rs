@@ -123,6 +123,9 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
     }
 
     fn mark_done(&mut self, job_id: &str) -> Result<(), QueueError> {
+        // SQL has `AND status = 'running'`, so affected==0 can mean either
+        // "job not found" or "job exists but not in running state". We return
+        // NotFound because SQL cannot distinguish the two without a second query.
         let affected = self
             .executor
             .execute(MARK_JOB_DONE_SQL, &[job_id.to_owned()])

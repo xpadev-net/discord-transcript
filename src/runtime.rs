@@ -1215,6 +1215,7 @@ fn resolve_bot_permissions(
     use serenity::all::Permissions;
 
     let Some(guild) = ctx.cache.guild(guild_id) else {
+        warn!(guild_id = %guild_id, "guild not found in cache, assuming permissive permissions");
         return PermissionSet {
             can_connect_voice: true,
             can_send_messages: true,
@@ -1222,6 +1223,7 @@ fn resolve_bot_permissions(
     };
     let bot_id = ctx.cache.current_user().id;
     let Some(member) = guild.members.get(&bot_id) else {
+        warn!(guild_id = %guild_id, bot_id = %bot_id, "bot member not found in cache, assuming permissive permissions");
         return PermissionSet {
             can_connect_voice: true,
             can_send_messages: true,
