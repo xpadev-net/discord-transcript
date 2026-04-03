@@ -28,8 +28,10 @@ use serenity::async_trait;
 use serenity::http::Http;
 use serenity::prelude::{Client, Context, EventHandler};
 use songbird::{
-    CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit,
+    CoreEvent, Config as SongbirdConfig, Event, EventContext,
+    EventHandler as SongbirdEventHandler, SerenityInit,
 };
+use songbird::driver::DecodeMode;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -327,9 +329,10 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let songbird_config = SongbirdConfig::default().decode_mode(DecodeMode::Decode);
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(handler)
-        .register_songbird()
+        .register_songbird_from_config(songbird_config)
         .await
         .map_err(|err| RuntimeError::ClientInit(err.to_string()))?;
 
@@ -468,14 +471,7 @@ impl EventHandler for ScaffoldHandler {
                             "auto stop triggered due to empty voice channel"
                         );
                         if result.outcome == StopOutcome::Owner {
-                            let meeting_dir = meeting_audio_dir(&handler.chunk_storage_dir, &result.meeting_id);
-                            if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
-                                warn!(meeting_id = %result.meeting_id, error = %err, "failed to merge audio chunks on auto-stop");
-                            }
-                            if let Err(err) = handler
-                                .run_summary_and_notify(&ctx_for_task.http, &result.meeting_id)
-                                .await
-                            {
+                            if let Err(err) = run_summary_background(&handler, &ctx_for_task.http, &result.meeting_id).await {
                                 warn!(
                                     guild_id = %guild_for_task,
                                     meeting_id = %result.meeting_id,
@@ -560,6 +556,15 @@ impl ScaffoldHandler {
                     // Merge per-user chunks into mixdown before ASR
                     if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
                         warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
+                        let _ = self.post_failure_for_meeting(
+                            &ctx.http,
+                            &snapshot.meeting_id,
+                            &format!("音声チャンクのマージに失敗しました (recovery): {err}"),
+                        ).await;
+                        let mut service = self.service.lock().await;
+                        let _ = service.store.set_meeting_status(&snapshot.meeting_id, MeetingStatus::Failed);
+                        let _ = service.store.set_error_message(&snapshot.meeting_id, Some(format!("merge failed during recovery: {err}")));
+                        continue;
                     }
                     let job_id = format!("summary-{}", snapshot.meeting_id);
                     let job_available = {
@@ -568,7 +573,7 @@ impl ScaffoldHandler {
                         // If the reset itself fails we cannot know whether a claimable job
                         // exists, so abort recovery for this meeting.
                         if let Err(err) = queue.executor.execute(
-                            "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status='failed'",
+                            "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status IN ('failed', 'running')",
                             &[job_id.clone()],
                         ) {
                             warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
@@ -670,6 +675,12 @@ impl ScaffoldHandler {
             resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
 
         let meeting_id = format!("{}-{}", guild_id.get(), command.id.get());
+        let permissions = resolve_bot_permissions(
+            ctx,
+            guild_id,
+            voice_channel_id_u64,
+            Some(command.channel_id.get()),
+        );
         let mut service = self.service.lock().await;
         let response = service
             .handle_record_start(StartCommandInput {
@@ -678,10 +689,7 @@ impl ScaffoldHandler {
                 user_id: command.user.id.get().to_string(),
                 command_channel_id: command.channel_id.get().to_string(),
                 user_voice_channel_id: voice_channel_id_u64.map(|v| v.to_string()),
-                permissions: PermissionSet {
-                    can_connect_voice: true,
-                    can_send_messages: true,
-                },
+                permissions,
             })
             .map_err(|err| err.to_string())?;
         drop(service);
@@ -801,24 +809,21 @@ impl ScaffoldHandler {
                 let outcome = result.outcome;
 
                 if outcome == StopOutcome::Owner {
-                    // Merge chunks into mixdown before ASR
-                    let meeting_dir = meeting_audio_dir(&self.chunk_storage_dir, &meeting_id);
-                    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
-                        warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
-                    }
-
-                    if let Err(err) = self.run_summary_and_notify(&ctx.http, &meeting_id).await {
-                        warn!(
-                            meeting_id = %meeting_id,
-                            error = %err,
-                            "failed to process summary after manual stop"
-                        );
-                    }
+                    // Spawn summary processing in background to avoid blocking
+                    // the Discord interaction response (3-second timeout).
+                    let handler = self.clone();
+                    let http = Arc::clone(&ctx.http);
+                    tokio::spawn(async move {
+                        let result = run_summary_background(&handler, &http, &meeting_id).await;
+                        if let Err(err) = result {
+                            error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                        }
+                    });
                 }
 
                 info!(
                     guild_id = %guild_key,
-                    meeting_id = %meeting_id,
+                    meeting_id = %result.meeting_id,
                     outcome = ?outcome,
                     "recording stop handled"
                 );
@@ -1113,14 +1118,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         match stop_result {
                             Ok(result) => {
                                 if result.outcome == StopOutcome::Owner {
-                                    let meeting_dir = meeting_audio_dir(&runtime.chunk_storage_dir, &result.meeting_id);
-                                    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
-                                        warn!(meeting_id = %result.meeting_id, error = %err, "failed to merge audio chunks on client disconnect");
-                                    }
-                                    if let Err(err) = runtime
-                                        .run_summary_and_notify(&http, &result.meeting_id)
-                                        .await
-                                    {
+                                    if let Err(err) = run_summary_background(&runtime, &http, &result.meeting_id).await {
                                         warn!(
                                             guild_id = %guild_key,
                                             meeting_id = %result.meeting_id,
@@ -1208,6 +1206,52 @@ fn count_non_bot_members_in_target_voice(
     Some(non_bot_count)
 }
 
+fn resolve_bot_permissions(
+    ctx: &Context,
+    guild_id: GuildId,
+    voice_channel_id: Option<u64>,
+    text_channel_id: Option<u64>,
+) -> PermissionSet {
+    use serenity::all::Permissions;
+
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        warn!(guild_id = %guild_id, "guild not found in cache, assuming permissive permissions");
+        return PermissionSet {
+            can_connect_voice: true,
+            can_send_messages: true,
+        };
+    };
+    let bot_id = ctx.cache.current_user().id;
+    let Some(member) = guild.members.get(&bot_id) else {
+        warn!(guild_id = %guild_id, bot_id = %bot_id, "bot member not found in cache, assuming permissive permissions");
+        return PermissionSet {
+            can_connect_voice: true,
+            can_send_messages: true,
+        };
+    };
+
+    let can_connect_voice = voice_channel_id
+        .and_then(|vc_id| {
+            let channel = guild.channels.get(&ChannelId::new(vc_id))?;
+            let perms = guild.user_permissions_in(channel, member);
+            Some(perms.contains(Permissions::CONNECT))
+        })
+        .unwrap_or(true);
+
+    let can_send_messages = text_channel_id
+        .and_then(|tc_id| {
+            let channel = guild.channels.get(&ChannelId::new(tc_id))?;
+            let perms = guild.user_permissions_in(channel, member);
+            Some(perms.contains(Permissions::SEND_MESSAGES))
+        })
+        .unwrap_or(true);
+
+    PermissionSet {
+        can_connect_voice,
+        can_send_messages,
+    }
+}
+
 fn resolve_user_voice_channel_id(ctx: &Context, guild_id: GuildId, user_id: UserId) -> Option<u64> {
     let guild = ctx.cache.guild(guild_id)?;
     guild
@@ -1231,6 +1275,36 @@ pub fn stop_reason_from_interaction(command: &CommandInteraction) -> Result<Stop
 
 pub fn parse_stop_reason(value: &str) -> Result<StopReason, String> {
     StopReason::from_str(value).ok_or_else(|| format!("invalid stop reason: {value}"))
+}
+
+/// Runs merge + summary + notify in a background context.
+/// All errors are handled internally (failure notification + status update).
+async fn run_summary_background(
+    handler: &ScaffoldHandler,
+    http: &Http,
+    meeting_id: &str,
+) -> Result<(), String> {
+    let meeting_dir = meeting_audio_dir(&handler.chunk_storage_dir, meeting_id);
+    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+        warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
+        let _ = handler
+            .post_failure_for_meeting(
+                http,
+                meeting_id,
+                &format!("音声チャンクのマージに失敗しました: {err}"),
+            )
+            .await;
+        let mut service = handler.service.lock().await;
+        let _ = service
+            .store
+            .set_meeting_status(meeting_id, MeetingStatus::Failed);
+        let _ = service
+            .store
+            .set_error_message(meeting_id, Some(format!("merge failed: {err}")));
+        return Err(err);
+    }
+
+    handler.run_summary_and_notify(http, meeting_id).await
 }
 
 async fn post_summary_to_report_channel(

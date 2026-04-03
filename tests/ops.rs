@@ -97,6 +97,74 @@ fn recovery_requeues_summary_for_stopping_with_recording() {
 }
 
 #[test]
+fn recovery_resets_transcribing_to_stopping_and_requeues() {
+    let mut store = InMemoryMeetingStore::new();
+    let mut meeting = recording_meeting("m1");
+    meeting.status = MeetingStatus::Transcribing;
+    store.insert(meeting);
+
+    let effect = run_recovery(
+        &mut store,
+        &RecoveryCandidate {
+            meeting_id: "m1".to_owned(),
+            status: MeetingStatus::Transcribing,
+            voice_connected: false,
+            has_recording_file: true,
+        },
+    )
+    .expect("recovery should work");
+
+    assert_eq!(
+        effect,
+        RecoveryEffect::SummaryRequeued {
+            meeting_id: "m1".to_owned()
+        }
+    );
+    // Status should be reset to Stopping so the pipeline can re-drive it
+    let saved = store.get("m1").expect("meeting should exist");
+    assert_eq!(saved.status, MeetingStatus::Stopping);
+}
+
+#[test]
+fn recovery_resets_summarizing_to_stopping_and_requeues() {
+    let mut store = InMemoryMeetingStore::new();
+    let mut meeting = recording_meeting("m1");
+    meeting.status = MeetingStatus::Summarizing;
+    store.insert(meeting);
+
+    let effect = run_recovery(
+        &mut store,
+        &RecoveryCandidate {
+            meeting_id: "m1".to_owned(),
+            status: MeetingStatus::Summarizing,
+            voice_connected: false,
+            has_recording_file: true,
+        },
+    )
+    .expect("recovery should work");
+
+    assert_eq!(
+        effect,
+        RecoveryEffect::SummaryRequeued {
+            meeting_id: "m1".to_owned()
+        }
+    );
+    let saved = store.get("m1").expect("meeting should exist");
+    assert_eq!(saved.status, MeetingStatus::Stopping);
+}
+
+#[test]
+fn recovery_marks_failed_for_transcribing_without_recording() {
+    let action = decide_recovery_action(&RecoveryCandidate {
+        meeting_id: "m1".to_owned(),
+        status: MeetingStatus::Transcribing,
+        voice_connected: false,
+        has_recording_file: false,
+    });
+    assert_eq!(action, RecoveryAction::MarkFailedMissingRecording);
+}
+
+#[test]
 fn retention_policy_selects_expected_cleanup_targets() {
     let now = 10_000_000u64;
     let policy = RetentionPolicy {

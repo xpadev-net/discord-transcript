@@ -89,7 +89,7 @@ WHERE id = $2
 pub const RECOVERY_SCAN_SQL: &str = r#"
 SELECT id, status, voice_channel_id
 FROM meetings
-WHERE status IN ('recording', 'stopping')
+WHERE status IN ('recording', 'stopping', 'transcribing', 'summarizing')
 "#;
 
 pub const ENQUEUE_JOB_SQL: &str = r#"
@@ -128,6 +128,7 @@ SET status = 'done',
     error_message = NULL,
     updated_at = NOW()
 WHERE id = $1
+  AND status = 'running'
 "#;
 
 pub const MARK_JOB_FAILED_SQL: &str = r#"
@@ -136,6 +137,7 @@ SET status = 'failed',
     error_message = $2,
     updated_at = NOW()
 WHERE id = $1
+  AND status = 'running'
 "#;
 
 pub const RETRY_JOB_SQL: &str = r#"
@@ -146,5 +148,6 @@ SET
   error_message = $2,
   updated_at = NOW()
 WHERE id = $1
+  AND status = 'running'
 RETURNING status
 "#;

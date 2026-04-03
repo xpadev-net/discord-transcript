@@ -89,6 +89,7 @@ pub fn parse_whisper_response(body: &str) -> Result<WhisperTranscriptionResult, 
             text: segment.text,
             confidence: segment.confidence,
             is_noisy: false,
+            merged_count: 1,
         });
     }
 

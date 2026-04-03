@@ -12,6 +12,11 @@ use crate::storage::{
 use std::collections::HashMap;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
 
+/// Prefix added to error messages when PostgreSQL returns SQLSTATE 23505
+/// (unique_violation). Callers can check `err.starts_with(UNIQUE_VIOLATION_PREFIX)`
+/// instead of locale-dependent string matching.
+pub const UNIQUE_VIOLATION_PREFIX: &str = "UNIQUE_VIOLATION: ";
+
 pub trait SqlExecutor {
     fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String>;
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String>;
@@ -86,8 +91,7 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         match result {
             Ok(_) => {}
             Err(err) => {
-                let lower = err.to_ascii_lowercase();
-                if lower.contains("duplicate key") || lower.contains("unique constraint") {
+                if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
                     return Err(QueueError::AlreadyExists { job_id });
                 }
                 return Err(QueueError::Backend(err));
@@ -119,6 +123,9 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
     }
 
     fn mark_done(&mut self, job_id: &str) -> Result<(), QueueError> {
+        // SQL has `AND status = 'running'`, so affected==0 can mean either
+        // "job not found" or "job exists but not in running state". We return
+        // NotFound because SQL cannot distinguish the two without a second query.
         let affected = self
             .executor
             .execute(MARK_JOB_DONE_SQL, &[job_id.to_owned()])
@@ -235,6 +242,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
         let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'scheduled')";
+        let meeting_id = request.id.clone();
         self.executor
             .execute(
                 sql,
@@ -246,7 +254,13 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     request.started_by_user_id,
                 ],
             )
-            .map_err(StoreError::Backend)?;
+            .map_err(|err| {
+                if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+                    StoreError::AlreadyExists { meeting_id }
+                } else {
+                    StoreError::Backend(err)
+                }
+            })?;
         Ok(())
     }
 
@@ -255,6 +269,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
         let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'recording')";
+        let meeting_id = request.id.clone();
         self.executor
             .execute(
                 sql,
@@ -266,7 +281,13 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     request.started_by_user_id,
                 ],
             )
-            .map_err(StoreError::Backend)?;
+            .map_err(|err| {
+                if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+                    StoreError::AlreadyExists { meeting_id }
+                } else {
+                    StoreError::Backend(err)
+                }
+            })?;
         Ok(())
     }
 
@@ -275,16 +296,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         meeting_id: &str,
         status: MeetingStatus,
     ) -> Result<(), StoreError> {
-        let status_value = match status {
-            MeetingStatus::Scheduled => "scheduled",
-            MeetingStatus::Recording => "recording",
-            MeetingStatus::Stopping => "stopping",
-            MeetingStatus::Transcribing => "transcribing",
-            MeetingStatus::Summarizing => "summarizing",
-            MeetingStatus::Posted => "posted",
-            MeetingStatus::Failed => "failed",
-            MeetingStatus::Aborted => "aborted",
-        };
+        let status_value = status.as_str();
         let affected = self
             .executor
             .execute(
@@ -402,7 +414,15 @@ impl SqlExecutor for PgSqlExecutor {
             s.spawn(|| {
                 runtime
                     .block_on(client.execute(sql, &bind))
-                    .map_err(|err| err.to_string())
+                    .map_err(|err| {
+                        if err.code()
+                            == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+                        {
+                            format!("{UNIQUE_VIOLATION_PREFIX}{err}")
+                        } else {
+                            err.to_string()
+                        }
+                    })
             })
             .join()
             .map_err(|_| "db execute thread panicked".to_owned())?
@@ -464,16 +484,11 @@ impl SqlExecutor for PgSqlExecutor {
 }
 
 fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
-    let status = match row.get::<_, String>("status").as_str() {
-        "scheduled" => MeetingStatus::Scheduled,
-        "recording" => MeetingStatus::Recording,
-        "stopping" => MeetingStatus::Stopping,
-        "transcribing" => MeetingStatus::Transcribing,
-        "summarizing" => MeetingStatus::Summarizing,
-        "posted" => MeetingStatus::Posted,
-        "failed" => MeetingStatus::Failed,
-        _ => MeetingStatus::Aborted,
-    };
+    let status_str = row.get::<_, String>("status");
+    let status = MeetingStatus::from_str(&status_str).unwrap_or_else(|| {
+        tracing::warn!(status = %status_str, "unknown meeting status in DB, defaulting to Aborted");
+        MeetingStatus::Aborted
+    });
     let stop_reason = row
         .get::<_, Option<String>>("stop_reason")
         .as_deref()

@@ -6,6 +6,8 @@ pub struct TranscriptSegment {
     pub text: String,
     pub confidence: Option<f32>,
     pub is_noisy: bool,
+    /// Number of original segments merged into this one (for weighted confidence).
+    pub merged_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,6 +48,7 @@ pub fn normalize_segments(
                 || segment
                     .confidence
                     .is_some_and(|value| value < config.min_confidence_for_clean),
+            merged_count: segment.merged_count,
         };
 
         if let Some(prev) = normalized.last_mut()
@@ -55,7 +58,13 @@ pub fn normalize_segments(
             prev.text.push(' ');
             prev.text.push_str(&normalized_segment.text);
             prev.is_noisy = prev.is_noisy || normalized_segment.is_noisy;
-            prev.confidence = merge_confidence(prev.confidence, normalized_segment.confidence);
+            prev.confidence = merge_confidence(
+                prev.confidence,
+                prev.merged_count,
+                normalized_segment.confidence,
+                normalized_segment.merged_count,
+            );
+            prev.merged_count += normalized_segment.merged_count;
             continue;
         }
 
@@ -69,9 +78,12 @@ fn can_merge(prev: &TranscriptSegment, next: &TranscriptSegment) -> bool {
     prev.speaker_id == next.speaker_id && next.start_ms <= prev.end_ms + 1_000
 }
 
-fn merge_confidence(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+fn merge_confidence(a: Option<f32>, a_count: u32, b: Option<f32>, b_count: u32) -> Option<f32> {
     match (a, b) {
-        (Some(x), Some(y)) => Some((x + y) / 2.0),
+        (Some(x), Some(y)) => {
+            let total = a_count + b_count;
+            Some((x * a_count as f32 + y * b_count as f32) / total as f32)
+        }
         (Some(x), None) => Some(x),
         (None, Some(y)) => Some(y),
         (None, None) => None,

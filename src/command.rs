@@ -44,6 +44,8 @@ pub enum CommandError {
     UserNotInVoice,
     MissingPermission(&'static str),
     ActiveMeetingExists { meeting_id: String },
+    /// A meeting with the given ID already exists in the store (duplicate key).
+    AlreadyExists { meeting_id: String },
     NoActiveMeeting,
     Store(String),
     Stop(String),
@@ -57,6 +59,9 @@ impl Display for CommandError {
             Self::ActiveMeetingExists { meeting_id } => {
                 write!(f, "an active meeting already exists: {meeting_id}")
             }
+            Self::AlreadyExists { meeting_id } => {
+                write!(f, "meeting already exists: {meeting_id}")
+            }
             Self::NoActiveMeeting => write!(f, "no active meeting found"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Stop(err) => write!(f, "{err}"),
@@ -68,7 +73,10 @@ impl std::error::Error for CommandError {}
 
 impl From<StoreError> for CommandError {
     fn from(value: StoreError) -> Self {
-        Self::Store(value.to_string())
+        match value {
+            StoreError::AlreadyExists { meeting_id } => Self::AlreadyExists { meeting_id },
+            other => Self::Store(other.to_string()),
+        }
     }
 }
 
@@ -94,9 +102,18 @@ pub fn record_start<S: MeetingStore>(
     }
 
     if let Some(active) = store.find_active_meeting_by_guild(&request.guild_id)? {
-        return Err(CommandError::ActiveMeetingExists {
-            meeting_id: active.id,
-        });
+        // find_active_meeting_by_guild returns Scheduled/Recording/Stopping.
+        // Only block new recordings for Scheduled/Recording — a Stopping
+        // meeting has already released the voice channel and should not
+        // prevent starting a new recording.
+        if matches!(
+            active.status,
+            crate::domain::MeetingStatus::Scheduled | crate::domain::MeetingStatus::Recording
+        ) {
+            return Err(CommandError::ActiveMeetingExists {
+                meeting_id: active.id,
+            });
+        }
     }
 
     store.create_meeting_as_recording(CreateMeetingRequest {

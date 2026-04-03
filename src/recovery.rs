@@ -27,7 +27,7 @@ pub fn decide_recovery_action(candidate: &RecoveryCandidate) -> RecoveryAction {
                 RecoveryAction::MarkFailedMissingRecording
             }
         }
-        MeetingStatus::Stopping => {
+        MeetingStatus::Stopping | MeetingStatus::Transcribing | MeetingStatus::Summarizing => {
             if candidate.has_recording_file {
                 // Always (re-)process the summary, whether or not a job was already queued.
                 // The runtime's enqueue call is idempotent (AlreadyExists is ignored), so
