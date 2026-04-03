@@ -136,9 +136,11 @@ fn sql_job_queue_retry_returns_failed_status() {
 #[test]
 fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
     let mut executor = FakeSqlExecutor::default();
-    let update_sql = "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3";
-    let update_key = format!("{}|{}", update_sql, "recording\u{1f}m-missing\u{1f}scheduled");
-    executor.execute_result.insert(update_key, 0);
+    let cas_sql = "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END";
+    let cas_key = format!("{}|{}", cas_sql, "recording\u{1f}m-missing\u{1f}scheduled");
+    executor
+        .query_rows_result
+        .insert(cas_key, vec![vec!["not_found".to_owned()]]);
 
     let mut store = SqlMeetingStore::new(executor);
     let result = store.set_meeting_status(
@@ -158,14 +160,11 @@ fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
 #[test]
 fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
     let mut executor = FakeSqlExecutor::default();
-    let update_sql = "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3";
-    let update_key = format!("{}|{}", update_sql, "recording\u{1f}m1\u{1f}scheduled");
-    executor.execute_result.insert(update_key, 0);
-    let exists_sql = format!("{}|{}", "SELECT 1 FROM meetings WHERE id=$1 LIMIT 1", "m1");
-    executor.query_rows_result.insert(
-        exists_sql,
-        vec![vec!["1".to_owned()]],
-    );
+    let cas_sql = "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END";
+    let cas_key = format!("{}|{}", cas_sql, "recording\u{1f}m1\u{1f}scheduled");
+    executor
+        .query_rows_result
+        .insert(cas_key, vec![vec!["conflict".to_owned()]]);
 
     let mut store = SqlMeetingStore::new(executor);
     let result = store.set_meeting_status("m1", MeetingStatus::Recording, Some(MeetingStatus::Scheduled));

@@ -300,48 +300,55 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         expected_current: Option<MeetingStatus>,
     ) -> Result<(), StoreError> {
         let status_value = status.as_str();
-        let (sql, params): (&str, Vec<String>) = match expected_current {
-            Some(expected) => (
-                "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3",
-                vec![
-                    status_value.to_owned(),
-                    meeting_id.to_owned(),
-                    expected.as_str().to_owned(),
-                ],
-            ),
-            None => (
-                "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2",
-                vec![status_value.to_owned(), meeting_id.to_owned()],
-            ),
-        };
-        let affected = self
-            .executor
-            .execute(sql, &params)
-            .map_err(StoreError::Backend)?;
-        if affected == 0 {
-            if expected_current.is_some() {
-                let exists = !self
+        match expected_current {
+            Some(expected) => {
+                let rows = self
                     .executor
                     .query_rows(
-                        "SELECT 1 FROM meetings WHERE id=$1 LIMIT 1",
-                        &[meeting_id.to_owned()],
+                        "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END",
+                        &[
+                            status_value.to_owned(),
+                            meeting_id.to_owned(),
+                            expected.as_str().to_owned(),
+                        ],
                     )
-                    .map_err(StoreError::Backend)?
-                    .is_empty();
-                if !exists {
+                    .map_err(StoreError::Backend)?;
+                let outcome = rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .map(|value| value.as_str())
+                    .ok_or_else(|| {
+                        StoreError::Backend("set_meeting_status CAS query returned no outcome".to_owned())
+                    })?;
+                match outcome {
+                    "updated" => Ok(()),
+                    "conflict" => Err(StoreError::CasConflict {
+                        meeting_id: meeting_id.to_owned(),
+                    }),
+                    "not_found" => Err(StoreError::NotFound {
+                        meeting_id: meeting_id.to_owned(),
+                    }),
+                    _ => Err(StoreError::Backend(format!(
+                        "set_meeting_status CAS query returned unknown outcome: {outcome}"
+                    ))),
+                }
+            }
+            None => {
+                let affected = self
+                    .executor
+                    .execute(
+                        "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2",
+                        &[status_value.to_owned(), meeting_id.to_owned()],
+                    )
+                    .map_err(StoreError::Backend)?;
+                if affected == 0 {
                     return Err(StoreError::NotFound {
                         meeting_id: meeting_id.to_owned(),
                     });
                 }
-                return Err(StoreError::CasConflict {
-                    meeting_id: meeting_id.to_owned(),
-                });
+                Ok(())
             }
-            return Err(StoreError::NotFound {
-                meeting_id: meeting_id.to_owned(),
-            });
         }
-        Ok(())
     }
 
     fn set_error_message(
