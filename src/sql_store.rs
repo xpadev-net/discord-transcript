@@ -410,7 +410,7 @@ impl SqlExecutor for PgSqlExecutor {
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, title, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording') ORDER BY started_at DESC LIMIT 1";
+        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, title, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
         let client = self.client()?;
         let runtime = self.runtime()?;
         std::thread::scope(|s| {

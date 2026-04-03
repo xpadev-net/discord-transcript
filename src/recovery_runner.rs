@@ -69,7 +69,10 @@ pub fn run_recovery<S: MeetingStore>(
             })
         }
         RecoveryAction::RequeueSummary => {
-            store.set_meeting_status(&candidate.meeting_id, MeetingStatus::Transcribing)?;
+            // Do NOT advance the status here — the meeting stays in Stopping until
+            // process_enqueued_summary_job sets it to Transcribing when the job
+            // actually begins.  Setting it prematurely would leave the DB in an
+            // inconsistent state if the subsequent enqueue fails.
             info!(
                 meeting_id = %candidate.meeting_id,
                 "recovery requeued summary pipeline"

@@ -570,11 +570,23 @@ impl ScaffoldHandler {
                     {
                         let mut queue = self.queue.lock().await;
                         // Reset any previously failed job to queued so it can be re-claimed
-                        let _ = queue.executor.execute(
+                        if let Err(err) = queue.executor.execute(
                             "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status='failed'",
                             &[job_id.clone()],
-                        );
-                        let _ = enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id);
+                        ) {
+                            warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
+                        }
+                        if let Err(err) = enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
+                            // A Queue("job already exists: …") error is expected when the job was
+                            // queued before the restart; skip that to avoid noisy warnings.
+                            let is_already_exists = matches!(
+                                &err,
+                                crate::worker::WorkerError::Queue(msg) if msg.contains("already exists")
+                            );
+                            if !is_already_exists {
+                                warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to enqueue summary job during recovery");
+                            }
+                        }
                     }
                     if let Err(err) = self
                         .run_summary_and_notify(&ctx.http, &snapshot.meeting_id)
@@ -837,8 +849,13 @@ impl ScaffoldHandler {
         };
         match self.process_enqueued_summary_job(meeting_id).await {
             Ok(output) => {
+                let chunks = if output.chunks.is_empty() {
+                    vec!["会議が終了しました。要約内容がありません。".to_owned()]
+                } else {
+                    output.chunks
+                };
                 if let Err(err) =
-                    post_summary_to_report_channel(http, report_channel_id, &output.chunks).await
+                    post_summary_to_report_channel(http, report_channel_id, &chunks).await
                 {
                     {
                         let mut service = self.service.lock().await;

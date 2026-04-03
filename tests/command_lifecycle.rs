@@ -87,6 +87,41 @@ fn record_start_rejects_if_active_meeting_exists() {
 }
 
 #[test]
+fn record_start_rejects_if_stopping_meeting_exists() {
+    // A meeting in Stopping state (processing in progress) must also block a new start
+    // to prevent parallel recordings in the same guild.
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "stopping-meeting".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-1".to_owned(),
+        report_channel_id: "report-chan".to_owned(),
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Stopping,
+        stop_reason: None,
+        error_message: None,
+    });
+
+    let request = RecordStartRequest {
+        meeting_id: "new".to_owned(),
+        guild_id: "g1".to_owned(),
+        started_by_user_id: "u2".to_owned(),
+        command_channel_id: "report-chan".to_owned(),
+        user_voice_channel_id: Some("vc-2".to_owned()),
+        permissions: default_permissions(),
+    };
+
+    let error = record_start(&mut store, request).expect_err("must fail while meeting is stopping");
+    assert_eq!(
+        error,
+        CommandError::ActiveMeetingExists {
+            meeting_id: "stopping-meeting".to_owned()
+        }
+    );
+}
+
+#[test]
 fn record_stop_is_idempotent_for_same_meeting() {
     use discord_transcript::stop::stop_meeting;
 
@@ -114,20 +149,19 @@ fn record_stop_is_idempotent_for_same_meeting() {
     .expect("first stop should pass");
     assert_eq!(first.outcome, StopOutcome::Owner);
 
-    // After stop, meeting is in Stopping and no longer "active" for find_active
+    // After stop, meeting is in Stopping but still found by find_active_meeting_by_guild.
+    // stop_meeting CAS returns AlreadyHandled, so record_stop is idempotent.
     let second = record_stop(
         &mut store,
         RecordStopRequest {
             guild_id: "g1".to_owned(),
             reason: StopReason::AutoEmpty,
         },
-    );
-    assert!(
-        matches!(second, Err(CommandError::NoActiveMeeting)),
-        "second stop via command should return NoActiveMeeting"
-    );
+    )
+    .expect("second stop should succeed (idempotent)");
+    assert_eq!(second.outcome, StopOutcome::AlreadyHandled);
 
-    // Direct stop_meeting on the same meeting_id is idempotent via CAS
+    // Direct stop_meeting on the same meeting_id is also idempotent via CAS
     let direct = stop_meeting(&mut store, "m1", StopReason::AutoEmpty)
         .expect("direct stop should pass");
     assert_eq!(direct, StopOutcome::AlreadyHandled);
