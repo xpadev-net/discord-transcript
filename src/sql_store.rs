@@ -29,12 +29,14 @@ pub struct FakeSqlExecutor {
     pub executed: Vec<(String, Vec<String>)>,
     pub active_by_guild: HashMap<String, StoredMeeting>,
     pub query_rows_result: HashMap<String, Vec<Vec<String>>>,
+    pub execute_result: HashMap<String, u64>,
 }
 
 impl SqlExecutor for FakeSqlExecutor {
     fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String> {
         self.executed.push((sql.to_owned(), params.to_vec()));
-        Ok(1)
+        let key = format!("{}|{}", sql, params.join("\u{1f}"));
+        Ok(*self.execute_result.get(&key).unwrap_or(&1))
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
@@ -317,10 +319,20 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .execute(sql, &params)
             .map_err(StoreError::Backend)?;
         if affected == 0 {
-            // When a CAS guard was provided and 0 rows matched, the meeting
-            // may exist but be in a different state.  Return CasConflict so
-            // callers can distinguish this from a genuinely missing meeting.
             if expected_current.is_some() {
+                let exists = !self
+                    .executor
+                    .query_rows(
+                        "SELECT 1 FROM meetings WHERE id=$1 LIMIT 1",
+                        &[meeting_id.to_owned()],
+                    )
+                    .map_err(StoreError::Backend)?
+                    .is_empty();
+                if !exists {
+                    return Err(StoreError::NotFound {
+                        meeting_id: meeting_id.to_owned(),
+                    });
+                }
                 return Err(StoreError::CasConflict {
                     meeting_id: meeting_id.to_owned(),
                 });

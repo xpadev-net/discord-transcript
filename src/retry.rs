@@ -69,7 +69,8 @@ where
                 }
 
                 thread::sleep(jittered_delay(delay, attempt, seed));
-                delay = (delay * multiplier).min(policy.max_delay);
+                let next_delay = delay.checked_mul(multiplier).unwrap_or(policy.max_delay);
+                delay = next_delay.min(policy.max_delay);
                 attempt += 1;
             }
         }

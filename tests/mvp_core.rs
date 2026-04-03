@@ -111,6 +111,9 @@ fn discord_message_split_counts_utf16_code_units() {
     let emojis_1001 = "😀".repeat(1001);
     let chunks = split_discord_message(&emojis_1001, DISCORD_MESSAGE_LIMIT);
     assert_eq!(chunks.len(), 2);
+    for chunk in &chunks {
+        assert!(chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT);
+    }
     assert_eq!(chunks.concat(), emojis_1001);
 }
 

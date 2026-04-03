@@ -6,7 +6,7 @@ use discord_transcript::sql::INITIAL_SCHEMA_SQL;
 use discord_transcript::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
 use discord_transcript::sql_store::{FakeSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::domain::MeetingStatus;
-use discord_transcript::storage::{CreateMeetingRequest, MeetingStore, StoredMeeting};
+use discord_transcript::storage::{CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -131,4 +131,49 @@ fn sql_job_queue_retry_returns_failed_status() {
         .retry("j-1", "still failing".to_owned(), 1)
         .expect("retry should succeed");
     assert_eq!(status, JobStatus::Failed);
+}
+
+#[test]
+fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
+    let mut executor = FakeSqlExecutor::default();
+    let update_sql = "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3";
+    let update_key = format!("{}|{}", update_sql, "recording\u{1f}m-missing\u{1f}scheduled");
+    executor.execute_result.insert(update_key, 0);
+
+    let mut store = SqlMeetingStore::new(executor);
+    let result = store.set_meeting_status(
+        "m-missing",
+        MeetingStatus::Recording,
+        Some(MeetingStatus::Scheduled),
+    );
+
+    assert_eq!(
+        result,
+        Err(StoreError::NotFound {
+            meeting_id: "m-missing".to_owned()
+        })
+    );
+}
+
+#[test]
+fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
+    let mut executor = FakeSqlExecutor::default();
+    let update_sql = "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3";
+    let update_key = format!("{}|{}", update_sql, "recording\u{1f}m1\u{1f}scheduled");
+    executor.execute_result.insert(update_key, 0);
+    let exists_sql = format!("{}|{}", "SELECT 1 FROM meetings WHERE id=$1 LIMIT 1", "m1");
+    executor.query_rows_result.insert(
+        exists_sql,
+        vec![vec!["1".to_owned()]],
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let result = store.set_meeting_status("m1", MeetingStatus::Recording, Some(MeetingStatus::Scheduled));
+
+    assert_eq!(
+        result,
+        Err(StoreError::CasConflict {
+            meeting_id: "m1".to_owned()
+        })
+    );
 }

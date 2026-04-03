@@ -62,7 +62,8 @@ pub trait MeetingStore {
 
     /// Update the meeting status. If `expected_current` is provided, the update
     /// is conditional (CAS): only applied when the current status matches.
-    /// Returns `StoreError::NotFound` if the meeting does not exist, or if
+    /// Returns `StoreError::NotFound` if the meeting does not exist.
+    /// Returns `StoreError::CasConflict` if `expected_current` is provided and
     /// the current status does not match the expected value.
     fn set_meeting_status(
         &mut self,
