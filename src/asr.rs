@@ -103,6 +103,14 @@ fn seconds_to_ms(value: f32) -> u64 {
     if value.is_nan() || value.is_sign_negative() || value.is_infinite() {
         0
     } else {
-        (value * 1_000.0).round() as u64
+        // Keep 1_000ms headroom so downstream `+ 1_000` window checks cannot overflow.
+        const MERGE_WINDOW_MS: u64 = 1_000;
+        let max_safe_ms = u64::MAX.saturating_sub(MERGE_WINDOW_MS);
+        let ms = (value as f64 * 1_000.0).round();
+        if ms.is_sign_negative() {
+            0
+        } else {
+            ms.min(max_safe_ms as f64) as u64
+        }
     }
 }

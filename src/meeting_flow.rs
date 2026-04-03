@@ -69,14 +69,39 @@ impl From<StoreError> for MeetingFlowError {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MeetingFlowInput<'a, W, C> {
-    pub recovery_candidate: &'a RecoveryCandidate,
-    pub now: Instant,
-    pub whisper: &'a W,
-    pub claude: &'a C,
-    pub summary_input: &'a ProcessMeetingInput,
-    pub retention_records: &'a [ArtifactRecord],
-    pub now_unix_seconds: u64,
-    pub retention_policy: RetentionPolicy,
+    recovery_candidate: &'a RecoveryCandidate,
+    now: Instant,
+    whisper: &'a W,
+    claude: &'a C,
+    summary_input: &'a ProcessMeetingInput,
+    retention_records: &'a [ArtifactRecord],
+    now_unix_seconds: u64,
+    retention_policy: RetentionPolicy,
+}
+
+impl<'a, W, C> MeetingFlowInput<'a, W, C> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        recovery_candidate: &'a RecoveryCandidate,
+        now: Instant,
+        whisper: &'a W,
+        claude: &'a C,
+        summary_input: &'a ProcessMeetingInput,
+        retention_records: &'a [ArtifactRecord],
+        now_unix_seconds: u64,
+        retention_policy: RetentionPolicy,
+    ) -> Self {
+        Self {
+            recovery_candidate,
+            now,
+            whisper,
+            claude,
+            summary_input,
+            retention_records,
+            now_unix_seconds,
+            retention_policy,
+        }
+    }
 }
 
 pub fn run_meeting_flow<S, C, W, FS>(
