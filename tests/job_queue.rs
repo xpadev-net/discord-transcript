@@ -68,9 +68,10 @@ fn worker_job_processing_marks_done_on_success() {
         mocked_markdown: "## Summary\ndone".to_owned(),
     };
 
-    let result = process_next_summary_job(&mut store, &mut queue, &whisper, &claude, 2, "/tmp/chunks")
-        .expect("worker should succeed")
-        .expect("job result should exist");
+    let result =
+        process_next_summary_job(&mut store, &mut queue, &whisper, &claude, 2, "/tmp/chunks")
+            .expect("worker should succeed")
+            .expect("job result should exist");
     assert_eq!(result.job_id, "j1");
     assert_eq!(
         queue.get("j1").expect("job should exist").status,

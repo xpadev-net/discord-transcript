@@ -2,9 +2,9 @@ use discord_transcript::auto_stop::{AutoStopSignal, AutoStopState};
 use discord_transcript::command::{
     CommandError, PermissionSet, RecordStartRequest, RecordStopRequest, record_start, record_stop,
 };
+use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::StopReason;
 use discord_transcript::stop::StopOutcome;
-use discord_transcript::domain::MeetingStatus;
 use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use std::time::Duration;
 
@@ -112,7 +112,8 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
         permissions: default_permissions(),
     };
 
-    let result = record_start(&mut store, request).expect("should succeed while previous meeting is stopping");
+    let result = record_start(&mut store, request)
+        .expect("should succeed while previous meeting is stopping");
     assert_eq!(result.meeting_id, "new");
 }
 
@@ -157,8 +158,8 @@ fn record_stop_is_idempotent_for_same_meeting() {
     assert_eq!(second.outcome, StopOutcome::AlreadyHandled);
 
     // Direct stop_meeting on the same meeting_id is also idempotent via CAS
-    let direct = stop_meeting(&mut store, "m1", StopReason::AutoEmpty)
-        .expect("direct stop should pass");
+    let direct =
+        stop_meeting(&mut store, "m1", StopReason::AutoEmpty).expect("direct stop should pass");
     assert_eq!(direct, StopOutcome::AlreadyHandled);
 
     // Verify original stop_reason was preserved

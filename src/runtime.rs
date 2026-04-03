@@ -4,7 +4,6 @@ use crate::command::{CommandError, PermissionSet};
 use crate::config::AppConfig;
 use crate::domain::{MeetingStatus, StopReason};
 use crate::integrations::{ClaudeCliSummaryClient, CommandWhisperClient};
-use crate::summary::ClaudeSummaryClient;
 use crate::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::queue::JobQueue;
 use crate::receiver::ReceiverConfig;
@@ -18,20 +17,21 @@ use crate::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore}
 use crate::stop::StopOutcome;
 use crate::storage::MeetingStore;
 use crate::storage_fs::LocalChunkStorage;
+use crate::summary::ClaudeSummaryClient;
 use crate::worker::enqueue_summary_job;
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
-    CreateInteractionResponse, CreateInteractionResponseMessage,
-    GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
+    CreateInteractionResponse, CreateInteractionResponseMessage, GatewayIntents, GuildId,
+    Interaction, Ready, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
 use serenity::prelude::{Client, Context, EventHandler};
-use songbird::{
-    CoreEvent, Config as SongbirdConfig, Event, EventContext,
-    EventHandler as SongbirdEventHandler, SerenityInit,
-};
 use songbird::driver::DecodeMode;
+use songbird::{
+    Config as SongbirdConfig, CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
+    SerenityInit,
+};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -138,16 +138,17 @@ pub fn meeting_audio_path(base_dir: &str, meeting_id: &str) -> String {
         .to_string()
 }
 
-pub fn merge_user_chunks_to_mixdown(
-    meeting_dir: &std::path::Path,
-) -> Result<String, String> {
+type UserPcmChunk = (String, Vec<u8>);
+type SequenceGroup = (u64, Vec<UserPcmChunk>);
+
+pub fn merge_user_chunks_to_mixdown(meeting_dir: &std::path::Path) -> Result<String, String> {
     use crate::audio::build_wav_bytes_raw;
 
     let mixdown_path = meeting_dir.join("mixdown.wav");
 
     let mut chunk_files: Vec<PathBuf> = Vec::new();
-    let entries = fs::read_dir(meeting_dir)
-        .map_err(|err| format!("failed to read meeting dir: {err}"))?;
+    let entries =
+        fs::read_dir(meeting_dir).map_err(|err| format!("failed to read meeting dir: {err}"))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
         let path = entry.path();
@@ -181,7 +182,7 @@ pub fn merge_user_chunks_to_mixdown(
     });
 
     // Read PCM from each chunk and mix same-sequence chunks by summing samples
-    let mut sequence_groups: Vec<(u64, Vec<(String, Vec<u8>)>)> = Vec::new();
+    let mut sequence_groups: Vec<SequenceGroup> = Vec::new();
     for chunk_path in &chunk_files {
         let stem = chunk_path
             .file_stem()
@@ -196,10 +197,7 @@ pub fn merge_user_chunks_to_mixdown(
             .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
         // Validate WAV header before stripping: must start with RIFF and have
         // a "data" subchunk at offset 36 for standard PCM WAV (44-byte header).
-        let pcm = if data.len() >= 44
-            && data[0..4] == *b"RIFF"
-            && data[36..40] == *b"data"
-        {
+        let pcm = if data.len() >= 44 && data[0..4] == *b"RIFF" && data[36..40] == *b"data" {
             data[44..].to_vec()
         } else {
             warn!(
@@ -501,15 +499,20 @@ impl EventHandler for ScaffoldHandler {
                             meeting_id = %result.meeting_id,
                             "auto stop triggered due to empty voice channel"
                         );
-                        if result.outcome == StopOutcome::Owner {
-                            if let Err(err) = run_summary_background(&handler, &ctx_for_task.http, &result.meeting_id).await {
-                                warn!(
-                                    guild_id = %guild_for_task,
-                                    meeting_id = %result.meeting_id,
-                                    error = %err,
-                                    "failed to process summary after auto stop"
-                                );
-                            }
+                        if result.outcome == StopOutcome::Owner
+                            && let Err(err) = run_summary_background(
+                                &handler,
+                                &ctx_for_task.http,
+                                &result.meeting_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                guild_id = %guild_for_task,
+                                meeting_id = %result.meeting_id,
+                                error = %err,
+                                "failed to process summary after auto stop"
+                            );
                         }
                     }
                     Err(err) => {
@@ -529,10 +532,7 @@ impl ScaffoldHandler {
     async fn run_startup_recovery(&self, ctx: &Context) -> Result<(), String> {
         let snapshots: Vec<RecoverySnapshot> = {
             let mut service = self.service.lock().await;
-            let rows = service
-                .store
-                .executor
-                .query_rows(RECOVERY_SCAN_SQL, &[])?;
+            let rows = service.store.executor.query_rows(RECOVERY_SCAN_SQL, &[])?;
             rows.into_iter()
                 .filter_map(|row| {
                     if row.len() < 3 {
@@ -556,11 +556,9 @@ impl ScaffoldHandler {
             let has_recording_file = meeting_dir.is_dir()
                 && fs::read_dir(&meeting_dir)
                     .map(|entries| {
-                        entries
-                            .filter_map(Result::ok)
-                            .any(|e| {
-                                e.path().extension().and_then(|ext| ext.to_str()) == Some("wav")
-                            })
+                        entries.filter_map(Result::ok).any(|e| {
+                            e.path().extension().and_then(|ext| ext.to_str()) == Some("wav")
+                        })
                     })
                     .unwrap_or(false);
             let voice_connected = snapshot
@@ -605,7 +603,7 @@ impl ScaffoldHandler {
                         // exists, so abort recovery for this meeting.
                         if let Err(err) = queue.executor.execute(
                             "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status IN ('failed', 'running')",
-                            &[job_id.clone()],
+                            std::slice::from_ref(&job_id),
                         ) {
                             warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
                             false
@@ -702,8 +700,7 @@ impl ScaffoldHandler {
         let guild_id = command
             .guild_id
             .ok_or_else(|| "guild_id is required for this command".to_owned())?;
-        let voice_channel_id_u64 =
-            resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
+        let voice_channel_id_u64 = resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
 
         let meeting_id = format!("{}-{}", guild_id.get(), command.id.get());
         let permissions = resolve_bot_permissions(
@@ -727,8 +724,8 @@ impl ScaffoldHandler {
 
         // voice_channel_id_u64 is guaranteed Some here because record_start
         // already validated user_voice_channel_id via CommandError::UserNotInVoice.
-        let voice_channel_id_u64 = voice_channel_id_u64
-            .expect("voice_channel_id should be validated by record_start");
+        let voice_channel_id_u64 =
+            voice_channel_id_u64.expect("voice_channel_id should be validated by record_start");
 
         let manager = songbird::get(ctx)
             .await
@@ -832,12 +829,7 @@ impl ScaffoldHandler {
         let stop_result = {
             let mut service = self.service.lock().await;
             let mut queue = self.queue.lock().await;
-            stop_and_enqueue_summary_job(
-                &mut service,
-                &mut *queue,
-                &guild_key,
-                StopReason::Manual,
-            )
+            stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)
         };
 
         match stop_result {
@@ -896,9 +888,11 @@ impl ScaffoldHandler {
                 {
                     {
                         let mut service = self.service.lock().await;
-                        let _ = service
-                            .store
-                            .set_meeting_status(meeting_id, MeetingStatus::Failed, None);
+                        let _ = service.store.set_meeting_status(
+                            meeting_id,
+                            MeetingStatus::Failed,
+                            None,
+                        );
                         let _ = service.store.set_error_message(
                             meeting_id,
                             Some(format!("summary posting failed: {err}")),
@@ -915,7 +909,11 @@ impl ScaffoldHandler {
                 let mut service = self.service.lock().await;
                 service
                     .store
-                    .set_meeting_status(meeting_id, MeetingStatus::Posted, Some(MeetingStatus::Summarizing))
+                    .set_meeting_status(
+                        meeting_id,
+                        MeetingStatus::Posted,
+                        Some(MeetingStatus::Summarizing),
+                    )
                     .map_err(|err| err.to_string())?;
                 service
                     .store
@@ -1021,9 +1019,11 @@ impl ScaffoldHandler {
         // Phase 1: Transcription (mutex held only for status update)
         if let Err(cas_err) = {
             let mut service = self.service.lock().await;
-            service
-                .store
-                .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Transcribing, Some(MeetingStatus::Stopping))
+            service.store.set_meeting_status(
+                &claimed_job.meeting_id,
+                MeetingStatus::Transcribing,
+                Some(MeetingStatus::Stopping),
+            )
         } {
             // CAS failed — another process may own this meeting.  Mark the
             // job failed so it does not stay Running forever.
@@ -1033,30 +1033,35 @@ impl ScaffoldHandler {
             return Err(cas_err.to_string());
         }
 
-        let transcription = tokio::task::block_in_place(|| {
-            crate::summary::run_transcription(&whisper, &request)
-        });
+        let transcription =
+            tokio::task::block_in_place(|| crate::summary::run_transcription(&whisper, &request));
         let transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
                 // Revert to Stopping so the next retry attempt's CAS guard succeeds.
                 let reverted = {
                     let mut service = self.service.lock().await;
-                    service.store.set_meeting_status(
-                        &claimed_job.meeting_id,
-                        MeetingStatus::Stopping,
-                        Some(MeetingStatus::Transcribing),
-                    ).is_ok()
+                    service
+                        .store
+                        .set_meeting_status(
+                            &claimed_job.meeting_id,
+                            MeetingStatus::Stopping,
+                            Some(MeetingStatus::Transcribing),
+                        )
+                        .is_ok()
                 };
                 if reverted {
                     let mut queue = self.queue.lock().await;
-                    let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    let retry_status =
+                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
                     drop(queue);
                     if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
                         let mut service = self.service.lock().await;
-                        let _ = service
-                            .store
-                            .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+                        let _ = service.store.set_meeting_status(
+                            &claimed_job.meeting_id,
+                            MeetingStatus::Failed,
+                            None,
+                        );
                         let _ = service
                             .store
                             .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
@@ -1078,9 +1083,11 @@ impl ScaffoldHandler {
         // Phase 2: Summarization (mutex held only for status update)
         if let Err(cas_err) = {
             let mut service = self.service.lock().await;
-            service
-                .store
-                .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Summarizing, Some(MeetingStatus::Transcribing))
+            service.store.set_meeting_status(
+                &claimed_job.meeting_id,
+                MeetingStatus::Summarizing,
+                Some(MeetingStatus::Transcribing),
+            )
         } {
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
             let mut queue = self.queue.lock().await;
@@ -1089,8 +1096,10 @@ impl ScaffoldHandler {
         }
 
         let markdown = tokio::task::block_in_place(|| {
-            let prompt =
-                crate::summary::build_summary_prompt(&request, &transcription.transcript_for_summary);
+            let prompt = crate::summary::build_summary_prompt(
+                &request,
+                &transcription.transcript_for_summary,
+            );
             claude.summarize(&prompt)
         });
         let markdown = match markdown {
@@ -1099,21 +1108,27 @@ impl ScaffoldHandler {
                 // Revert to Stopping so the next retry attempt starts from a consistent state.
                 let reverted = {
                     let mut service = self.service.lock().await;
-                    service.store.set_meeting_status(
-                        &claimed_job.meeting_id,
-                        MeetingStatus::Stopping,
-                        Some(MeetingStatus::Summarizing),
-                    ).is_ok()
+                    service
+                        .store
+                        .set_meeting_status(
+                            &claimed_job.meeting_id,
+                            MeetingStatus::Stopping,
+                            Some(MeetingStatus::Summarizing),
+                        )
+                        .is_ok()
                 };
                 if reverted {
                     let mut queue = self.queue.lock().await;
-                    let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    let retry_status =
+                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
                     drop(queue);
                     if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
                         let mut service = self.service.lock().await;
-                        let _ = service
-                            .store
-                            .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+                        let _ = service.store.set_meeting_status(
+                            &claimed_job.meeting_id,
+                            MeetingStatus::Failed,
+                            None,
+                        );
                         let _ = service
                             .store
                             .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
@@ -1171,10 +1186,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                 let adapted = adapt_voice_tick(tick, ts, &tracker);
                 drop(tracker);
                 let mut sessions = self.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&self.guild_id) {
-                    if let Err(err) = ingest_voice_frames_into_session(session, &adapted) {
-                        warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
-                    }
+                if let Some(session) = sessions.get_mut(&self.guild_id)
+                    && let Err(err) = ingest_voice_frames_into_session(session, &adapted)
+                {
+                    warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
                 }
             }
             EventContext::ClientDisconnect(evt) => {
@@ -1220,15 +1235,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         };
                         match stop_result {
                             Ok(result) => {
-                                if result.outcome == StopOutcome::Owner {
-                                    if let Err(err) = run_summary_background(&runtime, &http, &result.meeting_id).await {
-                                        warn!(
-                                            guild_id = %guild_key,
-                                            meeting_id = %result.meeting_id,
-                                            error = %err,
-                                            "failed to process summary after client disconnect"
-                                        );
-                                    }
+                                if result.outcome == StopOutcome::Owner
+                                    && let Err(err) =
+                                        run_summary_background(&runtime, &http, &result.meeting_id)
+                                            .await
+                                {
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = %result.meeting_id,
+                                        error = %err,
+                                        "failed to process summary after client disconnect"
+                                    );
                                 }
                             }
                             Err(err) => {

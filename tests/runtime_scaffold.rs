@@ -116,7 +116,10 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
     // stop_meeting CAS returns AlreadyHandled (no new job enqueued).
     let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
         .expect("second stop should succeed (idempotent)");
-    assert_eq!(second.outcome, discord_transcript::stop::StopOutcome::AlreadyHandled);
+    assert_eq!(
+        second.outcome,
+        discord_transcript::stop::StopOutcome::AlreadyHandled
+    );
 
     // Only one job should be enqueued
     let first_job = queue

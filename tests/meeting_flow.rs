@@ -1,10 +1,10 @@
 use discord_transcript::asr::StubWhisperClient;
-use discord_transcript::meeting_flow::run_meeting_flow;
+use discord_transcript::domain::MeetingStatus;
+use discord_transcript::meeting_flow::{MeetingFlowInput, run_meeting_flow};
 use discord_transcript::receiver::{BufferedFrame, ReceiverConfig};
 use discord_transcript::recording_session::RecordingSession;
 use discord_transcript::recovery::RecoveryCandidate;
 use discord_transcript::retention::{ArtifactRecord, RetentionKind, RetentionPolicy};
-use discord_transcript::domain::MeetingStatus;
 use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::storage_fs::LocalChunkStorage;
 use discord_transcript::summary::StubClaudeSummaryClient;
@@ -67,32 +67,37 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
     let claude = StubClaudeSummaryClient {
         mocked_markdown: "## Summary\ndone".to_owned(),
     };
+    let recovery_candidate = RecoveryCandidate {
+        meeting_id: "m1".to_owned(),
+        status: discord_transcript::domain::MeetingStatus::Stopping,
+        voice_connected: false,
+        has_recording_file: true,
+    };
+    let summary_input = ProcessMeetingInput {
+        meeting_id: "m1".to_owned(),
+        title: Some("Weekly".to_owned()),
+        audio_path: "audio.wav".to_owned(),
+        language: Some("ja".to_owned()),
+    };
+    let retention_records = [ArtifactRecord {
+        kind: RetentionKind::RawAudio,
+        created_at_unix_seconds: 0,
+    }];
 
     let start = Instant::now();
     let output = run_meeting_flow(
         &mut store,
         &mut session,
-        &RecoveryCandidate {
-            meeting_id: "m1".to_owned(),
-            status: discord_transcript::domain::MeetingStatus::Stopping,
-            voice_connected: false,
-            has_recording_file: true,
-        },
-        start + Duration::from_secs(21),
-        &whisper,
-        &claude,
-        &ProcessMeetingInput {
-            meeting_id: "m1".to_owned(),
-            title: Some("Weekly".to_owned()),
-            audio_path: "audio.wav".to_owned(),
-            language: Some("ja".to_owned()),
-        },
-        &[ArtifactRecord {
-            kind: RetentionKind::RawAudio,
-            created_at_unix_seconds: 0,
-        }],
-        10 * 86_400,
-        RetentionPolicy::default(),
+        MeetingFlowInput::new(
+            &recovery_candidate,
+            start + Duration::from_secs(21),
+            &whisper,
+            &claude,
+            &summary_input,
+            &retention_records,
+            10 * 86_400,
+            RetentionPolicy::default(),
+        ),
     )
     .expect("meeting flow should succeed");
 

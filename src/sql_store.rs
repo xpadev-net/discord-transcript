@@ -1,3 +1,4 @@
+use crate::domain::MeetingStatus;
 use crate::domain::StopReason;
 use crate::domain::{JobStatus, JobType};
 use crate::queue::{Job, JobQueue, QueueError};
@@ -5,7 +6,6 @@ use crate::sql::{
     CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, ENQUEUE_JOB_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
     MARK_STOPPING_IF_RECORDING_SQL, RETRY_JOB_SQL,
 };
-use crate::domain::MeetingStatus;
 use crate::storage::{
     CreateMeetingRequest, MeetingStore, StopTransition, StoreError, StoredMeeting,
 };
@@ -318,7 +318,9 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     .and_then(|row| row.first())
                     .map(|value| value.as_str())
                     .ok_or_else(|| {
-                        StoreError::Backend("set_meeting_status CAS query returned no outcome".to_owned())
+                        StoreError::Backend(
+                            "set_meeting_status CAS query returned no outcome".to_owned(),
+                        )
                     })?;
                 match outcome {
                     "updated" => Ok(()),
@@ -451,17 +453,13 @@ impl SqlExecutor for PgSqlExecutor {
         let runtime = self.runtime()?;
         std::thread::scope(|s| {
             s.spawn(|| {
-                runtime
-                    .block_on(client.execute(sql, &bind))
-                    .map_err(|err| {
-                        if err.code()
-                            == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
-                        {
-                            format!("{UNIQUE_VIOLATION_PREFIX}{err}")
-                        } else {
-                            err.to_string()
-                        }
-                    })
+                runtime.block_on(client.execute(sql, &bind)).map_err(|err| {
+                    if err.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+                        format!("{UNIQUE_VIOLATION_PREFIX}{err}")
+                    } else {
+                        err.to_string()
+                    }
+                })
             })
             .join()
             .map_err(|_| "db execute thread panicked".to_owned())?

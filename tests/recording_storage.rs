@@ -50,15 +50,20 @@ fn recording_session_flushes_and_persists_wav_chunks() {
         },
     );
 
-    let before = session.flush_due(start + Duration::from_millis(19_999)).expect("flush should succeed");
+    let before = session
+        .flush_due(start + Duration::from_millis(19_999))
+        .expect("flush should succeed");
     assert!(before.persisted.is_empty());
 
-    let result = session.flush_due(start + Duration::from_secs(21)).expect("flush should succeed");
+    let result = session
+        .flush_due(start + Duration::from_secs(21))
+        .expect("flush should succeed");
     assert_eq!(result.persisted.len(), 1);
     assert_eq!(result.persisted[0].sequence, 1);
     assert!(result.persisted[0].saved.path.exists());
 
-    let bytes = std::fs::read(&result.persisted[0].saved.path).expect("saved wav should be readable");
+    let bytes =
+        std::fs::read(&result.persisted[0].saved.path).expect("saved wav should be readable");
     assert!(bytes.starts_with(b"RIFF"));
 
     let _ = std::fs::remove_dir_all(base);
