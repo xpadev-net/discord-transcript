@@ -1,5 +1,5 @@
 use crate::receiver::{BufferedFrame, ReceiverConfig};
-use crate::recorder::{RecorderEngine, RecorderError};
+use crate::recorder::{RecorderEngine, RecorderError, RecorderOutputChunk};
 use crate::storage_fs::{ChunkStorage, ChunkStorageError, SavedChunk};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -10,6 +10,15 @@ pub struct PersistedChunk {
     pub user_id: String,
     pub sequence: u64,
     pub saved: SavedChunk,
+}
+
+/// Result of a flush operation.  Callers should inspect `failed` —
+/// those chunks have been drained from the recorder and could not be
+/// persisted.  The caller may retry storage or delay session teardown.
+#[derive(Debug)]
+pub struct FlushResult {
+    pub persisted: Vec<PersistedChunk>,
+    pub failed: Vec<RecorderOutputChunk>,
 }
 
 #[derive(Debug)]
@@ -68,24 +77,22 @@ impl<S: ChunkStorage> RecordingSession<S> {
         self.recorder.ingest_frame(user_id, frame);
     }
 
-    pub fn flush_due(&mut self, now: Instant) -> Result<Vec<PersistedChunk>, RecordingSessionError> {
+    pub fn flush_due(&mut self, now: Instant) -> Result<FlushResult, RecordingSessionError> {
         let chunks = self.recorder.flush_due(now)?;
         Ok(self.persist_chunks(chunks))
     }
 
-    pub fn flush_all(&mut self) -> Result<Vec<PersistedChunk>, RecordingSessionError> {
+    pub fn flush_all(&mut self) -> Result<FlushResult, RecordingSessionError> {
         let chunks = self.recorder.flush_all()?;
         Ok(self.persist_chunks(chunks))
     }
 
-    /// Persist chunks best-effort: individual storage failures are logged and
-    /// skipped so that a transient I/O error on one chunk does not cause the
-    /// remaining (already-drained) chunks to be silently dropped.
-    fn persist_chunks(
-        &mut self,
-        chunks: Vec<crate::recorder::RecorderOutputChunk>,
-    ) -> Vec<PersistedChunk> {
+    /// Persist chunks best-effort.  Successfully saved chunks are returned in
+    /// `persisted`; chunks whose storage write failed are returned in `failed`
+    /// so the caller can decide whether to retry or accept the loss.
+    fn persist_chunks(&mut self, chunks: Vec<RecorderOutputChunk>) -> FlushResult {
         let mut persisted = Vec::with_capacity(chunks.len());
+        let mut failed = Vec::new();
 
         for chunk in chunks {
             let saved = self.storage.save_chunk(
@@ -111,13 +118,14 @@ impl<S: ChunkStorage> RecordingSession<S> {
                         meeting_id = %self.meeting_id,
                         user_id = %chunk.user_id,
                         error = %err,
-                        "failed to persist audio chunk — data for this chunk is lost"
+                        "failed to persist audio chunk — returning to caller for retry"
                     );
+                    failed.push(chunk);
                 }
             }
         }
 
-        persisted
+        FlushResult { persisted, failed }
     }
 
     /// Returns the next sequence number without committing it.

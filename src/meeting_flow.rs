@@ -86,14 +86,14 @@ where
     FS: ChunkStorage,
 {
     let recovery_effect = run_recovery(store, recovery_candidate)?;
-    let persisted_chunks = recording_session.flush_due(now)?;
+    let flush_result = recording_session.flush_due(now)?;
     let summary = process_meeting_summary(store, whisper, claude, summary_input)?;
     let cleanup_candidates =
         select_cleanup_candidates(retention_records, now_unix_seconds, retention_policy);
 
     Ok(MeetingFlowOutput {
         recovery_effect,
-        persisted_chunks,
+        persisted_chunks: flush_result.persisted,
         summary,
         cleanup_candidates,
     })

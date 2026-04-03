@@ -63,10 +63,24 @@ fn sanitize_path_component(input: &str) -> String {
         .collect();
 
     // Guard against empty result or lone "." / ".." which have special filesystem meaning.
+    // Append a short hash of the original input to prevent collisions between
+    // different raw IDs that all sanitize to the fallback.
     if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        return "unknown".to_owned();
+        let hash = simple_hash(input);
+        return format!("unknown_{hash:016x}");
     }
     sanitized
+}
+
+/// Cheap, deterministic hash for filesystem-safe fallback names.
+fn simple_hash(input: &str) -> u64 {
+    // FNV-1a 64-bit
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in input.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 impl ChunkStorage for LocalChunkStorage {

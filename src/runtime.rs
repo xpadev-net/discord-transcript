@@ -196,7 +196,7 @@ pub fn merge_user_chunks_to_mixdown(
             .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
         // Validate WAV header before stripping: must start with RIFF and have
         // a "data" subchunk at offset 36 for standard PCM WAV (44-byte header).
-        let pcm = if data.len() > 44
+        let pcm = if data.len() >= 44
             && data[0..4] == *b"RIFF"
             && data[36..40] == *b"data"
         {
@@ -428,14 +428,9 @@ impl EventHandler for ScaffoldHandler {
             state.on_non_bot_member_count_changed(non_bot, now_ms())
         };
 
-        if signal == AutoStopSignal::Pending && non_bot == 0 {
-            // Mark timer as active to prevent duplicate timer spawns.
-            {
-                let mut states = self.auto_stop_states.lock().await;
-                if let Some(state) = states.get_mut(&guild_key) {
-                    state.mark_timer_active();
-                }
-            }
+        if signal == AutoStopSignal::StartTimer {
+            // timer_active was already set atomically inside
+            // on_non_bot_member_count_changed — no separate reservation needed.
             let handler = self.clone();
             let ctx_for_task = ctx.clone();
             let guild_for_task = guild_key;
@@ -470,8 +465,14 @@ impl EventHandler for ScaffoldHandler {
                 {
                     let mut sessions = handler.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&guild_for_task) {
-                        if let Err(err) = session.flush_all() {
-                            warn!(guild_id = %guild_for_task, error = %err, "failed to flush remaining audio on auto-stop");
+                        match session.flush_all() {
+                            Ok(result) if !result.failed.is_empty() => {
+                                warn!(guild_id = %guild_for_task, failed = result.failed.len(), "some chunks failed to persist on auto-stop");
+                            }
+                            Err(err) => {
+                                warn!(guild_id = %guild_for_task, error = %err, "failed to flush remaining audio on auto-stop");
+                            }
+                            _ => {}
                         }
                     }
                     sessions.remove(&guild_for_task);
@@ -807,8 +808,14 @@ impl ScaffoldHandler {
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&guild_key) {
-                if let Err(err) = session.flush_all() {
-                    warn!(guild_id = %guild_key, error = %err, "failed to flush remaining audio on stop");
+                match session.flush_all() {
+                    Ok(result) if !result.failed.is_empty() => {
+                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on stop");
+                    }
+                    Err(err) => {
+                        warn!(guild_id = %guild_key, error = %err, "failed to flush remaining audio on stop");
+                    }
+                    _ => {}
                 }
             }
             sessions.remove(&guild_key);
@@ -918,7 +925,14 @@ impl ScaffoldHandler {
                 {
                     let job_id = format!("summary-{meeting_id}");
                     let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_done(&job_id);
+                    if let Err(err) = queue.mark_done(&job_id) {
+                        error!(
+                            job_id = %job_id,
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "failed to mark summary job as done — job may be re-processed on restart"
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1005,12 +1019,18 @@ impl ScaffoldHandler {
         };
 
         // Phase 1: Transcription (mutex held only for status update)
-        {
+        if let Err(cas_err) = {
             let mut service = self.service.lock().await;
             service
                 .store
                 .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Transcribing, Some(MeetingStatus::Stopping))
-                .map_err(|e| e.to_string())?;
+        } {
+            // CAS failed — another process may own this meeting.  Mark the
+            // job failed so it does not stay Running forever.
+            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping→Transcribing failed; marking job failed");
+            let mut queue = self.queue.lock().await;
+            let _ = queue.mark_failed(&claimed_job.id, cas_err.to_string());
+            return Err(cas_err.to_string());
         }
 
         let transcription = tokio::task::block_in_place(|| {
@@ -1020,37 +1040,52 @@ impl ScaffoldHandler {
             Ok(t) => t,
             Err(err) => {
                 // Revert to Stopping so the next retry attempt's CAS guard succeeds.
-                {
+                let reverted = {
                     let mut service = self.service.lock().await;
-                    let _ = service.store.set_meeting_status(
+                    service.store.set_meeting_status(
                         &claimed_job.meeting_id,
                         MeetingStatus::Stopping,
                         Some(MeetingStatus::Transcribing),
+                    ).is_ok()
+                };
+                if reverted {
+                    let mut queue = self.queue.lock().await;
+                    let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    drop(queue);
+                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                        let mut service = self.service.lock().await;
+                        let _ = service
+                            .store
+                            .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    }
+                } else {
+                    // Revert failed — another process may have progressed the
+                    // state.  Mark the job failed so it does not stay Running.
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        "CAS revert to Stopping failed; marking job failed"
                     );
-                }
-                let mut queue = self.queue.lock().await;
-                let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                drop(queue);
-                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
-                    let mut service = self.service.lock().await;
-                    let _ = service
-                        .store
-                        .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    let mut queue = self.queue.lock().await;
+                    let _ = queue.mark_failed(&claimed_job.id, err.to_string());
                 }
                 return Err(err.to_string());
             }
         };
 
         // Phase 2: Summarization (mutex held only for status update)
-        {
+        if let Err(cas_err) = {
             let mut service = self.service.lock().await;
             service
                 .store
                 .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Summarizing, Some(MeetingStatus::Transcribing))
-                .map_err(|e| e.to_string())?;
+        } {
+            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
+            let mut queue = self.queue.lock().await;
+            let _ = queue.mark_failed(&claimed_job.id, cas_err.to_string());
+            return Err(cas_err.to_string());
         }
 
         let markdown = tokio::task::block_in_place(|| {
@@ -1062,25 +1097,34 @@ impl ScaffoldHandler {
             Ok(m) => m,
             Err(err) => {
                 // Revert to Stopping so the next retry attempt starts from a consistent state.
-                {
+                let reverted = {
                     let mut service = self.service.lock().await;
-                    let _ = service.store.set_meeting_status(
+                    service.store.set_meeting_status(
                         &claimed_job.meeting_id,
                         MeetingStatus::Stopping,
                         Some(MeetingStatus::Summarizing),
+                    ).is_ok()
+                };
+                if reverted {
+                    let mut queue = self.queue.lock().await;
+                    let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    drop(queue);
+                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                        let mut service = self.service.lock().await;
+                        let _ = service
+                            .store
+                            .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    }
+                } else {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        "CAS revert to Stopping failed; marking job failed"
                     );
-                }
-                let mut queue = self.queue.lock().await;
-                let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                drop(queue);
-                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
-                    let mut service = self.service.lock().await;
-                    let _ = service
-                        .store
-                        .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    let mut queue = self.queue.lock().await;
+                    let _ = queue.mark_failed(&claimed_job.id, err.to_string());
                 }
                 return Err(err.to_string());
             }
@@ -1148,8 +1192,14 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         {
                             let mut sessions = runtime.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&guild_key) {
-                                if let Err(err) = session.flush_all() {
-                                    warn!(guild_id = %guild_key, error = %err, "failed to flush audio on client disconnect");
+                                match session.flush_all() {
+                                    Ok(result) if !result.failed.is_empty() => {
+                                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on client disconnect");
+                                    }
+                                    Err(err) => {
+                                        warn!(guild_id = %guild_key, error = %err, "failed to flush audio on client disconnect");
+                                    }
+                                    _ => {}
                                 }
                             }
                             sessions.remove(&guild_key);
@@ -1208,7 +1258,15 @@ pub fn ingest_voice_frames_into_session(
 
     session
         .flush_due(Instant::now())
-        .map(|chunks| chunks.len())
+        .map(|result| {
+            if !result.failed.is_empty() {
+                tracing::warn!(
+                    failed_count = result.failed.len(),
+                    "some audio chunks could not be persisted during ingest flush"
+                );
+            }
+            result.persisted.len()
+        })
         .map_err(|err| err.to_string())
 }
 

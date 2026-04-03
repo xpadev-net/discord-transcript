@@ -317,6 +317,14 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .execute(sql, &params)
             .map_err(StoreError::Backend)?;
         if affected == 0 {
+            // When a CAS guard was provided and 0 rows matched, the meeting
+            // may exist but be in a different state.  Return CasConflict so
+            // callers can distinguish this from a genuinely missing meeting.
+            if expected_current.is_some() {
+                return Err(StoreError::CasConflict {
+                    meeting_id: meeting_id.to_owned(),
+                });
+            }
             return Err(StoreError::NotFound {
                 meeting_id: meeting_id.to_owned(),
             });

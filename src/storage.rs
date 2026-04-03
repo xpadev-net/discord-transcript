@@ -13,6 +13,9 @@ pub enum StoreError {
     AlreadyExists { meeting_id: String },
     Backend(String),
     NotFound { meeting_id: String },
+    /// The meeting exists but its current status does not match the expected
+    /// value provided to a CAS-guarded operation.
+    CasConflict { meeting_id: String },
 }
 
 impl Display for StoreError {
@@ -26,6 +29,12 @@ impl Display for StoreError {
             }
             Self::NotFound { meeting_id } => {
                 write!(f, "meeting not found: {meeting_id}")
+            }
+            Self::CasConflict { meeting_id } => {
+                write!(
+                    f,
+                    "meeting status does not match expected value: {meeting_id}"
+                )
             }
         }
     }
@@ -212,7 +221,7 @@ impl MeetingStore for InMemoryMeetingStore {
         };
         if let Some(expected) = expected_current {
             if meeting.status != expected {
-                return Err(StoreError::NotFound {
+                return Err(StoreError::CasConflict {
                     meeting_id: meeting_id.to_owned(),
                 });
             }
