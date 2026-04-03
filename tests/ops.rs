@@ -37,7 +37,6 @@ fn recovery_runner_marks_failed_when_recording_missing_file() {
             status: MeetingStatus::Recording,
             voice_connected: false,
             has_recording_file: false,
-            summary_job_already_queued: false,
         },
     )
     .expect("recovery should work");
@@ -67,7 +66,6 @@ fn recovery_runner_requeues_asr_for_stopping_meeting() {
             status: MeetingStatus::Stopping,
             voice_connected: false,
             has_recording_file: true,
-            summary_job_already_queued: false,
         },
     )
     .expect("recovery should work");
@@ -85,16 +83,15 @@ fn recovery_runner_requeues_asr_for_stopping_meeting() {
 }
 
 #[test]
-fn recovery_requeues_summary_even_when_job_already_queued() {
-    // A Stopping meeting whose summary job was already enqueued (e.g. bot restarted
-    // before the job was claimed) should still get RequeueSummary so the runtime
-    // can claim and process the existing queued job.
+fn recovery_requeues_summary_for_stopping_with_recording() {
+    // A Stopping meeting with a recording file always gets RequeueSummary.
+    // The runtime's enqueue call handles the AlreadyExists case gracefully, so
+    // this applies whether or not a summary job was previously queued.
     let action = decide_recovery_action(&RecoveryCandidate {
         meeting_id: "m1".to_owned(),
         status: MeetingStatus::Stopping,
         voice_connected: false,
         has_recording_file: true,
-        summary_job_already_queued: true,
     });
     assert_eq!(action, RecoveryAction::RequeueSummary);
 }

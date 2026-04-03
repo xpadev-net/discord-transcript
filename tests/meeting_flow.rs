@@ -76,7 +76,6 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
             status: discord_transcript::domain::MeetingStatus::Stopping,
             voice_connected: false,
             has_recording_file: true,
-            summary_job_already_queued: false,
         },
         21_000,
         &whisper,

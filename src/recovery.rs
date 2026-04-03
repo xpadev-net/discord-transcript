@@ -6,7 +6,6 @@ pub struct RecoveryCandidate {
     pub status: MeetingStatus,
     pub voice_connected: bool,
     pub has_recording_file: bool,
-    pub summary_job_already_queued: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -542,16 +542,11 @@ impl ScaffoldHandler {
                     is_bot_connected_to_voice_channel(ctx, self.guild_id, voice_channel_id)
                 })
                 .unwrap_or(false);
-            let summary_job_already_queued = self
-                .summary_job_already_queued(&snapshot.meeting_id)
-                .await
-                .unwrap_or(false);
             let candidate = RecoveryCandidate {
                 meeting_id: snapshot.meeting_id.clone(),
                 status: snapshot.status,
                 voice_connected,
                 has_recording_file,
-                summary_job_already_queued,
             };
 
             let effect = {
@@ -567,7 +562,7 @@ impl ScaffoldHandler {
                         warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
                     }
                     let job_id = format!("summary-{}", snapshot.meeting_id);
-                    {
+                    let job_available = {
                         let mut queue = self.queue.lock().await;
                         // Reset any previously failed job to queued so it can be re-claimed
                         if let Err(err) = queue.executor.execute(
@@ -576,17 +571,25 @@ impl ScaffoldHandler {
                         ) {
                             warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
                         }
-                        if let Err(err) = enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
-                            // A Queue("job already exists: …") error is expected when the job was
-                            // queued before the restart; skip that to avoid noisy warnings.
-                            let is_already_exists = matches!(
-                                &err,
-                                crate::worker::WorkerError::Queue(msg) if msg.contains("already exists")
-                            );
-                            if !is_already_exists {
-                                warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to enqueue summary job during recovery");
+                        match enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                // AlreadyExists means a claimable job is already in the queue.
+                                let is_already_exists = matches!(
+                                    &err,
+                                    crate::worker::WorkerError::Queue(msg) if msg.contains("already exists")
+                                );
+                                if !is_already_exists {
+                                    warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to enqueue summary job during recovery");
+                                }
+                                is_already_exists
                             }
                         }
+                    };
+                    if !job_available {
+                        // No job in the queue to claim — skip processing this meeting.
+                        // It will be retried on the next restart.
+                        continue;
                     }
                     if let Err(err) = self
                         .run_summary_and_notify(&ctx.http, &snapshot.meeting_id)
@@ -619,15 +622,6 @@ impl ScaffoldHandler {
             }
         }
         Ok(())
-    }
-
-    async fn summary_job_already_queued(&self, meeting_id: &str) -> Result<bool, String> {
-        let mut queue = self.queue.lock().await;
-        let rows = queue.executor.query_rows(
-            "SELECT id FROM jobs WHERE meeting_id=$1 AND job_type='summarize' AND status IN ('queued','running') LIMIT 1",
-            &[meeting_id.to_owned()],
-        )?;
-        Ok(!rows.is_empty())
     }
 
     async fn active_meeting_voice_channel_id(&self) -> Option<u64> {
