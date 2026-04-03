@@ -13,6 +13,9 @@ pub enum StoreError {
     AlreadyExists { meeting_id: String },
     Backend(String),
     NotFound { meeting_id: String },
+    /// The meeting exists but its current status does not match the expected
+    /// value provided to a CAS-guarded operation.
+    CasConflict { meeting_id: String },
 }
 
 impl Display for StoreError {
@@ -26,6 +29,12 @@ impl Display for StoreError {
             }
             Self::NotFound { meeting_id } => {
                 write!(f, "meeting not found: {meeting_id}")
+            }
+            Self::CasConflict { meeting_id } => {
+                write!(
+                    f,
+                    "meeting status does not match expected value: {meeting_id}"
+                )
             }
         }
     }
@@ -51,10 +60,16 @@ pub trait MeetingStore {
     fn create_meeting_as_recording(&mut self, request: CreateMeetingRequest)
     -> Result<(), StoreError>;
 
+    /// Update the meeting status. If `expected_current` is provided, the update
+    /// is conditional (CAS): only applied when the current status matches.
+    /// Returns `StoreError::NotFound` if the meeting does not exist.
+    /// Returns `StoreError::CasConflict` if `expected_current` is provided and
+    /// the current status does not match the expected value.
     fn set_meeting_status(
         &mut self,
         meeting_id: &str,
         status: MeetingStatus,
+        expected_current: Option<MeetingStatus>,
     ) -> Result<(), StoreError>;
 
     fn set_error_message(
@@ -198,12 +213,20 @@ impl MeetingStore for InMemoryMeetingStore {
         &mut self,
         meeting_id: &str,
         status: MeetingStatus,
+        expected_current: Option<MeetingStatus>,
     ) -> Result<(), StoreError> {
         let Some(meeting) = self.meetings.get_mut(meeting_id) else {
             return Err(StoreError::NotFound {
                 meeting_id: meeting_id.to_owned(),
             });
         };
+        if let Some(expected) = expected_current {
+            if meeting.status != expected {
+                return Err(StoreError::CasConflict {
+                    meeting_id: meeting_id.to_owned(),
+                });
+            }
+        }
         meeting.status = status;
         Ok(())
     }

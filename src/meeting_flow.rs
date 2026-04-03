@@ -12,6 +12,7 @@ use crate::worker::{
     ProcessMeetingInput, ProcessMeetingOutput, WorkerError, process_meeting_summary,
 };
 use std::fmt::{Display, Formatter};
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingFlowOutput {
@@ -70,7 +71,7 @@ pub fn run_meeting_flow<S, C, W, FS>(
     store: &mut S,
     recording_session: &mut RecordingSession<FS>,
     recovery_candidate: &RecoveryCandidate,
-    now_ms: u64,
+    now: Instant,
     whisper: &W,
     claude: &C,
     summary_input: &ProcessMeetingInput,
@@ -85,14 +86,14 @@ where
     FS: ChunkStorage,
 {
     let recovery_effect = run_recovery(store, recovery_candidate)?;
-    let persisted_chunks = recording_session.flush_due(now_ms)?;
+    let flush_result = recording_session.flush_due(now)?;
     let summary = process_meeting_summary(store, whisper, claude, summary_input)?;
     let cleanup_candidates =
         select_cleanup_candidates(retention_records, now_unix_seconds, retention_policy);
 
     Ok(MeetingFlowOutput {
         recovery_effect,
-        persisted_chunks,
+        persisted_chunks: flush_result.persisted,
         summary,
         cleanup_candidates,
     })

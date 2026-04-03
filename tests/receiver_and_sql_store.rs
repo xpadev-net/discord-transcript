@@ -6,8 +6,8 @@ use discord_transcript::sql::INITIAL_SCHEMA_SQL;
 use discord_transcript::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
 use discord_transcript::sql_store::{FakeSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::domain::MeetingStatus;
-use discord_transcript::storage::{CreateMeetingRequest, MeetingStore, StoredMeeting};
-use std::time::Duration;
+use discord_transcript::storage::{CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting};
+use std::time::{Duration, Instant};
 
 #[test]
 fn receiver_state_flushes_by_chunk_duration() {
@@ -16,6 +16,7 @@ fn receiver_state_flushes_by_chunk_duration() {
         chunk_duration: Duration::from_secs(20),
     };
 
+    let start = Instant::now();
     state.track_frame(
         "u1",
         BufferedFrame {
@@ -23,8 +24,8 @@ fn receiver_state_flushes_by_chunk_duration() {
             pcm_16le_bytes: vec![1, 2, 3],
         },
     );
-    assert!(state.users_ready_to_flush(20_999, &config).is_empty());
-    assert_eq!(state.users_ready_to_flush(21_000, &config), vec!["u1"]);
+    assert!(state.users_ready_to_flush(start + Duration::from_millis(19_999), &config).is_empty());
+    assert_eq!(state.users_ready_to_flush(start + Duration::from_secs(21), &config), vec!["u1"]);
 
     let chunk = state.take_user_chunk("u1").expect("chunk should exist");
     assert_eq!(chunk.len(), 1);
@@ -49,7 +50,7 @@ fn sql_store_applies_migration_and_writes_sql() {
         })
         .expect("insert should execute");
     store
-        .set_meeting_status("m1", MeetingStatus::Recording)
+        .set_meeting_status("m1", MeetingStatus::Recording, None)
         .expect("status update should execute");
     let transition = store
         .mark_stopping_if_recording("m1", StopReason::Manual)
@@ -130,4 +131,48 @@ fn sql_job_queue_retry_returns_failed_status() {
         .retry("j-1", "still failing".to_owned(), 1)
         .expect("retry should succeed");
     assert_eq!(status, JobStatus::Failed);
+}
+
+#[test]
+fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
+    let mut executor = FakeSqlExecutor::default();
+    let cas_sql = "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END";
+    let cas_key = format!("{}|{}", cas_sql, "recording\u{1f}m-missing\u{1f}scheduled");
+    executor
+        .query_rows_result
+        .insert(cas_key, vec![vec!["not_found".to_owned()]]);
+
+    let mut store = SqlMeetingStore::new(executor);
+    let result = store.set_meeting_status(
+        "m-missing",
+        MeetingStatus::Recording,
+        Some(MeetingStatus::Scheduled),
+    );
+
+    assert_eq!(
+        result,
+        Err(StoreError::NotFound {
+            meeting_id: "m-missing".to_owned()
+        })
+    );
+}
+
+#[test]
+fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
+    let mut executor = FakeSqlExecutor::default();
+    let cas_sql = "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END";
+    let cas_key = format!("{}|{}", cas_sql, "recording\u{1f}m1\u{1f}scheduled");
+    executor
+        .query_rows_result
+        .insert(cas_key, vec![vec!["conflict".to_owned()]]);
+
+    let mut store = SqlMeetingStore::new(executor);
+    let result = store.set_meeting_status("m1", MeetingStatus::Recording, Some(MeetingStatus::Scheduled));
+
+    assert_eq!(
+        result,
+        Err(StoreError::CasConflict {
+            meeting_id: "m1".to_owned()
+        })
+    );
 }

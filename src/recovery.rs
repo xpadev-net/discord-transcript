@@ -37,6 +37,9 @@ pub fn decide_recovery_action(candidate: &RecoveryCandidate) -> RecoveryAction {
                 RecoveryAction::MarkFailedMissingRecording
             }
         }
-        _ => RecoveryAction::Noop,
+        MeetingStatus::Scheduled
+        | MeetingStatus::Posted
+        | MeetingStatus::Failed
+        | MeetingStatus::Aborted => RecoveryAction::Noop,
     }
 }

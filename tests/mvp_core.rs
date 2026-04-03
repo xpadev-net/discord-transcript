@@ -99,6 +99,25 @@ fn discord_message_split_respects_character_limit() {
 }
 
 #[test]
+fn discord_message_split_counts_utf16_code_units() {
+    // Each emoji (😀) is 2 UTF-16 code units.  1000 emojis = 2000 UTF-16 units
+    // which exactly fills one Discord message.
+    let emojis_1000 = "😀".repeat(1000);
+    let chunks = split_discord_message(&emojis_1000, DISCORD_MESSAGE_LIMIT);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0], emojis_1000);
+
+    // 1001 emojis = 2002 UTF-16 units → must split into two messages.
+    let emojis_1001 = "😀".repeat(1001);
+    let chunks = split_discord_message(&emojis_1001, DISCORD_MESSAGE_LIMIT);
+    assert_eq!(chunks.len(), 2);
+    for chunk in &chunks {
+        assert!(chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT);
+    }
+    assert_eq!(chunks.concat(), emojis_1001);
+}
+
+#[test]
 fn transcript_delivery_falls_back_to_link_when_too_large() {
     assert_eq!(
         decide_transcript_delivery(1024, 2 * 1024),

@@ -1,6 +1,7 @@
 use crate::audio::{AudioError, WavChunk, build_wav_chunk};
 use crate::receiver::{BufferedFrame, ReceiverConfig, ReceiverState, UserChunkCandidate};
 use std::fmt::{Display, Formatter};
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecorderOutputChunk {
@@ -49,20 +50,33 @@ impl RecorderEngine {
         self.receiver.track_frame(user_id, frame);
     }
 
-    pub fn flush_due(&mut self, now_ms: u64) -> Result<Vec<RecorderOutputChunk>, RecorderError> {
-        let due = self
-            .receiver
-            .flush_due_chunks(now_ms, &self.receiver_config);
-        due.into_iter()
-            .map(|candidate| self.build_chunk(candidate))
-            .collect()
+    pub fn flush_due(&mut self, now: Instant) -> Result<Vec<RecorderOutputChunk>, RecorderError> {
+        let due = self.receiver.flush_due_chunks(now, &self.receiver_config);
+        Ok(self.build_chunks_best_effort(due))
     }
 
     pub fn flush_all(&mut self) -> Result<Vec<RecorderOutputChunk>, RecorderError> {
         let all = self.receiver.flush_all_chunks();
-        all.into_iter()
-            .map(|candidate| self.build_chunk(candidate))
-            .collect()
+        Ok(self.build_chunks_best_effort(all))
+    }
+
+    /// Build WAV chunks best-effort: individual user errors are logged and
+    /// skipped so that one user's bad audio does not discard all other users'
+    /// chunks in the same tick.
+    fn build_chunks_best_effort(
+        &self,
+        candidates: Vec<UserChunkCandidate>,
+    ) -> Vec<RecorderOutputChunk> {
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match self.build_chunk(candidate) {
+                Ok(chunk) => out.push(chunk),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping audio chunk due to build error");
+                }
+            }
+        }
+        out
     }
 
     fn build_chunk(

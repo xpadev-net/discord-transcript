@@ -2,7 +2,7 @@ use discord_transcript::receiver::{BufferedFrame, ReceiverConfig};
 use discord_transcript::recording_session::RecordingSession;
 use discord_transcript::storage_fs::{ChunkStorage, LocalChunkStorage};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn unique_temp_dir(test_name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -41,6 +41,7 @@ fn recording_session_flushes_and_persists_wav_chunks() {
         48_000,
     );
 
+    let start = Instant::now();
     session.ingest_frame(
         "u1",
         BufferedFrame {
@@ -49,15 +50,15 @@ fn recording_session_flushes_and_persists_wav_chunks() {
         },
     );
 
-    let before = session.flush_due(20_999).expect("flush should succeed");
-    assert!(before.is_empty());
+    let before = session.flush_due(start + Duration::from_millis(19_999)).expect("flush should succeed");
+    assert!(before.persisted.is_empty());
 
-    let persisted = session.flush_due(21_000).expect("flush should succeed");
-    assert_eq!(persisted.len(), 1);
-    assert_eq!(persisted[0].sequence, 1);
-    assert!(persisted[0].saved.path.exists());
+    let result = session.flush_due(start + Duration::from_secs(21)).expect("flush should succeed");
+    assert_eq!(result.persisted.len(), 1);
+    assert_eq!(result.persisted[0].sequence, 1);
+    assert!(result.persisted[0].saved.path.exists());
 
-    let bytes = std::fs::read(&persisted[0].saved.path).expect("saved wav should be readable");
+    let bytes = std::fs::read(&result.persisted[0].saved.path).expect("saved wav should be readable");
     assert!(bytes.starts_with(b"RIFF"));
 
     let _ = std::fs::remove_dir_all(base);
@@ -76,6 +77,7 @@ fn recording_session_increments_sequence_per_user() {
         48_000,
     );
 
+    let start = Instant::now();
     session.ingest_frame(
         "u1",
         BufferedFrame {
@@ -84,9 +86,9 @@ fn recording_session_increments_sequence_per_user() {
         },
     );
     let first = session
-        .flush_due(6_000)
+        .flush_due(start + Duration::from_secs(6))
         .expect("first flush should succeed");
-    assert_eq!(first[0].sequence, 1);
+    assert_eq!(first.persisted[0].sequence, 1);
 
     session.ingest_frame(
         "u1",
@@ -96,9 +98,9 @@ fn recording_session_increments_sequence_per_user() {
         },
     );
     let second = session
-        .flush_due(12_000)
+        .flush_due(start + Duration::from_secs(12))
         .expect("second flush should succeed");
-    assert_eq!(second[0].sequence, 2);
+    assert_eq!(second.persisted[0].sequence, 2);
 
     let _ = std::fs::remove_dir_all(base);
 }

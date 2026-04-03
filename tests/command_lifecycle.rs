@@ -171,19 +171,22 @@ fn auto_stop_triggers_after_grace_period_and_can_cancel() {
     let mut state = AutoStopState::new(Duration::from_secs(15));
     assert_eq!(
         state.on_non_bot_member_count_changed(0, 1_000),
-        AutoStopSignal::Pending
+        AutoStopSignal::StartTimer
     );
-    assert_eq!(state.tick(1_000 + 14_000), AutoStopSignal::Pending);
+    assert_eq!(state.tick(1_000 + 14_000), AutoStopSignal::Idle);
     assert_eq!(state.tick(1_000 + 15_000), AutoStopSignal::Trigger);
+
+    // Simulate the timer task completing (as the runtime would do).
+    state.clear_timer_active();
 
     // second cycle: empty -> rejoin cancels auto stop
     assert_eq!(
         state.on_non_bot_member_count_changed(0, 20_000),
-        AutoStopSignal::Pending
+        AutoStopSignal::StartTimer
     );
     assert_eq!(
         state.on_non_bot_member_count_changed(1, 25_000),
         AutoStopSignal::Cancelled
     );
-    assert_eq!(state.tick(40_000), AutoStopSignal::Pending);
+    assert_eq!(state.tick(40_000), AutoStopSignal::Idle);
 }

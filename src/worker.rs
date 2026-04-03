@@ -80,21 +80,33 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         language: input.language.clone(),
     };
 
-    store.set_meeting_status(&input.meeting_id, MeetingStatus::Transcribing)?;
+    store.set_meeting_status(&input.meeting_id, MeetingStatus::Transcribing, Some(MeetingStatus::Stopping))?;
     let transcription = match run_transcription(whisper, &request) {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "transcription failed");
+            // Revert to Stopping so the next retry attempt's CAS guard succeeds.
+            let _ = store.set_meeting_status(
+                &input.meeting_id,
+                MeetingStatus::Stopping,
+                Some(MeetingStatus::Transcribing),
+            );
             return Err(WorkerError::from(err));
         }
     };
 
-    store.set_meeting_status(&input.meeting_id, MeetingStatus::Summarizing)?;
+    store.set_meeting_status(&input.meeting_id, MeetingStatus::Summarizing, Some(MeetingStatus::Transcribing))?;
     let prompt = build_summary_prompt(&request, &transcription.transcript_for_summary);
     let markdown = match claude.summarize(&prompt) {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summarization failed");
+            // Revert to Stopping so the next retry attempt starts from a consistent state.
+            let _ = store.set_meeting_status(
+                &input.meeting_id,
+                MeetingStatus::Stopping,
+                Some(MeetingStatus::Summarizing),
+            );
             return Err(WorkerError::from(err));
         }
     };
@@ -147,8 +159,11 @@ where
 
     match process_meeting_summary(store, whisper, claude, &input) {
         Ok(output) => {
+            // Set meeting status first: if this fails the job stays Running
+            // and can be retried. The reverse order (mark_done first) would
+            // leave the meeting stuck in Summarizing with no way to recover.
+            store.set_meeting_status(&job.meeting_id, MeetingStatus::Posted, Some(MeetingStatus::Summarizing))?;
             queue.mark_done(&job.id)?;
-            store.set_meeting_status(&job.meeting_id, MeetingStatus::Posted)?;
             info!(job_id = %job.id, "summary job marked done");
             Ok(Some(ProcessJobResult {
                 job_id: job.id,
@@ -158,7 +173,7 @@ where
         Err(err) => {
             let status = queue.retry(&job.id, err.to_string(), max_retries)?;
             if status == JobStatus::Failed {
-                store.set_meeting_status(&job.meeting_id, MeetingStatus::Failed)?;
+                store.set_meeting_status(&job.meeting_id, MeetingStatus::Failed, None)?;
                 store.set_error_message(&job.meeting_id, Some(err.to_string()))?;
                 warn!(
                     job_id = %job.id,

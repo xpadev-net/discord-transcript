@@ -37,7 +37,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -194,7 +194,20 @@ pub fn merge_user_chunks_to_mixdown(
 
         let data = fs::read(chunk_path)
             .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
-        let pcm = if data.len() > 44 { data[44..].to_vec() } else { continue };
+        // Validate WAV header before stripping: must start with RIFF and have
+        // a "data" subchunk at offset 36 for standard PCM WAV (44-byte header).
+        let pcm = if data.len() >= 44
+            && data[0..4] == *b"RIFF"
+            && data[36..40] == *b"data"
+        {
+            data[44..].to_vec()
+        } else {
+            warn!(
+                path = %chunk_path.display(),
+                "skipping chunk: invalid WAV header or too small"
+            );
+            continue;
+        };
 
         match sequence_groups.last_mut() {
             Some((last_seq, group)) if *last_seq == seq => {
@@ -229,7 +242,8 @@ pub fn merge_user_chunks_to_mixdown(
         }
     }
 
-    let wav_bytes = build_wav_bytes_raw(&all_pcm, 48_000, 1, 16);
+    let wav_bytes = build_wav_bytes_raw(&all_pcm, 48_000, 1, 16)
+        .map_err(|err| format!("failed to build mixdown WAV: {err}"))?;
     fs::write(&mixdown_path, &wav_bytes)
         .map_err(|err| format!("failed to write mixdown: {err}"))?;
 
@@ -244,7 +258,7 @@ struct RecoverySnapshot {
 }
 
 fn parse_meeting_status(value: &str) -> MeetingStatus {
-    MeetingStatus::from_str(value).unwrap_or(MeetingStatus::Aborted)
+    MeetingStatus::parse_str(value).unwrap_or(MeetingStatus::Aborted)
 }
 
 fn parse_u64_with_warning(meeting_id: &str, field_name: &str, value: &str) -> Option<u64> {
@@ -414,7 +428,9 @@ impl EventHandler for ScaffoldHandler {
             state.on_non_bot_member_count_changed(non_bot, now_ms())
         };
 
-        if signal == AutoStopSignal::Pending && non_bot == 0 {
+        if signal == AutoStopSignal::StartTimer {
+            // timer_active was already set atomically inside
+            // on_non_bot_member_count_changed — no separate reservation needed.
             let handler = self.clone();
             let ctx_for_task = ctx.clone();
             let guild_for_task = guild_key;
@@ -424,6 +440,11 @@ impl EventHandler for ScaffoldHandler {
                 // Verify the same meeting is still active (not a new recording)
                 let current_meeting_id = handler.active_meeting_id().await;
                 if current_meeting_id != expected_meeting_id || expected_meeting_id.is_none() {
+                    // Clear timer flag before returning.
+                    let mut states = handler.auto_stop_states.lock().await;
+                    if let Some(state) = states.get_mut(&guild_for_task) {
+                        state.clear_timer_active();
+                    }
                     return;
                 }
                 let trigger = {
@@ -431,7 +452,11 @@ impl EventHandler for ScaffoldHandler {
                     let Some(state) = states.get_mut(&guild_for_task) else {
                         return;
                     };
-                    state.tick(now_ms()) == AutoStopSignal::Trigger
+                    let result = state.tick(now_ms()) == AutoStopSignal::Trigger;
+                    if !result {
+                        state.clear_timer_active();
+                    }
+                    result
                 };
                 if !trigger {
                     return;
@@ -440,8 +465,14 @@ impl EventHandler for ScaffoldHandler {
                 {
                     let mut sessions = handler.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&guild_for_task) {
-                        if let Err(err) = session.flush_all() {
-                            warn!(guild_id = %guild_for_task, error = %err, "failed to flush remaining audio on auto-stop");
+                        match session.flush_all() {
+                            Ok(result) if !result.failed.is_empty() => {
+                                warn!(guild_id = %guild_for_task, failed = result.failed.len(), "some chunks failed to persist on auto-stop");
+                            }
+                            Err(err) => {
+                                warn!(guild_id = %guild_for_task, error = %err, "failed to flush remaining audio on auto-stop");
+                            }
+                            _ => {}
                         }
                     }
                     sessions.remove(&guild_for_task);
@@ -562,7 +593,7 @@ impl ScaffoldHandler {
                             &format!("音声チャンクのマージに失敗しました (recovery): {err}"),
                         ).await;
                         let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(&snapshot.meeting_id, MeetingStatus::Failed);
+                        let _ = service.store.set_meeting_status(&snapshot.meeting_id, MeetingStatus::Failed, None);
                         let _ = service.store.set_error_message(&snapshot.meeting_id, Some(format!("merge failed during recovery: {err}")));
                         continue;
                     }
@@ -728,7 +759,7 @@ impl ScaffoldHandler {
                 let mut service = self.service.lock().await;
                 let _ = service
                     .store
-                    .set_meeting_status(&meeting_id, MeetingStatus::Failed);
+                    .set_meeting_status(&meeting_id, MeetingStatus::Failed, None);
                 let _ = service.store.set_error_message(
                     &meeting_id,
                     Some(format!("failed to join voice channel: {err}")),
@@ -777,8 +808,14 @@ impl ScaffoldHandler {
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&guild_key) {
-                if let Err(err) = session.flush_all() {
-                    warn!(guild_id = %guild_key, error = %err, "failed to flush remaining audio on stop");
+                match session.flush_all() {
+                    Ok(result) if !result.failed.is_empty() => {
+                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on stop");
+                    }
+                    Err(err) => {
+                        warn!(guild_id = %guild_key, error = %err, "failed to flush remaining audio on stop");
+                    }
+                    _ => {}
                 }
             }
             sessions.remove(&guild_key);
@@ -840,7 +877,7 @@ impl ScaffoldHandler {
                 let mut service = self.service.lock().await;
                 let _ = service
                     .store
-                    .set_meeting_status(meeting_id, MeetingStatus::Failed);
+                    .set_meeting_status(meeting_id, MeetingStatus::Failed, None);
                 let _ = service
                     .store
                     .set_error_message(meeting_id, Some(err.clone()));
@@ -861,10 +898,10 @@ impl ScaffoldHandler {
                         let mut service = self.service.lock().await;
                         let _ = service
                             .store
-                            .set_meeting_status(meeting_id, MeetingStatus::Failed);
+                            .set_meeting_status(meeting_id, MeetingStatus::Failed, None);
                         let _ = service.store.set_error_message(
                             meeting_id,
-                            Some(format!("summary posted failed: {err}")),
+                            Some(format!("summary posting failed: {err}")),
                         );
                     }
                     let _ =
@@ -872,15 +909,31 @@ impl ScaffoldHandler {
                             .await;
                     return Err(err);
                 }
+                // Mark meeting as Posted and job as Done only after successful posting.
+                // This order prevents data loss: if posting fails, the job stays
+                // Running and can be recovered on restart.
                 let mut service = self.service.lock().await;
                 service
                     .store
-                    .set_meeting_status(meeting_id, MeetingStatus::Posted)
+                    .set_meeting_status(meeting_id, MeetingStatus::Posted, Some(MeetingStatus::Summarizing))
                     .map_err(|err| err.to_string())?;
                 service
                     .store
                     .set_error_message(meeting_id, None)
                     .map_err(|err| err.to_string())?;
+                drop(service);
+                {
+                    let job_id = format!("summary-{meeting_id}");
+                    let mut queue = self.queue.lock().await;
+                    if let Err(err) = queue.mark_done(&job_id) {
+                        error!(
+                            job_id = %job_id,
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "failed to mark summary job as done — job may be re-processed on restart"
+                        );
+                    }
+                }
                 Ok(())
             }
             Err(err) => {
@@ -966,12 +1019,18 @@ impl ScaffoldHandler {
         };
 
         // Phase 1: Transcription (mutex held only for status update)
-        {
+        if let Err(cas_err) = {
             let mut service = self.service.lock().await;
             service
                 .store
-                .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Transcribing)
-                .map_err(|e| e.to_string())?;
+                .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Transcribing, Some(MeetingStatus::Stopping))
+        } {
+            // CAS failed — another process may own this meeting.  Mark the
+            // job failed so it does not stay Running forever.
+            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping→Transcribing failed; marking job failed");
+            let mut queue = self.queue.lock().await;
+            let _ = queue.mark_failed(&claimed_job.id, cas_err.to_string());
+            return Err(cas_err.to_string());
         }
 
         let transcription = tokio::task::block_in_place(|| {
@@ -980,29 +1039,53 @@ impl ScaffoldHandler {
         let transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
-                let mut queue = self.queue.lock().await;
-                let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                drop(queue);
-                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                // Revert to Stopping so the next retry attempt's CAS guard succeeds.
+                let reverted = {
                     let mut service = self.service.lock().await;
-                    let _ = service
-                        .store
-                        .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed);
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    service.store.set_meeting_status(
+                        &claimed_job.meeting_id,
+                        MeetingStatus::Stopping,
+                        Some(MeetingStatus::Transcribing),
+                    ).is_ok()
+                };
+                if reverted {
+                    let mut queue = self.queue.lock().await;
+                    let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    drop(queue);
+                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                        let mut service = self.service.lock().await;
+                        let _ = service
+                            .store
+                            .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    }
+                } else {
+                    // Revert failed — another process may have progressed the
+                    // state.  Mark the job failed so it does not stay Running.
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        "CAS revert to Stopping failed; marking job failed"
+                    );
+                    let mut queue = self.queue.lock().await;
+                    let _ = queue.mark_failed(&claimed_job.id, err.to_string());
                 }
                 return Err(err.to_string());
             }
         };
 
         // Phase 2: Summarization (mutex held only for status update)
-        {
+        if let Err(cas_err) = {
             let mut service = self.service.lock().await;
             service
                 .store
-                .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Summarizing)
-                .map_err(|e| e.to_string())?;
+                .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Summarizing, Some(MeetingStatus::Transcribing))
+        } {
+            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
+            let mut queue = self.queue.lock().await;
+            let _ = queue.mark_failed(&claimed_job.id, cas_err.to_string());
+            return Err(cas_err.to_string());
         }
 
         let markdown = tokio::task::block_in_place(|| {
@@ -1013,17 +1096,35 @@ impl ScaffoldHandler {
         let markdown = match markdown {
             Ok(m) => m,
             Err(err) => {
-                let mut queue = self.queue.lock().await;
-                let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                drop(queue);
-                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                // Revert to Stopping so the next retry attempt starts from a consistent state.
+                let reverted = {
                     let mut service = self.service.lock().await;
-                    let _ = service
-                        .store
-                        .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed);
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    service.store.set_meeting_status(
+                        &claimed_job.meeting_id,
+                        MeetingStatus::Stopping,
+                        Some(MeetingStatus::Summarizing),
+                    ).is_ok()
+                };
+                if reverted {
+                    let mut queue = self.queue.lock().await;
+                    let retry_status = queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    drop(queue);
+                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                        let mut service = self.service.lock().await;
+                        let _ = service
+                            .store
+                            .set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    }
+                } else {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        "CAS revert to Stopping failed; marking job failed"
+                    );
+                    let mut queue = self.queue.lock().await;
+                    let _ = queue.mark_failed(&claimed_job.id, err.to_string());
                 }
                 return Err(err.to_string());
             }
@@ -1031,13 +1132,9 @@ impl ScaffoldHandler {
 
         let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
 
-        // Mark job done
-        {
-            let mut queue = self.queue.lock().await;
-            queue
-                .mark_done(&claimed_job.id)
-                .map_err(|err| err.to_string())?;
-        }
+        // NOTE: mark_done is NOT called here. The caller (run_summary_and_notify)
+        // must call it after the Discord posting succeeds. This prevents data loss
+        // if posting fails -- the job stays Running and can be recovered on restart.
 
         Ok(crate::worker::ProcessMeetingOutput {
             meeting_id: claimed_job.meeting_id,
@@ -1075,7 +1172,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                 drop(tracker);
                 let mut sessions = self.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&self.guild_id) {
-                    if let Err(err) = ingest_voice_frames_into_session(session, &adapted, ts) {
+                    if let Err(err) = ingest_voice_frames_into_session(session, &adapted) {
                         warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
                     }
                 }
@@ -1095,8 +1192,14 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         {
                             let mut sessions = runtime.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&guild_key) {
-                                if let Err(err) = session.flush_all() {
-                                    warn!(guild_id = %guild_key, error = %err, "failed to flush audio on client disconnect");
+                                match session.flush_all() {
+                                    Ok(result) if !result.failed.is_empty() => {
+                                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on client disconnect");
+                                    }
+                                    Err(err) => {
+                                        warn!(guild_id = %guild_key, error = %err, "failed to flush audio on client disconnect");
+                                    }
+                                    _ => {}
                                 }
                             }
                             sessions.remove(&guild_key);
@@ -1148,15 +1251,22 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
 pub fn ingest_voice_frames_into_session(
     session: &mut RecordingSession<LocalChunkStorage>,
     adapted: &AdaptedVoiceFrames,
-    now_ms: u64,
 ) -> Result<usize, String> {
     for (user_id, frame) in &adapted.per_user {
         session.ingest_frame(user_id, frame.clone());
     }
 
     session
-        .flush_due(now_ms)
-        .map(|chunks| chunks.len())
+        .flush_due(Instant::now())
+        .map(|result| {
+            if !result.failed.is_empty() {
+                tracing::warn!(
+                    failed_count = result.failed.len(),
+                    "some audio chunks could not be persisted during ingest flush"
+                );
+            }
+            result.persisted.len()
+        })
         .map_err(|err| err.to_string())
 }
 
@@ -1274,7 +1384,7 @@ pub fn stop_reason_from_interaction(command: &CommandInteraction) -> Result<Stop
 }
 
 pub fn parse_stop_reason(value: &str) -> Result<StopReason, String> {
-    StopReason::from_str(value).ok_or_else(|| format!("invalid stop reason: {value}"))
+    StopReason::parse_str(value).ok_or_else(|| format!("invalid stop reason: {value}"))
 }
 
 /// Runs merge + summary + notify in a background context.
@@ -1297,7 +1407,7 @@ async fn run_summary_background(
         let mut service = handler.service.lock().await;
         let _ = service
             .store
-            .set_meeting_status(meeting_id, MeetingStatus::Failed);
+            .set_meeting_status(meeting_id, MeetingStatus::Failed, None);
         let _ = service
             .store
             .set_error_message(meeting_id, Some(format!("merge failed: {err}")));

@@ -24,7 +24,7 @@ impl MeetingStatus {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse_str(value: &str) -> Option<Self> {
         match value {
             "scheduled" => Some(Self::Scheduled),
             "recording" => Some(Self::Recording),
@@ -57,7 +57,7 @@ impl StopReason {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse_str(value: &str) -> Option<Self> {
         match value {
             "manual" => Some(Self::Manual),
             "auto_empty" => Some(Self::AutoEmpty),
@@ -84,7 +84,7 @@ impl JobType {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse_str(value: &str) -> Option<Self> {
         match value {
             "transcribe" => Some(Self::Transcribe),
             "summarize" => Some(Self::Summarize),
@@ -112,7 +112,7 @@ impl JobStatus {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse_str(value: &str) -> Option<Self> {
         match value {
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),

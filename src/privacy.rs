@@ -1,17 +1,17 @@
-use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
-static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
+static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b")
         .expect("email regex must compile")
 });
-static DISCORD_MENTION_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<@!?\d+>|<@&\d+>").expect("discord mention regex must compile"));
-static AT_USERNAME_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)(?P<mention>@[A-Za-z0-9_]{2,32})").expect("at mention regex"));
-static PHONE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\+?\d[\d\-\s().]{8,}\d").expect("phone regex must compile"));
+static DISCORD_MENTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<@!?\d+>|<@&\d+>").expect("discord mention regex must compile"));
+static AT_USERNAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(?P<mention>@[A-Za-z0-9_]{2,32})").expect("at mention regex"));
+static PHONE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\+?\d[\d\-\s().]{8,}\d").expect("phone regex must compile"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MaskingStats {
