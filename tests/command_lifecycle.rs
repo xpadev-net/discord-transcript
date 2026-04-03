@@ -87,9 +87,9 @@ fn record_start_rejects_if_active_meeting_exists() {
 }
 
 #[test]
-fn record_start_rejects_if_stopping_meeting_exists() {
-    // A meeting in Stopping state (processing in progress) must also block a new start
-    // to prevent parallel recordings in the same guild.
+fn record_start_allows_when_previous_meeting_is_stopping() {
+    // A meeting in Stopping state (summary processing in progress) should NOT block
+    // a new recording, since the voice channel is no longer occupied.
     let mut store = InMemoryMeetingStore::new();
     store.insert(StoredMeeting {
         id: "stopping-meeting".to_owned(),
@@ -112,13 +112,8 @@ fn record_start_rejects_if_stopping_meeting_exists() {
         permissions: default_permissions(),
     };
 
-    let error = record_start(&mut store, request).expect_err("must fail while meeting is stopping");
-    assert_eq!(
-        error,
-        CommandError::ActiveMeetingExists {
-            meeting_id: "stopping-meeting".to_owned()
-        }
-    );
+    let result = record_start(&mut store, request).expect("should succeed while previous meeting is stopping");
+    assert_eq!(result.meeting_id, "new");
 }
 
 #[test]

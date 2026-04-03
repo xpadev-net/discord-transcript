@@ -101,6 +101,11 @@ impl JobQueue for InMemoryJobQueue {
                 job_id: job_id.to_owned(),
             });
         };
+        if job.status != JobStatus::Running {
+            return Err(QueueError::NotFound {
+                job_id: job_id.to_owned(),
+            });
+        }
         job.status = JobStatus::Done;
         job.error_message = None;
         Ok(())
@@ -112,6 +117,11 @@ impl JobQueue for InMemoryJobQueue {
                 job_id: job_id.to_owned(),
             });
         };
+        if job.status != JobStatus::Running {
+            return Err(QueueError::NotFound {
+                job_id: job_id.to_owned(),
+            });
+        }
         job.status = JobStatus::Failed;
         job.error_message = Some(error_message);
         Ok(())
@@ -128,6 +138,11 @@ impl JobQueue for InMemoryJobQueue {
                 job_id: job_id.to_owned(),
             });
         };
+        if job.status != JobStatus::Running {
+            return Err(QueueError::NotFound {
+                job_id: job_id.to_owned(),
+            });
+        }
         job.retry_count += 1;
         job.error_message = Some(error_message);
         if job.retry_count > max_retries {

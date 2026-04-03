@@ -94,9 +94,17 @@ pub fn record_start<S: MeetingStore>(
     }
 
     if let Some(active) = store.find_active_meeting_by_guild(&request.guild_id)? {
-        return Err(CommandError::ActiveMeetingExists {
-            meeting_id: active.id,
-        });
+        // Only block new recordings for meetings that are truly active
+        // (not yet stopped). Meetings in stopping/transcribing/summarizing
+        // should not prevent starting a new recording.
+        if matches!(
+            active.status,
+            crate::domain::MeetingStatus::Scheduled | crate::domain::MeetingStatus::Recording
+        ) {
+            return Err(CommandError::ActiveMeetingExists {
+                meeting_id: active.id,
+            });
+        }
     }
 
     store.create_meeting_as_recording(CreateMeetingRequest {

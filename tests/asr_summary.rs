@@ -14,6 +14,7 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
             text: "  hello   world ".to_owned(),
             confidence: Some(0.9),
             is_noisy: false,
+            merged_count: 1,
         },
         TranscriptSegment {
             speaker_id: "alice".to_owned(),
@@ -22,6 +23,7 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
             text: "next".to_owned(),
             confidence: Some(0.4),
             is_noisy: false,
+            merged_count: 1,
         },
         TranscriptSegment {
             speaker_id: "bob".to_owned(),
@@ -30,6 +32,7 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
             text: " ".to_owned(),
             confidence: Some(0.8),
             is_noisy: false,
+            merged_count: 1,
         },
     ];
 
