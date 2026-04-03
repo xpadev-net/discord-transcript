@@ -53,7 +53,6 @@ fn recovery_decision_matches_mvp_rules() {
         status: MeetingStatus::Recording,
         voice_connected: false,
         has_recording_file: true,
-        summary_job_already_queued: false,
     };
     assert_eq!(
         decide_recovery_action(&recording_disconnected_with_audio),
@@ -65,7 +64,6 @@ fn recovery_decision_matches_mvp_rules() {
         status: MeetingStatus::Stopping,
         voice_connected: false,
         has_recording_file: true,
-        summary_job_already_queued: false,
     };
     assert_eq!(
         decide_recovery_action(&stopping_missing_asr_job),
@@ -77,7 +75,6 @@ fn recovery_decision_matches_mvp_rules() {
         status: MeetingStatus::Recording,
         voice_connected: false,
         has_recording_file: false,
-        summary_job_already_queued: false,
     };
     assert_eq!(
         decide_recovery_action(&recording_missing_audio),

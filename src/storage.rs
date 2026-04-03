@@ -107,7 +107,7 @@ impl InMemoryMeetingStore {
     fn is_active(status: MeetingStatus) -> bool {
         matches!(
             status,
-            MeetingStatus::Scheduled | MeetingStatus::Recording
+            MeetingStatus::Scheduled | MeetingStatus::Recording | MeetingStatus::Stopping
         )
     }
 }

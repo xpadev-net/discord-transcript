@@ -542,16 +542,11 @@ impl ScaffoldHandler {
                     is_bot_connected_to_voice_channel(ctx, self.guild_id, voice_channel_id)
                 })
                 .unwrap_or(false);
-            let summary_job_already_queued = self
-                .summary_job_already_queued(&snapshot.meeting_id)
-                .await
-                .unwrap_or(false);
             let candidate = RecoveryCandidate {
                 meeting_id: snapshot.meeting_id.clone(),
                 status: snapshot.status,
                 voice_connected,
                 has_recording_file,
-                summary_job_already_queued,
             };
 
             let effect = {
@@ -567,14 +562,35 @@ impl ScaffoldHandler {
                         warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
                     }
                     let job_id = format!("summary-{}", snapshot.meeting_id);
-                    {
+                    let job_available = {
                         let mut queue = self.queue.lock().await;
-                        // Reset any previously failed job to queued so it can be re-claimed
-                        let _ = queue.executor.execute(
+                        // Reset any previously failed job to queued so it can be re-claimed.
+                        // If the reset itself fails we cannot know whether a claimable job
+                        // exists, so abort recovery for this meeting.
+                        if let Err(err) = queue.executor.execute(
                             "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status='failed'",
                             &[job_id.clone()],
-                        );
-                        let _ = enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id);
+                        ) {
+                            warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
+                            false
+                        } else {
+                            match enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
+                                // Job freshly inserted — claimable.
+                                Ok(()) => true,
+                                // Job was already in the queue — also claimable.
+                                Err(crate::worker::WorkerError::AlreadyExists) => true,
+                                // Genuine failure — no job to claim.
+                                Err(err) => {
+                                    warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to enqueue summary job during recovery");
+                                    false
+                                }
+                            }
+                        }
+                    };
+                    if !job_available {
+                        // No claimable job — skip run_summary_and_notify for this meeting.
+                        // Recovery will be retried on the next restart.
+                        continue;
                     }
                     if let Err(err) = self
                         .run_summary_and_notify(&ctx.http, &snapshot.meeting_id)
@@ -607,15 +623,6 @@ impl ScaffoldHandler {
             }
         }
         Ok(())
-    }
-
-    async fn summary_job_already_queued(&self, meeting_id: &str) -> Result<bool, String> {
-        let mut queue = self.queue.lock().await;
-        let rows = queue.executor.query_rows(
-            "SELECT id FROM jobs WHERE meeting_id=$1 AND job_type='summarize' AND status IN ('queued','running') LIMIT 1",
-            &[meeting_id.to_owned()],
-        )?;
-        Ok(!rows.is_empty())
     }
 
     async fn active_meeting_voice_channel_id(&self) -> Option<u64> {
@@ -837,8 +844,13 @@ impl ScaffoldHandler {
         };
         match self.process_enqueued_summary_job(meeting_id).await {
             Ok(output) => {
+                let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
+                    vec!["会議が終了しました。要約内容がありません。".to_owned()]
+                } else {
+                    output.chunks
+                };
                 if let Err(err) =
-                    post_summary_to_report_channel(http, report_channel_id, &output.chunks).await
+                    post_summary_to_report_channel(http, report_channel_id, &chunks).await
                 {
                     {
                         let mut service = self.service.lock().await;

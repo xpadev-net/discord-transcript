@@ -1,3 +1,5 @@
+use discord_transcript::recovery::decide_recovery_action;
+use discord_transcript::recovery::RecoveryAction;
 use discord_transcript::audit::{AuditEvent, AuditLog};
 use discord_transcript::authz::{Action, UserRole, is_allowed};
 use discord_transcript::domain::MeetingStatus;
@@ -35,7 +37,6 @@ fn recovery_runner_marks_failed_when_recording_missing_file() {
             status: MeetingStatus::Recording,
             voice_connected: false,
             has_recording_file: false,
-            summary_job_already_queued: false,
         },
     )
     .expect("recovery should work");
@@ -65,7 +66,6 @@ fn recovery_runner_requeues_asr_for_stopping_meeting() {
             status: MeetingStatus::Stopping,
             voice_connected: false,
             has_recording_file: true,
-            summary_job_already_queued: false,
         },
     )
     .expect("recovery should work");
@@ -76,8 +76,24 @@ fn recovery_runner_requeues_asr_for_stopping_meeting() {
             meeting_id: "m1".to_owned()
         }
     );
+    // Status stays Stopping — it advances to Transcribing only when the job
+    // is actually claimed and begins processing.
     let saved = store.get("m1").expect("meeting should exist");
-    assert_eq!(saved.status, MeetingStatus::Transcribing);
+    assert_eq!(saved.status, MeetingStatus::Stopping);
+}
+
+#[test]
+fn recovery_requeues_summary_for_stopping_with_recording() {
+    // A Stopping meeting with a recording file always gets RequeueSummary.
+    // The runtime's enqueue call handles the AlreadyExists case gracefully, so
+    // this applies whether or not a summary job was previously queued.
+    let action = decide_recovery_action(&RecoveryCandidate {
+        meeting_id: "m1".to_owned(),
+        status: MeetingStatus::Stopping,
+        voice_connected: false,
+        has_recording_file: true,
+    });
+    assert_eq!(action, RecoveryAction::RequeueSummary);
 }
 
 #[test]

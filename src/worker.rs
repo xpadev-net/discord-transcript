@@ -28,6 +28,10 @@ pub enum WorkerError {
     Queue(String),
     Store(String),
     Summary(String),
+    /// A summary job with the same ID was already present in the queue.
+    /// The caller should treat this as "a claimable job already exists" and
+    /// proceed to claim it rather than treating it as a fatal error.
+    AlreadyExists,
 }
 
 impl Display for WorkerError {
@@ -36,6 +40,7 @@ impl Display for WorkerError {
             Self::Queue(err) => write!(f, "queue error: {err}"),
             Self::Store(err) => write!(f, "store error: {err}"),
             Self::Summary(err) => write!(f, "summary error: {err}"),
+            Self::AlreadyExists => write!(f, "summary job already exists in queue"),
         }
     }
 }
@@ -177,14 +182,18 @@ pub fn enqueue_summary_job<Q: JobQueue>(
     job_id: &str,
     meeting_id: &str,
 ) -> Result<(), WorkerError> {
-    queue.enqueue(Job {
+    match queue.enqueue(Job {
         id: job_id.to_owned(),
         meeting_id: meeting_id.to_owned(),
         job_type: JobType::Summarize,
         status: JobStatus::Queued,
         retry_count: 0,
         error_message: None,
-    })?;
+    }) {
+        Ok(()) => {}
+        Err(QueueError::AlreadyExists { .. }) => return Err(WorkerError::AlreadyExists),
+        Err(err) => return Err(WorkerError::Queue(err.to_string())),
+    }
     info!(job_id = %job_id, meeting_id = %meeting_id, "summary job enqueued");
     Ok(())
 }

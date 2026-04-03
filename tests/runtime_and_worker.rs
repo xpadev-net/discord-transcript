@@ -180,14 +180,18 @@ fn bot_command_service_idempotent_stop() {
         })
         .expect("stop should pass");
 
-    // After stop, meeting is Stopping and no longer "active" for find_active
-    let second = service.handle_record_stop_result(StopCommandInput {
-        guild_id: "g1".to_owned(),
-        reason: StopReason::Manual,
-    });
-    assert!(
-        second.is_err(),
-        "second stop via command should fail with NoActiveMeeting"
+    // After stop, meeting is Stopping but still found by find_active_meeting_by_guild.
+    // The CAS in stop_meeting returns AlreadyHandled, so the command is idempotent.
+    let second = service
+        .handle_record_stop_result(StopCommandInput {
+            guild_id: "g1".to_owned(),
+            reason: StopReason::Manual,
+        })
+        .expect("second stop should succeed (idempotent)");
+    assert_eq!(
+        second.outcome,
+        discord_transcript::stop::StopOutcome::AlreadyHandled,
+        "second stop via command should report AlreadyHandled"
     );
 
     // Direct stop_meeting on the meeting_id is idempotent via CAS

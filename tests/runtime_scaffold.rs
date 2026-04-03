@@ -112,9 +112,11 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
         .expect("first stop should succeed");
     assert_eq!(first.meeting_id, "m1");
 
-    // After stop, meeting is Stopping and no longer found by find_active_meeting_by_guild
-    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual);
-    assert!(second.is_err(), "second stop should fail with no active meeting");
+    // After stop, meeting is Stopping but still found by find_active_meeting_by_guild.
+    // stop_meeting CAS returns AlreadyHandled (no new job enqueued).
+    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+        .expect("second stop should succeed (idempotent)");
+    assert_eq!(second.outcome, discord_transcript::stop::StopOutcome::AlreadyHandled);
 
     // Only one job should be enqueued
     let first_job = queue

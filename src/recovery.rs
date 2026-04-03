@@ -6,7 +6,6 @@ pub struct RecoveryCandidate {
     pub status: MeetingStatus,
     pub voice_connected: bool,
     pub has_recording_file: bool,
-    pub summary_job_already_queued: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +28,10 @@ pub fn decide_recovery_action(candidate: &RecoveryCandidate) -> RecoveryAction {
             }
         }
         MeetingStatus::Stopping => {
-            if candidate.summary_job_already_queued {
-                RecoveryAction::Noop
-            } else if candidate.has_recording_file {
+            if candidate.has_recording_file {
+                // Always (re-)process the summary, whether or not a job was already queued.
+                // The runtime's enqueue call is idempotent (AlreadyExists is ignored), so
+                // the existing queued job will simply be claimed and run.
                 RecoveryAction::RequeueSummary
             } else {
                 RecoveryAction::MarkFailedMissingRecording
