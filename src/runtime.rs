@@ -564,31 +564,32 @@ impl ScaffoldHandler {
                     let job_id = format!("summary-{}", snapshot.meeting_id);
                     let job_available = {
                         let mut queue = self.queue.lock().await;
-                        // Reset any previously failed job to queued so it can be re-claimed
+                        // Reset any previously failed job to queued so it can be re-claimed.
+                        // If the reset itself fails we cannot know whether a claimable job
+                        // exists, so abort recovery for this meeting.
                         if let Err(err) = queue.executor.execute(
                             "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status='failed'",
                             &[job_id.clone()],
                         ) {
                             warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
-                        }
-                        match enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
-                            Ok(()) => true,
-                            Err(err) => {
-                                // AlreadyExists means a claimable job is already in the queue.
-                                let is_already_exists = matches!(
-                                    &err,
-                                    crate::worker::WorkerError::Queue(msg) if msg.contains("already exists")
-                                );
-                                if !is_already_exists {
+                            false
+                        } else {
+                            match enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
+                                // Job freshly inserted — claimable.
+                                Ok(()) => true,
+                                // Job was already in the queue — also claimable.
+                                Err(crate::worker::WorkerError::AlreadyExists) => true,
+                                // Genuine failure — no job to claim.
+                                Err(err) => {
                                     warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to enqueue summary job during recovery");
+                                    false
                                 }
-                                is_already_exists
                             }
                         }
                     };
                     if !job_available {
-                        // No job in the queue to claim — skip processing this meeting.
-                        // It will be retried on the next restart.
+                        // No claimable job — skip run_summary_and_notify for this meeting.
+                        // Recovery will be retried on the next restart.
                         continue;
                     }
                     if let Err(err) = self
@@ -843,7 +844,7 @@ impl ScaffoldHandler {
         };
         match self.process_enqueued_summary_job(meeting_id).await {
             Ok(output) => {
-                let chunks = if output.chunks.is_empty() {
+                let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
                 } else {
                     output.chunks

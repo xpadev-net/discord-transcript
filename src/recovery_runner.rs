@@ -75,7 +75,7 @@ pub fn run_recovery<S: MeetingStore>(
             // inconsistent state if the subsequent enqueue fails.
             info!(
                 meeting_id = %candidate.meeting_id,
-                "recovery requeued summary pipeline"
+                "recovery signaled summary pipeline requeue"
             );
             Ok(RecoveryEffect::SummaryRequeued {
                 meeting_id: candidate.meeting_id.clone(),
