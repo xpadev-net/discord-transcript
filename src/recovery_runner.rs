@@ -1,7 +1,7 @@
+use crate::domain::MeetingStatus;
 use crate::domain::StopReason;
 use crate::recovery::{RecoveryAction, RecoveryCandidate, decide_recovery_action};
 use crate::stop::{StopMeetingError, stop_meeting};
-use crate::domain::MeetingStatus;
 use crate::storage::{MeetingStore, StoreError};
 use std::fmt::{Display, Formatter};
 use tracing::{info, warn};
@@ -60,8 +60,7 @@ pub fn run_recovery<S: MeetingStore>(
         }
         RecoveryAction::ConfirmStopClientDisconnect => {
             use crate::stop::StopOutcome;
-            let outcome =
-                stop_meeting(store, &candidate.meeting_id, StopReason::ClientDisconnect)?;
+            let outcome = stop_meeting(store, &candidate.meeting_id, StopReason::ClientDisconnect)?;
             match outcome {
                 StopOutcome::Owner => {
                     info!(

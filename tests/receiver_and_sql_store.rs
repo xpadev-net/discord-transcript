@@ -1,3 +1,4 @@
+use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::StopReason;
 use discord_transcript::domain::{JobStatus, JobType};
 use discord_transcript::queue::JobQueue;
@@ -5,7 +6,6 @@ use discord_transcript::receiver::{BufferedFrame, ReceiverConfig, ReceiverState}
 use discord_transcript::sql::INITIAL_SCHEMA_SQL;
 use discord_transcript::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
 use discord_transcript::sql_store::{FakeSqlExecutor, SqlJobQueue, SqlMeetingStore};
-use discord_transcript::domain::MeetingStatus;
 use discord_transcript::storage::{CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting};
 use std::time::{Duration, Instant};
 
@@ -24,8 +24,15 @@ fn receiver_state_flushes_by_chunk_duration() {
             pcm_16le_bytes: vec![1, 2, 3],
         },
     );
-    assert!(state.users_ready_to_flush(start + Duration::from_millis(19_999), &config).is_empty());
-    assert_eq!(state.users_ready_to_flush(start + Duration::from_secs(21), &config), vec!["u1"]);
+    assert!(
+        state
+            .users_ready_to_flush(start + Duration::from_millis(19_999), &config)
+            .is_empty()
+    );
+    assert_eq!(
+        state.users_ready_to_flush(start + Duration::from_secs(21), &config),
+        vec!["u1"]
+    );
 
     let chunk = state.take_user_chunk("u1").expect("chunk should exist");
     assert_eq!(chunk.len(), 1);
@@ -74,7 +81,7 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
             voice_channel_id: "vc1".to_owned(),
             report_channel_id: "c1".to_owned(),
             started_by_user_id: "u1".to_owned(),
-        title: None,
+            title: None,
             status: MeetingStatus::Recording,
             stop_reason: None,
             error_message: None,
@@ -167,7 +174,11 @@ fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
         .insert(cas_key, vec![vec!["conflict".to_owned()]]);
 
     let mut store = SqlMeetingStore::new(executor);
-    let result = store.set_meeting_status("m1", MeetingStatus::Recording, Some(MeetingStatus::Scheduled));
+    let result = store.set_meeting_status(
+        "m1",
+        MeetingStatus::Recording,
+        Some(MeetingStatus::Scheduled),
+    );
 
     assert_eq!(
         result,

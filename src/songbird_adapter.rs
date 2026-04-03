@@ -23,6 +23,12 @@ impl SsrcTracker {
     }
 }
 
+impl Default for SsrcTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdaptedVoiceFrames {
     pub per_user: HashMap<String, BufferedFrame>,

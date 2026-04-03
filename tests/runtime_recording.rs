@@ -37,9 +37,8 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
         },
     );
 
-    let count =
-        ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user })
-            .expect("ingest should succeed");
+    let count = ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user })
+        .expect("ingest should succeed");
     assert_eq!(count, 1);
 
     let _ = std::fs::remove_dir_all(base);

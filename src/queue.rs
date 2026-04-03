@@ -15,8 +15,12 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueError {
     Backend(String),
-    AlreadyExists { job_id: String },
-    NotFound { job_id: String },
+    AlreadyExists {
+        job_id: String,
+    },
+    NotFound {
+        job_id: String,
+    },
     /// Job exists but is not in the expected state (e.g. not `Running`
     /// when `mark_done`/`mark_failed`/`retry` is called).
     InvalidState {

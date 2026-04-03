@@ -92,12 +92,12 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
                 .spawn()
                 .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
 
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Err(err) = stdin.write_all(prompt.as_bytes()) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(SummaryError::SummaryEngine(err.to_string()));
-                }
+            if let Some(mut stdin) = child.stdin.take()
+                && let Err(err) = stdin.write_all(prompt.as_bytes())
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SummaryError::SummaryEngine(err.to_string()));
             }
 
             let output = child

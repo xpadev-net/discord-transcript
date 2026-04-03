@@ -43,9 +43,13 @@ pub struct RecordStopResult {
 pub enum CommandError {
     UserNotInVoice,
     MissingPermission(&'static str),
-    ActiveMeetingExists { meeting_id: String },
+    ActiveMeetingExists {
+        meeting_id: String,
+    },
     /// A meeting with the given ID already exists in the store (duplicate key).
-    AlreadyExists { meeting_id: String },
+    AlreadyExists {
+        meeting_id: String,
+    },
     NoActiveMeeting,
     Store(String),
     Stop(String),
@@ -144,7 +148,11 @@ pub fn record_stop<S: MeetingStore>(
     // rather than sending it through the stop_meeting CAS path which only
     // handles the Recording→Stopping transition.
     if meeting.status == crate::domain::MeetingStatus::Scheduled {
-        store.set_meeting_status(&meeting.id, crate::domain::MeetingStatus::Aborted, Some(crate::domain::MeetingStatus::Scheduled))?;
+        store.set_meeting_status(
+            &meeting.id,
+            crate::domain::MeetingStatus::Aborted,
+            Some(crate::domain::MeetingStatus::Scheduled),
+        )?;
         return Ok(RecordStopResult {
             meeting_id: meeting.id,
             outcome: StopOutcome::AlreadyHandled,

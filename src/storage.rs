@@ -10,12 +10,18 @@ pub enum StopTransition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
-    AlreadyExists { meeting_id: String },
+    AlreadyExists {
+        meeting_id: String,
+    },
     Backend(String),
-    NotFound { meeting_id: String },
+    NotFound {
+        meeting_id: String,
+    },
     /// The meeting exists but its current status does not match the expected
     /// value provided to a CAS-guarded operation.
-    CasConflict { meeting_id: String },
+    CasConflict {
+        meeting_id: String,
+    },
 }
 
 impl Display for StoreError {
@@ -57,8 +63,10 @@ pub trait MeetingStore {
     fn create_scheduled_meeting(&mut self, request: CreateMeetingRequest)
     -> Result<(), StoreError>;
 
-    fn create_meeting_as_recording(&mut self, request: CreateMeetingRequest)
-    -> Result<(), StoreError>;
+    fn create_meeting_as_recording(
+        &mut self,
+        request: CreateMeetingRequest,
+    ) -> Result<(), StoreError>;
 
     /// Update the meeting status. If `expected_current` is provided, the update
     /// is conditional (CAS): only applied when the current status matches.
@@ -220,12 +228,12 @@ impl MeetingStore for InMemoryMeetingStore {
                 meeting_id: meeting_id.to_owned(),
             });
         };
-        if let Some(expected) = expected_current {
-            if meeting.status != expected {
-                return Err(StoreError::CasConflict {
-                    meeting_id: meeting_id.to_owned(),
-                });
-            }
+        if let Some(expected) = expected_current
+            && meeting.status != expected
+        {
+            return Err(StoreError::CasConflict {
+                meeting_id: meeting_id.to_owned(),
+            });
         }
         meeting.status = status;
         Ok(())

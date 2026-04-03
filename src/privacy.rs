@@ -8,8 +8,9 @@ static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DISCORD_MENTION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<@!?\d+>|<@&\d+>").expect("discord mention regex must compile"));
-static AT_USERNAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)(?P<mention>@[A-Za-z0-9_]{2,32})").expect("at mention regex"));
+static AT_USERNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?P<mention>@[A-Za-z0-9_]{2,32})").expect("at mention regex")
+});
 static PHONE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\+?\d[\d\-\s().]{8,}\d").expect("phone regex must compile"));
 
@@ -87,11 +88,7 @@ pub fn mask_pii(input: &str) -> MaskedText {
             let start = m.start();
             let end = m.end();
             let bytes = value.as_bytes();
-            if start > 0
-                && end < bytes.len()
-                && bytes[start - 1] == b'['
-                && bytes[end] == b']'
-            {
+            if start > 0 && end < bytes.len() && bytes[start - 1] == b'[' && bytes[end] == b']' {
                 return false;
             }
             true

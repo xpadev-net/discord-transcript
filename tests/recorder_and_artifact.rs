@@ -21,10 +21,14 @@ fn recorder_engine_flushes_wav_chunk_when_due() {
         },
     );
 
-    let before_due = engine.flush_due(start + Duration::from_millis(19_999)).expect("flush should work");
+    let before_due = engine
+        .flush_due(start + Duration::from_millis(19_999))
+        .expect("flush should work");
     assert!(before_due.is_empty());
 
-    let due = engine.flush_due(start + Duration::from_secs(21)).expect("flush should work");
+    let due = engine
+        .flush_due(start + Duration::from_secs(21))
+        .expect("flush should work");
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].user_id, "u1");
     assert!(due[0].wav.bytes.starts_with(b"RIFF"));

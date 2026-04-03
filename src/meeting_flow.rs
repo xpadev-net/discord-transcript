@@ -67,17 +67,22 @@ impl From<StoreError> for MeetingFlowError {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MeetingFlowInput<'a, W, C> {
+    pub recovery_candidate: &'a RecoveryCandidate,
+    pub now: Instant,
+    pub whisper: &'a W,
+    pub claude: &'a C,
+    pub summary_input: &'a ProcessMeetingInput,
+    pub retention_records: &'a [ArtifactRecord],
+    pub now_unix_seconds: u64,
+    pub retention_policy: RetentionPolicy,
+}
+
 pub fn run_meeting_flow<S, C, W, FS>(
     store: &mut S,
     recording_session: &mut RecordingSession<FS>,
-    recovery_candidate: &RecoveryCandidate,
-    now: Instant,
-    whisper: &W,
-    claude: &C,
-    summary_input: &ProcessMeetingInput,
-    retention_records: &[ArtifactRecord],
-    now_unix_seconds: u64,
-    retention_policy: RetentionPolicy,
+    input: MeetingFlowInput<'_, W, C>,
 ) -> Result<MeetingFlowOutput, MeetingFlowError>
 where
     S: MeetingStore,
@@ -85,11 +90,14 @@ where
     W: WhisperClient,
     FS: ChunkStorage,
 {
-    let recovery_effect = run_recovery(store, recovery_candidate)?;
-    let flush_result = recording_session.flush_due(now)?;
-    let summary = process_meeting_summary(store, whisper, claude, summary_input)?;
-    let cleanup_candidates =
-        select_cleanup_candidates(retention_records, now_unix_seconds, retention_policy);
+    let recovery_effect = run_recovery(store, input.recovery_candidate)?;
+    let flush_result = recording_session.flush_due(input.now)?;
+    let summary = process_meeting_summary(store, input.whisper, input.claude, input.summary_input)?;
+    let cleanup_candidates = select_cleanup_candidates(
+        input.retention_records,
+        input.now_unix_seconds,
+        input.retention_policy,
+    );
 
     Ok(MeetingFlowOutput {
         recovery_effect,
