@@ -514,7 +514,6 @@ dependencies = [
 name = "discord-transcript"
 version = "0.1.0"
 dependencies = [
- "once_cell",
  "regex",
  "serde",
  "serde_json",

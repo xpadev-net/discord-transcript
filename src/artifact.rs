@@ -3,7 +3,8 @@ use std::fmt::{Display, Formatter};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactKind {
     TranscriptText,
-    TranscriptGzip,
+    /// Transcript exceeds inline attachment limit; only a link is provided.
+    TranscriptLink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +58,7 @@ pub fn build_transcript_artifact(
 
     let link = fallback_link.ok_or(ArtifactError::MissingLink)?;
     Ok(TranscriptArtifact {
-        kind: ArtifactKind::TranscriptGzip,
+        kind: ArtifactKind::TranscriptLink,
         inline_attachment: None,
         link_url: Some(link),
     })

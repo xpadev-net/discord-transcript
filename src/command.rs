@@ -136,14 +136,24 @@ pub fn record_stop<S: MeetingStore>(
     store: &mut S,
     request: RecordStopRequest,
 ) -> Result<RecordStopResult, CommandError> {
-    let meeting_id = store
+    let meeting = store
         .find_active_meeting_by_guild(&request.guild_id)?
-        .map(|meeting| meeting.id)
         .ok_or(CommandError::NoActiveMeeting)?;
 
-    let outcome = stop_meeting(store, &meeting_id, request.reason)?;
+    // A Scheduled meeting was never actually recording — abort it directly
+    // rather than sending it through the stop_meeting CAS path which only
+    // handles the Recording→Stopping transition.
+    if meeting.status == crate::domain::MeetingStatus::Scheduled {
+        store.set_meeting_status(&meeting.id, crate::domain::MeetingStatus::Aborted, Some(crate::domain::MeetingStatus::Scheduled))?;
+        return Ok(RecordStopResult {
+            meeting_id: meeting.id,
+            outcome: StopOutcome::AlreadyHandled,
+        });
+    }
+
+    let outcome = stop_meeting(store, &meeting.id, request.reason)?;
     Ok(RecordStopResult {
-        meeting_id,
+        meeting_id: meeting.id,
         outcome,
     })
 }

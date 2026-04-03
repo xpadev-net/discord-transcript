@@ -59,14 +59,31 @@ pub fn run_recovery<S: MeetingStore>(
             })
         }
         RecoveryAction::ConfirmStopClientDisconnect => {
-            let _ = stop_meeting(store, &candidate.meeting_id, StopReason::ClientDisconnect)?;
-            info!(
-                meeting_id = %candidate.meeting_id,
-                "recovery confirmed stop with client_disconnect"
-            );
-            Ok(RecoveryEffect::StopConfirmedClientDisconnect {
-                meeting_id: candidate.meeting_id.clone(),
-            })
+            use crate::stop::StopOutcome;
+            let outcome =
+                stop_meeting(store, &candidate.meeting_id, StopReason::ClientDisconnect)?;
+            match outcome {
+                StopOutcome::Owner => {
+                    info!(
+                        meeting_id = %candidate.meeting_id,
+                        "recovery confirmed stop with client_disconnect"
+                    );
+                    Ok(RecoveryEffect::StopConfirmedClientDisconnect {
+                        meeting_id: candidate.meeting_id.clone(),
+                    })
+                }
+                StopOutcome::AlreadyHandled => {
+                    // Another path already owns the stop — treat as requeue
+                    // so the runtime can ensure the summary pipeline runs.
+                    info!(
+                        meeting_id = %candidate.meeting_id,
+                        "recovery: stop already handled, signaling requeue"
+                    );
+                    Ok(RecoveryEffect::SummaryRequeued {
+                        meeting_id: candidate.meeting_id.clone(),
+                    })
+                }
+            }
         }
         RecoveryAction::RequeueSummary => {
             // If the meeting was mid-pipeline (Transcribing/Summarizing), reset
@@ -75,7 +92,11 @@ pub fn run_recovery<S: MeetingStore>(
             if candidate.status == MeetingStatus::Transcribing
                 || candidate.status == MeetingStatus::Summarizing
             {
-                store.set_meeting_status(&candidate.meeting_id, MeetingStatus::Stopping)?;
+                store.set_meeting_status(
+                    &candidate.meeting_id,
+                    MeetingStatus::Stopping,
+                    Some(candidate.status),
+                )?;
             }
             info!(
                 meeting_id = %candidate.meeting_id,
@@ -86,7 +107,11 @@ pub fn run_recovery<S: MeetingStore>(
             })
         }
         RecoveryAction::MarkFailedMissingRecording => {
-            store.set_meeting_status(&candidate.meeting_id, MeetingStatus::Failed)?;
+            store.set_meeting_status(
+                &candidate.meeting_id,
+                MeetingStatus::Failed,
+                Some(candidate.status),
+            )?;
             store.set_error_message(
                 &candidate.meeting_id,
                 Some("missing recording artifact during recovery".to_owned()),

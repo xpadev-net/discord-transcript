@@ -22,7 +22,8 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
         "meeting-rt".to_owned(),
         LocalChunkStorage::new(&base),
         discord_transcript::receiver::ReceiverConfig {
-            chunk_duration: Duration::from_secs(20),
+            // Use zero duration so the chunk flushes immediately upon ingest.
+            chunk_duration: Duration::ZERO,
         },
         48_000,
     );
@@ -37,7 +38,7 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
     );
 
     let count =
-        ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user }, 21_000)
+        ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user })
             .expect("ingest should succeed");
     assert_eq!(count, 1);
 

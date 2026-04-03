@@ -55,12 +55,18 @@ impl LocalChunkStorage {
 }
 
 fn sanitize_path_component(input: &str) -> String {
-    input
+    let sanitized: String = input
         .replace(['/', '\\'], "_")
         .replace("..", "_")
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .collect()
+        .collect();
+
+    // Guard against empty result or lone "." / ".." which have special filesystem meaning.
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return "unknown".to_owned();
+    }
+    sanitized
 }
 
 impl ChunkStorage for LocalChunkStorage {

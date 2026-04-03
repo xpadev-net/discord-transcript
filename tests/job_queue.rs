@@ -7,7 +7,7 @@ use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::summary::StubClaudeSummaryClient;
 use discord_transcript::worker::{enqueue_summary_job, process_next_summary_job};
 
-fn recording_meeting(id: &str) -> StoredMeeting {
+fn stopping_meeting(id: &str) -> StoredMeeting {
     StoredMeeting {
         id: id.to_owned(),
         guild_id: "g1".to_owned(),
@@ -15,7 +15,7 @@ fn recording_meeting(id: &str) -> StoredMeeting {
         report_channel_id: "tc1".to_owned(),
         started_by_user_id: "u1".to_owned(),
         title: None,
-        status: MeetingStatus::Recording,
+        status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
     }
@@ -55,7 +55,7 @@ fn worker_job_processing_marks_done_on_success() {
     enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
 
     let mut store = InMemoryMeetingStore::new();
-    store.insert(recording_meeting("m1"));
+    store.insert(stopping_meeting("m1"));
 
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
@@ -84,7 +84,7 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
     enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
 
     let mut store = InMemoryMeetingStore::new();
-    store.insert(recording_meeting("m1"));
+    store.insert(stopping_meeting("m1"));
 
     let whisper = StubWhisperClient {
         mocked_response_json: "{invalid_json".to_owned(),

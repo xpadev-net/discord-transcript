@@ -172,7 +172,7 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         let status_value = row
             .first()
             .ok_or_else(|| QueueError::Backend("retry returned no status".to_owned()))?;
-        JobStatus::from_str(status_value).ok_or_else(|| {
+        JobStatus::parse_str(status_value).ok_or_else(|| {
             QueueError::Backend(format!(
                 "unknown job status in retry result: {status_value}"
             ))
@@ -187,9 +187,9 @@ fn parse_job_row(row: &[String]) -> Result<Job, QueueError> {
             row.len()
         )));
     }
-    let job_type = JobType::from_str(&row[2])
+    let job_type = JobType::parse_str(&row[2])
         .ok_or_else(|| QueueError::Backend(format!("unknown job type: {}", row[2])))?;
-    let status = JobStatus::from_str(&row[3])
+    let status = JobStatus::parse_str(&row[3])
         .ok_or_else(|| QueueError::Backend(format!("unknown job status: {}", row[3])))?;
     let retry_count = row[4]
         .parse::<u32>()
@@ -295,14 +295,26 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         meeting_id: &str,
         status: MeetingStatus,
+        expected_current: Option<MeetingStatus>,
     ) -> Result<(), StoreError> {
         let status_value = status.as_str();
+        let (sql, params): (&str, Vec<String>) = match expected_current {
+            Some(expected) => (
+                "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3",
+                vec![
+                    status_value.to_owned(),
+                    meeting_id.to_owned(),
+                    expected.as_str().to_owned(),
+                ],
+            ),
+            None => (
+                "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2",
+                vec![status_value.to_owned(), meeting_id.to_owned()],
+            ),
+        };
         let affected = self
             .executor
-            .execute(
-                "UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2",
-                &[status_value.to_owned(), meeting_id.to_owned()],
-            )
+            .execute(sql, &params)
             .map_err(StoreError::Backend)?;
         if affected == 0 {
             return Err(StoreError::NotFound {
@@ -485,20 +497,14 @@ impl SqlExecutor for PgSqlExecutor {
 
 fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
     let status_str = row.get::<_, String>("status");
-    let status = MeetingStatus::from_str(&status_str).unwrap_or_else(|| {
+    let status = MeetingStatus::parse_str(&status_str).unwrap_or_else(|| {
         tracing::warn!(status = %status_str, "unknown meeting status in DB, defaulting to Aborted");
         MeetingStatus::Aborted
     });
     let stop_reason = row
         .get::<_, Option<String>>("stop_reason")
         .as_deref()
-        .and_then(|v| match v {
-            "manual" => Some(StopReason::Manual),
-            "auto_empty" => Some(StopReason::AutoEmpty),
-            "client_disconnect" => Some(StopReason::ClientDisconnect),
-            "error" => Some(StopReason::Error),
-            _ => None,
-        });
+        .and_then(StopReason::parse_str);
 
     StoredMeeting {
         id: row.get("id"),

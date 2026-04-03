@@ -215,7 +215,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
         report_channel_id: "c1".to_owned(),
         started_by_user_id: "u1".to_owned(),
         title: None,
-        status: MeetingStatus::Recording,
+        status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
     });
@@ -240,8 +240,9 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
 
     assert!(result.is_err());
     let saved = store.get("m1").expect("meeting should exist");
-    // process_meeting_summary no longer sets Failed directly - caller handles retry/fail
-    assert_eq!(saved.status, MeetingStatus::Transcribing);
+    // process_meeting_summary transitions Stopping→Transcribing, transcription fails,
+    // then reverts back to Stopping so the next retry's CAS guard succeeds.
+    assert_eq!(saved.status, MeetingStatus::Stopping);
 }
 
 #[test]
@@ -254,7 +255,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         report_channel_id: "c1".to_owned(),
         started_by_user_id: "u1".to_owned(),
         title: None,
-        status: MeetingStatus::Recording,
+        status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
     });

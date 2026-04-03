@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverConfig {
@@ -20,11 +20,14 @@ pub struct BufferedFrame {
     pub pcm_16le_bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct UserAudioBuffer {
     pub user_id: String,
     pub frames: Vec<BufferedFrame>,
+    /// Wall-clock timestamp of the first frame (for metadata).
     pub first_frame_ms: Option<u64>,
+    /// Monotonic instant when the first frame arrived (for flush timing).
+    first_frame_instant: Option<Instant>,
 }
 
 impl UserAudioBuffer {
@@ -33,25 +36,30 @@ impl UserAudioBuffer {
             user_id,
             frames: Vec::new(),
             first_frame_ms: None,
+            first_frame_instant: None,
         }
     }
 
     pub fn push_frame(&mut self, frame: BufferedFrame) {
         if self.first_frame_ms.is_none() {
             self.first_frame_ms = Some(frame.timestamp_ms);
+            self.first_frame_instant = Some(Instant::now());
         }
         self.frames.push(frame);
     }
 
-    pub fn should_flush(&self, now_ms: u64, config: &ReceiverConfig) -> bool {
-        let Some(first) = self.first_frame_ms else {
+    /// Uses monotonic clock (Instant) so NTP adjustments cannot stall or
+    /// prematurely trigger flushes. Pass `Instant::now()` in production.
+    pub fn should_flush(&self, now: Instant, config: &ReceiverConfig) -> bool {
+        let Some(start) = self.first_frame_instant else {
             return false;
         };
-        now_ms.saturating_sub(first) >= config.chunk_duration.as_millis() as u64
+        now.saturating_duration_since(start) >= config.chunk_duration
     }
 
     pub fn take_frames(&mut self) -> Vec<BufferedFrame> {
         self.first_frame_ms = None;
+        self.first_frame_instant = None;
         std::mem::take(&mut self.frames)
     }
 }
@@ -74,12 +82,12 @@ impl ReceiverState {
 
     pub fn users_ready_to_flush<'a>(
         &'a self,
-        now_ms: u64,
+        now: Instant,
         config: &ReceiverConfig,
     ) -> Vec<&'a str> {
         self.per_user
             .values()
-            .filter(|buf| buf.should_flush(now_ms, config))
+            .filter(|buf| buf.should_flush(now, config))
             .map(|buf| buf.user_id.as_str())
             .collect()
     }
@@ -92,11 +100,11 @@ impl ReceiverState {
 
     pub fn flush_due_chunks(
         &mut self,
-        now_ms: u64,
+        now: Instant,
         config: &ReceiverConfig,
     ) -> Vec<UserChunkCandidate> {
         let user_ids: Vec<String> = self
-            .users_ready_to_flush(now_ms, config)
+            .users_ready_to_flush(now, config)
             .into_iter()
             .map(ToOwned::to_owned)
             .collect();

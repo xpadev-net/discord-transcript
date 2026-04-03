@@ -3,6 +3,7 @@ use crate::recorder::{RecorderEngine, RecorderError};
 use crate::storage_fs::{ChunkStorage, ChunkStorageError, SavedChunk};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedChunk {
@@ -67,53 +68,71 @@ impl<S: ChunkStorage> RecordingSession<S> {
         self.recorder.ingest_frame(user_id, frame);
     }
 
-    pub fn flush_due(&mut self, now_ms: u64) -> Result<Vec<PersistedChunk>, RecordingSessionError> {
-        let chunks = self.recorder.flush_due(now_ms)?;
-        let mut persisted = Vec::with_capacity(chunks.len());
-
-        for chunk in chunks {
-            let sequence = self.next_sequence(&chunk.user_id);
-            let saved = self.storage.save_chunk(
-                &self.meeting_id,
-                &chunk.user_id,
-                sequence,
-                &chunk.wav.bytes,
-            )?;
-            persisted.push(PersistedChunk {
-                user_id: chunk.user_id,
-                sequence,
-                saved,
-            });
-        }
-
-        Ok(persisted)
+    pub fn flush_due(&mut self, now: Instant) -> Result<Vec<PersistedChunk>, RecordingSessionError> {
+        let chunks = self.recorder.flush_due(now)?;
+        Ok(self.persist_chunks(chunks))
     }
 
     pub fn flush_all(&mut self) -> Result<Vec<PersistedChunk>, RecordingSessionError> {
         let chunks = self.recorder.flush_all()?;
+        Ok(self.persist_chunks(chunks))
+    }
+
+    /// Persist chunks best-effort: individual storage failures are logged and
+    /// skipped so that a transient I/O error on one chunk does not cause the
+    /// remaining (already-drained) chunks to be silently dropped.
+    fn persist_chunks(
+        &mut self,
+        chunks: Vec<crate::recorder::RecorderOutputChunk>,
+    ) -> Vec<PersistedChunk> {
         let mut persisted = Vec::with_capacity(chunks.len());
 
         for chunk in chunks {
-            let sequence = self.next_sequence(&chunk.user_id);
             let saved = self.storage.save_chunk(
                 &self.meeting_id,
                 &chunk.user_id,
-                sequence,
+                // Sequence is assigned only after successful persistence to
+                // avoid gaps when a save fails.
+                self.peek_next_sequence(&chunk.user_id),
                 &chunk.wav.bytes,
-            )?;
-            persisted.push(PersistedChunk {
-                user_id: chunk.user_id,
-                sequence,
-                saved,
-            });
+            );
+            match saved {
+                Ok(saved) => {
+                    self.commit_sequence(&chunk.user_id);
+                    let seq = self.current_sequence(&chunk.user_id);
+                    persisted.push(PersistedChunk {
+                        user_id: chunk.user_id,
+                        sequence: seq,
+                        saved,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        meeting_id = %self.meeting_id,
+                        user_id = %chunk.user_id,
+                        error = %err,
+                        "failed to persist audio chunk — data for this chunk is lost"
+                    );
+                }
+            }
         }
 
-        Ok(persisted)
+        persisted
     }
 
-    fn next_sequence(&mut self, user_id: &str) -> u64 {
+    /// Returns the next sequence number without committing it.
+    fn peek_next_sequence(&self, user_id: &str) -> u64 {
+        self.per_user_seq.get(user_id).copied().unwrap_or(0) + 1
+    }
+
+    /// Commits the sequence number (increments the counter).
+    fn commit_sequence(&mut self, user_id: &str) {
         let seq = self.per_user_seq.entry(user_id.to_owned()).or_insert(0);
         *seq += 1;
-        *seq
+    }
+
+    /// Returns the current (already committed) sequence number for a user.
+    fn current_sequence(&self, user_id: &str) -> u64 {
+        self.per_user_seq.get(user_id).copied().unwrap_or(0)
     }
 }

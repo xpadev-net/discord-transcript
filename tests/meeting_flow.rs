@@ -10,7 +10,7 @@ use discord_transcript::storage_fs::LocalChunkStorage;
 use discord_transcript::summary::StubClaudeSummaryClient;
 use discord_transcript::worker::ProcessMeetingInput;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn unique_temp_dir(test_name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -68,6 +68,7 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         mocked_markdown: "## Summary\ndone".to_owned(),
     };
 
+    let start = Instant::now();
     let output = run_meeting_flow(
         &mut store,
         &mut session,
@@ -77,7 +78,7 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
             voice_connected: false,
             has_recording_file: true,
         },
-        21_000,
+        start + Duration::from_secs(21),
         &whisper,
         &claude,
         &ProcessMeetingInput {

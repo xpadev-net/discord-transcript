@@ -7,7 +7,7 @@ use discord_transcript::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
 use discord_transcript::sql_store::{FakeSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::domain::MeetingStatus;
 use discord_transcript::storage::{CreateMeetingRequest, MeetingStore, StoredMeeting};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn receiver_state_flushes_by_chunk_duration() {
@@ -16,6 +16,7 @@ fn receiver_state_flushes_by_chunk_duration() {
         chunk_duration: Duration::from_secs(20),
     };
 
+    let start = Instant::now();
     state.track_frame(
         "u1",
         BufferedFrame {
@@ -23,8 +24,8 @@ fn receiver_state_flushes_by_chunk_duration() {
             pcm_16le_bytes: vec![1, 2, 3],
         },
     );
-    assert!(state.users_ready_to_flush(20_999, &config).is_empty());
-    assert_eq!(state.users_ready_to_flush(21_000, &config), vec!["u1"]);
+    assert!(state.users_ready_to_flush(start + Duration::from_millis(19_999), &config).is_empty());
+    assert_eq!(state.users_ready_to_flush(start + Duration::from_secs(21), &config), vec!["u1"]);
 
     let chunk = state.take_user_chunk("u1").expect("chunk should exist");
     assert_eq!(chunk.len(), 1);
@@ -49,7 +50,7 @@ fn sql_store_applies_migration_and_writes_sql() {
         })
         .expect("insert should execute");
     store
-        .set_meeting_status("m1", MeetingStatus::Recording)
+        .set_meeting_status("m1", MeetingStatus::Recording, None)
         .expect("status update should execute");
     let transition = store
         .mark_stopping_if_recording("m1", StopReason::Manual)
