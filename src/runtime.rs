@@ -582,7 +582,17 @@ impl ScaffoldHandler {
 
             let effect = {
                 let mut service = self.service.lock().await;
-                run_recovery(&mut service.store, &candidate).map_err(|err| err.to_string())?
+                match run_recovery(&mut service.store, &candidate) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %snapshot.meeting_id,
+                            error = %err,
+                            "run_recovery failed for meeting, skipping to next"
+                        );
+                        continue;
+                    }
+                }
             };
 
             match effect {
@@ -1296,10 +1306,13 @@ pub fn ingest_voice_frames_into_session(
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(err) => {
+            warn!(error = %err, "system clock is before UNIX epoch, returning 0");
+            0
+        }
+    }
 }
 
 fn is_bot_connected_to_voice_channel(
