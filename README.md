@@ -35,7 +35,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 
 | 変数名 | 説明 | 例 |
 |--------|------|-----|
-| `DISCORD_TOKEN` | Discord Bot トークン | `Bot xxxx...` |
+| `DISCORD_TOKEN` | Discord Bot トークン (serenity が `Bot ` プレフィックスを自動付与するため、トークン文字列のみ設定) | `xxxx...` |
 | `DISCORD_GUILD_ID` | 対象サーバーの ID | `123456789012345678` |
 | `WHISPER_ENDPOINT` | whisper.cpp サーバーの URL | `http://localhost:8080` |
 | `CLAUDE_COMMAND` | Claude CLI の実行パス | `/usr/local/bin/claude` |
@@ -78,8 +78,8 @@ cargo run --release
 
 ### 必要な Intent
 
-- **Server Members Intent** (ボイスチャンネル参加者の検出)
-- **Message Content Intent** (メッセージ投稿)
+- **Guilds** (サーバー情報の取得)
+- **Guild Voice States** (ボイスチャンネルの参加・退出検出)
 
 ### 必要な Bot Permission
 
@@ -156,24 +156,42 @@ sudo systemctl enable --now discord-transcript
 
 ## プロジェクト構成
 
-```
+```text
 src/
-  main.rs          # エントリーポイント
-  config.rs        # 環境変数からの設定読み込み
-  runtime.rs       # Bot ランタイム・イベントハンドリング
-  command.rs       # スラッシュコマンド実装
-  recorder.rs      # 音声録音管理
-  receiver.rs      # ボイスフレーム受信
-  asr.rs           # whisper.cpp クライアント
-  summary.rs       # 要約生成パイプライン
-  transcript.rs    # 文字起こしの正規化
-  privacy.rs       # PII マスキング (メール・電話番号等)
-  worker.rs        # バックグラウンドジョブ処理
-  queue.rs         # ジョブキュー
-  sql_store.rs     # PostgreSQL 実装
-  storage.rs       # ストレージ抽象レイヤー
-  recovery.rs      # Bot 再起動時のリカバリ
-  stop.rs          # 録音停止の冪等制御
+  main.rs              # エントリーポイント
+  lib.rs               # モジュールエクスポート
+  config.rs            # 環境変数からの設定読み込み
+  domain.rs            # コア型定義 (MeetingStatus, StopReason, JobType 等)
+  runtime.rs           # Bot ランタイム・イベントハンドリング
+  command.rs           # スラッシュコマンド実装
+  bot.rs               # Bot コマンドサービスレイヤー
+  authz.rs             # 権限チェック
+  recorder.rs          # 音声録音管理
+  recording_session.rs # 録音セッション状態
+  receiver.rs          # ボイスフレーム受信
+  audio.rs             # 音声処理ユーティリティ
+  songbird_adapter.rs  # Songbird ボイスクライアントアダプタ
+  asr.rs               # whisper.cpp クライアントインターフェース
+  integrations.rs      # 外部連携クライアント (Whisper, Claude CLI)
+  summary.rs           # 要約生成パイプライン
+  transcript.rs        # 文字起こしの正規化
+  privacy.rs           # PII マスキング (メール・電話番号等)
+  meeting_flow.rs      # ミーティングライフサイクル制御
+  stop.rs              # 録音停止の冪等制御
+  auto_stop.rs         # VC 空室時の自動停止
+  worker.rs            # バックグラウンドジョブ処理
+  queue.rs             # ジョブキュー抽象化
+  retry.rs             # リトライポリシー・指数バックオフ
+  posting.rs           # Discord メッセージ投稿ユーティリティ
+  artifact.rs          # アーティファクト・ストレージ URL 管理
+  storage.rs           # ストレージ抽象レイヤー
+  storage_fs.rs        # ファイルシステムストレージ実装
+  sql.rs               # SQL クエリ定数
+  sql_store.rs         # PostgreSQL 実装
+  recovery.rs          # Bot 再起動時のリカバリ判定
+  recovery_runner.rs   # リカバリ実行
+  retention.rs         # データ保持期間 (TTL) 管理
+  audit.rs             # 監査ログ
 migrations/
   0001_mvp_schema.sql  # DB スキーマ
 tests/                 # 統合テスト
