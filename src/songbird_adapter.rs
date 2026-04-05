@@ -64,10 +64,16 @@ pub fn adapt_voice_tick(
 }
 
 fn stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
-    stereo
+    let mut mono: Vec<i16> = stereo
         .chunks_exact(2)
         .map(|pair| ((pair[0] as i32 + pair[1] as i32) / 2) as i16)
-        .collect()
+        .collect();
+    // If there is a trailing odd sample (incomplete stereo pair), keep it as-is.
+    let remainder = stereo.chunks_exact(2).remainder();
+    if let Some(&sample) = remainder.first() {
+        mono.push(sample);
+    }
+    mono
 }
 
 fn i16_slice_to_le_bytes(input: &[i16]) -> Vec<u8> {

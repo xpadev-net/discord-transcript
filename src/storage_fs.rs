@@ -54,7 +54,7 @@ impl LocalChunkStorage {
     }
 }
 
-fn sanitize_path_component(input: &str) -> String {
+pub fn sanitize_path_component(input: &str) -> String {
     let sanitized: String = input
         .replace(['/', '\\'], "_")
         .replace("..", "_")

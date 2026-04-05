@@ -92,12 +92,23 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
                 .spawn()
                 .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
 
-            if let Some(mut stdin) = child.stdin.take()
-                && let Err(err) = stdin.write_all(prompt.as_bytes())
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(SummaryError::SummaryEngine(err.to_string()));
+            match child.stdin.take() {
+                Some(mut stdin) => {
+                    if let Err(err) = stdin.write_all(prompt.as_bytes()) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(SummaryError::SummaryEngine(err.to_string()));
+                    }
+                    // Drop stdin to close the pipe before waiting for output
+                    drop(stdin);
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SummaryError::SummaryEngine(
+                        "stdin pipe unexpectedly unavailable".to_owned(),
+                    ));
+                }
             }
 
             let output = child
