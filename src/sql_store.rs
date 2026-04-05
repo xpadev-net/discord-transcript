@@ -563,6 +563,14 @@ fn pg_row_to_strings(row: Row) -> Result<Vec<String>, String> {
             values.push(v.to_string());
             continue;
         }
+        if let Ok(v) = row.try_get::<usize, bool>(idx) {
+            values.push(v.to_string());
+            continue;
+        }
+        if let Ok(v) = row.try_get::<usize, f64>(idx) {
+            values.push(v.to_string());
+            continue;
+        }
         return Err(format!("unsupported postgres column type at index {idx}"));
     }
     Ok(values)

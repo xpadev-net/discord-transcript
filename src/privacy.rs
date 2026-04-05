@@ -75,14 +75,14 @@ pub fn mask_pii(input: &str) -> MaskedText {
         },
     );
 
-    value = replace_with_registry(
+    value = replace_with_registry_with_input(
         &value,
         &PHONE_RE,
         "PHONE",
         &mut phone_tokens,
         &mut phone_counter,
         &mut stats.phone_replacements,
-        |caps| {
+        |caps, input_bytes| {
             let m = caps.get(0).expect("full match should exist");
             let raw = m.as_str();
             if count_digits(raw) < 10 {
@@ -91,8 +91,11 @@ pub fn mask_pii(input: &str) -> MaskedText {
             // Exclude timestamp patterns like [123-456] used in transcript format
             let start = m.start();
             let end = m.end();
-            let bytes = value.as_bytes();
-            if start > 0 && end < bytes.len() && bytes[start - 1] == b'[' && bytes[end] == b']' {
+            if start > 0
+                && end < input_bytes.len()
+                && input_bytes[start - 1] == b'['
+                && input_bytes[end] == b']'
+            {
                 return false;
             }
             true
@@ -114,9 +117,33 @@ fn replace_with_registry<F>(
 where
     F: Fn(&Captures<'_>) -> bool,
 {
+    replace_with_registry_with_input(
+        input,
+        regex,
+        prefix,
+        registry,
+        next_index,
+        replacement_count,
+        |caps, _input_bytes| filter(caps),
+    )
+}
+
+fn replace_with_registry_with_input<F>(
+    input: &str,
+    regex: &Regex,
+    prefix: &str,
+    registry: &mut HashMap<String, usize>,
+    next_index: &mut usize,
+    replacement_count: &mut usize,
+    filter: F,
+) -> String
+where
+    F: Fn(&Captures<'_>, &[u8]) -> bool,
+{
+    let input_bytes = input.as_bytes();
     regex
         .replace_all(input, |caps: &Captures<'_>| {
-            if !filter(caps) {
+            if !filter(caps, input_bytes) {
                 return caps
                     .get(0)
                     .expect("full match should exist")

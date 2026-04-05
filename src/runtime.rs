@@ -128,7 +128,7 @@ where
 }
 
 pub fn meeting_audio_dir(base_dir: &str, meeting_id: &str) -> PathBuf {
-    PathBuf::from(base_dir).join(meeting_id)
+    PathBuf::from(base_dir).join(crate::storage_fs::sanitize_path_component(meeting_id))
 }
 
 pub fn meeting_audio_path(base_dir: &str, meeting_id: &str) -> String {
@@ -197,6 +197,8 @@ pub fn merge_user_chunks_to_mixdown(meeting_dir: &std::path::Path) -> Result<Str
             .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
         // Validate WAV header before stripping: must start with RIFF and have
         // a "data" subchunk at offset 36 for standard PCM WAV (44-byte header).
+        // This is coupled to `build_wav_bytes` which always writes a minimal
+        // 44-byte header. If WAV generation changes, update this check.
         let pcm = if data.len() >= 44 && data[0..4] == *b"RIFF" && data[36..40] == *b"data" {
             data[44..].to_vec()
         } else {
@@ -381,9 +383,13 @@ impl EventHandler for ScaffoldHandler {
             error!(error = %err, "failed to register guild commands");
         }
 
-        if let Err(err) = self.run_startup_recovery(&ctx).await {
-            error!(error = %err, "startup recovery failed");
-        }
+        let recovery_handler = self.clone();
+        let recovery_ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = recovery_handler.run_startup_recovery(&recovery_ctx).await {
+                error!(error = %err, "startup recovery failed");
+            }
+        });
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -576,7 +582,17 @@ impl ScaffoldHandler {
 
             let effect = {
                 let mut service = self.service.lock().await;
-                run_recovery(&mut service.store, &candidate).map_err(|err| err.to_string())?
+                match run_recovery(&mut service.store, &candidate) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %snapshot.meeting_id,
+                            error = %err,
+                            "run_recovery failed for meeting, skipping to next"
+                        );
+                        continue;
+                    }
+                }
             };
 
             match effect {
@@ -722,10 +738,8 @@ impl ScaffoldHandler {
             .map_err(|err| err.to_string())?;
         drop(service);
 
-        // voice_channel_id_u64 is guaranteed Some here because record_start
-        // already validated user_voice_channel_id via CommandError::UserNotInVoice.
-        let voice_channel_id_u64 =
-            voice_channel_id_u64.expect("voice_channel_id should be validated by record_start");
+        let voice_channel_id_u64 = voice_channel_id_u64
+            .ok_or_else(|| "voice_channel_id unexpectedly None after record_start".to_owned())?;
 
         let manager = songbird::get(ctx)
             .await
@@ -906,6 +920,10 @@ impl ScaffoldHandler {
                 // Mark meeting as Posted and job as Done only after successful posting.
                 // This order prevents data loss: if posting fails, the job stays
                 // Running and can be recovered on restart.
+                // Trade-off: if a concurrent recovery resets the status between
+                // posting and this CAS, the CAS will fail and the summary may be
+                // posted again on the next recovery cycle. Idempotent double-post
+                // is preferred over losing the summary entirely.
                 let mut service = self.service.lock().await;
                 service
                     .store
@@ -1288,10 +1306,13 @@ pub fn ingest_voice_frames_into_session(
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_millis() as u64
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(err) => {
+            warn!(error = %err, "system clock is before UNIX epoch, returning 0");
+            0
+        }
+    }
 }
 
 fn is_bot_connected_to_voice_channel(

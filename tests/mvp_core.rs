@@ -93,7 +93,7 @@ fn discord_message_split_respects_character_limit() {
     let chunks = split_discord_message(&text, DISCORD_MESSAGE_LIMIT);
     assert!(chunks.len() >= 2);
     for chunk in &chunks {
-        assert!(chunk.chars().count() <= DISCORD_MESSAGE_LIMIT);
+        assert!(chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT);
     }
     assert_eq!(chunks.concat(), text);
 }

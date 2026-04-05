@@ -21,8 +21,9 @@ impl AutoStopState {
     /// Notify the state that the non-bot member count has changed.
     ///
     /// Returns [`AutoStopSignal::StartTimer`] exactly once per empty-channel
-    /// episode.  The flag is set **atomically** inside this method so that two
-    /// concurrent callers can never both receive `StartTimer`.
+    /// episode.  Mutual exclusion is provided by the caller's lock (e.g. the
+    /// tokio `Mutex` in `runtime.rs`), so two concurrent callers can never
+    /// both receive `StartTimer`.
     pub fn on_non_bot_member_count_changed(
         &mut self,
         non_bot_member_count: usize,
