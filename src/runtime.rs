@@ -728,9 +728,8 @@ impl ScaffoldHandler {
             .map_err(|err| err.to_string())?;
         drop(service);
 
-        let voice_channel_id_u64 = voice_channel_id_u64.ok_or_else(|| {
-            "voice_channel_id unexpectedly None after record_start".to_owned()
-        })?;
+        let voice_channel_id_u64 = voice_channel_id_u64
+            .ok_or_else(|| "voice_channel_id unexpectedly None after record_start".to_owned())?;
 
         let manager = songbird::get(ctx)
             .await
