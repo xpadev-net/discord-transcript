@@ -49,6 +49,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Run migrations on the web DB connection before serving requests.
+    // These are idempotent (IF NOT EXISTS), so running them here AND in
+    // run_bot() is safe — but this ensures the web server never faces
+    // a pre-migration schema.
+    db_client
+        .batch_execute(discord_transcript::sql::INITIAL_SCHEMA_SQL)
+        .await?;
+    db_client
+        .batch_execute(discord_transcript::sql::INCREMENTAL_MIGRATIONS_SQL)
+        .await?;
+
     // Build OAuth config if all required fields are present
     let auth = match (
         &config.discord_client_id,

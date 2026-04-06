@@ -70,6 +70,7 @@ pub fn create_router(state: WebState) -> Router {
         ));
 
     Router::new()
+        .route("/", get(index_page))
         .merge(auth_routes)
         .merge(protected)
         .with_state(state)
@@ -650,6 +651,12 @@ fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+// ---------- Index ----------
+
+async fn index_page() -> Html<&'static str> {
+    Html("<html><body><p>discord-transcript is running.</p></body></html>")
+}
+
 // ---------- Response types ----------
 
 #[derive(Serialize)]
@@ -706,8 +713,8 @@ async fn api_meeting(
         .db
         .query_opt(
             "SELECT id, title, status, \
-             to_char(started_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as started_at, \
-             to_char(stopped_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as stopped_at, \
+             to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as started_at, \
+             to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as stopped_at, \
              meeting_duration_seconds \
              FROM meetings WHERE id=$1",
             &[&meeting_id],
