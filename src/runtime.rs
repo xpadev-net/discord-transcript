@@ -784,24 +784,58 @@ impl ScaffoldHandler {
             );
         }
 
-        let call_lock = match manager
-            .join(guild_id, ChannelId::new(voice_channel_id_u64))
-            .await
-        {
-            Ok(call) => call,
-            Err(err) => {
-                let mut sessions = self.sessions.lock().await;
-                sessions.remove(&guild_id.get().to_string());
-                drop(sessions);
-                let mut service = self.service.lock().await;
-                let _ = service
-                    .store
-                    .set_meeting_status(&meeting_id, MeetingStatus::Failed, None);
-                let _ = service.store.set_error_message(
-                    &meeting_id,
-                    Some(format!("failed to join voice channel: {err}")),
-                );
-                return Err(format!("failed to join voice channel: {err}"));
+        let call_lock = {
+            let channel_id = ChannelId::new(voice_channel_id_u64);
+            let mut join_delay = Duration::from_millis(500);
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 1..=3u32 {
+                match manager.join(guild_id, channel_id).await {
+                    Ok(call) => {
+                        result = Some(call);
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            attempt,
+                            guild_id = %guild_id.get(),
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "voice join attempt failed"
+                        );
+                        last_err = Some(err);
+                        if attempt < 3 {
+                            sleep(join_delay).await;
+                            join_delay *= 2;
+                        }
+                    }
+                }
+            }
+            match result {
+                Some(call) => call,
+                None => {
+                    let err = last_err.expect("last_err must be set when all attempts fail");
+                    let err_msg = format!("{err}");
+                    error!(
+                        guild_id = %guild_id.get(),
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "failed to join voice channel after 3 attempts"
+                    );
+                    let mut sessions = self.sessions.lock().await;
+                    sessions.remove(&guild_id.get().to_string());
+                    drop(sessions);
+                    let _ = manager.leave(guild_id).await;
+                    let mut service = self.service.lock().await;
+                    let _ = service
+                        .store
+                        .set_meeting_status(&meeting_id, MeetingStatus::Failed, None);
+                    let _ = service.store.set_error_message(
+                        &meeting_id,
+                        Some(err_msg.clone()),
+                    );
+                    return Err(err_msg);
+                }
             }
         };
         {
