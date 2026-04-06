@@ -83,7 +83,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         db: Arc::new(db_client),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auth,
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()?,
         permission_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let router = web::create_router(web_state);
