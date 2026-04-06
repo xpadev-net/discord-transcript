@@ -804,6 +804,8 @@ impl ScaffoldHandler {
                             "voice join attempt failed"
                         );
                         last_err = Some(err);
+                        // Clean up partial gateway state before retrying
+                        let _ = manager.leave(guild_id).await;
                         if attempt < 3 {
                             sleep(join_delay).await;
                             join_delay *= 2;
