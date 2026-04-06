@@ -9,7 +9,7 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| [Claude CLI](https://docs.anthropic.com/) | `claude -p` でプロンプト実行できること |
+| [Claude CLI](https://docs.anthropic.com/) | `claude --model haiku -p` でプロンプト実行できること |
 
 ## 環境構築
 

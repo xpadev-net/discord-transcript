@@ -116,6 +116,8 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
         retry_with_backoff(self.retry_policy, |_| {
             use std::io::Write;
             let mut child = Command::new(&self.command_path)
+                .arg("--model")
+                .arg("haiku")
                 .arg("-p")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
