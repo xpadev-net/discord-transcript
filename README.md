@@ -9,7 +9,7 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| [Claude CLI](https://docs.anthropic.com/) | `claude --model haiku -p` でプロンプト実行できること |
+| [Claude CLI](https://docs.anthropic.com/) | `claude --model <model> -p` でプロンプト実行できること |
 
 ## 環境構築
 
@@ -52,6 +52,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `INTEGRATION_RETRY_INITIAL_DELAY_MS` | `200` | リトライ初回遅延 (ms) |
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
+| `CLAUDE_MODEL` | `haiku` | Claude CLI の `--model` に渡すモデル名 |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 
 ### 4. ビルド

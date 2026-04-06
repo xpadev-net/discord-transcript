@@ -334,6 +334,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         whisper_endpoint: config.whisper_endpoint.clone(),
         claude_command: config.claude_command.clone(),
+        claude_model: config.claude_model.clone(),
         whisper_language: config.whisper_language.clone(),
         summary_max_retries: config.summary_max_retries,
         integration_retry_policy: RetryPolicy {
@@ -373,6 +374,7 @@ struct ScaffoldHandler {
     chunk_storage_dir: String,
     whisper_endpoint: String,
     claude_command: String,
+    claude_model: String,
     whisper_language: Option<String>,
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
@@ -1111,6 +1113,7 @@ impl ScaffoldHandler {
         };
         let claude = ClaudeCliSummaryClient {
             command_path: self.claude_command.clone(),
+            model: self.claude_model.clone(),
             retry_policy: self.integration_retry_policy,
         };
         let job_id = format!("summary-{meeting_id}");
