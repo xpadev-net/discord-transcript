@@ -801,6 +801,7 @@ impl ScaffoldHandler {
                             guild_id = %guild_id.get(),
                             meeting_id = %meeting_id,
                             error = %err,
+                            error_debug = ?err,
                             "voice join attempt failed"
                         );
                         last_err = Some(err);
@@ -830,6 +831,7 @@ impl ScaffoldHandler {
                         guild_id = %guild_id.get(),
                         meeting_id = %meeting_id,
                         error = %err,
+                        error_debug = ?err,
                         "failed to join voice channel after 3 attempts"
                     );
                     let mut sessions = self.sessions.lock().await;
