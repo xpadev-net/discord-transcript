@@ -827,7 +827,7 @@ impl ScaffoldHandler {
                     let mut sessions = self.sessions.lock().await;
                     sessions.remove(&guild_id.get().to_string());
                     drop(sessions);
-                    let _ = manager.leave(guild_id).await;
+                    // manager.leave() already called in the retry loop above
                     let mut service = self.service.lock().await;
                     let _ = service
                         .store
