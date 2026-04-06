@@ -410,11 +410,29 @@ impl EventHandler for ScaffoldHandler {
 
             let message = self.handle_command(&ctx, &command).await;
 
-            if let Err(err) = command
-                .edit_response(&ctx.http, EditInteractionResponse::new().content(message))
-                .await
-            {
-                error!(error = %err, "failed to edit interaction response");
+            let mut delay = Duration::from_millis(200);
+            let mut last_err = None;
+            for attempt in 1..=3u32 {
+                match command
+                    .edit_response(&ctx.http, EditInteractionResponse::new().content(&message))
+                    .await
+                {
+                    Ok(_) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => {
+                        error!(attempt, error = %err, "failed to edit interaction response");
+                        last_err = Some(err);
+                        if attempt < 3 {
+                            sleep(delay).await;
+                            delay *= 2;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = last_err {
+                error!(error = %err, "all retries exhausted for edit interaction response");
             }
         }
     }
@@ -860,8 +878,9 @@ impl ScaffoldHandler {
                 let outcome = result.outcome;
 
                 if outcome == StopOutcome::Owner {
-                    // Spawn summary processing in background to avoid blocking
-                    // the Discord interaction response (3-second timeout).
+                    // Spawn summary processing in background — transcription and
+                    // AI summarization can take minutes, far beyond the interaction
+                    // response window, and should not block the command reply.
                     let handler = self.clone();
                     let http = Arc::clone(&ctx.http);
                     tokio::spawn(async move {
