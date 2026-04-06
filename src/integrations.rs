@@ -49,7 +49,9 @@ impl WhisperClient for CommandWhisperClient {
                 .arg("POST")
                 .arg(format!("{}/inference", self.endpoint.trim_end_matches('/')))
                 .arg("-F")
-                .arg(format!("file=@{}", request.audio_path));
+                .arg(format!("file=@{}", request.audio_path))
+                .arg("-F")
+                .arg("response_format=verbose_json");
 
             if let Some(language) = &request.language {
                 cmd.arg("-F").arg(format!("language={language}"));
@@ -84,13 +86,37 @@ pub struct ClaudeCliSummaryClient {
     pub retry_policy: RetryPolicy,
 }
 
+const SANITIZE_MAX_LEN: usize = 500;
+
+/// Redact values that look like API keys or tokens, collapse whitespace,
+/// and truncate to a bounded length so error messages stay safe and compact.
+fn sanitize_output(raw: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let lossy = String::from_utf8_lossy(raw);
+    // Collapse runs of whitespace (including newlines) into a single space.
+    let collapsed: String = lossy.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Redact strings that look like API keys / bearer tokens.
+    let redacted =
+        regex::Regex::new(r"(?i)(sk-[a-zA-Z0-9\-_]{8,}|key-[a-zA-Z0-9]{8,}|bearer\s+\S{8,})")
+            .map(|re| re.replace_all(&collapsed, "[REDACTED]").into_owned())
+            .unwrap_or(collapsed);
+
+    if redacted.len() <= SANITIZE_MAX_LEN {
+        return redacted;
+    }
+    let mut truncated: String = redacted.chars().take(SANITIZE_MAX_LEN).collect();
+    let omitted = redacted.len() - truncated.len();
+    let _ = write!(truncated, "... ({omitted} bytes omitted)");
+    truncated
+}
+
 impl ClaudeSummaryClient for ClaudeCliSummaryClient {
     fn summarize(&self, prompt: &str) -> Result<String, SummaryError> {
         retry_with_backoff(self.retry_policy, |_| {
             use std::io::Write;
             let mut child = Command::new(&self.command_path)
                 .arg("-p")
-                .arg("-")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -122,9 +148,10 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
 
             if !output.status.success() {
                 return Err(SummaryError::SummaryEngine(format!(
-                    "claude command failed: status={:?}, stderr={}",
+                    "claude command failed: status={:?}, stderr={}, stdout={}",
                     output.status.code(),
-                    String::from_utf8_lossy(&output.stderr)
+                    sanitize_output(&output.stderr),
+                    sanitize_output(&output.stdout)
                 )));
             }
 
