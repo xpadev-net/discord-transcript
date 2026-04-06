@@ -90,7 +90,6 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
             use std::io::Write;
             let mut child = Command::new(&self.command_path)
                 .arg("-p")
-                .arg("-")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -122,9 +121,10 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
 
             if !output.status.success() {
                 return Err(SummaryError::SummaryEngine(format!(
-                    "claude command failed: status={:?}, stderr={}",
+                    "claude command failed: status={:?}, stderr={}, stdout={}",
                     output.status.code(),
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
                 )));
             }
 

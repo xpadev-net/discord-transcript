@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub integration_retry_initial_delay_ms: u64,
     pub integration_retry_backoff_multiplier: u32,
     pub integration_retry_max_delay_ms: u64,
+    pub whisper_language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,7 @@ impl AppConfig {
                 "INTEGRATION_RETRY_MAX_DELAY_MS",
             )?
             .unwrap_or(5_000),
+            whisper_language: optional_env("WHISPER_LANGUAGE"),
         })
     }
 
@@ -100,6 +102,7 @@ impl AppConfig {
                 "INTEGRATION_RETRY_MAX_DELAY_MS",
             )?
             .unwrap_or(5_000),
+            whisper_language: optional_from_map(values, "WHISPER_LANGUAGE"),
         })
     }
 }

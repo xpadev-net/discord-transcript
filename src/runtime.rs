@@ -331,6 +331,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         whisper_endpoint: config.whisper_endpoint.clone(),
         claude_command: config.claude_command.clone(),
+        whisper_language: config.whisper_language.clone(),
         summary_max_retries: config.summary_max_retries,
         integration_retry_policy: RetryPolicy {
             max_attempts: config.integration_retry_max_attempts,
@@ -368,6 +369,7 @@ struct ScaffoldHandler {
     chunk_storage_dir: String,
     whisper_endpoint: String,
     claude_command: String,
+    whisper_language: Option<String>,
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
 }
@@ -1119,7 +1121,7 @@ impl ScaffoldHandler {
             meeting_id: claimed_job.meeting_id.clone(),
             title: None,
             audio_path,
-            language: None,
+            language: self.whisper_language.clone(),
         };
 
         // Phase 1: Transcription (mutex held only for status update)
