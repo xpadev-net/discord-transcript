@@ -1,8 +1,10 @@
 use crate::domain::{JobStatus, JobType, MeetingStatus};
+use crate::meeting_audio::build_speaker_audio_inputs;
 use crate::queue::{Job, JobQueue, QueueError};
 use crate::storage::{MeetingStore, StoreError};
 use crate::summary::{
-    ClaudeSummaryClient, SummaryError, SummaryRequest, build_summary_prompt, run_transcription,
+    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, build_summary_prompt,
+    run_transcription,
 };
 use crate::{asr::WhisperClient, posting::split_discord_message};
 use std::fmt::{Display, Formatter};
@@ -13,6 +15,7 @@ pub struct ProcessMeetingInput {
     pub meeting_id: String,
     pub title: Option<String>,
     pub audio_path: String,
+    pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
 }
 
@@ -77,6 +80,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         meeting_id: input.meeting_id.clone(),
         title: input.title.clone(),
         audio_path: input.audio_path.clone(),
+        speaker_audio: input.speaker_audio.clone(),
         language: input.language.clone(),
     };
 
@@ -158,14 +162,22 @@ where
     };
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");
 
-    let input = ProcessMeetingInput {
-        meeting_id: job.meeting_id.clone(),
-        title: None,
-        audio_path: crate::runtime::meeting_audio_path(audio_base_dir, &job.meeting_id),
-        language: None,
-    };
+    let result = (|| {
+        let input = ProcessMeetingInput {
+            meeting_id: job.meeting_id.clone(),
+            title: None,
+            audio_path: crate::runtime::meeting_audio_path(audio_base_dir, &job.meeting_id),
+            speaker_audio: build_speaker_audio_inputs(&crate::runtime::meeting_audio_dir(
+                audio_base_dir,
+                &job.meeting_id,
+            ))
+            .map_err(WorkerError::Summary)?,
+            language: None,
+        };
+        process_meeting_summary(store, whisper, claude, &input)
+    })();
 
-    match process_meeting_summary(store, whisper, claude, &input) {
+    match result {
         Ok(output) => {
             // Set meeting status first: if this fails the job stays Running
             // and can be retried. The reverse order (mark_done first) would

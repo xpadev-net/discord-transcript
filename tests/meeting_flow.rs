@@ -7,7 +7,7 @@ use discord_transcript::recovery::RecoveryCandidate;
 use discord_transcript::retention::{ArtifactRecord, RetentionKind, RetentionPolicy};
 use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::storage_fs::LocalChunkStorage;
-use discord_transcript::summary::StubClaudeSummaryClient;
+use discord_transcript::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::worker::ProcessMeetingInput;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -77,6 +77,11 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         meeting_id: "m1".to_owned(),
         title: Some("Weekly".to_owned()),
         audio_path: "audio.wav".to_owned(),
+        speaker_audio: vec![SpeakerAudioInput {
+            speaker_id: "alice".to_owned(),
+            audio_path: "audio.wav".to_owned(),
+            offset_ms: 0,
+        }],
         language: Some("ja".to_owned()),
     };
     let retention_records = [ArtifactRecord {

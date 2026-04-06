@@ -4,6 +4,7 @@ use crate::command::{CommandError, PermissionSet};
 use crate::config::AppConfig;
 use crate::domain::{MeetingStatus, StopReason};
 use crate::integrations::{ClaudeCliSummaryClient, CommandWhisperClient};
+use crate::meeting_audio::{build_speaker_audio_inputs, load_chunks};
 use crate::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::queue::JobQueue;
 use crate::receiver::ReceiverConfig;
@@ -146,75 +147,24 @@ pub fn merge_user_chunks_to_mixdown(meeting_dir: &std::path::Path) -> Result<Str
 
     let mixdown_path = meeting_dir.join("mixdown.wav");
 
-    let mut chunk_files: Vec<PathBuf> = Vec::new();
-    let entries =
-        fs::read_dir(meeting_dir).map_err(|err| format!("failed to read meeting dir: {err}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("wav")
-            && path.file_name() != Some(std::ffi::OsStr::new("mixdown.wav"))
-        {
-            chunk_files.push(path);
-        }
-    }
-
-    if chunk_files.is_empty() {
-        return Err("no audio chunks found for meeting".to_owned());
+    let mut chunks = load_chunks(meeting_dir)?;
+    let sample_rate = chunks.first().map(|c| c.sample_rate).unwrap_or(48_000);
+    if chunks.iter().any(|c| c.sample_rate != sample_rate) {
+        return Err("mixed sample rates are not supported for mixdown".to_owned());
     }
 
     // Sort by (sequence, user_id) to interleave users within each time window.
-    // Filenames follow the pattern {user_id}_{sequence}.wav
-    chunk_files.sort_by(|a, b| {
-        let parse = |p: &PathBuf| -> (u64, String) {
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if let Some(pos) = stem.rfind('_') {
-                let seq = stem[pos + 1..].parse::<u64>().unwrap_or(0);
-                let user = stem[..pos].to_owned();
-                (seq, user)
-            } else {
-                (0, stem.to_owned())
-            }
-        };
-        let (seq_a, user_a) = parse(a);
-        let (seq_b, user_b) = parse(b);
-        seq_a.cmp(&seq_b).then(user_a.cmp(&user_b))
-    });
+    chunks.sort_by(|a, b| a.sequence.cmp(&b.sequence).then(a.user_id.cmp(&b.user_id)));
 
-    // Read PCM from each chunk and mix same-sequence chunks by summing samples
+    // Mix same-sequence chunks by summing samples
     let mut sequence_groups: Vec<SequenceGroup> = Vec::new();
-    for chunk_path in &chunk_files {
-        let stem = chunk_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let seq = stem
-            .rfind('_')
-            .and_then(|pos| stem[pos + 1..].parse::<u64>().ok())
-            .unwrap_or(0);
-
-        let data = fs::read(chunk_path)
-            .map_err(|err| format!("failed to read chunk {}: {err}", chunk_path.display()))?;
-        // Validate WAV header before stripping: must start with RIFF and have
-        // a "data" subchunk at offset 36 for standard PCM WAV (44-byte header).
-        // This is coupled to `build_wav_bytes` which always writes a minimal
-        // 44-byte header. If WAV generation changes, update this check.
-        let pcm = if data.len() >= 44 && data[0..4] == *b"RIFF" && data[36..40] == *b"data" {
-            data[44..].to_vec()
-        } else {
-            warn!(
-                path = %chunk_path.display(),
-                "skipping chunk: invalid WAV header or too small"
-            );
-            continue;
-        };
-
+    for chunk in chunks {
         match sequence_groups.last_mut() {
-            Some((last_seq, group)) if *last_seq == seq => {
-                group.push((stem.to_owned(), pcm));
+            Some((last_seq, group)) if *last_seq == chunk.sequence => {
+                group.push((chunk.user_id.clone(), chunk.pcm));
             }
             _ => {
-                sequence_groups.push((seq, vec![(stem.to_owned(), pcm)]));
+                sequence_groups.push((chunk.sequence, vec![(chunk.user_id, chunk.pcm)]));
             }
         }
     }
@@ -242,7 +192,7 @@ pub fn merge_user_chunks_to_mixdown(meeting_dir: &std::path::Path) -> Result<Str
         }
     }
 
-    let wav_bytes = build_wav_bytes_raw(&all_pcm, 48_000, 1, 16)
+    let wav_bytes = build_wav_bytes_raw(&all_pcm, sample_rate, 1, 16)
         .map_err(|err| format!("failed to build mixdown WAV: {err}"))?;
     fs::write(&mixdown_path, &wav_bytes)
         .map_err(|err| format!("failed to write mixdown: {err}"))?;
@@ -1114,7 +1064,11 @@ impl ScaffoldHandler {
             retry_policy: self.integration_retry_policy,
         };
         let job_id = format!("summary-{meeting_id}");
-        let audio_path = meeting_audio_path(&self.chunk_storage_dir, meeting_id);
+        let meeting_dir = meeting_audio_dir(&self.chunk_storage_dir, meeting_id);
+        let audio_path = meeting_dir
+            .join("mixdown.wav")
+            .to_string_lossy()
+            .to_string();
 
         let claimed_job = {
             let mut queue = self.queue.lock().await;
@@ -1132,10 +1086,33 @@ impl ScaffoldHandler {
             );
         }
 
+        let speaker_audio = match build_speaker_audio_inputs(&meeting_dir) {
+            Ok(value) => value,
+            Err(err) => {
+                let mut queue = self.queue.lock().await;
+                let retry_status =
+                    queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                drop(queue);
+                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                    let mut service = self.service.lock().await;
+                    let _ = service.store.set_meeting_status(
+                        &claimed_job.meeting_id,
+                        MeetingStatus::Failed,
+                        None,
+                    );
+                    let _ = service
+                        .store
+                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                }
+                return Err(err);
+            }
+        };
+
         let request = crate::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
             title: None,
             audio_path,
+            speaker_audio,
             language: self.whisper_language.clone(),
         };
 
