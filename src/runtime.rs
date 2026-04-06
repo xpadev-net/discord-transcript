@@ -12,7 +12,7 @@ use crate::recovery::RecoveryCandidate;
 use crate::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::retry::RetryPolicy;
 use crate::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
-use crate::sql::{INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
+use crate::sql::{INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
 use crate::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::stop::StopOutcome;
 use crate::storage::MeetingStore;
@@ -313,6 +313,9 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
     let mut migration_store = SqlMeetingStore::new(base_executor);
     migration_store
         .apply_initial_migration(INITIAL_SCHEMA_SQL)
+        .map_err(RuntimeError::DatabaseMigration)?;
+    migration_store
+        .apply_initial_migration(INCREMENTAL_MIGRATIONS_SQL)
         .map_err(RuntimeError::DatabaseMigration)?;
     let base_executor = migration_store.executor;
 

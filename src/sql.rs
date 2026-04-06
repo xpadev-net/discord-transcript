@@ -76,6 +76,12 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_meeting_kind
     ON artifacts (meeting_id, kind);
 "#;
 
+/// Incremental migrations applied after the initial schema.
+/// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
+pub const INCREMENTAL_MIGRATIONS_SQL: &str = r#"
+ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS is_noisy BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
 UPDATE meetings
 SET
