@@ -65,6 +65,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 session_secret: session_secret.clone(),
                 redirect_uri,
                 guild_id: config.discord_guild_id.clone(),
+                bot_token: config.discord_token.clone(),
                 secure_cookie,
             }))
         }

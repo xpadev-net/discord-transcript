@@ -3,7 +3,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -16,6 +16,9 @@ const MEETING_HTML: &str = include_str!("../assets/meeting.html");
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 const MAX_RANGE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB cap for range reads
+
+const VIEW_CHANNEL: u64 = 1 << 10;
+const ADMINISTRATOR: u64 = 1 << 3;
 
 // ---------- State ----------
 
@@ -33,8 +36,13 @@ pub struct AuthConfig {
     pub session_secret: String,
     pub redirect_uri: String,
     pub guild_id: String,
+    pub bot_token: String,
     pub secure_cookie: bool,
 }
+
+/// Authenticated user's Discord ID, injected by `require_auth` middleware.
+#[derive(Clone)]
+struct AuthUserId(String);
 
 // ---------- Router ----------
 
@@ -66,7 +74,7 @@ pub fn create_router(state: WebState) -> Router {
 async fn require_auth(
     State(state): State<WebState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let Some(ref auth) = state.auth else {
@@ -77,6 +85,7 @@ async fn require_auth(
         && let Some(session) = verify_session(&cookie_val, &auth.session_secret)
         && session.gid == auth.guild_id
     {
+        request.extensions_mut().insert(AuthUserId(session.uid));
         return next.run(request).await;
     }
 
@@ -135,6 +144,11 @@ struct TokenResponse {
 }
 
 #[derive(Deserialize)]
+struct DiscordUserInfo {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct DiscordGuild {
     id: String,
 }
@@ -159,7 +173,7 @@ async fn auth_callback(
     };
 
     // Exchange code for access token
-    let token_res = state
+    let token: TokenResponse = match state
         .http_client
         .post("https://discord.com/api/oauth2/token")
         .form(&[
@@ -170,9 +184,8 @@ async fn auth_callback(
             ("redirect_uri", auth.redirect_uri.as_str()),
         ])
         .send()
-        .await;
-
-    let token: TokenResponse = match token_res {
+        .await
+    {
         Ok(resp) if resp.status().is_success() => match resp.json().await {
             Ok(t) => t,
             Err(_) => return (StatusCode::BAD_GATEWAY, "invalid token response").into_response(),
@@ -180,13 +193,29 @@ async fn auth_callback(
         _ => return (StatusCode::BAD_GATEWAY, "token exchange failed").into_response(),
     };
 
-    // Check guild membership
-    let guilds_res = state
-        .http_client
-        .get("https://discord.com/api/users/@me/guilds")
-        .header("Authorization", format!("Bearer {}", token.access_token))
-        .send()
-        .await;
+    let bearer = format!("Bearer {}", token.access_token);
+
+    // Fetch user info and guilds in parallel
+    let (user_res, guilds_res) = tokio::join!(
+        state
+            .http_client
+            .get("https://discord.com/api/users/@me")
+            .header("Authorization", &bearer)
+            .send(),
+        state
+            .http_client
+            .get("https://discord.com/api/users/@me/guilds")
+            .header("Authorization", &bearer)
+            .send(),
+    );
+
+    let user: DiscordUserInfo = match user_res {
+        Ok(resp) if resp.status().is_success() => match resp.json().await {
+            Ok(u) => u,
+            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid user response").into_response(),
+        },
+        _ => return (StatusCode::BAD_GATEWAY, "failed to fetch user").into_response(),
+    };
 
     let guilds: Vec<DiscordGuild> = match guilds_res {
         Ok(resp) if resp.status().is_success() => match resp.json().await {
@@ -196,14 +225,13 @@ async fn auth_callback(
         _ => return (StatusCode::BAD_GATEWAY, "failed to fetch guilds").into_response(),
     };
 
-    let is_member = guilds.iter().any(|g| g.id == auth.guild_id);
-    if !is_member {
+    if !guilds.iter().any(|g| g.id == auth.guild_id) {
         return (StatusCode::FORBIDDEN, "not a member of this server").into_response();
     }
 
-    // Create session cookie
+    // Create session cookie with user ID
     let redirect = sanitize_redirect(&redirect);
-    let session_value = sign_session(&auth.guild_id, &auth.session_secret);
+    let session_value = sign_session(&user.id, &auth.guild_id, &auth.session_secret);
     let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
     let cookie = format!(
         "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}{secure_flag}",
@@ -237,16 +265,18 @@ async fn auth_logout(State(state): State<WebState>) -> Response {
 
 #[derive(Serialize, Deserialize)]
 struct SessionPayload {
+    uid: String,
     gid: String,
     exp: u64,
 }
 
-fn sign_session(guild_id: &str, secret: &str) -> String {
+fn sign_session(user_id: &str, guild_id: &str, secret: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let payload = SessionPayload {
+        uid: user_id.to_owned(),
         gid: guild_id.to_owned(),
         exp: now + SESSION_TTL_SECS,
     };
@@ -295,7 +325,6 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
     }
     let bytes = from_hex(payload_hex)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    // Reject expired state (10 minute window)
     let created = value.get("t")?.as_u64()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -305,6 +334,185 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
         return None;
     }
     value.get("r")?.as_str().map(|s| s.to_owned())
+}
+
+// ========== Channel permission check ==========
+
+/// Verify that the authenticated user has VIEW_CHANNEL permission on the
+/// voice channel where the meeting was recorded.
+async fn verify_meeting_access(
+    state: &WebState,
+    meeting_id: &str,
+    user_id: &str,
+) -> Result<(), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // Look up the meeting's voice channel
+    let row = state
+        .db
+        .query_opt(
+            "SELECT voice_channel_id FROM meetings WHERE id=$1",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let channel_id: String = row.get("voice_channel_id");
+
+    // Fetch guild info, channel info, and member info in parallel via bot token
+    let bot_auth = format!("Bot {}", auth.bot_token);
+    let (guild_res, channel_res, member_res) = tokio::join!(
+        state
+            .http_client
+            .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
+            .header("Authorization", &bot_auth)
+            .send(),
+        state
+            .http_client
+            .get(format!("https://discord.com/api/channels/{channel_id}"))
+            .header("Authorization", &bot_auth)
+            .send(),
+        state
+            .http_client
+            .get(format!(
+                "https://discord.com/api/guilds/{}/members/{user_id}",
+                auth.guild_id
+            ))
+            .header("Authorization", &bot_auth)
+            .send(),
+    );
+
+    let guild: DiscordGuildFull = guild_res
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let channel: DiscordChannelFull = channel_res
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let member: DiscordMemberFull = member_res
+        .map_err(|_| StatusCode::FORBIDDEN)?
+        .json()
+        .await
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    let perms = compute_channel_permissions(
+        user_id,
+        &guild.owner_id,
+        &auth.guild_id,
+        &member.roles,
+        &guild.roles,
+        &channel.permission_overwrites,
+    );
+
+    if perms & VIEW_CHANNEL != 0 || perms & ADMINISTRATOR != 0 {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+// Discord API response types for permission checking
+
+#[derive(Deserialize)]
+struct DiscordGuildFull {
+    owner_id: String,
+    roles: Vec<DiscordRoleFull>,
+}
+
+#[derive(Deserialize)]
+struct DiscordRoleFull {
+    id: String,
+    permissions: String,
+}
+
+#[derive(Deserialize)]
+struct DiscordChannelFull {
+    permission_overwrites: Vec<DiscordOverwrite>,
+}
+
+#[derive(Deserialize)]
+struct DiscordOverwrite {
+    id: String,
+    #[serde(rename = "type")]
+    type_: u8, // 0 = role, 1 = member
+    allow: String,
+    deny: String,
+}
+
+#[derive(Deserialize)]
+struct DiscordMemberFull {
+    roles: Vec<String>,
+}
+
+/// Compute a user's effective permissions for a channel following Discord's
+/// permission resolution algorithm.
+fn compute_channel_permissions(
+    user_id: &str,
+    owner_id: &str,
+    guild_id: &str,
+    member_roles: &[String],
+    guild_roles: &[DiscordRoleFull],
+    overwrites: &[DiscordOverwrite],
+) -> u64 {
+    // Guild owner has all permissions
+    if user_id == owner_id {
+        return u64::MAX;
+    }
+
+    // Base permissions from @everyone role (id == guild_id)
+    let mut permissions: u64 = guild_roles
+        .iter()
+        .find(|r| r.id == guild_id)
+        .and_then(|r| r.permissions.parse().ok())
+        .unwrap_or(0);
+
+    // Add permissions from member's roles
+    for role in guild_roles {
+        if member_roles.contains(&role.id) {
+            permissions |= role.permissions.parse::<u64>().unwrap_or(0);
+        }
+    }
+
+    // Administrator bypasses all channel overwrites
+    if permissions & ADMINISTRATOR != 0 {
+        return u64::MAX;
+    }
+
+    // Apply @everyone overwrite
+    if let Some(ow) = overwrites.iter().find(|o| o.type_ == 0 && o.id == guild_id) {
+        let allow = ow.allow.parse::<u64>().unwrap_or(0);
+        let deny = ow.deny.parse::<u64>().unwrap_or(0);
+        permissions &= !deny;
+        permissions |= allow;
+    }
+
+    // Apply role overwrites (union of allow/deny across all matching roles)
+    let mut role_allow: u64 = 0;
+    let mut role_deny: u64 = 0;
+    for ow in overwrites
+        .iter()
+        .filter(|o| o.type_ == 0 && o.id != guild_id && member_roles.contains(&o.id))
+    {
+        role_allow |= ow.allow.parse::<u64>().unwrap_or(0);
+        role_deny |= ow.deny.parse::<u64>().unwrap_or(0);
+    }
+    permissions &= !role_deny;
+    permissions |= role_allow;
+
+    // Apply member-specific overwrite
+    if let Some(ow) = overwrites.iter().find(|o| o.type_ == 1 && o.id == user_id) {
+        let allow = ow.allow.parse::<u64>().unwrap_or(0);
+        let deny = ow.deny.parse::<u64>().unwrap_or(0);
+        permissions &= !deny;
+        permissions |= allow;
+    }
+
+    permissions
 }
 
 // ========== Auth: crypto helpers ==========
@@ -407,23 +615,29 @@ struct SummaryResponse {
 
 // ---------- Handlers ----------
 
-async fn meeting_page(Path(meeting_id): Path<String>) -> impl IntoResponse {
-    // JSON-encode for safe JS string literal injection, then strip surrounding quotes.
-    // Also escape HTML entities for defense-in-depth (template only uses this in a
-    // JS string literal, but escaping <, >, & prevents injection if context changes).
+async fn meeting_page(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
     let escaped = serde_json::to_string(&meeting_id).unwrap_or_default();
     let escaped = escaped[1..escaped.len() - 1]
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     let html = MEETING_HTML.replace("{{MEETING_ID}}", &escaped);
-    Html(html)
+    Ok(Html(html))
 }
 
 async fn api_meeting(
     State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<MeetingResponse>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
     let row = state
         .db
         .query_opt(
@@ -450,8 +664,11 @@ async fn api_meeting(
 
 async fn api_transcript(
     State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<TranscriptSegmentResponse>>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
     let rows = state
         .db
         .query(
@@ -481,8 +698,11 @@ async fn api_transcript(
 
 async fn api_summary(
     State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<SummaryResponse>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
     let row = state
         .db
         .query_opt(
@@ -498,9 +718,12 @@ async fn api_summary(
 
 async fn api_audio(
     State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
     let safe_id = crate::storage_fs::sanitize_path_component(&meeting_id);
     let path = std::path::PathBuf::from(&state.chunk_storage_dir)
         .join(&safe_id)
@@ -511,7 +734,6 @@ async fn api_audio(
         .map_err(|_| StatusCode::NOT_FOUND)?;
     let file_size = metadata.len();
 
-    // Parse Range header for partial content
     if let Some(range_header) = headers.get(header::RANGE) {
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
         if let Some((start, end)) = parse_range(range_str, file_size) {
@@ -530,7 +752,6 @@ async fn api_audio(
         }
     }
 
-    // Stream full file without buffering entirely into memory
     let file = tokio::fs::File::open(&path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
