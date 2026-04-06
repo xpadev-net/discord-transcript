@@ -97,11 +97,10 @@ fn sanitize_output(raw: &[u8]) -> String {
     // Collapse runs of whitespace (including newlines) into a single space.
     let collapsed: String = lossy.split_whitespace().collect::<Vec<_>>().join(" ");
     // Redact strings that look like API keys / bearer tokens.
-    let redacted = regex::Regex::new(
-        r"(?i)(sk-[a-zA-Z0-9\-_]{8,}|key-[a-zA-Z0-9]{8,}|bearer\s+\S{8,})",
-    )
-    .map(|re| re.replace_all(&collapsed, "[REDACTED]").into_owned())
-    .unwrap_or(collapsed);
+    let redacted =
+        regex::Regex::new(r"(?i)(sk-[a-zA-Z0-9\-_]{8,}|key-[a-zA-Z0-9]{8,}|bearer\s+\S{8,})")
+            .map(|re| re.replace_all(&collapsed, "[REDACTED]").into_owned())
+            .unwrap_or(collapsed);
 
     if redacted.len() <= SANITIZE_MAX_LEN {
         return redacted;
