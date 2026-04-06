@@ -66,7 +66,8 @@ impl AppConfig {
                 "INTEGRATION_RETRY_MAX_DELAY_MS",
             )?
             .unwrap_or(5_000),
-            whisper_language: optional_env("WHISPER_LANGUAGE"),
+            whisper_language: optional_env("WHISPER_LANGUAGE")
+                .map(|s| s.trim().to_owned()),
         })
     }
 
