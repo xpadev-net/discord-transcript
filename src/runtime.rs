@@ -21,8 +21,8 @@ use crate::summary::ClaudeSummaryClient;
 use crate::worker::enqueue_summary_job;
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
-    CreateInteractionResponse, CreateInteractionResponseMessage, GatewayIntents, GuildId,
-    Interaction, Ready, UserId, VoiceState,
+    CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
+    GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -394,19 +394,27 @@ impl EventHandler for ScaffoldHandler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Command(command) = interaction {
-            let message = self.handle_command(&ctx, &command).await;
+            // Acknowledge immediately to avoid Discord's 3-second timeout
             if let Err(err) = command
                 .create_response(
                     &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(message)
-                            .ephemeral(true),
+                    CreateInteractionResponse::Defer(
+                        CreateInteractionResponseMessage::new().ephemeral(true),
                     ),
                 )
                 .await
             {
-                error!(error = %err, "failed to send interaction response");
+                error!(error = %err, "failed to defer interaction response");
+                return;
+            }
+
+            let message = self.handle_command(&ctx, &command).await;
+
+            if let Err(err) = command
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(message))
+                .await
+            {
+                error!(error = %err, "failed to edit interaction response");
             }
         }
     }
