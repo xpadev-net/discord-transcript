@@ -178,7 +178,7 @@ pub fn build_insert_transcripts_sql(count: usize) -> String {
             sql.push_str(", ");
         }
         sql.push_str(&format!(
-            "(${}, ${}, ${}, ${}::INTEGER, ${}::INTEGER, ${}, NULLIF(${},'')::DOUBLE PRECISION, ${}::BOOLEAN)",
+            "(${}, ${}, ${}, ${}::TEXT::INTEGER, ${}::TEXT::INTEGER, ${}, NULLIF(${},'')::TEXT::DOUBLE PRECISION, ${}::TEXT::BOOLEAN)",
             base + 1,
             base + 2,
             base + 3,
