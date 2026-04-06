@@ -829,13 +829,13 @@ impl ScaffoldHandler {
                     drop(sessions);
                     // manager.leave() already called in the retry loop above
                     let mut service = self.service.lock().await;
+                    let _ =
+                        service
+                            .store
+                            .set_meeting_status(&meeting_id, MeetingStatus::Failed, None);
                     let _ = service
                         .store
-                        .set_meeting_status(&meeting_id, MeetingStatus::Failed, None);
-                    let _ = service.store.set_error_message(
-                        &meeting_id,
-                        Some(err_msg.clone()),
-                    );
+                        .set_error_message(&meeting_id, Some(err_msg.clone()));
                     return Err(err_msg);
                 }
             }
