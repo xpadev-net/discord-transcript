@@ -239,6 +239,62 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .map_err(StoreError::Backend)
     }
 
+    fn get_meeting(&mut self, meeting_id: &str) -> Result<Option<StoredMeeting>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                "SELECT id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, title, status, stop_reason, error_message \
+                 FROM meetings WHERE id=$1 LIMIT 1",
+                &[meeting_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        if row.len() < 9 {
+            return Err(StoreError::Backend(format!(
+                "invalid meeting row length for id={meeting_id}: {}",
+                row.len()
+            )));
+        }
+        let status = MeetingStatus::parse_str(&row[6]).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "invalid meeting status for id={meeting_id}: {}",
+                row[6]
+            ))
+        })?;
+        let stop_reason = if row[7].trim().is_empty() {
+            None
+        } else {
+            Some(StopReason::parse_str(&row[7]).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "invalid stop_reason for id={meeting_id}: {}",
+                    row[7]
+                ))
+            })?)
+        };
+        let error_message = if row[8].trim().is_empty() {
+            None
+        } else {
+            Some(row[8].clone())
+        };
+        Ok(Some(StoredMeeting {
+            id: row[0].clone(),
+            guild_id: row[1].clone(),
+            voice_channel_id: row[2].clone(),
+            report_channel_id: row[3].clone(),
+            started_by_user_id: row[4].clone(),
+            title: if row[5].trim().is_empty() {
+                None
+            } else {
+                Some(row[5].clone())
+            },
+            status,
+            stop_reason,
+            error_message,
+        }))
+    }
+
     fn create_scheduled_meeting(
         &mut self,
         request: CreateMeetingRequest,

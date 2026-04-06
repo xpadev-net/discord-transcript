@@ -5,6 +5,7 @@ use crate::asr::{
 use crate::retry::{RetryPolicy, retry_with_backoff};
 use crate::summary::{ClaudeSummaryClient, SummaryError};
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,14 +113,19 @@ fn sanitize_output(raw: &[u8]) -> String {
 }
 
 impl ClaudeSummaryClient for ClaudeCliSummaryClient {
-    fn summarize(&self, prompt: &str) -> Result<String, SummaryError> {
+    fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
         retry_with_backoff(self.retry_policy, |_| {
             use std::io::Write;
-            let mut child = Command::new(&self.command_path)
+            let mut command = Command::new(&self.command_path);
+            command
                 .arg("-p")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(dir) = workdir {
+                command.current_dir(dir);
+            }
+            let mut child = command
                 .spawn()
                 .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
 

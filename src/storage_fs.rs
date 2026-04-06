@@ -1,6 +1,7 @@
+use crate::workspace::MeetingWorkspacePaths;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedChunk {
@@ -35,21 +36,22 @@ pub trait ChunkStorage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalChunkStorage {
-    pub base_dir: PathBuf,
+    pub workspace: MeetingWorkspacePaths,
+    pub meeting_id: String,
 }
 
 impl LocalChunkStorage {
-    pub fn new(base_dir: impl AsRef<Path>) -> Self {
+    pub fn new(workspace: MeetingWorkspacePaths, meeting_id: impl Into<String>) -> Self {
         Self {
-            base_dir: base_dir.as_ref().to_path_buf(),
+            workspace,
+            meeting_id: meeting_id.into(),
         }
     }
 
-    fn chunk_file_path(&self, meeting_id: &str, user_id: &str, sequence: u64) -> PathBuf {
-        let safe_meeting_id = sanitize_path_component(meeting_id);
+    fn chunk_file_path(&self, user_id: &str, sequence: u64) -> PathBuf {
         let safe_user_id = sanitize_path_component(user_id);
-        self.base_dir
-            .join(safe_meeting_id)
+        self.workspace
+            .audio_dir()
             .join(format!("{}_{}.wav", safe_user_id, sequence))
     }
 }
@@ -91,7 +93,14 @@ impl ChunkStorage for LocalChunkStorage {
         sequence: u64,
         bytes: &[u8],
     ) -> Result<SavedChunk, ChunkStorageError> {
-        let file_path = self.chunk_file_path(meeting_id, user_id, sequence);
+        let file_path = self.chunk_file_path(user_id, sequence);
+        if meeting_id != self.meeting_id {
+            tracing::warn!(
+                expected = %self.meeting_id,
+                provided = %meeting_id,
+                "meeting_id mismatch while saving chunk; proceeding with stored workspace"
+            );
+        }
         let Some(dir) = file_path.parent() else {
             return Err(ChunkStorageError::Io(
                 "chunk path has no parent directory".to_owned(),

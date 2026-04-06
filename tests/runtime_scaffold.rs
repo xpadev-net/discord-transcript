@@ -134,9 +134,9 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
 
 #[test]
 fn meeting_audio_path_uses_chunk_storage_base() {
-    let path = meeting_audio_path("/tmp/chunks", "m1");
+    let path = meeting_audio_path("/tmp/chunks", "g1", "vc1", "m1");
     assert!(
-        path.ends_with("/tmp/chunks/m1/mixdown.wav")
-            || path.ends_with("\\tmp\\chunks\\m1\\mixdown.wav")
+        path.ends_with("/tmp/chunks/workspaces/g1/vc1/m1/audio/mixdown.wav")
+            || path.ends_with("\\tmp\\chunks\\workspaces\\g1\\vc1\\m1\\audio\\mixdown.wav")
     );
 }

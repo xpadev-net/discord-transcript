@@ -1,6 +1,7 @@
 use discord_transcript::receiver::{BufferedFrame, ReceiverConfig};
 use discord_transcript::recording_session::RecordingSession;
 use discord_transcript::storage_fs::{ChunkStorage, LocalChunkStorage};
+use discord_transcript::workspace::MeetingWorkspaceLayout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,8 @@ fn unique_temp_dir(test_name: &str) -> PathBuf {
 #[test]
 fn local_chunk_storage_writes_expected_file() {
     let base = unique_temp_dir("chunk_storage");
-    let storage = LocalChunkStorage::new(&base);
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let storage = LocalChunkStorage::new(layout.for_meeting("g1", "vc1", "m1"), "m1");
     let saved = storage
         .save_chunk("m1", "u1", 1, b"abc")
         .expect("save should succeed");
@@ -31,7 +33,8 @@ fn local_chunk_storage_writes_expected_file() {
 #[test]
 fn recording_session_flushes_and_persists_wav_chunks() {
     let base = unique_temp_dir("recording_session");
-    let storage = LocalChunkStorage::new(&base);
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let storage = LocalChunkStorage::new(layout.for_meeting("g1", "vc1", "meeting-1"), "meeting-1");
     let mut session = RecordingSession::new(
         "meeting-1".to_owned(),
         storage,
@@ -72,7 +75,8 @@ fn recording_session_flushes_and_persists_wav_chunks() {
 #[test]
 fn recording_session_increments_sequence_per_user() {
     let base = unique_temp_dir("sequence");
-    let storage = LocalChunkStorage::new(&base);
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let storage = LocalChunkStorage::new(layout.for_meeting("g1", "vc1", "meeting-2"), "meeting-2");
     let mut session = RecordingSession::new(
         "meeting-2".to_owned(),
         storage,

@@ -844,10 +844,24 @@ async fn api_audio(
 ) -> Result<Response, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
-    let safe_id = crate::storage_fs::sanitize_path_component(&meeting_id);
-    let path = std::path::PathBuf::from(&state.chunk_storage_dir)
-        .join(&safe_id)
-        .join("mixdown.wav");
+    let row = state
+        .db
+        .query_opt(
+            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let guild_id: String = row.get("guild_id");
+    let voice_channel_id: String = row.get("voice_channel_id");
+
+    let layout = crate::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
+    let primary = workspace.mixdown_path();
+    let legacy = layout.legacy_meeting_dir(&meeting_id).join("mixdown.wav");
+    let path = if primary.exists() { primary } else { legacy };
 
     let metadata = tokio::fs::metadata(&path)
         .await

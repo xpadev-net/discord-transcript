@@ -9,6 +9,7 @@ use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::storage_fs::LocalChunkStorage;
 use discord_transcript::summary::StubClaudeSummaryClient;
 use discord_transcript::worker::ProcessMeetingInput;
+use discord_transcript::workspace::MeetingWorkspaceLayout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -40,7 +41,10 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
     store.insert(stopping_meeting("m1"));
 
     let base = unique_temp_dir("run");
-    let storage = LocalChunkStorage::new(&base);
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("workspace dirs");
+    let storage = LocalChunkStorage::new(workspace.clone(), "m1");
     let mut session = RecordingSession::new(
         "m1".to_owned(),
         storage,
@@ -75,9 +79,12 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
     };
     let summary_input = ProcessMeetingInput {
         meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
         title: Some("Weekly".to_owned()),
-        audio_path: "audio.wav".to_owned(),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         language: Some("ja".to_owned()),
+        workspace,
     };
     let retention_records = [ArtifactRecord {
         kind: RetentionKind::RawAudio,

@@ -31,3 +31,4 @@ pub mod summary;
 pub mod transcript;
 pub mod web;
 pub mod worker;
+pub mod workspace;

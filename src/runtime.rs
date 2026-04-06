@@ -15,7 +15,7 @@ use crate::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick}
 use crate::sql::{INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
 use crate::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::stop::StopOutcome;
-use crate::storage::MeetingStore;
+use crate::storage::{MeetingStore, StoredMeeting};
 use crate::storage_fs::LocalChunkStorage;
 use crate::summary::ClaudeSummaryClient;
 use crate::worker::enqueue_summary_job;
@@ -127,13 +127,26 @@ where
     Ok(stop_result)
 }
 
-pub fn meeting_audio_dir(base_dir: &str, meeting_id: &str) -> PathBuf {
-    PathBuf::from(base_dir).join(crate::storage_fs::sanitize_path_component(meeting_id))
+pub fn meeting_audio_dir(
+    base_dir: &str,
+    guild_id: &str,
+    voice_channel_id: &str,
+    meeting_id: &str,
+) -> PathBuf {
+    crate::workspace::MeetingWorkspaceLayout::new(base_dir)
+        .for_meeting(guild_id, voice_channel_id, meeting_id)
+        .audio_dir()
 }
 
-pub fn meeting_audio_path(base_dir: &str, meeting_id: &str) -> String {
-    meeting_audio_dir(base_dir, meeting_id)
-        .join("mixdown.wav")
+pub fn meeting_audio_path(
+    base_dir: &str,
+    guild_id: &str,
+    voice_channel_id: &str,
+    meeting_id: &str,
+) -> String {
+    crate::workspace::MeetingWorkspaceLayout::new(base_dir)
+        .for_meeting(guild_id, voice_channel_id, meeting_id)
+        .mixdown_path()
         .to_string_lossy()
         .to_string()
 }
@@ -141,14 +154,14 @@ pub fn meeting_audio_path(base_dir: &str, meeting_id: &str) -> String {
 type UserPcmChunk = (String, Vec<u8>);
 type SequenceGroup = (u64, Vec<UserPcmChunk>);
 
-pub fn merge_user_chunks_to_mixdown(meeting_dir: &std::path::Path) -> Result<String, String> {
+pub fn merge_user_chunks_to_mixdown(audio_dir: &std::path::Path) -> Result<String, String> {
     use crate::audio::build_wav_bytes_raw;
 
-    let mixdown_path = meeting_dir.join("mixdown.wav");
+    let mixdown_path = audio_dir.join("mixdown.wav");
 
     let mut chunk_files: Vec<PathBuf> = Vec::new();
     let entries =
-        fs::read_dir(meeting_dir).map_err(|err| format!("failed to read meeting dir: {err}"))?;
+        fs::read_dir(audio_dir).map_err(|err| format!("failed to read audio dir: {err}"))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
         let path = entry.path();
@@ -592,9 +605,18 @@ impl ScaffoldHandler {
         };
 
         for snapshot in snapshots {
-            let meeting_dir = meeting_audio_dir(&self.chunk_storage_dir, &snapshot.meeting_id);
-            let has_recording_file = meeting_dir.is_dir()
-                && fs::read_dir(&meeting_dir)
+            let meeting = self.load_meeting(&snapshot.meeting_id).await.ok();
+            let workspace = meeting.as_ref().map(|m| self.workspace_for_meeting(m));
+            let audio_dir = workspace
+                .as_ref()
+                .map(|w| w.audio_dir())
+                .filter(|dir| dir.is_dir())
+                .unwrap_or_else(|| {
+                    crate::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir)
+                        .legacy_meeting_dir(&snapshot.meeting_id)
+                });
+            let has_recording_file = audio_dir.is_dir()
+                && fs::read_dir(&audio_dir)
                     .map(|entries| {
                         entries.filter_map(Result::ok).any(|e| {
                             e.path().extension().and_then(|ext| ext.to_str()) == Some("wav")
@@ -633,7 +655,7 @@ impl ScaffoldHandler {
                 RecoveryEffect::SummaryRequeued { .. }
                 | RecoveryEffect::StopConfirmedClientDisconnect { .. } => {
                     // Merge per-user chunks into mixdown before ASR
-                    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+                    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir) {
                         warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
                         let _ = self.post_failure_for_meeting(
                             &ctx.http,
@@ -778,6 +800,15 @@ impl ScaffoldHandler {
         let manager = songbird::get(ctx)
             .await
             .ok_or_else(|| "songbird not initialized".to_owned())?;
+        let layout = crate::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
+        let workspace = layout.for_meeting(
+            &guild_id.get().to_string(),
+            &voice_channel_id_u64.to_string(),
+            &meeting_id,
+        );
+        workspace
+            .ensure_base_dirs()
+            .map_err(|err| format!("failed to prepare workspace: {err}"))?;
         // Insert session BEFORE joining VC so voice events aren't dropped
         {
             let mut sessions = self.sessions.lock().await;
@@ -785,7 +816,7 @@ impl ScaffoldHandler {
                 guild_id.get().to_string(),
                 RecordingSession::new(
                     meeting_id.clone(),
-                    LocalChunkStorage::new(&self.chunk_storage_dir),
+                    LocalChunkStorage::new(workspace.clone(), meeting_id.clone()),
                     ReceiverConfig::default(),
                     48_000,
                 ),
@@ -1100,6 +1131,32 @@ impl ScaffoldHandler {
         })
     }
 
+    async fn load_meeting(&self, meeting_id: &str) -> Result<StoredMeeting, String> {
+        let mut service = self.service.lock().await;
+        service
+            .store
+            .get_meeting(meeting_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("meeting not found: meeting_id={meeting_id}"))
+    }
+
+    fn workspace_for_meeting(
+        &self,
+        meeting: &StoredMeeting,
+    ) -> crate::workspace::MeetingWorkspacePaths {
+        crate::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir).for_meeting(
+            &meeting.guild_id,
+            &meeting.voice_channel_id,
+            &meeting.id,
+        )
+    }
+
+    fn legacy_mixdown_path(&self, meeting_id: &str) -> PathBuf {
+        crate::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir)
+            .legacy_meeting_dir(meeting_id)
+            .join("mixdown.wav")
+    }
+
     async fn process_enqueued_summary_job(
         &self,
         meeting_id: &str,
@@ -1114,7 +1171,26 @@ impl ScaffoldHandler {
             retry_policy: self.integration_retry_policy,
         };
         let job_id = format!("summary-{meeting_id}");
-        let audio_path = meeting_audio_path(&self.chunk_storage_dir, meeting_id);
+        let meeting = self.load_meeting(meeting_id).await?;
+        let workspace = self.workspace_for_meeting(&meeting);
+        workspace
+            .ensure_base_dirs()
+            .map_err(|err| format!("failed to prepare workspace: {err}"))?;
+        let (audio_path, using_legacy_audio) = {
+            let primary = workspace.mixdown_path();
+            if primary.exists() {
+                (primary, false)
+            } else {
+                (self.legacy_mixdown_path(&meeting.id), true)
+            }
+        };
+        if using_legacy_audio {
+            warn!(
+                meeting_id = %meeting.id,
+                path = %audio_path.display(),
+                "falling back to legacy mixdown path"
+            );
+        }
 
         let claimed_job = {
             let mut queue = self.queue.lock().await;
@@ -1134,9 +1210,12 @@ impl ScaffoldHandler {
 
         let request = crate::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
-            title: None,
-            audio_path,
+            guild_id: meeting.guild_id.clone(),
+            voice_channel_id: meeting.voice_channel_id.clone(),
+            title: meeting.title.clone(),
+            audio_path: audio_path.to_string_lossy().to_string(),
             language: self.whisper_language.clone(),
+            workspace: workspace.clone(),
         };
 
         // Phase 1: Transcription (mutex held only for status update)
@@ -1243,11 +1322,9 @@ impl ScaffoldHandler {
         }
 
         let markdown = tokio::task::block_in_place(|| {
-            let prompt = crate::summary::build_summary_prompt(
-                &request,
-                &transcription.transcript_for_summary,
-            );
-            claude.summarize(&prompt)
+            let manifest = crate::summary::write_transcript_files(&request, &transcription)?;
+            let prompt = crate::summary::build_summary_prompt(&request, &manifest);
+            claude.summarize(&prompt, Some(request.workspace.root()))
         });
         let markdown = match markdown {
             Ok(m) => m,
@@ -1577,8 +1654,25 @@ async fn run_summary_background(
     http: &Http,
     meeting_id: &str,
 ) -> Result<(), String> {
-    let meeting_dir = meeting_audio_dir(&handler.chunk_storage_dir, meeting_id);
-    if let Err(err) = merge_user_chunks_to_mixdown(&meeting_dir) {
+    let meeting = handler.load_meeting(meeting_id).await.ok();
+    let workspace = meeting.as_ref().map(|m| handler.workspace_for_meeting(m));
+    let audio_dir = workspace
+        .as_ref()
+        .map(|w| w.audio_dir())
+        .filter(|dir| dir.exists())
+        .unwrap_or_else(|| {
+            crate::workspace::MeetingWorkspaceLayout::new(&handler.chunk_storage_dir)
+                .legacy_meeting_dir(meeting_id)
+        });
+    if workspace.is_none() || !audio_dir.starts_with(&handler.chunk_storage_dir) {
+        warn!(
+            meeting_id = %meeting_id,
+            path = %audio_dir.display(),
+            "using legacy audio directory while merging chunks"
+        );
+    }
+
+    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir) {
         warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
         let _ = handler
             .post_failure_for_meeting(

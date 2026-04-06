@@ -40,7 +40,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `WHISPER_ENDPOINT` | whisper.cpp サーバーの URL | `http://localhost:8080` |
 | `CLAUDE_COMMAND` | Claude CLI の実行パス | `/usr/local/bin/claude` |
 | `DATABASE_URL` | PostgreSQL 接続文字列 | `postgresql://user:pass@localhost/discord_transcript` |
-| `CHUNK_STORAGE_DIR` | 音声チャンクの保存ディレクトリ | `/var/data/chunks` |
+| `CHUNK_STORAGE_DIR` | 会議ワークスペースのルート (`workspaces/<guild>/<voice>/<meeting>/...`) | `/var/data/chunks` |
 
 #### オプション
 
@@ -53,6 +53,18 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
+
+### ワークスペース構造
+
+`CHUNK_STORAGE_DIR` 配下に会議ごとのワークスペースを作成します。
+
+- ルート: `workspaces/<guild_id>/<voice_channel_id>/<meeting_id>/`
+- `audio/`: ユーザーごとのチャンクと `mixdown.wav`
+- `transcript/`: `transcript_masked.md`（PII マスク済み文字起こし）、`manifest.json`（meeting_id / guild_id / voice_channel_id / language / masking_stats / generated_at）
+- `context/`: 将来のドメイン知識ファイル用プレースホルダ
+- `summary/`: 将来の要約成果物置き場
+
+Claude 要約はこのワークスペースを作業ディレクトリとして起動し、トランスクリプトはプロンプトに直埋めせず `transcript/transcript_masked.md` を参照します（`transcript/manifest.json` でメタデータを共有）。
 
 ### 4. ビルド
 

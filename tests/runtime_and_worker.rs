@@ -6,7 +6,26 @@ use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::summary::StubClaudeSummaryClient;
 use discord_transcript::worker::{ProcessMeetingInput, process_meeting_summary};
+use discord_transcript::workspace::MeetingWorkspaceLayout;
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn temp_workspace(
+    meeting_id: &str,
+) -> (
+    PathBuf,
+    discord_transcript::workspace::MeetingWorkspacePaths,
+) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "discord_transcript_runtime_worker_{meeting_id}_{nanos}"
+    ));
+    let layout = MeetingWorkspaceLayout::new(&base);
+    (base, layout.for_meeting("g1", "vc", meeting_id))
+}
 
 #[test]
 fn app_config_loads_from_map() {
@@ -269,15 +288,19 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
     let claude = StubClaudeSummaryClient {
         mocked_markdown: "ignored".to_owned(),
     };
+    let (base, workspace) = temp_workspace("m1");
     let result = process_meeting_summary(
         &mut store,
         &whisper,
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc".to_owned(),
             title: None,
-            audio_path: "audio.wav".to_owned(),
+            audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             language: None,
+            workspace: workspace.clone(),
         },
     );
 
@@ -286,6 +309,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
     // process_meeting_summary transitions Stopping→Transcribing, transcription fails,
     // then reverts back to Stopping so the next retry's CAS guard succeeds.
     assert_eq!(saved.status, MeetingStatus::Stopping);
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -314,15 +338,19 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         mocked_markdown: "## Summary\nall good".to_owned(),
     };
 
+    let (base, workspace) = temp_workspace("m1_summary");
     let output = process_meeting_summary(
         &mut store,
         &whisper,
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc".to_owned(),
             title: None,
-            audio_path: "audio.wav".to_owned(),
+            audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             language: None,
+            workspace: workspace.clone(),
         },
     )
     .expect("worker should succeed");
@@ -331,4 +359,5 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.status, MeetingStatus::Summarizing);
     assert_eq!(saved.error_message, None);
+    let _ = std::fs::remove_dir_all(base);
 }

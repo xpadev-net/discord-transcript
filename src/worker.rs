@@ -3,7 +3,9 @@ use crate::queue::{Job, JobQueue, QueueError};
 use crate::storage::{MeetingStore, StoreError};
 use crate::summary::{
     ClaudeSummaryClient, SummaryError, SummaryRequest, build_summary_prompt, run_transcription,
+    write_transcript_files,
 };
+use crate::workspace::MeetingWorkspacePaths;
 use crate::{asr::WhisperClient, posting::split_discord_message};
 use std::fmt::{Display, Formatter};
 use tracing::{error, info, warn};
@@ -11,9 +13,12 @@ use tracing::{error, info, warn};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMeetingInput {
     pub meeting_id: String,
+    pub guild_id: String,
+    pub voice_channel_id: String,
     pub title: Option<String>,
     pub audio_path: String,
     pub language: Option<String>,
+    pub workspace: MeetingWorkspacePaths,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,9 +80,12 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
 
     let request = SummaryRequest {
         meeting_id: input.meeting_id.clone(),
+        guild_id: input.guild_id.clone(),
+        voice_channel_id: input.voice_channel_id.clone(),
         title: input.title.clone(),
         audio_path: input.audio_path.clone(),
         language: input.language.clone(),
+        workspace: input.workspace.clone(),
     };
 
     store.set_meeting_status(
@@ -104,8 +112,20 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         MeetingStatus::Summarizing,
         Some(MeetingStatus::Transcribing),
     )?;
-    let prompt = build_summary_prompt(&request, &transcription.transcript_for_summary);
-    let markdown = match claude.summarize(&prompt) {
+    let manifest = match write_transcript_files(&request, &transcription) {
+        Ok(value) => value,
+        Err(err) => {
+            error!(meeting_id = %input.meeting_id, error = %err, "transcript materialization failed");
+            let _ = store.set_meeting_status(
+                &input.meeting_id,
+                MeetingStatus::Stopping,
+                Some(MeetingStatus::Summarizing),
+            );
+            return Err(WorkerError::from(err));
+        }
+    };
+    let prompt = build_summary_prompt(&request, &manifest);
+    let markdown = match claude.summarize(&prompt, Some(request.workspace.root())) {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summarization failed");
@@ -158,11 +178,41 @@ where
     };
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");
 
+    let meeting = store
+        .get_meeting(&job.meeting_id)
+        .map_err(WorkerError::from)?
+        .ok_or_else(|| {
+            WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
+        })?;
+    let layout = crate::workspace::MeetingWorkspaceLayout::new(audio_base_dir);
+    let workspace = layout.for_meeting(
+        &meeting.guild_id,
+        &meeting.voice_channel_id,
+        &job.meeting_id,
+    );
+    workspace.ensure_base_dirs().map_err(|err| {
+        WorkerError::from(SummaryError::SummaryEngine(format!(
+            "failed to prepare workspace: {err}"
+        )))
+    })?;
+    let primary_mixdown = workspace.mixdown_path();
+    let legacy_mixdown = layout
+        .legacy_meeting_dir(&job.meeting_id)
+        .join("mixdown.wav");
+    let audio_path = if primary_mixdown.exists() {
+        primary_mixdown
+    } else {
+        legacy_mixdown
+    };
+
     let input = ProcessMeetingInput {
         meeting_id: job.meeting_id.clone(),
-        title: None,
-        audio_path: crate::runtime::meeting_audio_path(audio_base_dir, &job.meeting_id),
+        guild_id: meeting.guild_id.clone(),
+        voice_channel_id: meeting.voice_channel_id.clone(),
+        title: meeting.title.clone(),
+        audio_path: audio_path.to_string_lossy().to_string(),
         language: None,
+        workspace,
     };
 
     match process_meeting_summary(store, whisper, claude, &input) {

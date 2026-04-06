@@ -3,6 +3,7 @@ use discord_transcript::recording_session::RecordingSession;
 use discord_transcript::runtime::ingest_voice_frames_into_session;
 use discord_transcript::songbird_adapter::AdaptedVoiceFrames;
 use discord_transcript::storage_fs::LocalChunkStorage;
+use discord_transcript::workspace::MeetingWorkspaceLayout;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,9 +19,11 @@ fn unique_temp_dir(test_name: &str) -> PathBuf {
 #[test]
 fn ingest_voice_frames_into_session_persists_due_chunks() {
     let base = unique_temp_dir("ingest");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g1", "vc1", "meeting-rt");
     let mut session = RecordingSession::new(
         "meeting-rt".to_owned(),
-        LocalChunkStorage::new(&base),
+        LocalChunkStorage::new(workspace, "meeting-rt"),
         discord_transcript::receiver::ReceiverConfig {
             // Use zero duration so the chunk flushes immediately upon ingest.
             chunk_duration: Duration::ZERO,
