@@ -510,6 +510,7 @@ struct DiscordGuildFull {
 #[derive(Deserialize)]
 struct DiscordRoleFull {
     id: String,
+    #[serde(deserialize_with = "deserialize_string_or_number")]
     permissions: String,
 }
 
@@ -524,13 +525,42 @@ struct DiscordOverwrite {
     id: String,
     #[serde(rename = "type")]
     type_: u8, // 0 = role, 1 = member
+    #[serde(deserialize_with = "deserialize_string_or_number")]
     allow: String,
+    #[serde(deserialize_with = "deserialize_string_or_number")]
     deny: String,
 }
 
 #[derive(Deserialize)]
 struct DiscordMemberFull {
     roles: Vec<String>,
+}
+
+/// Discord API returns permission values as either strings or integers
+/// depending on the API version and context. Accept both.
+fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrNumber;
+    impl<'de> de::Visitor<'de> for StringOrNumber {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or number")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_owned())
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    deserializer.deserialize_any(StringOrNumber)
 }
 
 /// Compute a user's effective permissions for a channel following Discord's
