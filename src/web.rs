@@ -19,10 +19,7 @@ pub fn create_router(state: WebState) -> Router {
     Router::new()
         .route("/meetings/{meeting_id}", get(meeting_page))
         .route("/api/meetings/{meeting_id}", get(api_meeting))
-        .route(
-            "/api/meetings/{meeting_id}/transcript",
-            get(api_transcript),
-        )
+        .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
         .route("/api/meetings/{meeting_id}/audio", get(api_audio))
         .with_state(state)

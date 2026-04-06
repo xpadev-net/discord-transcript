@@ -195,9 +195,10 @@ fn optional_env_parse_u16(key: &'static str) -> Result<Option<u16>, ConfigError>
     let Some(value) = optional_env(key) else {
         return Ok(None);
     };
-    let parsed = value
-        .parse::<u16>()
-        .map_err(|_| ConfigError::InvalidEnv { key, value: value.clone() })?;
+    let parsed = value.parse::<u16>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
     if parsed == 0 {
         return Err(ConfigError::InvalidEnv { key, value });
     }
@@ -211,9 +212,10 @@ fn optional_from_map_parse_u16(
     let Some(value) = optional_from_map(values, key) else {
         return Ok(None);
     };
-    let parsed = value
-        .parse::<u16>()
-        .map_err(|_| ConfigError::InvalidEnv { key, value: value.clone() })?;
+    let parsed = value.parse::<u16>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
     if parsed == 0 {
         return Err(ConfigError::InvalidEnv { key, value });
     }

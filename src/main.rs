@@ -32,7 +32,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             '?'
         };
-        format!("{}{}sslmode={}", config.database_url, sep, config.database_ssl_mode)
+        format!(
+            "{}{}sslmode={}",
+            config.database_url, sep, config.database_ssl_mode
+        )
     };
     let (db_client, db_connection) = tokio_postgres::connect(&db_url, NoTls).await?;
     tokio::spawn(async move {

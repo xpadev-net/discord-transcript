@@ -1011,18 +1011,11 @@ impl ScaffoldHandler {
                 }
                 // Post meeting URL if PUBLIC_BASE_URL is configured
                 if let Some(ref base_url) = self.public_base_url {
-                    let url = format!(
-                        "{}/meetings/{}",
-                        base_url.trim_end_matches('/'),
-                        meeting_id,
-                    );
+                    let url =
+                        format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id,);
                     let url_msg = format!("詳細はこちら: {url}");
-                    let _ = post_summary_to_report_channel(
-                        http,
-                        report_channel_id,
-                        &[url_msg],
-                    )
-                    .await;
+                    let _ =
+                        post_summary_to_report_channel(http, report_channel_id, &[url_msg]).await;
                 }
                 // Mark meeting as Posted and job as Done only after successful posting.
                 // This order prevents data loss: if posting fails, the job stays
@@ -1216,11 +1209,7 @@ impl ScaffoldHandler {
                 params.push(seg.start_ms.to_string());
                 params.push(seg.end_ms.to_string());
                 params.push(seg.text.clone());
-                params.push(
-                    seg.confidence
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                );
+                params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
                 params.push(seg.is_noisy.to_string());
             }
             let mut service = self.service.lock().await;
@@ -1304,11 +1293,7 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(
                 crate::sql::INSERT_SUMMARY_SQL,
-                &[
-                    summary_id,
-                    claimed_job.meeting_id.clone(),
-                    markdown.clone(),
-                ],
+                &[summary_id, claimed_job.meeting_id.clone(), markdown.clone()],
             ) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
