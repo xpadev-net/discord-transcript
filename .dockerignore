@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+docs/
+tests/
+*.md
+.env
+.env.example
+docker-compose.yml
