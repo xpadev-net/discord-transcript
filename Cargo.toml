@@ -8,7 +8,7 @@ regex = "1.12.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serenity = { version = "0.12.5", features = ["client", "gateway", "model", "rustls_backend"] }
-songbird = { version = "0.5.0", features = ["serenity", "rustls", "receive"] }
+songbird = { version = "0.6.0", features = ["serenity", "rustls", "receive"] }
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7.15"
 tracing = "0.1.41"

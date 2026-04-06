@@ -27,7 +27,7 @@ use serenity::all::{
 use serenity::async_trait;
 use serenity::http::Http;
 use serenity::prelude::{Client, Context, EventHandler};
-use songbird::driver::DecodeMode;
+use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::{
     Config as SongbirdConfig, CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
     SerenityInit,
@@ -343,7 +343,8 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
-    let songbird_config = SongbirdConfig::default().decode_mode(DecodeMode::Decode);
+    let songbird_config =
+        SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(handler)
         .register_songbird_from_config(songbird_config)
