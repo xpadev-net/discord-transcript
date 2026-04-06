@@ -49,7 +49,7 @@ impl WhisperClient for CommandWhisperClient {
                 .arg("POST")
                 .arg(format!("{}/inference", self.endpoint.trim_end_matches('/')))
                 .arg("-F")
-                .arg(format!("audio=@{}", request.audio_path));
+                .arg(format!("file=@{}", request.audio_path));
 
             if let Some(language) = &request.language {
                 cmd.arg("-F").arg(format!("language={language}"));
