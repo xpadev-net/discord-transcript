@@ -18,6 +18,9 @@ services:
       WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-ja}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       WEB_PORT: ${WEB_PORT:-3000}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
     volumes:
       - ${HOME}/.claude:/home/app/.claude
       - chunks:/data/chunks

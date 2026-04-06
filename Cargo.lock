@@ -673,13 +673,17 @@ name = "discord-transcript"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hmac",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "serenity",
+ "sha2",
  "songbird",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

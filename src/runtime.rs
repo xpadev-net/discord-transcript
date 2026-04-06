@@ -1011,11 +1011,13 @@ impl ScaffoldHandler {
                 }
                 // Post meeting URL if PUBLIC_BASE_URL is configured
                 if let Some(ref base_url) = self.public_base_url {
-                    let url =
-                        format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id,);
+                    let url = format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id);
                     let url_msg = format!("詳細はこちら: {url}");
-                    let _ =
-                        post_summary_to_report_channel(http, report_channel_id, &[url_msg]).await;
+                    if let Err(err) =
+                        post_summary_to_report_channel(http, report_channel_id, &[url_msg]).await
+                    {
+                        warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
+                    }
                 }
                 // Mark meeting as Posted and job as Done only after successful posting.
                 // This order prevents data loss: if posting fails, the job stays

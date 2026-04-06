@@ -23,5 +23,6 @@ COPY --from=builder /app/target/release/discord-transcript /usr/local/bin/discor
 
 USER app
 ENV HOME=/home/app
+EXPOSE 3000
 
 CMD ["discord-transcript"]

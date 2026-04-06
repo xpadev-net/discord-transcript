@@ -495,6 +495,7 @@ audio::-webkit-media-controls-panel {
     }
 
     function inlineFormat(str) {
+      str = escapeHtml(str);
       str = str.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
       str = str.replace(/\*(.+?)\*/g, "<em>$1</em>");
       return str;
@@ -603,7 +604,7 @@ audio::-webkit-media-controls-panel {
 
         el.innerHTML =
           '<div class="segment-meta">' +
-            '<span class="speaker-badge" style="background:' + color + '">Speaker ' + seg.speaker_id.slice(-4) + '</span>' +
+            '<span class="speaker-badge" style="background:' + color + '">Speaker ' + escapeHtml(seg.speaker_id.slice(-4)) + '</span>' +
             '<span class="segment-time">' + formatTimestamp(seg.start_ms) + '</span>' +
           '</div>' +
           '<div class="segment-text">' + escapeHtml(seg.text) + '</div>';

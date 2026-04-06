@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub whisper_language: Option<String>,
     pub public_base_url: Option<String>,
     pub web_port: u16,
+    pub discord_client_id: Option<String>,
+    pub discord_client_secret: Option<String>,
+    pub web_session_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +74,9 @@ impl AppConfig {
             whisper_language: optional_env_language("WHISPER_LANGUAGE")?,
             public_base_url: optional_env("PUBLIC_BASE_URL"),
             web_port: optional_env_parse_u16("WEB_PORT")?.unwrap_or(3000),
+            discord_client_id: optional_env("DISCORD_CLIENT_ID"),
+            discord_client_secret: optional_env("DISCORD_CLIENT_SECRET"),
+            web_session_secret: optional_env("WEB_SESSION_SECRET"),
         })
     }
 
@@ -109,6 +115,9 @@ impl AppConfig {
             whisper_language: optional_from_map_language(values, "WHISPER_LANGUAGE")?,
             public_base_url: optional_from_map(values, "PUBLIC_BASE_URL"),
             web_port: optional_from_map_parse_u16(values, "WEB_PORT")?.unwrap_or(3000),
+            discord_client_id: optional_from_map(values, "DISCORD_CLIENT_ID"),
+            discord_client_secret: optional_from_map(values, "DISCORD_CLIENT_SECRET"),
+            web_session_secret: optional_from_map(values, "WEB_SESSION_SECRET"),
         })
     }
 }
