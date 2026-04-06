@@ -421,8 +421,8 @@ audio::-webkit-media-controls-panel {
 
 <script>
 (function() {
-  var MEETING_ID = "{{MEETING_ID}}";
-  var BASE = "/api/meetings/" + MEETING_ID;
+  var MEETING_ID = {{MEETING_ID}};
+  var BASE = "/api/meetings/" + encodeURIComponent(MEETING_ID);
 
   var speakerColors = [
     "var(--speaker-1)", "var(--speaker-2)", "var(--speaker-3)",
@@ -609,12 +609,25 @@ audio::-webkit-media-controls-panel {
           '</div>' +
           '<div class="segment-text">' + escapeHtml(seg.text) + '</div>';
 
-        el.addEventListener("click", (function(startMs) {
+        el.tabIndex = 0;
+        el.setAttribute("role", "button");
+
+        var seekFn = (function(startMs) {
           return function() {
             audioPlayer.currentTime = startMs / 1000;
             audioPlayer.play();
           };
-        })(seg.start_ms));
+        })(seg.start_ms);
+
+        el.addEventListener("click", seekFn);
+        el.addEventListener("keydown", (function(fn) {
+          return function(e) {
+            if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+              e.preventDefault();
+              fn();
+            }
+          };
+        })(seekFn));
 
         container.appendChild(el);
       }

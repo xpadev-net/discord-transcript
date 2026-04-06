@@ -622,11 +622,11 @@ async fn meeting_page(
 ) -> Result<Html<String>, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
-    let escaped = serde_json::to_string(&meeting_id).unwrap_or_default();
-    let escaped = escaped[1..escaped.len() - 1]
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    // serde_json produces a quoted, JS-safe string (escapes ", \, control chars).
+    // Escape </ to <\/ to prevent </script> injection inside the script tag.
+    let escaped = serde_json::to_string(&meeting_id)
+        .unwrap_or_default()
+        .replace("</", "<\\/");
     let html = MEETING_HTML.replace("{{MEETING_ID}}", &escaped);
     Ok(Html(html))
 }
@@ -770,26 +770,35 @@ async fn api_audio(
 // ---------- Helpers ----------
 
 fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
+    if file_size == 0 {
+        return None;
+    }
     let range_str = range_str.strip_prefix("bytes=")?;
     let mut parts = range_str.splitn(2, '-');
     let start_str = parts.next()?.trim();
     let end_str = parts.next()?.trim();
 
     if start_str.is_empty() {
+        // Suffix range: bytes=-N
         let suffix_len: u64 = end_str.parse().ok()?;
+        if suffix_len == 0 {
+            return None;
+        }
         let start = file_size.saturating_sub(suffix_len);
         Some((start, file_size - 1))
     } else {
         let start: u64 = start_str.parse().ok()?;
+        if start >= file_size {
+            return None;
+        }
         let end = if end_str.is_empty() {
             file_size - 1
         } else {
-            end_str.parse().ok()?
+            end_str.parse::<u64>().ok()?.min(file_size - 1)
         };
-        if start > end || start >= file_size {
+        if start > end {
             return None;
         }
-        let end = end.min(file_size - 1);
         Some((start, end))
     }
 }
@@ -801,8 +810,10 @@ async fn read_file_range(
 ) -> Result<Vec<u8>, StatusCode> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let buf_len =
-        usize::try_from(length.min(MAX_RANGE_BYTES)).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if length > MAX_RANGE_BYTES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let buf_len = usize::try_from(length).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let mut file = tokio::fs::File::open(path)
         .await
