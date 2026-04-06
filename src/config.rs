@@ -185,7 +185,7 @@ fn optional_from_map_parse_u64(
         .map_err(|_| ConfigError::InvalidEnv { key, value })
 }
 
-fn is_iso639_1(s: &str) -> bool {
+fn is_iso639_1_format(s: &str) -> bool {
     s.len() == 2 && s.bytes().all(|b| b.is_ascii_lowercase())
 }
 
@@ -194,7 +194,7 @@ fn optional_env_language(key: &'static str) -> Result<Option<String>, ConfigErro
         return Ok(None);
     };
     let value = raw.trim().to_owned();
-    if is_iso639_1(&value) {
+    if is_iso639_1_format(&value) {
         Ok(Some(value))
     } else {
         Err(ConfigError::InvalidEnv { key, value })
@@ -208,7 +208,7 @@ fn optional_from_map_language(
     let Some(value) = optional_from_map(values, key) else {
         return Ok(None);
     };
-    if is_iso639_1(&value) {
+    if is_iso639_1_format(&value) {
         Ok(Some(value))
     } else {
         Err(ConfigError::InvalidEnv { key, value })
