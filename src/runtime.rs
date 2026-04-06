@@ -805,7 +805,15 @@ impl ScaffoldHandler {
                         );
                         last_err = Some(err);
                         // Clean up partial gateway state before retrying
-                        let _ = manager.leave(guild_id).await;
+                        if let Err(leave_err) = manager.leave(guild_id).await {
+                            warn!(
+                                attempt,
+                                guild_id = %guild_id.get(),
+                                meeting_id = %meeting_id,
+                                error = %leave_err,
+                                "failed to leave voice channel during retry cleanup"
+                            );
+                        }
                         if attempt < 3 {
                             sleep(join_delay).await;
                             join_delay *= 2;
@@ -829,13 +837,27 @@ impl ScaffoldHandler {
                     drop(sessions);
                     // manager.leave() already called in the retry loop above
                     let mut service = self.service.lock().await;
-                    let _ =
+                    if let Err(e) =
                         service
                             .store
-                            .set_meeting_status(&meeting_id, MeetingStatus::Failed, None);
-                    let _ = service
+                            .set_meeting_status(&meeting_id, MeetingStatus::Failed, None)
+                    {
+                        error!(
+                            meeting_id = %meeting_id,
+                            error = %e,
+                            "failed to mark meeting as failed in database"
+                        );
+                    }
+                    if let Err(e) = service
                         .store
-                        .set_error_message(&meeting_id, Some(err_msg.clone()));
+                        .set_error_message(&meeting_id, Some(err_msg.clone()))
+                    {
+                        error!(
+                            meeting_id = %meeting_id,
+                            error = %e,
+                            "failed to persist error message in database"
+                        );
+                    }
                     return Err(err_msg);
                 }
             }
