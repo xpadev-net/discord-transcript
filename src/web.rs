@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio_postgres::Client as PgClient;
+use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -442,32 +443,49 @@ async fn check_channel_permission(
             .send(),
     );
 
-    let guild: DiscordGuildFull = guild_res
-        .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .json()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let guild_resp = guild_res.map_err(|err| {
+        warn!(error = %err, "discord guild API request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let guild_body = guild_resp.text().await.map_err(|err| {
+        warn!(error = %err, "discord guild API response read failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
+        warn!(
+            error = %err,
+            body_preview = %&guild_body[..guild_body.len().min(500)],
+            "discord guild API response parse failed"
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
 
-    let channel: DiscordChannelFull = channel_res
-        .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .json()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let channel_resp = channel_res.map_err(|err| {
+        warn!(error = %err, "discord channel API request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let channel: DiscordChannelFull = channel_resp.json().await.map_err(|err| {
+        warn!(error = %err, "discord channel API response parse failed");
+        StatusCode::BAD_GATEWAY
+    })?;
 
-    let member_resp = member_res.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let member_resp = member_res.map_err(|err| {
+        warn!(error = %err, "discord member API request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
     if member_resp.status() == reqwest::StatusCode::NOT_FOUND
         || member_resp.status() == reqwest::StatusCode::FORBIDDEN
     {
-        // User is not a member of the guild
         return Ok(false);
     }
     if !member_resp.status().is_success() {
+        warn!(status = %member_resp.status(), "discord member API non-success");
         return Err(StatusCode::BAD_GATEWAY);
     }
-    let member: DiscordMemberFull = member_resp
-        .json()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let member: DiscordMemberFull = member_resp.json().await.map_err(|err| {
+        warn!(error = %err, "discord member API response parse failed");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let perms = compute_channel_permissions(
         user_id,
@@ -497,6 +515,7 @@ struct DiscordRoleFull {
 
 #[derive(Deserialize)]
 struct DiscordChannelFull {
+    #[serde(default)]
     permission_overwrites: Vec<DiscordOverwrite>,
 }
 
