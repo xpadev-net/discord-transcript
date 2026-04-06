@@ -21,8 +21,8 @@ use crate::summary::ClaudeSummaryClient;
 use crate::worker::enqueue_summary_job;
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
-    CreateInteractionResponse, CreateInteractionResponseMessage, GatewayIntents, GuildId,
-    Interaction, Ready, UserId, VoiceState,
+    CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
+    GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -394,19 +394,45 @@ impl EventHandler for ScaffoldHandler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Command(command) = interaction {
-            let message = self.handle_command(&ctx, &command).await;
+            // Acknowledge immediately to avoid Discord's 3-second timeout
             if let Err(err) = command
                 .create_response(
                     &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(message)
-                            .ephemeral(true),
+                    CreateInteractionResponse::Defer(
+                        CreateInteractionResponseMessage::new().ephemeral(true),
                     ),
                 )
                 .await
             {
-                error!(error = %err, "failed to send interaction response");
+                error!(error = %err, "failed to defer interaction response");
+                return;
+            }
+
+            let message = self.handle_command(&ctx, &command).await;
+
+            let mut delay = Duration::from_millis(200);
+            let mut last_err = None;
+            for attempt in 1..=3u32 {
+                match command
+                    .edit_response(&ctx.http, EditInteractionResponse::new().content(&message))
+                    .await
+                {
+                    Ok(_) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => {
+                        error!(attempt, error = %err, "failed to edit interaction response");
+                        last_err = Some(err);
+                        if attempt < 3 {
+                            sleep(delay).await;
+                            delay *= 2;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = last_err {
+                error!(error = %err, "all retries exhausted for edit interaction response");
             }
         }
     }
@@ -852,8 +878,9 @@ impl ScaffoldHandler {
                 let outcome = result.outcome;
 
                 if outcome == StopOutcome::Owner {
-                    // Spawn summary processing in background to avoid blocking
-                    // the Discord interaction response (3-second timeout).
+                    // Spawn summary processing in background — transcription and
+                    // AI summarization can take minutes, far beyond the interaction
+                    // response window, and should not block the command reply.
                     let handler = self.clone();
                     let http = Arc::clone(&ctx.http);
                     tokio::spawn(async move {
