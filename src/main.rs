@@ -44,7 +44,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (db_client, db_connection) = tokio_postgres::connect(&db_url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = db_connection.await {
-            tracing::error!(error = %err, "web db connection error");
+            tracing::error!(error = %err, "web db connection lost, exiting");
+            std::process::exit(1);
         }
     });
 
@@ -93,7 +94,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(host = %web_bind_host, port = web_port, "web server listening");
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
-            tracing::error!(error = %err, "web server error");
+            tracing::error!(error = %err, "web server fatal error, exiting");
+            std::process::exit(1);
         }
     });
 

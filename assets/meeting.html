@@ -432,7 +432,6 @@ audio::-webkit-media-controls-panel {
   ];
 
   var speakerColorMap = {};
-  var speakerIndex = 0;
 
   function getSpeakerColor(speakerId) {
     if (!speakerColorMap[speakerId]) {
@@ -442,7 +441,6 @@ audio::-webkit-media-controls-panel {
         hash = hash & hash;
       }
       speakerColorMap[speakerId] = speakerColors[Math.abs(hash) % speakerColors.length];
-      speakerIndex++;
     }
     return speakerColorMap[speakerId];
   }
@@ -550,9 +548,14 @@ audio::-webkit-media-controls-panel {
   var userScrolled = false;
   var scrollTimeout = null;
 
+  function checkResponse(r) {
+    if (!r.ok) throw new Error(r.status + " " + r.statusText);
+    return r.json();
+  }
+
   // Fetch meeting info
   fetch(BASE)
-    .then(function(r) { return r.json(); })
+    .then(checkResponse)
     .then(function(data) {
       document.getElementById("meeting-title").textContent = data.title || "Untitled meeting";
       document.title = data.title || "Meeting";
@@ -580,7 +583,7 @@ audio::-webkit-media-controls-panel {
 
   // Fetch transcript
   fetch(BASE + "/transcript")
-    .then(function(r) { return r.json(); })
+    .then(checkResponse)
     .then(function(data) {
       var container = document.getElementById("transcript-container");
       container.innerHTML = "";
@@ -648,7 +651,7 @@ audio::-webkit-media-controls-panel {
 
   // Fetch summary
   fetch(BASE + "/summary")
-    .then(function(r) { return r.json(); })
+    .then(checkResponse)
     .then(function(data) {
       var el = document.getElementById("summary-content");
       if (!data || !data.markdown) {

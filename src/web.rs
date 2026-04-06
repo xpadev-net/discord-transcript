@@ -455,11 +455,20 @@ async fn check_channel_permission(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    let member: DiscordMemberFull = member_res
-        .map_err(|_| StatusCode::FORBIDDEN)?
+    let member_resp = member_res.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if member_resp.status() == reqwest::StatusCode::NOT_FOUND
+        || member_resp.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        // User is not a member of the guild
+        return Ok(false);
+    }
+    if !member_resp.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let member: DiscordMemberFull = member_resp
         .json()
         .await
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
     let perms = compute_channel_permissions(
         user_id,
