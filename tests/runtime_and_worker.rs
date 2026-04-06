@@ -34,6 +34,49 @@ fn app_config_loads_from_map() {
     assert_eq!(config.integration_retry_initial_delay_ms, 200);
     assert_eq!(config.integration_retry_backoff_multiplier, 2);
     assert_eq!(config.integration_retry_max_delay_ms, 5_000);
+    assert_eq!(config.whisper_language, None);
+}
+
+#[test]
+fn app_config_accepts_valid_whisper_language() {
+    let mut values = HashMap::new();
+    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
+    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
+    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
+    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
+    values.insert(
+        "DATABASE_URL".to_owned(),
+        "postgres://localhost/db".to_owned(),
+    );
+    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    values.insert("WHISPER_LANGUAGE".to_owned(), "ja".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.whisper_language, Some("ja".to_owned()));
+}
+
+#[test]
+fn app_config_rejects_invalid_whisper_language() {
+    let mut values = HashMap::new();
+    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
+    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
+    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
+    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
+    values.insert(
+        "DATABASE_URL".to_owned(),
+        "postgres://localhost/db".to_owned(),
+    );
+    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    values.insert("WHISPER_LANGUAGE".to_owned(), "Japanese".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_LANGUAGE",
+            value: "Japanese".to_owned()
+        }
+    );
 }
 
 #[test]
