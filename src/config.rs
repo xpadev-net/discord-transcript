@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub integration_retry_backoff_multiplier: u32,
     pub integration_retry_max_delay_ms: u64,
     pub whisper_language: Option<String>,
+    pub public_base_url: Option<String>,
+    pub web_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,8 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_env_language("WHISPER_LANGUAGE")?,
+            public_base_url: optional_env("PUBLIC_BASE_URL"),
+            web_port: optional_env_parse_u16("WEB_PORT")?.unwrap_or(3000),
         })
     }
 
@@ -103,6 +107,8 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_from_map_language(values, "WHISPER_LANGUAGE")?,
+            public_base_url: optional_from_map(values, "PUBLIC_BASE_URL"),
+            web_port: optional_from_map_parse_u16(values, "WEB_PORT")?.unwrap_or(3000),
         })
     }
 }
@@ -183,6 +189,35 @@ fn optional_from_map_parse_u64(
         .parse::<u64>()
         .map(Some)
         .map_err(|_| ConfigError::InvalidEnv { key, value })
+}
+
+fn optional_env_parse_u16(key: &'static str) -> Result<Option<u16>, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidEnv { key, value: value.clone() })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
+}
+
+fn optional_from_map_parse_u16(
+    values: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<u16>, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidEnv { key, value: value.clone() })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
 }
 
 fn is_iso639_1_format(s: &str) -> bool {

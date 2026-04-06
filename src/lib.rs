@@ -29,4 +29,5 @@ pub mod storage;
 pub mod storage_fs;
 pub mod summary;
 pub mod transcript;
+pub mod web;
 pub mod worker;
