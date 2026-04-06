@@ -447,8 +447,16 @@ async fn check_channel_permission(
         warn!(error = %err, "discord guild API request failed");
         StatusCode::BAD_GATEWAY
     })?;
-    let guild: DiscordGuildFull = guild_resp.json().await.map_err(|err| {
-        warn!(error = %err, "discord guild API response parse failed");
+    let guild_body = guild_resp.text().await.map_err(|err| {
+        warn!(error = %err, "discord guild API response read failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
+        warn!(
+            error = %err,
+            body_preview = %&guild_body[..guild_body.len().min(500)],
+            "discord guild API response parse failed"
+        );
         StatusCode::BAD_GATEWAY
     })?;
 
