@@ -83,12 +83,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auth,
         http_client: reqwest::Client::new(),
+        permission_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let router = web::create_router(web_state);
 
+    let web_bind_host = config.web_bind_host.clone();
     let web_port = config.web_port;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", web_port)).await?;
-    tracing::info!(host = "127.0.0.1", port = web_port, "web server listening");
+    let listener = tokio::net::TcpListener::bind((&*web_bind_host, web_port)).await?;
+    tracing::info!(host = %web_bind_host, port = web_port, "web server listening");
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             tracing::error!(error = %err, "web server error");

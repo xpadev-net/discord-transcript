@@ -7,7 +7,9 @@ use axum::{Extension, Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio_postgres::Client as PgClient;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -22,12 +24,18 @@ const ADMINISTRATOR: u64 = 1 << 3;
 
 // ---------- State ----------
 
+const PERMISSION_CACHE_TTL_SECS: u64 = 60;
+
+type PermissionCache = Arc<Mutex<HashMap<(String, String), (bool, Instant)>>>;
+
 #[derive(Clone)]
 pub struct WebState {
     pub db: Arc<PgClient>,
     pub chunk_storage_dir: String,
     pub auth: Option<Arc<AuthConfig>>,
     pub http_client: reqwest::Client,
+    /// Cache: (user_id, channel_id) → (allowed, expires_at)
+    pub permission_cache: PermissionCache,
 }
 
 pub struct AuthConfig {
@@ -340,6 +348,8 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
 
 /// Verify that the authenticated user has VIEW_CHANNEL permission on the
 /// voice channel where the meeting was recorded.
+/// Results are cached per (user_id, channel_id) for 60 seconds to avoid
+/// Discord API rate-limit exhaustion on page loads (which trigger ~4 requests).
 async fn verify_meeting_access(
     state: &WebState,
     meeting_id: &str,
@@ -359,7 +369,58 @@ async fn verify_meeting_access(
         .ok_or(StatusCode::NOT_FOUND)?;
     let channel_id: String = row.get("voice_channel_id");
 
-    // Fetch guild info, channel info, and member info in parallel via bot token
+    // Check permission cache
+    let cache_key = (user_id.to_owned(), channel_id.clone());
+    {
+        let cache = state
+            .permission_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
+            && Instant::now() < expires_at
+        {
+            return if allowed {
+                Ok(())
+            } else {
+                Err(StatusCode::FORBIDDEN)
+            };
+        }
+    }
+
+    // Cache miss — query Discord API
+    let allowed = check_channel_permission(state, auth, &channel_id, user_id).await?;
+
+    // Store result in cache (also evict expired entries periodically)
+    {
+        let mut cache = state
+            .permission_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+        cache.insert(cache_key, (allowed, expires_at));
+
+        // Evict expired entries if cache grows large
+        if cache.len() > 1000 {
+            let now = Instant::now();
+            cache.retain(|_, (_, exp)| *exp > now);
+        }
+    }
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+/// Query Discord API for channel permission. Returns Ok(true) if allowed,
+/// Ok(false) if denied, Err on API failure.
+async fn check_channel_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
     let bot_auth = format!("Bot {}", auth.bot_token);
     let (guild_res, channel_res, member_res) = tokio::join!(
         state
@@ -409,11 +470,7 @@ async fn verify_meeting_access(
         &channel.permission_overwrites,
     );
 
-    if perms & VIEW_CHANNEL != 0 || perms & ADMINISTRATOR != 0 {
-        Ok(())
-    } else {
-        Err(StatusCode::FORBIDDEN)
-    }
+    Ok(perms & VIEW_CHANNEL != 0 || perms & ADMINISTRATOR != 0)
 }
 
 // Discord API response types for permission checking
@@ -736,19 +793,29 @@ async fn api_audio(
 
     if let Some(range_header) = headers.get(header::RANGE) {
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-        if let Some((start, end)) = parse_range(range_str, file_size) {
-            let length = end - start + 1;
-            let data = read_file_range(&path, start, length).await?;
+        match parse_range(range_str, file_size) {
+            Some((start, end)) => {
+                let length = end - start + 1;
+                let data = read_file_range(&path, start, length).await?;
 
-            let content_range = format!("bytes {start}-{end}/{file_size}");
-            return Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "audio/wav")
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_LENGTH, length.to_string())
-                .header(header::CONTENT_RANGE, content_range)
-                .body(axum::body::Body::from(data))
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                let content_range = format!("bytes {start}-{end}/{file_size}");
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "audio/wav")
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_LENGTH, length.to_string())
+                    .header(header::CONTENT_RANGE, content_range)
+                    .body(axum::body::Body::from(data))
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            None => {
+                // RFC 7233: 416 Range Not Satisfiable
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+                    .body(axum::body::Body::empty())
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            }
         }
     }
 
