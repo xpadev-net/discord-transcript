@@ -17,8 +17,6 @@ type HmacSha256 = Hmac<Sha256>;
 const MEETING_HTML: &str = include_str!("../assets/meeting.html");
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
-const MAX_RANGE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB cap for range reads
-
 const VIEW_CHANNEL: u64 = 1 << 10;
 const ADMINISTRATOR: u64 = 1 << 3;
 
@@ -805,16 +803,17 @@ async fn api_audio(
         match parse_range(range_str, file_size) {
             Some((start, end)) => {
                 let length = end - start + 1;
-                let data = read_file_range(&path, start, length).await?;
-
                 let content_range = format!("bytes {start}-{end}/{file_size}");
+
+                let body = stream_file_range(&path, start, length).await?;
+
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(header::CONTENT_TYPE, "audio/wav")
                     .header(header::ACCEPT_RANGES, "bytes")
                     .header(header::CONTENT_LENGTH, length.to_string())
                     .header(header::CONTENT_RANGE, content_range)
-                    .body(axum::body::Body::from(data))
+                    .body(body)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
             }
             None => {
@@ -879,17 +878,15 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     }
 }
 
-async fn read_file_range(
+/// Stream a byte range from a file. Seeks to `start` and limits the reader
+/// to `length` bytes, then wraps it in a `ReaderStream` so the response is
+/// streamed without buffering the entire range in memory.
+async fn stream_file_range(
     path: &std::path::Path,
     start: u64,
     length: u64,
-) -> Result<Vec<u8>, StatusCode> {
+) -> Result<axum::body::Body, StatusCode> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    if length > MAX_RANGE_BYTES {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let buf_len = usize::try_from(length).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let mut file = tokio::fs::File::open(path)
         .await
@@ -897,9 +894,7 @@ async fn read_file_range(
     file.seek(std::io::SeekFrom::Start(start))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut buf = vec![0u8; buf_len];
-    file.read_exact(&mut buf)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(buf)
+    let limited = file.take(length);
+    let stream = tokio_util::io::ReaderStream::new(limited);
+    Ok(axum::body::Body::from_stream(stream))
 }
