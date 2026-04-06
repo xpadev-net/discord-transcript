@@ -8,6 +8,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 
 COPY src/ src/
+COPY assets/ assets/
 RUN touch src/main.rs && cargo build --release
 
 FROM node:22-bookworm-slim
@@ -22,5 +23,6 @@ COPY --from=builder /app/target/release/discord-transcript /usr/local/bin/discor
 
 USER app
 ENV HOME=/home/app
+EXPOSE 3000
 
 CMD ["discord-transcript"]

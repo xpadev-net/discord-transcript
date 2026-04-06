@@ -12,7 +12,7 @@ use crate::recovery::RecoveryCandidate;
 use crate::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::retry::RetryPolicy;
 use crate::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
-use crate::sql::{INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
+use crate::sql::{INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
 use crate::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::stop::StopOutcome;
 use crate::storage::MeetingStore;
@@ -314,6 +314,9 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
     migration_store
         .apply_initial_migration(INITIAL_SCHEMA_SQL)
         .map_err(RuntimeError::DatabaseMigration)?;
+    migration_store
+        .apply_initial_migration(INCREMENTAL_MIGRATIONS_SQL)
+        .map_err(RuntimeError::DatabaseMigration)?;
     let base_executor = migration_store.executor;
 
     let handler = ScaffoldHandler {
@@ -341,6 +344,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
             backoff_multiplier: config.integration_retry_backoff_multiplier,
             max_delay: std::time::Duration::from_millis(config.integration_retry_max_delay_ms),
         },
+        public_base_url: config.public_base_url.clone(),
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
@@ -372,6 +376,7 @@ struct ScaffoldHandler {
     whisper_language: Option<String>,
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
+    public_base_url: Option<String>,
 }
 
 #[async_trait]
@@ -1007,6 +1012,16 @@ impl ScaffoldHandler {
                             .await;
                     return Err(err);
                 }
+                // Post meeting URL if PUBLIC_BASE_URL is configured
+                if let Some(ref base_url) = self.public_base_url {
+                    let url = format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id);
+                    let url_msg = format!("詳細はこちら: {url}");
+                    if let Err(err) =
+                        post_summary_to_report_channel(http, report_channel_id, &[url_msg]).await
+                    {
+                        warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
+                    }
+                }
                 // Mark meeting as Posted and job as Done only after successful posting.
                 // This order prevents data loss: if posting fails, the job stays
                 // Running and can be recovered on restart.
@@ -1188,6 +1203,30 @@ impl ScaffoldHandler {
             }
         };
 
+        // Persist transcript segments to DB (best-effort)
+        if !transcription.segments.is_empty() {
+            let sql = crate::sql::build_insert_transcripts_sql(transcription.segments.len());
+            let mut params = Vec::with_capacity(transcription.segments.len() * 8);
+            for (i, seg) in transcription.segments.iter().enumerate() {
+                params.push(format!("{}-t-{i}", claimed_job.meeting_id));
+                params.push(claimed_job.meeting_id.clone());
+                params.push(seg.speaker_id.clone());
+                params.push(seg.start_ms.to_string());
+                params.push(seg.end_ms.to_string());
+                params.push(seg.text.clone());
+                params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
+                params.push(seg.is_noisy.to_string());
+            }
+            let mut service = self.service.lock().await;
+            if let Err(err) = service.store.executor.execute(&sql, &params) {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "failed to persist transcript segments"
+                );
+            }
+        }
+
         // Phase 2: Summarization (mutex held only for status update)
         if let Err(cas_err) = {
             let mut service = self.service.lock().await;
@@ -1252,6 +1291,22 @@ impl ScaffoldHandler {
                 return Err(err.to_string());
             }
         };
+
+        // Persist summary markdown to DB (best-effort)
+        {
+            let summary_id = format!("{}-s-1", claimed_job.meeting_id);
+            let mut service = self.service.lock().await;
+            if let Err(err) = service.store.executor.execute(
+                crate::sql::INSERT_SUMMARY_SQL,
+                &[summary_id, claimed_job.meeting_id.clone(), markdown.clone()],
+            ) {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "failed to persist summary"
+                );
+            }
+        }
 
         let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
 

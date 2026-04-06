@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     end_ms INTEGER NOT NULL,
     text TEXT NOT NULL,
     confidence DOUBLE PRECISION,
+    is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -73,6 +74,12 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_meeting_kind
     ON artifacts (meeting_id, kind);
+"#;
+
+/// Incremental migrations applied after the initial schema.
+/// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
+pub const INCREMENTAL_MIGRATIONS_SQL: &str = r#"
+ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS is_noisy BOOLEAN NOT NULL DEFAULT FALSE;
 "#;
 
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
@@ -151,3 +158,37 @@ WHERE id = $1
   AND status = 'running'
 RETURNING status
 "#;
+
+pub const INSERT_SUMMARY_SQL: &str = r#"
+INSERT INTO summaries (id, meeting_id, version, markdown)
+VALUES ($1, $2, 1, $3)
+ON CONFLICT (meeting_id, version) DO UPDATE SET markdown = EXCLUDED.markdown
+"#;
+
+/// Build a multi-row INSERT statement for transcript segments.
+/// Each segment uses 8 parameters with explicit type casts for the
+/// String-only `SqlExecutor::execute` interface.
+pub fn build_insert_transcripts_sql(count: usize) -> String {
+    let mut sql = String::from(
+        "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy) VALUES ",
+    );
+    for i in 0..count {
+        let base = i * 8;
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!(
+            "(${}, ${}, ${}, ${}::INTEGER, ${}::INTEGER, ${}, NULLIF(${},'')::DOUBLE PRECISION, ${}::BOOLEAN)",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+        ));
+    }
+    sql.push_str(" ON CONFLICT (id) DO NOTHING");
+    sql
+}

@@ -59,8 +59,9 @@ impl From<WhisperParseError> for SummaryError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionOutput {
+    pub segments: Vec<crate::transcript::TranscriptSegment>,
     pub transcript_for_summary: String,
     pub masking_stats: MaskingStats,
 }
@@ -77,6 +78,7 @@ pub fn run_transcription<W: WhisperClient>(
     let rendered = render_for_summary(&normalized);
     let masked = mask_pii(&rendered);
     Ok(TranscriptionOutput {
+        segments: normalized,
         transcript_for_summary: masked.text,
         masking_stats: masked.stats,
     })
