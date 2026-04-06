@@ -68,7 +68,12 @@ impl WhisperClient for CommandWhisperClient {
 
             let body = String::from_utf8(output.stdout)
                 .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
-            parse_whisper_response(&body)
+            parse_whisper_response(&body).map_err(|err| {
+                let preview: String = body.chars().take(200).collect();
+                WhisperParseError::InvalidJson(format!(
+                    "{err} (response body preview: {preview:?})"
+                ))
+            })
         })
     }
 }
