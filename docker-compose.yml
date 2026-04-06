@@ -1,6 +1,10 @@
 services:
   app:
     build: .
+    # Host networking is required for Discord voice (songbird).
+    # Docker's bridge network does not reliably NAT the UDP traffic
+    # needed for voice gateway IP discovery and audio streaming.
+    network_mode: host
     depends_on:
       db:
         condition: service_healthy
@@ -8,11 +12,9 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@db/discord_transcript
+      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@127.0.0.1/discord_transcript
       CLAUDE_COMMAND: claude
       CHUNK_STORAGE_DIR: /data/chunks
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/.claude:/home/app/.claude
       - chunks:/data/chunks
@@ -24,6 +26,8 @@ services:
       POSTGRES_DB: discord_transcript
       POSTGRES_USER: discord_transcript
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
