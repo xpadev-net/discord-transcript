@@ -52,6 +52,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `INTEGRATION_RETRY_INITIAL_DELAY_MS` | `200` | リトライ初回遅延 (ms) |
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
+| `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
 | `CLAUDE_MODEL` | `haiku` | Claude CLI の `--model` に渡すモデル名 |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 
