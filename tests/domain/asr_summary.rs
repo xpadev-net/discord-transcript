@@ -148,6 +148,9 @@ fn parse_whisper_response_extracts_segments() {
 
 #[test]
 fn summary_pipeline_masks_pii_and_chunks_output() {
+    let original_email = "alice@example.com";
+    let original_phone = "+81 90-1234-5678";
+    let original_mention = "@bob";
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
           "text":"raw",
@@ -184,6 +187,9 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.transcript_for_summary.contains("[EMAIL_1]"));
     assert!(result.transcript_for_summary.contains("[PHONE_1]"));
     assert!(result.transcript_for_summary.contains("[USER_1]"));
+    assert!(!result.transcript_for_summary.contains(original_email));
+    assert!(!result.transcript_for_summary.contains(original_phone));
+    assert!(!result.transcript_for_summary.contains(original_mention));
     assert_eq!(result.message_chunks.concat(), result.markdown);
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
@@ -204,15 +210,13 @@ fn prompt_contains_required_sections() {
         language: None,
         workspace,
     };
+    let forbidden = "SHOULD_NOT_BE_INLINE";
     let manifest = TranscriptManifest {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         language: None,
-        masked_transcript_path: format!(
-            "transcript/{}",
-            discord_transcript::infrastructure::workspace::MASKED_TRANSCRIPT_FILENAME
-        ),
+        masked_transcript_path: format!("transcript/{forbidden}.md"),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
         masking_stats: MaskingStats {
             mention_replacements: 1,
@@ -220,7 +224,6 @@ fn prompt_contains_required_sections() {
             phone_replacements: 3,
         },
     };
-    let forbidden = "SHOULD_NOT_BE_INLINE";
     let prompt = build_summary_prompt(&request, &manifest);
     assert!(prompt.contains("## Summary"));
     assert!(prompt.contains("## Decisions"));

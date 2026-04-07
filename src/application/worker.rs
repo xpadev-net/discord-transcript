@@ -1,3 +1,4 @@
+use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, build_summary_prompt,
     run_transcription, write_transcript_files,
@@ -236,8 +237,7 @@ where
             );
         }
 
-        crate::application::runtime::merge_user_chunks_to_mixdown(&meeting_dir)
-            .map_err(WorkerError::Summary)?;
+        merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
