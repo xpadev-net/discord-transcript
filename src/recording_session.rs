@@ -9,6 +9,7 @@ use std::time::Instant;
 pub struct PersistedChunk {
     pub user_id: String,
     pub sequence: u64,
+    pub start_ms: u64,
     pub saved: SavedChunk,
 }
 
@@ -101,6 +102,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
                 // Sequence is assigned only after successful persistence to
                 // avoid gaps when a save fails.
                 self.peek_next_sequence(&chunk.user_id),
+                chunk.start_ms,
                 &chunk.wav.bytes,
             );
             match saved {
@@ -110,6 +112,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
                     persisted.push(PersistedChunk {
                         user_id: chunk.user_id,
                         sequence: seq,
+                        start_ms: chunk.start_ms,
                         saved,
                     });
                 }

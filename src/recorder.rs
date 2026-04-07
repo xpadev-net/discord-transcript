@@ -6,6 +6,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecorderOutputChunk {
     pub user_id: String,
+    pub start_ms: u64,
     pub wav: WavChunk,
 }
 
@@ -86,6 +87,7 @@ impl RecorderEngine {
         let wav = build_wav_chunk(&candidate.frames, self.sample_rate)?;
         Ok(RecorderOutputChunk {
             user_id: candidate.user_id,
+            start_ms: candidate.start_ms,
             wav,
         })
     }

@@ -9,7 +9,17 @@ pub struct SummaryRequest {
     pub meeting_id: String,
     pub title: Option<String>,
     pub audio_path: String,
+    pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerAudioInput {
+    pub speaker_id: String,
+    pub audio_path: String,
+    /// Offset from meeting start in milliseconds to align segments from this
+    /// speaker's audio back onto the meeting timeline.
+    pub offset_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,18 +80,35 @@ pub fn run_transcription<W: WhisperClient>(
     whisper: &W,
     request: &SummaryRequest,
 ) -> Result<TranscriptionOutput, SummaryError> {
-    let transcription = whisper.infer(&WhisperInferenceRequest {
-        audio_path: request.audio_path.clone(),
-        language: request.language.clone(),
-    })?;
-    let normalized = normalize_segments(&transcription.segments, NormalizationConfig::default());
-    let rendered = render_for_summary(&normalized);
-    let masked = mask_pii(&rendered);
-    Ok(TranscriptionOutput {
-        segments: normalized,
-        transcript_for_summary: masked.text,
-        masking_stats: masked.stats,
-    })
+    if request.speaker_audio.is_empty() {
+        let transcription = whisper.infer(&WhisperInferenceRequest {
+            audio_path: request.audio_path.clone(),
+            language: request.language.clone(),
+        })?;
+        return build_transcription_output(transcription.segments);
+    }
+
+    let mut merged_segments = Vec::new();
+    for speaker in &request.speaker_audio {
+        let transcription = whisper.infer(&WhisperInferenceRequest {
+            audio_path: speaker.audio_path.clone(),
+            language: request.language.clone(),
+        })?;
+        for mut segment in transcription.segments {
+            segment.speaker_id = speaker.speaker_id.clone();
+            segment.start_ms = segment.start_ms.saturating_add(speaker.offset_ms);
+            segment.end_ms = segment.end_ms.saturating_add(speaker.offset_ms);
+            merged_segments.push(segment);
+        }
+    }
+
+    merged_segments.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(a.speaker_id.cmp(&b.speaker_id))
+    });
+    build_transcription_output(merged_segments)
 }
 
 pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
@@ -121,4 +148,17 @@ Meeting title: {}\n\n\
 Transcript (PII-masked):\n{}\n",
         request.meeting_id, title, masked_transcript
     )
+}
+
+fn build_transcription_output(
+    segments: Vec<crate::transcript::TranscriptSegment>,
+) -> Result<TranscriptionOutput, SummaryError> {
+    let normalized = normalize_segments(&segments, NormalizationConfig::default());
+    let rendered = render_for_summary(&normalized);
+    let masked = mask_pii(&rendered);
+    Ok(TranscriptionOutput {
+        segments: normalized,
+        transcript_for_summary: masked.text,
+        masking_stats: masked.stats,
+    })
 }

@@ -96,6 +96,12 @@ cargo run --release
 | `/record-start` | ユーザーが参加中のボイスチャンネルの録音を開始 |
 | `/record-stop` | 録音を停止し、文字起こし・要約を実行 |
 
+## 録音と文字起こしの流れ
+
+- 音声はユーザーごとの WAV チャンクとして保存し、各チャンクには録音開始時刻を埋め込みます。
+- Whisper 推論は話者ごとに生成した WAV を入力として実行し、セグメント開始時刻を会議タイムラインに再マッピングして統合します。
+- `mixdown.wav` も従来通り生成されるため、再生や API 互換性は維持されます。
+
 ## テスト
 
 ```bash
@@ -171,6 +177,7 @@ src/
   recording_session.rs # 録音セッション状態
   receiver.rs          # ボイスフレーム受信
   audio.rs             # 音声処理ユーティリティ
+  meeting_audio.rs     # 録音チャンク読み出し・話者別 WAV 生成
   songbird_adapter.rs  # Songbird ボイスクライアントアダプタ
   asr.rs               # whisper.cpp クライアントインターフェース
   integrations.rs      # 外部連携クライアント (Whisper, Claude CLI)

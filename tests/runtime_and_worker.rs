@@ -4,7 +4,7 @@ use discord_transcript::command::PermissionSet;
 use discord_transcript::config::{AppConfig, ConfigError};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
-use discord_transcript::summary::StubClaudeSummaryClient;
+use discord_transcript::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::worker::{ProcessMeetingInput, process_meeting_summary};
 use std::collections::HashMap;
 
@@ -296,6 +296,11 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
             meeting_id: "m1".to_owned(),
             title: None,
             audio_path: "audio.wav".to_owned(),
+            speaker_audio: vec![SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "audio.wav".to_owned(),
+                offset_ms: 0,
+            }],
             language: None,
         },
     );
@@ -341,6 +346,11 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
             meeting_id: "m1".to_owned(),
             title: None,
             audio_path: "audio.wav".to_owned(),
+            speaker_audio: vec![SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "audio.wav".to_owned(),
+                offset_ms: 0,
+            }],
             language: None,
         },
     )

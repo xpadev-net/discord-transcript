@@ -1,6 +1,7 @@
 use discord_transcript::asr::{StubWhisperClient, parse_whisper_response};
 use discord_transcript::summary::{
-    StubClaudeSummaryClient, SummaryRequest, build_summary_prompt, run_summary_pipeline,
+    SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, build_summary_prompt,
+    run_summary_pipeline,
 };
 use discord_transcript::transcript::{NormalizationConfig, TranscriptSegment, normalize_segments};
 
@@ -90,6 +91,11 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
         meeting_id: "m1".to_owned(),
         title: Some("Weekly".to_owned()),
         audio_path: "audio.wav".to_owned(),
+        speaker_audio: vec![SpeakerAudioInput {
+            speaker_id: "alice".to_owned(),
+            audio_path: "audio.wav".to_owned(),
+            offset_ms: 0,
+        }],
         language: Some("ja".to_owned()),
     };
 
@@ -111,6 +117,7 @@ fn prompt_contains_required_sections() {
         meeting_id: "m1".to_owned(),
         title: None,
         audio_path: "audio.wav".to_owned(),
+        speaker_audio: vec![],
         language: None,
     };
 

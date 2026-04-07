@@ -29,6 +29,7 @@ pub trait ChunkStorage {
         meeting_id: &str,
         user_id: &str,
         sequence: u64,
+        start_ms: u64,
         bytes: &[u8],
     ) -> Result<SavedChunk, ChunkStorageError>;
 }
@@ -45,12 +46,18 @@ impl LocalChunkStorage {
         }
     }
 
-    fn chunk_file_path(&self, meeting_id: &str, user_id: &str, sequence: u64) -> PathBuf {
+    fn chunk_file_path(
+        &self,
+        meeting_id: &str,
+        user_id: &str,
+        sequence: u64,
+        start_ms: u64,
+    ) -> PathBuf {
         let safe_meeting_id = sanitize_path_component(meeting_id);
         let safe_user_id = sanitize_path_component(user_id);
         self.base_dir
             .join(safe_meeting_id)
-            .join(format!("{}_{}.wav", safe_user_id, sequence))
+            .join(format!("{}_{}_{}.wav", safe_user_id, sequence, start_ms))
     }
 }
 
@@ -89,9 +96,10 @@ impl ChunkStorage for LocalChunkStorage {
         meeting_id: &str,
         user_id: &str,
         sequence: u64,
+        start_ms: u64,
         bytes: &[u8],
     ) -> Result<SavedChunk, ChunkStorageError> {
-        let file_path = self.chunk_file_path(meeting_id, user_id, sequence);
+        let file_path = self.chunk_file_path(meeting_id, user_id, sequence, start_ms);
         let Some(dir) = file_path.parent() else {
             return Err(ChunkStorageError::Io(
                 "chunk path has no parent directory".to_owned(),
