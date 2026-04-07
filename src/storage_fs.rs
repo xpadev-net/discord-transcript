@@ -67,7 +67,7 @@ pub fn sanitize_path_component(input: &str) -> String {
     // Guard against empty result or lone "." / ".." which have special filesystem meaning.
     // Append a short hash of the original input to prevent collisions between
     // different raw IDs that all sanitize to the fallback.
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+    if sanitized.is_empty() || sanitized == "." {
         let hash = simple_hash(input);
         return format!("unknown_{hash:016x}");
     }

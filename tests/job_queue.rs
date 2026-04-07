@@ -68,10 +68,17 @@ fn worker_job_processing_marks_done_on_success() {
         mocked_markdown: "## Summary\ndone".to_owned(),
     };
 
-    let result =
-        process_next_summary_job(&mut store, &mut queue, &whisper, &claude, 2, "/tmp/chunks")
-            .expect("worker should succeed")
-            .expect("job result should exist");
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        2,
+        "/tmp/chunks",
+        Some("ja".to_owned()),
+    )
+    .expect("worker should succeed")
+    .expect("job result should exist");
     assert_eq!(result.job_id, "j1");
     assert_eq!(
         queue.get("j1").expect("job should exist").status,
@@ -94,8 +101,15 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
         mocked_markdown: "ignored".to_owned(),
     };
 
-    let result =
-        process_next_summary_job(&mut store, &mut queue, &whisper, &claude, 0, "/tmp/chunks");
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        0,
+        "/tmp/chunks",
+        None,
+    );
     assert!(result.is_err(), "should fail with invalid JSON");
     let job = queue.get("j1").expect("job exists");
     assert_eq!(job.status, JobStatus::Failed);

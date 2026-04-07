@@ -134,6 +134,13 @@ pub fn write_transcript_files(
         masked_transcript_path: request
             .workspace
             .relative_path(&transcript_path)
+            .ok_or_else(|| {
+                SummaryError::SummaryEngine(format!(
+                    "transcript path {:?} escaped workspace {:?}",
+                    transcript_path,
+                    request.workspace.root()
+                ))
+            })?
             .to_string_lossy()
             .to_string(),
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),

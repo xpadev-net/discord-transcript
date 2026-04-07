@@ -89,7 +89,9 @@ impl MeetingWorkspacePaths {
         fs::create_dir_all(self.summary_dir())
     }
 
-    pub fn relative_path<'a>(&'a self, path: &'a Path) -> &'a Path {
-        path.strip_prefix(&self.root).unwrap_or(path)
+    /// Returns a path relative to the workspace root. Returns None if the
+    /// provided path is outside the workspace (avoids leaking absolute paths).
+    pub fn relative_path(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.root).ok().map(PathBuf::from)
     }
 }

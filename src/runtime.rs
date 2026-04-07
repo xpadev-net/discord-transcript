@@ -1656,14 +1656,25 @@ async fn run_summary_background(
 ) -> Result<(), String> {
     let meeting = handler.load_meeting(meeting_id).await.ok();
     let workspace = meeting.as_ref().map(|m| handler.workspace_for_meeting(m));
-    let audio_dir = workspace
+    let primary_audio_dir = workspace.as_ref().map(|w| w.audio_dir());
+    let audio_dir = primary_audio_dir
         .as_ref()
-        .map(|w| w.audio_dir())
         .filter(|dir| dir.exists())
+        .cloned()
         .unwrap_or_else(|| {
             crate::workspace::MeetingWorkspaceLayout::new(&handler.chunk_storage_dir)
                 .legacy_meeting_dir(meeting_id)
         });
+    if let Some(primary) = primary_audio_dir
+        && !primary.exists()
+    {
+        warn!(
+            meeting_id = %meeting_id,
+            primary = %primary.display(),
+            fallback = %audio_dir.display(),
+            "workspace audio dir missing; falling back to legacy mixdown path"
+        );
+    }
     if workspace.is_none() || !audio_dir.starts_with(&handler.chunk_storage_dir) {
         warn!(
             meeting_id = %meeting_id,

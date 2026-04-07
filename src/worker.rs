@@ -166,6 +166,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
     claude: &C,
     max_retries: u32,
     audio_base_dir: &str,
+    language: Option<String>,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
     S: MeetingStore,
@@ -211,7 +212,7 @@ where
         voice_channel_id: meeting.voice_channel_id.clone(),
         title: meeting.title.clone(),
         audio_path: audio_path.to_string_lossy().to_string(),
-        language: None,
+        language,
         workspace,
     };
 
