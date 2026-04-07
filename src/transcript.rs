@@ -1,3 +1,6 @@
+use crate::speaker::{SpeakerProfile, display_label_for_id};
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptSegment {
     pub speaker_id: String,
@@ -112,13 +115,17 @@ fn clean_text(text: &str) -> String {
     out
 }
 
-pub fn render_for_summary(segments: &[TranscriptSegment]) -> String {
+pub fn render_for_summary(
+    segments: &[TranscriptSegment],
+    speakers: Option<&HashMap<String, SpeakerProfile>>,
+) -> String {
     let mut lines = Vec::with_capacity(segments.len());
     for segment in segments {
+        let label = display_label_for_id(speakers, &segment.speaker_id);
         let noise_tag = if segment.is_noisy { " [NOISY]" } else { "" };
         lines.push(format!(
-            "[{}-{}] {}{}: {}",
-            segment.start_ms, segment.end_ms, segment.speaker_id, noise_tag, segment.text
+            "[{}-{}] {} (id:{}){}: {}",
+            segment.start_ms, segment.end_ms, label, segment.speaker_id, noise_tag, segment.text
         ));
     }
     lines.join("\n")

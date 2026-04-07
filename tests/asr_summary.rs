@@ -1,9 +1,13 @@
 use discord_transcript::asr::{StubWhisperClient, parse_whisper_response};
+use discord_transcript::speaker::SpeakerProfile;
 use discord_transcript::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, build_summary_prompt,
     run_summary_pipeline,
 };
-use discord_transcript::transcript::{NormalizationConfig, TranscriptSegment, normalize_segments};
+use discord_transcript::transcript::{
+    NormalizationConfig, TranscriptSegment, normalize_segments, render_for_summary,
+};
+use std::collections::HashMap;
 
 #[test]
 fn normalize_segments_merges_speaker_and_marks_noisy() {
@@ -51,6 +55,42 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
     // confidence should be the weighted average: (0.9*1 + 0.4*1) / 2 = 0.65
     let conf = normalized[0].confidence.expect("confidence should be Some");
     assert!((conf - 0.65).abs() < 1e-5, "expected ~0.65, got {conf}");
+}
+
+#[test]
+fn render_for_summary_prefers_speaker_labels() {
+    let segment = TranscriptSegment {
+        speaker_id: "user-1".to_owned(),
+        start_ms: 0,
+        end_ms: 1_000,
+        text: "hello world".to_owned(),
+        confidence: None,
+        is_noisy: false,
+        merged_count: 1,
+    };
+
+    let mut profiles = HashMap::new();
+    profiles.insert(
+        "user-1".to_owned(),
+        SpeakerProfile {
+            speaker_id: "user-1".to_owned(),
+            username: Some("alice".to_owned()),
+            nickname: Some("Alice W.".to_owned()),
+            display_name: Some("Alicia".to_owned()),
+        },
+    );
+
+    let rendered = render_for_summary(std::slice::from_ref(&segment), Some(&profiles));
+    assert!(
+        rendered.contains("Alice W. (id:user-1)"),
+        "nickname should be preferred in label: {rendered}"
+    );
+
+    let fallback = render_for_summary(std::slice::from_ref(&segment), None);
+    assert!(
+        fallback.contains("user-1 (id:user-1)"),
+        "speaker_id should be used when metadata is missing: {fallback}"
+    );
 }
 
 #[test]
@@ -127,4 +167,8 @@ fn prompt_contains_required_sections() {
     assert!(prompt.contains("## TODO"));
     assert!(prompt.contains("## Open Questions"));
     assert!(prompt.contains("Meeting ID: m1"));
+    assert!(
+        prompt.contains("speaker names"),
+        "prompt should guide model to retain speaker attribution"
+    );
 }

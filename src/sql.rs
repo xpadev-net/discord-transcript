@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS transcripts (
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
 
+CREATE TABLE IF NOT EXISTS meeting_speakers (
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    speaker_id TEXT NOT NULL,
+    username TEXT,
+    nickname TEXT,
+    display_name TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (meeting_id, speaker_id)
+);
+
 CREATE TABLE IF NOT EXISTS summaries (
     id TEXT PRIMARY KEY,
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -80,6 +91,16 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_meeting_kind
 /// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
 pub const INCREMENTAL_MIGRATIONS_SQL: &str = r#"
 ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS is_noisy BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS meeting_speakers (
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    speaker_id TEXT NOT NULL,
+    username TEXT,
+    nickname TEXT,
+    display_name TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (meeting_id, speaker_id)
+);
 "#;
 
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
@@ -163,6 +184,16 @@ pub const INSERT_SUMMARY_SQL: &str = r#"
 INSERT INTO summaries (id, meeting_id, version, markdown)
 VALUES ($1, $2, 1, $3)
 ON CONFLICT (meeting_id, version) DO UPDATE SET markdown = EXCLUDED.markdown
+"#;
+
+pub const UPSERT_MEETING_SPEAKER_SQL: &str = r#"
+INSERT INTO meeting_speakers (meeting_id, speaker_id, username, nickname, display_name, updated_at)
+VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NOW())
+ON CONFLICT (meeting_id, speaker_id) DO UPDATE SET
+    username = EXCLUDED.username,
+    nickname = EXCLUDED.nickname,
+    display_name = EXCLUDED.display_name,
+    updated_at = NOW()
 "#;
 
 /// Build a multi-row INSERT statement for transcript segments.

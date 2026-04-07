@@ -13,6 +13,7 @@ use crate::recovery::RecoveryCandidate;
 use crate::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::retry::RetryPolicy;
 use crate::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
+use crate::speaker::SpeakerProfile;
 use crate::sql::{INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
 use crate::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::stop::StopOutcome;
@@ -33,7 +34,7 @@ use songbird::{
     Config as SongbirdConfig, CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
     SerenityInit,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
@@ -937,7 +938,7 @@ impl ScaffoldHandler {
                 return Err(err);
             }
         };
-        match self.process_enqueued_summary_job(meeting_id).await {
+        match self.process_enqueued_summary_job(http, meeting_id).await {
             Ok(output) => {
                 let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
@@ -1054,6 +1055,7 @@ impl ScaffoldHandler {
 
     async fn process_enqueued_summary_job(
         &self,
+        http: &Http,
         meeting_id: &str,
     ) -> Result<crate::worker::ProcessMeetingOutput, String> {
         let whisper = CommandWhisperClient {
@@ -1207,6 +1209,22 @@ impl ScaffoldHandler {
             }
         }
 
+        // Resolve speaker labels for summarization and snapshot to DB (best-effort)
+        let mut summary_transcript = transcription.transcript_for_summary.clone();
+        if !transcription.segments.is_empty() {
+            let speaker_profiles = self
+                .resolve_and_upsert_speakers(http, &claimed_job.meeting_id, &transcription.segments)
+                .await;
+            if !speaker_profiles.is_empty() {
+                let rendered = crate::transcript::render_for_summary(
+                    &transcription.segments,
+                    Some(&speaker_profiles),
+                );
+                let masked = crate::privacy::mask_pii(&rendered);
+                summary_transcript = masked.text;
+            }
+        }
+
         // Phase 2: Summarization (mutex held only for status update)
         if let Err(cas_err) = {
             let mut service = self.service.lock().await;
@@ -1223,10 +1241,7 @@ impl ScaffoldHandler {
         }
 
         let markdown = tokio::task::block_in_place(|| {
-            let prompt = crate::summary::build_summary_prompt(
-                &request,
-                &transcription.transcript_for_summary,
-            );
+            let prompt = crate::summary::build_summary_prompt(&request, &summary_transcript);
             claude.summarize(&prompt)
         });
         let markdown = match markdown {
@@ -1299,6 +1314,183 @@ impl ScaffoldHandler {
             markdown,
             chunks,
         })
+    }
+
+    async fn resolve_and_upsert_speakers(
+        &self,
+        http: &Http,
+        meeting_id: &str,
+        segments: &[crate::transcript::TranscriptSegment],
+    ) -> HashMap<String, SpeakerProfile> {
+        let speaker_ids: HashSet<String> =
+            segments.iter().map(|seg| seg.speaker_id.clone()).collect();
+        if speaker_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let (guild_id, mut profiles) = self.load_guild_and_speakers(meeting_id).await;
+
+        let Some(guild_id) = guild_id else {
+            warn!(
+                meeting_id = %meeting_id,
+                "meeting not found while resolving speakers"
+            );
+            return profiles;
+        };
+        let guild_id_u64 = match guild_id.parse::<u64>() {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    guild_id = %guild_id,
+                    error = %err,
+                    "failed to parse guild_id while resolving speakers"
+                );
+                return profiles;
+            }
+        };
+
+        let mut newly_resolved = Vec::new();
+        for speaker_id in speaker_ids {
+            if let Some(existing) = profiles.get(&speaker_id)
+                && existing.display_label() != speaker_id
+            {
+                continue;
+            }
+            if speaker_id.trim().is_empty() {
+                continue;
+            }
+            let user_id_u64 = match speaker_id.parse::<u64>() {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        speaker_id = %speaker_id,
+                        error = %err,
+                        "failed to parse speaker_id while resolving speakers"
+                    );
+                    continue;
+                }
+            };
+
+            match http
+                .get_member(GuildId::new(guild_id_u64), UserId::new(user_id_u64))
+                .await
+            {
+                Ok(member) => {
+                    let profile = SpeakerProfile {
+                        speaker_id: speaker_id.clone(),
+                        username: Some(member.user.name.clone()),
+                        nickname: member.nick.clone(),
+                        display_name: member.user.global_name.clone(),
+                    };
+                    profiles.insert(speaker_id, profile.clone());
+                    newly_resolved.push(profile);
+                }
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        speaker_id = %speaker_id,
+                        error = %err,
+                        "failed to fetch member while resolving speakers"
+                    );
+                }
+            }
+        }
+
+        if !newly_resolved.is_empty() {
+            let mut service = self.service.lock().await;
+            for profile in &newly_resolved {
+                if let Err(err) = service.store.executor.execute(
+                    crate::sql::UPSERT_MEETING_SPEAKER_SQL,
+                    &[
+                        meeting_id.to_owned(),
+                        profile.speaker_id.clone(),
+                        profile.username.clone().unwrap_or_default(),
+                        profile.nickname.clone().unwrap_or_default(),
+                        profile.display_name.clone().unwrap_or_default(),
+                    ],
+                ) {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        speaker_id = %profile.speaker_id,
+                        error = %err,
+                        "failed to upsert meeting speaker snapshot"
+                    );
+                }
+            }
+        }
+
+        profiles
+    }
+
+    async fn load_guild_and_speakers(
+        &self,
+        meeting_id: &str,
+    ) -> (Option<String>, HashMap<String, SpeakerProfile>) {
+        let (guild_row, speaker_rows) = {
+            let mut service = self.service.lock().await;
+            let guild_row = match service.store.executor.query_rows(
+                "SELECT guild_id FROM meetings WHERE id=$1 LIMIT 1",
+                &[meeting_id.to_owned()],
+            ) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "failed to load guild_id while resolving speakers"
+                    );
+                    Vec::new()
+                }
+            };
+            let speaker_rows = match service.store.executor.query_rows(
+                "SELECT speaker_id, username, nickname, display_name \
+                     FROM meeting_speakers WHERE meeting_id=$1",
+                &[meeting_id.to_owned()],
+            ) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "failed to load existing meeting speakers"
+                    );
+                    Vec::new()
+                }
+            };
+            (guild_row, speaker_rows)
+        };
+
+        let guild_id = guild_row
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next());
+
+        let mut profiles = HashMap::new();
+        for row in speaker_rows {
+            if row.len() < 4 {
+                continue;
+            }
+            let profile = SpeakerProfile {
+                speaker_id: row[0].clone(),
+                username: optional_string(&row[1]),
+                nickname: optional_string(&row[2]),
+                display_name: optional_string(&row[3]),
+            };
+            profiles.insert(profile.speaker_id.clone(), profile);
+        }
+
+        (guild_id, profiles)
+    }
+}
+
+fn optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 

@@ -203,6 +203,12 @@ audio::-webkit-media-controls-panel {
   white-space: nowrap;
 }
 
+.speaker-meta {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.3;
+}
+
 .segment-time {
   font-size: 0.75rem;
   color: var(--text-muted);
@@ -445,6 +451,40 @@ audio::-webkit-media-controls-panel {
     return speakerColorMap[speakerId];
   }
 
+  function normalizeSpeaker(seg) {
+    var speaker = seg && seg.speaker ? seg.speaker : null;
+    var id = "";
+    if (speaker) {
+      id = speaker.id || speaker.speaker_id || "";
+    }
+    if (!id && seg && seg.speaker_id) {
+      id = seg.speaker_id;
+    }
+    var nickname = speaker && speaker.nickname ? speaker.nickname : null;
+    var username = speaker && speaker.username ? speaker.username : null;
+    var displayName = speaker && speaker.display_name ? speaker.display_name : null;
+    var displayLabel = speaker && speaker.display_label
+      ? speaker.display_label
+      : (nickname || displayName || username || id);
+
+    return {
+      id: id,
+      username: username,
+      nickname: nickname,
+      display_name: displayName,
+      display_label: displayLabel || id
+    };
+  }
+
+  function renderSpeakerMeta(speaker) {
+    var parts = [];
+    if (speaker.nickname) parts.push("Nick: " + escapeHtml(speaker.nickname));
+    if (speaker.username) parts.push("User: " + escapeHtml(speaker.username));
+    if (speaker.id) parts.push("ID: " + escapeHtml(speaker.id));
+    if (parts.length === 0) return "";
+    return '<div class="speaker-meta">' + parts.join(" / ") + '</div>';
+  }
+
   function formatDuration(seconds) {
     var h = Math.floor(seconds / 3600);
     var m = Math.floor((seconds % 3600) / 60);
@@ -597,17 +637,21 @@ audio::-webkit-media-controls-panel {
 
       for (var i = 0; i < data.length; i++) {
         var seg = data[i];
+        var speaker = normalizeSpeaker(seg);
         var el = document.createElement("div");
         el.className = "segment" + (seg.is_noisy ? " noisy" : "");
         el.setAttribute("data-index", i);
         el.setAttribute("data-start", seg.start_ms);
         el.setAttribute("data-end", seg.end_ms);
 
-        var color = getSpeakerColor(seg.speaker_id);
+        var color = getSpeakerColor(speaker.id || seg.speaker_id);
+        var badgeLabel = speaker.display_label || speaker.id || seg.speaker_id;
+        var speakerMeta = renderSpeakerMeta(speaker);
 
         el.innerHTML =
           '<div class="segment-meta">' +
-            '<span class="speaker-badge" style="background:' + color + '">Speaker ' + escapeHtml(seg.speaker_id.slice(-4)) + '</span>' +
+            '<span class="speaker-badge" style="background:' + color + '">' + escapeHtml(badgeLabel) + '</span>' +
+            speakerMeta +
             '<span class="segment-time">' + formatTimestamp(seg.start_ms) + '</span>' +
           '</div>' +
           '<div class="segment-text">' + escapeHtml(seg.text) + '</div>';
