@@ -244,7 +244,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
-        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'scheduled')";
+        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')";
         let meeting_id = request.id.clone();
         self.executor
             .execute(
@@ -254,6 +254,8 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     request.guild_id,
                     request.voice_channel_id,
                     request.report_channel_id,
+                    request.status_message_channel_id.unwrap_or_default(),
+                    request.status_message_id.unwrap_or_default(),
                     request.started_by_user_id,
                 ],
             )
@@ -271,7 +273,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
-        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'recording')";
+        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')";
         let meeting_id = request.id.clone();
         self.executor
             .execute(
@@ -281,6 +283,8 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     request.guild_id,
                     request.voice_channel_id,
                     request.report_channel_id,
+                    request.status_message_channel_id.unwrap_or_default(),
+                    request.status_message_id.unwrap_or_default(),
                     request.started_by_user_id,
                 ],
             )

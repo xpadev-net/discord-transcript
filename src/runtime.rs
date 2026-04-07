@@ -325,11 +325,30 @@ fn format_status_message_content(meeting_id: &str, update: &StatusMessageUpdate<
 
 fn truncate_error_for_status(error: &str) -> String {
     const LIMIT: usize = 1400;
-    if error.len() > LIMIT {
-        format!("{}…", &error[..LIMIT])
-    } else {
-        error.to_owned()
+    if error.len() <= LIMIT {
+        return error.to_owned();
     }
+
+    let mut end = 0usize;
+    for (idx, ch) in error.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > LIMIT {
+            break;
+        }
+        end = next;
+    }
+
+    if end == 0 {
+        return error
+            .chars()
+            .next()
+            .map(|c| format!("{c}…"))
+            .unwrap_or_default();
+    }
+
+    let mut truncated = error[..end].to_owned();
+    truncated.push('…');
+    truncated
 }
 
 async fn upsert_status_message_via_messenger<M: StatusMessenger + Sync>(
@@ -1299,7 +1318,24 @@ impl ScaffoldHandler {
             }
             Err(err) => {
                 // process_enqueued_summary_job already handles Failed/retry status.
-                // Only post failure notification here.
+                // Also update the status message so users see the failure.
+                if let Err(status_err) = self
+                    .update_status_message(
+                        http,
+                        meeting_id,
+                        StatusMessageUpdate::Failed {
+                            phase: "summary",
+                            error: &err,
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        error = %status_err,
+                        "failed to update status message after summary failure"
+                    );
+                }
                 let _ =
                     post_failure_to_report_channel(http, report_channel_id, meeting_id, &err).await;
                 Err(err)
