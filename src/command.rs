@@ -125,6 +125,8 @@ pub fn record_start<S: MeetingStore>(
         guild_id: request.guild_id.clone(),
         voice_channel_id: voice_channel_id.clone(),
         report_channel_id: request.command_channel_id.clone(),
+        status_message_channel_id: None,
+        status_message_id: None,
         started_by_user_id: request.started_by_user_id,
     })?;
 

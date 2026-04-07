@@ -7,7 +7,8 @@ use crate::sql::{
     MARK_STOPPING_IF_RECORDING_SQL, RETRY_JOB_SQL,
 };
 use crate::storage::{
-    CreateMeetingRequest, MeetingStore, StopTransition, StoreError, StoredMeeting,
+    CreateMeetingRequest, MeetingStore, StatusMessageMetadata, StopTransition, StoreError,
+    StoredMeeting,
 };
 use std::collections::HashMap;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
@@ -243,7 +244,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
-        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'scheduled')";
+        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')";
         let meeting_id = request.id.clone();
         self.executor
             .execute(
@@ -253,6 +254,8 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     request.guild_id,
                     request.voice_channel_id,
                     request.report_channel_id,
+                    request.status_message_channel_id.unwrap_or_default(),
+                    request.status_message_id.unwrap_or_default(),
                     request.started_by_user_id,
                 ],
             )
@@ -270,7 +273,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
-        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,status) VALUES($1,$2,$3,$4,$5,'recording')";
+        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')";
         let meeting_id = request.id.clone();
         self.executor
             .execute(
@@ -280,6 +283,8 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     request.guild_id,
                     request.voice_channel_id,
                     request.report_channel_id,
+                    request.status_message_channel_id.unwrap_or_default(),
+                    request.status_message_id.unwrap_or_default(),
                     request.started_by_user_id,
                 ],
             )
@@ -363,6 +368,73 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .execute(
                 "UPDATE meetings SET error_message=NULLIF($1, ''), updated_at=NOW() WHERE id=$2",
                 &[error_message.unwrap_or_default(), meeting_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_status_message_metadata(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<StatusMessageMetadata, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                "SELECT report_channel_id, status_message_channel_id, status_message_id FROM meetings WHERE id=$1 LIMIT 1",
+                &[meeting_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        };
+
+        let report_channel_id = row.first().cloned().ok_or_else(|| {
+            StoreError::Backend(format!(
+                "report_channel_id missing in status metadata row for meeting_id={meeting_id}"
+            ))
+        })?;
+        let status_message_channel_id = row.get(1).and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
+        let status_message_id = row.get(2).and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
+
+        Ok(StatusMessageMetadata {
+            report_channel_id,
+            status_message_channel_id,
+            status_message_id,
+        })
+    }
+
+    fn set_status_message(
+        &mut self,
+        meeting_id: &str,
+        channel_id: String,
+        message_id: String,
+    ) -> Result<(), StoreError> {
+        let affected = self
+            .executor
+            .execute(
+                "UPDATE meetings SET status_message_channel_id=$1, status_message_id=$2, updated_at=NOW() WHERE id=$3",
+                &[channel_id, message_id, meeting_id.to_owned()],
             )
             .map_err(StoreError::Backend)?;
         if affected == 0 {
@@ -467,7 +539,7 @@ impl SqlExecutor for PgSqlExecutor {
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, title, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
+        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
         let client = self.client()?;
         let runtime = self.runtime()?;
         std::thread::scope(|s| {
@@ -536,6 +608,8 @@ fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
         guild_id: row.get("guild_id"),
         voice_channel_id: row.get("voice_channel_id"),
         report_channel_id: row.get("report_channel_id"),
+        status_message_channel_id: row.get("status_message_channel_id"),
+        status_message_id: row.get("status_message_id"),
         started_by_user_id: row.get("started_by_user_id"),
         title: row.get("title"),
         status,

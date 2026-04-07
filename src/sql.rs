@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS meetings (
     guild_id TEXT NOT NULL,
     voice_channel_id TEXT NOT NULL,
     report_channel_id TEXT NOT NULL,
+    status_message_channel_id TEXT,
+    status_message_id TEXT,
     started_by_user_id TEXT NOT NULL,
     title TEXT,
     status TEXT NOT NULL,
@@ -91,6 +93,8 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_meeting_kind
 /// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
 pub const INCREMENTAL_MIGRATIONS_SQL: &str = r#"
 ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS is_noisy BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_channel_id TEXT;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_id TEXT;
 CREATE TABLE IF NOT EXISTS meeting_speakers (
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     speaker_id TEXT NOT NULL,
