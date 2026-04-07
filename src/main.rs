@@ -1,6 +1,6 @@
-use discord_transcript::config::AppConfig;
-use discord_transcript::runtime::run_bot;
-use discord_transcript::web;
+use discord_transcript::application::runtime::run_bot;
+use discord_transcript::bootstrap::config::AppConfig;
+use discord_transcript::interfaces::web;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -54,10 +54,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // run_bot() is safe — but this ensures the web server never faces
     // a pre-migration schema.
     db_client
-        .batch_execute(discord_transcript::sql::INITIAL_SCHEMA_SQL)
+        .batch_execute(discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL)
         .await?;
     db_client
-        .batch_execute(discord_transcript::sql::INCREMENTAL_MIGRATIONS_SQL)
+        .batch_execute(discord_transcript::infrastructure::sql::INCREMENTAL_MIGRATIONS_SQL)
         .await?;
 
     // Build OAuth config if all required fields are present
