@@ -163,15 +163,14 @@ where
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");
 
     let result = (|| {
+        let meeting_dir = crate::runtime::meeting_audio_dir(audio_base_dir, &job.meeting_id);
+        crate::runtime::merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             title: None,
             audio_path: crate::runtime::meeting_audio_path(audio_base_dir, &job.meeting_id),
-            speaker_audio: build_speaker_audio_inputs(&crate::runtime::meeting_audio_dir(
-                audio_base_dir,
-                &job.meeting_id,
-            ))
-            .map_err(WorkerError::Summary)?,
+            speaker_audio: build_speaker_audio_inputs(&meeting_dir)
+                .map_err(WorkerError::Summary)?,
             language: None,
         };
         process_meeting_summary(store, whisper, claude, &input)

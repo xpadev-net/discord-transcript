@@ -4,6 +4,7 @@ use crate::summary::SpeakerAudioInput;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct LoadedChunk {
@@ -116,7 +117,7 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
             bits_per_sample
         ));
     }
-    if data.len() < 44 || &data[36..40] != b"data" {
+    if &data[36..40] != b"data" {
         return Err(format!(
             "missing data chunk in WAV header for {}",
             path.display()
@@ -202,6 +203,32 @@ pub fn build_speaker_audio_inputs(meeting_dir: &Path) -> Result<Vec<SpeakerAudio
             if chunk.start_ms > current_ms {
                 let gap_ms = chunk.start_ms - current_ms;
                 pcm_out.extend_from_slice(&silence_bytes(gap_ms, sample_rate));
+            }
+            if chunk.start_ms < current_ms {
+                let overlap_ms = current_ms - chunk.start_ms;
+                let samples_to_skip =
+                    overlap_ms.saturating_mul(sample_rate as u64) as u128 / 1_000u128;
+                let bytes_to_skip = samples_to_skip.saturating_mul(2) as usize;
+                if bytes_to_skip >= chunk.pcm.len() {
+                    warn!(
+                        user_id = %chunk.user_id,
+                        sequence = chunk.sequence,
+                        start_ms = chunk.start_ms,
+                        current_ms,
+                        "skipping fully overlapped chunk while stitching speaker audio"
+                    );
+                    continue;
+                }
+                warn!(
+                    user_id = %chunk.user_id,
+                    sequence = chunk.sequence,
+                    overlap_ms,
+                    "trimming overlapping chunk while stitching speaker audio"
+                );
+                let trimmed = &chunk.pcm[bytes_to_skip..];
+                pcm_out.extend_from_slice(trimmed);
+                current_ms = current_ms.saturating_add(pcm_duration_ms(trimmed, sample_rate));
+                continue;
             }
             pcm_out.extend_from_slice(&chunk.pcm);
             current_ms = chunk.start_ms + chunk.duration_ms;
