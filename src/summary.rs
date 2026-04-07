@@ -138,6 +138,7 @@ pub fn build_summary_prompt(request: &SummaryRequest, masked_transcript: &str) -
 
     format!(
         "You are an assistant that summarizes meeting transcripts.\n\
+Keep speaker attributions by using the provided speaker names when describing Summary, Decisions, TODO, and Open Questions.\n\
 Output in markdown using the exact sections below:\n\
 ## Summary\n\
 ## Decisions\n\
@@ -154,7 +155,9 @@ fn build_transcription_output(
     segments: Vec<crate::transcript::TranscriptSegment>,
 ) -> Result<TranscriptionOutput, SummaryError> {
     let normalized = normalize_segments(&segments, NormalizationConfig::default());
-    let rendered = render_for_summary(&normalized);
+    // Standalone callers render with only speaker IDs; the runtime path re-renders
+    // with resolved speaker profiles before summarization.
+    let rendered = render_for_summary(&normalized, None);
     let masked = mask_pii(&rendered);
     Ok(TranscriptionOutput {
         segments: normalized,
