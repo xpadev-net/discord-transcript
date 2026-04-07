@@ -9,6 +9,10 @@ fn mask_pii_replaces_mentions_email_and_phone() {
     assert!(masked.text.contains("[USER_2]"));
     assert!(masked.text.contains("[EMAIL_1]"));
     assert!(masked.text.contains("[PHONE_1]"));
+    assert!(!masked.text.contains("<@123456>"));
+    assert!(!masked.text.contains("@alice"));
+    assert!(!masked.text.contains("alice@example.com"));
+    assert!(!masked.text.contains("+1 (555) 123-4567"));
     assert_eq!(masked.stats.mention_replacements, 2);
     assert_eq!(masked.stats.email_replacements, 1);
     assert_eq!(masked.stats.phone_replacements, 1);

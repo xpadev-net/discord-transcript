@@ -1,2 +1,1 @@
-#[path = "domain/privacy.rs"]
-mod privacy;
+include!("domain/privacy.rs");

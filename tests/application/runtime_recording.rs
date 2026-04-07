@@ -23,7 +23,7 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
     let workspace = layout.for_meeting("g1", "vc1", "meeting-rt");
     let mut session = RecordingSession::new(
         "meeting-rt".to_owned(),
-        LocalChunkStorage::new(workspace, "meeting-rt"),
+        LocalChunkStorage::new(workspace.clone(), "meeting-rt"),
         discord_transcript::audio::receiver::ReceiverConfig {
             // Use zero duration so the chunk flushes immediately upon ingest.
             chunk_duration: Duration::ZERO,
@@ -43,6 +43,25 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
     let count = ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user })
         .expect("ingest should succeed");
     assert_eq!(count, 1);
+    let persisted_wavs: Vec<_> = std::fs::read_dir(workspace.audio_dir())
+        .expect("audio dir should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        })
+        .collect();
+    assert_eq!(
+        persisted_wavs.len(),
+        1,
+        "a single chunk file should be persisted"
+    );
+    let chunk_size = std::fs::metadata(&persisted_wavs[0])
+        .expect("persisted chunk should be readable")
+        .len();
+    assert!(chunk_size > 0, "persisted chunk file should not be empty");
 
     let _ = std::fs::remove_dir_all(base);
 }

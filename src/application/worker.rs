@@ -7,8 +7,8 @@ use crate::domain::{JobStatus, JobType, MeetingStatus};
 use crate::infrastructure::asr::WhisperClient;
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::storage::{MeetingStore, StoreError};
-use crate::infrastructure::workspace::MeetingWorkspacePaths;
-use crate::interfaces::posting::split_discord_message;
+use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
+use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use std::fmt::{Display, Formatter};
 use tracing::{error, info, warn};
 
@@ -143,8 +143,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
 
-    let chunks =
-        split_discord_message(&markdown, crate::interfaces::posting::DISCORD_MESSAGE_LIMIT);
+    let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
     info!(
         meeting_id = %input.meeting_id,
         chunks = chunks.len(),
@@ -191,7 +190,7 @@ where
             .ok_or_else(|| {
                 WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
             })?;
-        let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(audio_base_dir);
+        let layout = MeetingWorkspaceLayout::new(audio_base_dir);
         let workspace = layout.for_meeting(
             &meeting.guild_id,
             &meeting.voice_channel_id,

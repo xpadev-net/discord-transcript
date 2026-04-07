@@ -118,6 +118,22 @@ WHERE id = $2
   AND status = 'recording'
 "#;
 
+pub const SET_MEETING_STATUS_CAS_SQL: &str = r#"
+WITH updated AS (
+    UPDATE meetings
+    SET status=$1, updated_at=NOW()
+    WHERE id=$2 AND status=$3
+    RETURNING 1
+), existing AS (
+    SELECT 1 FROM meetings WHERE id=$2
+)
+SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated'
+    WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict'
+    ELSE 'not_found'
+END
+"#;
+
 pub const RECOVERY_SCAN_SQL: &str = r#"
 SELECT id, status, voice_channel_id
 FROM meetings

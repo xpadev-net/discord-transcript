@@ -4,7 +4,7 @@ use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
     CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, ENQUEUE_JOB_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
-    MARK_STOPPING_IF_RECORDING_SQL, RETRY_JOB_SQL,
+    MARK_STOPPING_IF_RECORDING_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, MeetingStore, StatusMessageMetadata, StopTransition, StoreError,
@@ -375,7 +375,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                 let rows = self
                     .executor
                     .query_rows(
-                        "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END",
+                        SET_MEETING_STATUS_CAS_SQL,
                         &[
                             status_value.to_owned(),
                             meeting_id.to_owned(),

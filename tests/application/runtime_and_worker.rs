@@ -8,16 +8,28 @@ use discord_transcript::bootstrap::config::{AppConfig, ConfigError};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::infrastructure::asr::StubWhisperClient;
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
-use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
+use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-fn temp_workspace(
-    meeting_id: &str,
-) -> (
-    PathBuf,
-    discord_transcript::infrastructure::workspace::MeetingWorkspacePaths,
-) {
+struct TempWorkspaceGuard {
+    base: PathBuf,
+    workspace: MeetingWorkspacePaths,
+}
+
+impl TempWorkspaceGuard {
+    fn workspace(&self) -> &MeetingWorkspacePaths {
+        &self.workspace
+    }
+}
+
+impl Drop for TempWorkspaceGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+fn temp_workspace(meeting_id: &str) -> TempWorkspaceGuard {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -26,21 +38,26 @@ fn temp_workspace(
         "discord_transcript_runtime_worker_{meeting_id}_{nanos}"
     ));
     let layout = MeetingWorkspaceLayout::new(&base);
-    (base, layout.for_meeting("g1", "vc", meeting_id))
+    TempWorkspaceGuard {
+        workspace: layout.for_meeting("g1", "vc", meeting_id),
+        base,
+    }
 }
 
-#[test]
-fn app_config_loads_from_map() {
+fn base_env() -> HashMap<String, String> {
     let mut values = HashMap::new();
     values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
     values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
     values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
     values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
+    values.insert("DATABASE_URL".to_owned(), "postgres://localhost/db".to_owned());
     values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    values
+}
+
+#[test]
+fn app_config_loads_from_map() {
+    let values = base_env();
 
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.discord_token, "token");
@@ -62,16 +79,7 @@ fn app_config_loads_from_map() {
 
 #[test]
 fn app_config_accepts_valid_whisper_language() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    let mut values = base_env();
     values.insert("WHISPER_LANGUAGE".to_owned(), "ja".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
@@ -80,17 +88,8 @@ fn app_config_accepts_valid_whisper_language() {
 
 #[test]
 fn app_config_accepts_claude_model_override() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
+    let mut values = base_env();
     values.insert("CLAUDE_MODEL".to_owned(), "sonnet".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.claude_model, "sonnet");
@@ -98,16 +97,7 @@ fn app_config_accepts_claude_model_override() {
 
 #[test]
 fn app_config_rejects_invalid_whisper_language() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    let mut values = base_env();
     values.insert("WHISPER_LANGUAGE".to_owned(), "Japanese".to_owned());
 
     let err = AppConfig::from_map(&values).expect_err("config should fail");
@@ -122,7 +112,8 @@ fn app_config_rejects_invalid_whisper_language() {
 
 #[test]
 fn app_config_requires_all_values() {
-    let values = HashMap::new();
+    let mut values = base_env();
+    values.clear();
     let err = AppConfig::from_map(&values).expect_err("config should fail");
     assert_eq!(
         err,
@@ -134,16 +125,7 @@ fn app_config_requires_all_values() {
 
 #[test]
 fn app_config_loads_retry_overrides_from_map() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    let mut values = base_env();
     values.insert("SUMMARY_MAX_RETRIES".to_owned(), "5".to_owned());
     values.insert("INTEGRATION_RETRY_MAX_ATTEMPTS".to_owned(), "7".to_owned());
     values.insert(
@@ -171,16 +153,7 @@ fn app_config_loads_retry_overrides_from_map() {
 
 #[test]
 fn app_config_rejects_invalid_retry_override() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    let mut values = base_env();
     values.insert("SUMMARY_MAX_RETRIES".to_owned(), "abc".to_owned());
 
     let err = AppConfig::from_map(&values).expect_err("config should fail");
@@ -195,16 +168,7 @@ fn app_config_rejects_invalid_retry_override() {
 
 #[test]
 fn app_config_rejects_zero_auto_stop_grace() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    let mut values = base_env();
     values.insert("AUTO_STOP_GRACE_SECONDS".to_owned(), "0".to_owned());
 
     let err = AppConfig::from_map(&values).expect_err("config should fail");
@@ -219,17 +183,8 @@ fn app_config_rejects_zero_auto_stop_grace() {
 
 #[test]
 fn app_config_supports_optional_ssl_mode() {
-    let mut values = HashMap::new();
-    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
-    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
-    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
-    values.insert(
-        "DATABASE_URL".to_owned(),
-        "postgres://localhost/db".to_owned(),
-    );
+    let mut values = base_env();
     values.insert("DATABASE_SSL_MODE".to_owned(), "require".to_owned());
-    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.database_ssl_mode, "require");
@@ -338,7 +293,8 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
     let claude = StubClaudeSummaryClient {
         mocked_markdown: "ignored".to_owned(),
     };
-    let (base, workspace) = temp_workspace("m1");
+    let temp = temp_workspace("m1");
+    let workspace = temp.workspace().clone();
     let result = process_meeting_summary(
         &mut store,
         &whisper,
@@ -364,7 +320,6 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
     // process_meeting_summary transitions Stopping→Transcribing, transcription fails,
     // then reverts back to Stopping so the next retry's CAS guard succeeds.
     assert_eq!(saved.status, MeetingStatus::Stopping);
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -395,7 +350,8 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         mocked_markdown: "## Summary\nall good".to_owned(),
     };
 
-    let (base, workspace) = temp_workspace("m1_summary");
+    let temp = temp_workspace("m1_summary");
+    let workspace = temp.workspace().clone();
     let output = process_meeting_summary(
         &mut store,
         &whisper,
@@ -421,5 +377,4 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.status, MeetingStatus::Summarizing);
     assert_eq!(saved.error_message, None);
-    let _ = std::fs::remove_dir_all(base);
 }

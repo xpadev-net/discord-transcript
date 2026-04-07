@@ -8,24 +8,39 @@ use discord_transcript::domain::transcript::{
     NormalizationConfig, TranscriptSegment, normalize_segments, render_for_summary,
 };
 use discord_transcript::infrastructure::asr::{StubWhisperClient, parse_whisper_response};
-use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
+use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-fn unique_workspace(
-    test_name: &str,
-    meeting_id: &str,
-) -> (
-    PathBuf,
-    discord_transcript::infrastructure::workspace::MeetingWorkspacePaths,
-) {
+struct TempWorkspaceGuard {
+    base: PathBuf,
+    workspace: MeetingWorkspacePaths,
+}
+
+impl TempWorkspaceGuard {
+    fn workspace(&self) -> &MeetingWorkspacePaths {
+        &self.workspace
+    }
+}
+
+impl Drop for TempWorkspaceGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+fn unique_workspace(test_name: &str, meeting_id: &str) -> TempWorkspaceGuard {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_nanos();
-    let base = std::env::temp_dir().join(format!("discord_transcript_summary_{test_name}_{nanos}"));
+    let base =
+        std::env::temp_dir().join(format!("discord_transcript_summary_{test_name}_{nanos}"));
     let layout = MeetingWorkspaceLayout::new(&base);
-    (base, layout.for_meeting("g1", "vc1", meeting_id))
+    TempWorkspaceGuard {
+        workspace: layout.for_meeting("g1", "vc1", meeting_id),
+        base,
+    }
 }
 
 #[test]
@@ -146,7 +161,8 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     let claude = StubClaudeSummaryClient {
         mocked_markdown: "## Summary\nx".to_owned(),
     };
-    let (base, workspace) = unique_workspace("pipeline_masks", "m1");
+    let temp = unique_workspace("pipeline_masks", "m1");
+    let workspace = temp.workspace().clone();
     let request = SummaryRequest {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
@@ -172,12 +188,12 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
     assert!(result.masking_stats.mention_replacements >= 1);
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
 fn prompt_contains_required_sections() {
-    let (base, workspace) = unique_workspace("prompt_sections", "m1");
+    let temp = unique_workspace("prompt_sections", "m1");
+    let workspace = temp.workspace().clone();
     let request = SummaryRequest {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
@@ -217,5 +233,4 @@ fn prompt_contains_required_sections() {
         "prompt should guide model to retain speaker attribution"
     );
     assert!(!prompt.contains(forbidden));
-    let _ = std::fs::remove_dir_all(base);
 }

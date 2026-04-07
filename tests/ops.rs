@@ -1,2 +1,1 @@
-#[path = "domain/ops.rs"]
-mod ops;
+include!("domain/ops.rs");

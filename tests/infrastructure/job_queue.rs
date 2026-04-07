@@ -6,6 +6,7 @@ use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
 use discord_transcript::infrastructure::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
 use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, SqlJobQueue};
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 fn stopping_meeting(id: &str) -> StoredMeeting {
@@ -24,12 +25,37 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
     }
 }
 
-fn unique_temp_dir(test_name: &str) -> PathBuf {
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_dir_all(&self.path)
+            && err.kind() != ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to remove temp test directory {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+fn unique_temp_dir(test_name: &str) -> TempDirGuard {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("discord_transcript_job_queue_{test_name}_{nanos}"))
+    TempDirGuard {
+        path: std::env::temp_dir().join(format!("discord_transcript_job_queue_{test_name}_{nanos}")),
+    }
 }
 
 fn write_dummy_chunk(base: &Path, meeting_id: &str) {
@@ -74,7 +100,7 @@ fn in_memory_queue_claim_done_and_retry_flow() {
 #[test]
 fn worker_job_processing_marks_done_on_success() {
     let base = unique_temp_dir("worker_success");
-    write_dummy_chunk(&base, "m1");
+    write_dummy_chunk(base.path(), "m1");
 
     let mut queue = InMemoryJobQueue::new();
     enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
@@ -99,7 +125,7 @@ fn worker_job_processing_marks_done_on_success() {
         &whisper,
         &claude,
         2,
-        base.to_str().unwrap(),
+        &base.path().to_string_lossy(),
         Some("ja".to_owned()),
     )
     .expect("worker should succeed")
@@ -109,14 +135,12 @@ fn worker_job_processing_marks_done_on_success() {
         queue.get("j1").expect("job should exist").status,
         JobStatus::Done
     );
-
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
 fn worker_job_processing_marks_failed_after_retries_exhausted() {
     let base = unique_temp_dir("worker_failure");
-    write_dummy_chunk(&base, "m1");
+    write_dummy_chunk(base.path(), "m1");
 
     let mut queue = InMemoryJobQueue::new();
     enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
@@ -137,7 +161,7 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
         &whisper,
         &claude,
         0,
-        base.to_str().unwrap(),
+        &base.path().to_string_lossy(),
         None,
     );
     assert!(result.is_err(), "should fail with invalid JSON");
@@ -145,8 +169,6 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
     assert_eq!(job.status, JobStatus::Failed);
     let saved = store.get("m1").expect("meeting exists");
     assert_eq!(saved.status, MeetingStatus::Failed);
-
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]

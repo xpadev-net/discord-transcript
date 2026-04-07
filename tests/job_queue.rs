@@ -1,2 +1,1 @@
-#[path = "infrastructure/job_queue.rs"]
-mod job_queue;
+include!("infrastructure/job_queue.rs");

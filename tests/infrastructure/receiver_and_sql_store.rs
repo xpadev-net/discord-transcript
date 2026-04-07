@@ -4,7 +4,9 @@ use discord_transcript::domain::StopReason;
 use discord_transcript::domain::{JobStatus, JobType};
 use discord_transcript::infrastructure::queue::JobQueue;
 use discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL;
-use discord_transcript::infrastructure::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
+use discord_transcript::infrastructure::sql::{
+    CLAIM_JOB_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
+};
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, SqlMeetingStore,
 };
@@ -152,8 +154,11 @@ fn sql_job_queue_retry_returns_failed_status() {
 #[test]
 fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
     let mut executor = FakeSqlExecutor::default();
-    let cas_sql = "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END";
-    let cas_key = format!("{}|{}", cas_sql, "recording\u{1f}m-missing\u{1f}scheduled");
+    let cas_key = format!(
+        "{}|{}",
+        SET_MEETING_STATUS_CAS_SQL,
+        "recording\u{1f}m-missing\u{1f}scheduled"
+    );
     executor
         .query_rows_result
         .insert(cas_key, vec![vec!["not_found".to_owned()]]);
@@ -176,8 +181,11 @@ fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
 #[test]
 fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
     let mut executor = FakeSqlExecutor::default();
-    let cas_sql = "WITH updated AS (UPDATE meetings SET status=$1, updated_at=NOW() WHERE id=$2 AND status=$3 RETURNING 1), existing AS (SELECT 1 FROM meetings WHERE id=$2) SELECT CASE WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated' WHEN EXISTS (SELECT 1 FROM existing) THEN 'conflict' ELSE 'not_found' END";
-    let cas_key = format!("{}|{}", cas_sql, "recording\u{1f}m1\u{1f}scheduled");
+    let cas_key = format!(
+        "{}|{}",
+        SET_MEETING_STATUS_CAS_SQL,
+        "recording\u{1f}m1\u{1f}scheduled"
+    );
     executor
         .query_rows_result
         .insert(cas_key, vec![vec!["conflict".to_owned()]]);

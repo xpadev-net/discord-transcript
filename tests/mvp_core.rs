@@ -1,2 +1,1 @@
-#[path = "application/mvp_core.rs"]
-mod mvp_core;
+include!("application/mvp_core.rs");
