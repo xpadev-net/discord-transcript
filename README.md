@@ -52,6 +52,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `INTEGRATION_RETRY_INITIAL_DELAY_MS` | `200` | リトライ初回遅延 (ms) |
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
+| `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
 | `CLAUDE_MODEL` | `haiku` | Claude CLI の `--model` に渡すモデル名 |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 
@@ -113,6 +114,7 @@ cargo run --release
 - 音声はユーザーごとの WAV チャンクとして保存し、各チャンクには録音開始時刻を埋め込みます。
 - Whisper 推論は話者ごとに生成した WAV を入力として実行し、セグメント開始時刻を会議タイムラインに再マッピングして統合します。
 - `mixdown.wav` も従来通り生成されるため、再生や API 互換性は維持されます。
+- 録音開始→録音終了→要約開始→要約完了の進捗は、レポートチャンネルに投稿された 1 件の通常メッセージを編集して更新します（要約ページのリンクや失敗理由も同じメッセージに反映されます）。
 
 ## テスト
 

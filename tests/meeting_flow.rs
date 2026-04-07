@@ -7,7 +7,7 @@ use discord_transcript::recovery::RecoveryCandidate;
 use discord_transcript::retention::{ArtifactRecord, RetentionKind, RetentionPolicy};
 use discord_transcript::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::storage_fs::LocalChunkStorage;
-use discord_transcript::summary::StubClaudeSummaryClient;
+use discord_transcript::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::worker::ProcessMeetingInput;
 use discord_transcript::workspace::MeetingWorkspaceLayout;
 use std::path::PathBuf;
@@ -27,6 +27,8 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         report_channel_id: "tc1".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
         started_by_user_id: "u1".to_owned(),
         title: None,
         status: MeetingStatus::Stopping,
@@ -83,7 +85,11 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         voice_channel_id: "vc1".to_owned(),
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
-        speaker_audio: vec![],
+        speaker_audio: vec![SpeakerAudioInput {
+            speaker_id: "alice".to_owned(),
+            audio_path: "audio.wav".to_owned(),
+            offset_ms: 0,
+        }],
         language: Some("ja".to_owned()),
         workspace,
     };

@@ -61,6 +61,8 @@ fn record_start_rejects_if_active_meeting_exists() {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc-1".to_owned(),
         report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
         started_by_user_id: "u1".to_owned(),
         title: None,
         status: MeetingStatus::Recording,
@@ -96,6 +98,8 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc-1".to_owned(),
         report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
         started_by_user_id: "u1".to_owned(),
         title: None,
         status: MeetingStatus::Stopping,
@@ -127,6 +131,8 @@ fn record_stop_is_idempotent_for_same_meeting() {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc-1".to_owned(),
         report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
         started_by_user_id: "u1".to_owned(),
         title: None,
         status: MeetingStatus::Recording,
@@ -169,13 +175,13 @@ fn record_stop_is_idempotent_for_same_meeting() {
 
 #[test]
 fn auto_stop_triggers_after_grace_period_and_can_cancel() {
-    let mut state = AutoStopState::new(Duration::from_secs(15));
+    let mut state = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(
         state.on_non_bot_member_count_changed(0, 1_000),
         AutoStopSignal::StartTimer
     );
-    assert_eq!(state.tick(1_000 + 14_000), AutoStopSignal::Idle);
-    assert_eq!(state.tick(1_000 + 15_000), AutoStopSignal::Trigger);
+    assert_eq!(state.tick(1_000 + 59_000), AutoStopSignal::Idle);
+    assert_eq!(state.tick(1_000 + 60_000), AutoStopSignal::Trigger);
 
     // Simulate the timer task completing (as the runtime would do).
     state.clear_timer_active();

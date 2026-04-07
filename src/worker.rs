@@ -249,7 +249,6 @@ where
         };
         process_meeting_summary(store, whisper, claude, &input)
     })();
-
     match result {
         Ok(output) => {
             // Set meeting status first: if this fails the job stays Running
