@@ -11,6 +11,7 @@ use crate::infrastructure::storage::{MeetingStore, StoreError};
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +165,43 @@ pub struct ProcessJobResult {
     pub output: ProcessMeetingOutput,
 }
 
+fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
+    let entries = match std::fs::read_dir(meeting_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "failed to read meeting dir {}: {err}",
+                meeting_dir.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        let is_candidate = matches!(ext.as_deref(), Some("wav"))
+            && path.file_stem().and_then(|stem| stem.to_str()) != Some("mixdown");
+        if !is_candidate {
+            continue;
+        }
+        let size = entry
+            .metadata()
+            .map_err(|err| format!("failed to read metadata {}: {err}", path.display()))?
+            .len();
+        if size > 44 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn process_next_summary_job<S, Q, W, C>(
     store: &mut S,
     queue: &mut Q,
@@ -204,34 +242,30 @@ where
         })?;
         let legacy_dir = layout.legacy_meeting_dir(&job.meeting_id);
         let primary_dir = workspace.audio_dir();
-        let primary_has_wav = std::fs::read_dir(&primary_dir)
-            .map(|entries| {
-                entries.filter_map(Result::ok).any(|e| {
-                    let path = e.path();
-                    path.file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .map(|stem| stem != "mixdown")
-                        .unwrap_or(false)
-                        && path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
-                })
-            })
-            .unwrap_or(false);
-        let meeting_dir = if primary_has_wav {
-            primary_dir
+        let primary_has_nonempty =
+            has_nonempty_audio_chunk(&primary_dir).map_err(WorkerError::Summary)?;
+        let meeting_dir = if primary_has_nonempty {
+            primary_dir.clone()
         } else {
-            legacy_dir.clone()
+            let legacy_has_nonempty =
+                has_nonempty_audio_chunk(&legacy_dir).map_err(WorkerError::Summary)?;
+            if legacy_has_nonempty {
+                let expected_mixdown_path = legacy_dir.join("mixdown.wav");
+                warn!(
+                    meeting_id = %job.meeting_id,
+                    path = %expected_mixdown_path.display(),
+                    "workspace audio dir missing non-empty chunks; falling back to legacy mixdown path"
+                );
+                legacy_dir.clone()
+            } else {
+                return Err(WorkerError::Summary(format!(
+                    "no non-empty audio chunks found for meeting {} in {} or {}",
+                    job.meeting_id,
+                    primary_dir.display(),
+                    legacy_dir.display()
+                )));
+            }
         };
-        if !primary_has_wav {
-            let expected_mixdown_path = legacy_dir.join("mixdown.wav");
-            warn!(
-                meeting_id = %job.meeting_id,
-                path = %expected_mixdown_path.display(),
-                "workspace audio dir missing chunks; falling back to legacy mixdown path"
-            );
-        }
 
         let mixdown_path =
             merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;

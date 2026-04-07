@@ -69,6 +69,36 @@ fn write_dummy_chunk(base: &Path, meeting_id: &str) {
     std::fs::write(meeting_dir.join("u1_1_0.wav"), wav).expect("wav should write");
 }
 
+fn write_dummy_legacy_chunk(base: &Path, meeting_id: &str) {
+    use discord_transcript::audio::build_wav_bytes_raw;
+    let meeting_dir =
+        discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout::new(base)
+            .legacy_meeting_dir(meeting_id);
+    std::fs::create_dir_all(&meeting_dir).expect("meeting dir should be created");
+    let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
+    std::fs::write(meeting_dir.join("u1_1_0.wav"), wav).expect("wav should write");
+}
+
+fn write_empty_wav_chunk(base: &Path, meeting_id: &str) {
+    use discord_transcript::audio::build_wav_bytes_raw;
+    let meeting_dir =
+        discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout::new(base)
+            .for_meeting("g1", "vc1", meeting_id)
+            .audio_dir();
+    std::fs::create_dir_all(&meeting_dir).expect("meeting dir should be created");
+    let wav = build_wav_bytes_raw(&[], 1_000, 1, 16).expect("wav header should build");
+    std::fs::write(meeting_dir.join("u1_1_0.wav"), wav).expect("wav should write");
+}
+
+fn write_nonempty_pcm_chunk(base: &Path, meeting_id: &str) {
+    let meeting_dir =
+        discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout::new(base)
+            .for_meeting("g1", "vc1", meeting_id)
+            .audio_dir();
+    std::fs::create_dir_all(&meeting_dir).expect("meeting dir should be created");
+    std::fs::write(meeting_dir.join("u1_2_1000.pcm"), vec![1_u8; 128]).expect("pcm should write");
+}
+
 #[test]
 fn in_memory_queue_claim_done_and_retry_flow() {
     let mut queue = InMemoryJobQueue::new();
@@ -169,6 +199,132 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
     assert_eq!(job.status, JobStatus::Failed);
     let saved = store.get("m1").expect("meeting exists");
     assert_eq!(saved.status, MeetingStatus::Failed);
+}
+
+#[test]
+fn worker_job_processing_rejects_empty_chunks() {
+    let base = unique_temp_dir("worker_empty_chunk");
+    write_empty_wav_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "ignored".to_owned(),
+    };
+
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        0,
+        &base.path().to_string_lossy(),
+        None,
+    );
+    let err = result.expect_err("should fail when only empty chunks exist");
+    assert!(
+        err.to_string().contains("no non-empty audio chunks found"),
+        "unexpected error: {err}"
+    );
+    let job = queue.get("j1").expect("job exists");
+    assert_eq!(job.status, JobStatus::Failed);
+    let saved = store.get("m1").expect("meeting exists");
+    assert_eq!(saved.status, MeetingStatus::Failed);
+}
+
+#[test]
+fn worker_job_processing_rejects_pcm_only_chunks() {
+    let base = unique_temp_dir("worker_pcm_only_chunk");
+    write_empty_wav_chunk(base.path(), "m1");
+    write_nonempty_pcm_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "ignored".to_owned(),
+    };
+
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        0,
+        &base.path().to_string_lossy(),
+        None,
+    );
+    let err = result.expect_err("should fail when only pcm chunks are non-empty");
+    assert!(
+        err.to_string().contains("no non-empty audio chunks found"),
+        "unexpected error: {err}"
+    );
+    let job = queue.get("j1").expect("job exists");
+    assert_eq!(job.status, JobStatus::Failed);
+    let saved = store.get("m1").expect("meeting exists");
+    assert_eq!(saved.status, MeetingStatus::Failed);
+}
+
+#[test]
+fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() {
+    let base = unique_temp_dir("worker_legacy_fallback");
+    write_empty_wav_chunk(base.path(), "m1");
+    write_dummy_legacy_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "## Summary\ndone".to_owned(),
+    };
+
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        2,
+        &base.path().to_string_lossy(),
+        Some("ja".to_owned()),
+    )
+    .expect("worker should succeed")
+    .expect("job result should exist");
+    assert_eq!(result.job_id, "j1");
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
+        JobStatus::Done
+    );
 }
 
 #[test]
