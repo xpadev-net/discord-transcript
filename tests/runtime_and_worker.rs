@@ -45,6 +45,7 @@ fn app_config_loads_from_map() {
     assert_eq!(config.discord_guild_id, "guild");
     assert_eq!(config.whisper_endpoint, "http://whisper");
     assert_eq!(config.claude_command, "claude");
+    assert_eq!(config.claude_model, "haiku");
     assert_eq!(config.database_url, "postgres://localhost/db");
     assert_eq!(config.database_ssl_mode, "disable");
     assert_eq!(config.chunk_storage_dir, "/tmp/chunks");
@@ -72,6 +73,24 @@ fn app_config_accepts_valid_whisper_language() {
 
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.whisper_language, Some("ja".to_owned()));
+}
+
+#[test]
+fn app_config_accepts_claude_model_override() {
+    let mut values = HashMap::new();
+    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
+    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
+    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
+    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
+    values.insert("CLAUDE_MODEL".to_owned(), "sonnet".to_owned());
+    values.insert(
+        "DATABASE_URL".to_owned(),
+        "postgres://localhost/db".to_owned(),
+    );
+    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.claude_model, "sonnet");
 }
 
 #[test]
@@ -299,6 +318,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
             voice_channel_id: "vc".to_owned(),
             title: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+            speaker_audio: vec![],
             language: None,
             workspace: workspace.clone(),
         },
@@ -349,6 +369,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
             voice_channel_id: "vc".to_owned(),
             title: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+            speaker_audio: vec![],
             language: None,
             workspace: workspace.clone(),
         },

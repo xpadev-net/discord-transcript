@@ -35,7 +35,8 @@ fn receiver_state_flushes_by_chunk_duration() {
     );
 
     let chunk = state.take_user_chunk("u1").expect("chunk should exist");
-    assert_eq!(chunk.len(), 1);
+    assert_eq!(chunk.frames.len(), 1);
+    assert_eq!(chunk.start_ms, 1_000);
     assert!(state.take_user_chunk("u1").is_none());
 }
 

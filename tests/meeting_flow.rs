@@ -83,6 +83,7 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         voice_channel_id: "vc1".to_owned(),
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
         language: Some("ja".to_owned()),
         workspace,
     };

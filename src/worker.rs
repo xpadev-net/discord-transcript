@@ -1,9 +1,10 @@
 use crate::domain::{JobStatus, JobType, MeetingStatus};
+use crate::meeting_audio::build_speaker_audio_inputs;
 use crate::queue::{Job, JobQueue, QueueError};
 use crate::storage::{MeetingStore, StoreError};
 use crate::summary::{
-    ClaudeSummaryClient, SummaryError, SummaryRequest, build_summary_prompt, run_transcription,
-    write_transcript_files,
+    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, build_summary_prompt,
+    run_transcription, write_transcript_files,
 };
 use crate::workspace::MeetingWorkspacePaths;
 use crate::{asr::WhisperClient, posting::split_discord_message};
@@ -17,6 +18,7 @@ pub struct ProcessMeetingInput {
     pub voice_channel_id: String,
     pub title: Option<String>,
     pub audio_path: String,
+    pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
     pub workspace: MeetingWorkspacePaths,
 }
@@ -84,6 +86,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         voice_channel_id: input.voice_channel_id.clone(),
         title: input.title.clone(),
         audio_path: input.audio_path.clone(),
+        speaker_audio: input.speaker_audio.clone(),
         language: input.language.clone(),
         workspace: input.workspace.clone(),
     };
@@ -179,44 +182,75 @@ where
     };
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");
 
-    let meeting = store
-        .get_meeting(&job.meeting_id)
-        .map_err(WorkerError::from)?
-        .ok_or_else(|| {
-            WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
+    let result = (|| {
+        let meeting = store
+            .get_meeting(&job.meeting_id)
+            .map_err(WorkerError::from)?
+            .ok_or_else(|| {
+                WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
+            })?;
+        let layout = crate::workspace::MeetingWorkspaceLayout::new(audio_base_dir);
+        let workspace = layout.for_meeting(
+            &meeting.guild_id,
+            &meeting.voice_channel_id,
+            &job.meeting_id,
+        );
+        workspace.ensure_base_dirs().map_err(|err| {
+            WorkerError::from(SummaryError::SummaryEngine(format!(
+                "failed to prepare workspace: {err}"
+            )))
         })?;
-    let layout = crate::workspace::MeetingWorkspaceLayout::new(audio_base_dir);
-    let workspace = layout.for_meeting(
-        &meeting.guild_id,
-        &meeting.voice_channel_id,
-        &job.meeting_id,
-    );
-    workspace.ensure_base_dirs().map_err(|err| {
-        WorkerError::from(SummaryError::SummaryEngine(format!(
-            "failed to prepare workspace: {err}"
-        )))
-    })?;
-    let primary_mixdown = workspace.mixdown_path();
-    let legacy_mixdown = layout
-        .legacy_meeting_dir(&job.meeting_id)
-        .join("mixdown.wav");
-    let audio_path = if primary_mixdown.exists() {
-        primary_mixdown
-    } else {
-        legacy_mixdown
-    };
+        let legacy_dir = layout.legacy_meeting_dir(&job.meeting_id);
+        let primary_dir = workspace.audio_dir();
+        let primary_has_wav = std::fs::read_dir(&primary_dir)
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|e| {
+                    let path = e.path();
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| stem != "mixdown")
+                        .unwrap_or(false)
+                        && path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+                })
+            })
+            .unwrap_or(false);
+        let meeting_dir = if primary_has_wav {
+            primary_dir
+        } else {
+            legacy_dir.clone()
+        };
+        let audio_path = if primary_has_wav {
+            workspace.mixdown_path()
+        } else {
+            legacy_dir.join("mixdown.wav")
+        };
+        if !primary_has_wav {
+            warn!(
+                meeting_id = %job.meeting_id,
+                path = %audio_path.display(),
+                "workspace audio dir missing chunks; falling back to legacy mixdown path"
+            );
+        }
 
-    let input = ProcessMeetingInput {
-        meeting_id: job.meeting_id.clone(),
-        guild_id: meeting.guild_id.clone(),
-        voice_channel_id: meeting.voice_channel_id.clone(),
-        title: meeting.title.clone(),
-        audio_path: audio_path.to_string_lossy().to_string(),
-        language,
-        workspace,
-    };
+        crate::runtime::merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
+        let input = ProcessMeetingInput {
+            meeting_id: job.meeting_id.clone(),
+            guild_id: meeting.guild_id.clone(),
+            voice_channel_id: meeting.voice_channel_id.clone(),
+            title: meeting.title.clone(),
+            audio_path: audio_path.to_string_lossy().to_string(),
+            speaker_audio: build_speaker_audio_inputs(&meeting_dir)
+                .map_err(WorkerError::Summary)?,
+            language: language.clone(),
+            workspace,
+        };
+        process_meeting_summary(store, whisper, claude, &input)
+    })();
 
-    match process_meeting_summary(store, whisper, claude, &input) {
+    match result {
         Ok(output) => {
             // Set meeting status first: if this fails the job stays Running
             // and can be retried. The reverse order (mark_done first) would

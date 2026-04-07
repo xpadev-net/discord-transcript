@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub discord_guild_id: String,
     pub whisper_endpoint: String,
     pub claude_command: String,
+    pub claude_model: String,
     pub database_url: String,
     pub database_ssl_mode: String,
     pub chunk_storage_dir: String,
@@ -51,6 +52,7 @@ impl AppConfig {
             discord_guild_id: required_env("DISCORD_GUILD_ID")?,
             whisper_endpoint: required_env("WHISPER_ENDPOINT")?,
             claude_command: required_env("CLAUDE_COMMAND")?,
+            claude_model: optional_env("CLAUDE_MODEL").unwrap_or_else(|| "haiku".to_owned()),
             database_url: required_env("DATABASE_URL")?,
             database_ssl_mode: optional_env("DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
@@ -88,6 +90,8 @@ impl AppConfig {
             discord_guild_id: required_from_map(values, "DISCORD_GUILD_ID")?,
             whisper_endpoint: required_from_map(values, "WHISPER_ENDPOINT")?,
             claude_command: required_from_map(values, "CLAUDE_COMMAND")?,
+            claude_model: optional_from_map(values, "CLAUDE_MODEL")
+                .unwrap_or_else(|| "haiku".to_owned()),
             database_url: required_from_map(values, "DATABASE_URL")?,
             database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),

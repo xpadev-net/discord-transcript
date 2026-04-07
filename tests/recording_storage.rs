@@ -19,10 +19,18 @@ fn local_chunk_storage_writes_expected_file() {
     let layout = MeetingWorkspaceLayout::new(&base);
     let storage = LocalChunkStorage::new(layout.for_meeting("g1", "vc1", "m1"), "m1");
     let saved = storage
-        .save_chunk("m1", "u1", 1, b"abc")
+        .save_chunk("m1", "u1", 1, 0, b"abc")
         .expect("save should succeed");
 
     assert!(saved.path.exists());
+    assert_eq!(
+        saved
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
+        "u1_1_0.wav"
+    );
     assert_eq!(saved.size_bytes, 3);
     let loaded = std::fs::read(saved.path).expect("file should be readable");
     assert_eq!(loaded, b"abc");
@@ -63,7 +71,16 @@ fn recording_session_flushes_and_persists_wav_chunks() {
         .expect("flush should succeed");
     assert_eq!(result.persisted.len(), 1);
     assert_eq!(result.persisted[0].sequence, 1);
+    assert_eq!(result.persisted[0].start_ms, 1_000);
     assert!(result.persisted[0].saved.path.exists());
+    assert!(
+        result.persisted[0]
+            .saved
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.ends_with("_1_1000.wav"))
+    );
 
     let bytes =
         std::fs::read(&result.persisted[0].saved.path).expect("saved wav should be readable");
@@ -110,6 +127,7 @@ fn recording_session_increments_sequence_per_user() {
         .flush_due(start + Duration::from_secs(12))
         .expect("second flush should succeed");
     assert_eq!(second.persisted[0].sequence, 2);
+    assert_eq!(second.persisted[0].start_ms, 7_000);
 
     let _ = std::fs::remove_dir_all(base);
 }

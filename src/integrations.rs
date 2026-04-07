@@ -84,6 +84,7 @@ impl WhisperClient for CommandWhisperClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeCliSummaryClient {
     pub command_path: String,
+    pub model: String,
     pub retry_policy: RetryPolicy,
 }
 
@@ -118,6 +119,8 @@ impl ClaudeSummaryClient for ClaudeCliSummaryClient {
             use std::io::Write;
             let mut command = Command::new(&self.command_path);
             command
+                .arg("--model")
+                .arg(&self.model)
                 .arg("-p")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

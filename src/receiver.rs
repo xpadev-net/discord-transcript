@@ -57,10 +57,11 @@ impl UserAudioBuffer {
         now.saturating_duration_since(start) >= config.chunk_duration
     }
 
-    pub fn take_frames(&mut self) -> Vec<BufferedFrame> {
+    pub fn take_frames(&mut self) -> (u64, Vec<BufferedFrame>) {
+        let start_ms = self.first_frame_ms.unwrap_or(0);
         self.first_frame_ms = None;
         self.first_frame_instant = None;
-        std::mem::take(&mut self.frames)
+        (start_ms, std::mem::take(&mut self.frames))
     }
 }
 
@@ -92,10 +93,18 @@ impl ReceiverState {
             .collect()
     }
 
-    pub fn take_user_chunk(&mut self, user_id: &str) -> Option<Vec<BufferedFrame>> {
+    pub fn take_user_chunk(&mut self, user_id: &str) -> Option<UserChunkCandidate> {
         let user = self.per_user.get_mut(user_id)?;
-        let chunk = user.take_frames();
-        if chunk.is_empty() { None } else { Some(chunk) }
+        let (start_ms, frames) = user.take_frames();
+        if frames.is_empty() {
+            None
+        } else {
+            Some(UserChunkCandidate {
+                user_id: user.user_id.clone(),
+                start_ms,
+                frames,
+            })
+        }
     }
 
     pub fn flush_due_chunks(
@@ -109,29 +118,24 @@ impl ReceiverState {
             .map(ToOwned::to_owned)
             .collect();
 
-        let mut out = Vec::new();
-        for user_id in user_ids {
-            if let Some(frames) = self.take_user_chunk(&user_id) {
-                out.push(UserChunkCandidate { user_id, frames });
-            }
-        }
-        out
+        user_ids
+            .into_iter()
+            .filter_map(|user_id| self.take_user_chunk(&user_id))
+            .collect()
     }
 
     pub fn flush_all_chunks(&mut self) -> Vec<UserChunkCandidate> {
         let user_ids: Vec<String> = self.per_user.keys().cloned().collect();
-        let mut out = Vec::new();
-        for user_id in user_ids {
-            if let Some(frames) = self.take_user_chunk(&user_id) {
-                out.push(UserChunkCandidate { user_id, frames });
-            }
-        }
-        out
+        user_ids
+            .into_iter()
+            .filter_map(|user_id| self.take_user_chunk(&user_id))
+            .collect()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserChunkCandidate {
     pub user_id: String,
+    pub start_ms: u64,
     pub frames: Vec<BufferedFrame>,
 }

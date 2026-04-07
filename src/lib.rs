@@ -9,6 +9,7 @@ pub mod command;
 pub mod config;
 pub mod domain;
 pub mod integrations;
+pub mod meeting_audio;
 pub mod meeting_flow;
 pub mod posting;
 pub mod privacy;

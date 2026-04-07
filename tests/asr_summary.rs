@@ -1,8 +1,8 @@
 use discord_transcript::asr::{StubWhisperClient, parse_whisper_response};
 use discord_transcript::privacy::MaskingStats;
 use discord_transcript::summary::{
-    StubClaudeSummaryClient, SummaryRequest, TranscriptManifest, build_summary_prompt,
-    run_summary_pipeline,
+    SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
+    build_summary_prompt, run_summary_pipeline,
 };
 use discord_transcript::transcript::{NormalizationConfig, TranscriptSegment, normalize_segments};
 use discord_transcript::workspace::MeetingWorkspaceLayout;
@@ -113,6 +113,11 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
         voice_channel_id: "vc1".to_owned(),
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![SpeakerAudioInput {
+            speaker_id: "alice".to_owned(),
+            audio_path: "audio.wav".to_owned(),
+            offset_ms: 0,
+        }],
         language: Some("ja".to_owned()),
         workspace: workspace.clone(),
     };
@@ -139,6 +144,7 @@ fn prompt_contains_required_sections() {
         voice_channel_id: "vc1".to_owned(),
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
         language: None,
         workspace,
     };
