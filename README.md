@@ -181,43 +181,54 @@ sudo systemctl enable --now discord-transcript
 ```text
 src/
   main.rs              # エントリーポイント
-  lib.rs               # モジュールエクスポート
-  config.rs            # 環境変数からの設定読み込み
-  domain.rs            # コア型定義 (MeetingStatus, StopReason, JobType 等)
-  runtime.rs           # Bot ランタイム・イベントハンドリング
-  command.rs           # スラッシュコマンド実装
-  bot.rs               # Bot コマンドサービスレイヤー
-  authz.rs             # 権限チェック
-  recorder.rs          # 音声録音管理
-  recording_session.rs # 録音セッション状態
-  receiver.rs          # ボイスフレーム受信
-  audio.rs             # 音声処理ユーティリティ
-  meeting_audio.rs     # 録音チャンク読み出し・話者別 WAV 生成
-  songbird_adapter.rs  # Songbird ボイスクライアントアダプタ
-  asr.rs               # whisper.cpp クライアントインターフェース
-  integrations.rs      # 外部連携クライアント (Whisper, Claude CLI)
-  summary.rs           # 要約生成パイプライン
-  transcript.rs        # 文字起こしの正規化
-  privacy.rs           # PII マスキング (メール・電話番号等)
-  meeting_flow.rs      # ミーティングライフサイクル制御
-  stop.rs              # 録音停止の冪等制御
-  auto_stop.rs         # VC 空室時の自動停止
-  worker.rs            # バックグラウンドジョブ処理
-  queue.rs             # ジョブキュー抽象化
-  retry.rs             # リトライポリシー・指数バックオフ
-  posting.rs           # Discord メッセージ投稿ユーティリティ
-  artifact.rs          # アーティファクト・ストレージ URL 管理
-  storage.rs           # ストレージ抽象レイヤー
-  storage_fs.rs        # ファイルシステムストレージ実装
-  sql.rs               # SQL クエリ定数
-  sql_store.rs         # PostgreSQL 実装
-  recovery.rs          # Bot 再起動時のリカバリ判定
-  recovery_runner.rs   # リカバリ実行
-  retention.rs         # データ保持期間 (TTL) 管理
-  audit.rs             # 監査ログ
+  lib.rs               # ルートモジュール
+  application/         # ユースケース・実行フロー
+    runtime.rs         # Bot ランタイム・イベントハンドリング
+    command.rs         # スラッシュコマンド実装
+    bot.rs             # Bot コマンドサービスレイヤー
+    stop.rs            # 録音停止の冪等制御
+    auto_stop.rs       # VC 空室時の自動停止
+    worker.rs          # バックグラウンドジョブ処理
+    summary.rs         # 要約生成パイプライン
+  audio/               # 音声受信・録音処理
+    wav.rs             # WAV 変換・音声ユーティリティ
+    receiver.rs        # ボイスフレーム受信
+    recorder.rs        # 音声録音管理
+    recording_session.rs
+    meeting_audio.rs
+    songbird_adapter.rs
+  bootstrap/
+    config.rs          # 環境変数からの設定読み込み
+  domain/              # ドメインルール・型・ポリシー
+    model.rs           # コア型定義 (MeetingStatus, StopReason, JobType 等)
+    authz.rs
+    privacy.rs
+    transcript.rs
+    retention.rs
+    recovery.rs
+    audit.rs
+  infrastructure/      # 外部I/O・永続化・連携
+    sql.rs             # SQL クエリ定数
+    sql_store.rs       # PostgreSQL 実装
+    storage.rs
+    storage_fs.rs
+    queue.rs
+    integrations.rs
+    asr.rs
+    retry.rs
+    artifact.rs
+    workspace.rs
+  interfaces/          # 外部向けインターフェース
+    web.rs             # Web API
+    posting.rs         # Discord メッセージ投稿
 migrations/
   0001_mvp_schema.sql  # DB スキーマ
-tests/                 # 統合テスト
+tests/
+  application/         # 統合テスト本体（機能別）
+  audio/
+  domain/
+  infrastructure/
+  *.rs                 # Cargo 用エントリ（薄いラッパー）
 .github/workflows/
   ci.yml               # CI 設定
 ```
