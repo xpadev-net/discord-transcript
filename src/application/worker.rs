@@ -224,7 +224,7 @@ where
         } else {
             legacy_dir.clone()
         };
-        let audio_path = if primary_has_wav {
+        let expected_mixdown_path = if primary_has_wav {
             workspace.mixdown_path()
         } else {
             legacy_dir.join("mixdown.wav")
@@ -232,18 +232,19 @@ where
         if !primary_has_wav {
             warn!(
                 meeting_id = %job.meeting_id,
-                path = %audio_path.display(),
+                path = %expected_mixdown_path.display(),
                 "workspace audio dir missing chunks; falling back to legacy mixdown path"
             );
         }
 
-        merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
+        let mixdown_path =
+            merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
-            audio_path: audio_path.to_string_lossy().to_string(),
+            audio_path: mixdown_path,
             speaker_audio: build_speaker_audio_inputs(&meeting_dir)
                 .map_err(WorkerError::Summary)?,
             language: language.clone(),
