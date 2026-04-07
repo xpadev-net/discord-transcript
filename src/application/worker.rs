@@ -224,12 +224,8 @@ where
         } else {
             legacy_dir.clone()
         };
-        let expected_mixdown_path = if primary_has_wav {
-            workspace.mixdown_path()
-        } else {
-            legacy_dir.join("mixdown.wav")
-        };
         if !primary_has_wav {
+            let expected_mixdown_path = legacy_dir.join("mixdown.wav");
             warn!(
                 meeting_id = %job.meeting_id,
                 path = %expected_mixdown_path.display(),
