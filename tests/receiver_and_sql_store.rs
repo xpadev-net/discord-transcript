@@ -54,6 +54,8 @@ fn sql_store_applies_migration_and_writes_sql() {
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
             report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
             started_by_user_id: "u1".to_owned(),
         })
         .expect("insert should execute");
@@ -81,6 +83,8 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
             report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
             started_by_user_id: "u1".to_owned(),
             title: None,
             status: MeetingStatus::Recording,
@@ -186,5 +190,41 @@ fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
         Err(StoreError::CasConflict {
             meeting_id: "m1".to_owned()
         })
+    );
+}
+
+#[test]
+fn sql_store_reads_and_sets_status_message_metadata() {
+    let mut executor = FakeSqlExecutor::default();
+    let query_sql = "SELECT report_channel_id, status_message_channel_id, status_message_id FROM meetings WHERE id=$1 LIMIT 1";
+    executor.query_rows_result.insert(
+        format!("{query_sql}|{}", "m1"),
+        vec![vec![
+            "c-report".to_owned(),
+            "c-status".to_owned(),
+            "m-status".to_owned(),
+        ]],
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let metadata = store
+        .get_status_message_metadata("m1")
+        .expect("metadata should load");
+    assert_eq!(metadata.report_channel_id, "c-report");
+    assert_eq!(
+        metadata.status_message_channel_id.as_deref(),
+        Some("c-status")
+    );
+    assert_eq!(metadata.status_message_id.as_deref(), Some("m-status"));
+
+    store
+        .set_status_message("m1", "c-new".to_owned(), "msg-2".to_owned())
+        .expect("status message should persist");
+    assert!(
+        store.executor.executed.iter().any(|(sql, params)| {
+            sql.contains("status_message_id")
+                && params == &vec!["c-new".to_owned(), "msg-2".to_owned(), "m1".to_owned()]
+        }),
+        "set_status_message should execute update SQL"
     );
 }

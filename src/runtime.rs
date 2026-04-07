@@ -16,14 +16,14 @@ use crate::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick}
 use crate::sql::{INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL};
 use crate::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::stop::StopOutcome;
-use crate::storage::MeetingStore;
+use crate::storage::{MeetingStore, StatusMessageMetadata};
 use crate::storage_fs::LocalChunkStorage;
 use crate::summary::ClaudeSummaryClient;
 use crate::worker::enqueue_summary_job;
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
+    EditMessage, GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -244,6 +244,131 @@ impl Display for RuntimeError {
             Self::DatabaseMigration(err) => write!(f, "failed to run migration: {err}"),
             Self::ClientInit(err) => write!(f, "failed to initialize serenity client: {err}"),
             Self::ClientRun(err) => write!(f, "failed while running serenity client: {err}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum StatusMessageUpdate<'a> {
+    RecordingStarted {
+        voice_channel_id: u64,
+        report_channel_id: u64,
+    },
+    RecordingStopped,
+    SummaryStarted,
+    SummaryCompleted {
+        summary_url: Option<String>,
+    },
+    Failed {
+        phase: &'a str,
+        error: &'a str,
+    },
+}
+
+struct DiscordStatusMessenger<'a> {
+    http: &'a Http,
+}
+
+#[async_trait]
+trait StatusMessenger {
+    async fn send(&self, channel_id: u64, content: &str) -> Result<u64, String>;
+    async fn edit(&self, channel_id: u64, message_id: u64, content: &str) -> Result<(), String>;
+}
+
+#[async_trait]
+impl StatusMessenger for DiscordStatusMessenger<'_> {
+    async fn send(&self, channel_id: u64, content: &str) -> Result<u64, String> {
+        ChannelId::new(channel_id)
+            .say(self.http, content)
+            .await
+            .map(|msg| msg.id.get())
+            .map_err(|err| err.to_string())
+    }
+
+    async fn edit(&self, channel_id: u64, message_id: u64, content: &str) -> Result<(), String> {
+        ChannelId::new(channel_id)
+            .edit_message(self.http, message_id, EditMessage::new().content(content))
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
+fn format_status_message_content(meeting_id: &str, update: &StatusMessageUpdate<'_>) -> String {
+    match update {
+        StatusMessageUpdate::RecordingStarted {
+            voice_channel_id,
+            report_channel_id,
+        } => format!(
+            "🎙️ 録音を開始しました\nmeeting_id={meeting_id}\nVC: <#{}>\nレポート: <#{}>",
+            voice_channel_id, report_channel_id
+        ),
+        StatusMessageUpdate::RecordingStopped => {
+            format!("⏹️ 録音を終了しました。要約を準備しています。\nmeeting_id={meeting_id}")
+        }
+        StatusMessageUpdate::SummaryStarted => {
+            format!("📝 要約を開始しました (文字起こし/要約を実行中)\nmeeting_id={meeting_id}")
+        }
+        StatusMessageUpdate::SummaryCompleted { summary_url } => {
+            let base = format!("✅ 要約が完了しました\nmeeting_id={meeting_id}");
+            match summary_url {
+                Some(url) => format!("{base}\n要約ページ: {url}"),
+                None => base,
+            }
+        }
+        StatusMessageUpdate::Failed { phase, error } => {
+            let trimmed = truncate_error_for_status(error);
+            format!("⚠️ 処理に失敗しました ({phase})\nmeeting_id={meeting_id}\nerror={trimmed}")
+        }
+    }
+}
+
+fn truncate_error_for_status(error: &str) -> String {
+    const LIMIT: usize = 1400;
+    if error.len() > LIMIT {
+        format!("{}…", &error[..LIMIT])
+    } else {
+        error.to_owned()
+    }
+}
+
+async fn upsert_status_message_via_messenger<M: StatusMessenger + Sync>(
+    messenger: &M,
+    meeting_id: &str,
+    channel_id: u64,
+    existing_message_id: Option<u64>,
+    content: &str,
+) -> Result<Option<u64>, String> {
+    let mut edit_error = None;
+    if let Some(message_id) = existing_message_id {
+        match messenger.edit(channel_id, message_id, content).await {
+            Ok(_) => return Ok(None),
+            Err(err) => {
+                edit_error = Some(err);
+            }
+        }
+    }
+
+    match messenger.send(channel_id, content).await {
+        Ok(message_id) => {
+            if let Some(err) = edit_error {
+                warn!(
+                    meeting_id = %meeting_id,
+                    channel_id = channel_id,
+                    error = %err,
+                    "failed to edit status message, posted a new one instead"
+                );
+            }
+            Ok(Some(message_id))
+        }
+        Err(err) => {
+            if let Some(edit_err) = edit_error {
+                Err(format!(
+                    "status message update failed (edit failed: {edit_err}; send failed: {err})"
+                ))
+            } else {
+                Err(err)
+            }
         }
     }
 }
@@ -486,6 +611,22 @@ impl EventHandler for ScaffoldHandler {
                 };
                 match stop_result {
                     Ok(result) => {
+                        if result.outcome == StopOutcome::Owner
+                            && let Err(err) = handler
+                                .update_status_message(
+                                    &ctx_for_task.http,
+                                    &result.meeting_id,
+                                    StatusMessageUpdate::RecordingStopped,
+                                )
+                                .await
+                        {
+                            warn!(
+                                guild_id = %guild_for_task,
+                                meeting_id = %result.meeting_id,
+                                error = %err,
+                                "failed to update status message after auto stop"
+                            );
+                        }
                         info!(
                             guild_id = %guild_for_task,
                             meeting_id = %result.meeting_id,
@@ -681,6 +822,81 @@ impl ScaffoldHandler {
             .map(|m| m.id)
     }
 
+    async fn status_message_metadata(
+        &self,
+        meeting_id: &str,
+    ) -> Result<StatusMessageMetadata, String> {
+        let mut service = self.service.lock().await;
+        service
+            .store
+            .get_status_message_metadata(meeting_id)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn update_status_message(
+        &self,
+        http: &Http,
+        meeting_id: &str,
+        update: StatusMessageUpdate<'_>,
+    ) -> Result<(), String> {
+        let messenger = DiscordStatusMessenger { http };
+        self.update_status_message_with_messenger(&messenger, meeting_id, update)
+            .await
+    }
+
+    async fn update_status_message_with_messenger<M: StatusMessenger + Sync>(
+        &self,
+        messenger: &M,
+        meeting_id: &str,
+        update: StatusMessageUpdate<'_>,
+    ) -> Result<(), String> {
+        let metadata = self.status_message_metadata(meeting_id).await?;
+        let channel_id_str = metadata
+            .status_message_channel_id
+            .as_deref()
+            .unwrap_or(&metadata.report_channel_id);
+        let channel_id = channel_id_str.parse::<u64>().map_err(|err| {
+            format!(
+                "invalid status message channel id: meeting_id={meeting_id}, value={channel_id_str}, error={err}"
+            )
+        })?;
+        let content = format_status_message_content(meeting_id, &update);
+
+        let existing_message_id = match metadata.status_message_id {
+            Some(ref message_id_str) => match message_id_str.parse::<u64>() {
+                Ok(message_id) => Some(message_id),
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        message_id = message_id_str,
+                        error = %err,
+                        "invalid status message id, recreating status message"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let message_id = upsert_status_message_via_messenger(
+            messenger,
+            meeting_id,
+            channel_id,
+            existing_message_id,
+            &content,
+        )
+        .await?;
+
+        if let Some(message_id) = message_id {
+            let mut service = self.service.lock().await;
+            service
+                .store
+                .set_status_message(meeting_id, channel_id.to_string(), message_id.to_string())
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    }
+
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
         let result = match command.data.name.as_str() {
             RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
@@ -848,7 +1064,29 @@ impl ScaffoldHandler {
             "recording started"
         );
 
-        Ok(response)
+        let status_update = self
+            .update_status_message(
+                &ctx.http,
+                &meeting_id,
+                StatusMessageUpdate::RecordingStarted {
+                    voice_channel_id: voice_channel_id_u64,
+                    report_channel_id: command.channel_id.get(),
+                },
+            )
+            .await;
+        if let Err(err) = status_update {
+            warn!(
+                guild_id = %guild_id.get(),
+                meeting_id = %meeting_id,
+                error = %err,
+                "failed to post or update status message after record start"
+            );
+            Ok(format!(
+                "{response}\n(ステータスメッセージ更新に失敗しました: {err})"
+            ))
+        } else {
+            Ok(response)
+        }
     }
 
     async fn handle_record_stop(
@@ -898,6 +1136,21 @@ impl ScaffoldHandler {
                 let outcome = result.outcome;
 
                 if outcome == StopOutcome::Owner {
+                    if let Err(err) = self
+                        .update_status_message(
+                            &ctx.http,
+                            &meeting_id,
+                            StatusMessageUpdate::RecordingStopped,
+                        )
+                        .await
+                    {
+                        warn!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "failed to update status message after manual stop"
+                        );
+                    }
                     // Spawn summary processing in background — transcription and
                     // AI summarization can take minutes, far beyond the interaction
                     // response window, and should not block the command reply.
@@ -937,8 +1190,11 @@ impl ScaffoldHandler {
                 return Err(err);
             }
         };
-        match self.process_enqueued_summary_job(meeting_id).await {
+        match self.process_enqueued_summary_job(http, meeting_id).await {
             Ok(output) => {
+                let summary_url = self.public_base_url.as_ref().map(|base_url| {
+                    format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id)
+                });
                 let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
                 } else {
@@ -959,20 +1215,52 @@ impl ScaffoldHandler {
                             Some(format!("summary posting failed: {err}")),
                         );
                     }
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "summary_post",
+                                error: &err,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            error = %status_err,
+                            "failed to update status message after summary posting failure"
+                        );
+                    }
                     let _ =
                         post_failure_to_report_channel(http, report_channel_id, meeting_id, &err)
                             .await;
                     return Err(err);
                 }
                 // Post meeting URL if PUBLIC_BASE_URL is configured
-                if let Some(ref base_url) = self.public_base_url {
-                    let url = format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id);
+                if let Some(ref url) = summary_url {
                     let url_msg = format!("詳細はこちら: {url}");
                     if let Err(err) =
                         post_summary_to_report_channel(http, report_channel_id, &[url_msg]).await
                     {
                         warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
                     }
+                }
+                if let Err(err) = self
+                    .update_status_message(
+                        http,
+                        meeting_id,
+                        StatusMessageUpdate::SummaryCompleted {
+                            summary_url: summary_url.clone(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "failed to update status message after summary completion"
+                    );
                 }
                 // Mark meeting as Posted and job as Done only after successful posting.
                 // This order prevents data loss: if posting fails, the job stays
@@ -1026,34 +1314,39 @@ impl ScaffoldHandler {
         error_message: &str,
     ) -> Result<(), String> {
         let report_channel_id = self.report_channel_id_for_meeting(meeting_id).await?;
+        if let Err(status_err) = self
+            .update_status_message(
+                http,
+                meeting_id,
+                StatusMessageUpdate::Failed {
+                    phase: "summary",
+                    error: error_message,
+                },
+            )
+            .await
+        {
+            warn!(
+                meeting_id = %meeting_id,
+                error = %status_err,
+                "failed to update status message while posting failure"
+            );
+        }
         post_failure_to_report_channel(http, report_channel_id, meeting_id, error_message).await
     }
 
     async fn report_channel_id_for_meeting(&self, meeting_id: &str) -> Result<u64, String> {
-        let mut service = self.service.lock().await;
-        let rows = service.store.executor.query_rows(
-            "SELECT report_channel_id FROM meetings WHERE id=$1 LIMIT 1",
-            &[meeting_id.to_owned()],
-        )?;
-        let Some(row) = rows.into_iter().next() else {
-            return Err(format!(
-                "meeting not found while loading report channel: meeting_id={meeting_id}"
-            ));
-        };
-        let Some(value) = row.first() else {
-            return Err(format!(
-                "report channel row missing value: meeting_id={meeting_id}"
-            ));
-        };
-        value.parse::<u64>().map_err(|err| {
+        let metadata = self.status_message_metadata(meeting_id).await?;
+        metadata.report_channel_id.parse::<u64>().map_err(|err| {
             format!(
-                "invalid report channel id: meeting_id={meeting_id}, value={value}, error={err}"
+                "invalid report channel id: meeting_id={meeting_id}, value={}, error={err}",
+                metadata.report_channel_id
             )
         })
     }
 
     async fn process_enqueued_summary_job(
         &self,
+        http: &Http,
         meeting_id: &str,
     ) -> Result<crate::worker::ProcessMeetingOutput, String> {
         let whisper = CommandWhisperClient {
@@ -1106,6 +1399,24 @@ impl ScaffoldHandler {
                     let _ = service
                         .store
                         .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    drop(service);
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "transcription_input",
+                                error: &err,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %status_err,
+                            "failed to update status message after speaker audio error"
+                        );
+                    }
                 }
                 return Err(err);
             }
@@ -1128,12 +1439,46 @@ impl ScaffoldHandler {
                 Some(MeetingStatus::Stopping),
             )
         } {
+            let cas_err_string = cas_err.to_string();
             // CAS failed — another process may own this meeting.  Mark the
             // job failed so it does not stay Running forever.
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping→Transcribing failed; marking job failed");
             let mut queue = self.queue.lock().await;
-            let _ = queue.mark_failed(&claimed_job.id, cas_err.to_string());
-            return Err(cas_err.to_string());
+            let _ = queue.mark_failed(&claimed_job.id, cas_err_string.clone());
+            drop(queue);
+            if let Err(status_err) = self
+                .update_status_message(
+                    http,
+                    &claimed_job.meeting_id,
+                    StatusMessageUpdate::Failed {
+                        phase: "summary_start",
+                        error: &cas_err_string,
+                    },
+                )
+                .await
+            {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %status_err,
+                    "failed to update status message after summary start CAS failure"
+                );
+            }
+            return Err(cas_err_string);
+        }
+
+        if let Err(err) = self
+            .update_status_message(
+                http,
+                &claimed_job.meeting_id,
+                StatusMessageUpdate::SummaryStarted,
+            )
+            .await
+        {
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                error = %err,
+                "failed to update status message at summary start"
+            );
         }
 
         let transcription =
@@ -1141,6 +1486,7 @@ impl ScaffoldHandler {
         let transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
+                let err_string = err.to_string();
                 // Revert to Stopping so the next retry attempt's CAS guard succeeds.
                 let reverted = {
                     let mut service = self.service.lock().await;
@@ -1155,8 +1501,11 @@ impl ScaffoldHandler {
                 };
                 if reverted {
                     let mut queue = self.queue.lock().await;
-                    let retry_status =
-                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    let retry_status = queue.retry(
+                        &claimed_job.id,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                    );
                     drop(queue);
                     if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
                         let mut service = self.service.lock().await;
@@ -1167,7 +1516,25 @@ impl ScaffoldHandler {
                         );
                         let _ = service
                             .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
+                        drop(service);
+                        if let Err(status_err) = self
+                            .update_status_message(
+                                http,
+                                &claimed_job.meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: "transcription",
+                                    error: &err_string,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                meeting_id = %claimed_job.meeting_id,
+                                error = %status_err,
+                                "failed to update status message after transcription failure"
+                            );
+                        }
                     }
                 } else {
                     // Revert failed — another process may have progressed the
@@ -1177,9 +1544,26 @@ impl ScaffoldHandler {
                         "CAS revert to Stopping failed; marking job failed"
                     );
                     let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_failed(&claimed_job.id, err.to_string());
+                    let _ = queue.mark_failed(&claimed_job.id, err_string.clone());
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "transcription",
+                                error: &err_string,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %status_err,
+                            "failed to update status message after transcription CAS failure"
+                        );
+                    }
                 }
-                return Err(err.to_string());
+                return Err(err_string);
             }
         };
 
@@ -1216,10 +1600,28 @@ impl ScaffoldHandler {
                 Some(MeetingStatus::Transcribing),
             )
         } {
+            let cas_err_string = cas_err.to_string();
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
             let mut queue = self.queue.lock().await;
-            let _ = queue.mark_failed(&claimed_job.id, cas_err.to_string());
-            return Err(cas_err.to_string());
+            let _ = queue.mark_failed(&claimed_job.id, cas_err_string.clone());
+            if let Err(status_err) = self
+                .update_status_message(
+                    http,
+                    &claimed_job.meeting_id,
+                    StatusMessageUpdate::Failed {
+                        phase: "summary_start",
+                        error: &cas_err_string,
+                    },
+                )
+                .await
+            {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %status_err,
+                    "failed to update status message after summary start CAS failure"
+                );
+            }
+            return Err(cas_err_string);
         }
 
         let markdown = tokio::task::block_in_place(|| {
@@ -1232,6 +1634,7 @@ impl ScaffoldHandler {
         let markdown = match markdown {
             Ok(m) => m,
             Err(err) => {
+                let err_string = err.to_string();
                 // Revert to Stopping so the next retry attempt starts from a consistent state.
                 let reverted = {
                     let mut service = self.service.lock().await;
@@ -1246,8 +1649,11 @@ impl ScaffoldHandler {
                 };
                 if reverted {
                     let mut queue = self.queue.lock().await;
-                    let retry_status =
-                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    let retry_status = queue.retry(
+                        &claimed_job.id,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                    );
                     drop(queue);
                     if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
                         let mut service = self.service.lock().await;
@@ -1258,7 +1664,25 @@ impl ScaffoldHandler {
                         );
                         let _ = service
                             .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
+                        drop(service);
+                        if let Err(status_err) = self
+                            .update_status_message(
+                                http,
+                                &claimed_job.meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: "summary",
+                                    error: &err_string,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                meeting_id = %claimed_job.meeting_id,
+                                error = %status_err,
+                                "failed to update status message after summary failure"
+                            );
+                        }
                     }
                 } else {
                     warn!(
@@ -1266,9 +1690,26 @@ impl ScaffoldHandler {
                         "CAS revert to Stopping failed; marking job failed"
                     );
                     let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_failed(&claimed_job.id, err.to_string());
+                    let _ = queue.mark_failed(&claimed_job.id, err_string.clone());
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "summary",
+                                error: &err_string,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %status_err,
+                            "failed to update status message after summary CAS failure"
+                        );
+                    }
                 }
-                return Err(err.to_string());
+                return Err(err_string);
             }
         };
 
@@ -1378,6 +1819,22 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         };
                         match stop_result {
                             Ok(result) => {
+                                if result.outcome == StopOutcome::Owner
+                                    && let Err(err) = runtime
+                                        .update_status_message(
+                                            &http,
+                                            &result.meeting_id,
+                                            StatusMessageUpdate::RecordingStopped,
+                                        )
+                                        .await
+                                {
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = %result.meeting_id,
+                                        error = %err,
+                                        "failed to update status message after client disconnect stop"
+                                    );
+                                }
                                 if result.outcome == StopOutcome::Owner
                                     && let Err(err) =
                                         run_summary_background(&runtime, &http, &result.meeting_id)
@@ -1616,4 +2073,89 @@ async fn post_failure_to_report_channel(
             .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod status_message_tests {
+    use super::*;
+    use serenity::async_trait;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct StubMessenger {
+        edits: Mutex<Vec<(u64, u64, String)>>,
+        sends: Mutex<Vec<(u64, String)>>,
+        edit_error: Option<String>,
+        send_id: Mutex<u64>,
+    }
+
+    #[async_trait]
+    impl StatusMessenger for StubMessenger {
+        async fn send(&self, channel_id: u64, content: &str) -> Result<u64, String> {
+            self.sends
+                .lock()
+                .unwrap()
+                .push((channel_id, content.to_owned()));
+            let mut id = self.send_id.lock().unwrap();
+            *id += 1;
+            Ok(*id)
+        }
+
+        async fn edit(
+            &self,
+            channel_id: u64,
+            message_id: u64,
+            content: &str,
+        ) -> Result<(), String> {
+            self.edits
+                .lock()
+                .unwrap()
+                .push((channel_id, message_id, content.to_owned()));
+            if let Some(err) = &self.edit_error {
+                return Err(err.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_edits_when_existing_message_available() {
+        let messenger = StubMessenger::default();
+        let result =
+            upsert_status_message_via_messenger(&messenger, "meeting-1", 1, Some(10), "hello")
+                .await
+                .expect("upsert should succeed");
+
+        assert!(result.is_none());
+        assert_eq!(messenger.edits.lock().unwrap().len(), 1);
+        assert!(messenger.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_posts_new_when_edit_fails() {
+        let messenger = StubMessenger {
+            edit_error: Some("boom".to_owned()),
+            ..Default::default()
+        };
+        let result =
+            upsert_status_message_via_messenger(&messenger, "meeting-1", 1, Some(10), "hello")
+                .await
+                .expect("upsert should succeed");
+
+        assert_eq!(result, Some(1));
+        assert_eq!(messenger.edits.lock().unwrap().len(), 1);
+        assert_eq!(messenger.sends.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn summary_completion_message_includes_url() {
+        let message = format_status_message_content(
+            "meeting-1",
+            &StatusMessageUpdate::SummaryCompleted {
+                summary_url: Some("https://example.test/meetings/meeting-1".to_owned()),
+            },
+        );
+        assert!(message.contains("https://example.test/meetings/meeting-1"));
+        assert!(message.contains("✅"));
+    }
 }

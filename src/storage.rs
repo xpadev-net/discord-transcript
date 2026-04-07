@@ -9,6 +9,13 @@ pub enum StopTransition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMessageMetadata {
+    pub report_channel_id: String,
+    pub status_message_channel_id: Option<String>,
+    pub status_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     AlreadyExists {
         meeting_id: String,
@@ -85,6 +92,18 @@ pub trait MeetingStore {
         meeting_id: &str,
         error_message: Option<String>,
     ) -> Result<(), StoreError>;
+
+    fn get_status_message_metadata(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<StatusMessageMetadata, StoreError>;
+
+    fn set_status_message(
+        &mut self,
+        meeting_id: &str,
+        channel_id: String,
+        message_id: String,
+    ) -> Result<(), StoreError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +112,8 @@ pub struct StoredMeeting {
     pub guild_id: String,
     pub voice_channel_id: String,
     pub report_channel_id: String,
+    pub status_message_channel_id: Option<String>,
+    pub status_message_id: Option<String>,
     pub started_by_user_id: String,
     pub title: Option<String>,
     pub status: MeetingStatus,
@@ -106,6 +127,8 @@ pub struct CreateMeetingRequest {
     pub guild_id: String,
     pub voice_channel_id: String,
     pub report_channel_id: String,
+    pub status_message_channel_id: Option<String>,
+    pub status_message_id: Option<String>,
     pub started_by_user_id: String,
 }
 
@@ -182,6 +205,8 @@ impl MeetingStore for InMemoryMeetingStore {
             guild_id: request.guild_id,
             voice_channel_id: request.voice_channel_id,
             report_channel_id: request.report_channel_id,
+            status_message_channel_id: request.status_message_channel_id,
+            status_message_id: request.status_message_id,
             started_by_user_id: request.started_by_user_id,
             title: None,
             status: MeetingStatus::Scheduled,
@@ -207,6 +232,8 @@ impl MeetingStore for InMemoryMeetingStore {
             guild_id: request.guild_id,
             voice_channel_id: request.voice_channel_id,
             report_channel_id: request.report_channel_id,
+            status_message_channel_id: request.status_message_channel_id,
+            status_message_id: request.status_message_id,
             started_by_user_id: request.started_by_user_id,
             title: None,
             status: MeetingStatus::Recording,
@@ -250,6 +277,39 @@ impl MeetingStore for InMemoryMeetingStore {
             });
         };
         meeting.error_message = error_message;
+        Ok(())
+    }
+
+    fn get_status_message_metadata(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<StatusMessageMetadata, StoreError> {
+        let Some(meeting) = self.meetings.get(meeting_id) else {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        };
+
+        Ok(StatusMessageMetadata {
+            report_channel_id: meeting.report_channel_id.clone(),
+            status_message_channel_id: meeting.status_message_channel_id.clone(),
+            status_message_id: meeting.status_message_id.clone(),
+        })
+    }
+
+    fn set_status_message(
+        &mut self,
+        meeting_id: &str,
+        channel_id: String,
+        message_id: String,
+    ) -> Result<(), StoreError> {
+        let Some(meeting) = self.meetings.get_mut(meeting_id) else {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        };
+        meeting.status_message_channel_id = Some(channel_id);
+        meeting.status_message_id = Some(message_id);
         Ok(())
     }
 }
