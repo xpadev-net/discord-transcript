@@ -123,10 +123,22 @@ pub fn render_for_summary(
     for segment in segments {
         let label = display_label_for_id(speakers, &segment.speaker_id);
         let noise_tag = if segment.is_noisy { " [NOISY]" } else { "" };
-        lines.push(format!(
-            "[{}-{}] {} (id:{}){}: {}",
-            segment.start_ms, segment.end_ms, label, segment.speaker_id, noise_tag, segment.text
-        ));
+        if label == segment.speaker_id {
+            lines.push(format!(
+                "[{}-{}] {}{}: {}",
+                segment.start_ms, segment.end_ms, label, noise_tag, segment.text
+            ));
+        } else {
+            lines.push(format!(
+                "[{}-{}] {} (id:{}){}: {}",
+                segment.start_ms,
+                segment.end_ms,
+                label,
+                segment.speaker_id,
+                noise_tag,
+                segment.text
+            ));
+        }
     }
     lines.join("\n")
 }

@@ -155,6 +155,8 @@ fn build_transcription_output(
     segments: Vec<crate::transcript::TranscriptSegment>,
 ) -> Result<TranscriptionOutput, SummaryError> {
     let normalized = normalize_segments(&segments, NormalizationConfig::default());
+    // Standalone callers render with only speaker IDs; the runtime path re-renders
+    // with resolved speaker profiles before summarization.
     let rendered = render_for_summary(&normalized, None);
     let masked = mask_pii(&rendered);
     Ok(TranscriptionOutput {

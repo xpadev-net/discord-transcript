@@ -1352,10 +1352,13 @@ impl ScaffoldHandler {
 
         let mut newly_resolved = Vec::new();
         for speaker_id in speaker_ids {
-            if let Some(existing) = profiles.get(&speaker_id)
-                && existing.display_label() != speaker_id
-            {
-                continue;
+            if let Some(existing) = profiles.get(&speaker_id) {
+                let has_profile_data = existing.nickname.is_some()
+                    || existing.display_name.is_some()
+                    || existing.username.is_some();
+                if has_profile_data {
+                    continue;
+                }
             }
             if speaker_id.trim().is_empty() {
                 continue;

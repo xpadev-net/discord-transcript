@@ -88,7 +88,7 @@ fn render_for_summary_prefers_speaker_labels() {
 
     let fallback = render_for_summary(std::slice::from_ref(&segment), None);
     assert!(
-        fallback.contains("user-1 (id:user-1)"),
+        fallback.contains("user-1:"),
         "speaker_id should be used when metadata is missing: {fallback}"
     );
 }
