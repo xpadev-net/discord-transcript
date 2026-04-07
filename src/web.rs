@@ -1,3 +1,4 @@
+use crate::speaker::SpeakerProfile;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
@@ -719,8 +720,18 @@ struct MeetingResponse {
 }
 
 #[derive(Serialize)]
+struct SpeakerResponse {
+    id: String,
+    username: Option<String>,
+    nickname: Option<String>,
+    display_name: Option<String>,
+    display_label: String,
+}
+
+#[derive(Serialize)]
 struct TranscriptSegmentResponse {
     speaker_id: String,
+    speaker: SpeakerResponse,
     start_ms: i32,
     end_ms: i32,
     text: String,
@@ -792,10 +803,13 @@ async fn api_transcript(
     let rows = state
         .db
         .query(
-            "SELECT speaker_id, start_ms, end_ms, text, confidence, is_noisy \
-             FROM transcripts \
-             WHERE meeting_id=$1 AND NOT is_deleted \
-             ORDER BY start_ms",
+            "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, \
+                    ms.username, ms.nickname, ms.display_name \
+             FROM transcripts t \
+             LEFT JOIN meeting_speakers ms \
+               ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
+             WHERE t.meeting_id=$1 AND NOT t.is_deleted \
+             ORDER BY t.start_ms",
             &[&meeting_id],
         )
         .await
@@ -803,13 +817,30 @@ async fn api_transcript(
 
     let segments: Vec<TranscriptSegmentResponse> = rows
         .iter()
-        .map(|row| TranscriptSegmentResponse {
-            speaker_id: row.get("speaker_id"),
-            start_ms: row.get("start_ms"),
-            end_ms: row.get("end_ms"),
-            text: row.get("text"),
-            confidence: row.get("confidence"),
-            is_noisy: row.get("is_noisy"),
+        .map(|row| {
+            let speaker_id: String = row.get("speaker_id");
+            let profile = SpeakerProfile {
+                speaker_id: speaker_id.clone(),
+                username: row.get::<_, Option<String>>("username"),
+                nickname: row.get::<_, Option<String>>("nickname"),
+                display_name: row.get::<_, Option<String>>("display_name"),
+            };
+
+            TranscriptSegmentResponse {
+                speaker_id,
+                speaker: SpeakerResponse {
+                    id: profile.speaker_id.clone(),
+                    username: profile.username.clone(),
+                    nickname: profile.nickname.clone(),
+                    display_name: profile.display_name.clone(),
+                    display_label: profile.display_label(),
+                },
+                start_ms: row.get("start_ms"),
+                end_ms: row.get("end_ms"),
+                text: row.get("text"),
+                confidence: row.get("confidence"),
+                is_noisy: row.get("is_noisy"),
+            }
         })
         .collect();
 

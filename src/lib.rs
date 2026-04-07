@@ -23,6 +23,7 @@ pub mod retention;
 pub mod retry;
 pub mod runtime;
 pub mod songbird_adapter;
+pub mod speaker;
 pub mod sql;
 pub mod sql_store;
 pub mod stop;
