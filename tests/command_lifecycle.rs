@@ -169,13 +169,13 @@ fn record_stop_is_idempotent_for_same_meeting() {
 
 #[test]
 fn auto_stop_triggers_after_grace_period_and_can_cancel() {
-    let mut state = AutoStopState::new(Duration::from_secs(15));
+    let mut state = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(
         state.on_non_bot_member_count_changed(0, 1_000),
         AutoStopSignal::StartTimer
     );
-    assert_eq!(state.tick(1_000 + 14_000), AutoStopSignal::Idle);
-    assert_eq!(state.tick(1_000 + 15_000), AutoStopSignal::Trigger);
+    assert_eq!(state.tick(1_000 + 59_000), AutoStopSignal::Idle);
+    assert_eq!(state.tick(1_000 + 60_000), AutoStopSignal::Trigger);
 
     // Simulate the timer task completing (as the runtime would do).
     state.clear_timer_active();

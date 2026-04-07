@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub database_url: String,
     pub database_ssl_mode: String,
     pub chunk_storage_dir: String,
+    pub auto_stop_grace_seconds: u64,
     pub summary_max_retries: u32,
     pub integration_retry_max_attempts: u32,
     pub integration_retry_initial_delay_ms: u64,
@@ -57,6 +58,8 @@ impl AppConfig {
             database_ssl_mode: optional_env("DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
             chunk_storage_dir: required_env("CHUNK_STORAGE_DIR")?,
+            auto_stop_grace_seconds: optional_env_parse_u64_nonzero("AUTO_STOP_GRACE_SECONDS")?
+                .unwrap_or(60),
             summary_max_retries: optional_env_parse_u32("SUMMARY_MAX_RETRIES")?.unwrap_or(3),
             integration_retry_max_attempts: optional_env_parse_u32(
                 "INTEGRATION_RETRY_MAX_ATTEMPTS",
@@ -96,6 +99,11 @@ impl AppConfig {
             database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
             chunk_storage_dir: required_from_map(values, "CHUNK_STORAGE_DIR")?,
+            auto_stop_grace_seconds: optional_from_map_parse_u64_nonzero(
+                values,
+                "AUTO_STOP_GRACE_SECONDS",
+            )?
+            .unwrap_or(60),
             summary_max_retries: optional_from_map_parse_u32(values, "SUMMARY_MAX_RETRIES")?
                 .unwrap_or(3),
             integration_retry_max_attempts: optional_from_map_parse_u32(
@@ -182,6 +190,20 @@ fn optional_env_parse_u64(key: &'static str) -> Result<Option<u64>, ConfigError>
         .map_err(|_| ConfigError::InvalidEnv { key, value })
 }
 
+fn optional_env_parse_u64_nonzero(key: &'static str) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u64>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
+}
+
 fn optional_from_map_parse_u32(
     values: &HashMap<String, String>,
     key: &'static str,
@@ -206,6 +228,23 @@ fn optional_from_map_parse_u64(
         .parse::<u64>()
         .map(Some)
         .map_err(|_| ConfigError::InvalidEnv { key, value })
+}
+
+fn optional_from_map_parse_u64_nonzero(
+    values: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u64>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
 }
 
 fn optional_env_parse_u16(key: &'static str) -> Result<Option<u16>, ConfigError> {

@@ -282,6 +282,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
+        auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
         claude_command: config.claude_command.clone(),
         claude_model: config.claude_model.clone(),
@@ -322,6 +323,7 @@ struct ScaffoldHandler {
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     chunk_storage_dir: String,
+    auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
     claude_command: String,
     claude_model: String,
@@ -410,11 +412,12 @@ impl EventHandler for ScaffoldHandler {
         let non_bot =
             count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id)
                 .unwrap_or(0);
+        let grace = Duration::from_secs(self.auto_stop_grace_seconds);
         let signal = {
             let mut states = self.auto_stop_states.lock().await;
             let state = states
                 .entry(guild_key.clone())
-                .or_insert_with(|| AutoStopState::new(Duration::from_secs(15)));
+                .or_insert_with(|| AutoStopState::new(grace));
             state.on_non_bot_member_count_changed(non_bot, now_ms())
         };
 
@@ -425,8 +428,9 @@ impl EventHandler for ScaffoldHandler {
             let ctx_for_task = ctx.clone();
             let guild_for_task = guild_key;
             let expected_meeting_id = self.active_meeting_id().await;
+            let grace_for_task = grace;
             tokio::spawn(async move {
-                sleep(Duration::from_secs(15)).await;
+                sleep(grace_for_task).await;
                 // Verify the same meeting is still active (not a new recording)
                 let current_meeting_id = handler.active_meeting_id().await;
                 if current_meeting_id != expected_meeting_id || expected_meeting_id.is_none() {
@@ -832,6 +836,7 @@ impl ScaffoldHandler {
                 guild_id: guild_id.get().to_string(),
                 runtime: self.clone(),
                 http: Arc::clone(&ctx.http),
+                ctx: ctx.clone(),
                 bot_user_id: ctx.cache.current_user().id.get(),
             };
             call.add_global_event(
@@ -1309,6 +1314,7 @@ struct VoiceReceiveHandler {
     guild_id: String,
     runtime: ScaffoldHandler,
     http: Arc<Http>,
+    ctx: Context,
     bot_user_id: u64,
 }
 
@@ -1345,7 +1351,36 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let runtime = self.runtime.clone();
                     let guild_key = self.guild_id.clone();
                     let http = Arc::clone(&self.http);
+                    let ctx_for_task = self.ctx.clone();
+                    let expected_meeting_id = runtime.active_meeting_id().await;
+                    let grace = Duration::from_secs(runtime.auto_stop_grace_seconds);
                     tokio::spawn(async move {
+                        sleep(grace).await;
+                        let current_meeting_id = runtime.active_meeting_id().await;
+                        if current_meeting_id != expected_meeting_id || current_meeting_id.is_none()
+                        {
+                            return;
+                        }
+                        let Some(target_voice_channel_id) =
+                            runtime.active_meeting_voice_channel_id().await
+                        else {
+                            return;
+                        };
+                        let reconnected = is_bot_connected_to_voice_channel(
+                            &ctx_for_task,
+                            runtime.guild_id,
+                            target_voice_channel_id,
+                        )
+                        .unwrap_or(false);
+                        let non_bot = count_non_bot_members_in_target_voice(
+                            &ctx_for_task,
+                            runtime.guild_id,
+                            target_voice_channel_id,
+                        )
+                        .unwrap_or(0);
+                        if reconnected || non_bot > 0 {
+                            return;
+                        }
                         // Flush remaining audio and clean up session
                         {
                             let mut sessions = runtime.sessions.lock().await;

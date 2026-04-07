@@ -30,6 +30,7 @@ fn app_config_loads_from_map() {
     assert_eq!(config.database_url, "postgres://localhost/db");
     assert_eq!(config.database_ssl_mode, "disable");
     assert_eq!(config.chunk_storage_dir, "/tmp/chunks");
+    assert_eq!(config.auto_stop_grace_seconds, 60);
     assert_eq!(config.summary_max_retries, 3);
     assert_eq!(config.integration_retry_max_attempts, 3);
     assert_eq!(config.integration_retry_initial_delay_ms, 200);
@@ -136,6 +137,7 @@ fn app_config_loads_retry_overrides_from_map() {
         "INTEGRATION_RETRY_MAX_DELAY_MS".to_owned(),
         "9000".to_owned(),
     );
+    values.insert("AUTO_STOP_GRACE_SECONDS".to_owned(), "45".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.summary_max_retries, 5);
@@ -143,6 +145,7 @@ fn app_config_loads_retry_overrides_from_map() {
     assert_eq!(config.integration_retry_initial_delay_ms, 100);
     assert_eq!(config.integration_retry_backoff_multiplier, 3);
     assert_eq!(config.integration_retry_max_delay_ms, 9_000);
+    assert_eq!(config.auto_stop_grace_seconds, 45);
 }
 
 #[test]
@@ -165,6 +168,30 @@ fn app_config_rejects_invalid_retry_override() {
         ConfigError::InvalidEnv {
             key: "SUMMARY_MAX_RETRIES",
             value: "abc".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_zero_auto_stop_grace() {
+    let mut values = HashMap::new();
+    values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
+    values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
+    values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
+    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
+    values.insert(
+        "DATABASE_URL".to_owned(),
+        "postgres://localhost/db".to_owned(),
+    );
+    values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
+    values.insert("AUTO_STOP_GRACE_SECONDS".to_owned(), "0".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "AUTO_STOP_GRACE_SECONDS",
+            value: "0".to_owned()
         }
     );
 }
