@@ -67,6 +67,8 @@ pub trait MeetingStore {
         guild_id: &str,
     ) -> Result<Option<StoredMeeting>, StoreError>;
 
+    fn get_meeting(&mut self, meeting_id: &str) -> Result<Option<StoredMeeting>, StoreError>;
+
     fn create_scheduled_meeting(&mut self, request: CreateMeetingRequest)
     -> Result<(), StoreError>;
 
@@ -188,6 +190,10 @@ impl MeetingStore for InMemoryMeetingStore {
             .values()
             .find(|m| m.guild_id == guild_id && Self::is_active(m.status))
             .cloned())
+    }
+
+    fn get_meeting(&mut self, meeting_id: &str) -> Result<Option<StoredMeeting>, StoreError> {
+        Ok(self.meetings.get(meeting_id).cloned())
     }
 
     fn create_scheduled_meeting(

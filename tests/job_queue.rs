@@ -34,7 +34,9 @@ fn unique_temp_dir(test_name: &str) -> PathBuf {
 
 fn write_dummy_chunk(base: &Path, meeting_id: &str) {
     use discord_transcript::audio::build_wav_bytes_raw;
-    let meeting_dir = base.join(meeting_id);
+    let meeting_dir = discord_transcript::workspace::MeetingWorkspaceLayout::new(base)
+        .for_meeting("g1", "vc1", meeting_id)
+        .audio_dir();
     std::fs::create_dir_all(&meeting_dir).expect("meeting dir should be created");
     let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
     std::fs::write(meeting_dir.join("u1_1_0.wav"), wav).expect("wav should write");
@@ -97,6 +99,7 @@ fn worker_job_processing_marks_done_on_success() {
         &claude,
         2,
         base.to_str().unwrap(),
+        Some("ja".to_owned()),
     )
     .expect("worker should succeed")
     .expect("job result should exist");
@@ -134,6 +137,7 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
         &claude,
         0,
         base.to_str().unwrap(),
+        None,
     );
     assert!(result.is_err(), "should fail with invalid JSON");
     let job = queue.get("j1").expect("job exists");

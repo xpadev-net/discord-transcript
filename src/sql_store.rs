@@ -240,6 +240,71 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .map_err(StoreError::Backend)
     }
 
+    fn get_meeting(&mut self, meeting_id: &str) -> Result<Option<StoredMeeting>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message \
+                  FROM meetings WHERE id=$1 LIMIT 1",
+                &[meeting_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        if row.len() < 11 {
+            return Err(StoreError::Backend(format!(
+                "invalid meeting row length for id={meeting_id}: {}",
+                row.len()
+            )));
+        }
+        let status = MeetingStatus::parse_str(&row[8]).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "invalid meeting status for id={meeting_id}: {}",
+                row[8]
+            ))
+        })?;
+        let stop_reason = if row[9].trim().is_empty() {
+            None
+        } else {
+            Some(StopReason::parse_str(&row[9]).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "invalid stop_reason for id={meeting_id}: {}",
+                    row[9]
+                ))
+            })?)
+        };
+        Ok(Some(StoredMeeting {
+            id: row[0].clone(),
+            guild_id: row[1].clone(),
+            voice_channel_id: row[2].clone(),
+            report_channel_id: row[3].clone(),
+            status_message_channel_id: if row[4].trim().is_empty() {
+                None
+            } else {
+                Some(row[4].clone())
+            },
+            status_message_id: if row[5].trim().is_empty() {
+                None
+            } else {
+                Some(row[5].clone())
+            },
+            started_by_user_id: row[6].clone(),
+            title: if row[7].trim().is_empty() {
+                None
+            } else {
+                Some(row[7].clone())
+            },
+            status,
+            stop_reason,
+            error_message: if row[10].trim().is_empty() {
+                None
+            } else {
+                Some(row[10].clone())
+            },
+        }))
+    }
+
     fn create_scheduled_meeting(
         &mut self,
         request: CreateMeetingRequest,

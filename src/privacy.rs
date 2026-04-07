@@ -1,4 +1,5 @@
 use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -18,7 +19,7 @@ static PHONE_RE: LazyLock<Regex> = LazyLock::new(|| {
     compiled.expect("phone regex must compile")
 });
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MaskingStats {
     pub mention_replacements: usize,
     pub email_replacements: usize,
