@@ -121,4 +121,6 @@ jobs:
             $(printf 'ghcr.io/xpadev-net/discord-transcript@sha256:%s ' *)
 
       - name: Inspect image
-        run: docker buildx imagetools inspect ghcr.io/xpadev-net/discord-transcript:latest
+        run: |
+          tag=$(jq -cr '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools inspect "$tag"
