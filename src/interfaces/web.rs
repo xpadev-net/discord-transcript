@@ -371,7 +371,7 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
 
 /// Verify that the authenticated user has VIEW_CHANNEL permission on the
 /// voice channel where the meeting was recorded.
-/// Results are cached per (user_id, channel_id) for 60 seconds to avoid
+/// Results are cached per (user_id, channel_id) for 5 minutes to avoid
 /// Discord API rate-limit exhaustion on page loads (which trigger ~4 requests).
 async fn verify_meeting_access(
     state: &WebState,
