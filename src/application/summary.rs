@@ -282,7 +282,16 @@ pub fn correct_transcript<C: ClaudeSummaryClient>(
         return Ok(transcript.to_owned());
     }
 
-    let lang_hint = language.unwrap_or("ja");
+    let is_japanese = language == Some("ja");
+    let language_rules = if is_japanese {
+        "- Fix misrecognized kanji/characters (e.g. homophone errors)\n\
+         - Add or fix punctuation (。、！？) where appropriate\n\
+         - Normalize spoken numbers to digits (e.g. 「ひゃくにじゅうさん」→「123」)"
+    } else {
+        "- Fix misrecognized words and spelling errors\n\
+         - Add or fix punctuation where appropriate for the language\n\
+         - Normalize spoken numbers to digits (e.g. \"one hundred twenty three\" → \"123\")"
+    };
     let prompt = format!(
         "You are a speech-recognition error corrector.\n\
 \n\
@@ -291,9 +300,7 @@ Below is an ASR (automatic speech recognition) transcript. Each line has the for
 \n\
 Fix recognition errors in the **text** portion of each line while keeping the \
 timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
-- Fix misrecognized kanji/characters (e.g. homophone errors)\n\
-- Add or fix punctuation (。、！？) where appropriate for {lang_hint}\n\
-- Normalize spoken numbers to digits (e.g. 「ひゃくにじゅうさん」→「123」)\n\
+{language_rules}\n\
 - Do NOT change speaker names, timestamps, or line structure\n\
 - Do NOT add, remove, or reorder lines\n\
 - Do NOT add commentary or explanation\n\

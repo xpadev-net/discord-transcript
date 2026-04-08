@@ -218,16 +218,20 @@ fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone)]
+pub struct SummaryJobOptions {
+    pub max_retries: u32,
+    pub audio_base_dir: String,
+    pub language: Option<String>,
+    pub resample_to_16k: bool,
+}
+
 pub fn process_next_summary_job<S, Q, W, C>(
     store: &mut S,
     queue: &mut Q,
     whisper: &W,
     claude: &C,
-    max_retries: u32,
-    audio_base_dir: &str,
-    language: Option<String>,
-    resample_to_16k: bool,
+    options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
     S: MeetingStore,
@@ -247,7 +251,7 @@ where
             .ok_or_else(|| {
                 WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
             })?;
-        let layout = MeetingWorkspaceLayout::new(audio_base_dir);
+        let layout = MeetingWorkspaceLayout::new(&options.audio_base_dir);
         let workspace = layout.for_meeting(
             &meeting.guild_id,
             &meeting.voice_channel_id,
@@ -285,7 +289,7 @@ where
             }
         };
 
-        let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, resample_to_16k)
+        let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, options.resample_to_16k)
             .map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
@@ -293,9 +297,9 @@ where
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
             audio_path: mixdown_path,
-            speaker_audio: build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
+            speaker_audio: build_speaker_audio_inputs(&meeting_dir, options.resample_to_16k)
                 .map_err(WorkerError::Summary)?,
-            language: language.clone(),
+            language: options.language.clone(),
             workspace,
         };
         process_meeting_summary(store, whisper, claude, &input)
@@ -318,7 +322,7 @@ where
             }))
         }
         Err(err) => {
-            let status = queue.retry(&job.id, err.to_string(), max_retries)?;
+            let status = queue.retry(&job.id, err.to_string(), options.max_retries)?;
             if status == JobStatus::Failed {
                 store.set_meeting_status(&job.meeting_id, MeetingStatus::Failed, None)?;
                 store.set_error_message(&job.meeting_id, Some(err.to_string()))?;

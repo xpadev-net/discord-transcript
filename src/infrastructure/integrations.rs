@@ -65,15 +65,12 @@ impl WhisperClient for CommandWhisperClient {
             if let Some(bs) = self.beam_size {
                 cmd.arg("-F").arg(format!("beam_size={bs}"));
             }
-            if self.suppress_non_speech {
-                cmd.arg("-F").arg("suppress_non_speech=true");
-            }
+            cmd.arg("-F")
+                .arg(format!("suppress_non_speech={}", self.suppress_non_speech));
             if let Some(p) = &self.prompt {
                 cmd.arg("--form-string").arg(format!("prompt={p}"));
             }
-            if self.vad {
-                cmd.arg("-F").arg("vad=true");
-            }
+            cmd.arg("-F").arg(format!("vad={}", self.vad));
             cmd.arg("-F")
                 .arg(format!("temperature={}", self.temperature));
 

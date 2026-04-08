@@ -204,20 +204,26 @@ pub fn build_speaker_audio_inputs(
         let Some(first) = user_chunks.first() else {
             continue;
         };
+
+        // Normalize each chunk's volume before stitching with silence gaps.
+        // This avoids silence gaps diluting the RMS calculation.
+        let normalized_first = normalize_rms_pcm_16le(&first.pcm, NORMALIZE_TARGET_RMS);
+
         let mut pcm_out = Vec::new();
         let mut current_ms = first.start_ms + first.duration_ms;
-        pcm_out.extend_from_slice(&first.pcm);
+        pcm_out.extend_from_slice(&normalized_first);
         for chunk in user_chunks.iter().skip(1) {
             if chunk.start_ms > current_ms {
                 let gap_ms = chunk.start_ms - current_ms;
                 pcm_out.extend_from_slice(&silence_bytes(gap_ms, sample_rate));
             }
+            let chunk_pcm = normalize_rms_pcm_16le(&chunk.pcm, NORMALIZE_TARGET_RMS);
             if chunk.start_ms < current_ms {
                 let overlap_ms = current_ms - chunk.start_ms;
                 let samples_to_skip =
                     overlap_ms.saturating_mul(sample_rate as u64) as u128 / 1_000u128;
                 let bytes_to_skip = samples_to_skip.saturating_mul(2) as usize;
-                if bytes_to_skip >= chunk.pcm.len() {
+                if bytes_to_skip >= chunk_pcm.len() {
                     warn!(
                         user_id = %chunk.user_id,
                         sequence = chunk.sequence,
@@ -233,20 +239,18 @@ pub fn build_speaker_audio_inputs(
                     overlap_ms,
                     "trimming overlapping chunk while stitching speaker audio"
                 );
-                let trimmed = &chunk.pcm[bytes_to_skip..];
+                let trimmed = &chunk_pcm[bytes_to_skip..];
                 pcm_out.extend_from_slice(trimmed);
                 current_ms = current_ms.saturating_add(pcm_duration_ms(trimmed, sample_rate));
                 continue;
             }
-            pcm_out.extend_from_slice(&chunk.pcm);
+            pcm_out.extend_from_slice(&chunk_pcm);
             current_ms = chunk.start_ms + chunk.duration_ms;
         }
-
-        let normalized_pcm = normalize_rms_pcm_16le(&pcm_out, NORMALIZE_TARGET_RMS);
         let (final_pcm, final_rate) = if resample_to_16k {
-            resample_pcm_16le(&normalized_pcm, sample_rate, 16_000)
+            resample_pcm_16le(&pcm_out, sample_rate, 16_000)
         } else {
-            (normalized_pcm, sample_rate)
+            (pcm_out, sample_rate)
         };
         let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
             .map_err(|err| format!("failed to build speaker wav for {user_id}: {err}"))?;

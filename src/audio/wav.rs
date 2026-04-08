@@ -62,7 +62,8 @@ pub fn build_wav_bytes_raw(
 /// supported for the given rate pair (only 48kHz→16kHz is implemented),
 /// the input is returned unchanged with the original rate.
 pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>, u32) {
-    // Need at least one complete i16 sample (2 bytes) and different rates.
+    // Need at least 2 complete i16 samples (4 bytes) to avoid odd-byte reads,
+    // and rates must differ to justify any work.
     if input.len() < 4 || from_rate == to_rate {
         return (input.to_vec(), from_rate);
     }

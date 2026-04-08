@@ -139,6 +139,34 @@ fn app_config_rejects_invalid_whisper_beam_size() {
 }
 
 #[test]
+fn app_config_rejects_zero_whisper_beam_size() {
+    let mut values = base_env();
+    values.insert("WHISPER_BEAM_SIZE".to_owned(), "0".to_owned());
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_BEAM_SIZE",
+            value: "0".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_invalid_whisper_temperature() {
+    let mut values = base_env();
+    values.insert("WHISPER_TEMPERATURE".to_owned(), "1.5".to_owned());
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_TEMPERATURE",
+            value: "1.5".to_owned()
+        }
+    );
+}
+
+#[test]
 fn app_config_accepts_whisper_bool_flags() {
     let mut values = base_env();
     values.insert("WHISPER_SUPPRESS_NON_SPEECH".to_owned(), "0".to_owned());

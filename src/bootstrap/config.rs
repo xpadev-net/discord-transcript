@@ -84,7 +84,7 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_env_language("WHISPER_LANGUAGE")?,
-            whisper_beam_size: optional_env_parse_u32("WHISPER_BEAM_SIZE")?.unwrap_or(5),
+            whisper_beam_size: optional_env_parse_u32_nonzero("WHISPER_BEAM_SIZE")?.unwrap_or(5),
             whisper_suppress_non_speech: optional_env_parse_bool(
                 "WHISPER_SUPPRESS_NON_SPEECH",
                 true,
@@ -142,7 +142,7 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_from_map_language(values, "WHISPER_LANGUAGE")?,
-            whisper_beam_size: optional_from_map_parse_u32(values, "WHISPER_BEAM_SIZE")?
+            whisper_beam_size: optional_from_map_parse_u32_nonzero(values, "WHISPER_BEAM_SIZE")?
                 .unwrap_or(5),
             whisper_suppress_non_speech: optional_from_map_parse_bool(
                 values,
@@ -211,6 +211,20 @@ fn optional_env_parse_u32(key: &'static str) -> Result<Option<u32>, ConfigError>
         .map_err(|_| ConfigError::InvalidEnv { key, value })
 }
 
+fn optional_env_parse_u32_nonzero(key: &'static str) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u32>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
+}
+
 fn optional_env_parse_u64(key: &'static str) -> Result<Option<u64>, ConfigError> {
     let Some(value) = optional_env(key) else {
         return Ok(None);
@@ -246,6 +260,23 @@ fn optional_from_map_parse_u32(
         .parse::<u32>()
         .map(Some)
         .map_err(|_| ConfigError::InvalidEnv { key, value })
+}
+
+fn optional_from_map_parse_u32_nonzero(
+    values: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u32>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
 }
 
 fn optional_from_map_parse_u64(
@@ -309,14 +340,22 @@ fn optional_from_map_parse_u16(
     Ok(Some(parsed))
 }
 
+fn parse_f32_unit_range(key: &'static str, value: String) -> Result<f32, ConfigError> {
+    let parsed = value.parse::<f32>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(parsed)
+}
+
 fn optional_env_parse_f32(key: &'static str) -> Result<Option<f32>, ConfigError> {
     let Some(value) = optional_env(key) else {
         return Ok(None);
     };
-    value
-        .parse::<f32>()
-        .map(Some)
-        .map_err(|_| ConfigError::InvalidEnv { key, value })
+    parse_f32_unit_range(key, value).map(Some)
 }
 
 fn optional_from_map_parse_f32(
@@ -326,10 +365,7 @@ fn optional_from_map_parse_f32(
     let Some(value) = optional_from_map(values, key) else {
         return Ok(None);
     };
-    value
-        .parse::<f32>()
-        .map(Some)
-        .map_err(|_| ConfigError::InvalidEnv { key, value })
+    parse_f32_unit_range(key, value).map(Some)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
