@@ -5,7 +5,7 @@ use crate::infrastructure::storage_fs::sanitize_path_component;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct LoadedChunk {
@@ -224,7 +224,7 @@ pub fn build_speaker_audio_inputs(
                     overlap_ms.saturating_mul(sample_rate as u64) as u128 / 1_000u128;
                 let bytes_to_skip = samples_to_skip.saturating_mul(2) as usize;
                 if bytes_to_skip >= chunk_pcm.len() {
-                    warn!(
+                    debug!(
                         user_id = %chunk.user_id,
                         sequence = chunk.sequence,
                         start_ms = chunk.start_ms,
@@ -233,7 +233,7 @@ pub fn build_speaker_audio_inputs(
                     );
                     continue;
                 }
-                warn!(
+                debug!(
                     user_id = %chunk.user_id,
                     sequence = chunk.sequence,
                     overlap_ms,
