@@ -643,7 +643,7 @@ impl EventHandler for ScaffoldHandler {
                     return;
                 }
                 // Flush remaining audio before stopping
-                {
+                let removed_session = {
                     let mut sessions = handler.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&guild_for_task) {
                         match session.flush_all() {
@@ -655,17 +655,19 @@ impl EventHandler for ScaffoldHandler {
                             }
                             _ => {}
                         }
-                        let tracker = handler.ssrc_tracker.lock().await;
-                        session.persist_ssrc_mapping(&tracker);
                     }
-                    sessions.remove(&guild_for_task);
-                }
+                    sessions.remove(&guild_for_task)
+                };
                 {
                     let mut states = handler.auto_stop_states.lock().await;
                     states.remove(&guild_for_task);
                 }
                 if let Some(manager) = songbird::get(&ctx_for_task).await {
                     let _ = manager.leave(handler.guild_id).await;
+                }
+                if let Some(session) = &removed_session {
+                    let tracker = handler.ssrc_tracker.lock().await;
+                    session.persist_ssrc_mapping(&tracker);
                 }
                 let stop_result = {
                     let mut service = handler.service.lock().await;
@@ -1190,7 +1192,7 @@ impl ScaffoldHandler {
         let guild_key = guild_id.get().to_string();
 
         // Flush remaining audio before stopping
-        {
+        let removed_session = {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&guild_key) {
                 match session.flush_all() {
@@ -1202,11 +1204,9 @@ impl ScaffoldHandler {
                     }
                     _ => {}
                 }
-                let tracker = self.ssrc_tracker.lock().await;
-                session.persist_ssrc_mapping(&tracker);
             }
-            sessions.remove(&guild_key);
-        }
+            sessions.remove(&guild_key)
+        };
         {
             let mut states = self.auto_stop_states.lock().await;
             states.remove(&guild_key);
@@ -1214,6 +1214,13 @@ impl ScaffoldHandler {
 
         if let Some(manager) = songbird::get(ctx).await {
             let _ = manager.leave(guild_id).await;
+        }
+
+        // Persist SSRC mapping after voice teardown so late
+        // SpeakingStateUpdate events are captured.
+        if let Some(session) = &removed_session {
+            let tracker = self.ssrc_tracker.lock().await;
+            session.persist_ssrc_mapping(&tracker);
         }
 
         let stop_result = {
@@ -2168,7 +2175,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     drop(tracker);
 
                     // Re-key any in-memory frames buffered under the SSRC fallback ID
-                    let ssrc_key = format!("ssrc:{}", evt.ssrc);
+                    let ssrc_key = SsrcTracker::fallback_key(evt.ssrc);
                     let mut sessions = self.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&self.guild_id) {
                         let moved = session.rekey_user(&ssrc_key, &user_id_str);
@@ -2236,7 +2243,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             return;
                         }
                         // Flush remaining audio and clean up session
-                        {
+                        let removed_session = {
                             let mut sessions = runtime.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&guild_key) {
                                 match session.flush_all() {
@@ -2248,14 +2255,18 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     }
                                     _ => {}
                                 }
-                                let tracker = runtime.ssrc_tracker.lock().await;
-                                session.persist_ssrc_mapping(&tracker);
                             }
-                            sessions.remove(&guild_key);
-                        }
+                            sessions.remove(&guild_key)
+                        };
                         {
                             let mut states = runtime.auto_stop_states.lock().await;
                             states.remove(&guild_key);
+                        }
+                        // Persist SSRC mapping after session removal so the
+                        // tracker captures any late SpeakingStateUpdate events.
+                        if let Some(session) = &removed_session {
+                            let tracker = runtime.ssrc_tracker.lock().await;
+                            session.persist_ssrc_mapping(&tracker);
                         }
                         let stop_result = {
                             let mut service = runtime.service.lock().await;

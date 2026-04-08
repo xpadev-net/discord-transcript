@@ -184,7 +184,7 @@ fn load_ssrc_mapping(meeting_dir: &Path) -> HashMap<String, String> {
         .all_mappings()
         .iter()
         .map(|(ssrc, user_id)| {
-            let sanitized_key = sanitize_path_component(&format!("ssrc:{ssrc}"));
+            let sanitized_key = sanitize_path_component(&SsrcTracker::fallback_key(*ssrc));
             (sanitized_key, user_id.clone())
         })
         .collect()

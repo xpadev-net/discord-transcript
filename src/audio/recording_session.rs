@@ -164,12 +164,14 @@ impl<S: ChunkStorage> RecordingSession<S> {
 
 impl RecordingSession<LocalChunkStorage> {
     /// Persist the SSRC-to-user mapping as a JSON file in the audio directory.
+    /// Only mappings for users recorded in this session are included.
     pub fn persist_ssrc_mapping(&self, tracker: &SsrcTracker) {
-        if tracker.all_mappings().is_empty() {
+        let filtered = tracker.filtered_by_users(self.per_user_seq.keys().map(String::as_str));
+        if filtered.all_mappings().is_empty() {
             return;
         }
         let path = self.storage.workspace.ssrc_mapping_path();
-        match serde_json::to_vec_pretty(tracker) {
+        match serde_json::to_vec_pretty(&filtered) {
             Ok(json) => {
                 if let Err(err) = std::fs::write(&path, &json) {
                     tracing::warn!(

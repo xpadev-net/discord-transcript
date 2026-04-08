@@ -35,6 +35,28 @@ impl SsrcTracker {
             .or_else(|| speaker_id.strip_prefix("ssrc"))
             .and_then(|n| n.parse::<u32>().ok())
     }
+
+    /// Canonical fallback key for an unresolved SSRC.
+    pub fn fallback_key(ssrc: u32) -> String {
+        format!("ssrc:{ssrc}")
+    }
+
+    /// Return a new tracker containing only mappings whose user_id appears
+    /// in the given set.
+    pub fn filtered_by_users<'a>(
+        &self,
+        user_ids: impl IntoIterator<Item = &'a str>,
+    ) -> SsrcTracker {
+        let set: std::collections::HashSet<&str> = user_ids.into_iter().collect();
+        SsrcTracker {
+            ssrc_to_user: self
+                .ssrc_to_user
+                .iter()
+                .filter(|(_, uid)| set.contains(uid.as_str()))
+                .map(|(ssrc, uid)| (*ssrc, uid.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl Default for SsrcTracker {
@@ -64,7 +86,7 @@ pub fn adapt_voice_tick(
         let user_id = tracker
             .resolve_user(*ssrc)
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("ssrc:{ssrc}"));
+            .unwrap_or_else(|| SsrcTracker::fallback_key(*ssrc));
         let mono = stereo_to_mono(decoded);
         per_user.insert(
             user_id,
