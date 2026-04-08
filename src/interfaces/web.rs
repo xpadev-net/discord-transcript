@@ -2,7 +2,7 @@ use crate::domain::speaker::SpeakerProfile;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use hmac::{Hmac, Mac};
@@ -12,11 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_postgres::Client as PgClient;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
-
-const MEETING_HTML: &str = include_str!("../../assets/meeting.html");
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 const VIEW_CHANNEL: u64 = 1 << 10;
@@ -40,6 +39,7 @@ pub struct WebState {
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
+    pub static_files_dir: String,
 }
 
 impl WebState {
@@ -48,6 +48,7 @@ impl WebState {
         chunk_storage_dir: String,
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
+        static_files_dir: String,
     ) -> Self {
         Self {
             db,
@@ -56,6 +57,7 @@ impl WebState {
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            static_files_dir,
         }
     }
 }
@@ -83,7 +85,6 @@ pub fn create_router(state: WebState) -> Router {
         .route("/auth/logout", get(auth_logout));
 
     let protected = Router::new()
-        .route("/meetings/{meeting_id}", get(meeting_page))
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
@@ -93,10 +94,13 @@ pub fn create_router(state: WebState) -> Router {
             require_auth,
         ));
 
+    let index_html = format!("{}/index.html", state.static_files_dir);
+    let spa = ServeDir::new(&state.static_files_dir).not_found_service(ServeFile::new(index_html));
+
     Router::new()
-        .route("/", get(index_page))
         .merge(auth_routes)
         .merge(protected)
+        .fallback_service(spa)
         .with_state(state)
 }
 
@@ -755,12 +759,6 @@ fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-// ---------- Index ----------
-
-async fn index_page() -> Html<&'static str> {
-    Html("<html><body><p>discord-transcript is running.</p></body></html>")
-}
-
 // ---------- Response types ----------
 
 #[derive(Serialize)]
@@ -799,22 +797,6 @@ struct SummaryResponse {
 }
 
 // ---------- Handlers ----------
-
-async fn meeting_page(
-    State(state): State<WebState>,
-    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
-    Path(meeting_id): Path<String>,
-) -> Result<Html<String>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
-
-    // serde_json produces a quoted, JS-safe string (escapes ", \, control chars).
-    // Escape </ to <\/ to prevent </script> injection inside the script tag.
-    let escaped = serde_json::to_string(&meeting_id)
-        .unwrap_or_default()
-        .replace("</", "<\\/");
-    let html = MEETING_HTML.replace("{{MEETING_ID}}", &escaped);
-    Ok(Html(html))
-}
 
 async fn api_meeting(
     State(state): State<WebState>,
