@@ -218,6 +218,7 @@ fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn process_next_summary_job<S, Q, W, C>(
     store: &mut S,
     queue: &mut Q,

@@ -155,7 +155,7 @@ fn lowpass_fir_coefficients(taps: usize, cutoff_hz: f64, sample_rate: f64) -> Ve
     let mut coeffs = vec![0.0f64; taps];
     let mut sum = 0.0;
 
-    for i in 0..taps {
+    for (i, coeff) in coeffs.iter_mut().enumerate() {
         let n = i as f64;
         // Sinc function
         let sinc = if i == m / 2 {
@@ -167,8 +167,8 @@ fn lowpass_fir_coefficients(taps: usize, cutoff_hz: f64, sample_rate: f64) -> Ve
         // Blackman window
         let window =
             0.42 - 0.5 * (2.0 * PI * n / m as f64).cos() + 0.08 * (4.0 * PI * n / m as f64).cos();
-        coeffs[i] = sinc * window;
-        sum += coeffs[i];
+        *coeff = sinc * window;
+        sum += *coeff;
     }
 
     // Normalize to unity gain at DC.
