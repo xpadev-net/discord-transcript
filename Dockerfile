@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim AS frontend
 
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10
 WORKDIR /app/web
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile

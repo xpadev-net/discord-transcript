@@ -13,12 +13,20 @@ export function useAudioSync(
   const userScrolledRef = useRef(false);
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
-  // Track user scroll to pause auto-scroll
+  // Reset active index when segments change (e.g. meeting navigation)
+  useEffect(() => {
+    if (!segments || segments.length === 0) {
+      setActiveIndex(-1);
+      prevIndexRef.current = -1;
+    }
+  }, [segments]);
+
+  // Track user scroll via input events to avoid false positives from programmatic scrollBy
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    const handleScroll = () => {
+    const markUserScrolled = () => {
       userScrolledRef.current = true;
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
       scrollTimeoutRef.current = setTimeout(() => {
@@ -26,9 +34,15 @@ export function useAudioSync(
       }, SCROLL_COOLDOWN_MS);
     };
 
-    container.addEventListener("scroll", handleScroll);
+    container.addEventListener("wheel", markUserScrolled);
+    container.addEventListener("touchstart", markUserScrolled);
+    container.addEventListener("pointerdown", markUserScrolled);
+    container.addEventListener("keydown", markUserScrolled);
     return () => {
-      container.removeEventListener("scroll", handleScroll);
+      container.removeEventListener("wheel", markUserScrolled);
+      container.removeEventListener("touchstart", markUserScrolled);
+      container.removeEventListener("pointerdown", markUserScrolled);
+      container.removeEventListener("keydown", markUserScrolled);
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
     };
   }, [containerRef]);

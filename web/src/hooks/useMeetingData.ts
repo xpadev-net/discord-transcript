@@ -18,7 +18,10 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!meetingId) return;
+    if (!meetingId) {
+      setLoading(false);
+      return;
+    }
 
     const controller = new AbortController();
     setLoading(true);

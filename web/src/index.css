@@ -160,6 +160,13 @@ audio::-webkit-media-controls-panel {
   background: var(--bg-segment-hover);
 }
 
+.segment:focus-visible {
+  background: var(--bg-segment-hover);
+  border-left-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .segment.active {
   background: var(--accent-glow);
   border-left-color: var(--accent);

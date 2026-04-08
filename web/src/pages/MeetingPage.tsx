@@ -42,7 +42,7 @@ export function MeetingPage() {
       <Header meeting={meeting} />
       <div className="main-container">
         <div className="left-panel">
-          <AudioPlayer ref={audioRef} src={meetingId ? getAudioUrl(meetingId) : ""} />
+          <AudioPlayer key={meetingId} ref={audioRef} src={meetingId ? getAudioUrl(meetingId) : ""} />
           <TranscriptPanel
             ref={transcriptContainerRef}
             segments={transcript}
