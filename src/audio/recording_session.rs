@@ -1,7 +1,9 @@
 use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
 use crate::audio::recorder::{RecorderEngine, RecorderError, RecorderOutputChunk};
 use crate::audio::songbird_adapter::SsrcTracker;
-use crate::infrastructure::storage_fs::{ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk};
+use crate::infrastructure::storage_fs::{
+    ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
+};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Instant;
