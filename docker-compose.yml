@@ -56,7 +56,7 @@ services:
     volumes:
       - ./migrations:/migrations:ro
     entrypoint: >
-      sh -c 'set -e; for f in /migrations/*.sql; do psql -h db -U discord_transcript -d discord_transcript -f "$$f"; done'
+      sh -c 'set -e; find /migrations -maxdepth 1 -name "*.sql" | sort | while read -r f; do psql -h db -U discord_transcript -d discord_transcript -f "$$f"; done'
 
 volumes:
   pgdata:
