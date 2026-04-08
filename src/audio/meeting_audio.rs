@@ -3,6 +3,7 @@ use crate::audio::build_wav_bytes_raw;
 use crate::audio::songbird_adapter::SsrcTracker;
 use crate::audio::wav::{normalize_rms_pcm_16le, resample_pcm_16le};
 use crate::infrastructure::storage_fs::sanitize_path_component;
+use crate::infrastructure::workspace::SSRC_MAPPING_FILENAME;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -164,7 +165,7 @@ const NORMALIZE_TARGET_RMS: f64 = 3000.0;
 /// Load the persisted SSRC-to-user mapping and build a lookup from sanitized
 /// SSRC fallback filenames to real user IDs.
 fn load_ssrc_mapping(meeting_dir: &Path) -> HashMap<String, String> {
-    let mapping_path = meeting_dir.join("ssrc_mapping.json");
+    let mapping_path = meeting_dir.join(SSRC_MAPPING_FILENAME);
     let data = match fs::read(&mapping_path) {
         Ok(data) => data,
         Err(_) => return HashMap::new(),
