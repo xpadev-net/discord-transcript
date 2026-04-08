@@ -98,6 +98,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
+        config.static_files_dir.clone(),
     );
     let router = web::create_router(web_state);
 

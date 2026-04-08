@@ -8,3 +8,5 @@ tests/
 .env.example
 docker-compose.yml
 docker-compose.dev.yml
+web/node_modules/
+web/dist/

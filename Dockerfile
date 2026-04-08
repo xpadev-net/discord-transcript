@@ -1,3 +1,11 @@
+FROM node:22-bookworm-slim AS frontend
+
+WORKDIR /app/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM rust:1.94-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends cmake libopus-dev && rm -rf /var/lib/apt/lists/*
@@ -8,7 +16,6 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 
 COPY src/ src/
-COPY assets/ assets/
 RUN touch src/main.rs && cargo build --release
 
 FROM node:22-bookworm-slim
@@ -20,9 +27,12 @@ RUN groupadd -r app && useradd -r -g app -m -d /home/app app
 RUN mkdir -p /data/chunks && chown app:app /data/chunks
 
 COPY --from=builder /app/target/release/discord-transcript /usr/local/bin/discord-transcript
+COPY --from=frontend /app/web/dist /app/web/dist
 
 USER app
+WORKDIR /app
 ENV HOME=/home/app
+ENV STATIC_FILES_DIR=/app/web/dist
 EXPOSE 3000
 
 CMD ["discord-transcript"]
