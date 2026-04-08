@@ -1535,45 +1535,46 @@ impl ScaffoldHandler {
             );
         }
 
-        let speaker_audio = match build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k) {
-            Ok(value) => value,
-            Err(err) => {
-                let mut queue = self.queue.lock().await;
-                let retry_status =
-                    queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                drop(queue);
-                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
-                    let mut service = self.service.lock().await;
-                    let _ = service.store.set_meeting_status(
-                        &claimed_job.meeting_id,
-                        MeetingStatus::Failed,
-                        None,
-                    );
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
-                    drop(service);
-                    if let Err(status_err) = self
-                        .update_status_message(
-                            http,
+        let speaker_audio =
+            match build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k) {
+                Ok(value) => value,
+                Err(err) => {
+                    let mut queue = self.queue.lock().await;
+                    let retry_status =
+                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    drop(queue);
+                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                        let mut service = self.service.lock().await;
+                        let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
-                            StatusMessageUpdate::Failed {
-                                phase: "transcription_input",
-                                error: &err,
-                            },
-                        )
-                        .await
-                    {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %status_err,
-                            "failed to update status message after speaker audio error"
+                            MeetingStatus::Failed,
+                            None,
                         );
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                        drop(service);
+                        if let Err(status_err) = self
+                            .update_status_message(
+                                http,
+                                &claimed_job.meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: "transcription_input",
+                                    error: &err,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                meeting_id = %claimed_job.meeting_id,
+                                error = %status_err,
+                                "failed to update status message after speaker audio error"
+                            );
+                        }
                     }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
 
         let request = crate::application::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),

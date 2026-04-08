@@ -313,10 +313,7 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn optional_env_parse_bool(
-    key: &'static str,
-    default: bool,
-) -> Result<bool, ConfigError> {
+fn optional_env_parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
     let Some(value) = optional_env(key) else {
         return Ok(default);
     };

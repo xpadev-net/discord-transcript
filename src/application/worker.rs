@@ -268,8 +268,8 @@ where
             }
         };
 
-        let mixdown_path =
-            merge_user_chunks_to_mixdown(&meeting_dir, resample_to_16k).map_err(WorkerError::Summary)?;
+        let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, resample_to_16k)
+            .map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
