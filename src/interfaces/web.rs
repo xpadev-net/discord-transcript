@@ -439,10 +439,10 @@ async fn get_guild_info(
     // Check cache (read lock)
     {
         let cache = state.guild_cache.read().await;
-        if let Some((ref guild, expires_at)) = *cache {
-            if Instant::now() < expires_at {
-                return Ok(guild.clone());
-            }
+        if let Some((ref guild, expires_at)) = *cache
+            && Instant::now() < expires_at
+        {
+            return Ok(guild.clone());
         }
     }
 
