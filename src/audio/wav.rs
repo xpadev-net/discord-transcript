@@ -160,10 +160,10 @@ fn lowpass_fir_coefficients(taps: usize, cutoff_hz: f64, sample_rate: f64) -> Ve
         let n = i as f64;
         // Sinc function
         let sinc = if i == m / 2 {
-            2.0 * PI * fc
+            2.0 * fc
         } else {
             let x = 2.0 * PI * fc * (n - m as f64 / 2.0);
-            x.sin() / (n - m as f64 / 2.0)
+            x.sin() / (PI * (n - m as f64 / 2.0))
         };
         // Blackman window
         let window =

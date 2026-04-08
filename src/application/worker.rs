@@ -218,7 +218,7 @@ fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryJobOptions {
     pub max_retries: u32,
     pub audio_base_dir: String,
