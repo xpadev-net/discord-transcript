@@ -25,15 +25,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install pnpm
-        run: npm install -g pnpm
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
 
       - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
       - run: pnpm exec tsc --noEmit
       - run: pnpm run build
 

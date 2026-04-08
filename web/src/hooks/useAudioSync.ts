@@ -9,6 +9,7 @@ export function useAudioSync(
   segments: TranscriptSegment[] | null,
 ) {
   const [activeIndex, setActiveIndex] = useState(-1);
+  const prevIndexRef = useRef(-1);
   const userScrolledRef = useRef(false);
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
@@ -48,26 +49,25 @@ export function useAudioSync(
         }
       }
 
-      setActiveIndex((prev) => {
-        if (newIndex === prev) return prev;
+      if (newIndex === prevIndexRef.current) return;
 
-        // Auto-scroll to active segment
-        if (newIndex >= 0 && !userScrolledRef.current) {
-          const container = containerRef.current;
-          if (container) {
-            const segmentEls = container.querySelectorAll(".segment");
-            if (newIndex < segmentEls.length) {
-              const segEl = segmentEls[newIndex];
-              const containerRect = container.getBoundingClientRect();
-              const segRect = segEl.getBoundingClientRect();
-              const offset = segRect.top - containerRect.top - containerRect.height / 3;
-              container.scrollBy({ top: offset, behavior: "smooth" });
-            }
+      // Auto-scroll to active segment
+      if (newIndex >= 0 && !userScrolledRef.current) {
+        const container = containerRef.current;
+        if (container) {
+          const segmentEls = container.querySelectorAll(".segment");
+          if (newIndex < segmentEls.length) {
+            const segEl = segmentEls[newIndex];
+            const containerRect = container.getBoundingClientRect();
+            const segRect = segEl.getBoundingClientRect();
+            const offset = segRect.top - containerRect.top - containerRect.height / 3;
+            container.scrollBy({ top: offset, behavior: "smooth" });
           }
         }
+      }
 
-        return newIndex;
-      });
+      prevIndexRef.current = newIndex;
+      setActiveIndex(newIndex);
     };
 
     audio.addEventListener("timeupdate", handleTimeUpdate);
@@ -79,7 +79,7 @@ export function useAudioSync(
       const audio = audioRef.current;
       if (audio) {
         audio.currentTime = startMs / 1000;
-        audio.play();
+        audio.play().catch(() => {});
       }
     },
     [audioRef],

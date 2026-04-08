@@ -13,7 +13,7 @@ export function MeetingPage() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
 
-  const { meeting, transcript, summary, loading } = useMeetingData(meetingId);
+  const { meeting, transcript, summary, loading, error } = useMeetingData(meetingId);
   const { activeIndex, seekTo } = useAudioSync(
     audioRef,
     transcriptContainerRef,
@@ -25,6 +25,17 @@ export function MeetingPage() {
       document.title = meeting?.title || "Meeting";
     }
   }, [meetingId, meeting?.title]);
+
+  if (error) {
+    return (
+      <>
+        <Header meeting={null} />
+        <div className="empty-state">
+          {error}
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
