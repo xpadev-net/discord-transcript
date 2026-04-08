@@ -248,7 +248,15 @@ pub fn build_speaker_audio_inputs(
             current_ms = chunk.start_ms + chunk.duration_ms;
         }
         let (final_pcm, final_rate) = if resample_to_16k {
-            resample_pcm_16le(&pcm_out, sample_rate, 16_000)
+            let (resampled, rate) = resample_pcm_16le(&pcm_out, sample_rate, 16_000);
+            if rate != 16_000 {
+                warn!(
+                    user_id = %user_id,
+                    sample_rate,
+                    "resampling skipped: unsupported sample rate (expected 48000)"
+                );
+            }
+            (resampled, rate)
         } else {
             (pcm_out, sample_rate)
         };

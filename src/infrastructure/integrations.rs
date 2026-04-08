@@ -36,7 +36,7 @@ pub struct CommandWhisperClient {
     pub endpoint: String,
     pub curl_bin: String,
     pub retry_policy: RetryPolicy,
-    pub beam_size: Option<u32>,
+    pub beam_size: u32,
     pub suppress_non_speech: bool,
     pub prompt: Option<String>,
     pub vad: bool,
@@ -62,9 +62,7 @@ impl WhisperClient for CommandWhisperClient {
             if let Some(language) = &request.language {
                 cmd.arg("-F").arg(format!("language={language}"));
             }
-            if let Some(bs) = self.beam_size {
-                cmd.arg("-F").arg(format!("beam_size={bs}"));
-            }
+            cmd.arg("-F").arg(format!("beam_size={}", self.beam_size));
             cmd.arg("-F")
                 .arg(format!("suppress_non_speech={}", self.suppress_non_speech));
             if let Some(p) = &self.prompt {

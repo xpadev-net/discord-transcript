@@ -1468,7 +1468,7 @@ impl ScaffoldHandler {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
             retry_policy: self.integration_retry_policy,
-            beam_size: Some(self.whisper_beam_size),
+            beam_size: self.whisper_beam_size,
             suppress_non_speech: self.whisper_suppress_non_speech,
             prompt: self.whisper_prompt.clone(),
             vad: self.whisper_vad,
