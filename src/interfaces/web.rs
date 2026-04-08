@@ -436,7 +436,7 @@ async fn get_guild_info(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<DiscordGuildFull, StatusCode> {
-    // Check cache (read lock)
+    // Fast path: read lock
     {
         let cache = state.guild_cache.read().await;
         if let Some((ref guild, expires_at)) = *cache
@@ -446,7 +446,14 @@ async fn get_guild_info(
         }
     }
 
-    // Cache miss — fetch from Discord API
+    // Slow path: hold write lock for the entire fetch to serialize concurrent misses
+    let mut cache = state.guild_cache.write().await;
+    if let Some((ref guild, expires_at)) = *cache
+        && Instant::now() < expires_at
+    {
+        return Ok(guild.clone());
+    }
+
     let bot_auth = format!("Bot {}", auth.bot_token);
     let guild_resp = state
         .http_client
@@ -472,12 +479,8 @@ async fn get_guild_info(
         StatusCode::BAD_GATEWAY
     })?;
 
-    // Store in cache (write lock)
-    {
-        let mut cache = state.guild_cache.write().await;
-        let expires_at = Instant::now() + std::time::Duration::from_secs(GUILD_CACHE_TTL_SECS);
-        *cache = Some((guild.clone(), expires_at));
-    }
+    let expires_at = Instant::now() + std::time::Duration::from_secs(GUILD_CACHE_TTL_SECS);
+    *cache = Some((guild.clone(), expires_at));
 
     Ok(guild)
 }
