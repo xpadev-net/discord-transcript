@@ -1,6 +1,6 @@
 services:
   app:
-    image: ghcr.io/xpadev-net/discord-transcript:latest
+    build: .
     # Host networking is required for Discord voice (songbird).
     # Docker's bridge network does not reliably NAT the UDP traffic
     # needed for voice gateway IP discovery and audio streaming.

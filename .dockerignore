@@ -7,3 +7,4 @@ tests/
 .env
 .env.example
 docker-compose.yml
+docker-compose.dev.yml
