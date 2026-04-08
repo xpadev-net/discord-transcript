@@ -33,7 +33,7 @@ export const TranscriptPanel = forwardRef<HTMLDivElement, Props>(
       <div className="transcript-container" ref={ref}>
         {segments.map((seg, i) => (
           <TranscriptSegmentRow
-            key={i}
+            key={`${seg.speaker_id}-${seg.start_ms}`}
             segment={seg}
             isActive={i === activeIndex}
             onSeek={onSeek}
