@@ -168,7 +168,15 @@ fn load_ssrc_mapping(meeting_dir: &Path) -> HashMap<String, String> {
     let mapping_path = meeting_dir.join(SSRC_MAPPING_FILENAME);
     let data = match fs::read(&mapping_path) {
         Ok(data) => data,
-        Err(_) => return HashMap::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => {
+            warn!(
+                path = %mapping_path.display(),
+                error = %err,
+                "failed to read SSRC mapping file"
+            );
+            return HashMap::new();
+        }
     };
     let tracker: SsrcTracker = match serde_json::from_slice(&data) {
         Ok(parsed) => parsed,
