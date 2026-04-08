@@ -1,5 +1,6 @@
 use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
+use crate::audio::wav::resample_pcm_16le;
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use std::collections::HashMap;
 use std::fs;
@@ -155,7 +156,10 @@ fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
     vec![0; samples.saturating_mul(2)]
 }
 
-pub fn build_speaker_audio_inputs(meeting_dir: &Path) -> Result<Vec<SpeakerAudioInput>, String> {
+pub fn build_speaker_audio_inputs(
+    meeting_dir: &Path,
+    resample_to_16k: bool,
+) -> Result<Vec<SpeakerAudioInput>, String> {
     let chunks = load_chunks(meeting_dir)?;
     let sample_rate = chunks.first().map(|c| c.sample_rate).unwrap_or(48_000);
     if chunks.iter().any(|c| c.sample_rate != sample_rate) {
@@ -234,7 +238,12 @@ pub fn build_speaker_audio_inputs(meeting_dir: &Path) -> Result<Vec<SpeakerAudio
             current_ms = chunk.start_ms + chunk.duration_ms;
         }
 
-        let wav_bytes = build_wav_bytes_raw(&pcm_out, sample_rate, 1, 16)
+        let (final_pcm, final_rate) = if resample_to_16k {
+            resample_pcm_16le(&pcm_out, sample_rate, 16_000)
+        } else {
+            (pcm_out, sample_rate)
+        };
+        let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
             .map_err(|err| format!("failed to build speaker wav for {user_id}: {err}"))?;
         let safe_user = sanitize_path_component(&user_id);
         let output_path = speaker_dir.join(format!("{safe_user}_speaker.wav"));

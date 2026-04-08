@@ -157,6 +157,7 @@ fn worker_job_processing_marks_done_on_success() {
         2,
         &base.path().to_string_lossy(),
         Some("ja".to_owned()),
+        false,
     )
     .expect("worker should succeed")
     .expect("job result should exist");
@@ -193,6 +194,7 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
         0,
         &base.path().to_string_lossy(),
         None,
+        false,
     );
     assert!(result.is_err(), "should fail with invalid JSON");
     let job = queue.get("j1").expect("job exists");
@@ -231,6 +233,7 @@ fn worker_job_processing_rejects_empty_chunks() {
         0,
         &base.path().to_string_lossy(),
         None,
+        false,
     );
     let err = result.expect_err("should fail when only empty chunks exist");
     assert!(
@@ -274,6 +277,7 @@ fn worker_job_processing_rejects_pcm_only_chunks() {
         0,
         &base.path().to_string_lossy(),
         None,
+        false,
     );
     let err = result.expect_err("should fail when only pcm chunks are non-empty");
     assert!(
@@ -317,6 +321,7 @@ fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() 
         2,
         &base.path().to_string_lossy(),
         Some("ja".to_owned()),
+        false,
     )
     .expect("worker should succeed")
     .expect("job result should exist");

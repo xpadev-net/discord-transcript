@@ -158,7 +158,10 @@ pub fn meeting_audio_path(
 type UserPcmChunk = (String, Vec<u8>);
 type SequenceGroup = (u64, Vec<UserPcmChunk>);
 
-pub fn merge_user_chunks_to_mixdown(audio_dir: &std::path::Path) -> Result<String, String> {
+pub fn merge_user_chunks_to_mixdown(
+    audio_dir: &std::path::Path,
+    resample_to_16k: bool,
+) -> Result<String, String> {
     use crate::audio::build_wav_bytes_raw;
 
     let mixdown_path = audio_dir.join("mixdown.wav");
@@ -208,7 +211,12 @@ pub fn merge_user_chunks_to_mixdown(audio_dir: &std::path::Path) -> Result<Strin
         }
     }
 
-    let wav_bytes = build_wav_bytes_raw(&all_pcm, sample_rate, 1, 16)
+    let (final_pcm, final_rate) = if resample_to_16k {
+        crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000)
+    } else {
+        (all_pcm, sample_rate)
+    };
+    let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
         .map_err(|err| format!("failed to build mixdown WAV: {err}"))?;
     fs::write(&mixdown_path, &wav_bytes)
         .map_err(|err| format!("failed to write mixdown: {err}"))?;
@@ -447,6 +455,11 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         claude_command: config.claude_command.clone(),
         claude_model: config.claude_model.clone(),
         whisper_language: config.whisper_language.clone(),
+        whisper_beam_size: config.whisper_beam_size,
+        whisper_suppress_non_speech: config.whisper_suppress_non_speech,
+        whisper_prompt: config.whisper_prompt.clone(),
+        whisper_vad: config.whisper_vad,
+        whisper_resample_to_16k: config.whisper_resample_to_16k,
         summary_max_retries: config.summary_max_retries,
         integration_retry_policy: RetryPolicy {
             max_attempts: config.integration_retry_max_attempts,
@@ -488,6 +501,11 @@ struct ScaffoldHandler {
     claude_command: String,
     claude_model: String,
     whisper_language: Option<String>,
+    whisper_beam_size: u32,
+    whisper_suppress_non_speech: bool,
+    whisper_prompt: Option<String>,
+    whisper_vad: bool,
+    whisper_resample_to_16k: bool,
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
@@ -776,7 +794,7 @@ impl ScaffoldHandler {
                 RecoveryEffect::SummaryRequeued { .. }
                 | RecoveryEffect::StopConfirmedClientDisconnect { .. } => {
                     // Merge per-user chunks into mixdown before ASR
-                    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir) {
+                    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir, self.whisper_resample_to_16k) {
                         warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
                         let _ = self.post_failure_for_meeting(
                             &ctx.http,
@@ -1448,6 +1466,10 @@ impl ScaffoldHandler {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
             retry_policy: self.integration_retry_policy,
+            beam_size: Some(self.whisper_beam_size),
+            suppress_non_speech: self.whisper_suppress_non_speech,
+            prompt: self.whisper_prompt.clone(),
+            vad: self.whisper_vad,
         };
         let claude = ClaudeCliSummaryClient {
             command_path: self.claude_command.clone(),
@@ -1513,7 +1535,7 @@ impl ScaffoldHandler {
             );
         }
 
-        let speaker_audio = match build_speaker_audio_inputs(&meeting_dir) {
+        let speaker_audio = match build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k) {
             Ok(value) => value,
             Err(err) => {
                 let mut queue = self.queue.lock().await;
@@ -2416,7 +2438,7 @@ async fn run_summary_background(
         );
     }
 
-    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir) {
+    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir, handler.whisper_resample_to_16k) {
         warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
         let _ = handler
             .post_failure_for_meeting(

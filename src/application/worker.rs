@@ -210,6 +210,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
     max_retries: u32,
     audio_base_dir: &str,
     language: Option<String>,
+    resample_to_16k: bool,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
     S: MeetingStore,
@@ -268,14 +269,14 @@ where
         };
 
         let mixdown_path =
-            merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
+            merge_user_chunks_to_mixdown(&meeting_dir, resample_to_16k).map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
             audio_path: mixdown_path,
-            speaker_audio: build_speaker_audio_inputs(&meeting_dir)
+            speaker_audio: build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
                 .map_err(WorkerError::Summary)?,
             language: language.clone(),
             workspace,
