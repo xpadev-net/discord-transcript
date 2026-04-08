@@ -80,6 +80,10 @@ impl RecorderEngine {
         out
     }
 
+    pub fn rekey_user(&mut self, old_id: &str, new_id: &str) -> usize {
+        self.receiver.rekey_user(old_id, new_id)
+    }
+
     fn build_chunk(
         &self,
         candidate: UserChunkCandidate,

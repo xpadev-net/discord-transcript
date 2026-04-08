@@ -82,6 +82,10 @@ impl MeetingWorkspacePaths {
         self.transcript_dir().join(TRANSCRIPT_MANIFEST_FILENAME)
     }
 
+    pub fn ssrc_mapping_path(&self) -> PathBuf {
+        self.audio_dir().join("ssrc_mapping.json")
+    }
+
     pub fn ensure_base_dirs(&self) -> std::io::Result<()> {
         fs::create_dir_all(self.audio_dir())?;
         fs::create_dir_all(self.transcript_dir())?;

@@ -2,7 +2,7 @@ use crate::audio::receiver::BufferedFrame;
 use songbird::events::context_data::VoiceTick;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SsrcTracker {
     ssrc_to_user: HashMap<u32, String>,
 }
@@ -20,6 +20,20 @@ impl SsrcTracker {
 
     pub fn resolve_user(&self, ssrc: u32) -> Option<&str> {
         self.ssrc_to_user.get(&ssrc).map(String::as_str)
+    }
+
+    pub fn all_mappings(&self) -> &HashMap<u32, String> {
+        &self.ssrc_to_user
+    }
+
+    /// Parse an SSRC-based fallback speaker ID.
+    /// Handles both `"ssrc:13829"` (in-memory format) and
+    /// `"ssrc13829"` (sanitized on-disk format).
+    pub fn parse_ssrc_fallback(speaker_id: &str) -> Option<u32> {
+        speaker_id
+            .strip_prefix("ssrc:")
+            .or_else(|| speaker_id.strip_prefix("ssrc"))
+            .and_then(|n| n.parse::<u32>().ok())
     }
 }
 

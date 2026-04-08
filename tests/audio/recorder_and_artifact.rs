@@ -1,4 +1,4 @@
-use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig};
+use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig, ReceiverState};
 use discord_transcript::audio::recorder::RecorderEngine;
 use discord_transcript::infrastructure::artifact::{
     ArtifactError, ArtifactPolicy, build_transcript_artifact,
@@ -61,4 +61,71 @@ fn transcript_artifact_requires_link_for_large_payload() {
     )
     .expect_err("large artifact without link should fail");
     assert_eq!(err, ArtifactError::MissingLink);
+}
+
+#[test]
+fn receiver_state_rekey_user_moves_frames() {
+    let mut state = ReceiverState::default();
+    state.track_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 10,
+            pcm_16le_bytes: vec![1, 0],
+        },
+    );
+    state.track_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 30,
+            pcm_16le_bytes: vec![2, 0],
+        },
+    );
+
+    let moved = state.rekey_user("ssrc:100", "12345");
+    assert_eq!(moved, 2);
+
+    // Old key should be gone; flushing should yield the new key
+    let all = state.flush_all_chunks();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].user_id, "12345");
+    assert_eq!(all[0].frames.len(), 2);
+}
+
+#[test]
+fn receiver_state_rekey_user_merges_with_existing() {
+    let mut state = ReceiverState::default();
+    // Pre-existing frames under the real user ID
+    state.track_frame(
+        "12345",
+        BufferedFrame {
+            timestamp_ms: 5,
+            pcm_16le_bytes: vec![0, 0],
+        },
+    );
+    // Frames under the SSRC fallback
+    state.track_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 10,
+            pcm_16le_bytes: vec![1, 0],
+        },
+    );
+
+    let moved = state.rekey_user("ssrc:100", "12345");
+    assert_eq!(moved, 1);
+
+    let all = state.flush_all_chunks();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].user_id, "12345");
+    assert_eq!(all[0].frames.len(), 2);
+    // Frames should be sorted by timestamp
+    assert_eq!(all[0].frames[0].timestamp_ms, 5);
+    assert_eq!(all[0].frames[1].timestamp_ms, 10);
+}
+
+#[test]
+fn receiver_state_rekey_user_noop_for_missing_key() {
+    let mut state = ReceiverState::default();
+    let moved = state.rekey_user("nonexistent", "12345");
+    assert_eq!(moved, 0);
 }

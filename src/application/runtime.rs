@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
@@ -655,6 +655,8 @@ impl EventHandler for ScaffoldHandler {
                             }
                             _ => {}
                         }
+                        let tracker = handler.ssrc_tracker.lock().await;
+                        session.persist_ssrc_mapping(&tracker);
                     }
                     sessions.remove(&guild_for_task);
                 }
@@ -1200,6 +1202,8 @@ impl ScaffoldHandler {
                     }
                     _ => {}
                 }
+                let tracker = self.ssrc_tracker.lock().await;
+                session.persist_ssrc_mapping(&tracker);
             }
             sessions.remove(&guild_key);
         }
@@ -2001,12 +2005,20 @@ impl ScaffoldHandler {
             let user_id_u64 = match speaker_id.parse::<u64>() {
                 Ok(value) => value,
                 Err(err) => {
-                    warn!(
-                        meeting_id = %meeting_id,
-                        speaker_id = %speaker_id,
-                        error = %err,
-                        "failed to parse speaker_id while resolving speakers"
-                    );
+                    if SsrcTracker::parse_ssrc_fallback(&speaker_id).is_some() {
+                        debug!(
+                            meeting_id = %meeting_id,
+                            speaker_id = %speaker_id,
+                            "skipping SSRC-based speaker (mapping was unavailable)"
+                        );
+                    } else {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            speaker_id = %speaker_id,
+                            error = %err,
+                            "failed to parse speaker_id while resolving speakers"
+                        );
+                    }
                     continue;
                 }
             };
@@ -2151,7 +2163,24 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                 if let Some(user_id) = evt.user_id {
                     let mut tracker = self.tracker.lock().await;
                     let user_id_u64 = user_id.0;
+                    let user_id_str = user_id_u64.to_string();
                     tracker.update_mapping(evt.ssrc, user_id_u64);
+                    drop(tracker);
+
+                    // Re-key any in-memory frames buffered under the SSRC fallback ID
+                    let ssrc_key = format!("ssrc:{}", evt.ssrc);
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&self.guild_id) {
+                        let moved = session.rekey_user(&ssrc_key, &user_id_str);
+                        if moved > 0 {
+                            info!(
+                                ssrc = evt.ssrc,
+                                user_id = user_id_u64,
+                                frames_moved = moved,
+                                "re-keyed in-memory audio frames from SSRC fallback to user ID"
+                            );
+                        }
+                    }
                 }
             }
             EventContext::VoiceTick(tick) => {
@@ -2219,6 +2248,8 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     }
                                     _ => {}
                                 }
+                                let tracker = runtime.ssrc_tracker.lock().await;
+                                session.persist_ssrc_mapping(&tracker);
                             }
                             sessions.remove(&guild_key);
                         }

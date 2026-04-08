@@ -1,5 +1,6 @@
 use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
+use crate::audio::songbird_adapter::SsrcTracker;
 use crate::audio::wav::{normalize_rms_pcm_16le, resample_pcm_16le};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use std::collections::HashMap;
@@ -160,11 +161,48 @@ fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
 /// 3000 out of i16 max (32767) is a moderate level that avoids clipping.
 const NORMALIZE_TARGET_RMS: f64 = 3000.0;
 
+/// Load the persisted SSRC-to-user mapping and build a lookup from sanitized
+/// SSRC fallback filenames to real user IDs.
+fn load_ssrc_mapping(meeting_dir: &Path) -> HashMap<String, String> {
+    let mapping_path = meeting_dir.join("ssrc_mapping.json");
+    let data = match fs::read(&mapping_path) {
+        Ok(data) => data,
+        Err(_) => return HashMap::new(),
+    };
+    let tracker: SsrcTracker = match serde_json::from_slice(&data) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!(
+                path = %mapping_path.display(),
+                error = %err,
+                "failed to parse SSRC mapping"
+            );
+            return HashMap::new();
+        }
+    };
+    tracker
+        .all_mappings()
+        .iter()
+        .map(|(ssrc, user_id)| {
+            let sanitized_key = sanitize_path_component(&format!("ssrc:{ssrc}"));
+            (sanitized_key, user_id.clone())
+        })
+        .collect()
+}
+
 pub fn build_speaker_audio_inputs(
     meeting_dir: &Path,
     resample_to_16k: bool,
 ) -> Result<Vec<SpeakerAudioInput>, String> {
-    let chunks = load_chunks(meeting_dir)?;
+    let mut chunks = load_chunks(meeting_dir)?;
+
+    // Resolve any SSRC-based user IDs using persisted mapping
+    let ssrc_mapping = load_ssrc_mapping(meeting_dir);
+    for chunk in &mut chunks {
+        if let Some(real_id) = ssrc_mapping.get(&chunk.user_id) {
+            chunk.user_id = real_id.clone();
+        }
+    }
     let sample_rate = chunks.first().map(|c| c.sample_rate).unwrap_or(48_000);
     if chunks.iter().any(|c| c.sample_rate != sample_rate) {
         return Err("mixed sample rates are not supported".to_owned());

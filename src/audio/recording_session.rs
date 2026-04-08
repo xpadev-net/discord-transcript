@@ -1,6 +1,7 @@
 use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
 use crate::audio::recorder::{RecorderEngine, RecorderError, RecorderOutputChunk};
-use crate::infrastructure::storage_fs::{ChunkStorage, ChunkStorageError, SavedChunk};
+use crate::audio::songbird_adapter::SsrcTracker;
+use crate::infrastructure::storage_fs::{ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Instant;
@@ -145,5 +146,45 @@ impl<S: ChunkStorage> RecordingSession<S> {
     /// Returns the current (already committed) sequence number for a user.
     fn current_sequence(&self, user_id: &str) -> u64 {
         self.per_user_seq.get(user_id).copied().unwrap_or(0)
+    }
+
+    /// Re-key in-memory audio buffers and sequence counters from `old_id`
+    /// to `new_id`. Returns the number of in-memory frames moved.
+    pub fn rekey_user(&mut self, old_id: &str, new_id: &str) -> usize {
+        let moved = self.recorder.rekey_user(old_id, new_id);
+        if let Some(old_seq) = self.per_user_seq.remove(old_id) {
+            let new_seq = self.per_user_seq.entry(new_id.to_owned()).or_insert(0);
+            *new_seq = (*new_seq).max(old_seq);
+        }
+        moved
+    }
+}
+
+impl RecordingSession<LocalChunkStorage> {
+    /// Persist the SSRC-to-user mapping as a JSON file in the audio directory.
+    pub fn persist_ssrc_mapping(&self, tracker: &SsrcTracker) {
+        if tracker.all_mappings().is_empty() {
+            return;
+        }
+        let path = self.storage.workspace.ssrc_mapping_path();
+        match serde_json::to_vec_pretty(tracker) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(&path, &json) {
+                    tracing::warn!(
+                        meeting_id = %self.meeting_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to persist SSRC mapping"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    meeting_id = %self.meeting_id,
+                    error = %err,
+                    "failed to serialize SSRC mapping"
+                );
+            }
+        }
     }
 }
