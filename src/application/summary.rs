@@ -301,6 +301,7 @@ Below is an ASR (automatic speech recognition) transcript. Each line has the for
 Fix recognition errors in the **text** portion of each line while keeping the \
 timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
 {language_rules}\n\
+- Preserve bracketed placeholder tokens exactly as-is (e.g. [MENTION_1], [EMAIL_1], [PHONE_1])\n\
 - Do NOT change speaker names, timestamps, or line structure\n\
 - Do NOT add, remove, or reorder lines\n\
 - Do NOT add commentary or explanation\n\

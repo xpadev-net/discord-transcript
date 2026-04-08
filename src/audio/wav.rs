@@ -117,7 +117,7 @@ pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>
 /// Returns the input unchanged if it is too short or effectively silent.
 pub fn normalize_rms_pcm_16le(input: &[u8], target_rms: f64) -> Vec<u8> {
     let sample_count = input.len() / 2;
-    if sample_count == 0 {
+    if sample_count == 0 || !target_rms.is_finite() || target_rms <= 0.0 {
         return input.to_vec();
     }
 

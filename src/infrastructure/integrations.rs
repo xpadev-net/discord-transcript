@@ -70,7 +70,7 @@ impl WhisperClient for CommandWhisperClient {
             }
             cmd.arg("-F").arg(format!("vad={}", self.vad));
             cmd.arg("-F")
-                .arg(format!("temperature={:.1}", self.temperature));
+                .arg(format!("temperature={}", self.temperature));
 
             let output = cmd
                 .output()

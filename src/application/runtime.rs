@@ -212,7 +212,14 @@ pub fn merge_user_chunks_to_mixdown(
     }
 
     let (final_pcm, final_rate) = if resample_to_16k {
-        crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000)
+        let (pcm, rate) = crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000);
+        if rate != 16_000 {
+            warn!(
+                sample_rate,
+                "mixdown resampling skipped: unsupported sample rate (expected 48000)"
+            );
+        }
+        (pcm, rate)
     } else {
         (all_pcm, sample_rate)
     };
