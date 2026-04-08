@@ -9,7 +9,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio_postgres::Client as PgClient;
 use tracing::warn;
@@ -24,9 +24,11 @@ const ADMINISTRATOR: u64 = 1 << 3;
 
 // ---------- State ----------
 
-const PERMISSION_CACHE_TTL_SECS: u64 = 60;
+const PERMISSION_CACHE_TTL_SECS: u64 = 300;
+const GUILD_CACHE_TTL_SECS: u64 = 300;
 
-type PermissionCache = Arc<Mutex<HashMap<(String, String), (bool, Instant)>>>;
+type PermissionCache = Arc<tokio::sync::RwLock<HashMap<(String, String), (bool, Instant)>>>;
+type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
 
 #[derive(Clone)]
 pub struct WebState {
@@ -36,6 +38,26 @@ pub struct WebState {
     pub http_client: reqwest::Client,
     /// Cache: (user_id, channel_id) → (allowed, expires_at)
     pub permission_cache: PermissionCache,
+    /// Cache: guild info (shared across all requests)
+    guild_cache: GuildCache,
+}
+
+impl WebState {
+    pub fn new(
+        db: Arc<PgClient>,
+        chunk_storage_dir: String,
+        auth: Option<Arc<AuthConfig>>,
+        http_client: reqwest::Client,
+    ) -> Self {
+        Self {
+            db,
+            chunk_storage_dir,
+            auth,
+            http_client,
+            permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
 }
 
 pub struct AuthConfig {
@@ -349,7 +371,7 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
 
 /// Verify that the authenticated user has VIEW_CHANNEL permission on the
 /// voice channel where the meeting was recorded.
-/// Results are cached per (user_id, channel_id) for 60 seconds to avoid
+/// Results are cached per (user_id, channel_id) for 5 minutes to avoid
 /// Discord API rate-limit exhaustion on page loads (which trigger ~4 requests).
 async fn verify_meeting_access(
     state: &WebState,
@@ -373,10 +395,7 @@ async fn verify_meeting_access(
     // Check permission cache
     let cache_key = (user_id.to_owned(), channel_id.clone());
     {
-        let cache = state
-            .permission_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = state.permission_cache.read().await;
         if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
         {
@@ -393,15 +412,12 @@ async fn verify_meeting_access(
 
     // Store result in cache (also evict expired entries periodically)
     {
-        let mut cache = state
-            .permission_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = state.permission_cache.write().await;
         let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
         cache.insert(cache_key, (allowed, expires_at));
 
         // Evict expired entries if cache grows large
-        if cache.len() > 1000 {
+        if cache.len() > 5000 {
             let now = Instant::now();
             cache.retain(|_, (_, exp)| *exp > now);
         }
@@ -414,6 +430,61 @@ async fn verify_meeting_access(
     }
 }
 
+/// Fetch guild info with caching. Guild data is shared across all requests
+/// since the server operates on a single guild.
+async fn get_guild_info(
+    state: &WebState,
+    auth: &AuthConfig,
+) -> Result<DiscordGuildFull, StatusCode> {
+    // Fast path: read lock
+    {
+        let cache = state.guild_cache.read().await;
+        if let Some((ref guild, expires_at)) = *cache
+            && Instant::now() < expires_at
+        {
+            return Ok(guild.clone());
+        }
+    }
+
+    // Slow path: hold write lock for the entire fetch to serialize concurrent misses
+    let mut cache = state.guild_cache.write().await;
+    if let Some((ref guild, expires_at)) = *cache
+        && Instant::now() < expires_at
+    {
+        return Ok(guild.clone());
+    }
+
+    let bot_auth = format!("Bot {}", auth.bot_token);
+    let guild_resp = state
+        .http_client
+        .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
+        .header("Authorization", &bot_auth)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "discord guild API request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let guild_body = guild_resp.text().await.map_err(|err| {
+        warn!(error = %err, "discord guild API response read failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
+        warn!(
+            error = %err,
+            body_preview = %&guild_body[..guild_body.len().min(500)],
+            "discord guild API response parse failed"
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let expires_at = Instant::now() + std::time::Duration::from_secs(GUILD_CACHE_TTL_SECS);
+    *cache = Some((guild.clone(), expires_at));
+
+    Ok(guild)
+}
+
 /// Query Discord API for channel permission. Returns Ok(true) if allowed,
 /// Ok(false) if denied, Err on API failure.
 async fn check_channel_permission(
@@ -423,12 +494,10 @@ async fn check_channel_permission(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let bot_auth = format!("Bot {}", auth.bot_token);
-    let (guild_res, channel_res, member_res) = tokio::join!(
-        state
-            .http_client
-            .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
-            .header("Authorization", &bot_auth)
-            .send(),
+
+    // Fetch guild from cache, channel and member from API in parallel
+    let (guild_result, channel_res, member_res) = tokio::join!(
+        get_guild_info(state, auth),
         state
             .http_client
             .get(format!("https://discord.com/api/channels/{channel_id}"))
@@ -444,22 +513,7 @@ async fn check_channel_permission(
             .send(),
     );
 
-    let guild_resp = guild_res.map_err(|err| {
-        warn!(error = %err, "discord guild API request failed");
-        StatusCode::BAD_GATEWAY
-    })?;
-    let guild_body = guild_resp.text().await.map_err(|err| {
-        warn!(error = %err, "discord guild API response read failed");
-        StatusCode::BAD_GATEWAY
-    })?;
-    let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
-        warn!(
-            error = %err,
-            body_preview = %&guild_body[..guild_body.len().min(500)],
-            "discord guild API response parse failed"
-        );
-        StatusCode::BAD_GATEWAY
-    })?;
+    let guild = guild_result?;
 
     let channel_resp = channel_res.map_err(|err| {
         warn!(error = %err, "discord channel API request failed");
@@ -502,13 +556,13 @@ async fn check_channel_permission(
 
 // Discord API response types for permission checking
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct DiscordGuildFull {
     owner_id: String,
     roles: Vec<DiscordRoleFull>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct DiscordRoleFull {
     id: String,
     #[serde(deserialize_with = "deserialize_string_or_number")]
@@ -893,7 +947,11 @@ async fn api_audio(
     let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
     let primary = workspace.mixdown_path();
     let legacy = layout.legacy_meeting_dir(&meeting_id).join("mixdown.wav");
-    let path = if primary.exists() { primary } else { legacy };
+    let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+        primary
+    } else {
+        legacy
+    };
 
     let metadata = tokio::fs::metadata(&path)
         .await
