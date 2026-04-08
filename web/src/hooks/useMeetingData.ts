@@ -20,22 +20,30 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   useEffect(() => {
     if (!meetingId) return;
 
+    const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setMeeting(null);
+    setTranscript(null);
+    setSummary(null);
 
     Promise.all([
-      fetchMeeting(meetingId).then(setMeeting).catch(() => {
-        setError("\u4f1a\u8b70\u60c5\u5831\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f");
+      fetchMeeting(meetingId, controller.signal).then(setMeeting).catch(() => {
+        if (!controller.signal.aborted) {
+          setError("\u4f1a\u8b70\u60c5\u5831\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f");
+        }
       }),
-      fetchTranscript(meetingId).then(setTranscript).catch(() => {
-        setTranscript([]);
+      fetchTranscript(meetingId, controller.signal).then(setTranscript).catch(() => {
+        if (!controller.signal.aborted) setTranscript([]);
       }),
-      fetchSummary(meetingId).then(setSummary).catch(() => {
-        setSummary({ markdown: null });
+      fetchSummary(meetingId, controller.signal).then(setSummary).catch(() => {
+        if (!controller.signal.aborted) setSummary({ markdown: null });
       }),
     ]).finally(() => {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     });
+
+    return () => controller.abort();
   }, [meetingId]);
 
   return { meeting, transcript, summary, loading, error };

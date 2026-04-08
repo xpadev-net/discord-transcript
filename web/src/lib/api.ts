@@ -15,16 +15,16 @@ function handleResponse(response: Response): Promise<unknown> {
   return response.json();
 }
 
-export function fetchMeeting(meetingId: string): Promise<MeetingResponse> {
-  return fetch(basePath(meetingId)).then(handleResponse) as Promise<MeetingResponse>;
+export function fetchMeeting(meetingId: string, signal?: AbortSignal): Promise<MeetingResponse> {
+  return fetch(basePath(meetingId), { signal }).then(handleResponse) as Promise<MeetingResponse>;
 }
 
-export function fetchTranscript(meetingId: string): Promise<TranscriptSegment[]> {
-  return fetch(`${basePath(meetingId)}/transcript`).then(handleResponse) as Promise<TranscriptSegment[]>;
+export function fetchTranscript(meetingId: string, signal?: AbortSignal): Promise<TranscriptSegment[]> {
+  return fetch(`${basePath(meetingId)}/transcript`, { signal }).then(handleResponse) as Promise<TranscriptSegment[]>;
 }
 
-export function fetchSummary(meetingId: string): Promise<SummaryResponse> {
-  return fetch(`${basePath(meetingId)}/summary`).then(handleResponse) as Promise<SummaryResponse>;
+export function fetchSummary(meetingId: string, signal?: AbortSignal): Promise<SummaryResponse> {
+  return fetch(`${basePath(meetingId)}/summary`, { signal }).then(handleResponse) as Promise<SummaryResponse>;
 }
 
 export function getAudioUrl(meetingId: string): string {

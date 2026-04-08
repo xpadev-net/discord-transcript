@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { Header } from "../components/Header";
 import { AudioPlayer } from "../components/AudioPlayer";
@@ -20,9 +20,11 @@ export function MeetingPage() {
     transcript,
   );
 
-  if (meetingId) {
-    document.title = meeting?.title || "Meeting";
-  }
+  useEffect(() => {
+    if (meetingId) {
+      document.title = meeting?.title || "Meeting";
+    }
+  }, [meetingId, meeting?.title]);
 
   return (
     <>
