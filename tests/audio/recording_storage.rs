@@ -131,3 +131,124 @@ fn recording_session_increments_sequence_per_user() {
 
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn recording_session_rekey_user_transfers_sequence_counter() {
+    let base = unique_temp_dir("rekey_seq");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let storage =
+        LocalChunkStorage::new(layout.for_meeting("g1", "vc1", "meeting-rk"), "meeting-rk");
+    let mut session = RecordingSession::new(
+        "meeting-rk".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(5),
+        },
+        48_000,
+    );
+
+    let start = Instant::now();
+
+    // Ingest frames under the SSRC fallback key and flush to commit sequence
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![0, 0],
+        },
+    );
+    let first = session
+        .flush_due(start + Duration::from_secs(6))
+        .expect("first flush should succeed");
+    assert_eq!(first.persisted.len(), 1);
+    assert_eq!(first.persisted[0].user_id, "ssrc:100");
+    assert_eq!(first.persisted[0].sequence, 1);
+
+    // Ingest another frame (still under fallback, not yet flushed)
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 7_000,
+            pcm_16le_bytes: vec![1, 0],
+        },
+    );
+
+    // Re-key: sequence counter (1) should transfer to the real user ID
+    let moved = session.rekey_user("ssrc:100", "12345");
+    assert_eq!(moved, 1);
+
+    // Flush the remaining frame — should use the new user ID and
+    // continue the sequence (2) from the transferred counter
+    let second = session
+        .flush_due(start + Duration::from_secs(12))
+        .expect("second flush should succeed");
+    assert_eq!(second.persisted.len(), 1);
+    assert_eq!(second.persisted[0].user_id, "12345");
+    assert_eq!(second.persisted[0].sequence, 2);
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn recording_session_rekey_user_keeps_higher_sequence() {
+    let base = unique_temp_dir("rekey_max");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let storage =
+        LocalChunkStorage::new(layout.for_meeting("g1", "vc1", "meeting-mx"), "meeting-mx");
+    let mut session = RecordingSession::new(
+        "meeting-mx".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(5),
+        },
+        48_000,
+    );
+
+    let start = Instant::now();
+
+    // Build up sequence 3 under the real user ID
+    for i in 0..3u64 {
+        session.ingest_frame(
+            "12345",
+            BufferedFrame {
+                timestamp_ms: i * 6_000,
+                pcm_16le_bytes: vec![0, 0],
+            },
+        );
+        session
+            .flush_due(start + Duration::from_secs((i + 1) * 6))
+            .expect("flush should succeed");
+    }
+
+    // Build up sequence 1 under SSRC fallback
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 20_000,
+            pcm_16le_bytes: vec![1, 0],
+        },
+    );
+    session
+        .flush_due(start + Duration::from_secs(25))
+        .expect("flush should succeed");
+
+    // Re-key: new_seq=3 > old_seq=1, so max keeps 3
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 30_000,
+            pcm_16le_bytes: vec![2, 0],
+        },
+    );
+    session.rekey_user("ssrc:100", "12345");
+
+    let result = session
+        .flush_due(start + Duration::from_secs(36))
+        .expect("flush should succeed");
+    assert_eq!(result.persisted.len(), 1);
+    assert_eq!(result.persisted[0].user_id, "12345");
+    // Should be 4 (max(3,1) + 1), not 2 (1 + 1)
+    assert_eq!(result.persisted[0].sequence, 4);
+
+    let _ = std::fs::remove_dir_all(base);
+}

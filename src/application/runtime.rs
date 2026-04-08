@@ -1037,6 +1037,12 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
+        // Reset SSRC tracker so stale mappings from previous recordings
+        // cannot mis-attribute audio when Discord reuses an SSRC value.
+        {
+            let mut tracker = self.ssrc_tracker.lock().await;
+            *tracker = SsrcTracker::new();
+        }
         // Insert session BEFORE joining VC so voice events aren't dropped
         {
             let mut sessions = self.sessions.lock().await;
@@ -1216,8 +1222,8 @@ impl ScaffoldHandler {
             let _ = manager.leave(guild_id).await;
         }
 
-        // Persist SSRC mapping after voice teardown so late
-        // SpeakingStateUpdate events are captured.
+        // Persist SSRC mapping after voice teardown so all events
+        // received up to disconnect are captured in the tracker.
         if let Some(session) = &removed_session {
             let tracker = self.ssrc_tracker.lock().await;
             session.persist_ssrc_mapping(&tracker);
@@ -2262,8 +2268,8 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             let mut states = runtime.auto_stop_states.lock().await;
                             states.remove(&guild_key);
                         }
-                        // Persist SSRC mapping after session removal so the
-                        // tracker captures any late SpeakingStateUpdate events.
+                        // Persist SSRC mapping after session removal so all
+                        // events received up to disconnect are captured.
                         if let Some(session) = &removed_session {
                             let tracker = runtime.ssrc_tracker.lock().await;
                             session.persist_ssrc_mapping(&tracker);
