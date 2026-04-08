@@ -68,7 +68,18 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 
 Claude 要約はこのワークスペースを作業ディレクトリとして起動し、トランスクリプトはプロンプトに直埋めせず `transcript/transcript_masked.md` を参照します（`transcript/manifest.json` でメタデータを共有）。
 
-### 4. ビルド
+### 4. Git Hooks (lefthook)
+
+[lefthook](https://github.com/evilmartians/lefthook) でコミット前にフォーマットと Lint を自動チェックします。
+
+```bash
+brew install lefthook   # macOS
+lefthook install
+```
+
+インストール後、`git commit` 時に `cargo fmt --check` と `cargo clippy` が、`git push` 時に `cargo test` が自動実行されます。
+
+### 5. ビルド
 
 ```bash
 cargo build --release
@@ -76,7 +87,7 @@ cargo build --release
 
 ビルド成果物は `target/release/discord-transcript` に生成されます。
 
-### 5. 起動
+### 6. 起動
 
 ```bash
 # 環境変数を設定済みの状態で
