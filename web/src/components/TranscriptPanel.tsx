@@ -10,7 +10,7 @@ interface Props {
 }
 
 export const TranscriptPanel = forwardRef<HTMLDivElement, Props>(
-  ({ segments, activeIndex, onSeek }, ref) => {
+  function TranscriptPanel({ segments, activeIndex, onSeek }, ref) {
     if (segments === null) {
       return (
         <div className="transcript-container" ref={ref}>

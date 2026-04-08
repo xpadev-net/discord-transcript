@@ -11,18 +11,11 @@ const SPEAKER_COLORS = [
   "var(--speaker-10)",
 ];
 
-const colorMap = new Map<string, string>();
-
 export function getSpeakerColor(speakerId: string): string {
-  const cached = colorMap.get(speakerId);
-  if (cached) return cached;
-
   let hash = 0;
   for (let i = 0; i < speakerId.length; i++) {
     hash = ((hash << 5) - hash) + speakerId.charCodeAt(i);
-    hash = hash & hash; // Convert to 32-bit integer
+    hash = hash & hash;
   }
-  const color = SPEAKER_COLORS[Math.abs(hash) % SPEAKER_COLORS.length];
-  colorMap.set(speakerId, color);
-  return color;
+  return SPEAKER_COLORS[Math.abs(hash) % SPEAKER_COLORS.length];
 }

@@ -5,7 +5,7 @@ interface AudioPlayerProps {
 }
 
 export const AudioPlayer = forwardRef<HTMLAudioElement, AudioPlayerProps>(
-  ({ src }, ref) => {
+  function AudioPlayer({ src }, ref) {
     return (
       <div className="audio-container">
         <audio ref={ref} controls preload="metadata">
