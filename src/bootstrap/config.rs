@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub discord_token: String,
     pub discord_guild_id: String,
@@ -19,6 +19,12 @@ pub struct AppConfig {
     pub integration_retry_backoff_multiplier: u32,
     pub integration_retry_max_delay_ms: u64,
     pub whisper_language: Option<String>,
+    pub whisper_beam_size: u32,
+    pub whisper_suppress_non_speech: bool,
+    pub whisper_prompt: Option<String>,
+    pub whisper_vad: bool,
+    pub whisper_temperature: f32,
+    pub whisper_resample_to_16k: bool,
     pub public_base_url: Option<String>,
     pub web_port: u16,
     pub web_bind_host: String,
@@ -78,6 +84,15 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_env_language("WHISPER_LANGUAGE")?,
+            whisper_beam_size: optional_env_parse_u32_nonzero("WHISPER_BEAM_SIZE")?.unwrap_or(5),
+            whisper_suppress_non_speech: optional_env_parse_bool(
+                "WHISPER_SUPPRESS_NON_SPEECH",
+                true,
+            )?,
+            whisper_prompt: optional_env("WHISPER_PROMPT"),
+            whisper_vad: optional_env_parse_bool("WHISPER_VAD", true)?,
+            whisper_temperature: optional_env_parse_f32("WHISPER_TEMPERATURE")?.unwrap_or(0.0),
+            whisper_resample_to_16k: optional_env_parse_bool("WHISPER_RESAMPLE_TO_16K", true)?,
             public_base_url: optional_env("PUBLIC_BASE_URL"),
             web_port: optional_env_parse_u16("WEB_PORT")?.unwrap_or(3000),
             web_bind_host: optional_env("WEB_BIND_HOST").unwrap_or_else(|| "127.0.0.1".to_owned()),
@@ -127,6 +142,22 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_from_map_language(values, "WHISPER_LANGUAGE")?,
+            whisper_beam_size: optional_from_map_parse_u32_nonzero(values, "WHISPER_BEAM_SIZE")?
+                .unwrap_or(5),
+            whisper_suppress_non_speech: optional_from_map_parse_bool(
+                values,
+                "WHISPER_SUPPRESS_NON_SPEECH",
+                true,
+            )?,
+            whisper_prompt: optional_from_map(values, "WHISPER_PROMPT"),
+            whisper_vad: optional_from_map_parse_bool(values, "WHISPER_VAD", true)?,
+            whisper_temperature: optional_from_map_parse_f32(values, "WHISPER_TEMPERATURE")?
+                .unwrap_or(0.0),
+            whisper_resample_to_16k: optional_from_map_parse_bool(
+                values,
+                "WHISPER_RESAMPLE_TO_16K",
+                true,
+            )?,
             public_base_url: optional_from_map(values, "PUBLIC_BASE_URL"),
             web_port: optional_from_map_parse_u16(values, "WEB_PORT")?.unwrap_or(3000),
             web_bind_host: optional_from_map(values, "WEB_BIND_HOST")
@@ -180,6 +211,20 @@ fn optional_env_parse_u32(key: &'static str) -> Result<Option<u32>, ConfigError>
         .map_err(|_| ConfigError::InvalidEnv { key, value })
 }
 
+fn optional_env_parse_u32_nonzero(key: &'static str) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u32>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
+}
+
 fn optional_env_parse_u64(key: &'static str) -> Result<Option<u64>, ConfigError> {
     let Some(value) = optional_env(key) else {
         return Ok(None);
@@ -215,6 +260,23 @@ fn optional_from_map_parse_u32(
         .parse::<u32>()
         .map(Some)
         .map_err(|_| ConfigError::InvalidEnv { key, value })
+}
+
+fn optional_from_map_parse_u32_nonzero(
+    values: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u32>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(Some(parsed))
 }
 
 fn optional_from_map_parse_u64(
@@ -276,6 +338,60 @@ fn optional_from_map_parse_u16(
         return Err(ConfigError::InvalidEnv { key, value });
     }
     Ok(Some(parsed))
+}
+
+fn parse_f32_unit_range(key: &'static str, value: String) -> Result<f32, ConfigError> {
+    let parsed = value.parse::<f32>().map_err(|_| ConfigError::InvalidEnv {
+        key,
+        value: value.clone(),
+    })?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err(ConfigError::InvalidEnv { key, value });
+    }
+    Ok(parsed)
+}
+
+fn optional_env_parse_f32(key: &'static str) -> Result<Option<f32>, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(None);
+    };
+    parse_f32_unit_range(key, value).map(Some)
+}
+
+fn optional_from_map_parse_f32(
+    values: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<f32>, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(None);
+    };
+    parse_f32_unit_range(key, value).map(Some)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Some(true),
+        "false" | "0" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn optional_env_parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(default);
+    };
+    parse_bool(&value).ok_or(ConfigError::InvalidEnv { key, value })
+}
+
+fn optional_from_map_parse_bool(
+    values: &HashMap<String, String>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(default);
+    };
+    parse_bool(&value).ok_or(ConfigError::InvalidEnv { key, value })
 }
 
 fn is_iso639_1_format(s: &str) -> bool {

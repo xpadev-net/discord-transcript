@@ -1,7 +1,7 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
-    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, build_summary_prompt,
-    run_transcription, write_transcript_files,
+    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, TranscriptionOutput,
+    build_summary_prompt, correct_transcript, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::{JobStatus, JobType, MeetingStatus};
@@ -113,6 +113,22 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
 
+    // Apply LLM-based error correction to the transcript before summarization.
+    let transcription = match correct_transcript(
+        claude,
+        &transcription.transcript_for_summary,
+        request.language.as_deref(),
+    ) {
+        Ok(corrected) => TranscriptionOutput {
+            transcript_for_summary: corrected,
+            ..transcription
+        },
+        Err(err) => {
+            warn!(meeting_id = %input.meeting_id, error = %err, "transcript correction failed, using original");
+            transcription
+        }
+    };
+
     store.set_meeting_status(
         &input.meeting_id,
         MeetingStatus::Summarizing,
@@ -202,14 +218,20 @@ fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryJobOptions {
+    pub max_retries: u32,
+    pub audio_base_dir: String,
+    pub language: Option<String>,
+    pub resample_to_16k: bool,
+}
+
 pub fn process_next_summary_job<S, Q, W, C>(
     store: &mut S,
     queue: &mut Q,
     whisper: &W,
     claude: &C,
-    max_retries: u32,
-    audio_base_dir: &str,
-    language: Option<String>,
+    options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
     S: MeetingStore,
@@ -229,7 +251,7 @@ where
             .ok_or_else(|| {
                 WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
             })?;
-        let layout = MeetingWorkspaceLayout::new(audio_base_dir);
+        let layout = MeetingWorkspaceLayout::new(&options.audio_base_dir);
         let workspace = layout.for_meeting(
             &meeting.guild_id,
             &meeting.voice_channel_id,
@@ -267,17 +289,17 @@ where
             }
         };
 
-        let mixdown_path =
-            merge_user_chunks_to_mixdown(&meeting_dir).map_err(WorkerError::Summary)?;
+        let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, options.resample_to_16k)
+            .map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
             audio_path: mixdown_path,
-            speaker_audio: build_speaker_audio_inputs(&meeting_dir)
+            speaker_audio: build_speaker_audio_inputs(&meeting_dir, options.resample_to_16k)
                 .map_err(WorkerError::Summary)?,
-            language: language.clone(),
+            language: options.language.clone(),
             workspace,
         };
         process_meeting_summary(store, whisper, claude, &input)
@@ -300,7 +322,7 @@ where
             }))
         }
         Err(err) => {
-            let status = queue.retry(&job.id, err.to_string(), max_retries)?;
+            let status = queue.retry(&job.id, err.to_string(), options.max_retries)?;
             if status == JobStatus::Failed {
                 store.set_meeting_status(&job.meeting_id, MeetingStatus::Failed, None)?;
                 store.set_error_message(&job.meeting_id, Some(err.to_string()))?;

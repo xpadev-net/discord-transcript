@@ -158,7 +158,10 @@ pub fn meeting_audio_path(
 type UserPcmChunk = (String, Vec<u8>);
 type SequenceGroup = (u64, Vec<UserPcmChunk>);
 
-pub fn merge_user_chunks_to_mixdown(audio_dir: &std::path::Path) -> Result<String, String> {
+pub fn merge_user_chunks_to_mixdown(
+    audio_dir: &std::path::Path,
+    resample_to_16k: bool,
+) -> Result<String, String> {
     use crate::audio::build_wav_bytes_raw;
 
     let mixdown_path = audio_dir.join("mixdown.wav");
@@ -208,7 +211,19 @@ pub fn merge_user_chunks_to_mixdown(audio_dir: &std::path::Path) -> Result<Strin
         }
     }
 
-    let wav_bytes = build_wav_bytes_raw(&all_pcm, sample_rate, 1, 16)
+    let (final_pcm, final_rate) = if resample_to_16k {
+        let (pcm, rate) = crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000);
+        if rate != 16_000 {
+            warn!(
+                sample_rate,
+                "mixdown resampling skipped: unsupported sample rate (expected 48000)"
+            );
+        }
+        (pcm, rate)
+    } else {
+        (all_pcm, sample_rate)
+    };
+    let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
         .map_err(|err| format!("failed to build mixdown WAV: {err}"))?;
     fs::write(&mixdown_path, &wav_bytes)
         .map_err(|err| format!("failed to write mixdown: {err}"))?;
@@ -447,6 +462,12 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         claude_command: config.claude_command.clone(),
         claude_model: config.claude_model.clone(),
         whisper_language: config.whisper_language.clone(),
+        whisper_beam_size: config.whisper_beam_size,
+        whisper_suppress_non_speech: config.whisper_suppress_non_speech,
+        whisper_prompt: config.whisper_prompt.clone(),
+        whisper_vad: config.whisper_vad,
+        whisper_temperature: config.whisper_temperature,
+        whisper_resample_to_16k: config.whisper_resample_to_16k,
         summary_max_retries: config.summary_max_retries,
         integration_retry_policy: RetryPolicy {
             max_attempts: config.integration_retry_max_attempts,
@@ -488,6 +509,12 @@ struct ScaffoldHandler {
     claude_command: String,
     claude_model: String,
     whisper_language: Option<String>,
+    whisper_beam_size: u32,
+    whisper_suppress_non_speech: bool,
+    whisper_prompt: Option<String>,
+    whisper_vad: bool,
+    whisper_temperature: f32,
+    whisper_resample_to_16k: bool,
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
@@ -776,7 +803,7 @@ impl ScaffoldHandler {
                 RecoveryEffect::SummaryRequeued { .. }
                 | RecoveryEffect::StopConfirmedClientDisconnect { .. } => {
                     // Merge per-user chunks into mixdown before ASR
-                    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir) {
+                    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir, self.whisper_resample_to_16k) {
                         warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
                         let _ = self.post_failure_for_meeting(
                             &ctx.http,
@@ -1448,6 +1475,11 @@ impl ScaffoldHandler {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
             retry_policy: self.integration_retry_policy,
+            beam_size: self.whisper_beam_size,
+            suppress_non_speech: self.whisper_suppress_non_speech,
+            prompt: self.whisper_prompt.clone(),
+            vad: self.whisper_vad,
+            temperature: self.whisper_temperature,
         };
         let claude = ClaudeCliSummaryClient {
             command_path: self.claude_command.clone(),
@@ -1513,45 +1545,46 @@ impl ScaffoldHandler {
             );
         }
 
-        let speaker_audio = match build_speaker_audio_inputs(&meeting_dir) {
-            Ok(value) => value,
-            Err(err) => {
-                let mut queue = self.queue.lock().await;
-                let retry_status =
-                    queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                drop(queue);
-                if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
-                    let mut service = self.service.lock().await;
-                    let _ = service.store.set_meeting_status(
-                        &claimed_job.meeting_id,
-                        MeetingStatus::Failed,
-                        None,
-                    );
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
-                    drop(service);
-                    if let Err(status_err) = self
-                        .update_status_message(
-                            http,
+        let speaker_audio =
+            match build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k) {
+                Ok(value) => value,
+                Err(err) => {
+                    let mut queue = self.queue.lock().await;
+                    let retry_status =
+                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
+                    drop(queue);
+                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                        let mut service = self.service.lock().await;
+                        let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
-                            StatusMessageUpdate::Failed {
-                                phase: "transcription_input",
-                                error: &err,
-                            },
-                        )
-                        .await
-                    {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %status_err,
-                            "failed to update status message after speaker audio error"
+                            MeetingStatus::Failed,
+                            None,
                         );
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                        drop(service);
+                        if let Err(status_err) = self
+                            .update_status_message(
+                                http,
+                                &claimed_job.meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: "transcription_input",
+                                    error: &err,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                meeting_id = %claimed_job.meeting_id,
+                                error = %status_err,
+                                "failed to update status message after speaker audio error"
+                            );
+                        }
                     }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
 
         let request = crate::application::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
@@ -1746,9 +1779,24 @@ impl ScaffoldHandler {
             }
         }
 
+        // Apply LLM-based error correction to the transcript.
+        let corrected_transcript = match tokio::task::block_in_place(|| {
+            crate::application::summary::correct_transcript(
+                &claude,
+                &summary_transcript,
+                self.whisper_language.as_deref(),
+            )
+        }) {
+            Ok(corrected) => corrected,
+            Err(err) => {
+                warn!(meeting_id = %claimed_job.meeting_id, error = %err, "transcript correction failed, using original");
+                summary_transcript
+            }
+        };
+
         // Phase 2: Summarization (mutex held only for status update)
         let transcription_for_summary = crate::application::summary::TranscriptionOutput {
-            transcript_for_summary: summary_transcript,
+            transcript_for_summary: corrected_transcript,
             masking_stats: summary_masking_stats,
             ..transcription.clone()
         };
@@ -2416,7 +2464,7 @@ async fn run_summary_background(
         );
     }
 
-    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir) {
+    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir, handler.whisper_resample_to_16k) {
         warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
         let _ = handler
             .post_failure_for_meeting(

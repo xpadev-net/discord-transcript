@@ -75,6 +75,12 @@ fn app_config_loads_from_map() {
     assert_eq!(config.integration_retry_backoff_multiplier, 2);
     assert_eq!(config.integration_retry_max_delay_ms, 5_000);
     assert_eq!(config.whisper_language, None);
+    assert_eq!(config.whisper_beam_size, 5);
+    assert!(config.whisper_suppress_non_speech);
+    assert_eq!(config.whisper_prompt, None);
+    assert!(config.whisper_vad);
+    assert_eq!(config.whisper_temperature, 0.0);
+    assert!(config.whisper_resample_to_16k);
 }
 
 #[test]
@@ -108,6 +114,90 @@ fn app_config_rejects_invalid_whisper_language() {
             value: "Japanese".to_owned()
         }
     );
+}
+
+#[test]
+fn app_config_accepts_whisper_beam_size() {
+    let mut values = base_env();
+    values.insert("WHISPER_BEAM_SIZE".to_owned(), "8".to_owned());
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.whisper_beam_size, 8);
+}
+
+#[test]
+fn app_config_rejects_invalid_whisper_beam_size() {
+    let mut values = base_env();
+    values.insert("WHISPER_BEAM_SIZE".to_owned(), "abc".to_owned());
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_BEAM_SIZE",
+            value: "abc".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_zero_whisper_beam_size() {
+    let mut values = base_env();
+    values.insert("WHISPER_BEAM_SIZE".to_owned(), "0".to_owned());
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_BEAM_SIZE",
+            value: "0".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_invalid_whisper_temperature() {
+    let mut values = base_env();
+    values.insert("WHISPER_TEMPERATURE".to_owned(), "1.5".to_owned());
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_TEMPERATURE",
+            value: "1.5".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_accepts_whisper_bool_flags() {
+    let mut values = base_env();
+    values.insert("WHISPER_SUPPRESS_NON_SPEECH".to_owned(), "0".to_owned());
+    values.insert("WHISPER_VAD".to_owned(), "no".to_owned());
+    values.insert("WHISPER_RESAMPLE_TO_16K".to_owned(), "yes".to_owned());
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert!(!config.whisper_suppress_non_speech);
+    assert!(!config.whisper_vad);
+    assert!(config.whisper_resample_to_16k);
+}
+
+#[test]
+fn app_config_rejects_invalid_whisper_bool() {
+    let mut values = base_env();
+    values.insert("WHISPER_VAD".to_owned(), "maybe".to_owned());
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "WHISPER_VAD",
+            value: "maybe".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_accepts_whisper_prompt() {
+    let mut values = base_env();
+    values.insert("WHISPER_PROMPT".to_owned(), "会議の文字起こし".to_owned());
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.whisper_prompt, Some("会議の文字起こし".to_owned()));
 }
 
 #[test]
