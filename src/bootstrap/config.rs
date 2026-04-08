@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub discord_token: String,
     pub discord_guild_id: String,
@@ -23,6 +23,7 @@ pub struct AppConfig {
     pub whisper_suppress_non_speech: bool,
     pub whisper_prompt: Option<String>,
     pub whisper_vad: bool,
+    pub whisper_temperature: f32,
     pub whisper_resample_to_16k: bool,
     pub public_base_url: Option<String>,
     pub web_port: u16,
@@ -90,6 +91,7 @@ impl AppConfig {
             )?,
             whisper_prompt: optional_env("WHISPER_PROMPT"),
             whisper_vad: optional_env_parse_bool("WHISPER_VAD", true)?,
+            whisper_temperature: optional_env_parse_f32("WHISPER_TEMPERATURE")?.unwrap_or(0.0),
             whisper_resample_to_16k: optional_env_parse_bool("WHISPER_RESAMPLE_TO_16K", true)?,
             public_base_url: optional_env("PUBLIC_BASE_URL"),
             web_port: optional_env_parse_u16("WEB_PORT")?.unwrap_or(3000),
@@ -149,6 +151,8 @@ impl AppConfig {
             )?,
             whisper_prompt: optional_from_map(values, "WHISPER_PROMPT"),
             whisper_vad: optional_from_map_parse_bool(values, "WHISPER_VAD", true)?,
+            whisper_temperature: optional_from_map_parse_f32(values, "WHISPER_TEMPERATURE")?
+                .unwrap_or(0.0),
             whisper_resample_to_16k: optional_from_map_parse_bool(
                 values,
                 "WHISPER_RESAMPLE_TO_16K",
@@ -305,10 +309,33 @@ fn optional_from_map_parse_u16(
     Ok(Some(parsed))
 }
 
+fn optional_env_parse_f32(key: &'static str) -> Result<Option<f32>, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(None);
+    };
+    value
+        .parse::<f32>()
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidEnv { key, value })
+}
+
+fn optional_from_map_parse_f32(
+    values: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<f32>, ConfigError> {
+    let Some(value) = optional_from_map(values, key) else {
+        return Ok(None);
+    };
+    value
+        .parse::<f32>()
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidEnv { key, value })
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Some(true),
+        "false" | "0" | "no" | "n" | "off" => Some(false),
         _ => None,
     }
 }

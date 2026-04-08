@@ -31,7 +31,7 @@ impl Display for IntegrationError {
 
 impl std::error::Error for IntegrationError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandWhisperClient {
     pub endpoint: String,
     pub curl_bin: String,
@@ -40,6 +40,7 @@ pub struct CommandWhisperClient {
     pub suppress_non_speech: bool,
     pub prompt: Option<String>,
     pub vad: bool,
+    pub temperature: f32,
 }
 
 impl WhisperClient for CommandWhisperClient {
@@ -68,11 +69,13 @@ impl WhisperClient for CommandWhisperClient {
                 cmd.arg("-F").arg("suppress_non_speech=true");
             }
             if let Some(p) = &self.prompt {
-                cmd.arg("-F").arg(format!("prompt={p}"));
+                cmd.arg("--form-string").arg(format!("prompt={p}"));
             }
             if self.vad {
                 cmd.arg("-F").arg("vad=true");
             }
+            cmd.arg("-F")
+                .arg(format!("temperature={}", self.temperature));
 
             let output = cmd
                 .output()

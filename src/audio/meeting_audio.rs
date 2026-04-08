@@ -1,6 +1,6 @@
 use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
-use crate::audio::wav::resample_pcm_16le;
+use crate::audio::wav::{normalize_rms_pcm_16le, resample_pcm_16le};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use std::collections::HashMap;
 use std::fs;
@@ -156,6 +156,10 @@ fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
     vec![0; samples.saturating_mul(2)]
 }
 
+/// Target RMS amplitude for per-speaker audio normalization.
+/// 3000 out of i16 max (32767) is a moderate level that avoids clipping.
+const NORMALIZE_TARGET_RMS: f64 = 3000.0;
+
 pub fn build_speaker_audio_inputs(
     meeting_dir: &Path,
     resample_to_16k: bool,
@@ -238,10 +242,11 @@ pub fn build_speaker_audio_inputs(
             current_ms = chunk.start_ms + chunk.duration_ms;
         }
 
+        let normalized_pcm = normalize_rms_pcm_16le(&pcm_out, NORMALIZE_TARGET_RMS);
         let (final_pcm, final_rate) = if resample_to_16k {
-            resample_pcm_16le(&pcm_out, sample_rate, 16_000)
+            resample_pcm_16le(&normalized_pcm, sample_rate, 16_000)
         } else {
-            (pcm_out, sample_rate)
+            (normalized_pcm, sample_rate)
         };
         let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
             .map_err(|err| format!("failed to build speaker wav for {user_id}: {err}"))?;

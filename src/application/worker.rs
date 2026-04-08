@@ -1,7 +1,7 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
-    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, build_summary_prompt,
-    run_transcription, write_transcript_files,
+    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, TranscriptionOutput,
+    build_summary_prompt, correct_transcript, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::{JobStatus, JobType, MeetingStatus};
@@ -110,6 +110,22 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
                 Some(MeetingStatus::Transcribing),
             );
             return Err(WorkerError::from(err));
+        }
+    };
+
+    // Apply LLM-based error correction to the transcript before summarization.
+    let transcription = match correct_transcript(
+        claude,
+        &transcription.transcript_for_summary,
+        request.language.as_deref(),
+    ) {
+        Ok(corrected) => TranscriptionOutput {
+            transcript_for_summary: corrected,
+            ..transcription
+        },
+        Err(err) => {
+            warn!(meeting_id = %input.meeting_id, error = %err, "transcript correction failed, using original");
+            transcription
         }
     };
 

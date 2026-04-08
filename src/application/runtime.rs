@@ -459,6 +459,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         whisper_suppress_non_speech: config.whisper_suppress_non_speech,
         whisper_prompt: config.whisper_prompt.clone(),
         whisper_vad: config.whisper_vad,
+        whisper_temperature: config.whisper_temperature,
         whisper_resample_to_16k: config.whisper_resample_to_16k,
         summary_max_retries: config.summary_max_retries,
         integration_retry_policy: RetryPolicy {
@@ -505,6 +506,7 @@ struct ScaffoldHandler {
     whisper_suppress_non_speech: bool,
     whisper_prompt: Option<String>,
     whisper_vad: bool,
+    whisper_temperature: f32,
     whisper_resample_to_16k: bool,
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
@@ -1470,6 +1472,7 @@ impl ScaffoldHandler {
             suppress_non_speech: self.whisper_suppress_non_speech,
             prompt: self.whisper_prompt.clone(),
             vad: self.whisper_vad,
+            temperature: self.whisper_temperature,
         };
         let claude = ClaudeCliSummaryClient {
             command_path: self.claude_command.clone(),
@@ -1769,9 +1772,24 @@ impl ScaffoldHandler {
             }
         }
 
+        // Apply LLM-based error correction to the transcript.
+        let corrected_transcript = match tokio::task::block_in_place(|| {
+            crate::application::summary::correct_transcript(
+                &claude,
+                &summary_transcript,
+                self.whisper_language.as_deref(),
+            )
+        }) {
+            Ok(corrected) => corrected,
+            Err(err) => {
+                warn!(meeting_id = %claimed_job.meeting_id, error = %err, "transcript correction failed, using original");
+                summary_transcript
+            }
+        };
+
         // Phase 2: Summarization (mutex held only for status update)
         let transcription_for_summary = crate::application::summary::TranscriptionOutput {
-            transcript_for_summary: summary_transcript,
+            transcript_for_summary: corrected_transcript,
             masking_stats: summary_masking_stats,
             ..transcription.clone()
         };

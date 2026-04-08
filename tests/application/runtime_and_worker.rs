@@ -79,6 +79,7 @@ fn app_config_loads_from_map() {
     assert!(config.whisper_suppress_non_speech);
     assert_eq!(config.whisper_prompt, None);
     assert!(config.whisper_vad);
+    assert_eq!(config.whisper_temperature, 0.0);
     assert!(config.whisper_resample_to_16k);
 }
 
@@ -140,9 +141,9 @@ fn app_config_rejects_invalid_whisper_beam_size() {
 #[test]
 fn app_config_accepts_whisper_bool_flags() {
     let mut values = base_env();
-    values.insert("WHISPER_SUPPRESS_NON_SPEECH".to_owned(), "false".to_owned());
-    values.insert("WHISPER_VAD".to_owned(), "FALSE".to_owned());
-    values.insert("WHISPER_RESAMPLE_TO_16K".to_owned(), "True".to_owned());
+    values.insert("WHISPER_SUPPRESS_NON_SPEECH".to_owned(), "0".to_owned());
+    values.insert("WHISPER_VAD".to_owned(), "no".to_owned());
+    values.insert("WHISPER_RESAMPLE_TO_16K".to_owned(), "yes".to_owned());
     let config = AppConfig::from_map(&values).expect("config should load");
     assert!(!config.whisper_suppress_non_speech);
     assert!(!config.whisper_vad);
@@ -152,13 +153,13 @@ fn app_config_accepts_whisper_bool_flags() {
 #[test]
 fn app_config_rejects_invalid_whisper_bool() {
     let mut values = base_env();
-    values.insert("WHISPER_VAD".to_owned(), "yes".to_owned());
+    values.insert("WHISPER_VAD".to_owned(), "maybe".to_owned());
     let err = AppConfig::from_map(&values).expect_err("config should fail");
     assert_eq!(
         err,
         ConfigError::InvalidEnv {
             key: "WHISPER_VAD",
-            value: "yes".to_owned()
+            value: "maybe".to_owned()
         }
     );
 }

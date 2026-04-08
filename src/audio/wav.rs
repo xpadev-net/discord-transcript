@@ -62,12 +62,13 @@ pub fn build_wav_bytes_raw(
 /// supported for the given rate pair (only 48kHz→16kHz is implemented),
 /// the input is returned unchanged with the original rate.
 pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>, u32) {
-    if from_rate == to_rate || input.len() < 2 {
+    // Need at least one complete i16 sample (2 bytes) and different rates.
+    if input.len() < 4 || from_rate == to_rate {
         return (input.to_vec(), from_rate);
     }
 
-    // Only support 3:1 decimation (48kHz → 16kHz).
-    if from_rate != 3 * to_rate {
+    // Only support 48kHz → 16kHz. The FIR coefficients are tuned for this pair.
+    if from_rate != 48_000 || to_rate != 16_000 {
         return (input.to_vec(), from_rate);
     }
 
@@ -82,7 +83,7 @@ pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>
         .collect();
 
     // Generate Blackman-windowed sinc low-pass FIR filter coefficients.
-    // Cutoff at 7500 Hz for 48 kHz input (Nyquist of 16 kHz output is 8 kHz).
+    // Cutoff at 7500 Hz (Nyquist of 16 kHz output is 8 kHz, with transition band).
     let coeffs = lowpass_fir_coefficients(RESAMPLE_FIR_TAPS, 7500.0, from_rate as f64);
 
     // Apply FIR filter and decimate by 3.
@@ -107,6 +108,42 @@ pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>
     }
 
     (output, to_rate)
+}
+
+/// Normalize 16-bit PCM audio to a target RMS level.
+///
+/// `target_rms` is the desired RMS amplitude (e.g. 3000.0 for moderate volume).
+/// Returns the input unchanged if it is too short or effectively silent.
+pub fn normalize_rms_pcm_16le(input: &[u8], target_rms: f64) -> Vec<u8> {
+    let sample_count = input.len() / 2;
+    if sample_count == 0 {
+        return input.to_vec();
+    }
+
+    // Calculate current RMS.
+    let mut sum_sq = 0.0f64;
+    for i in 0..sample_count {
+        let sample = i16::from_le_bytes([input[i * 2], input[i * 2 + 1]]) as f64;
+        sum_sq += sample * sample;
+    }
+    let current_rms = (sum_sq / sample_count as f64).sqrt();
+
+    // Skip normalization if audio is effectively silent (RMS < 1).
+    if current_rms < 1.0 {
+        return input.to_vec();
+    }
+
+    let gain = target_rms / current_rms;
+
+    let mut output = Vec::with_capacity(input.len());
+    for i in 0..sample_count {
+        let sample = i16::from_le_bytes([input[i * 2], input[i * 2 + 1]]) as f64;
+        let normalized = (sample * gain)
+            .round()
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        output.extend_from_slice(&normalized.to_le_bytes());
+    }
+    output
 }
 
 const RESAMPLE_FIR_TAPS: usize = 45;

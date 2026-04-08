@@ -268,3 +268,40 @@ fn build_transcription_output(
         masking_stats: masked.stats,
     })
 }
+
+/// Apply LLM-based Generative Error Correction to the transcript text.
+///
+/// This step corrects misrecognized kanji, adds proper punctuation, and
+/// normalizes numbers in the Whisper output using Claude.
+pub fn correct_transcript<C: ClaudeSummaryClient>(
+    claude: &C,
+    transcript: &str,
+    language: Option<&str>,
+) -> Result<String, SummaryError> {
+    if transcript.trim().is_empty() {
+        return Ok(transcript.to_owned());
+    }
+
+    let lang_hint = language.unwrap_or("ja");
+    let prompt = format!(
+        "You are a speech-recognition error corrector.\n\
+\n\
+Below is an ASR (automatic speech recognition) transcript. Each line has the format:\n\
+[start_ms-end_ms] Speaker: text\n\
+\n\
+Fix recognition errors in the **text** portion of each line while keeping the \
+timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
+- Fix misrecognized kanji/characters (e.g. homophone errors)\n\
+- Add or fix punctuation (。、！？) where appropriate for {lang_hint}\n\
+- Normalize spoken numbers to digits (e.g. 「ひゃくにじゅうさん」→「123」)\n\
+- Do NOT change speaker names, timestamps, or line structure\n\
+- Do NOT add, remove, or reorder lines\n\
+- Do NOT add commentary or explanation\n\
+- Output ONLY the corrected transcript, nothing else\n\
+\n\
+Transcript:\n\
+{transcript}"
+    );
+
+    claude.summarize(&prompt, None)
+}
