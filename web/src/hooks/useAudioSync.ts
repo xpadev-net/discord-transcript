@@ -18,6 +18,8 @@ export function useAudioSync(
     if (!segments || segments.length === 0) {
       setActiveIndex(-1);
       prevIndexRef.current = -1;
+      userScrolledRef.current = false;
+      if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
     }
   }, [segments]);
 

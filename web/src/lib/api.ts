@@ -7,7 +7,7 @@ function basePath(meetingId: string): string {
 function handleResponse(response: Response): Promise<unknown> {
   if (response.status === 401) {
     window.location.href = `/auth/login?redirect=${encodeURIComponent(window.location.pathname + window.location.search + window.location.hash)}`;
-    return Promise.reject(new Error("Unauthorized"));
+    return new Promise(() => {});
   }
   if (!response.ok) {
     return Promise.reject(new Error(`${response.status} ${response.statusText}`));
