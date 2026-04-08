@@ -52,3 +52,29 @@ fn ssrc_tracker_maps_ssrc_to_user_id() {
     assert_eq!(tracker.resolve_user(1234), Some("5678"));
     assert_eq!(tracker.resolve_user(9999), None);
 }
+
+#[test]
+fn ssrc_tracker_parse_ssrc_fallback() {
+    // In-memory format with colon
+    assert_eq!(SsrcTracker::parse_ssrc_fallback("ssrc:13829"), Some(13829));
+    // Sanitized on-disk format without colon
+    assert_eq!(SsrcTracker::parse_ssrc_fallback("ssrc13829"), Some(13829));
+    // Regular user IDs should return None
+    assert_eq!(SsrcTracker::parse_ssrc_fallback("123456789"), None);
+    assert_eq!(SsrcTracker::parse_ssrc_fallback(""), None);
+    // Non-numeric suffix
+    assert_eq!(SsrcTracker::parse_ssrc_fallback("ssrc:abc"), None);
+}
+
+#[test]
+fn ssrc_tracker_serde_round_trip() {
+    let mut tracker = SsrcTracker::new();
+    tracker.update_mapping(1234, 5678);
+    tracker.update_mapping(9999, 1111);
+
+    let json = serde_json::to_vec(&tracker).expect("serialize");
+    let restored: SsrcTracker = serde_json::from_slice(&json).expect("deserialize");
+    assert_eq!(tracker, restored);
+    assert_eq!(restored.resolve_user(1234), Some("5678"));
+    assert_eq!(restored.all_mappings().len(), 2);
+}

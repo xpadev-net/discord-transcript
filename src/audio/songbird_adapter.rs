@@ -2,7 +2,7 @@ use crate::audio::receiver::BufferedFrame;
 use songbird::events::context_data::VoiceTick;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SsrcTracker {
     ssrc_to_user: HashMap<u32, String>,
 }
@@ -20,6 +20,42 @@ impl SsrcTracker {
 
     pub fn resolve_user(&self, ssrc: u32) -> Option<&str> {
         self.ssrc_to_user.get(&ssrc).map(String::as_str)
+    }
+
+    pub fn all_mappings(&self) -> &HashMap<u32, String> {
+        &self.ssrc_to_user
+    }
+
+    /// Parse an SSRC-based fallback speaker ID.
+    /// Handles both `"ssrc:13829"` (in-memory format) and
+    /// `"ssrc13829"` (sanitized on-disk format).
+    pub fn parse_ssrc_fallback(speaker_id: &str) -> Option<u32> {
+        speaker_id
+            .strip_prefix("ssrc:")
+            .or_else(|| speaker_id.strip_prefix("ssrc"))
+            .and_then(|n| n.parse::<u32>().ok())
+    }
+
+    /// Canonical fallback key for an unresolved SSRC.
+    pub fn fallback_key(ssrc: u32) -> String {
+        format!("ssrc:{ssrc}")
+    }
+
+    /// Return a new tracker containing only mappings whose user_id appears
+    /// in the given set.
+    pub fn filtered_by_users<'a>(
+        &self,
+        user_ids: impl IntoIterator<Item = &'a str>,
+    ) -> SsrcTracker {
+        let set: std::collections::HashSet<&str> = user_ids.into_iter().collect();
+        SsrcTracker {
+            ssrc_to_user: self
+                .ssrc_to_user
+                .iter()
+                .filter(|(_, uid)| set.contains(uid.as_str()))
+                .map(|(ssrc, uid)| (*ssrc, uid.clone()))
+                .collect(),
+        }
     }
 }
 
@@ -50,7 +86,7 @@ pub fn adapt_voice_tick(
         let user_id = tracker
             .resolve_user(*ssrc)
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("ssrc:{ssrc}"));
+            .unwrap_or_else(|| SsrcTracker::fallback_key(*ssrc));
         let mono = stereo_to_mono(decoded);
         per_user.insert(
             user_id,

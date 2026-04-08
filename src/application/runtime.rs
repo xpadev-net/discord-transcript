@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
@@ -643,7 +643,7 @@ impl EventHandler for ScaffoldHandler {
                     return;
                 }
                 // Flush remaining audio before stopping
-                {
+                let removed_session = {
                     let mut sessions = handler.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&guild_for_task) {
                         match session.flush_all() {
@@ -656,14 +656,18 @@ impl EventHandler for ScaffoldHandler {
                             _ => {}
                         }
                     }
-                    sessions.remove(&guild_for_task);
-                }
+                    sessions.remove(&guild_for_task)
+                };
                 {
                     let mut states = handler.auto_stop_states.lock().await;
                     states.remove(&guild_for_task);
                 }
                 if let Some(manager) = songbird::get(&ctx_for_task).await {
                     let _ = manager.leave(handler.guild_id).await;
+                }
+                if let Some(session) = &removed_session {
+                    let tracker = handler.ssrc_tracker.lock().await;
+                    session.persist_ssrc_mapping(&tracker);
                 }
                 let stop_result = {
                     let mut service = handler.service.lock().await;
@@ -1033,6 +1037,12 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
+        // Reset SSRC tracker so stale mappings from previous recordings
+        // cannot mis-attribute audio when Discord reuses an SSRC value.
+        {
+            let mut tracker = self.ssrc_tracker.lock().await;
+            *tracker = SsrcTracker::new();
+        }
         // Insert session BEFORE joining VC so voice events aren't dropped
         {
             let mut sessions = self.sessions.lock().await;
@@ -1188,7 +1198,7 @@ impl ScaffoldHandler {
         let guild_key = guild_id.get().to_string();
 
         // Flush remaining audio before stopping
-        {
+        let removed_session = {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&guild_key) {
                 match session.flush_all() {
@@ -1201,8 +1211,8 @@ impl ScaffoldHandler {
                     _ => {}
                 }
             }
-            sessions.remove(&guild_key);
-        }
+            sessions.remove(&guild_key)
+        };
         {
             let mut states = self.auto_stop_states.lock().await;
             states.remove(&guild_key);
@@ -1210,6 +1220,13 @@ impl ScaffoldHandler {
 
         if let Some(manager) = songbird::get(ctx).await {
             let _ = manager.leave(guild_id).await;
+        }
+
+        // Persist SSRC mapping after voice teardown so all events
+        // received up to disconnect are captured in the tracker.
+        if let Some(session) = &removed_session {
+            let tracker = self.ssrc_tracker.lock().await;
+            session.persist_ssrc_mapping(&tracker);
         }
 
         let stop_result = {
@@ -2001,12 +2018,20 @@ impl ScaffoldHandler {
             let user_id_u64 = match speaker_id.parse::<u64>() {
                 Ok(value) => value,
                 Err(err) => {
-                    warn!(
-                        meeting_id = %meeting_id,
-                        speaker_id = %speaker_id,
-                        error = %err,
-                        "failed to parse speaker_id while resolving speakers"
-                    );
+                    if SsrcTracker::parse_ssrc_fallback(&speaker_id).is_some() {
+                        debug!(
+                            meeting_id = %meeting_id,
+                            speaker_id = %speaker_id,
+                            "skipping SSRC-based speaker (mapping was unavailable)"
+                        );
+                    } else {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            speaker_id = %speaker_id,
+                            error = %err,
+                            "failed to parse speaker_id while resolving speakers"
+                        );
+                    }
                     continue;
                 }
             };
@@ -2151,7 +2176,24 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                 if let Some(user_id) = evt.user_id {
                     let mut tracker = self.tracker.lock().await;
                     let user_id_u64 = user_id.0;
+                    let user_id_str = user_id_u64.to_string();
                     tracker.update_mapping(evt.ssrc, user_id_u64);
+                    drop(tracker);
+
+                    // Re-key any in-memory frames buffered under the SSRC fallback ID
+                    let ssrc_key = SsrcTracker::fallback_key(evt.ssrc);
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&self.guild_id) {
+                        let moved = session.rekey_user(&ssrc_key, &user_id_str);
+                        if moved > 0 {
+                            info!(
+                                ssrc = evt.ssrc,
+                                user_id = user_id_u64,
+                                frames_moved = moved,
+                                "re-keyed in-memory audio frames from SSRC fallback to user ID"
+                            );
+                        }
+                    }
                 }
             }
             EventContext::VoiceTick(tick) => {
@@ -2207,7 +2249,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             return;
                         }
                         // Flush remaining audio and clean up session
-                        {
+                        let removed_session = {
                             let mut sessions = runtime.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&guild_key) {
                                 match session.flush_all() {
@@ -2220,11 +2262,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     _ => {}
                                 }
                             }
-                            sessions.remove(&guild_key);
-                        }
+                            sessions.remove(&guild_key)
+                        };
                         {
                             let mut states = runtime.auto_stop_states.lock().await;
                             states.remove(&guild_key);
+                        }
+                        // Persist SSRC mapping after session removal so all
+                        // events received up to disconnect are captured.
+                        if let Some(session) = &removed_session {
+                            let tracker = runtime.ssrc_tracker.lock().await;
+                            session.persist_ssrc_mapping(&tracker);
                         }
                         let stop_result = {
                             let mut service = runtime.service.lock().await;

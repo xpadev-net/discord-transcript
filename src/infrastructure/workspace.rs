@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub const WORKSPACES_ROOT_DIR: &str = "workspaces";
 pub const MASKED_TRANSCRIPT_FILENAME: &str = "transcript_masked.md";
 pub const TRANSCRIPT_MANIFEST_FILENAME: &str = "manifest.json";
+pub const SSRC_MAPPING_FILENAME: &str = "ssrc_mapping.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspaceLayout {
@@ -80,6 +81,10 @@ impl MeetingWorkspacePaths {
 
     pub fn transcript_manifest_path(&self) -> PathBuf {
         self.transcript_dir().join(TRANSCRIPT_MANIFEST_FILENAME)
+    }
+
+    pub fn ssrc_mapping_path(&self) -> PathBuf {
+        self.audio_dir().join(SSRC_MAPPING_FILENAME)
     }
 
     pub fn ensure_base_dirs(&self) -> std::io::Result<()> {
