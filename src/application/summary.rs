@@ -237,11 +237,13 @@ Meeting ID: {}\n\
 Guild ID: {}\n\
 Voice channel ID: {}\n\
 Meeting title: {}\n\
-Language hint: {}\n\
+Whisper language (ISO 639-1, speech-recognition setting): {}\n\
 Masking stats: mentions={}, emails={}, phones={}\n\
 \n\
 Instructions:\n\
 - Read the transcript file to produce the summary; do not expect transcript text inline.\n\
+- Output language: Write the **entire** markdown output in the **same language** as the Whisper setting above (this matches how the transcript was transcribed). That includes all section headings, paragraphs, and list items. Examples: if the setting is `ja`, use Japanese throughout; if `en`, English throughout; if `de`, German throughout.\n\
+- If the Whisper language is shown as `unknown or auto-detected`, infer the output language from the dominant language of the transcript text.\n\
 - Keep the summary concise and actionable without leaking placeholder tokens.\n",
         request.meeting_id,
         request.guild_id,
