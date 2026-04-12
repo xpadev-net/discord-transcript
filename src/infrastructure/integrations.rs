@@ -238,12 +238,15 @@ fn summarize_cursor_argv(
     workdir: Option<&Path>,
 ) -> Result<String, SummaryError> {
     let mut command = Command::new(&client.command_path);
-    command.arg("-p").arg("--output-format").arg("text");
+    command
+        .arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("text");
     if !client.model.trim().is_empty() {
         command.arg("--model").arg(&client.model);
     }
     command
-        .arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

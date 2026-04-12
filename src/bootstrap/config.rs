@@ -268,7 +268,11 @@ fn resolve_summary_settings(
         });
     };
 
-    let mut model = summary_model.or(claude_model).unwrap_or_default();
+    let mut model = if harness == SummaryHarness::OpenCode {
+        summary_model.unwrap_or_default()
+    } else {
+        summary_model.or(claude_model).unwrap_or_default()
+    };
     if model.trim().is_empty() {
         model = match harness {
             SummaryHarness::Claude => "haiku".to_owned(),

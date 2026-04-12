@@ -27,6 +27,7 @@ services:
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
     volumes:
       - ${HOME}/.claude:/home/app/.claude
+      # OpenCode (auth.json under ~/.local/share/opencode) and Cursor CLI (~/.cursor)
       - ${HOME}/.local/share/opencode:/home/app/.local/share/opencode
       - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks

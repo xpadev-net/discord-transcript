@@ -122,6 +122,17 @@ fn app_config_opencode_requires_summary_model() {
 }
 
 #[test]
+fn app_config_opencode_does_not_fall_back_to_claude_model() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "opencode".to_owned());
+    values.insert("SUMMARY_COMMAND".to_owned(), "opencode".to_owned());
+    values.insert("CLAUDE_MODEL".to_owned(), "haiku".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(err, ConfigError::MissingEnv { key: "SUMMARY_MODEL" });
+}
+
+#[test]
 fn app_config_opencode_loads_with_model() {
     let mut values = base_env();
     values.insert("SUMMARY_HARNESS".to_owned(), "opencode".to_owned());
