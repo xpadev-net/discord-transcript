@@ -9,11 +9,11 @@ use crate::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::RecordingSession;
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
-use crate::bootstrap::config::AppConfig;
+use crate::bootstrap::config::{AppConfig, SummaryHarness};
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::{MeetingStatus, StopReason};
-use crate::infrastructure::integrations::{ClaudeCliSummaryClient, CommandWhisperClient};
+use crate::infrastructure::integrations::{CommandWhisperClient, HarnessCliSummaryClient};
 use crate::infrastructure::queue::JobQueue;
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
@@ -459,8 +459,9 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
-        claude_command: config.claude_command.clone(),
-        claude_model: config.claude_model.clone(),
+        summary_harness: config.summary_harness,
+        summary_command: config.summary_command.clone(),
+        summary_model: config.summary_model.clone(),
         whisper_language: config.whisper_language.clone(),
         whisper_beam_size: config.whisper_beam_size,
         whisper_suppress_non_speech: config.whisper_suppress_non_speech,
@@ -506,8 +507,9 @@ struct ScaffoldHandler {
     chunk_storage_dir: String,
     auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
-    claude_command: String,
-    claude_model: String,
+    summary_harness: SummaryHarness,
+    summary_command: String,
+    summary_model: String,
     whisper_language: Option<String>,
     whisper_beam_size: u32,
     whisper_suppress_non_speech: bool,
@@ -1498,9 +1500,10 @@ impl ScaffoldHandler {
             vad: self.whisper_vad,
             temperature: self.whisper_temperature,
         };
-        let claude = ClaudeCliSummaryClient {
-            command_path: self.claude_command.clone(),
-            model: self.claude_model.clone(),
+        let summary_client = HarnessCliSummaryClient {
+            harness: self.summary_harness,
+            command_path: self.summary_command.clone(),
+            model: self.summary_model.clone(),
             retry_policy: self.integration_retry_policy,
         };
         let job_id = format!("summary-{meeting_id}");
@@ -1796,18 +1799,28 @@ impl ScaffoldHandler {
             }
         }
 
-        // Apply LLM-based error correction to the transcript.
-        let corrected_transcript = match tokio::task::block_in_place(|| {
-            crate::application::summary::correct_transcript(
-                &claude,
-                &summary_transcript,
-                self.whisper_language.as_deref(),
-            )
-        }) {
-            Ok(corrected) => corrected,
-            Err(err) => {
-                warn!(meeting_id = %claimed_job.meeting_id, error = %err, "transcript correction failed, using original");
-                summary_transcript
+        // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
+        // argv-based OpenCode / Cursor would pass the full transcript on the command line.
+        let corrected_transcript = if !summary_client.can_run_llm_transcript_correction() {
+            info!(
+                meeting_id = %claimed_job.meeting_id,
+                harness = %self.summary_harness,
+                "skipping LLM transcript correction (not supported for argv-based summary harness)"
+            );
+            summary_transcript
+        } else {
+            match tokio::task::block_in_place(|| {
+                crate::application::summary::correct_transcript(
+                    &summary_client,
+                    &summary_transcript,
+                    self.whisper_language.as_deref(),
+                )
+            }) {
+                Ok(corrected) => corrected,
+                Err(err) => {
+                    warn!(meeting_id = %claimed_job.meeting_id, error = %err, "transcript correction failed, using original");
+                    summary_transcript
+                }
             }
         };
 
@@ -1855,7 +1868,7 @@ impl ScaffoldHandler {
                 &transcription_for_summary,
             )?;
             let prompt = crate::application::summary::build_summary_prompt(&request, &manifest);
-            claude.summarize(&prompt, Some(request.workspace.root()))
+            summary_client.summarize(&prompt, Some(request.workspace.root()))
         });
         let markdown = match markdown {
             Ok(m) => m,

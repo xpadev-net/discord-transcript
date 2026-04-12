@@ -4,7 +4,7 @@ use discord_transcript::application::bot::{
 use discord_transcript::application::command::PermissionSet;
 use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::application::worker::{ProcessMeetingInput, process_meeting_summary};
-use discord_transcript::bootstrap::config::{AppConfig, ConfigError};
+use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::infrastructure::asr::StubWhisperClient;
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
@@ -63,8 +63,9 @@ fn app_config_loads_from_map() {
     assert_eq!(config.discord_token, "token");
     assert_eq!(config.discord_guild_id, "guild");
     assert_eq!(config.whisper_endpoint, "http://whisper");
-    assert_eq!(config.claude_command, "claude");
-    assert_eq!(config.claude_model, "haiku");
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "claude");
+    assert_eq!(config.summary_model, "haiku");
     assert_eq!(config.database_url, "postgres://localhost/db");
     assert_eq!(config.database_ssl_mode, "disable");
     assert_eq!(config.chunk_storage_dir, "/tmp/chunks");
@@ -98,7 +99,65 @@ fn app_config_accepts_claude_model_override() {
     values.insert("CLAUDE_MODEL".to_owned(), "sonnet".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
-    assert_eq!(config.claude_model, "sonnet");
+    assert_eq!(config.summary_model, "sonnet");
+}
+
+#[test]
+fn app_config_summary_command_overrides_claude_path() {
+    let mut values = base_env();
+    values.insert("SUMMARY_COMMAND".to_owned(), "/opt/bin/claude".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_command, "/opt/bin/claude");
+}
+
+#[test]
+fn app_config_opencode_requires_summary_model() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "opencode".to_owned());
+    values.insert("SUMMARY_COMMAND".to_owned(), "opencode".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(err, ConfigError::MissingEnv { key: "SUMMARY_MODEL" });
+}
+
+#[test]
+fn app_config_opencode_loads_with_model() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "opencode".to_owned());
+    values.insert("SUMMARY_COMMAND".to_owned(), "opencode".to_owned());
+    values.insert(
+        "SUMMARY_MODEL".to_owned(),
+        "anthropic/claude-3-5-haiku-20241022".to_owned(),
+    );
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_harness, SummaryHarness::OpenCode);
+    assert_eq!(config.summary_model, "anthropic/claude-3-5-haiku-20241022");
+}
+
+#[test]
+fn app_config_rejects_invalid_summary_harness() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "unknown".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "SUMMARY_HARNESS",
+            value: "unknown".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_cursor_agent_requires_summary_command_even_if_claude_set() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "cursor_agent".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(err, ConfigError::MissingEnv { key: "SUMMARY_COMMAND" });
 }
 
 #[test]

@@ -13,6 +13,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@127.0.0.1/discord_transcript
+      # Default: Claude CLI. Use SUMMARY_HARNESS / SUMMARY_COMMAND / SUMMARY_MODEL for Cursor or OpenCode.
       CLAUDE_COMMAND: claude
       CLAUDE_MODEL: ${CLAUDE_MODEL:-haiku}
       CHUNK_STORAGE_DIR: /data/chunks
@@ -26,6 +27,8 @@ services:
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
     volumes:
       - ${HOME}/.claude:/home/app/.claude
+      - ${HOME}/.local/share/opencode:/home/app/.local/share/opencode
+      - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks
     restart: unless-stopped
 
