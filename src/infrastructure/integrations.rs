@@ -1,4 +1,5 @@
 use crate::application::summary::{ClaudeSummaryClient, SummaryError};
+use crate::bootstrap::config::SummaryHarness;
 use crate::infrastructure::asr::{
     WhisperClient, WhisperInferenceRequest, WhisperParseError, WhisperTranscriptionResult,
     parse_whisper_response,
@@ -96,7 +97,8 @@ impl WhisperClient for CommandWhisperClient {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeCliSummaryClient {
+pub struct HarnessCliSummaryClient {
+    pub harness: SummaryHarness,
     pub command_path: String,
     pub model: String,
     pub retry_policy: RetryPolicy,
@@ -127,59 +129,141 @@ fn sanitize_output(raw: &[u8]) -> String {
     truncated
 }
 
-impl ClaudeSummaryClient for ClaudeCliSummaryClient {
+impl ClaudeSummaryClient for HarnessCliSummaryClient {
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
-        retry_with_backoff(self.retry_policy, |_| {
-            use std::io::Write;
-            let mut command = Command::new(&self.command_path);
-            command
-                .arg("--model")
-                .arg(&self.model)
-                .arg("-p")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            if let Some(dir) = workdir {
-                command.current_dir(dir);
-            }
-            let mut child = command
-                .spawn()
-                .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
-
-            match child.stdin.take() {
-                Some(mut stdin) => {
-                    if let Err(err) = stdin.write_all(prompt.as_bytes()) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(SummaryError::SummaryEngine(err.to_string()));
-                    }
-                    // Drop stdin to close the pipe before waiting for output
-                    drop(stdin);
-                }
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(SummaryError::SummaryEngine(
-                        "stdin pipe unexpectedly unavailable".to_owned(),
-                    ));
-                }
-            }
-
-            let output = child
-                .wait_with_output()
-                .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
-
-            if !output.status.success() {
-                return Err(SummaryError::SummaryEngine(format!(
-                    "claude command failed: status={:?}, stderr={}, stdout={}",
-                    output.status.code(),
-                    sanitize_output(&output.stderr),
-                    sanitize_output(&output.stdout)
-                )));
-            }
-
-            String::from_utf8(output.stdout)
-                .map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+        retry_with_backoff(self.retry_policy, |_| match self.harness {
+            SummaryHarness::Claude => summarize_claude_stdin(self, prompt, workdir),
+            SummaryHarness::OpenCode => summarize_opencode_argv(self, prompt, workdir),
+            SummaryHarness::CursorAgent => summarize_cursor_argv(self, prompt, workdir),
         })
     }
+}
+
+fn summarize_claude_stdin(
+    client: &HarnessCliSummaryClient,
+    prompt: &str,
+    workdir: Option<&Path>,
+) -> Result<String, SummaryError> {
+    use std::io::Write;
+    let mut command = Command::new(&client.command_path);
+    command
+        .arg("--model")
+        .arg(&client.model)
+        .arg("-p")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = workdir {
+        command.current_dir(dir);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+
+    match child.stdin.take() {
+        Some(mut stdin) => {
+            if let Err(err) = stdin.write_all(prompt.as_bytes()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SummaryError::SummaryEngine(err.to_string()));
+            }
+            drop(stdin);
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SummaryError::SummaryEngine(
+                "stdin pipe unexpectedly unavailable".to_owned(),
+            ));
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+
+    if !output.status.success() {
+        return Err(summary_command_failed(
+            client.harness,
+            &output.status,
+            &output.stderr,
+            &output.stdout,
+        ));
+    }
+
+    String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+}
+
+fn summarize_opencode_argv(
+    client: &HarnessCliSummaryClient,
+    prompt: &str,
+    workdir: Option<&Path>,
+) -> Result<String, SummaryError> {
+    let mut command = Command::new(&client.command_path);
+    command
+        .arg("run")
+        .arg("--model")
+        .arg(&client.model)
+        .arg(prompt)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = workdir {
+        command.current_dir(dir);
+    }
+    let output = command
+        .output()
+        .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+    if !output.status.success() {
+        return Err(summary_command_failed(
+            client.harness,
+            &output.status,
+            &output.stderr,
+            &output.stdout,
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+}
+
+fn summarize_cursor_argv(
+    client: &HarnessCliSummaryClient,
+    prompt: &str,
+    workdir: Option<&Path>,
+) -> Result<String, SummaryError> {
+    let mut command = Command::new(&client.command_path);
+    command.arg("-p").arg("--output-format").arg("text");
+    if !client.model.trim().is_empty() {
+        command.arg("--model").arg(&client.model);
+    }
+    command
+        .arg(prompt)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = workdir {
+        command.current_dir(dir);
+    }
+    let output = command
+        .output()
+        .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+    if !output.status.success() {
+        return Err(summary_command_failed(
+            client.harness,
+            &output.status,
+            &output.stderr,
+            &output.stdout,
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+}
+
+fn summary_command_failed(
+    harness: SummaryHarness,
+    status: &std::process::ExitStatus,
+    stderr: &[u8],
+    stdout: &[u8],
+) -> SummaryError {
+    SummaryError::SummaryEngine(format!(
+        "summary command failed (harness={harness}): status={status:?}, stderr={}, stdout={}",
+        sanitize_output(stderr),
+        sanitize_output(stdout)
+    ))
 }

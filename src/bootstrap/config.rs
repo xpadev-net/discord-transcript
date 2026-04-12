@@ -2,13 +2,51 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
 
+/// Which CLI drives meeting summary and transcript correction (`summarize` integration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryHarness {
+    Claude,
+    CursorAgent,
+    OpenCode,
+}
+
+impl SummaryHarness {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let key = "SUMMARY_HARNESS";
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "claude" => Ok(Self::Claude),
+            "cursor_agent" => Ok(Self::CursorAgent),
+            "opencode" => Ok(Self::OpenCode),
+            _ => Err(ConfigError::InvalidEnv {
+                key,
+                value: raw.to_owned(),
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::CursorAgent => "cursor_agent",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+impl Display for SummaryHarness {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub discord_token: String,
     pub discord_guild_id: String,
     pub whisper_endpoint: String,
-    pub claude_command: String,
-    pub claude_model: String,
+    pub summary_harness: SummaryHarness,
+    pub summary_command: String,
+    pub summary_model: String,
     pub database_url: String,
     pub database_ssl_mode: String,
     pub chunk_storage_dir: String,
@@ -55,16 +93,30 @@ impl std::error::Error for ConfigError {}
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let discord_token = required_env("DISCORD_TOKEN")?;
+        let discord_guild_id = required_env("DISCORD_GUILD_ID")?;
+        let whisper_endpoint = required_env("WHISPER_ENDPOINT")?;
+        let database_url = required_env("DATABASE_URL")?;
+        let chunk_storage_dir = required_env("CHUNK_STORAGE_DIR")?;
+
+        let summary_harness = optional_env("SUMMARY_HARNESS")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| SummaryHarness::parse(&s))
+            .transpose()?
+            .unwrap_or(SummaryHarness::Claude);
+        let (summary_command, summary_model) = resolve_summary_settings_env(summary_harness)?;
+
         Ok(Self {
-            discord_token: required_env("DISCORD_TOKEN")?,
-            discord_guild_id: required_env("DISCORD_GUILD_ID")?,
-            whisper_endpoint: required_env("WHISPER_ENDPOINT")?,
-            claude_command: required_env("CLAUDE_COMMAND")?,
-            claude_model: optional_env("CLAUDE_MODEL").unwrap_or_else(|| "haiku".to_owned()),
-            database_url: required_env("DATABASE_URL")?,
+            discord_token,
+            discord_guild_id,
+            whisper_endpoint,
+            summary_harness,
+            summary_command,
+            summary_model,
+            database_url,
             database_ssl_mode: optional_env("DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
-            chunk_storage_dir: required_env("CHUNK_STORAGE_DIR")?,
+            chunk_storage_dir,
             auto_stop_grace_seconds: optional_env_parse_u64_nonzero("AUTO_STOP_GRACE_SECONDS")?
                 .unwrap_or(60),
             summary_max_retries: optional_env_parse_u32("SUMMARY_MAX_RETRIES")?.unwrap_or(3),
@@ -106,17 +158,31 @@ impl AppConfig {
     }
 
     pub fn from_map(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        let discord_token = required_from_map(values, "DISCORD_TOKEN")?;
+        let discord_guild_id = required_from_map(values, "DISCORD_GUILD_ID")?;
+        let whisper_endpoint = required_from_map(values, "WHISPER_ENDPOINT")?;
+        let database_url = required_from_map(values, "DATABASE_URL")?;
+        let chunk_storage_dir = required_from_map(values, "CHUNK_STORAGE_DIR")?;
+
+        let summary_harness = optional_from_map(values, "SUMMARY_HARNESS")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| SummaryHarness::parse(&s))
+            .transpose()?
+            .unwrap_or(SummaryHarness::Claude);
+        let (summary_command, summary_model) =
+            resolve_summary_settings_map(values, summary_harness)?;
+
         Ok(Self {
-            discord_token: required_from_map(values, "DISCORD_TOKEN")?,
-            discord_guild_id: required_from_map(values, "DISCORD_GUILD_ID")?,
-            whisper_endpoint: required_from_map(values, "WHISPER_ENDPOINT")?,
-            claude_command: required_from_map(values, "CLAUDE_COMMAND")?,
-            claude_model: optional_from_map(values, "CLAUDE_MODEL")
-                .unwrap_or_else(|| "haiku".to_owned()),
-            database_url: required_from_map(values, "DATABASE_URL")?,
+            discord_token,
+            discord_guild_id,
+            whisper_endpoint,
+            summary_harness,
+            summary_command,
+            summary_model,
+            database_url,
             database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
-            chunk_storage_dir: required_from_map(values, "CHUNK_STORAGE_DIR")?,
+            chunk_storage_dir,
             auto_stop_grace_seconds: optional_from_map_parse_u64_nonzero(
                 values,
                 "AUTO_STOP_GRACE_SECONDS",
@@ -172,6 +238,71 @@ impl AppConfig {
                 .unwrap_or_else(|| "web/dist".to_owned()),
         })
     }
+}
+
+fn resolve_summary_settings_env(harness: SummaryHarness) -> Result<(String, String), ConfigError> {
+    let summary_cmd = optional_env("SUMMARY_COMMAND");
+    let command = if let Some(c) = summary_cmd.filter(|s| !s.trim().is_empty()) {
+        c
+    } else if harness == SummaryHarness::Claude {
+        required_env("CLAUDE_COMMAND")?
+    } else {
+        return Err(ConfigError::MissingEnv {
+            key: "SUMMARY_COMMAND",
+        });
+    };
+
+    let mut model = optional_env("SUMMARY_MODEL")
+        .or_else(|| optional_env("CLAUDE_MODEL"))
+        .unwrap_or_default();
+    if model.trim().is_empty() {
+        model = match harness {
+            SummaryHarness::Claude => "haiku".to_owned(),
+            SummaryHarness::CursorAgent | SummaryHarness::OpenCode => String::new(),
+        };
+    }
+
+    if harness == SummaryHarness::OpenCode && model.trim().is_empty() {
+        return Err(ConfigError::MissingEnv {
+            key: "SUMMARY_MODEL",
+        });
+    }
+
+    Ok((command, model))
+}
+
+fn resolve_summary_settings_map(
+    values: &HashMap<String, String>,
+    harness: SummaryHarness,
+) -> Result<(String, String), ConfigError> {
+    let summary_cmd = optional_from_map(values, "SUMMARY_COMMAND");
+    let command = if let Some(c) = summary_cmd.filter(|s| !s.trim().is_empty()) {
+        c
+    } else if harness == SummaryHarness::Claude {
+        required_from_map(values, "CLAUDE_COMMAND")?
+    } else {
+        return Err(ConfigError::MissingEnv {
+            key: "SUMMARY_COMMAND",
+        });
+    };
+
+    let mut model = optional_from_map(values, "SUMMARY_MODEL")
+        .or_else(|| optional_from_map(values, "CLAUDE_MODEL"))
+        .unwrap_or_default();
+    if model.trim().is_empty() {
+        model = match harness {
+            SummaryHarness::Claude => "haiku".to_owned(),
+            SummaryHarness::CursorAgent | SummaryHarness::OpenCode => String::new(),
+        };
+    }
+
+    if harness == SummaryHarness::OpenCode && model.trim().is_empty() {
+        return Err(ConfigError::MissingEnv {
+            key: "SUMMARY_MODEL",
+        });
+    }
+
+    Ok((command, model))
 }
 
 fn required_env(key: &'static str) -> Result<String, ConfigError> {

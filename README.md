@@ -1,6 +1,6 @@
 # discord-transcript
 
-Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし、Claude で要約を生成して結果をテキストチャンネルに投稿する Bot です。
+Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし、CLI 経由の LLM（Claude Code / Claude CLI、[Cursor Agent CLI](https://cursor.com/docs/cli/)、[OpenCode](https://opencode.ai/docs/cli/) など）で要約を生成して結果をテキストチャンネルに投稿する Bot です。
 
 ## 前提条件
 
@@ -9,7 +9,7 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| [Claude CLI](https://docs.anthropic.com/) | `claude --model <model> -p` でプロンプト実行できること |
+| 要約用 CLI | 既定は Claude（`claude --model <model> -p`）。`SUMMARY_HARNESS` で Cursor / OpenCode に切り替え可能（下記） |
 
 ## 環境構築
 
@@ -38,7 +38,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `DISCORD_TOKEN` | Discord Bot トークン (serenity が `Bot ` プレフィックスを自動付与するため、トークン文字列のみ設定) | `xxxx...` |
 | `DISCORD_GUILD_ID` | 対象サーバーの ID | `123456789012345678` |
 | `WHISPER_ENDPOINT` | whisper.cpp サーバーの URL | `http://localhost:8080` |
-| `CLAUDE_COMMAND` | Claude CLI の実行パス | `/usr/local/bin/claude` |
+| `CLAUDE_COMMAND` | **harness が `claude`（既定）**のとき必須。Claude CLI の実行パス（`SUMMARY_COMMAND` 未指定時のみ使用） | `/usr/local/bin/claude` |
 | `DATABASE_URL` | PostgreSQL 接続文字列 | `postgresql://user:pass@localhost/discord_transcript` |
 | `CHUNK_STORAGE_DIR` | 会議ワークスペースのルート (`workspaces/<guild>/<voice>/<meeting>/...`) | `/var/data/chunks` |
 
@@ -53,7 +53,12 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
-| `CLAUDE_MODEL` | `haiku` | Claude CLI の `--model` に渡すモデル名 |
+| `CLAUDE_MODEL` | `haiku` | Claude harness 時の `--model`（`SUMMARY_MODEL` 未指定時のフォールバック） |
+| `SUMMARY_HARNESS` | `claude` | `claude` / `cursor_agent` / `opencode` |
+| `SUMMARY_COMMAND` | 未設定 | 設定時は **どの harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
+| `SUMMARY_MODEL` | 未設定 | `CLAUDE_MODEL` より優先。**`opencode` では必須**（`provider/model` 形式。例: `anthropic/claude-3-5-haiku-20241022`） |
+
+要約・文字起こし補正は同じ CLI を通します。`cursor_agent` / `opencode` でプロンプトを **コマンド行引数で渡す**ため、ホストの `ps` 等に本文が見える可能性があります（Claude harness は stdin のため相対的にリスクが低いです）。
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 
 ### ワークスペース構造
@@ -66,7 +71,7 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 - `context/`: 将来のドメイン知識ファイル用プレースホルダ
 - `summary/`: 将来の要約成果物置き場
 
-Claude 要約はこのワークスペースを作業ディレクトリとして起動し、トランスクリプトはプロンプトに直埋めせず `transcript/transcript_masked.md` を参照します（`transcript/manifest.json` でメタデータを共有）。
+要約処理はこのワークスペースを作業ディレクトリとして CLI を起動し、トランスクリプトはプロンプトに直埋めせず `transcript/transcript_masked.md` を参照します（`transcript/manifest.json` でメタデータを共有）。
 
 ### 4. Git Hooks (lefthook)
 
@@ -163,7 +168,7 @@ cargo build --release
 - 全ての必須環境変数が設定されていること
 - PostgreSQL に接続可能で、マイグレーションが適用済みであること
 - whisper.cpp サーバーが起動していること
-- Claude CLI がインストール・認証済みであること
+- 要約用 CLI（既定なら Claude）がインストール・認証済みであること
 - `CHUNK_STORAGE_DIR` で指定したディレクトリが存在し、書き込み可能であること
 
 ### systemd によるサービス化 (例)
