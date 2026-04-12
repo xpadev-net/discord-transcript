@@ -104,7 +104,13 @@ impl AppConfig {
             .map(|s| SummaryHarness::parse(&s))
             .transpose()?
             .unwrap_or(SummaryHarness::Claude);
-        let (summary_command, summary_model) = resolve_summary_settings_env(summary_harness)?;
+        let (summary_command, summary_model) = resolve_summary_settings(
+            summary_harness,
+            optional_env("SUMMARY_COMMAND"),
+            || required_env("CLAUDE_COMMAND"),
+            optional_env("SUMMARY_MODEL"),
+            optional_env("CLAUDE_MODEL"),
+        )?;
 
         Ok(Self {
             discord_token,
@@ -169,8 +175,13 @@ impl AppConfig {
             .map(|s| SummaryHarness::parse(&s))
             .transpose()?
             .unwrap_or(SummaryHarness::Claude);
-        let (summary_command, summary_model) =
-            resolve_summary_settings_map(values, summary_harness)?;
+        let (summary_command, summary_model) = resolve_summary_settings(
+            summary_harness,
+            optional_from_map(values, "SUMMARY_COMMAND"),
+            || required_from_map(values, "CLAUDE_COMMAND"),
+            optional_from_map(values, "SUMMARY_MODEL"),
+            optional_from_map(values, "CLAUDE_MODEL"),
+        )?;
 
         Ok(Self {
             discord_token,
@@ -240,55 +251,24 @@ impl AppConfig {
     }
 }
 
-fn resolve_summary_settings_env(harness: SummaryHarness) -> Result<(String, String), ConfigError> {
-    let summary_cmd = optional_env("SUMMARY_COMMAND");
-    let command = if let Some(c) = summary_cmd.filter(|s| !s.trim().is_empty()) {
-        c
-    } else if harness == SummaryHarness::Claude {
-        required_env("CLAUDE_COMMAND")?
-    } else {
-        return Err(ConfigError::MissingEnv {
-            key: "SUMMARY_COMMAND",
-        });
-    };
-
-    let mut model = optional_env("SUMMARY_MODEL")
-        .or_else(|| optional_env("CLAUDE_MODEL"))
-        .unwrap_or_default();
-    if model.trim().is_empty() {
-        model = match harness {
-            SummaryHarness::Claude => "haiku".to_owned(),
-            SummaryHarness::CursorAgent | SummaryHarness::OpenCode => String::new(),
-        };
-    }
-
-    if harness == SummaryHarness::OpenCode && model.trim().is_empty() {
-        return Err(ConfigError::MissingEnv {
-            key: "SUMMARY_MODEL",
-        });
-    }
-
-    Ok((command, model))
-}
-
-fn resolve_summary_settings_map(
-    values: &HashMap<String, String>,
+fn resolve_summary_settings(
     harness: SummaryHarness,
+    summary_command: Option<String>,
+    get_claude_command: impl FnOnce() -> Result<String, ConfigError>,
+    summary_model: Option<String>,
+    claude_model: Option<String>,
 ) -> Result<(String, String), ConfigError> {
-    let summary_cmd = optional_from_map(values, "SUMMARY_COMMAND");
-    let command = if let Some(c) = summary_cmd.filter(|s| !s.trim().is_empty()) {
+    let command = if let Some(c) = summary_command.filter(|s| !s.trim().is_empty()) {
         c
     } else if harness == SummaryHarness::Claude {
-        required_from_map(values, "CLAUDE_COMMAND")?
+        get_claude_command()?
     } else {
         return Err(ConfigError::MissingEnv {
             key: "SUMMARY_COMMAND",
         });
     };
 
-    let mut model = optional_from_map(values, "SUMMARY_MODEL")
-        .or_else(|| optional_from_map(values, "CLAUDE_MODEL"))
-        .unwrap_or_default();
+    let mut model = summary_model.or(claude_model).unwrap_or_default();
     if model.trim().is_empty() {
         model = match harness {
             SummaryHarness::Claude => "haiku".to_owned(),

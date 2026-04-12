@@ -27,6 +27,8 @@ services:
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
     volumes:
       - ${HOME}/.claude:/home/app/.claude
+      - ${HOME}/.local/share/opencode:/home/app/.local/share/opencode
+      - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks
     restart: unless-stopped
 

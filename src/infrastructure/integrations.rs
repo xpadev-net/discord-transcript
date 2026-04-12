@@ -129,6 +129,13 @@ fn sanitize_output(raw: &[u8]) -> String {
     truncated
 }
 
+impl HarnessCliSummaryClient {
+    /// Full-transcript correction sends one large prompt; argv-based CLIs risk `ARG_MAX` / hangs.
+    pub fn can_run_llm_transcript_correction(&self) -> bool {
+        matches!(self.harness, SummaryHarness::Claude)
+    }
+}
+
 impl ClaudeSummaryClient for HarnessCliSummaryClient {
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
         retry_with_backoff(self.retry_policy, |_| match self.harness {
@@ -205,6 +212,7 @@ fn summarize_opencode_argv(
         .arg("--model")
         .arg(&client.model)
         .arg(prompt)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if let Some(dir) = workdir {
@@ -236,6 +244,7 @@ fn summarize_cursor_argv(
     }
     command
         .arg(prompt)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if let Some(dir) = workdir {

@@ -1799,18 +1799,28 @@ impl ScaffoldHandler {
             }
         }
 
-        // Apply LLM-based error correction to the transcript.
-        let corrected_transcript = match tokio::task::block_in_place(|| {
-            crate::application::summary::correct_transcript(
-                &summary_client,
-                &summary_transcript,
-                self.whisper_language.as_deref(),
-            )
-        }) {
-            Ok(corrected) => corrected,
-            Err(err) => {
-                warn!(meeting_id = %claimed_job.meeting_id, error = %err, "transcript correction failed, using original");
-                summary_transcript
+        // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
+        // argv-based OpenCode / Cursor would pass the full transcript on the command line.
+        let corrected_transcript = if !summary_client.can_run_llm_transcript_correction() {
+            info!(
+                meeting_id = %claimed_job.meeting_id,
+                harness = %self.summary_harness,
+                "skipping LLM transcript correction (not supported for argv-based summary harness)"
+            );
+            summary_transcript
+        } else {
+            match tokio::task::block_in_place(|| {
+                crate::application::summary::correct_transcript(
+                    &summary_client,
+                    &summary_transcript,
+                    self.whisper_language.as_deref(),
+                )
+            }) {
+                Ok(corrected) => corrected,
+                Err(err) => {
+                    warn!(meeting_id = %claimed_job.meeting_id, error = %err, "transcript correction failed, using original");
+                    summary_transcript
+                }
             }
         };
 
