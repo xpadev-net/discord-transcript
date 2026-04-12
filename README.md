@@ -60,6 +60,8 @@ psql -d discord_transcript -f migrations/0001_mvp_schema.sql
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 
 > **Note:** 要約・文字起こし補正（LLM によるトランスクリプト整形）は **Claude harness のみ**実行します（stdin で全文を渡せるため）。`cursor_agent` / `opencode` では要約フェーズも含め CLI が **コマンド行引数**でプロンプトを受け取るため、ホストの `ps` 等に本文が見える可能性があります。
+>
+> **`cursor_agent`:** バックグラウンド要約は TTY がないため、Cursor Agent CLI に **`--trust`** を付与してワークスペース（`CHUNK_STORAGE_DIR` 配下の会議ディレクトリ）を信頼済みとして実行します。
 
 Docker Compose では各要約 CLI の認証用ディレクトリ（ホストの `~/.claude`・`~/.local/share/opencode`・`~/.cursor`）をコンテナの `HOME` 配下にマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
 

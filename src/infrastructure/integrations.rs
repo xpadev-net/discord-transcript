@@ -240,6 +240,7 @@ fn summarize_cursor_argv(
     let mut command = Command::new(&client.command_path);
     command
         .arg("-p")
+        .arg("--trust")
         .arg(prompt)
         .arg("--output-format")
         .arg("text");
