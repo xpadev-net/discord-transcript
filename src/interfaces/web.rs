@@ -523,8 +523,48 @@ async fn check_channel_permission(
         warn!(error = %err, "discord channel API request failed");
         StatusCode::BAD_GATEWAY
     })?;
-    let channel: DiscordChannelFull = channel_resp.json().await.map_err(|err| {
-        warn!(error = %err, "discord channel API response parse failed");
+    let channel_status = channel_resp.status();
+    let retry_after_header = channel_resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    let channel_body = channel_resp.text().await.map_err(|err| {
+        warn!(error = %err, "discord channel API response read failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if channel_status == reqwest::StatusCode::NOT_FOUND
+        || channel_status == reqwest::StatusCode::FORBIDDEN
+        || channel_status == reqwest::StatusCode::UNAUTHORIZED
+    {
+        return Ok(false);
+    }
+    if channel_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!(
+            status = %channel_status,
+            retry_after = retry_after_header.as_deref(),
+            body_preview = %&channel_body[..channel_body.len().min(500)],
+            "discord channel API rate limited"
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    if !channel_status.is_success() {
+        warn!(
+            status = %channel_status,
+            body_preview = %&channel_body[..channel_body.len().min(500)],
+            "discord channel API non-success"
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let channel: DiscordChannelFull = serde_json::from_str(&channel_body).map_err(|err| {
+        warn!(
+            error = %err,
+            body_preview = %&channel_body[..channel_body.len().min(500)],
+            "discord channel API response parse failed"
+        );
         StatusCode::BAD_GATEWAY
     })?;
 
@@ -560,39 +600,8 @@ async fn check_channel_permission(
 
 // Discord API response types for permission checking
 
-#[derive(Deserialize, Clone)]
-struct DiscordGuildFull {
-    owner_id: String,
-    roles: Vec<DiscordRoleFull>,
-}
-
-#[derive(Deserialize, Clone)]
-struct DiscordRoleFull {
-    id: String,
-    #[serde(deserialize_with = "deserialize_string_or_number")]
-    permissions: String,
-}
-
-#[derive(Deserialize)]
-struct DiscordChannelFull {
-    #[serde(default)]
-    permission_overwrites: Vec<DiscordOverwrite>,
-}
-
-#[derive(Deserialize)]
-struct DiscordOverwrite {
-    id: String,
-    #[serde(rename = "type")]
-    type_: u8, // 0 = role, 1 = member
-    #[serde(deserialize_with = "deserialize_string_or_number")]
-    allow: String,
-    #[serde(deserialize_with = "deserialize_string_or_number")]
-    deny: String,
-}
-
-#[derive(Deserialize)]
-struct DiscordMemberFull {
-    roles: Vec<String>,
+fn zero_perm_string() -> String {
+    "0".to_string()
 }
 
 /// Discord API returns permission values as either strings or integers
@@ -620,6 +629,51 @@ where
         }
     }
     deserializer.deserialize_any(StringOrNumber)
+}
+
+#[derive(Deserialize, Clone)]
+struct DiscordGuildFull {
+    owner_id: String,
+    roles: Vec<DiscordRoleFull>,
+}
+
+#[derive(Deserialize, Clone)]
+struct DiscordRoleFull {
+    id: String,
+    #[serde(deserialize_with = "deserialize_string_or_number")]
+    permissions: String,
+}
+
+#[derive(Deserialize)]
+struct DiscordOverwrite {
+    id: String,
+    #[serde(rename = "type")]
+    type_: u8, // 0 = role, 1 = member
+    #[serde(default = "zero_perm_string", deserialize_with = "deserialize_string_or_number")]
+    allow: String,
+    #[serde(default = "zero_perm_string", deserialize_with = "deserialize_string_or_number")]
+    deny: String,
+}
+
+fn deserialize_permission_overwrites<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DiscordOverwrite>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Vec<DiscordOverwrite>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+struct DiscordChannelFull {
+    #[serde(default, deserialize_with = "deserialize_permission_overwrites")]
+    permission_overwrites: Vec<DiscordOverwrite>,
+}
+
+#[derive(Deserialize)]
+struct DiscordMemberFull {
+    roles: Vec<String>,
 }
 
 /// Compute a user's effective permissions for a channel following Discord's
@@ -1039,4 +1093,54 @@ async fn stream_file_range(
     let limited = file.take(length);
     let stream = tokio_util::io::ReaderStream::new(limited);
     Ok(axum::body::Body::from_stream(stream))
+}
+
+#[cfg(test)]
+mod discord_channel_full_tests {
+    use super::DiscordChannelFull;
+
+    #[test]
+    fn channel_full_permission_overwrites_omitted() {
+        let ch: DiscordChannelFull = serde_json::from_str("{}").unwrap();
+        assert!(ch.permission_overwrites.is_empty());
+    }
+
+    #[test]
+    fn channel_full_permission_overwrites_null() {
+        let ch: DiscordChannelFull =
+            serde_json::from_str(r#"{"permission_overwrites":null}"#).unwrap();
+        assert!(ch.permission_overwrites.is_empty());
+    }
+
+    #[test]
+    fn channel_full_permission_overwrites_populated() {
+        let ch: DiscordChannelFull = serde_json::from_str(
+            r#"{"permission_overwrites":[{"id":"1","type":0,"allow":"1024","deny":"0"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(ch.permission_overwrites.len(), 1);
+        assert_eq!(ch.permission_overwrites[0].id, "1");
+        assert_eq!(ch.permission_overwrites[0].type_, 0);
+        assert_eq!(ch.permission_overwrites[0].allow, "1024");
+        assert_eq!(ch.permission_overwrites[0].deny, "0");
+    }
+
+    #[test]
+    fn overwrite_allow_deny_numeric_and_partial() {
+        let ch: DiscordChannelFull = serde_json::from_str(
+            r#"{"permission_overwrites":[
+                {"id":"10","type":1,"allow":1024,"deny":0},
+                {"id":"20","type":0,"allow":"1"},
+                {"id":"30","type":0,"deny":"2"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(ch.permission_overwrites.len(), 3);
+        assert_eq!(ch.permission_overwrites[0].allow, "1024");
+        assert_eq!(ch.permission_overwrites[0].deny, "0");
+        assert_eq!(ch.permission_overwrites[1].allow, "1");
+        assert_eq!(ch.permission_overwrites[1].deny, "0");
+        assert_eq!(ch.permission_overwrites[2].allow, "0");
+        assert_eq!(ch.permission_overwrites[2].deny, "2");
+    }
 }
