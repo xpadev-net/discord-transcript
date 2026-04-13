@@ -1817,7 +1817,7 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(
                 "DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text'",
-                &[claimed_job.meeting_id.clone()],
+                std::slice::from_ref(&claimed_job.meeting_id),
             ) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
