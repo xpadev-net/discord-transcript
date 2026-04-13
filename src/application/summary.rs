@@ -304,6 +304,7 @@ Fix recognition errors in the **text** portion of each line while keeping the \
 timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
 {language_rules}\n\
 - Preserve bracketed placeholder tokens exactly as-is (e.g. [MENTION_1], [EMAIL_1], [PHONE_1])\n\
+- If a line's text starts with [チャット], keep that text content unchanged\n\
 - Do NOT change speaker names, timestamps, or line structure\n\
 - Do NOT add, remove, or reorder lines\n\
 - Do NOT add commentary or explanation\n\

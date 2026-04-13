@@ -1,0 +1,2 @@
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'voice';

@@ -1,4 +1,4 @@
-use crate::domain::transcript::TranscriptSegment;
+use crate::domain::transcript::{TranscriptSegment, TranscriptSource};
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
 
@@ -89,6 +89,7 @@ pub fn parse_whisper_response(body: &str) -> Result<WhisperTranscriptionResult, 
             text: segment.text,
             confidence: segment.confidence,
             is_noisy: false,
+            source: TranscriptSource::Voice,
             merged_count: 1,
         });
     }

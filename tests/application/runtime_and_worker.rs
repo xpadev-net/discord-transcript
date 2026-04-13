@@ -445,6 +445,8 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
         status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
+        started_at: None,
+        stopped_at: None,
     });
 
     let whisper = StubWhisperClient {
@@ -497,6 +499,8 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
+        started_at: None,
+        stopped_at: None,
     });
 
     let whisper = StubWhisperClient {

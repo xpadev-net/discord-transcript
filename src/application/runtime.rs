@@ -12,6 +12,7 @@ use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voic
 use crate::bootstrap::config::{AppConfig, SummaryHarness};
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
+use crate::domain::transcript::{NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments, render_for_summary};
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::integrations::{CommandWhisperClient, HarnessCliSummaryClient};
 use crate::infrastructure::queue::JobQueue;
@@ -23,6 +24,7 @@ use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, 
 use crate::infrastructure::storage::{MeetingStore, StatusMessageMetadata, StoredMeeting};
 use crate::infrastructure::storage_fs::LocalChunkStorage;
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
+use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
@@ -1671,7 +1673,7 @@ impl ScaffoldHandler {
         let transcription = tokio::task::block_in_place(|| {
             crate::application::summary::run_transcription(&whisper, &request)
         });
-        let transcription = match transcription {
+        let mut transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
                 let err_string = err.to_string();
@@ -1755,12 +1757,55 @@ impl ScaffoldHandler {
             }
         };
 
+        if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
+            match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at).await
+            {
+                Ok(messages) => {
+                    let mut vc_segments = Vec::with_capacity(messages.len());
+                    for msg in messages {
+                        let delta_ms = (msg.timestamp - started_at).num_milliseconds();
+                        let start_ms = delta_ms.max(0) as u64;
+                        vc_segments.push(TranscriptSegment {
+                            speaker_id: msg.speaker_id,
+                            start_ms,
+                            end_ms: start_ms.saturating_add(1),
+                            text: msg.text,
+                            confidence: None,
+                            is_noisy: false,
+                            source: TranscriptSource::VcText,
+                            merged_count: 1,
+                        });
+                    }
+                    if !vc_segments.is_empty() {
+                        transcription.segments.extend(vc_segments);
+                        transcription.segments.sort_by(|a, b| {
+                            a.start_ms
+                                .cmp(&b.start_ms)
+                                .then(a.end_ms.cmp(&b.end_ms))
+                                .then(a.speaker_id.cmp(&b.speaker_id))
+                        });
+                        transcription.segments = normalize_segments(
+                            &transcription.segments,
+                            NormalizationConfig::default(),
+                        );
+                        let masked = crate::domain::privacy::mask_pii(&render_for_summary(
+                            &transcription.segments,
+                            None,
+                        ));
+                        transcription.transcript_for_summary = masked.text;
+                        transcription.masking_stats = masked.stats;
+                    }
+                }
+                Err(err) => warn_and_fallback_on_vc_text_error(&claimed_job.meeting_id, &err),
+            }
+        }
+
         // Persist transcript segments to DB (best-effort)
         if !transcription.segments.is_empty() {
             let sql = crate::infrastructure::sql::build_insert_transcripts_sql(
                 transcription.segments.len(),
             );
-            let mut params = Vec::with_capacity(transcription.segments.len() * 8);
+            let mut params = Vec::with_capacity(transcription.segments.len() * 9);
             for (i, seg) in transcription.segments.iter().enumerate() {
                 params.push(format!("{}-t-{i}", claimed_job.meeting_id));
                 params.push(claimed_job.meeting_id.clone());
@@ -1770,6 +1815,7 @@ impl ScaffoldHandler {
                 params.push(seg.text.clone());
                 params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
                 params.push(seg.is_noisy.to_string());
+                params.push(seg.source.as_str().to_owned());
             }
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(&sql, &params) {

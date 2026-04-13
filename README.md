@@ -121,6 +121,8 @@ cargo run --release
 - Connect (ボイスチャンネルへの接続)
 - Speak (ボイスチャンネルでの送受信)
 - Send Messages (テキストチャンネルへのメッセージ送信)
+- View Channel (VC テキストチャットの閲覧)
+- Read Message History (会議中 VC チャット履歴の取得)
 - Use Slash Commands
 
 ### スラッシュコマンド

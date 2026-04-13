@@ -1,4 +1,5 @@
 use crate::domain::speaker::SpeakerProfile;
+use crate::domain::transcript::TranscriptSource;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
@@ -843,6 +844,7 @@ struct TranscriptSegmentResponse {
     text: String,
     confidence: Option<f64>,
     is_noisy: bool,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -893,7 +895,7 @@ async fn api_transcript(
     let rows = state
         .db
         .query(
-            "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, \
+            "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, \
                     ms.username, ms.nickname, ms.display_name \
              FROM transcripts t \
              LEFT JOIN meeting_speakers ms \
@@ -930,6 +932,10 @@ async fn api_transcript(
                 text: row.get("text"),
                 confidence: row.get("confidence"),
                 is_noisy: row.get("is_noisy"),
+                source: row
+                    .get::<_, Option<String>>("source")
+                    .and_then(|s| TranscriptSource::parse_str(&s).map(|v| v.as_str().to_owned()))
+                    .unwrap_or_else(|| TranscriptSource::Voice.as_str().to_owned()),
             }
         })
         .collect();

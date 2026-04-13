@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     end_ms INTEGER NOT NULL,
     text TEXT NOT NULL,
     confidence DOUBLE PRECISION,
+    source TEXT NOT NULL DEFAULT 'voice',
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

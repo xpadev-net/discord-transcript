@@ -49,6 +49,7 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
     "segment",
     isActive && "active",
     segment.is_noisy && "noisy",
+    segment.source === "vc_text" && "vc-text",
   ]
     .filter(Boolean)
     .join(" ");
@@ -67,6 +68,9 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
         </span>
         <SpeakerMeta speaker={speaker} />
         <span className="segment-time">{formatTimestamp(segment.start_ms)}</span>
+        {segment.source === "vc_text" && (
+          <span className="segment-source">チャット</span>
+        )}
       </div>
       <div className="segment-text">{segment.text}</div>
     </div>
