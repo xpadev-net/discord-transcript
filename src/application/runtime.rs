@@ -1760,11 +1760,13 @@ impl ScaffoldHandler {
             }
         };
 
+        let mut vc_text_fetch_succeeded = false;
         if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
             match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at)
                 .await
             {
                 Ok(messages) => {
+                    vc_text_fetch_succeeded = true;
                     let started_at_ms = started_at.timestamp_millis();
                     let mut vc_segments = Vec::with_capacity(messages.len());
                     for msg in messages {
@@ -1803,6 +1805,13 @@ impl ScaffoldHandler {
                 }
                 Err(err) => warn_and_fallback_on_vc_text_error(&claimed_job.meeting_id, &err),
             }
+        } else {
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                started_at = %meeting.started_at.is_some(),
+                stopped_at = %meeting.stopped_at.is_some(),
+                "skipping VC text fetch: meeting timestamps unavailable"
+            );
         }
 
         // Persist transcript segments to DB (best-effort)
@@ -1823,6 +1832,18 @@ impl ScaffoldHandler {
                 params.push(seg.source.as_str().to_owned());
             }
             let mut service = self.service.lock().await;
+            if vc_text_fetch_succeeded
+                && let Err(err) = service.store.executor.execute(
+                    "DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text'",
+                    &[claimed_job.meeting_id.clone()],
+                )
+            {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "failed to clear old vc_text segments before re-persist"
+                );
+            }
             if let Err(err) = service.store.executor.execute(&sql, &params) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
