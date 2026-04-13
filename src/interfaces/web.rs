@@ -645,11 +645,62 @@ struct DiscordRoleFull {
     permissions: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordOverwriteType {
+    Role,
+    Member,
+}
+
+impl<'de> Deserialize<'de> for DiscordOverwriteType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct DiscordOverwriteTypeVisitor;
+
+        impl<'de> de::Visitor<'de> for DiscordOverwriteTypeVisitor {
+            type Value = DiscordOverwriteType;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("0, 1, \"role\", or \"member\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                match value {
+                    0 => Ok(DiscordOverwriteType::Role),
+                    1 => Ok(DiscordOverwriteType::Member),
+                    other => Err(E::custom(format!("invalid overwrite type: {other}"))),
+                }
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                match value {
+                    0 => Ok(DiscordOverwriteType::Role),
+                    1 => Ok(DiscordOverwriteType::Member),
+                    other => Err(E::custom(format!("invalid overwrite type: {other}"))),
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "0" | "role" => Ok(DiscordOverwriteType::Role),
+                    "1" | "member" => Ok(DiscordOverwriteType::Member),
+                    other => Err(E::custom(format!("invalid overwrite type: {other}"))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(DiscordOverwriteTypeVisitor)
+    }
+}
+
 #[derive(Deserialize)]
 struct DiscordOverwrite {
     id: String,
     #[serde(rename = "type")]
-    type_: u8, // 0 = role, 1 = member
+    type_: DiscordOverwriteType,
     #[serde(
         default = "zero_perm_string",
         deserialize_with = "deserialize_string_or_number"
@@ -718,7 +769,10 @@ fn compute_channel_permissions(
     }
 
     // Apply @everyone overwrite
-    if let Some(ow) = overwrites.iter().find(|o| o.type_ == 0 && o.id == guild_id) {
+    if let Some(ow) = overwrites
+        .iter()
+        .find(|o| matches!(o.type_, DiscordOverwriteType::Role) && o.id == guild_id)
+    {
         let allow = ow.allow.parse::<u64>().unwrap_or(0);
         let deny = ow.deny.parse::<u64>().unwrap_or(0);
         permissions &= !deny;
@@ -728,10 +782,11 @@ fn compute_channel_permissions(
     // Apply role overwrites (union of allow/deny across all matching roles)
     let mut role_allow: u64 = 0;
     let mut role_deny: u64 = 0;
-    for ow in overwrites
-        .iter()
-        .filter(|o| o.type_ == 0 && o.id != guild_id && member_roles.contains(&o.id))
-    {
+    for ow in overwrites.iter().filter(|o| {
+        matches!(o.type_, DiscordOverwriteType::Role)
+            && o.id != guild_id
+            && member_roles.contains(&o.id)
+    }) {
         role_allow |= ow.allow.parse::<u64>().unwrap_or(0);
         role_deny |= ow.deny.parse::<u64>().unwrap_or(0);
     }
@@ -739,7 +794,10 @@ fn compute_channel_permissions(
     permissions |= role_allow;
 
     // Apply member-specific overwrite
-    if let Some(ow) = overwrites.iter().find(|o| o.type_ == 1 && o.id == user_id) {
+    if let Some(ow) = overwrites
+        .iter()
+        .find(|o| matches!(o.type_, DiscordOverwriteType::Member) && o.id == user_id)
+    {
         let allow = ow.allow.parse::<u64>().unwrap_or(0);
         let deny = ow.deny.parse::<u64>().unwrap_or(0);
         permissions &= !deny;
@@ -1109,7 +1167,10 @@ async fn stream_file_range(
 
 #[cfg(test)]
 mod discord_channel_full_tests {
-    use super::DiscordChannelFull;
+    use super::{
+        DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull, VIEW_CHANNEL,
+        compute_channel_permissions,
+    };
 
     #[test]
     fn channel_full_permission_overwrites_omitted() {
@@ -1132,9 +1193,34 @@ mod discord_channel_full_tests {
         .unwrap();
         assert_eq!(ch.permission_overwrites.len(), 1);
         assert_eq!(ch.permission_overwrites[0].id, "1");
-        assert_eq!(ch.permission_overwrites[0].type_, 0);
+        assert_eq!(
+            ch.permission_overwrites[0].type_,
+            DiscordOverwriteType::Role
+        );
         assert_eq!(ch.permission_overwrites[0].allow, "1024");
         assert_eq!(ch.permission_overwrites[0].deny, "0");
+    }
+
+    #[test]
+    fn channel_full_permission_overwrites_string_types() {
+        let ch: DiscordChannelFull = serde_json::from_str(
+            r#"{"permission_overwrites":[
+                {"id":"10","type":"role","allow":"1024","deny":"0"},
+                {"id":"20","type":"member","allow":1,"deny":0}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(ch.permission_overwrites.len(), 2);
+        assert_eq!(
+            ch.permission_overwrites[0].type_,
+            DiscordOverwriteType::Role
+        );
+        assert_eq!(
+            ch.permission_overwrites[1].type_,
+            DiscordOverwriteType::Member
+        );
+        assert_eq!(ch.permission_overwrites[0].allow, "1024");
+        assert_eq!(ch.permission_overwrites[1].allow, "1");
     }
 
     #[test]
@@ -1154,5 +1240,67 @@ mod discord_channel_full_tests {
         assert_eq!(ch.permission_overwrites[1].deny, "0");
         assert_eq!(ch.permission_overwrites[2].allow, "0");
         assert_eq!(ch.permission_overwrites[2].deny, "2");
+    }
+
+    #[test]
+    fn overwrite_invalid_type_rejected() {
+        for type_value in [r#""unknown""#, "2", "-1"] {
+            let json = format!(
+                r#"{{"permission_overwrites":[{{"id":"1","type":{},"allow":"0","deny":"0"}}]}}"#,
+                type_value
+            );
+            let result = serde_json::from_str::<DiscordChannelFull>(&json);
+            assert!(result.is_err(), "type {type_value} unexpectedly parsed");
+            let err = result.err().unwrap();
+            assert!(err.to_string().contains("invalid overwrite type"));
+        }
+    }
+
+    #[test]
+    fn compute_channel_permissions_applies_role_and_member_overwrites() {
+        let guild_id = "guild";
+        let user_id = "user";
+        let member_roles = vec!["role-a".to_owned()];
+        let guild_roles = vec![
+            DiscordRoleFull {
+                id: guild_id.to_owned(),
+                permissions: "0".to_owned(),
+            },
+            DiscordRoleFull {
+                id: "role-a".to_owned(),
+                permissions: "0".to_owned(),
+            },
+        ];
+        let overwrites = vec![
+            DiscordOverwrite {
+                id: guild_id.to_owned(),
+                type_: DiscordOverwriteType::Role,
+                allow: "0".to_owned(),
+                deny: "0".to_owned(),
+            },
+            DiscordOverwrite {
+                id: "role-a".to_owned(),
+                type_: DiscordOverwriteType::Role,
+                allow: VIEW_CHANNEL.to_string(),
+                deny: "0".to_owned(),
+            },
+            DiscordOverwrite {
+                id: user_id.to_owned(),
+                type_: DiscordOverwriteType::Member,
+                allow: "0".to_owned(),
+                deny: VIEW_CHANNEL.to_string(),
+            },
+        ];
+
+        let permissions = compute_channel_permissions(
+            user_id,
+            "other-owner",
+            guild_id,
+            &member_roles,
+            &guild_roles,
+            &overwrites,
+        );
+
+        assert_eq!(permissions & VIEW_CHANNEL, 0);
     }
 }
