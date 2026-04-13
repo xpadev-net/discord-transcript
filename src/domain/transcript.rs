@@ -154,7 +154,7 @@ pub fn render_for_summary(
         let label = display_label_for_id(speakers, &segment.speaker_id);
         let noise_tag = if segment.is_noisy { " [NOISY]" } else { "" };
         let source_tag = if segment.source == TranscriptSource::VcText {
-            " [チャット]"
+            " [VC_TEXT]"
         } else {
             ""
         };

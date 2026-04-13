@@ -32,9 +32,12 @@ pub async fn fetch_vc_text_messages(
     const MAX_PAGES: u32 = 50;
     loop {
         if pages >= MAX_PAGES {
-            return Err(format!(
-                "VC chat fetch pagination exceeded max pages ({MAX_PAGES})"
-            ));
+            warn!(
+                pages = MAX_PAGES,
+                collected = out.len(),
+                "VC chat fetch hit page limit; returning partial results"
+            );
+            return Ok(finish_vc_messages(out));
         }
         pages += 1;
 
