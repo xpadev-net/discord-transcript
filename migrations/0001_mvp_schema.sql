@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS transcripts (
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE transcripts
+ADD CONSTRAINT transcripts_source_check
+CHECK (source IN ('voice', 'vc_text'));
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
