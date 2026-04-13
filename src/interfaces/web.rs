@@ -690,10 +690,6 @@ impl<'de> Deserialize<'de> for DiscordOverwriteType {
                     other => Err(E::custom(format!("invalid overwrite type: {other}"))),
                 }
             }
-
-            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
-                self.visit_str(value)
-            }
         }
 
         deserializer.deserialize_any(DiscordOverwriteTypeVisitor)
@@ -1248,12 +1244,16 @@ mod discord_channel_full_tests {
 
     #[test]
     fn overwrite_invalid_type_rejected() {
-        let result = serde_json::from_str::<DiscordChannelFull>(
-            r#"{"permission_overwrites":[{"id":"1","type":"unknown","allow":"0","deny":"0"}]}"#,
-        );
-        assert!(result.is_err());
-        let err = result.err().unwrap();
-        assert!(err.to_string().contains("invalid overwrite type"));
+        for type_value in [r#""unknown""#, "2", "-1"] {
+            let json = format!(
+                r#"{{"permission_overwrites":[{{"id":"1","type":{},"allow":"0","deny":"0"}}]}}"#,
+                type_value
+            );
+            let result = serde_json::from_str::<DiscordChannelFull>(&json);
+            assert!(result.is_err(), "type {type_value} unexpectedly parsed");
+            let err = result.err().unwrap();
+            assert!(err.to_string().contains("invalid overwrite type"));
+        }
     }
 
     #[test]
