@@ -103,6 +103,9 @@ pub fn normalize_segments(
 }
 
 fn can_merge(prev: &TranscriptSegment, next: &TranscriptSegment) -> bool {
+    if prev.source == TranscriptSource::VcText || next.source == TranscriptSource::VcText {
+        return false;
+    }
     prev.source == next.source
         && prev.speaker_id == next.speaker_id
         && next.start_ms <= prev.end_ms + 1_000

@@ -1765,9 +1765,10 @@ impl ScaffoldHandler {
                 .await
             {
                 Ok(messages) => {
+                    let started_at_ms = started_at.timestamp_millis();
                     let mut vc_segments = Vec::with_capacity(messages.len());
                     for msg in messages {
-                        let delta_ms = (msg.timestamp - started_at).num_milliseconds();
+                        let delta_ms = msg.timestamp_ms.saturating_sub(started_at_ms);
                         let start_ms = delta_ms.max(0) as u64;
                         vc_segments.push(TranscriptSegment {
                             speaker_id: msg.speaker_id,

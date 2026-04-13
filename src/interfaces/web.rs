@@ -907,7 +907,7 @@ async fn api_transcript(
              LEFT JOIN meeting_speakers ms \
                ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
              WHERE t.meeting_id=$1 AND NOT t.is_deleted \
-             ORDER BY t.start_ms",
+             ORDER BY t.start_ms, t.end_ms, t.speaker_id, t.id",
             &[&meeting_id],
         )
         .await
