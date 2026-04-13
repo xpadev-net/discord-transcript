@@ -10,6 +10,7 @@ use crate::infrastructure::storage::{
     CreateMeetingRequest, MeetingStore, StatusMessageMetadata, StopTransition, StoreError,
     StoredMeeting,
 };
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
 
@@ -244,7 +245,9 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let rows = self
             .executor
             .query_rows(
-                "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message \
+                "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+                        to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
                   FROM meetings WHERE id=$1 LIMIT 1",
                 &[meeting_id.to_owned()],
             )
@@ -252,7 +255,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        if row.len() < 11 {
+        if row.len() < 13 {
             return Err(StoreError::Backend(format!(
                 "invalid meeting row length for id={meeting_id}: {}",
                 row.len()
@@ -302,6 +305,16 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             } else {
                 Some(row[10].clone())
             },
+            started_at: parse_optional_rfc3339(if row[11].trim().is_empty() {
+                None
+            } else {
+                Some(row[11].clone())
+            }),
+            stopped_at: parse_optional_rfc3339(if row[12].trim().is_empty() {
+                None
+            } else {
+                Some(row[12].clone())
+            }),
         }))
     }
 
@@ -604,7 +617,7 @@ impl SqlExecutor for PgSqlExecutor {
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
+        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
         let client = self.client()?;
         let runtime = self.runtime()?;
         std::thread::scope(|s| {
@@ -680,7 +693,16 @@ fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
         status,
         stop_reason,
         error_message: row.get("error_message"),
+        started_at: parse_optional_rfc3339(row.get::<_, Option<String>>("started_at")),
+        stopped_at: parse_optional_rfc3339(row.get::<_, Option<String>>("stopped_at")),
     }
+}
+
+fn parse_optional_rfc3339(value: Option<String>) -> Option<DateTime<Utc>> {
+    value
+        .as_deref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|ts| ts.with_timezone(&Utc))
 }
 
 fn pg_row_to_strings(row: Row) -> Result<Vec<String>, String> {

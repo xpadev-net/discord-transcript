@@ -96,6 +96,8 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
             status: MeetingStatus::Recording,
             stop_reason: None,
             error_message: None,
+            started_at: None,
+            stopped_at: None,
         },
     );
 

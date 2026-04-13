@@ -1,4 +1,5 @@
 use crate::domain::speaker::SpeakerProfile;
+use crate::domain::transcript::TranscriptSource;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
@@ -649,9 +650,15 @@ struct DiscordOverwrite {
     id: String,
     #[serde(rename = "type")]
     type_: u8, // 0 = role, 1 = member
-    #[serde(default = "zero_perm_string", deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default = "zero_perm_string",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     allow: String,
-    #[serde(default = "zero_perm_string", deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default = "zero_perm_string",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     deny: String,
 }
 
@@ -843,6 +850,7 @@ struct TranscriptSegmentResponse {
     text: String,
     confidence: Option<f64>,
     is_noisy: bool,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -893,13 +901,13 @@ async fn api_transcript(
     let rows = state
         .db
         .query(
-            "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, \
+            "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, \
                     ms.username, ms.nickname, ms.display_name \
              FROM transcripts t \
              LEFT JOIN meeting_speakers ms \
                ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
              WHERE t.meeting_id=$1 AND NOT t.is_deleted \
-             ORDER BY t.start_ms",
+             ORDER BY t.start_ms, t.end_ms, t.speaker_id, t.id",
             &[&meeting_id],
         )
         .await
@@ -930,6 +938,10 @@ async fn api_transcript(
                 text: row.get("text"),
                 confidence: row.get("confidence"),
                 is_noisy: row.get("is_noisy"),
+                source: row
+                    .get::<_, Option<String>>("source")
+                    .and_then(|s| TranscriptSource::parse_str(&s).map(|v| v.as_str().to_owned()))
+                    .unwrap_or_else(|| TranscriptSource::Voice.as_str().to_owned()),
             }
         })
         .collect();

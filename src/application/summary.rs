@@ -298,12 +298,15 @@ pub fn correct_transcript<C: ClaudeSummaryClient>(
         "You are a speech-recognition error corrector.\n\
 \n\
 Below is an ASR (automatic speech recognition) transcript. Each line has the format:\n\
-[start_ms-end_ms] Speaker: text\n\
+[start_ms-end_ms] Speaker [optional-tags]: text\n\
+\n\
+Optional tags that may appear between the speaker name and the colon include [VC_TEXT] (VC chat message) and [NOISY] (low-confidence segment).\n\
 \n\
 Fix recognition errors in the **text** portion of each line while keeping the \
 timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
 {language_rules}\n\
 - Preserve bracketed placeholder tokens exactly as-is (e.g. [MENTION_1], [EMAIL_1], [PHONE_1])\n\
+- If a line contains [VC_TEXT] before the colon (i.e. a VC chat segment), keep that line's text content unchanged\n\
 - Do NOT change speaker names, timestamps, or line structure\n\
 - Do NOT add, remove, or reorder lines\n\
 - Do NOT add commentary or explanation\n\

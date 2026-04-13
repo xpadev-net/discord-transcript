@@ -1,6 +1,29 @@
 use crate::domain::speaker::{SpeakerProfile, display_label_for_id};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptSource {
+    Voice,
+    VcText,
+}
+
+impl TranscriptSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Voice => "voice",
+            Self::VcText => "vc_text",
+        }
+    }
+
+    pub fn parse_str(value: &str) -> Option<Self> {
+        match value {
+            "voice" => Some(Self::Voice),
+            "vc_text" => Some(Self::VcText),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptSegment {
     pub speaker_id: String,
@@ -9,6 +32,7 @@ pub struct TranscriptSegment {
     pub text: String,
     pub confidence: Option<f32>,
     pub is_noisy: bool,
+    pub source: TranscriptSource,
     /// Number of original segments merged into this one (for weighted confidence).
     pub merged_count: u32,
 }
@@ -51,6 +75,7 @@ pub fn normalize_segments(
                 || segment
                     .confidence
                     .is_some_and(|value| value < config.min_confidence_for_clean),
+            source: segment.source,
             merged_count: segment.merged_count,
         };
 
@@ -78,7 +103,12 @@ pub fn normalize_segments(
 }
 
 fn can_merge(prev: &TranscriptSegment, next: &TranscriptSegment) -> bool {
-    prev.speaker_id == next.speaker_id && next.start_ms <= prev.end_ms + 1_000
+    if prev.source == TranscriptSource::VcText || next.source == TranscriptSource::VcText {
+        return false;
+    }
+    prev.source == next.source
+        && prev.speaker_id == next.speaker_id
+        && next.start_ms <= prev.end_ms + 1_000
 }
 
 fn merge_confidence(a: Option<f32>, a_count: u32, b: Option<f32>, b_count: u32) -> Option<f32> {
@@ -123,18 +153,24 @@ pub fn render_for_summary(
     for segment in segments {
         let label = display_label_for_id(speakers, &segment.speaker_id);
         let noise_tag = if segment.is_noisy { " [NOISY]" } else { "" };
+        let source_tag = if segment.source == TranscriptSource::VcText {
+            " [VC_TEXT]"
+        } else {
+            ""
+        };
         if label == segment.speaker_id {
             lines.push(format!(
-                "[{}-{}] {}{}: {}",
-                segment.start_ms, segment.end_ms, label, noise_tag, segment.text
+                "[{}-{}] {}{}{}: {}",
+                segment.start_ms, segment.end_ms, label, source_tag, noise_tag, segment.text
             ));
         } else {
             lines.push(format!(
-                "[{}-{}] {} (id:{}){}: {}",
+                "[{}-{}] {} (id:{}){}{}: {}",
                 segment.start_ms,
                 segment.end_ms,
                 label,
                 segment.speaker_id,
+                source_tag,
                 noise_tag,
                 segment.text
             ));

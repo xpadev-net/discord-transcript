@@ -1,4 +1,5 @@
 use crate::domain::{MeetingStatus, StopReason};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
@@ -121,6 +122,8 @@ pub struct StoredMeeting {
     pub status: MeetingStatus,
     pub stop_reason: Option<StopReason>,
     pub error_message: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +178,7 @@ impl MeetingStore for InMemoryMeetingStore {
         if meeting.status == MeetingStatus::Recording {
             meeting.status = MeetingStatus::Stopping;
             meeting.stop_reason = Some(reason);
+            meeting.stopped_at = Some(Utc::now());
             return Ok(StopTransition::Acquired);
         }
 
@@ -218,6 +222,8 @@ impl MeetingStore for InMemoryMeetingStore {
             status: MeetingStatus::Scheduled,
             stop_reason: None,
             error_message: None,
+            started_at: None,
+            stopped_at: None,
         };
         self.meetings.insert(request.id, meeting);
         Ok(())
@@ -245,6 +251,8 @@ impl MeetingStore for InMemoryMeetingStore {
             status: MeetingStatus::Recording,
             stop_reason: None,
             error_message: None,
+            started_at: Some(Utc::now()),
+            stopped_at: None,
         };
         self.meetings.insert(request.id, meeting);
         Ok(())

@@ -26,9 +26,20 @@ CREATE TABLE IF NOT EXISTS transcripts (
     end_ms INTEGER NOT NULL,
     text TEXT NOT NULL,
     confidence DOUBLE PRECISION,
+    is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
+    source TEXT NOT NULL DEFAULT 'voice',
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+DO $$
+BEGIN
+    ALTER TABLE transcripts
+    ADD CONSTRAINT transcripts_source_check
+    CHECK (source IN ('voice', 'vc_text'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);

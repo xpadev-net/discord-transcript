@@ -23,6 +23,7 @@ export interface TranscriptSegment {
   text: string;
   confidence: number | null;
   is_noisy: boolean;
+  source: "voice" | "vc_text";
 }
 
 export interface SummaryResponse {

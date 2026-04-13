@@ -68,6 +68,8 @@ fn record_start_rejects_if_active_meeting_exists() {
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,
+        started_at: None,
+        stopped_at: None,
     });
 
     let request = RecordStartRequest {
@@ -105,6 +107,8 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
         status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
+        started_at: None,
+        stopped_at: None,
     });
 
     let request = RecordStartRequest {
@@ -138,6 +142,8 @@ fn record_stop_is_idempotent_for_same_meeting() {
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,
+        started_at: None,
+        stopped_at: None,
     });
 
     // First stop via command should succeed

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     text TEXT NOT NULL,
     confidence DOUBLE PRECISION,
     is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
+    source TEXT NOT NULL DEFAULT 'voice',
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -93,6 +94,15 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_meeting_kind
 /// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
 pub const INCREMENTAL_MIGRATIONS_SQL: &str = r#"
 ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS is_noisy BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'voice';
+DO $$
+BEGIN
+    ALTER TABLE transcripts
+    ADD CONSTRAINT transcripts_source_check CHECK (source IN ('voice', 'vc_text'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_channel_id TEXT;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_id TEXT;
 CREATE TABLE IF NOT EXISTS meeting_speakers (
@@ -217,19 +227,22 @@ ON CONFLICT (meeting_id, speaker_id) DO UPDATE SET
 "#;
 
 /// Build a multi-row INSERT statement for transcript segments.
-/// Each segment uses 8 parameters with explicit type casts for the
+/// Each segment uses 9 parameters with explicit type casts for the
 /// String-only `SqlExecutor::execute` interface.
-pub fn build_insert_transcripts_sql(count: usize) -> String {
+///
+/// `param_offset` shifts placeholders by N positions to allow callers to
+/// reserve leading parameters for wrapping CTEs.
+pub fn build_insert_transcripts_sql_with_offset(count: usize, param_offset: usize) -> String {
     let mut sql = String::from(
-        "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy) VALUES ",
+        "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy, source) VALUES ",
     );
     for i in 0..count {
-        let base = i * 8;
+        let base = i * 9 + param_offset;
         if i > 0 {
             sql.push_str(", ");
         }
         sql.push_str(&format!(
-            "(${}, ${}, ${}, ${}::TEXT::INTEGER, ${}::TEXT::INTEGER, ${}, NULLIF(${},'')::TEXT::DOUBLE PRECISION, ${}::TEXT::BOOLEAN)",
+            "(${}, ${}, ${}, ${}::TEXT::INTEGER, ${}::TEXT::INTEGER, ${}, NULLIF(${},'')::TEXT::DOUBLE PRECISION, ${}::TEXT::BOOLEAN, ${})",
             base + 1,
             base + 2,
             base + 3,
@@ -238,8 +251,23 @@ pub fn build_insert_transcripts_sql(count: usize) -> String {
             base + 6,
             base + 7,
             base + 8,
+            base + 9,
         ));
     }
-    sql.push_str(" ON CONFLICT (id) DO NOTHING");
+    sql.push_str(
+        " ON CONFLICT (id) DO UPDATE SET \
+        meeting_id = EXCLUDED.meeting_id, \
+        speaker_id = EXCLUDED.speaker_id, \
+        start_ms = EXCLUDED.start_ms, \
+        end_ms = EXCLUDED.end_ms, \
+        text = EXCLUDED.text, \
+        confidence = EXCLUDED.confidence, \
+        is_noisy = EXCLUDED.is_noisy, \
+        source = EXCLUDED.source",
+    );
     sql
+}
+
+pub fn build_insert_transcripts_sql(count: usize) -> String {
+    build_insert_transcripts_sql_with_offset(count, 0)
 }

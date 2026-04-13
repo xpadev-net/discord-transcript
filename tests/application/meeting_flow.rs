@@ -34,6 +34,8 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
         status: MeetingStatus::Stopping,
         stop_reason: None,
         error_message: None,
+        started_at: None,
+        stopped_at: None,
     }
 }
 

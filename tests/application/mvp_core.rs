@@ -4,6 +4,7 @@ use discord_transcript::domain::recovery::{
 };
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use chrono::Utc;
 use discord_transcript::interfaces::posting::{
     DISCORD_MESSAGE_LIMIT, TranscriptDelivery, decide_transcript_delivery, split_discord_message,
 };
@@ -21,6 +22,8 @@ fn recording_meeting(id: &str) -> StoredMeeting {
         status: MeetingStatus::Recording,
         stop_reason: None,
         error_message: None,
+        started_at: Some(Utc::now()),
+        stopped_at: None,
     }
 }
 

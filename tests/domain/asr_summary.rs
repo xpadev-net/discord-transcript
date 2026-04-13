@@ -5,7 +5,7 @@ use discord_transcript::application::summary::{
 use discord_transcript::domain::privacy::MaskingStats;
 use discord_transcript::domain::speaker::SpeakerProfile;
 use discord_transcript::domain::transcript::{
-    NormalizationConfig, TranscriptSegment, normalize_segments, render_for_summary,
+    NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments, render_for_summary,
 };
 use discord_transcript::infrastructure::asr::{StubWhisperClient, parse_whisper_response};
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
@@ -53,6 +53,7 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
             text: "  hello   world ".to_owned(),
             confidence: Some(0.9),
             is_noisy: false,
+            source: TranscriptSource::Voice,
             merged_count: 1,
         },
         TranscriptSegment {
@@ -62,6 +63,7 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
             text: "next".to_owned(),
             confidence: Some(0.4),
             is_noisy: false,
+            source: TranscriptSource::Voice,
             merged_count: 1,
         },
         TranscriptSegment {
@@ -71,6 +73,7 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
             text: " ".to_owned(),
             confidence: Some(0.8),
             is_noisy: false,
+            source: TranscriptSource::Voice,
             merged_count: 1,
         },
     ];
@@ -100,6 +103,7 @@ fn render_for_summary_prefers_speaker_labels() {
         text: "hello world".to_owned(),
         confidence: None,
         is_noisy: false,
+        source: TranscriptSource::Voice,
         merged_count: 1,
     };
 
