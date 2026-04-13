@@ -1760,13 +1760,11 @@ impl ScaffoldHandler {
             }
         };
 
-        let mut vc_text_fetch_succeeded = false;
         if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
             match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at)
                 .await
             {
                 Ok(messages) => {
-                    vc_text_fetch_succeeded = true;
                     let started_at_ms = started_at.timestamp_millis();
                     let mut vc_segments = Vec::with_capacity(messages.len());
                     for msg in messages {
@@ -1815,9 +1813,26 @@ impl ScaffoldHandler {
         }
 
         // Persist transcript segments to DB (best-effort)
+        if transcription.segments.is_empty() {
+            let mut service = self.service.lock().await;
+            if let Err(err) = service.store.executor.execute(
+                "DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text'",
+                &[claimed_job.meeting_id.clone()],
+            ) {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "failed to clear old vc_text segments after successful empty VC fetch"
+                );
+            }
+        }
         if !transcription.segments.is_empty() {
-            let sql = crate::infrastructure::sql::build_insert_transcripts_sql(
+            let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql(
                 transcription.segments.len(),
+            );
+            let escaped_meeting_id = claimed_job.meeting_id.replace('\'', "''");
+            let sql = format!(
+                "WITH cleared AS (DELETE FROM transcripts WHERE meeting_id='{escaped_meeting_id}' AND source='vc_text') {base_sql}"
             );
             let mut params = Vec::with_capacity(transcription.segments.len() * 9);
             for (i, seg) in transcription.segments.iter().enumerate() {
@@ -1832,18 +1847,6 @@ impl ScaffoldHandler {
                 params.push(seg.source.as_str().to_owned());
             }
             let mut service = self.service.lock().await;
-            if vc_text_fetch_succeeded
-                && let Err(err) = service.store.executor.execute(
-                    "DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text'",
-                    &[claimed_job.meeting_id.clone()],
-                )
-            {
-                warn!(
-                    meeting_id = %claimed_job.meeting_id,
-                    error = %err,
-                    "failed to clear old vc_text segments before re-persist"
-                );
-            }
             if let Err(err) = service.store.executor.execute(&sql, &params) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
