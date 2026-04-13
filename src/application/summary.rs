@@ -298,7 +298,9 @@ pub fn correct_transcript<C: ClaudeSummaryClient>(
         "You are a speech-recognition error corrector.\n\
 \n\
 Below is an ASR (automatic speech recognition) transcript. Each line has the format:\n\
-[start_ms-end_ms] Speaker: text\n\
+[start_ms-end_ms] Speaker [optional-tags]: text\n\
+\n\
+Optional tags that may appear between the speaker name and the colon include [チャット] (VC chat message) and [NOISY] (low-confidence segment).\n\
 \n\
 Fix recognition errors in the **text** portion of each line while keeping the \
 timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\

@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     text TEXT NOT NULL,
     confidence DOUBLE PRECISION,
     is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
-    source TEXT NOT NULL DEFAULT 'voice' CHECK (source IN ('voice', 'vc_text')),
+    source TEXT NOT NULL DEFAULT 'voice',
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

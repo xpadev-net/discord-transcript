@@ -36,6 +36,7 @@ function SpeakerMeta({
 export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
   const speaker = normalizeSpeaker(segment);
   const color = getSpeakerColor(speaker.id || segment.speaker_id);
+  const isVcText = segment.source === "vc_text";
 
   const handleClick = () => onSeek(segment.start_ms);
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -49,7 +50,7 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
     "segment",
     isActive && "active",
     segment.is_noisy && "noisy",
-    segment.source === "vc_text" && "vc-text",
+    isVcText && "vc-text",
   ]
     .filter(Boolean)
     .join(" ");
@@ -68,7 +69,7 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
         </span>
         <SpeakerMeta speaker={speaker} />
         <span className="segment-time">{formatTimestamp(segment.start_ms)}</span>
-        {segment.source === "vc_text" && (
+        {isVcText && (
           <span className="segment-source">Chat</span>
         )}
       </div>

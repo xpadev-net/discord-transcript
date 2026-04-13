@@ -1816,13 +1816,13 @@ impl ScaffoldHandler {
         if transcription.segments.is_empty() {
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(
-                "DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text'",
+                "DELETE FROM transcripts WHERE meeting_id=$1",
                 std::slice::from_ref(&claimed_job.meeting_id),
             ) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
                     error = %err,
-                    "failed to clear old vc_text segments after successful empty VC fetch"
+                    "failed to clear old transcript segments for empty transcription persist"
                 );
             }
         }
@@ -1831,9 +1831,8 @@ impl ScaffoldHandler {
                 transcription.segments.len(),
                 1,
             );
-            let sql = format!(
-                "WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text') {base_sql}"
-            );
+            let sql =
+                format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
             let mut params = Vec::with_capacity(transcription.segments.len() * 9 + 1);
             params.push(claimed_job.meeting_id.clone());
             for (i, seg) in transcription.segments.iter().enumerate() {
