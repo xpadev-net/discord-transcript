@@ -12,7 +12,10 @@ use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voic
 use crate::bootstrap::config::{AppConfig, SummaryHarness};
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
-use crate::domain::transcript::{NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments, render_for_summary};
+use crate::domain::transcript::{
+    NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments,
+    render_for_summary,
+};
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::integrations::{CommandWhisperClient, HarnessCliSummaryClient};
 use crate::infrastructure::queue::JobQueue;
@@ -1758,7 +1761,8 @@ impl ScaffoldHandler {
         };
 
         if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
-            match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at).await
+            match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at)
+                .await
             {
                 Ok(messages) => {
                     let mut vc_segments = Vec::with_capacity(messages.len());

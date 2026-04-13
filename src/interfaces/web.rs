@@ -650,9 +650,15 @@ struct DiscordOverwrite {
     id: String,
     #[serde(rename = "type")]
     type_: u8, // 0 = role, 1 = member
-    #[serde(default = "zero_perm_string", deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default = "zero_perm_string",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     allow: String,
-    #[serde(default = "zero_perm_string", deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default = "zero_perm_string",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     deny: String,
 }
 
