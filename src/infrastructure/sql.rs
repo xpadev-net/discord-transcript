@@ -229,12 +229,15 @@ ON CONFLICT (meeting_id, speaker_id) DO UPDATE SET
 /// Build a multi-row INSERT statement for transcript segments.
 /// Each segment uses 9 parameters with explicit type casts for the
 /// String-only `SqlExecutor::execute` interface.
-pub fn build_insert_transcripts_sql(count: usize) -> String {
+///
+/// `param_offset` shifts placeholders by N positions to allow callers to
+/// reserve leading parameters for wrapping CTEs.
+pub fn build_insert_transcripts_sql_with_offset(count: usize, param_offset: usize) -> String {
     let mut sql = String::from(
         "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy, source) VALUES ",
     );
     for i in 0..count {
-        let base = i * 9;
+        let base = i * 9 + param_offset;
         if i > 0 {
             sql.push_str(", ");
         }
@@ -263,4 +266,8 @@ pub fn build_insert_transcripts_sql(count: usize) -> String {
         source = EXCLUDED.source",
     );
     sql
+}
+
+pub fn build_insert_transcripts_sql(count: usize) -> String {
+    build_insert_transcripts_sql_with_offset(count, 0)
 }

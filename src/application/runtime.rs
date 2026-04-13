@@ -1827,14 +1827,15 @@ impl ScaffoldHandler {
             }
         }
         if !transcription.segments.is_empty() {
-            let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql(
+            let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(
                 transcription.segments.len(),
+                1,
             );
-            let escaped_meeting_id = claimed_job.meeting_id.replace('\'', "''");
             let sql = format!(
-                "WITH cleared AS (DELETE FROM transcripts WHERE meeting_id='{escaped_meeting_id}' AND source='vc_text') {base_sql}"
+                "WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1 AND source='vc_text') {base_sql}"
             );
-            let mut params = Vec::with_capacity(transcription.segments.len() * 9);
+            let mut params = Vec::with_capacity(transcription.segments.len() * 9 + 1);
+            params.push(claimed_job.meeting_id.clone());
             for (i, seg) in transcription.segments.iter().enumerate() {
                 params.push(format!("{}-t-{i}", claimed_job.meeting_id));
                 params.push(claimed_job.meeting_id.clone());

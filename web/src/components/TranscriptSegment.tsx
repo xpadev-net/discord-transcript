@@ -69,7 +69,7 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
         <SpeakerMeta speaker={speaker} />
         <span className="segment-time">{formatTimestamp(segment.start_ms)}</span>
         {segment.source === "vc_text" && (
-          <span className="segment-source">チャット</span>
+          <span className="segment-source">Chat</span>
         )}
       </div>
       <div className="segment-text">{segment.text}</div>
