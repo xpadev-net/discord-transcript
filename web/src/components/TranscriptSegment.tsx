@@ -30,7 +30,7 @@ function SpeakerMeta({
   if (speaker.username) parts.push(`User: ${speaker.username}`);
   if (speaker.id) parts.push(`ID: ${speaker.id}`);
   if (parts.length === 0) return null;
-  return <div className="speaker-meta">{parts.join(" / ")}</div>;
+  return <span className="speaker-meta">{parts.join(" / ")}</span>;
 }
 
 export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
@@ -50,7 +50,7 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
 
   return (
     <button type="button" className={className} onClick={handleClick}>
-      <div className="segment-meta">
+      <span className="segment-meta">
         <span className="speaker-badge" style={{ background: color }}>
           {speaker.displayLabel}
         </span>
@@ -59,8 +59,8 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
           {formatTimestamp(segment.start_ms)}
         </span>
         {isVcText && <span className="segment-source">Chat</span>}
-      </div>
-      <div className="segment-text">{segment.text}</div>
+      </span>
+      <span className="segment-text">{segment.text}</span>
     </button>
   );
 }
