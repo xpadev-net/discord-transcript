@@ -19,7 +19,9 @@ export function SummaryPanel({ markdown, loading }: Props) {
           </div>
         ) : (
           <div className="empty-state">
-            {"\u30b5\u30de\u30ea\u30fc\u306f\u307e\u3060\u5229\u7528\u3067\u304d\u307e\u305b\u3093"}
+            {
+              "\u30b5\u30de\u30ea\u30fc\u306f\u307e\u3060\u5229\u7528\u3067\u304d\u307e\u305b\u3093"
+            }
           </div>
         )}
       </div>

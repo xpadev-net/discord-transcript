@@ -1,6 +1,6 @@
-import type { TranscriptSegment as Segment } from "../lib/types";
 import { formatTimestamp } from "../lib/formatters";
 import { getSpeakerColor } from "../lib/speakers";
+import type { TranscriptSegment as Segment } from "../lib/types";
 
 interface Props {
   segment: Segment;
@@ -30,7 +30,7 @@ function SpeakerMeta({
   if (speaker.username) parts.push(`User: ${speaker.username}`);
   if (speaker.id) parts.push(`ID: ${speaker.id}`);
   if (parts.length === 0) return null;
-  return <div className="speaker-meta">{parts.join(" / ")}</div>;
+  return <span className="speaker-meta">{parts.join(" / ")}</span>;
 }
 
 export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
@@ -39,13 +39,6 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
   const isVcText = segment.source === "vc_text";
 
   const handleClick = () => onSeek(segment.start_ms);
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      onSeek(segment.start_ms);
-    }
-  };
-
   const className = [
     "segment",
     isActive && "active",
@@ -56,24 +49,18 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
     .join(" ");
 
   return (
-    <div
-      className={className}
-      tabIndex={0}
-      role="button"
-      onClick={handleClick}
-      onKeyDown={handleKeyDown}
-    >
-      <div className="segment-meta">
+    <button type="button" className={className} onClick={handleClick}>
+      <span className="segment-meta">
         <span className="speaker-badge" style={{ background: color }}>
           {speaker.displayLabel}
         </span>
         <SpeakerMeta speaker={speaker} />
-        <span className="segment-time">{formatTimestamp(segment.start_ms)}</span>
-        {isVcText && (
-          <span className="segment-source">Chat</span>
-        )}
-      </div>
-      <div className="segment-text">{segment.text}</div>
-    </div>
+        <span className="segment-time">
+          {formatTimestamp(segment.start_ms)}
+        </span>
+        {isVcText && <span className="segment-source">Chat</span>}
+      </span>
+      <span className="segment-text">{segment.text}</span>
+    </button>
   );
 }

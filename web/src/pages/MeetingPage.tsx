@@ -1,11 +1,11 @@
 import { useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
-import { Header } from "../components/Header";
 import { AudioPlayer } from "../components/AudioPlayer";
-import { TranscriptPanel } from "../components/TranscriptPanel";
+import { Header } from "../components/Header";
 import { SummaryPanel } from "../components/SummaryPanel";
-import { useMeetingData } from "../hooks/useMeetingData";
+import { TranscriptPanel } from "../components/TranscriptPanel";
 import { useAudioSync } from "../hooks/useAudioSync";
+import { useMeetingData } from "../hooks/useMeetingData";
 import { getAudioUrl } from "../lib/api";
 
 export function MeetingPage() {
@@ -13,7 +13,8 @@ export function MeetingPage() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
 
-  const { meeting, transcript, summary, loading, error } = useMeetingData(meetingId);
+  const { meeting, transcript, summary, loading, error } =
+    useMeetingData(meetingId);
   const { activeIndex, seekTo } = useAudioSync(
     audioRef,
     transcriptContainerRef,
@@ -30,9 +31,7 @@ export function MeetingPage() {
     return (
       <>
         <Header meeting={null} />
-        <div className="empty-state">
-          {error}
-        </div>
+        <div className="empty-state">{error}</div>
       </>
     );
   }
@@ -42,7 +41,11 @@ export function MeetingPage() {
       <Header meeting={meeting} />
       <div className="main-container">
         <div className="left-panel">
-          <AudioPlayer key={meetingId} ref={audioRef} src={meetingId ? getAudioUrl(meetingId) : ""} />
+          <AudioPlayer
+            key={meetingId}
+            ref={audioRef}
+            src={meetingId ? getAudioUrl(meetingId) : ""}
+          />
           <TranscriptPanel
             ref={transcriptContainerRef}
             segments={transcript}

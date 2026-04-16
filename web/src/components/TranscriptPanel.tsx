@@ -1,7 +1,7 @@
 import { forwardRef } from "react";
 import type { TranscriptSegment } from "../lib/types";
-import { TranscriptSegmentRow } from "./TranscriptSegment";
 import { LoadingSpinner } from "./LoadingSpinner";
+import { TranscriptSegmentRow } from "./TranscriptSegment";
 
 interface Props {
   segments: TranscriptSegment[] | null;
@@ -23,7 +23,9 @@ export const TranscriptPanel = forwardRef<HTMLDivElement, Props>(
       return (
         <div className="transcript-container" ref={ref}>
           <div className="empty-state">
-            {"\u3053\u306e\u4f1a\u8b70\u306e\u6587\u5b57\u8d77\u3053\u3057\u306f\u307e\u3060\u5229\u7528\u3067\u304d\u307e\u305b\u3093"}
+            {
+              "\u3053\u306e\u4f1a\u8b70\u306e\u6587\u5b57\u8d77\u3053\u3057\u306f\u307e\u3060\u5229\u7528\u3067\u304d\u307e\u305b\u3093"
+            }
           </div>
         </div>
       );

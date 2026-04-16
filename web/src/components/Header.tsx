@@ -1,5 +1,5 @@
-import type { MeetingResponse } from "../lib/types";
 import { formatDate, formatDuration } from "../lib/formatters";
+import type { MeetingResponse } from "../lib/types";
 
 const STATUS_LABELS: Record<string, string> = {
   posted: "\u5b8c\u4e86",

@@ -14,7 +14,7 @@ const SPEAKER_COLORS = [
 export function getSpeakerColor(speakerId: string): string {
   let hash = 0;
   for (let i = 0; i < speakerId.length; i++) {
-    hash = ((hash << 5) - hash) + speakerId.charCodeAt(i);
+    hash = (hash << 5) - hash + speakerId.charCodeAt(i);
     hash = hash & hash;
   }
   return SPEAKER_COLORS[Math.abs(hash) % SPEAKER_COLORS.length];
