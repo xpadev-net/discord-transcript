@@ -1,4 +1,4 @@
-import { Routes, Route } from "react-router-dom";
+import { Route, Routes } from "react-router-dom";
 import { MeetingPage } from "./pages/MeetingPage";
 
 export function App() {
@@ -9,7 +9,9 @@ export function App() {
         path="*"
         element={
           <div className="empty-state">
-            {"\u4f1a\u8b70\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044"}
+            {
+              "\u4f1a\u8b70\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044"
+            }
           </div>
         }
       />

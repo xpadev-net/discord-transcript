@@ -59,7 +59,10 @@ export function useAudioSync(
       let newIndex = -1;
 
       for (let i = 0; i < segments.length; i++) {
-        if (currentMs >= segments[i].start_ms && currentMs < segments[i].end_ms) {
+        if (
+          currentMs >= segments[i].start_ms &&
+          currentMs < segments[i].end_ms
+        ) {
           newIndex = i;
           break;
         }
@@ -76,7 +79,8 @@ export function useAudioSync(
             const segEl = segmentEls[newIndex];
             const containerRect = container.getBoundingClientRect();
             const segRect = segEl.getBoundingClientRect();
-            const offset = segRect.top - containerRect.top - containerRect.height / 3;
+            const offset =
+              segRect.top - containerRect.top - containerRect.height / 3;
             container.scrollBy({ top: offset, behavior: "smooth" });
           }
         }
