@@ -603,9 +603,16 @@ impl EventHandler for ScaffoldHandler {
             states.remove(&guild_key);
             return;
         };
-        let non_bot =
+        let Some(non_bot) =
             count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id)
-                .unwrap_or(0);
+        else {
+            warn!(
+                guild_id = %self.guild_id,
+                target_voice_channel_id,
+                "voice state cache unavailable; skipping auto-stop evaluation to avoid false trigger"
+            );
+            return;
+        };
         let grace = Duration::from_secs(self.auto_stop_grace_seconds);
         let signal = {
             let mut states = self.auto_stop_states.lock().await;
@@ -623,6 +630,7 @@ impl EventHandler for ScaffoldHandler {
             let guild_for_task = guild_key;
             let expected_meeting_id = self.active_meeting_id().await;
             let grace_for_task = grace;
+            let target_channel_for_task = target_voice_channel_id;
             tokio::spawn(async move {
                 sleep(grace_for_task).await;
                 // Verify the same meeting is still active (not a new recording)
@@ -634,6 +642,42 @@ impl EventHandler for ScaffoldHandler {
                         state.clear_timer_active();
                     }
                     return;
+                }
+                // Re-verify the voice channel state at fire time. A prior cache-miss
+                // in voice_state_update may have skipped cancelling this timer even
+                // after members rejoined, so we must not rely solely on the state
+                // machine's stale empty_since_ms here.
+                match count_non_bot_members_in_target_voice(
+                    &ctx_for_task,
+                    handler.guild_id,
+                    target_channel_for_task,
+                ) {
+                    None => {
+                        warn!(
+                            guild_id = %handler.guild_id,
+                            target_voice_channel_id = target_channel_for_task,
+                            "voice state cache unavailable at auto-stop grace expiry; skipping stop"
+                        );
+                        let mut states = handler.auto_stop_states.lock().await;
+                        if let Some(state) = states.get_mut(&guild_for_task) {
+                            state.clear_timer_active();
+                        }
+                        return;
+                    }
+                    Some(n) if n > 0 => {
+                        debug!(
+                            guild_id = %handler.guild_id,
+                            target_voice_channel_id = target_channel_for_task,
+                            non_bot = n,
+                            "members rejoined during grace period; cancelling auto-stop"
+                        );
+                        let mut states = handler.auto_stop_states.lock().await;
+                        if let Some(state) = states.get_mut(&guild_for_task) {
+                            let _ = state.on_non_bot_member_count_changed(n, now_ms());
+                        }
+                        return;
+                    }
+                    Some(_) => {}
                 }
                 let trigger = {
                     let mut states = handler.auto_stop_states.lock().await;
@@ -2325,14 +2369,23 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             &ctx_for_task,
                             runtime.guild_id,
                             target_voice_channel_id,
-                        )
-                        .unwrap_or(false);
+                        );
                         let non_bot = count_non_bot_members_in_target_voice(
                             &ctx_for_task,
                             runtime.guild_id,
                             target_voice_channel_id,
-                        )
-                        .unwrap_or(0);
+                        );
+                        // Treat cache misses as "unknown" rather than "empty/disconnected" to
+                        // avoid stopping an active recording when the guild cache is transiently
+                        // unavailable (e.g. during gateway reconnect / warm-up).
+                        let (Some(reconnected), Some(non_bot)) = (reconnected, non_bot) else {
+                            warn!(
+                                guild_id = %runtime.guild_id,
+                                target_voice_channel_id,
+                                "voice state cache unavailable on client-disconnect grace expiry; skipping stop"
+                            );
+                            return;
+                        };
                         if reconnected || non_bot > 0 {
                             return;
                         }
