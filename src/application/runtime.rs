@@ -1197,14 +1197,13 @@ impl ScaffoldHandler {
                 runtime: self.clone(),
                 http: Arc::clone(&ctx.http),
                 ctx: ctx.clone(),
-                bot_user_id: ctx.cache.current_user().id.get(),
             };
             call.add_global_event(
                 Event::Core(CoreEvent::SpeakingStateUpdate),
                 voice_handler.clone(),
             );
             call.add_global_event(Event::Core(CoreEvent::VoiceTick), voice_handler.clone());
-            call.add_global_event(Event::Core(CoreEvent::ClientDisconnect), voice_handler);
+            call.add_global_event(Event::Core(CoreEvent::DriverDisconnect), voice_handler);
         }
 
         info!(
@@ -2297,7 +2296,6 @@ struct VoiceReceiveHandler {
     runtime: ScaffoldHandler,
     http: Arc<Http>,
     ctx: Context,
-    bot_user_id: u64,
 }
 
 #[serenity::async_trait]
@@ -2340,12 +2338,14 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
                 }
             }
-            EventContext::ClientDisconnect(evt) => {
-                let user_id_u64 = evt.user_id.0;
-                if user_id_u64 != self.bot_user_id {
-                    return None;
-                }
-                warn!(user_id = user_id_u64, "bot voice client disconnected");
+            EventContext::DriverDisconnect(data) => {
+                warn!(
+                    guild_id = %self.guild_id,
+                    channel_id = data.channel_id.0.get(),
+                    kind = ?data.kind,
+                    reason = ?data.reason,
+                    "bot voice driver disconnected"
+                );
                 {
                     let runtime = self.runtime.clone();
                     let guild_key = self.guild_id.clone();
@@ -2382,7 +2382,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             warn!(
                                 guild_id = %runtime.guild_id,
                                 target_voice_channel_id,
-                                "voice state cache unavailable on client-disconnect grace expiry; skipping stop"
+                                "voice state cache unavailable on driver-disconnect grace expiry; skipping stop"
                             );
                             return;
                         };
@@ -2395,10 +2395,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             if let Some(session) = sessions.get_mut(&guild_key) {
                                 match session.flush_all() {
                                     Ok(result) if !result.failed.is_empty() => {
-                                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on client disconnect");
+                                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on driver disconnect");
                                     }
                                     Err(err) => {
-                                        warn!(guild_id = %guild_key, error = %err, "failed to flush audio on client disconnect");
+                                        warn!(guild_id = %guild_key, error = %err, "failed to flush audio on driver disconnect");
                                     }
                                     _ => {}
                                 }
@@ -2440,7 +2440,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         guild_id = %guild_key,
                                         meeting_id = %result.meeting_id,
                                         error = %err,
-                                        "failed to update status message after client disconnect stop"
+                                        "failed to update status message after driver disconnect stop"
                                     );
                                 }
                                 if result.outcome == StopOutcome::Owner
@@ -2452,7 +2452,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         guild_id = %guild_key,
                                         meeting_id = %result.meeting_id,
                                         error = %err,
-                                        "failed to process summary after client disconnect"
+                                        "failed to process summary after driver disconnect"
                                     );
                                 }
                             }
@@ -2460,7 +2460,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 warn!(
                                     guild_id = %guild_key,
                                     error = %err,
-                                    "failed to stop recording on client disconnect"
+                                    "failed to stop recording on driver disconnect"
                                 );
                             }
                         }
