@@ -603,9 +603,16 @@ impl EventHandler for ScaffoldHandler {
             states.remove(&guild_key);
             return;
         };
-        let non_bot =
+        let Some(non_bot) =
             count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id)
-                .unwrap_or(0);
+        else {
+            warn!(
+                guild_id = %self.guild_id,
+                target_voice_channel_id,
+                "voice state cache unavailable; skipping auto-stop evaluation to avoid false trigger"
+            );
+            return;
+        };
         let grace = Duration::from_secs(self.auto_stop_grace_seconds);
         let signal = {
             let mut states = self.auto_stop_states.lock().await;
@@ -2325,14 +2332,23 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             &ctx_for_task,
                             runtime.guild_id,
                             target_voice_channel_id,
-                        )
-                        .unwrap_or(false);
+                        );
                         let non_bot = count_non_bot_members_in_target_voice(
                             &ctx_for_task,
                             runtime.guild_id,
                             target_voice_channel_id,
-                        )
-                        .unwrap_or(0);
+                        );
+                        // Treat cache misses as "unknown" rather than "empty/disconnected" to
+                        // avoid stopping an active recording when the guild cache is transiently
+                        // unavailable (e.g. during gateway reconnect / warm-up).
+                        let (Some(reconnected), Some(non_bot)) = (reconnected, non_bot) else {
+                            warn!(
+                                guild_id = %runtime.guild_id,
+                                target_voice_channel_id,
+                                "voice state cache unavailable on client-disconnect grace expiry; skipping stop"
+                            );
+                            return;
+                        };
                         if reconnected || non_bot > 0 {
                             return;
                         }
