@@ -203,3 +203,28 @@ fn auto_stop_triggers_after_grace_period_and_can_cancel() {
     );
     assert_eq!(state.tick(40_000), AutoStopSignal::Idle);
 }
+
+#[test]
+fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
+    // Simulates the runtime's grace-expiry path when a prior cache miss caused
+    // voice_state_update to skip cancelling the timer. At fire time the runtime
+    // re-checks member count, sees members returned, feeds that back into the
+    // state machine, and must allow a fresh timer for a subsequent empty episode.
+    let mut state = AutoStopState::new(Duration::from_secs(60));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0, 1_000),
+        AutoStopSignal::StartTimer
+    );
+    // Fire-time re-verification observes members present and pushes that into state.
+    assert_eq!(
+        state.on_non_bot_member_count_changed(2, 1_000 + 60_000),
+        AutoStopSignal::Cancelled
+    );
+
+    // A later empty episode must be able to start a new timer.
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0, 120_000),
+        AutoStopSignal::StartTimer
+    );
+    assert_eq!(state.tick(120_000 + 60_000), AutoStopSignal::Trigger);
+}
