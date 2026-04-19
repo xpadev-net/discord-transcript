@@ -151,6 +151,16 @@ fn fallback_start_ms(path: &Path, duration_ms: u64) -> u64 {
     }
 }
 
+pub(crate) fn compute_meeting_start_ms(chunks: &[LoadedChunk]) -> u64 {
+    chunks
+        .iter()
+        .map(|c| c.start_ms)
+        .filter(|value| *value > 0)
+        .min()
+        .or_else(|| chunks.iter().map(|c| c.start_ms).min())
+        .unwrap_or(0)
+}
+
 fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
     let samples = (duration_ms as u128)
         .saturating_mul(sample_rate as u128)
@@ -217,13 +227,7 @@ pub fn build_speaker_audio_inputs(
         return Err("mixed sample rates are not supported".to_owned());
     }
 
-    let meeting_start_ms = chunks
-        .iter()
-        .map(|c| c.start_ms)
-        .filter(|value| *value > 0)
-        .min()
-        .or_else(|| chunks.iter().map(|c| c.start_ms).min())
-        .unwrap_or(0);
+    let meeting_start_ms = compute_meeting_start_ms(&chunks);
 
     let mut per_user: HashMap<String, Vec<LoadedChunk>> = HashMap::new();
     for chunk in chunks {

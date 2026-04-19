@@ -5,7 +5,7 @@ use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::enqueue_summary_job;
-use crate::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
+use crate::audio::meeting_audio::{build_speaker_audio_inputs, compute_meeting_start_ms, load_chunks};
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::RecordingSession;
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
@@ -160,8 +160,46 @@ pub fn meeting_audio_path(
         .to_string()
 }
 
-type UserPcmChunk = (String, Vec<u8>);
-type SequenceGroup = (u64, Vec<UserPcmChunk>);
+/// Place every chunk on a shared wall-clock timeline so speakers with
+/// different join times (and thus independent per-user sequence numbers)
+/// stay aligned in the mixdown. `meeting_start_ms` anchors t=0 of the output.
+fn mix_chunks_by_wallclock(
+    chunks: &[crate::audio::meeting_audio::LoadedChunk],
+    sample_rate: u32,
+) -> Vec<u8> {
+    let meeting_start_ms = compute_meeting_start_ms(chunks);
+    let total_ms = chunks
+        .iter()
+        .map(|c| c.start_ms.saturating_add(c.duration_ms))
+        .max()
+        .unwrap_or(meeting_start_ms)
+        .saturating_sub(meeting_start_ms);
+    let total_samples = (total_ms as u128)
+        .saturating_mul(sample_rate as u128)
+        .saturating_div(1_000) as usize;
+
+    let mut mixed = vec![0i32; total_samples];
+    for chunk in chunks {
+        let offset_ms = chunk.start_ms.saturating_sub(meeting_start_ms);
+        let offset_samples =
+            ((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize;
+        let chunk_samples = chunk.pcm.len() / 2;
+        let end_samples = offset_samples.saturating_add(chunk_samples).min(total_samples);
+        let usable = end_samples.saturating_sub(offset_samples);
+        for i in 0..usable {
+            let sample =
+                i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;
+            mixed[offset_samples + i] = mixed[offset_samples + i].saturating_add(sample);
+        }
+    }
+
+    let mut out = Vec::with_capacity(mixed.len() * 2);
+    for sample in &mixed {
+        let clamped = (*sample).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        out.extend_from_slice(&clamped.to_le_bytes());
+    }
+    out
+}
 
 pub fn merge_user_chunks_to_mixdown(
     audio_dir: &std::path::Path,
@@ -171,50 +209,13 @@ pub fn merge_user_chunks_to_mixdown(
 
     let mixdown_path = audio_dir.join("mixdown.wav");
 
-    let mut chunks = load_chunks(audio_dir)?;
+    let chunks = load_chunks(audio_dir)?;
     let sample_rate = chunks.first().map(|c| c.sample_rate).unwrap_or(48_000);
     if chunks.iter().any(|c| c.sample_rate != sample_rate) {
         return Err("mixed sample rates are not supported for mixdown".to_owned());
     }
 
-    // Sort by (sequence, user_id) to interleave users within each time window.
-    chunks.sort_by(|a, b| a.sequence.cmp(&b.sequence).then(a.user_id.cmp(&b.user_id)));
-
-    // Mix same-sequence chunks by summing samples
-    let mut sequence_groups: Vec<SequenceGroup> = Vec::new();
-    for chunk in chunks {
-        match sequence_groups.last_mut() {
-            Some((last_seq, group)) if *last_seq == chunk.sequence => {
-                group.push((chunk.user_id.clone(), chunk.pcm));
-            }
-            _ => {
-                sequence_groups.push((chunk.sequence, vec![(chunk.user_id, chunk.pcm)]));
-            }
-        }
-    }
-
-    // Mix each sequence group: sum i16 samples with clipping
-    let mut all_pcm = Vec::new();
-    for (_seq, group) in &sequence_groups {
-        if group.len() == 1 {
-            all_pcm.extend_from_slice(&group[0].1);
-            continue;
-        }
-        // Find max length, then sum samples
-        let max_len = group.iter().map(|(_, pcm)| pcm.len()).max().unwrap_or(0);
-        let sample_count = max_len / 2;
-        let mut mixed = vec![0i32; sample_count];
-        for (_, pcm) in group {
-            for i in 0..pcm.len() / 2 {
-                let sample = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as i32;
-                mixed[i] += sample;
-            }
-        }
-        for sample in &mixed {
-            let clamped = (*sample).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            all_pcm.extend_from_slice(&clamped.to_le_bytes());
-        }
-    }
+    let all_pcm = mix_chunks_by_wallclock(&chunks, sample_rate);
 
     let (final_pcm, final_rate) = if resample_to_16k {
         let (pcm, rate) = crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000);
@@ -2783,6 +2784,63 @@ mod status_message_tests {
         assert_eq!(result, Some(1));
         assert_eq!(messenger.edits.lock().unwrap().len(), 1);
         assert_eq!(messenger.sends.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mix_chunks_by_wallclock_aligns_speakers_on_shared_timeline() {
+        use crate::audio::meeting_audio::LoadedChunk;
+        use std::path::PathBuf;
+
+        // User A speaks at t=0..1000ms with amplitude 1000.
+        // User B joins late and speaks at t=2000..3000ms with amplitude 2000.
+        // Their chunks have independent per-user sequence numbers (both seq=1),
+        // so the old mixdown logic collapsed them to the same position.
+        let sample_rate = 48_000;
+        let samples_per_sec = sample_rate as usize;
+
+        let pcm_a = i16_bytes(&vec![1000i16; samples_per_sec]);
+        let pcm_b = i16_bytes(&vec![2000i16; samples_per_sec]);
+
+        let chunks = vec![
+            LoadedChunk {
+                user_id: "user-a".into(),
+                sequence: 1,
+                start_ms: 1_000,
+                duration_ms: 1_000,
+                sample_rate,
+                pcm: pcm_a,
+                path: PathBuf::from("a.wav"),
+            },
+            LoadedChunk {
+                user_id: "user-b".into(),
+                sequence: 1,
+                start_ms: 3_000,
+                duration_ms: 1_000,
+                sample_rate,
+                pcm: pcm_b,
+                path: PathBuf::from("b.wav"),
+            },
+        ];
+
+        let mixed = super::mix_chunks_by_wallclock(&chunks, sample_rate);
+        let sample_at = |ms: u64| {
+            let i = (ms as usize) * samples_per_sec / 1000;
+            i16::from_le_bytes([mixed[i * 2], mixed[i * 2 + 1]])
+        };
+
+        // meeting_start is 1000ms, so output spans 0..3000ms (3s).
+        assert_eq!(mixed.len(), 3 * samples_per_sec * 2);
+        assert_eq!(sample_at(500), 1000, "user A audio in first second");
+        assert_eq!(sample_at(1500), 0, "silence while no one speaks");
+        assert_eq!(sample_at(2500), 2000, "user B audio in third second");
+    }
+
+    fn i16_bytes(samples: &[i16]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
     }
 
     #[test]
