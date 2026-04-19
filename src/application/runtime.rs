@@ -5,7 +5,9 @@ use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::enqueue_summary_job;
-use crate::audio::meeting_audio::{build_speaker_audio_inputs, compute_meeting_start_ms, load_chunks};
+use crate::audio::meeting_audio::{
+    build_speaker_audio_inputs, compute_meeting_start_ms, load_chunks,
+};
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::RecordingSession;
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
@@ -168,27 +170,25 @@ fn mix_chunks_by_wallclock(
     sample_rate: u32,
 ) -> Vec<u8> {
     let meeting_start_ms = compute_meeting_start_ms(chunks);
-    let total_ms = chunks
+    // Derive buffer length from actual PCM byte counts rather than
+    // duration_ms so that sub-millisecond tails aren't truncated by the
+    // round-trip through integer milliseconds.
+    let offset_samples_for = |start_ms: u64| -> usize {
+        let offset_ms = start_ms.saturating_sub(meeting_start_ms);
+        ((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize
+    };
+    let total_samples = chunks
         .iter()
-        .map(|c| c.start_ms.saturating_add(c.duration_ms))
+        .map(|c| offset_samples_for(c.start_ms) + c.pcm.len() / 2)
         .max()
-        .unwrap_or(meeting_start_ms)
-        .saturating_sub(meeting_start_ms);
-    let total_samples = (total_ms as u128)
-        .saturating_mul(sample_rate as u128)
-        .saturating_div(1_000) as usize;
+        .unwrap_or(0);
 
     let mut mixed = vec![0i32; total_samples];
     for chunk in chunks {
-        let offset_ms = chunk.start_ms.saturating_sub(meeting_start_ms);
-        let offset_samples =
-            ((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize;
+        let offset_samples = offset_samples_for(chunk.start_ms);
         let chunk_samples = chunk.pcm.len() / 2;
-        let end_samples = offset_samples.saturating_add(chunk_samples).min(total_samples);
-        let usable = end_samples.saturating_sub(offset_samples);
-        for i in 0..usable {
-            let sample =
-                i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;
+        for i in 0..chunk_samples {
+            let sample = i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;
             mixed[offset_samples + i] = mixed[offset_samples + i].saturating_add(sample);
         }
     }
@@ -2833,6 +2833,33 @@ mod status_message_tests {
         assert_eq!(sample_at(500), 1000, "user A audio in first second");
         assert_eq!(sample_at(1500), 0, "silence while no one speaks");
         assert_eq!(sample_at(2500), 2000, "user B audio in third second");
+    }
+
+    #[test]
+    fn mix_chunks_by_wallclock_preserves_sub_ms_tail_samples() {
+        use crate::audio::meeting_audio::LoadedChunk;
+        use std::path::PathBuf;
+
+        // 47999 samples @ 48 kHz = 999 ms (floor) — if total_samples were
+        // derived from duration_ms, the last 47 samples would be clipped.
+        let sample_rate = 48_000;
+        let sample_count = 47_999;
+        let pcm = i16_bytes(&vec![1234i16; sample_count]);
+
+        let chunks = vec![LoadedChunk {
+            user_id: "user-a".into(),
+            sequence: 1,
+            start_ms: 0,
+            duration_ms: 999,
+            sample_rate,
+            pcm,
+            path: PathBuf::from("a.wav"),
+        }];
+
+        let mixed = super::mix_chunks_by_wallclock(&chunks, sample_rate);
+        assert_eq!(mixed.len(), sample_count * 2);
+        let last = i16::from_le_bytes([mixed[mixed.len() - 2], mixed[mixed.len() - 1]]);
+        assert_eq!(last, 1234, "tail sample preserved despite ms rounding");
     }
 
     fn i16_bytes(samples: &[i16]) -> Vec<u8> {
