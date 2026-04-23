@@ -420,6 +420,8 @@ audio::-webkit-media-controls-panel {
 .speaker-audio-name {
   font-size: 0.85rem;
   color: var(--text-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .speaker-audio-download {

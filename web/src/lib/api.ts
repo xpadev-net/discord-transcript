@@ -9,7 +9,7 @@ function basePath(meetingId: string): string {
   return `/api/meetings/${encodeURIComponent(meetingId)}`;
 }
 
-function handleResponse(response: Response): Promise<unknown> {
+function handleResponse<T>(response: Response): Promise<T> {
   if (response.status === 401) {
     window.location.href = `/auth/login?redirect=${encodeURIComponent(window.location.pathname + window.location.search + window.location.hash)}`;
     return new Promise(() => {});
@@ -19,16 +19,14 @@ function handleResponse(response: Response): Promise<unknown> {
       new Error(`${response.status} ${response.statusText}`),
     );
   }
-  return response.json();
+  return response.json() as Promise<T>;
 }
 
 export function fetchMeeting(
   meetingId: string,
   signal?: AbortSignal,
 ): Promise<MeetingResponse> {
-  return fetch(basePath(meetingId), { signal }).then(
-    handleResponse,
-  ) as Promise<MeetingResponse>;
+  return fetch(basePath(meetingId), { signal }).then(handleResponse<MeetingResponse>);
 }
 
 export function fetchTranscript(
@@ -36,8 +34,8 @@ export function fetchTranscript(
   signal?: AbortSignal,
 ): Promise<TranscriptSegment[]> {
   return fetch(`${basePath(meetingId)}/transcript`, { signal }).then(
-    handleResponse,
-  ) as Promise<TranscriptSegment[]>;
+    handleResponse<TranscriptSegment[]>,
+  );
 }
 
 export function fetchSummary(
@@ -45,8 +43,8 @@ export function fetchSummary(
   signal?: AbortSignal,
 ): Promise<SummaryResponse> {
   return fetch(`${basePath(meetingId)}/summary`, { signal }).then(
-    handleResponse,
-  ) as Promise<SummaryResponse>;
+    handleResponse<SummaryResponse>,
+  );
 }
 
 export function getAudioUrl(meetingId: string): string {
@@ -58,8 +56,8 @@ export function fetchSpeakers(
   signal?: AbortSignal,
 ): Promise<SpeakerAudioInfo[]> {
   return fetch(`${basePath(meetingId)}/speakers`, { signal }).then(
-    handleResponse,
-  ) as Promise<SpeakerAudioInfo[]>;
+    handleResponse<SpeakerAudioInfo[]>,
+  );
 }
 
 export function getSpeakerAudioUrl(

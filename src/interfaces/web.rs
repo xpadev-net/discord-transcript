@@ -1088,7 +1088,13 @@ async fn api_audio(
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
-                let body = stream_file_range(&path, start, length).await?;
+                let body = stream_file_range(&path, start, length).await.map_err(|e| {
+                    if e == StatusCode::NOT_FOUND {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                })?;
 
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
@@ -1280,7 +1286,13 @@ async fn api_speaker_audio(
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
-                let body = stream_file_range(&path, start, length).await?;
+                let body = stream_file_range(&path, start, length).await.map_err(|e| {
+                    if e == StatusCode::NOT_FOUND {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                })?;
 
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
@@ -1350,17 +1362,29 @@ fn build_content_disposition(display_label: &str) -> String {
     } else {
         ascii_fallback
     };
-    let encoded: String = safe_label
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{:02X}", b),
-        })
-        .collect();
+    let encoded_label: String = if safe_label.trim().is_empty() {
+        fallback_name
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{:02X}", b),
+            })
+            .collect()
+    } else {
+        safe_label
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{:02X}", b),
+            })
+            .collect()
+    };
     format!(
-        r#"attachment; filename="{fallback_name}_speaker.wav"; filename*=UTF-8''{encoded}_speaker.wav"#
+        r#"attachment; filename="{fallback_name}_speaker.wav"; filename*=UTF-8''{encoded_label}_speaker.wav"#
     )
 }
 
@@ -1408,9 +1432,13 @@ async fn stream_file_range(
 ) -> Result<axum::body::Body, StatusCode> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     file.seek(std::io::SeekFrom::Start(start))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

@@ -40,23 +40,24 @@ export function MeetingPage() {
       setSpeakersError(false);
       return;
     }
+    const currentId = meetingId;
     const controller = new AbortController();
     setSpeakers(null);
     setSpeakersError(false);
     setSpeakersLoading(true);
-    fetchSpeakers(meetingId, controller.signal)
+    fetchSpeakers(currentId, controller.signal)
       .then((data) => {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && meetingId === currentId) {
           setSpeakers(data);
         }
       })
       .catch(() => {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && meetingId === currentId) {
           setSpeakersError(true);
         }
       })
       .finally(() => {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && meetingId === currentId) {
           setSpeakersLoading(false);
         }
       });
