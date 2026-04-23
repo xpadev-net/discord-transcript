@@ -1213,17 +1213,26 @@ async fn api_speaker_audio(
 ) -> Result<Response, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
-    let speaker_exists = state
+    let speaker_row = state
         .db
         .query_opt(
-            "SELECT 1 FROM meeting_speakers WHERE meeting_id=$1 AND speaker_id=$2",
+            "SELECT username, nickname, display_name FROM meeting_speakers WHERE meeting_id=$1 AND speaker_id=$2",
             &[&meeting_id, &speaker_id],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if speaker_exists.is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    let speaker_row = match speaker_row {
+        Some(row) => row,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let profile = SpeakerProfile {
+        speaker_id: speaker_id.clone(),
+        username: speaker_row.get("username"),
+        nickname: speaker_row.get("nickname"),
+        display_name: speaker_row.get("display_name"),
+    };
+    let display_label = profile.display_label();
 
     let row = state
         .db
@@ -1258,7 +1267,7 @@ async fn api_speaker_audio(
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     let file_size = metadata.len();
-    let content_disposition = format!("attachment; filename=\"{safe_speaker}_speaker.wav\"");
+    let content_disposition = build_content_disposition(&display_label);
 
     if let Some(range_header) = headers.get(header::RANGE) {
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1307,6 +1316,32 @@ async fn api_speaker_audio(
 }
 
 // ---------- Helpers ----------
+
+fn build_content_disposition(display_label: &str) -> String {
+    let safe_label: String = display_label
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let ascii_fallback: String = safe_label
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect();
+    let encoded: String = safe_label
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
+    format!(
+        r#"attachment; filename="{ascii_fallback}_speaker.wav"; filename*=UTF-8''{encoded}_speaker.wav"#
+    )
+}
 
 fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     if file_size == 0 {
