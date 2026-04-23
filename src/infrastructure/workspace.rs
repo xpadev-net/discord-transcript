@@ -75,6 +75,10 @@ impl MeetingWorkspacePaths {
         self.audio_dir().join("mixdown.wav")
     }
 
+    pub fn speakers_dir(&self) -> PathBuf {
+        self.root.join("speakers")
+    }
+
     pub fn masked_transcript_path(&self) -> PathBuf {
         self.transcript_dir().join(MASKED_TRANSCRIPT_FILENAME)
     }

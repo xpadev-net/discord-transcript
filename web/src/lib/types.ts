@@ -29,3 +29,12 @@ export interface TranscriptSegment {
 export interface SummaryResponse {
   markdown: string | null;
 }
+
+export interface SpeakerAudioInfo {
+  speaker_id: string;
+  username: string | null;
+  nickname: string | null;
+  display_name: string | null;
+  display_label: string;
+  has_audio: boolean;
+}

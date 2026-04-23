@@ -1,5 +1,6 @@
 import type {
   MeetingResponse,
+  SpeakerAudioInfo,
   SummaryResponse,
   TranscriptSegment,
 } from "./types";
@@ -50,4 +51,20 @@ export function fetchSummary(
 
 export function getAudioUrl(meetingId: string): string {
   return `${basePath(meetingId)}/audio`;
+}
+
+export function fetchSpeakers(
+  meetingId: string,
+  signal?: AbortSignal,
+): Promise<SpeakerAudioInfo[]> {
+  return fetch(`${basePath(meetingId)}/speakers`, { signal }).then(
+    handleResponse,
+  ) as Promise<SpeakerAudioInfo[]>;
+}
+
+export function getSpeakerAudioUrl(
+  meetingId: string,
+  speakerId: string,
+): string {
+  return `${basePath(meetingId)}/speakers/${encodeURIComponent(speakerId)}/audio`;
 }
