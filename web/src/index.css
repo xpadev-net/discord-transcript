@@ -432,7 +432,8 @@ audio::-webkit-media-controls-panel {
   transition: background 0.15s ease;
 }
 
-.speaker-audio-download:hover {
+.speaker-audio-download:hover,
+.speaker-audio-download:focus-visible {
   background: var(--accent-glow);
 }
 

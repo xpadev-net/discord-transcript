@@ -1112,7 +1112,13 @@ async fn api_audio(
 
     let file = tokio::fs::File::open(&path)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
@@ -1301,7 +1307,13 @@ async fn api_speaker_audio(
 
     let file = tokio::fs::File::open(&path)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
@@ -1322,13 +1334,20 @@ fn build_content_disposition(display_label: &str) -> String {
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect();
     let ascii_fallback: String = safe_label
         .chars()
-        .map(|c| if c.is_ascii() { c } else { '_' })
+        .map(|c| if c.is_ascii() && !c.is_control() { c } else { '_' })
         .collect();
+    let ascii_fallback = ascii_fallback.trim();
+    let fallback_name = if ascii_fallback.is_empty() {
+        "speaker"
+    } else {
+        ascii_fallback
+    };
     let encoded: String = safe_label
         .bytes()
         .map(|b| match b {
@@ -1339,7 +1358,7 @@ fn build_content_disposition(display_label: &str) -> String {
         })
         .collect();
     format!(
-        r#"attachment; filename="{ascii_fallback}_speaker.wav"; filename*=UTF-8''{encoded}_speaker.wav"#
+        r#"attachment; filename="{fallback_name}_speaker.wav"; filename*=UTF-8''{encoded}_speaker.wav"#
     )
 }
 
@@ -1402,7 +1421,7 @@ async fn stream_file_range(
 mod discord_channel_full_tests {
     use super::{
         DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull, VIEW_CHANNEL,
-        compute_channel_permissions,
+        build_content_disposition, compute_channel_permissions,
     };
 
     #[test]
@@ -1535,5 +1554,30 @@ mod discord_channel_full_tests {
         );
 
         assert_eq!(permissions & VIEW_CHANNEL, 0);
+    }
+
+    #[test]
+    fn content_disposition_strips_control_chars_and_empty_fallback() {
+        let label = "John\r\nDoe:/test";
+        let cd = build_content_disposition(label);
+        assert!(
+            cd.contains(r#"filename="John__Doe__test_speaker.wav""#),
+            "unexpected ascii fallback in: {cd}"
+        );
+        assert!(
+            cd.contains("filename*=UTF-8''"),
+            "missing RFC5987 encoded filename in: {cd}"
+        );
+        assert!(!cd.contains('\r') && !cd.contains('\n'), "control chars leaked into header");
+    }
+
+    #[test]
+    fn content_disposition_empty_fallback() {
+        let cd = build_content_disposition("\t\n\r");
+        assert!(
+            cd.contains(r#"filename="____speaker.wav""#),
+            "unexpected result for control-only label in: {cd}"
+        );
+        assert!(!cd.contains('\r') && !cd.contains('\n'), "control chars leaked into header");
     }
 }

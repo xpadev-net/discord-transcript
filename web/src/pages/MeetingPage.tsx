@@ -53,7 +53,6 @@ export function MeetingPage() {
       .catch(() => {
         if (!controller.signal.aborted) {
           setSpeakersError(true);
-          setSpeakers([]);
         }
       })
       .finally(() => {
