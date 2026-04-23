@@ -1145,10 +1145,12 @@ async fn api_speakers(
     let rows = state
         .db
         .query(
-            "SELECT speaker_id, username, nickname, display_name \
-             FROM meeting_speakers \
-             WHERE meeting_id=$1 \
-             ORDER BY speaker_id",
+            "SELECT ms.speaker_id, ms.username, ms.nickname, ms.display_name, \
+                    m.guild_id, m.voice_channel_id \
+             FROM meeting_speakers ms \
+             JOIN meetings m ON m.id = ms.meeting_id \
+             WHERE ms.meeting_id=$1 \
+             ORDER BY ms.speaker_id",
             &[&meeting_id],
         )
         .await
@@ -1158,17 +1160,8 @@ async fn api_speakers(
         return Ok(Json(vec![]));
     }
 
-    let row = state
-        .db
-        .query_opt(
-            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
-            &[&meeting_id],
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let guild_id: String = row.get("guild_id");
-    let voice_channel_id: String = row.get("voice_channel_id");
+    let guild_id: String = rows[0].get("guild_id");
+    let voice_channel_id: String = rows[0].get("voice_channel_id");
 
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
@@ -1223,36 +1216,28 @@ async fn api_speaker_audio(
 ) -> Result<Response, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
-    let speaker_row = state
-        .db
-        .query_opt(
-            "SELECT username, nickname, display_name FROM meeting_speakers WHERE meeting_id=$1 AND speaker_id=$2",
-            &[&meeting_id, &speaker_id],
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let speaker_row = match speaker_row {
-        Some(row) => row,
-        None => return Err(StatusCode::NOT_FOUND),
-    };
-
-    let profile = SpeakerProfile {
-        speaker_id: speaker_id.clone(),
-        username: speaker_row.get("username"),
-        nickname: speaker_row.get("nickname"),
-        display_name: speaker_row.get("display_name"),
-    };
-    let display_label = profile.display_label();
-
     let row = state
         .db
         .query_opt(
-            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
-            &[&meeting_id],
+            "SELECT ms.username, ms.nickname, ms.display_name, \
+                    m.guild_id, m.voice_channel_id \
+             FROM meeting_speakers ms \
+             JOIN meetings m ON m.id = ms.meeting_id \
+             WHERE ms.meeting_id=$1 AND ms.speaker_id=$2 \
+             LIMIT 1",
+            &[&meeting_id, &speaker_id],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
+
+    let profile = SpeakerProfile {
+        speaker_id: speaker_id.clone(),
+        username: row.get("username"),
+        nickname: row.get("nickname"),
+        display_name: row.get("display_name"),
+    };
+    let display_label = profile.display_label();
 
     let guild_id: String = row.get("guild_id");
     let voice_channel_id: String = row.get("voice_channel_id");
@@ -1273,9 +1258,13 @@ async fn api_speaker_audio(
         legacy
     };
 
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     let file_size = metadata.len();
     let content_disposition = build_content_disposition(&display_label);
 
