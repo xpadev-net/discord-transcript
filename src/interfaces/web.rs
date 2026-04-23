@@ -1,6 +1,3 @@
-use crate::domain::speaker::SpeakerProfile;
-use crate::domain::transcript::TranscriptSource;
-use crate::infrastructure::storage_fs::sanitize_path_component;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
@@ -16,6 +13,10 @@ use std::time::Instant;
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
+
+use crate::domain::speaker::SpeakerProfile;
+use crate::domain::transcript::TranscriptSource;
+use crate::infrastructure::storage_fs::sanitize_path_component;
 
 type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
@@ -1236,6 +1237,7 @@ async fn api_speaker_audio(
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     let file_size = metadata.len();
+    let content_disposition = format!("attachment; filename=\"{safe_speaker}_speaker.wav\"");
 
     if let Some(range_header) = headers.get(header::RANGE) {
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1252,6 +1254,7 @@ async fn api_speaker_audio(
                     .header(header::ACCEPT_RANGES, "bytes")
                     .header(header::CONTENT_LENGTH, length.to_string())
                     .header(header::CONTENT_RANGE, content_range)
+                    .header(header::CONTENT_DISPOSITION, &content_disposition)
                     .body(body)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
             }
@@ -1259,6 +1262,7 @@ async fn api_speaker_audio(
                 return Response::builder()
                     .status(StatusCode::RANGE_NOT_SATISFIABLE)
                     .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+                    .header(header::CONTENT_DISPOSITION, &content_disposition)
                     .body(axum::body::Body::empty())
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
             }
@@ -1276,6 +1280,7 @@ async fn api_speaker_audio(
         .header(header::CONTENT_TYPE, "audio/wav")
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, file_size.to_string())
+        .header(header::CONTENT_DISPOSITION, &content_disposition)
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }

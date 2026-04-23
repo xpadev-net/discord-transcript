@@ -24,7 +24,8 @@ export function MeetingPage() {
   );
 
   const [speakers, setSpeakers] = useState<SpeakerAudioInfo[] | null>(null);
-  const [speakersLoading, setSpeakersLoading] = useState(false);
+  const [speakersLoading, setSpeakersLoading] = useState(true);
+  const [speakersError, setSpeakersError] = useState(false);
 
   useEffect(() => {
     if (meetingId) {
@@ -35,14 +36,23 @@ export function MeetingPage() {
   useEffect(() => {
     if (!meetingId) {
       setSpeakers(null);
+      setSpeakersLoading(false);
+      setSpeakersError(false);
       return;
     }
     const controller = new AbortController();
+    setSpeakers(null);
+    setSpeakersError(false);
     setSpeakersLoading(true);
     fetchSpeakers(meetingId, controller.signal)
-      .then(setSpeakers)
+      .then((data) => {
+        if (!controller.signal.aborted) {
+          setSpeakers(data);
+        }
+      })
       .catch(() => {
         if (!controller.signal.aborted) {
+          setSpeakersError(true);
           setSpeakers([]);
         }
       })
@@ -73,11 +83,14 @@ export function MeetingPage() {
             ref={audioRef}
             src={meetingId ? getAudioUrl(meetingId) : ""}
           />
-          <SpeakerAudioDownloads
-            meetingId={meetingId || ""}
-            speakers={speakers}
-            loading={speakersLoading}
-          />
+          {meetingId && (
+            <SpeakerAudioDownloads
+              meetingId={meetingId}
+              speakers={speakers}
+              loading={speakersLoading}
+              error={speakersError}
+            />
+          )}
           <TranscriptPanel
             ref={transcriptContainerRef}
             segments={transcript}

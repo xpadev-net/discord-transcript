@@ -1,22 +1,44 @@
-import type { SpeakerAudioInfo } from "../lib/types";
 import { getSpeakerAudioUrl } from "../lib/api";
+import type { SpeakerAudioInfo } from "../lib/types";
 
 interface SpeakerAudioDownloadsProps {
   meetingId: string;
   speakers: SpeakerAudioInfo[] | null;
   loading: boolean;
+  error: boolean;
+}
+
+function sanitizeFilename(name: string): string {
+  const sanitized = name
+    .trim()
+    .replace(/[\/\\:*?"<>|]/g, "_")
+    .replace(/_+/g, "_");
+  if (sanitized.length === 0) {
+    return "speaker";
+  }
+  return sanitized;
 }
 
 export function SpeakerAudioDownloads({
   meetingId,
   speakers,
   loading,
+  error,
 }: SpeakerAudioDownloadsProps) {
   if (loading) {
     return (
       <div className="speaker-audio-section">
-        <h3>{"\u8a71\u8005\u5225\u97f3\u58f0"}</h3>
-        <div className="speaker-audio-loading">{"\u8aad\u307f\u8fbc\u307f\u4e2d..."}</div>
+        <h3>話者別音声</h3>
+        <div className="speaker-audio-loading">読み込み中...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="speaker-audio-section">
+        <h3>話者別音声（デバッグ）</h3>
+        <div className="speaker-audio-error">取得に失敗しました</div>
       </div>
     );
   }
@@ -28,22 +50,28 @@ export function SpeakerAudioDownloads({
   const speakersWithAudio = speakers.filter((s) => s.has_audio);
 
   if (speakersWithAudio.length === 0) {
-    return null;
+    return (
+      <div className="speaker-audio-section">
+        <h3>話者別音声（デバッグ）</h3>
+        <div className="speaker-audio-loading">話者別音声はありません</div>
+      </div>
+    );
   }
 
   return (
     <div className="speaker-audio-section">
-      <h3>{"\u8a71\u8005\u5225\u97f3\u58f0\uff08\u30c7\u30d0\u30c3\u30b0\uff09"}</h3>
+      <h3>話者別音声（デバッグ）</h3>
       <ul className="speaker-audio-list">
         {speakersWithAudio.map((speaker) => (
           <li key={speaker.speaker_id} className="speaker-audio-item">
             <span className="speaker-audio-name">{speaker.display_label}</span>
             <a
               href={getSpeakerAudioUrl(meetingId, speaker.speaker_id)}
-              download={`${speaker.display_label}_speaker.wav`}
+              download={`${sanitizeFilename(speaker.display_label)}_speaker.wav`}
               className="speaker-audio-download"
+              aria-label={`${speaker.display_label}の音声をダウンロード`}
             >
-              {"\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9"}
+              ダウンロード
             </a>
           </li>
         ))}
