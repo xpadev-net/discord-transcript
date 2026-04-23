@@ -1226,7 +1226,10 @@ async fn api_speaker_audio(
     let safe_speaker = sanitize_path_component(&speaker_id);
     let filename = format!("{safe_speaker}_speaker.wav");
     let primary = workspace.speakers_dir().join(&filename);
-    let legacy = layout.legacy_meeting_dir(&meeting_id).join("speakers").join(&filename);
+    let legacy = layout
+        .legacy_meeting_dir(&meeting_id)
+        .join("speakers")
+        .join(&filename);
     let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
         primary
     } else {
