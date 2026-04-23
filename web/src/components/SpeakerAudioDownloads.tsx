@@ -28,7 +28,7 @@ export function SpeakerAudioDownloads({
   if (loading) {
     return (
       <div className="speaker-audio-section">
-        <h3>話者別音声</h3>
+        <h3>話者別音声（デバッグ）</h3>
         <div className="speaker-audio-loading">読み込み中...</div>
       </div>
     );
@@ -53,7 +53,7 @@ export function SpeakerAudioDownloads({
     return (
       <div className="speaker-audio-section">
         <h3>話者別音声（デバッグ）</h3>
-        <div className="speaker-audio-loading">話者別音声はありません</div>
+        <div className="speaker-audio-empty">話者別音声はありません</div>
       </div>
     );
   }

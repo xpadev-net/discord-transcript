@@ -446,6 +446,11 @@ audio::-webkit-media-controls-panel {
   color: #e06c75;
 }
 
+.speaker-audio-empty {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   .main-container {

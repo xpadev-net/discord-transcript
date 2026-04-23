@@ -95,7 +95,8 @@ impl MeetingWorkspacePaths {
         fs::create_dir_all(self.audio_dir())?;
         fs::create_dir_all(self.transcript_dir())?;
         fs::create_dir_all(self.context_dir())?;
-        fs::create_dir_all(self.summary_dir())
+        fs::create_dir_all(self.summary_dir())?;
+        fs::create_dir_all(self.speakers_dir())
     }
 
     /// Returns a path relative to the workspace root. Returns None if the

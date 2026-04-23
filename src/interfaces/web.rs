@@ -1040,7 +1040,7 @@ async fn api_summary(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let markdown = row.map(|r| r.get::<_, String>("markdown"));
+    let markdown = row.and_then(|r| r.get::<_, Option<String>>("markdown"));
     Ok(Json(SummaryResponse { markdown }))
 }
 
@@ -1166,35 +1166,41 @@ async fn api_speakers(
     let primary_speakers_dir = workspace.speakers_dir();
     let legacy_speakers_dir = layout.legacy_meeting_dir(&meeting_id).join("speakers");
 
-    let mut speakers = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let speaker_id: String = row.get("speaker_id");
-        let username: Option<String> = row.get("username");
-        let nickname: Option<String> = row.get("nickname");
-        let display_name: Option<String> = row.get("display_name");
-        let profile = SpeakerProfile {
-            speaker_id: speaker_id.clone(),
-            username: username.clone(),
-            nickname: nickname.clone(),
-            display_name: display_name.clone(),
-        };
-        let safe_speaker = sanitize_path_component(&speaker_id);
-        let filename = format!("{safe_speaker}_speaker.wav");
-        let primary_path = primary_speakers_dir.join(&filename);
-        let legacy_path = legacy_speakers_dir.join(&filename);
-
-        let has_audio = tokio::fs::try_exists(&primary_path).await.unwrap_or(false)
-            || tokio::fs::try_exists(&legacy_path).await.unwrap_or(false);
-
-        speakers.push(SpeakerAudioResponse {
-            speaker_id: speaker_id.clone(),
-            username: username.clone(),
-            nickname: nickname.clone(),
-            display_name: display_name.clone(),
-            display_label: profile.display_label(),
-            has_audio,
-        });
-    }
+    let speaker_tasks: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let speaker_id: String = row.get("speaker_id");
+            let username: Option<String> = row.get("username");
+            let nickname: Option<String> = row.get("nickname");
+            let display_name: Option<String> = row.get("display_name");
+            let profile = SpeakerProfile {
+                speaker_id: speaker_id.clone(),
+                username: username.clone(),
+                nickname: nickname.clone(),
+                display_name: display_name.clone(),
+            };
+            let safe_speaker = sanitize_path_component(&speaker_id);
+            let filename = format!("{safe_speaker}_speaker.wav");
+            let primary_path = primary_speakers_dir.join(&filename);
+            let legacy_path = legacy_speakers_dir.join(&filename);
+            async move {
+                let (primary_exists, legacy_exists) = tokio::join!(
+                    tokio::fs::try_exists(&primary_path),
+                    tokio::fs::try_exists(&legacy_path),
+                );
+                let has_audio = primary_exists.unwrap_or(false) || legacy_exists.unwrap_or(false);
+                SpeakerAudioResponse {
+                    speaker_id,
+                    username,
+                    nickname,
+                    display_name,
+                    display_label: profile.display_label(),
+                    has_audio,
+                }
+            }
+        })
+        .collect();
+    let speakers = futures_util::future::join_all(speaker_tasks).await;
 
     Ok(Json(speakers))
 }
@@ -1206,6 +1212,18 @@ async fn api_speaker_audio(
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let speaker_exists = state
+        .db
+        .query_opt(
+            "SELECT 1 FROM meeting_speakers WHERE meeting_id=$1 AND speaker_id=$2",
+            &[&meeting_id, &speaker_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if speaker_exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     let row = state
         .db
