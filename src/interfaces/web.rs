@@ -1344,7 +1344,7 @@ fn build_content_disposition(display_label: &str) -> String {
             }
         })
         .collect();
-    let ascii_fallback = ascii_fallback.trim();
+    let ascii_fallback = ascii_fallback.trim().trim_matches('_');
     let fallback_name = if ascii_fallback.is_empty() {
         "speaker"
     } else {
@@ -1580,8 +1580,8 @@ mod discord_channel_full_tests {
     fn content_disposition_empty_fallback() {
         let cd = build_content_disposition("\t\n\r");
         assert!(
-            cd.contains(r#"filename="____speaker.wav""#),
-            "unexpected result for control-only label in: {cd}"
+            cd.contains(r#"filename="speaker_speaker.wav""#),
+            "fallback name missing in: {cd}"
         );
         assert!(
             !cd.contains('\r') && !cd.contains('\n'),
