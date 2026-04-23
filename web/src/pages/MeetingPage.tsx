@@ -24,7 +24,7 @@ export function MeetingPage() {
   );
 
   const [speakers, setSpeakers] = useState<SpeakerAudioInfo[] | null>(null);
-  const [speakersLoading, setSpeakersLoading] = useState(true);
+  const [speakersLoading, setSpeakersLoading] = useState(false);
   const [speakersError, setSpeakersError] = useState(false);
 
   useEffect(() => {
@@ -40,24 +40,23 @@ export function MeetingPage() {
       setSpeakersError(false);
       return;
     }
-    const currentId = meetingId;
     const controller = new AbortController();
     setSpeakers(null);
     setSpeakersError(false);
     setSpeakersLoading(true);
-    fetchSpeakers(currentId, controller.signal)
+    fetchSpeakers(meetingId, controller.signal)
       .then((data) => {
-        if (!controller.signal.aborted && meetingId === currentId) {
+        if (!controller.signal.aborted) {
           setSpeakers(data);
         }
       })
       .catch(() => {
-        if (!controller.signal.aborted && meetingId === currentId) {
+        if (!controller.signal.aborted) {
           setSpeakersError(true);
         }
       })
       .finally(() => {
-        if (!controller.signal.aborted && meetingId === currentId) {
+        if (!controller.signal.aborted) {
           setSpeakersLoading(false);
         }
       });
