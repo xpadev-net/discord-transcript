@@ -1351,7 +1351,7 @@ fn build_content_disposition(display_label: &str) -> String {
     } else {
         ascii_fallback
     };
-    let input_to_encode: &str = if safe_label.trim().is_empty() {
+    let input_to_encode: &str = if safe_label.trim().trim_matches('_').is_empty() {
         fallback_name
     } else {
         &safe_label

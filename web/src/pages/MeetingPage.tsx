@@ -24,7 +24,7 @@ export function MeetingPage() {
   );
 
   const [speakers, setSpeakers] = useState<SpeakerAudioInfo[] | null>(null);
-  const [speakersLoading, setSpeakersLoading] = useState(false);
+  const [speakersLoading, setSpeakersLoading] = useState(true);
   const [speakersError, setSpeakersError] = useState(false);
 
   useEffect(() => {
