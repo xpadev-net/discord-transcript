@@ -1362,27 +1362,20 @@ fn build_content_disposition(display_label: &str) -> String {
     } else {
         ascii_fallback
     };
-    let encoded_label: String = if safe_label.trim().is_empty() {
+    let input_to_encode: &str = if safe_label.trim().is_empty() {
         fallback_name
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    (b as char).to_string()
-                }
-                _ => format!("%{:02X}", b),
-            })
-            .collect()
     } else {
-        safe_label
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    (b as char).to_string()
-                }
-                _ => format!("%{:02X}", b),
-            })
-            .collect()
+        &safe_label
     };
+    let encoded_label: String = input_to_encode
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
     format!(
         r#"attachment; filename="{fallback_name}_speaker.wav"; filename*=UTF-8''{encoded_label}_speaker.wav"#
     )

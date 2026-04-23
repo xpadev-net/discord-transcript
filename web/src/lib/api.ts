@@ -26,7 +26,9 @@ export function fetchMeeting(
   meetingId: string,
   signal?: AbortSignal,
 ): Promise<MeetingResponse> {
-  return fetch(basePath(meetingId), { signal }).then(handleResponse<MeetingResponse>);
+  return fetch(basePath(meetingId), { signal }).then(
+    handleResponse<MeetingResponse>,
+  );
 }
 
 export function fetchTranscript(

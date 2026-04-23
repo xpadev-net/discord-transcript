@@ -14,7 +14,7 @@ function sanitizeFilename(name: string): string {
     .split("")
     .map((c) => {
       const cp = c.charCodeAt(0);
-      if (cp < 0x20 || cp === 0x7f || /[\/\\:*?"<>|]/.test(c)) {
+      if (cp < 0x20 || cp === 0x7f || /[/\\:*?"<>|]/.test(c)) {
         return "_";
       }
       return c;
