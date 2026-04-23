@@ -1,5 +1,3 @@
-use crate::domain::speaker::SpeakerProfile;
-use crate::domain::transcript::TranscriptSource;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
@@ -15,6 +13,10 @@ use std::time::Instant;
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
+
+use crate::domain::speaker::SpeakerProfile;
+use crate::domain::transcript::TranscriptSource;
+use crate::infrastructure::storage_fs::sanitize_path_component;
 
 type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
@@ -90,6 +92,11 @@ pub fn create_router(state: WebState) -> Router {
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
         .route("/api/meetings/{meeting_id}/audio", get(api_audio))
+        .route("/api/meetings/{meeting_id}/speakers", get(api_speakers))
+        .route(
+            "/api/meetings/{meeting_id}/speakers/{speaker_id}/audio",
+            get(api_speaker_audio),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -916,6 +923,16 @@ struct SummaryResponse {
     markdown: Option<String>,
 }
 
+#[derive(Serialize)]
+struct SpeakerAudioResponse {
+    speaker_id: String,
+    username: Option<String>,
+    nickname: Option<String>,
+    display_name: Option<String>,
+    display_label: String,
+    has_audio: bool,
+}
+
 // ---------- Handlers ----------
 
 async fn api_meeting(
@@ -1023,7 +1040,7 @@ async fn api_summary(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let markdown = row.map(|r| r.get::<_, String>("markdown"));
+    let markdown = row.and_then(|r| r.get::<_, Option<String>>("markdown"));
     Ok(Json(SummaryResponse { markdown }))
 }
 
@@ -1071,7 +1088,13 @@ async fn api_audio(
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
-                let body = stream_file_range(&path, start, length).await?;
+                let body = stream_file_range(&path, start, length).await.map_err(|e| {
+                    if e == StatusCode::NOT_FOUND {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                })?;
 
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
@@ -1093,9 +1116,13 @@ async fn api_audio(
         }
     }
 
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
@@ -1108,7 +1135,240 @@ async fn api_audio(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn api_speakers(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<Vec<SpeakerAudioResponse>>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let rows = state
+        .db
+        .query(
+            "SELECT ms.speaker_id, ms.username, ms.nickname, ms.display_name, \
+                    m.guild_id, m.voice_channel_id \
+             FROM meeting_speakers ms \
+             JOIN meetings m ON m.id = ms.meeting_id \
+             WHERE ms.meeting_id=$1 \
+             ORDER BY ms.speaker_id",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if rows.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    let guild_id: String = rows[0].get("guild_id");
+    let voice_channel_id: String = rows[0].get("voice_channel_id");
+
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
+    let primary_speakers_dir = workspace.speakers_dir();
+    let legacy_speakers_dir = layout.legacy_meeting_dir(&meeting_id).join("speakers");
+
+    let speaker_tasks: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let speaker_id: String = row.get("speaker_id");
+            let username: Option<String> = row.get("username");
+            let nickname: Option<String> = row.get("nickname");
+            let display_name: Option<String> = row.get("display_name");
+            let profile = SpeakerProfile {
+                speaker_id: speaker_id.clone(),
+                username: username.clone(),
+                nickname: nickname.clone(),
+                display_name: display_name.clone(),
+            };
+            let safe_speaker = sanitize_path_component(&speaker_id);
+            let filename = format!("{safe_speaker}_speaker.wav");
+            let primary_path = primary_speakers_dir.join(&filename);
+            let legacy_path = legacy_speakers_dir.join(&filename);
+            async move {
+                let (primary_exists, legacy_exists) = tokio::join!(
+                    tokio::fs::try_exists(&primary_path),
+                    tokio::fs::try_exists(&legacy_path),
+                );
+                let has_audio = primary_exists.unwrap_or(false) || legacy_exists.unwrap_or(false);
+                SpeakerAudioResponse {
+                    speaker_id,
+                    username,
+                    nickname,
+                    display_name,
+                    display_label: profile.display_label(),
+                    has_audio,
+                }
+            }
+        })
+        .collect();
+    let speakers = futures_util::future::join_all(speaker_tasks).await;
+
+    Ok(Json(speakers))
+}
+
+async fn api_speaker_audio(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path((meeting_id, speaker_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let row = state
+        .db
+        .query_opt(
+            "SELECT ms.username, ms.nickname, ms.display_name, \
+                    m.guild_id, m.voice_channel_id \
+             FROM meeting_speakers ms \
+             JOIN meetings m ON m.id = ms.meeting_id \
+             WHERE ms.meeting_id=$1 AND ms.speaker_id=$2 \
+             LIMIT 1",
+            &[&meeting_id, &speaker_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let profile = SpeakerProfile {
+        speaker_id: speaker_id.clone(),
+        username: row.get("username"),
+        nickname: row.get("nickname"),
+        display_name: row.get("display_name"),
+    };
+    let display_label = profile.display_label();
+
+    let guild_id: String = row.get("guild_id");
+    let voice_channel_id: String = row.get("voice_channel_id");
+
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
+    let safe_speaker = sanitize_path_component(&speaker_id);
+    let filename = format!("{safe_speaker}_speaker.wav");
+    let primary = workspace.speakers_dir().join(&filename);
+    let legacy = layout
+        .legacy_meeting_dir(&meeting_id)
+        .join("speakers")
+        .join(&filename);
+    let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+        primary
+    } else {
+        legacy
+    };
+
+    let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    let file_size = metadata.len();
+    let content_disposition = build_content_disposition(&display_label);
+
+    if let Some(range_header) = headers.get(header::RANGE) {
+        let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+        match parse_range(range_str, file_size) {
+            Some((start, end)) => {
+                let length = end - start + 1;
+                let content_range = format!("bytes {start}-{end}/{file_size}");
+
+                let body = stream_file_range(&path, start, length).await.map_err(|e| {
+                    if e == StatusCode::NOT_FOUND {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                })?;
+
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "audio/wav")
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_LENGTH, length.to_string())
+                    .header(header::CONTENT_RANGE, content_range)
+                    .header(header::CONTENT_DISPOSITION, &content_disposition)
+                    .body(body)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            None => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+                    .header(header::CONTENT_DISPOSITION, &content_disposition)
+                    .body(axum::body::Body::empty())
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, file_size.to_string())
+        .header(header::CONTENT_DISPOSITION, &content_disposition)
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 // ---------- Helpers ----------
+
+fn build_content_disposition(display_label: &str) -> String {
+    let safe_label: String = display_label
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            _ => c,
+        })
+        .collect();
+    let ascii_fallback: String = safe_label
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_control() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ascii_fallback = ascii_fallback.trim().trim_matches('_');
+    let fallback_name = if ascii_fallback.is_empty() {
+        "speaker"
+    } else {
+        ascii_fallback
+    };
+    let input_to_encode: &str = if safe_label.trim().trim_matches('_').is_empty() {
+        fallback_name
+    } else {
+        &safe_label
+    };
+    let encoded_label: String = input_to_encode
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
+    format!(
+        r#"attachment; filename="{fallback_name}_speaker.wav"; filename*=UTF-8''{encoded_label}_speaker.wav"#
+    )
+}
 
 fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     if file_size == 0 {
@@ -1154,9 +1414,13 @@ async fn stream_file_range(
 ) -> Result<axum::body::Body, StatusCode> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     file.seek(std::io::SeekFrom::Start(start))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1169,7 +1433,7 @@ async fn stream_file_range(
 mod discord_channel_full_tests {
     use super::{
         DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull, VIEW_CHANNEL,
-        compute_channel_permissions,
+        build_content_disposition, compute_channel_permissions,
     };
 
     #[test]
@@ -1302,5 +1566,36 @@ mod discord_channel_full_tests {
         );
 
         assert_eq!(permissions & VIEW_CHANNEL, 0);
+    }
+
+    #[test]
+    fn content_disposition_strips_control_chars_and_empty_fallback() {
+        let label = "John\r\nDoe:/test";
+        let cd = build_content_disposition(label);
+        assert!(
+            cd.contains(r#"filename="John__Doe__test_speaker.wav""#),
+            "unexpected ascii fallback in: {cd}"
+        );
+        assert!(
+            cd.contains("filename*=UTF-8''"),
+            "missing RFC5987 encoded filename in: {cd}"
+        );
+        assert!(
+            !cd.contains('\r') && !cd.contains('\n'),
+            "control chars leaked into header"
+        );
+    }
+
+    #[test]
+    fn content_disposition_empty_fallback() {
+        let cd = build_content_disposition("\t\n\r");
+        assert!(
+            cd.contains(r#"filename="speaker_speaker.wav""#),
+            "fallback name missing in: {cd}"
+        );
+        assert!(
+            !cd.contains('\r') && !cd.contains('\n'),
+            "control chars leaked into header"
+        );
     }
 }
