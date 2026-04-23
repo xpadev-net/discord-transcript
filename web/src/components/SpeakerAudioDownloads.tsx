@@ -9,10 +9,7 @@ interface SpeakerAudioDownloadsProps {
 }
 
 function sanitizeFilename(name: string): string {
-  const sanitized = name
-    .trim()
-    .replace(/[\/\\:*?"<>|]/g, "_")
-    .replace(/_+/g, "_");
+  const sanitized = name.trim().replace(/[\/\\:*?"<>|]/g, "_");
   if (sanitized.length === 0) {
     return "speaker";
   }

@@ -1110,15 +1110,13 @@ async fn api_audio(
         }
     }
 
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })?;
+    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
@@ -1305,15 +1303,13 @@ async fn api_speaker_audio(
         }
     }
 
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })?;
+    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
@@ -1340,7 +1336,13 @@ fn build_content_disposition(display_label: &str) -> String {
         .collect();
     let ascii_fallback: String = safe_label
         .chars()
-        .map(|c| if c.is_ascii() && !c.is_control() { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii() && !c.is_control() {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let ascii_fallback = ascii_fallback.trim();
     let fallback_name = if ascii_fallback.is_empty() {
@@ -1568,7 +1570,10 @@ mod discord_channel_full_tests {
             cd.contains("filename*=UTF-8''"),
             "missing RFC5987 encoded filename in: {cd}"
         );
-        assert!(!cd.contains('\r') && !cd.contains('\n'), "control chars leaked into header");
+        assert!(
+            !cd.contains('\r') && !cd.contains('\n'),
+            "control chars leaked into header"
+        );
     }
 
     #[test]
@@ -1578,6 +1583,9 @@ mod discord_channel_full_tests {
             cd.contains(r#"filename="____speaker.wav""#),
             "unexpected result for control-only label in: {cd}"
         );
-        assert!(!cd.contains('\r') && !cd.contains('\n'), "control chars leaked into header");
+        assert!(
+            !cd.contains('\r') && !cd.contains('\n'),
+            "control chars leaked into header"
+        );
     }
 }
