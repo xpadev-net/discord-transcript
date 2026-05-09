@@ -36,15 +36,44 @@ impl std::error::Error for AudioError {}
 
 pub fn build_wav_chunk(frames: &[BufferedFrame], sample_rate: u32) -> Result<WavChunk, AudioError> {
     let mut pcm = Vec::new();
-    for frame in frames {
+    let mut sorted_frames = frames.iter().collect::<Vec<_>>();
+    sorted_frames.sort_by_key(|frame| frame.timestamp_ms);
+
+    let mut output_end_ms: Option<u64> = None;
+    for frame in sorted_frames {
         if frame.pcm_16le_bytes.len() % 2 != 0 {
             return Err(AudioError::InvalidPcmLength(frame.pcm_16le_bytes.len()));
         }
+
+        if let Some(end_ms) = output_end_ms
+            && frame.timestamp_ms > end_ms
+        {
+            let gap_ms = frame.timestamp_ms - end_ms;
+            let gap_samples = (gap_ms as u128)
+                .saturating_mul(sample_rate as u128)
+                .saturating_div(1_000) as usize;
+            pcm.resize(pcm.len().saturating_add(gap_samples.saturating_mul(2)), 0);
+            output_end_ms = Some(frame.timestamp_ms);
+        }
+
         pcm.extend_from_slice(&frame.pcm_16le_bytes);
+        output_end_ms = Some(
+            output_end_ms
+                .unwrap_or(frame.timestamp_ms)
+                .saturating_add(pcm_duration_ms(&frame.pcm_16le_bytes, sample_rate)),
+        );
     }
 
     let wav = build_wav_bytes(&pcm, sample_rate, 1, 16)?;
     Ok(WavChunk { bytes: wav })
+}
+
+pub fn pcm_duration_ms(pcm_16le: &[u8], sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let samples = pcm_16le.len() as u128 / 2;
+    (samples.saturating_mul(1_000) / sample_rate as u128) as u64
 }
 
 pub fn build_wav_bytes_raw(
@@ -109,42 +138,6 @@ pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>
     }
 
     (output, to_rate)
-}
-
-/// Normalize 16-bit PCM audio to a target RMS level.
-///
-/// `target_rms` is the desired RMS amplitude (e.g. 3000.0 for moderate volume).
-/// Returns the input unchanged if it is too short or effectively silent.
-pub fn normalize_rms_pcm_16le(input: &[u8], target_rms: f64) -> Vec<u8> {
-    let sample_count = input.len() / 2;
-    if sample_count == 0 || !target_rms.is_finite() || target_rms <= 0.0 {
-        return input.to_vec();
-    }
-
-    // Calculate current RMS.
-    let mut sum_sq = 0.0f64;
-    for i in 0..sample_count {
-        let sample = i16::from_le_bytes([input[i * 2], input[i * 2 + 1]]) as f64;
-        sum_sq += sample * sample;
-    }
-    let current_rms = (sum_sq / sample_count as f64).sqrt();
-
-    // Skip normalization if audio is effectively silent (RMS < 1).
-    if current_rms < 1.0 {
-        return input.to_vec();
-    }
-
-    let gain = target_rms / current_rms;
-
-    let mut output = Vec::with_capacity(input.len());
-    for i in 0..sample_count {
-        let sample = i16::from_le_bytes([input[i * 2], input[i * 2 + 1]]) as f64;
-        let normalized = (sample * gain)
-            .round()
-            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-        output.extend_from_slice(&normalized.to_le_bytes());
-    }
-    output
 }
 
 const RESAMPLE_FIR_TAPS: usize = 45;

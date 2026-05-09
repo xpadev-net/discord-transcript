@@ -1,7 +1,7 @@
 use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
 use crate::audio::songbird_adapter::SsrcTracker;
-use crate::audio::wav::{normalize_rms_pcm_16le, resample_pcm_16le};
+use crate::audio::wav::{pcm_duration_ms, resample_pcm_16le};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use crate::infrastructure::workspace::SSRC_MAPPING_FILENAME;
 use std::collections::HashMap;
@@ -129,14 +129,6 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
     Ok((sample_rate, data[44..].to_vec()))
 }
 
-fn pcm_duration_ms(pcm: &[u8], sample_rate: u32) -> u64 {
-    if sample_rate == 0 {
-        return 0;
-    }
-    let samples = pcm.len() as u128 / 2;
-    (samples.saturating_mul(1_000) / sample_rate as u128) as u64
-}
-
 fn fallback_start_ms(path: &Path, duration_ms: u64) -> u64 {
     match path.metadata().and_then(|m| m.modified()) {
         Ok(modified) => match modified.duration_since(std::time::UNIX_EPOCH) {
@@ -167,10 +159,6 @@ fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
         .saturating_div(1_000) as usize;
     vec![0; samples.saturating_mul(2)]
 }
-
-/// Target RMS amplitude for per-speaker audio normalization.
-/// 3000 out of i16 max (32767) is a moderate level that avoids clipping.
-const NORMALIZE_TARGET_RMS: f64 = 3000.0;
 
 /// Load the persisted SSRC-to-user mapping and build a lookup from sanitized
 /// SSRC fallback filenames to real user IDs.
@@ -256,19 +244,15 @@ pub fn build_speaker_audio_inputs(
             continue;
         };
 
-        // Normalize each chunk's volume before stitching with silence gaps.
-        // This avoids silence gaps diluting the RMS calculation.
-        let normalized_first = normalize_rms_pcm_16le(&first.pcm, NORMALIZE_TARGET_RMS);
-
         let mut pcm_out = Vec::new();
         let mut current_ms = first.start_ms + first.duration_ms;
-        pcm_out.extend_from_slice(&normalized_first);
+        pcm_out.extend_from_slice(&first.pcm);
         for chunk in user_chunks.iter().skip(1) {
             if chunk.start_ms > current_ms {
                 let gap_ms = chunk.start_ms - current_ms;
                 pcm_out.extend_from_slice(&silence_bytes(gap_ms, sample_rate));
             }
-            let chunk_pcm = normalize_rms_pcm_16le(&chunk.pcm, NORMALIZE_TARGET_RMS);
+            let chunk_pcm = &chunk.pcm;
             if chunk.start_ms < current_ms {
                 let overlap_ms = current_ms - chunk.start_ms;
                 let samples_to_skip =
@@ -295,7 +279,7 @@ pub fn build_speaker_audio_inputs(
                 current_ms = current_ms.saturating_add(pcm_duration_ms(trimmed, sample_rate));
                 continue;
             }
-            pcm_out.extend_from_slice(&chunk_pcm);
+            pcm_out.extend_from_slice(chunk_pcm);
             current_ms = chunk.start_ms + chunk.duration_ms;
         }
         let (final_pcm, final_rate) = if resample_to_16k {
