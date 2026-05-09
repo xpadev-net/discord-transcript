@@ -1,4 +1,5 @@
-use discord_transcript::audio::build_wav_bytes_raw;
+use discord_transcript::audio::receiver::BufferedFrame;
+use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
 use discord_transcript::audio::meeting_audio::build_speaker_audio_inputs;
 use discord_transcript::audio::wav::resample_pcm_16le;
 use std::fs;
@@ -12,6 +13,14 @@ fn unique_temp_dir(test_name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "discord_transcript_meeting_audio_{test_name}_{nanos}"
     ))
+}
+
+fn i16_pcm(samples: &[i16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
 }
 
 #[test]
@@ -50,6 +59,104 @@ fn speaker_audio_builds_offsets_and_gaps_per_user() {
     let bob_bytes = fs::read(&bob.audio_path).expect("bob audio should exist");
     // 0.5s audio = 1_000 bytes + 44-byte header.
     assert_eq!(bob_bytes.len(), 1_044);
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn build_wav_chunk_preserves_timestamp_gaps_as_silence() {
+    let first = i16_pcm(&[1; 10]);
+    let second = i16_pcm(&[2; 10]);
+    let wav = build_wav_chunk(
+        &[
+            BufferedFrame {
+                timestamp_ms: 1_000,
+                pcm_16le_bytes: first.clone(),
+            },
+            BufferedFrame {
+                timestamp_ms: 1_030,
+                pcm_16le_bytes: second.clone(),
+            },
+        ],
+        1_000,
+    )
+    .expect("wav chunk should build");
+
+    let pcm = &wav.bytes[44..];
+    assert_eq!(pcm.len(), 80);
+    assert_eq!(&pcm[..20], &first);
+    assert_eq!(&pcm[20..60], vec![0; 40].as_slice());
+    assert_eq!(&pcm[60..], &second);
+}
+
+#[test]
+fn build_wav_chunk_does_not_insert_extra_silence_for_contiguous_frames() {
+    let first = i16_pcm(&[1; 10]);
+    let second = i16_pcm(&[2; 10]);
+    let wav = build_wav_chunk(
+        &[
+            BufferedFrame {
+                timestamp_ms: 1_000,
+                pcm_16le_bytes: first.clone(),
+            },
+            BufferedFrame {
+                timestamp_ms: 1_010,
+                pcm_16le_bytes: second.clone(),
+            },
+        ],
+        1_000,
+    )
+    .expect("wav chunk should build");
+
+    assert_eq!(wav.bytes.len(), 84);
+    assert_eq!(&wav.bytes[44..64], &first);
+    assert_eq!(&wav.bytes[64..], &second);
+}
+
+#[test]
+fn build_wav_chunk_keeps_overlapping_frames_without_dropping_pcm() {
+    let first = i16_pcm(&[1; 10]);
+    let second = i16_pcm(&[2; 5]);
+    let third = i16_pcm(&[3; 10]);
+    let wav = build_wav_chunk(
+        &[
+            BufferedFrame {
+                timestamp_ms: 1_000,
+                pcm_16le_bytes: first.clone(),
+            },
+            BufferedFrame {
+                timestamp_ms: 1_002,
+                pcm_16le_bytes: second.clone(),
+            },
+            BufferedFrame {
+                timestamp_ms: 2_000,
+                pcm_16le_bytes: third.clone(),
+            },
+        ],
+        1_000,
+    )
+    .expect("wav chunk should build");
+
+    let pcm = &wav.bytes[44..];
+    assert_eq!(pcm.len(), 2_020);
+    assert_eq!(&pcm[..20], &first);
+    assert_eq!(&pcm[20..30], &second);
+    assert_eq!(&pcm[30..2_000], vec![0; 1_970].as_slice());
+    assert_eq!(&pcm[2_000..], &third);
+}
+
+#[test]
+fn speaker_audio_does_not_normalize_pcm_amplitude() {
+    let base = unique_temp_dir("no_normalize");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let pcm = i16_pcm(&[2, -2, 4, -4]);
+    let wav = build_wav_bytes_raw(&pcm, 1_000, 1, 16).unwrap();
+    fs::write(base.join("user_1_0.wav"), &wav).unwrap();
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should build");
+    let speaker_wav = fs::read(&outputs[0].audio_path).expect("speaker wav should exist");
+    assert_eq!(&speaker_wav[44..], pcm.as_slice());
 
     let _ = fs::remove_dir_all(base);
 }
