@@ -1918,10 +1918,11 @@ impl ScaffoldHandler {
             }
         }
 
-        crate::application::summary::persist_correction_debug_artifacts(
+        // The pre-correction transcript is accurate regardless of whether the
+        // optional GEC step runs, so it is always persisted.
+        crate::application::summary::persist_pre_correction_transcript_debug_artifact(
             &request.workspace,
             &summary_transcript,
-            self.whisper_language.as_deref(),
         );
 
         // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
@@ -1934,6 +1935,14 @@ impl ScaffoldHandler {
             );
             summary_transcript
         } else {
+            // Persist the correction prompt only when the GEC step is actually
+            // about to run; otherwise the artifact would falsely imply the
+            // correction step executed.
+            crate::application::summary::persist_correction_prompt_debug_artifact(
+                &request.workspace,
+                &summary_transcript,
+                self.whisper_language.as_deref(),
+            );
             match tokio::task::block_in_place(|| {
                 crate::application::summary::correct_transcript(
                     &summary_client,

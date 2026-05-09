@@ -165,20 +165,30 @@ fn persist_whisper_debug_response(path: &Path, body: &str) {
     }
 }
 
-/// Persist the pre-correction transcript and the correction prompt to the
-/// workspace's `debug/` directory. Should only be called when the caller is
-/// going to actually run [`correct_transcript`]; otherwise the artifact is
-/// misleading because it implies the correction step ran. Best-effort: I/O
-/// failures are logged but do not interrupt the summary pipeline.
-pub fn persist_correction_debug_artifacts(
+/// Persist the transcript that the summary pipeline produced *before* any
+/// optional LLM correction step. Always safe to call: the artifact is
+/// accurate regardless of whether [`correct_transcript`] is subsequently
+/// invoked, because by definition this is the transcript prior to correction.
+/// Best-effort: I/O failures are logged but do not interrupt the pipeline.
+pub fn persist_pre_correction_transcript_debug_artifact(
     workspace: &MeetingWorkspacePaths,
     pre_correction_transcript: &str,
-    language: Option<&str>,
 ) {
     persist_debug_text(
         &workspace.pre_correction_transcript_path(),
         pre_correction_transcript,
     );
+}
+
+/// Persist the prompt that will be sent to [`correct_transcript`]. Should
+/// only be called immediately before the correction step actually runs;
+/// otherwise the artifact is misleading because it implies the GEC step
+/// executed when it didn't. Best-effort.
+pub fn persist_correction_prompt_debug_artifact(
+    workspace: &MeetingWorkspacePaths,
+    pre_correction_transcript: &str,
+    language: Option<&str>,
+) {
     persist_debug_text(
         &workspace.correction_prompt_path(),
         &build_correction_prompt(pre_correction_transcript, language),

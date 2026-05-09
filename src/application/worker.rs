@@ -1,8 +1,9 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, TranscriptionOutput,
-    build_summary_prompt, correct_transcript, persist_correction_debug_artifacts,
-    persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
+    build_summary_prompt, correct_transcript, persist_correction_prompt_debug_artifact,
+    persist_pre_correction_transcript_debug_artifact, persist_summary_prompt_debug_artifact,
+    run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::{JobStatus, JobType, MeetingStatus};
@@ -114,7 +115,11 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
 
-    persist_correction_debug_artifacts(
+    persist_pre_correction_transcript_debug_artifact(
+        &request.workspace,
+        &transcription.transcript_for_summary,
+    );
+    persist_correction_prompt_debug_artifact(
         &request.workspace,
         &transcription.transcript_for_summary,
         request.language.as_deref(),
