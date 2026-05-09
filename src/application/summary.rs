@@ -165,9 +165,35 @@ fn persist_whisper_debug_response(path: &Path, body: &str) {
     }
 }
 
+/// Persist the pre-correction transcript and the correction prompt to the
+/// workspace's `debug/` directory. Should only be called when the caller is
+/// going to actually run [`correct_transcript`]; otherwise the artifact is
+/// misleading because it implies the correction step ran. Best-effort: I/O
+/// failures are logged but do not interrupt the summary pipeline.
+pub fn persist_correction_debug_artifacts(
+    workspace: &MeetingWorkspacePaths,
+    pre_correction_transcript: &str,
+    language: Option<&str>,
+) {
+    persist_debug_text(
+        &workspace.pre_correction_transcript_path(),
+        pre_correction_transcript,
+    );
+    persist_debug_text(
+        &workspace.correction_prompt_path(),
+        &build_correction_prompt(pre_correction_transcript, language),
+    );
+}
+
+/// Persist the prompt sent to the summary harness to the workspace's
+/// `debug/` directory. Best-effort.
+pub fn persist_summary_prompt_debug_artifact(workspace: &MeetingWorkspacePaths, prompt: &str) {
+    persist_debug_text(&workspace.summary_prompt_path(), prompt);
+}
+
 /// Best-effort write of a debug artifact (transcript or prompt). Failures are
 /// logged but do not interrupt the summary pipeline.
-pub fn persist_debug_text(path: &Path, contents: &str) {
+fn persist_debug_text(path: &Path, contents: &str) {
     if let Some(parent) = path.parent()
         && let Err(err) = fs::create_dir_all(parent)
     {
@@ -246,20 +272,12 @@ pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
     request: &SummaryRequest,
 ) -> Result<SummaryResult, SummaryError> {
     let transcription = run_transcription(whisper, request)?;
-    persist_debug_text(
-        &request.workspace.pre_correction_transcript_path(),
-        &transcription.transcript_for_summary,
-    );
-    persist_debug_text(
-        &request.workspace.correction_prompt_path(),
-        &build_correction_prompt(
-            &transcription.transcript_for_summary,
-            request.language.as_deref(),
-        ),
-    );
+    // Note: this entry point intentionally does NOT run `correct_transcript`,
+    // so we do not write the correction-prompt debug artifact here — doing so
+    // would mislead a reader into thinking the GEC step had executed.
     let manifest = write_transcript_files(request, &transcription)?;
     let prompt = build_summary_prompt(request, &manifest);
-    persist_debug_text(&request.workspace.summary_prompt_path(), &prompt);
+    persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let markdown = claude.summarize(&prompt, Some(request.workspace.root()))?;
     let message_chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
 

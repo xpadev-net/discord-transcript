@@ -1,8 +1,8 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, TranscriptionOutput,
-    build_correction_prompt, build_summary_prompt, correct_transcript, persist_debug_text,
-    run_transcription, write_transcript_files,
+    build_summary_prompt, correct_transcript, persist_correction_debug_artifacts,
+    persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::{JobStatus, JobType, MeetingStatus};
@@ -114,16 +114,10 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
 
-    persist_debug_text(
-        &request.workspace.pre_correction_transcript_path(),
+    persist_correction_debug_artifacts(
+        &request.workspace,
         &transcription.transcript_for_summary,
-    );
-    persist_debug_text(
-        &request.workspace.correction_prompt_path(),
-        &build_correction_prompt(
-            &transcription.transcript_for_summary,
-            request.language.as_deref(),
-        ),
+        request.language.as_deref(),
     );
 
     // Apply LLM-based error correction to the transcript before summarization.
@@ -160,7 +154,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
     let prompt = build_summary_prompt(&request, &manifest);
-    persist_debug_text(&request.workspace.summary_prompt_path(), &prompt);
+    persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let markdown = match claude.summarize(&prompt, Some(request.workspace.root())) {
         Ok(value) => value,
         Err(err) => {
