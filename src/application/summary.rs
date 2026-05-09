@@ -183,16 +183,25 @@ pub fn persist_pre_correction_transcript_debug_artifact(
 /// Persist the prompt that will be sent to [`correct_transcript`]. Should
 /// only be called immediately before the correction step actually runs;
 /// otherwise the artifact is misleading because it implies the GEC step
-/// executed when it didn't. Best-effort.
+/// executed when it didn't.
+///
+/// Returns the built prompt (so the caller can pass it to
+/// [`correct_transcript_with_prompt`] without re-building) or `None` if the
+/// transcript is empty/whitespace, in which case the correction step would
+/// short-circuit and no artifact is written. Best-effort: I/O failures are
+/// logged but do not interrupt the pipeline.
+#[must_use = "the returned prompt should be reused by `correct_transcript_with_prompt` to avoid rebuilding it"]
 pub fn persist_correction_prompt_debug_artifact(
     workspace: &MeetingWorkspacePaths,
     pre_correction_transcript: &str,
     language: Option<&str>,
-) {
-    persist_debug_text(
-        &workspace.correction_prompt_path(),
-        &build_correction_prompt(pre_correction_transcript, language),
-    );
+) -> Option<String> {
+    if pre_correction_transcript.trim().is_empty() {
+        return None;
+    }
+    let prompt = build_correction_prompt(pre_correction_transcript, language);
+    persist_debug_text(&workspace.correction_prompt_path(), &prompt);
+    Some(prompt)
 }
 
 /// Persist the prompt sent to the summary harness to the workspace's
@@ -419,7 +428,21 @@ pub fn correct_transcript<C: ClaudeSummaryClient>(
     if transcript.trim().is_empty() {
         return Ok(transcript.to_owned());
     }
-
     let prompt = build_correction_prompt(transcript, language);
-    claude.summarize(&prompt, None)
+    correct_transcript_with_prompt(claude, transcript, &prompt)
+}
+
+/// Run the LLM-based transcript correction step using a pre-built prompt.
+/// Use this variant when the prompt has already been constructed (for
+/// example by [`persist_correction_prompt_debug_artifact`]) to avoid the
+/// non-trivial cost of rebuilding it for large transcripts.
+pub fn correct_transcript_with_prompt<C: ClaudeSummaryClient>(
+    claude: &C,
+    transcript: &str,
+    prompt: &str,
+) -> Result<String, SummaryError> {
+    if transcript.trim().is_empty() {
+        return Ok(transcript.to_owned());
+    }
+    claude.summarize(prompt, None)
 }

@@ -1937,17 +1937,25 @@ impl ScaffoldHandler {
         } else {
             // Persist the correction prompt only when the GEC step is actually
             // about to run; otherwise the artifact would falsely imply the
-            // correction step executed.
-            crate::application::summary::persist_correction_prompt_debug_artifact(
-                &request.workspace,
-                &summary_transcript,
-                self.whisper_language.as_deref(),
-            );
-            match tokio::task::block_in_place(|| {
-                crate::application::summary::correct_transcript(
-                    &summary_client,
+            // correction step executed. Reuse the built prompt for the
+            // correction call to avoid building it twice.
+            let correction_prompt =
+                crate::application::summary::persist_correction_prompt_debug_artifact(
+                    &request.workspace,
                     &summary_transcript,
                     self.whisper_language.as_deref(),
+                )
+                .unwrap_or_else(|| {
+                    crate::application::summary::build_correction_prompt(
+                        &summary_transcript,
+                        self.whisper_language.as_deref(),
+                    )
+                });
+            match tokio::task::block_in_place(|| {
+                crate::application::summary::correct_transcript_with_prompt(
+                    &summary_client,
+                    &summary_transcript,
+                    &correction_prompt,
                 )
             }) {
                 Ok(corrected) => corrected,
