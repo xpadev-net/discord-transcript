@@ -1,7 +1,6 @@
 use crate::domain::privacy::{MaskingStats, mask_pii};
 use crate::domain::transcript::{NormalizationConfig, normalize_segments, render_for_summary};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
-use crate::infrastructure::storage_fs::sanitize_path_component;
 use crate::infrastructure::workspace::{
     MASKED_TRANSCRIPT_FILENAME, MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
 };
@@ -123,9 +122,8 @@ pub fn run_transcription<W: WhisperClient>(
             audio_path: speaker.audio_path.clone(),
             language: request.language.clone(),
         })?;
-        let safe_speaker = sanitize_path_component(&speaker.speaker_id);
         persist_whisper_debug_response(
-            &request.workspace.whisper_response_path(&safe_speaker),
+            &request.workspace.whisper_response_path(&speaker.speaker_id),
             &transcription.raw_body,
         );
         for mut segment in transcription.segments {

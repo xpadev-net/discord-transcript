@@ -106,11 +106,13 @@ impl MeetingWorkspacePaths {
     }
 
     /// Per-speaker Whisper raw response path.
-    /// `speaker_id` is sanitized by the caller's `sanitize_path_component`
-    /// helper to keep filenames inside the workspace.
-    pub fn whisper_response_path(&self, safe_speaker_id: &str) -> PathBuf {
-        self.whisper_debug_dir()
-            .join(format!("{safe_speaker_id}.json"))
+    ///
+    /// The speaker identifier is sanitized internally via
+    /// [`sanitize_path_component`] so this method is safe to call with raw
+    /// (untrusted) speaker IDs and cannot escape the workspace.
+    pub fn whisper_response_path(&self, speaker_id: &str) -> PathBuf {
+        let sanitized = sanitize_path_component(speaker_id);
+        self.whisper_debug_dir().join(format!("{sanitized}.json"))
     }
 
     pub fn mixdown_whisper_response_path(&self) -> PathBuf {
