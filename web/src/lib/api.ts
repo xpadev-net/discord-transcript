@@ -1,4 +1,5 @@
 import type {
+  DebugArtifact,
   MeetingResponse,
   SpeakerAudioInfo,
   SummaryResponse,
@@ -67,4 +68,13 @@ export function getSpeakerAudioUrl(
   speakerId: string,
 ): string {
   return `${basePath(meetingId)}/speakers/${encodeURIComponent(speakerId)}/audio`;
+}
+
+export function fetchDebugManifest(
+  meetingId: string,
+  signal?: AbortSignal,
+): Promise<DebugArtifact[]> {
+  return fetch(`${basePath(meetingId)}/debug/manifest`, { signal }).then(
+    handleResponse<DebugArtifact[]>,
+  );
 }

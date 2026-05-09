@@ -1,7 +1,9 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, TranscriptionOutput,
-    build_summary_prompt, correct_transcript, run_transcription, write_transcript_files,
+    build_correction_prompt, build_summary_prompt, correct_transcript_with_prompt,
+    persist_correction_prompt_debug_artifact, persist_pre_correction_transcript_debug_artifact,
+    persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::{JobStatus, JobType, MeetingStatus};
@@ -113,11 +115,31 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
 
-    // Apply LLM-based error correction to the transcript before summarization.
-    let transcription = match correct_transcript(
-        claude,
+    persist_pre_correction_transcript_debug_artifact(
+        &request.workspace,
+        &transcription.transcript_for_summary,
+    );
+    // Reuse the persisted prompt (when one was written) instead of rebuilding
+    // it inside `correct_transcript`. Falls back to a fresh build only for the
+    // (rare) case where the artifact was skipped — e.g., transcript fully
+    // empty — but `correct_transcript_with_prompt` still short-circuits there.
+    let correction_prompt = persist_correction_prompt_debug_artifact(
+        &request.workspace,
         &transcription.transcript_for_summary,
         request.language.as_deref(),
+    )
+    .unwrap_or_else(|| {
+        build_correction_prompt(
+            &transcription.transcript_for_summary,
+            request.language.as_deref(),
+        )
+    });
+
+    // Apply LLM-based error correction to the transcript before summarization.
+    let transcription = match correct_transcript_with_prompt(
+        claude,
+        &transcription.transcript_for_summary,
+        &correction_prompt,
     ) {
         Ok(corrected) => TranscriptionOutput {
             transcript_for_summary: corrected,
@@ -147,6 +169,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         }
     };
     let prompt = build_summary_prompt(&request, &manifest);
+    persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let markdown = match claude.summarize(&prompt, Some(request.workspace.root())) {
         Ok(value) => value,
         Err(err) => {

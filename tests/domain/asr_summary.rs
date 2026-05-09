@@ -1,6 +1,6 @@
 use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
-    build_summary_prompt, run_summary_pipeline,
+    build_correction_prompt, build_summary_prompt, run_summary_pipeline,
 };
 use discord_transcript::domain::privacy::MaskingStats;
 use discord_transcript::domain::speaker::SpeakerProfile;
@@ -148,6 +148,33 @@ fn parse_whisper_response_extracts_segments() {
     assert_eq!(parsed.segments[0].start_ms, 0);
     assert_eq!(parsed.segments[0].end_ms, 1_200);
     assert_eq!(parsed.segments[1].speaker_id, "unknown");
+    assert_eq!(parsed.raw_body, json);
+}
+
+#[test]
+fn build_correction_prompt_includes_japanese_rules_when_language_is_ja() {
+    let prompt = build_correction_prompt("hi", Some("ja"));
+    assert!(
+        prompt.contains("misrecognized kanji"),
+        "Japanese rules should be included; got: {prompt}"
+    );
+    assert!(prompt.contains("hi"));
+}
+
+#[test]
+fn build_correction_prompt_falls_back_to_generic_rules_for_other_languages() {
+    let prompt = build_correction_prompt("hi", Some("en"));
+    assert!(
+        prompt.contains("Fix misrecognized words"),
+        "Generic rules should be used for non-ja languages; got: {prompt}"
+    );
+    assert!(!prompt.contains("misrecognized kanji"));
+}
+
+#[test]
+fn build_correction_prompt_returns_empty_string_for_blank_transcript() {
+    assert!(build_correction_prompt("", Some("ja")).is_empty());
+    assert!(build_correction_prompt("   \n", None).is_empty());
 }
 
 #[test]

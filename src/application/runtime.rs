@@ -1918,6 +1918,13 @@ impl ScaffoldHandler {
             }
         }
 
+        // The pre-correction transcript is accurate regardless of whether the
+        // optional GEC step runs, so it is always persisted.
+        crate::application::summary::persist_pre_correction_transcript_debug_artifact(
+            &request.workspace,
+            &summary_transcript,
+        );
+
         // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
         // argv-based OpenCode / Cursor would pass the full transcript on the command line.
         let corrected_transcript = if !summary_client.can_run_llm_transcript_correction() {
@@ -1928,11 +1935,27 @@ impl ScaffoldHandler {
             );
             summary_transcript
         } else {
-            match tokio::task::block_in_place(|| {
-                crate::application::summary::correct_transcript(
-                    &summary_client,
+            // Persist the correction prompt only when the GEC step is actually
+            // about to run; otherwise the artifact would falsely imply the
+            // correction step executed. Reuse the built prompt for the
+            // correction call to avoid building it twice.
+            let correction_prompt =
+                crate::application::summary::persist_correction_prompt_debug_artifact(
+                    &request.workspace,
                     &summary_transcript,
                     self.whisper_language.as_deref(),
+                )
+                .unwrap_or_else(|| {
+                    crate::application::summary::build_correction_prompt(
+                        &summary_transcript,
+                        self.whisper_language.as_deref(),
+                    )
+                });
+            match tokio::task::block_in_place(|| {
+                crate::application::summary::correct_transcript_with_prompt(
+                    &summary_client,
+                    &summary_transcript,
+                    &correction_prompt,
                 )
             }) {
                 Ok(corrected) => corrected,
@@ -1987,6 +2010,10 @@ impl ScaffoldHandler {
                 &transcription_for_summary,
             )?;
             let prompt = crate::application::summary::build_summary_prompt(&request, &manifest);
+            crate::application::summary::persist_summary_prompt_debug_artifact(
+                &request.workspace,
+                &prompt,
+            );
             summary_client.summarize(&prompt, Some(request.workspace.root()))
         });
         let markdown = match markdown {
