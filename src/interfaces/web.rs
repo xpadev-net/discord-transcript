@@ -389,28 +389,43 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
 
 // ========== Channel permission check ==========
 
+/// Meeting workspace identifiers returned alongside an access check so callers
+/// don't need to re-query the meetings table to find the workspace.
+#[derive(Debug, Clone)]
+struct MeetingAccess {
+    guild_id: String,
+    voice_channel_id: String,
+}
+
 /// Verify that the authenticated user has VIEW_CHANNEL permission on the
-/// voice channel where the meeting was recorded.
+/// voice channel where the meeting was recorded. Returns the meeting's
+/// guild/voice-channel IDs so callers can build paths without an extra
+/// DB round-trip.
 /// Results are cached per (user_id, channel_id) for 5 minutes to avoid
 /// Discord API rate-limit exhaustion on page loads (which trigger ~4 requests).
 async fn verify_meeting_access(
     state: &WebState,
     meeting_id: &str,
     user_id: &str,
-) -> Result<(), StatusCode> {
+) -> Result<MeetingAccess, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // Look up the meeting's voice channel
+    // Look up the meeting's voice channel and guild ID in a single round-trip.
     let row = state
         .db
         .query_opt(
-            "SELECT voice_channel_id FROM meetings WHERE id=$1",
+            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1",
             &[&meeting_id],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    let guild_id: String = row.get("guild_id");
     let channel_id: String = row.get("voice_channel_id");
+    let access = MeetingAccess {
+        guild_id,
+        voice_channel_id: channel_id.clone(),
+    };
 
     // Check permission cache
     let cache_key = (user_id.to_owned(), channel_id.clone());
@@ -420,7 +435,7 @@ async fn verify_meeting_access(
             && Instant::now() < expires_at
         {
             return if allowed {
-                Ok(())
+                Ok(access)
             } else {
                 Err(StatusCode::FORBIDDEN)
             };
@@ -444,7 +459,7 @@ async fn verify_meeting_access(
     }
 
     if allowed {
-        Ok(())
+        Ok(access)
     } else {
         Err(StatusCode::FORBIDDEN)
     }
@@ -1410,23 +1425,11 @@ async fn api_debug_manifest(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<DebugArtifactEntry>>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
-
-    let row = state
-        .db
-        .query_opt(
-            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
-            &[&meeting_id],
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let guild_id: String = row.get("guild_id");
-    let voice_channel_id: String = row.get("voice_channel_id");
+    let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
-    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
+    let workspace = layout.for_meeting(&access.guild_id, &access.voice_channel_id, &meeting_id);
     let legacy_dir = layout.legacy_meeting_dir(&meeting_id);
 
     let speaker_rows = state
@@ -1503,7 +1506,7 @@ async fn api_debug_manifest(
             let speaker_filename = format!("{safe_speaker}_speaker.wav");
             let primary_speaker_path = primary_speakers_dir.join(&speaker_filename);
             let legacy_speaker_path = legacy_speakers_dir.join(&speaker_filename);
-            let whisper_path = workspace.whisper_response_path(&safe_speaker);
+            let whisper_path = workspace.whisper_response_path_for_sanitized(&safe_speaker);
             async move {
                 let (primary_exists, legacy_exists, whisper_exists) = tokio::join!(
                     tokio::fs::try_exists(&primary_speaker_path),
@@ -1672,9 +1675,9 @@ async fn api_debug_file(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path((meeting_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
-    let source = resolve_debug_artifact(&state, &meeting_id, &artifact_id).await?;
+    let source = resolve_debug_artifact(&state, &meeting_id, &access, &artifact_id).await?;
     match source {
         DebugArtifactSource::File {
             path,
@@ -1692,23 +1695,12 @@ async fn api_debug_file(
 async fn resolve_debug_artifact(
     state: &WebState,
     meeting_id: &str,
+    access: &MeetingAccess,
     artifact_id: &str,
 ) -> Result<DebugArtifactSource, StatusCode> {
-    let row = state
-        .db
-        .query_opt(
-            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
-            &[&meeting_id],
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let guild_id: String = row.get("guild_id");
-    let voice_channel_id: String = row.get("voice_channel_id");
-
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
-    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, meeting_id);
+    let workspace = layout.for_meeting(&access.guild_id, &access.voice_channel_id, meeting_id);
     let legacy_dir = layout.legacy_meeting_dir(meeting_id);
 
     if let Some((kind, raw_value)) = artifact_id.split_once('~') {
@@ -1734,7 +1726,10 @@ async fn resolve_debug_artifact(
                 });
             }
             "whisper" => {
-                let path = workspace.whisper_response_path(&safe);
+                // Unlike speaker_audio there is no legacy fallback, so we
+                // skip the explicit existence check here and let
+                // stream_debug_file's metadata() call surface 404s.
+                let path = workspace.whisper_response_path_for_sanitized(&safe);
                 return Ok(DebugArtifactSource::File {
                     path,
                     filename: format!("whisper_{safe}.json"),
@@ -1819,13 +1814,10 @@ async fn stream_debug_file(
     filename: &str,
     content_type: &'static str,
 ) -> Result<Response, StatusCode> {
-    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    })?;
+    // Open the file first, then read metadata from the same file handle so
+    // Content-Length is tied to the same on-disk inode as the byte stream
+    // (avoids TOCTOU between stat and open if the file is replaced or
+    // truncated between syscalls).
     let file = tokio::fs::File::open(path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             StatusCode::NOT_FOUND
@@ -1833,6 +1825,10 @@ async fn stream_debug_file(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     })?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
     let content_disposition = build_debug_content_disposition(filename);
