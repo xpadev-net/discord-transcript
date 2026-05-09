@@ -129,5 +129,37 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.status, MeetingStatus::Summarizing);
 
+    let workspace_for_assert =
+        MeetingWorkspaceLayout::new(&base).for_meeting("g1", "vc1", "m1");
+    let whisper_response_path = workspace_for_assert.whisper_response_path("alice");
+    assert!(
+        whisper_response_path.exists(),
+        "whisper raw response should be persisted at {whisper_response_path:?}"
+    );
+    let raw_body =
+        std::fs::read_to_string(&whisper_response_path).expect("whisper response readable");
+    assert!(raw_body.contains("alice@example.com"));
+
+    let pre_correction_path = workspace_for_assert.pre_correction_transcript_path();
+    assert!(
+        pre_correction_path.exists(),
+        "pre-correction transcript should be persisted at {pre_correction_path:?}"
+    );
+
+    let correction_prompt_path = workspace_for_assert.correction_prompt_path();
+    assert!(
+        correction_prompt_path.exists(),
+        "correction prompt should be persisted at {correction_prompt_path:?}"
+    );
+
+    let summary_prompt_path = workspace_for_assert.summary_prompt_path();
+    assert!(
+        summary_prompt_path.exists(),
+        "summary prompt should be persisted at {summary_prompt_path:?}"
+    );
+    let summary_prompt =
+        std::fs::read_to_string(&summary_prompt_path).expect("summary prompt readable");
+    assert!(summary_prompt.contains("Meeting ID: m1"));
+
     let _ = std::fs::remove_dir_all(base);
 }

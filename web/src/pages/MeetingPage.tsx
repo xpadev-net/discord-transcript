@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { AudioPlayer } from "../components/AudioPlayer";
+import { DebugDownloads } from "../components/DebugDownloads";
 import { Header } from "../components/Header";
-import { SpeakerAudioDownloads } from "../components/SpeakerAudioDownloads";
 import { SummaryPanel } from "../components/SummaryPanel";
 import { TranscriptPanel } from "../components/TranscriptPanel";
 import { useAudioSync } from "../hooks/useAudioSync";
 import { useMeetingData } from "../hooks/useMeetingData";
-import { fetchSpeakers, getAudioUrl } from "../lib/api";
-import type { SpeakerAudioInfo } from "../lib/types";
+import { fetchDebugManifest, getAudioUrl } from "../lib/api";
+import type { DebugArtifact } from "../lib/types";
 
 export function MeetingPage() {
   const { meetingId } = useParams<{ meetingId: string }>();
@@ -23,9 +23,11 @@ export function MeetingPage() {
     transcript,
   );
 
-  const [speakers, setSpeakers] = useState<SpeakerAudioInfo[] | null>(null);
-  const [speakersLoading, setSpeakersLoading] = useState(true);
-  const [speakersError, setSpeakersError] = useState(false);
+  const [debugArtifacts, setDebugArtifacts] = useState<DebugArtifact[] | null>(
+    null,
+  );
+  const [debugLoading, setDebugLoading] = useState(true);
+  const [debugError, setDebugError] = useState(false);
 
   useEffect(() => {
     if (meetingId) {
@@ -35,29 +37,29 @@ export function MeetingPage() {
 
   useEffect(() => {
     if (!meetingId) {
-      setSpeakers(null);
-      setSpeakersLoading(false);
-      setSpeakersError(false);
+      setDebugArtifacts(null);
+      setDebugLoading(false);
+      setDebugError(false);
       return;
     }
     const controller = new AbortController();
-    setSpeakers(null);
-    setSpeakersError(false);
-    setSpeakersLoading(true);
-    fetchSpeakers(meetingId, controller.signal)
+    setDebugArtifacts(null);
+    setDebugError(false);
+    setDebugLoading(true);
+    fetchDebugManifest(meetingId, controller.signal)
       .then((data) => {
         if (!controller.signal.aborted) {
-          setSpeakers(data);
+          setDebugArtifacts(data);
         }
       })
       .catch(() => {
         if (!controller.signal.aborted) {
-          setSpeakersError(true);
+          setDebugError(true);
         }
       })
       .finally(() => {
         if (!controller.signal.aborted) {
-          setSpeakersLoading(false);
+          setDebugLoading(false);
         }
       });
     return () => controller.abort();
@@ -83,11 +85,10 @@ export function MeetingPage() {
             src={meetingId ? getAudioUrl(meetingId) : ""}
           />
           {meetingId && (
-            <SpeakerAudioDownloads
-              meetingId={meetingId}
-              speakers={speakers}
-              loading={speakersLoading}
-              error={speakersError}
+            <DebugDownloads
+              artifacts={debugArtifacts}
+              loading={debugLoading}
+              error={debugError}
             />
           )}
           <TranscriptPanel

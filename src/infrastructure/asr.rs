@@ -12,6 +12,9 @@ pub struct WhisperInferenceRequest {
 pub struct WhisperTranscriptionResult {
     pub text: String,
     pub segments: Vec<TranscriptSegment>,
+    /// Raw response body returned by the Whisper server. Captured so callers
+    /// can persist it as a debug artifact without re-running inference.
+    pub raw_body: String,
 }
 
 #[derive(Debug)]
@@ -97,6 +100,7 @@ pub fn parse_whisper_response(body: &str) -> Result<WhisperTranscriptionResult, 
     Ok(WhisperTranscriptionResult {
         text: parsed.text,
         segments,
+        raw_body: body.to_owned(),
     })
 }
 

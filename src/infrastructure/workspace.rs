@@ -6,6 +6,12 @@ pub const WORKSPACES_ROOT_DIR: &str = "workspaces";
 pub const MASKED_TRANSCRIPT_FILENAME: &str = "transcript_masked.md";
 pub const TRANSCRIPT_MANIFEST_FILENAME: &str = "manifest.json";
 pub const SSRC_MAPPING_FILENAME: &str = "ssrc_mapping.json";
+pub const DEBUG_DIR: &str = "debug";
+pub const DEBUG_WHISPER_DIR: &str = "whisper";
+pub const DEBUG_MIXDOWN_WHISPER_FILENAME: &str = "mixdown.json";
+pub const DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME: &str = "transcript_pre_correction.md";
+pub const DEBUG_CORRECTION_PROMPT_FILENAME: &str = "correction_prompt.txt";
+pub const DEBUG_SUMMARY_PROMPT_FILENAME: &str = "summary_prompt.txt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspaceLayout {
@@ -91,12 +97,47 @@ impl MeetingWorkspacePaths {
         self.audio_dir().join(SSRC_MAPPING_FILENAME)
     }
 
+    pub fn debug_dir(&self) -> PathBuf {
+        self.root.join(DEBUG_DIR)
+    }
+
+    pub fn whisper_debug_dir(&self) -> PathBuf {
+        self.debug_dir().join(DEBUG_WHISPER_DIR)
+    }
+
+    /// Per-speaker Whisper raw response path.
+    /// `speaker_id` is sanitized by the caller's `sanitize_path_component`
+    /// helper to keep filenames inside the workspace.
+    pub fn whisper_response_path(&self, safe_speaker_id: &str) -> PathBuf {
+        self.whisper_debug_dir()
+            .join(format!("{safe_speaker_id}.json"))
+    }
+
+    pub fn mixdown_whisper_response_path(&self) -> PathBuf {
+        self.whisper_debug_dir()
+            .join(DEBUG_MIXDOWN_WHISPER_FILENAME)
+    }
+
+    pub fn pre_correction_transcript_path(&self) -> PathBuf {
+        self.debug_dir()
+            .join(DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME)
+    }
+
+    pub fn correction_prompt_path(&self) -> PathBuf {
+        self.debug_dir().join(DEBUG_CORRECTION_PROMPT_FILENAME)
+    }
+
+    pub fn summary_prompt_path(&self) -> PathBuf {
+        self.debug_dir().join(DEBUG_SUMMARY_PROMPT_FILENAME)
+    }
+
     pub fn ensure_base_dirs(&self) -> std::io::Result<()> {
         fs::create_dir_all(self.audio_dir())?;
         fs::create_dir_all(self.transcript_dir())?;
         fs::create_dir_all(self.context_dir())?;
         fs::create_dir_all(self.summary_dir())?;
-        fs::create_dir_all(self.speakers_dir())
+        fs::create_dir_all(self.speakers_dir())?;
+        fs::create_dir_all(self.whisper_debug_dir())
     }
 
     /// Returns a path relative to the workspace root. Returns None if the

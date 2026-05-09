@@ -97,6 +97,14 @@ pub fn create_router(state: WebState) -> Router {
             "/api/meetings/{meeting_id}/speakers/{speaker_id}/audio",
             get(api_speaker_audio),
         )
+        .route(
+            "/api/meetings/{meeting_id}/debug/manifest",
+            get(api_debug_manifest),
+        )
+        .route(
+            "/api/meetings/{meeting_id}/debug/files/{artifact_id}",
+            get(api_debug_file),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -933,6 +941,17 @@ struct SpeakerAudioResponse {
     has_audio: bool,
 }
 
+#[derive(Serialize)]
+struct DebugArtifactEntry {
+    id: String,
+    label: String,
+    category: &'static str,
+    available: bool,
+    download_url: String,
+    filename: String,
+    content_type: &'static str,
+}
+
 // ---------- Handlers ----------
 
 async fn api_meeting(
@@ -1322,6 +1341,528 @@ async fn api_speaker_audio(
         .header(header::CONTENT_DISPOSITION, &content_disposition)
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// ========== Debug artifacts ==========
+
+/// Static (non-parameterized) debug artifact identifier. Parameterized
+/// identifiers (`whisper~<id>`, `speaker_audio~<id>`) are handled separately
+/// in [`resolve_debug_artifact`].
+#[derive(Debug, Clone, Copy)]
+enum StaticDebugArtifactKind {
+    MixdownAudio,
+    WhisperMixdown,
+    TranscriptPreCorrection,
+    TranscriptPostCorrection,
+    TranscriptManifest,
+    CorrectionPrompt,
+    SummaryPrompt,
+    SummaryOutput,
+}
+
+impl StaticDebugArtifactKind {
+    fn as_id(self) -> &'static str {
+        match self {
+            Self::MixdownAudio => "mixdown_audio",
+            Self::WhisperMixdown => "whisper_mixdown",
+            Self::TranscriptPreCorrection => "transcript_pre_correction",
+            Self::TranscriptPostCorrection => "transcript_post_correction",
+            Self::TranscriptManifest => "transcript_manifest",
+            Self::CorrectionPrompt => "correction_prompt",
+            Self::SummaryPrompt => "summary_prompt",
+            Self::SummaryOutput => "summary_output",
+        }
+    }
+
+    fn parse(input: &str) -> Option<Self> {
+        Some(match input {
+            "mixdown_audio" => Self::MixdownAudio,
+            "whisper_mixdown" => Self::WhisperMixdown,
+            "transcript_pre_correction" => Self::TranscriptPreCorrection,
+            "transcript_post_correction" => Self::TranscriptPostCorrection,
+            "transcript_manifest" => Self::TranscriptManifest,
+            "correction_prompt" => Self::CorrectionPrompt,
+            "summary_prompt" => Self::SummaryPrompt,
+            "summary_output" => Self::SummaryOutput,
+            _ => return None,
+        })
+    }
+}
+
+/// Resolved physical source for a debug artifact request.
+enum DebugArtifactSource {
+    /// File on disk relative to the meeting workspace.
+    File {
+        path: std::path::PathBuf,
+        filename: String,
+        content_type: &'static str,
+    },
+    /// Inline body served from the database (or another non-file source).
+    Inline {
+        bytes: Vec<u8>,
+        filename: String,
+        content_type: &'static str,
+    },
+}
+
+async fn api_debug_manifest(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<Vec<DebugArtifactEntry>>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let row = state
+        .db
+        .query_opt(
+            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let guild_id: String = row.get("guild_id");
+    let voice_channel_id: String = row.get("voice_channel_id");
+
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
+    let legacy_dir = layout.legacy_meeting_dir(&meeting_id);
+
+    let speaker_rows = state
+        .db
+        .query(
+            "SELECT speaker_id, username, nickname, display_name \
+             FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut entries: Vec<DebugArtifactEntry> = Vec::new();
+    let base_url = format!("/api/meetings/{}/debug/files", percent_encode(&meeting_id));
+
+    let mixdown_path = if tokio::fs::try_exists(&workspace.mixdown_path())
+        .await
+        .unwrap_or(false)
+    {
+        Some(workspace.mixdown_path())
+    } else if tokio::fs::try_exists(&legacy_dir.join("mixdown.wav"))
+        .await
+        .unwrap_or(false)
+    {
+        Some(legacy_dir.join("mixdown.wav"))
+    } else {
+        None
+    };
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::MixdownAudio.as_id().to_owned(),
+        label: "Mixdown 音声".to_owned(),
+        category: "audio",
+        available: mixdown_path.is_some(),
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::MixdownAudio.as_id()
+        ),
+        filename: "mixdown.wav".to_owned(),
+        content_type: "audio/wav",
+    });
+
+    let primary_speakers_dir = workspace.speakers_dir();
+    let legacy_speakers_dir = legacy_dir.join("speakers");
+    for row in &speaker_rows {
+        let speaker_id: String = row.get("speaker_id");
+        let username: Option<String> = row.get("username");
+        let nickname: Option<String> = row.get("nickname");
+        let display_name: Option<String> = row.get("display_name");
+        let profile = SpeakerProfile {
+            speaker_id: speaker_id.clone(),
+            username,
+            nickname,
+            display_name,
+        };
+        let label_base = profile.display_label();
+        let safe_speaker = sanitize_path_component(&speaker_id);
+
+        let speaker_filename = format!("{safe_speaker}_speaker.wav");
+        let primary_speaker_path = primary_speakers_dir.join(&speaker_filename);
+        let legacy_speaker_path = legacy_speakers_dir.join(&speaker_filename);
+        let speaker_available = tokio::fs::try_exists(&primary_speaker_path)
+            .await
+            .unwrap_or(false)
+            || tokio::fs::try_exists(&legacy_speaker_path)
+                .await
+                .unwrap_or(false);
+        entries.push(DebugArtifactEntry {
+            id: format!("speaker_audio~{safe_speaker}"),
+            label: format!("Whisper送信音声 ({label_base})"),
+            category: "audio",
+            available: speaker_available,
+            download_url: format!("{base_url}/speaker_audio~{safe_speaker}"),
+            filename: speaker_filename,
+            content_type: "audio/wav",
+        });
+
+        let whisper_response_path = workspace.whisper_response_path(&safe_speaker);
+        let whisper_available = tokio::fs::try_exists(&whisper_response_path)
+            .await
+            .unwrap_or(false);
+        entries.push(DebugArtifactEntry {
+            id: format!("whisper~{safe_speaker}"),
+            label: format!("Whisperレスポンス ({label_base})"),
+            category: "whisper",
+            available: whisper_available,
+            download_url: format!("{base_url}/whisper~{safe_speaker}"),
+            filename: format!("whisper_{safe_speaker}.json"),
+            content_type: "application/json",
+        });
+    }
+
+    let mixdown_whisper_path = workspace.mixdown_whisper_response_path();
+    let mixdown_whisper_available = tokio::fs::try_exists(&mixdown_whisper_path)
+        .await
+        .unwrap_or(false);
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::WhisperMixdown.as_id().to_owned(),
+        label: "Whisperレスポンス (mixdown)".to_owned(),
+        category: "whisper",
+        available: mixdown_whisper_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::WhisperMixdown.as_id()
+        ),
+        filename: "whisper_mixdown.json".to_owned(),
+        content_type: "application/json",
+    });
+
+    let pre_correction_path = workspace.pre_correction_transcript_path();
+    let pre_correction_available = tokio::fs::try_exists(&pre_correction_path)
+        .await
+        .unwrap_or(false);
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::TranscriptPreCorrection
+            .as_id()
+            .to_owned(),
+        label: "Transcript (補正前)".to_owned(),
+        category: "transcript",
+        available: pre_correction_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::TranscriptPreCorrection.as_id()
+        ),
+        filename: "transcript_pre_correction.md".to_owned(),
+        content_type: "text/markdown",
+    });
+
+    let masked_path = workspace.masked_transcript_path();
+    let masked_available = tokio::fs::try_exists(&masked_path).await.unwrap_or(false);
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::TranscriptPostCorrection
+            .as_id()
+            .to_owned(),
+        label: "Transcript (補正後)".to_owned(),
+        category: "transcript",
+        available: masked_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::TranscriptPostCorrection.as_id()
+        ),
+        filename: "transcript_masked.md".to_owned(),
+        content_type: "text/markdown",
+    });
+
+    let manifest_path = workspace.transcript_manifest_path();
+    let manifest_available = tokio::fs::try_exists(&manifest_path).await.unwrap_or(false);
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::TranscriptManifest
+            .as_id()
+            .to_owned(),
+        label: "Transcript manifest".to_owned(),
+        category: "transcript",
+        available: manifest_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::TranscriptManifest.as_id()
+        ),
+        filename: "manifest.json".to_owned(),
+        content_type: "application/json",
+    });
+
+    let correction_prompt_path = workspace.correction_prompt_path();
+    let correction_prompt_available = tokio::fs::try_exists(&correction_prompt_path)
+        .await
+        .unwrap_or(false);
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::CorrectionPrompt.as_id().to_owned(),
+        label: "Transcript補正プロンプト".to_owned(),
+        category: "prompt",
+        available: correction_prompt_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::CorrectionPrompt.as_id()
+        ),
+        filename: "correction_prompt.txt".to_owned(),
+        content_type: "text/plain",
+    });
+
+    let summary_prompt_path = workspace.summary_prompt_path();
+    let summary_prompt_available = tokio::fs::try_exists(&summary_prompt_path)
+        .await
+        .unwrap_or(false);
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::SummaryPrompt.as_id().to_owned(),
+        label: "要約プロンプト".to_owned(),
+        category: "prompt",
+        available: summary_prompt_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::SummaryPrompt.as_id()
+        ),
+        filename: "summary_prompt.txt".to_owned(),
+        content_type: "text/plain",
+    });
+
+    let summary_row = state
+        .db
+        .query_opt(
+            "SELECT markdown FROM summaries WHERE meeting_id=$1 ORDER BY version DESC LIMIT 1",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let summary_available = summary_row
+        .as_ref()
+        .and_then(|r| r.get::<_, Option<String>>("markdown"))
+        .is_some();
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::SummaryOutput.as_id().to_owned(),
+        label: "要約モデル生出力".to_owned(),
+        category: "summary",
+        available: summary_available,
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::SummaryOutput.as_id()
+        ),
+        filename: "summary.md".to_owned(),
+        content_type: "text/markdown",
+    });
+
+    Ok(Json(entries))
+}
+
+async fn api_debug_file(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path((meeting_id, artifact_id)): Path<(String, String)>,
+) -> Result<Response, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let source = resolve_debug_artifact(&state, &meeting_id, &artifact_id).await?;
+    match source {
+        DebugArtifactSource::File {
+            path,
+            filename,
+            content_type,
+        } => stream_debug_file(&path, &filename, content_type).await,
+        DebugArtifactSource::Inline {
+            bytes,
+            filename,
+            content_type,
+        } => Ok(build_inline_debug_response(bytes, &filename, content_type)),
+    }
+}
+
+async fn resolve_debug_artifact(
+    state: &WebState,
+    meeting_id: &str,
+    artifact_id: &str,
+) -> Result<DebugArtifactSource, StatusCode> {
+    let row = state
+        .db
+        .query_opt(
+            "SELECT guild_id, voice_channel_id FROM meetings WHERE id=$1 LIMIT 1",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let guild_id: String = row.get("guild_id");
+    let voice_channel_id: String = row.get("voice_channel_id");
+
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let workspace = layout.for_meeting(&guild_id, &voice_channel_id, meeting_id);
+    let legacy_dir = layout.legacy_meeting_dir(meeting_id);
+
+    if let Some((kind, raw_value)) = artifact_id.split_once('~') {
+        // Pass the raw value through the same sanitizer used at write time so
+        // we cannot escape the workspace via crafted artifact_ids.
+        let safe = sanitize_path_component(raw_value);
+        match kind {
+            "speaker_audio" => {
+                let filename = format!("{safe}_speaker.wav");
+                let primary = workspace.speakers_dir().join(&filename);
+                let legacy = legacy_dir.join("speakers").join(&filename);
+                let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+                    primary
+                } else if tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
+                    legacy
+                } else {
+                    return Err(StatusCode::NOT_FOUND);
+                };
+                return Ok(DebugArtifactSource::File {
+                    path,
+                    filename,
+                    content_type: "audio/wav",
+                });
+            }
+            "whisper" => {
+                let path = workspace.whisper_response_path(&safe);
+                return Ok(DebugArtifactSource::File {
+                    path,
+                    filename: format!("whisper_{safe}.json"),
+                    content_type: "application/json",
+                });
+            }
+            _ => return Err(StatusCode::NOT_FOUND),
+        }
+    }
+
+    let kind = StaticDebugArtifactKind::parse(artifact_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(match kind {
+        StaticDebugArtifactKind::MixdownAudio => {
+            let primary = workspace.mixdown_path();
+            let legacy = legacy_dir.join("mixdown.wav");
+            let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+                primary
+            } else if tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
+                legacy
+            } else {
+                return Err(StatusCode::NOT_FOUND);
+            };
+            DebugArtifactSource::File {
+                path,
+                filename: "mixdown.wav".to_owned(),
+                content_type: "audio/wav",
+            }
+        }
+        StaticDebugArtifactKind::WhisperMixdown => DebugArtifactSource::File {
+            path: workspace.mixdown_whisper_response_path(),
+            filename: "whisper_mixdown.json".to_owned(),
+            content_type: "application/json",
+        },
+        StaticDebugArtifactKind::TranscriptPreCorrection => DebugArtifactSource::File {
+            path: workspace.pre_correction_transcript_path(),
+            filename: "transcript_pre_correction.md".to_owned(),
+            content_type: "text/markdown",
+        },
+        StaticDebugArtifactKind::TranscriptPostCorrection => DebugArtifactSource::File {
+            path: workspace.masked_transcript_path(),
+            filename: "transcript_masked.md".to_owned(),
+            content_type: "text/markdown",
+        },
+        StaticDebugArtifactKind::TranscriptManifest => DebugArtifactSource::File {
+            path: workspace.transcript_manifest_path(),
+            filename: "manifest.json".to_owned(),
+            content_type: "application/json",
+        },
+        StaticDebugArtifactKind::CorrectionPrompt => DebugArtifactSource::File {
+            path: workspace.correction_prompt_path(),
+            filename: "correction_prompt.txt".to_owned(),
+            content_type: "text/plain",
+        },
+        StaticDebugArtifactKind::SummaryPrompt => DebugArtifactSource::File {
+            path: workspace.summary_prompt_path(),
+            filename: "summary_prompt.txt".to_owned(),
+            content_type: "text/plain",
+        },
+        StaticDebugArtifactKind::SummaryOutput => {
+            let summary_row = state
+                .db
+                .query_opt(
+                    "SELECT markdown FROM summaries WHERE meeting_id=$1 ORDER BY version DESC LIMIT 1",
+                    &[&meeting_id],
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let markdown: String = summary_row
+                .and_then(|r| r.get::<_, Option<String>>("markdown"))
+                .ok_or(StatusCode::NOT_FOUND)?;
+            DebugArtifactSource::Inline {
+                bytes: markdown.into_bytes(),
+                filename: "summary.md".to_owned(),
+                content_type: "text/markdown",
+            }
+        }
+    })
+}
+
+async fn stream_debug_file(
+    path: &std::path::Path,
+    filename: &str,
+    content_type: &'static str,
+) -> Result<Response, StatusCode> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    let file = tokio::fs::File::open(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    let content_disposition = build_debug_content_disposition(filename);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, metadata.len().to_string())
+        .header(header::CONTENT_DISPOSITION, content_disposition)
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn build_inline_debug_response(
+    bytes: Vec<u8>,
+    filename: &str,
+    content_type: &'static str,
+) -> Response {
+    let len = bytes.len();
+    let content_disposition = build_debug_content_disposition(filename);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .header(header::CONTENT_DISPOSITION, content_disposition)
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Build a Content-Disposition header for debug artifacts. Filenames produced
+/// here are constructed by the server (already sanitized via
+/// [`sanitize_path_component`]) so the ASCII fallback is straightforward.
+fn build_debug_content_disposition(filename: &str) -> String {
+    let safe: String = filename
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            _ => c,
+        })
+        .collect();
+    let safe = if safe.trim().is_empty() {
+        "debug_artifact".to_owned()
+    } else {
+        safe
+    };
+    format!(r#"attachment; filename="{safe}""#)
 }
 
 // ---------- Helpers ----------

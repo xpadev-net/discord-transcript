@@ -1918,6 +1918,18 @@ impl ScaffoldHandler {
             }
         }
 
+        crate::application::summary::persist_debug_text(
+            &request.workspace.pre_correction_transcript_path(),
+            &summary_transcript,
+        );
+        crate::application::summary::persist_debug_text(
+            &request.workspace.correction_prompt_path(),
+            &crate::application::summary::build_correction_prompt(
+                &summary_transcript,
+                self.whisper_language.as_deref(),
+            ),
+        );
+
         // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
         // argv-based OpenCode / Cursor would pass the full transcript on the command line.
         let corrected_transcript = if !summary_client.can_run_llm_transcript_correction() {
@@ -1987,6 +1999,10 @@ impl ScaffoldHandler {
                 &transcription_for_summary,
             )?;
             let prompt = crate::application::summary::build_summary_prompt(&request, &manifest);
+            crate::application::summary::persist_debug_text(
+                &request.workspace.summary_prompt_path(),
+                &prompt,
+            );
             summary_client.summarize(&prompt, Some(request.workspace.root()))
         });
         let markdown = match markdown {

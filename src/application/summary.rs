@@ -1,6 +1,7 @@
 use crate::domain::privacy::{MaskingStats, mask_pii};
 use crate::domain::transcript::{NormalizationConfig, normalize_segments, render_for_summary};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
+use crate::infrastructure::storage_fs::sanitize_path_component;
 use crate::infrastructure::workspace::{
     MASKED_TRANSCRIPT_FILENAME, MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
 };
@@ -11,6 +12,7 @@ use serde_json;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryRequest {
@@ -108,6 +110,10 @@ pub fn run_transcription<W: WhisperClient>(
             audio_path: request.audio_path.clone(),
             language: request.language.clone(),
         })?;
+        persist_whisper_debug_response(
+            &request.workspace.mixdown_whisper_response_path(),
+            &transcription.raw_body,
+        );
         return build_transcription_output(transcription.segments);
     }
 
@@ -117,6 +123,11 @@ pub fn run_transcription<W: WhisperClient>(
             audio_path: speaker.audio_path.clone(),
             language: request.language.clone(),
         })?;
+        let safe_speaker = sanitize_path_component(&speaker.speaker_id);
+        persist_whisper_debug_response(
+            &request.workspace.whisper_response_path(&safe_speaker),
+            &transcription.raw_body,
+        );
         for mut segment in transcription.segments {
             segment.speaker_id = speaker.speaker_id.clone();
             segment.start_ms = segment.start_ms.saturating_add(speaker.offset_ms);
@@ -132,6 +143,50 @@ pub fn run_transcription<W: WhisperClient>(
             .then(a.speaker_id.cmp(&b.speaker_id))
     });
     build_transcription_output(merged_segments)
+}
+
+/// Best-effort write of a Whisper raw response JSON for debugging. Failures
+/// are logged but do not interrupt the transcription pipeline.
+fn persist_whisper_debug_response(path: &Path, body: &str) {
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        warn!(
+            path = %parent.display(),
+            error = %err,
+            "failed to create whisper debug directory"
+        );
+        return;
+    }
+    if let Err(err) = fs::write(path, body) {
+        warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to persist whisper raw response for debugging"
+        );
+    }
+}
+
+/// Best-effort write of a debug artifact (transcript or prompt). Failures are
+/// logged but do not interrupt the summary pipeline.
+pub fn persist_debug_text(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        warn!(
+            path = %parent.display(),
+            error = %err,
+            "failed to create debug directory"
+        );
+        return;
+    }
+    if let Err(err) = fs::write(path, contents) {
+        warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to persist debug artifact"
+        );
+    }
 }
 
 pub fn write_transcript_files(
@@ -193,8 +248,20 @@ pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
     request: &SummaryRequest,
 ) -> Result<SummaryResult, SummaryError> {
     let transcription = run_transcription(whisper, request)?;
+    persist_debug_text(
+        &request.workspace.pre_correction_transcript_path(),
+        &transcription.transcript_for_summary,
+    );
+    persist_debug_text(
+        &request.workspace.correction_prompt_path(),
+        &build_correction_prompt(
+            &transcription.transcript_for_summary,
+            request.language.as_deref(),
+        ),
+    );
     let manifest = write_transcript_files(request, &transcription)?;
     let prompt = build_summary_prompt(request, &manifest);
+    persist_debug_text(&request.workspace.summary_prompt_path(), &prompt);
     let markdown = claude.summarize(&prompt, Some(request.workspace.root()))?;
     let message_chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
 
@@ -271,17 +338,14 @@ fn build_transcription_output(
     })
 }
 
-/// Apply LLM-based Generative Error Correction to the transcript text.
+/// Build the prompt sent to the Claude harness for ASR error correction.
 ///
-/// This step corrects misrecognized kanji, adds proper punctuation, and
-/// normalizes numbers in the Whisper output using Claude.
-pub fn correct_transcript<C: ClaudeSummaryClient>(
-    claude: &C,
-    transcript: &str,
-    language: Option<&str>,
-) -> Result<String, SummaryError> {
+/// Returns an empty string when the transcript is empty so callers can skip
+/// invoking the LLM entirely. The output is exposed as a debug artifact, so
+/// the prompt construction is intentionally a pure function.
+pub fn build_correction_prompt(transcript: &str, language: Option<&str>) -> String {
     if transcript.trim().is_empty() {
-        return Ok(transcript.to_owned());
+        return String::new();
     }
 
     let is_japanese = language == Some("ja");
@@ -294,7 +358,7 @@ pub fn correct_transcript<C: ClaudeSummaryClient>(
          - Add or fix punctuation where appropriate for the language\n\
          - Normalize spoken numbers to digits (e.g. \"one hundred twenty three\" → \"123\")"
     };
-    let prompt = format!(
+    format!(
         "You are a speech-recognition error corrector.\n\
 \n\
 Below is an ASR (automatic speech recognition) transcript. Each line has the format:\n\
@@ -314,7 +378,22 @@ timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
 \n\
 Transcript:\n\
 {transcript}"
-    );
+    )
+}
 
+/// Apply LLM-based Generative Error Correction to the transcript text.
+///
+/// This step corrects misrecognized kanji, adds proper punctuation, and
+/// normalizes numbers in the Whisper output using Claude.
+pub fn correct_transcript<C: ClaudeSummaryClient>(
+    claude: &C,
+    transcript: &str,
+    language: Option<&str>,
+) -> Result<String, SummaryError> {
+    if transcript.trim().is_empty() {
+        return Ok(transcript.to_owned());
+    }
+
+    let prompt = build_correction_prompt(transcript, language);
     claude.summarize(&prompt, None)
 }

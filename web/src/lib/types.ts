@@ -38,3 +38,20 @@ export interface SpeakerAudioInfo {
   display_label: string;
   has_audio: boolean;
 }
+
+export type DebugCategory =
+  | "audio"
+  | "whisper"
+  | "transcript"
+  | "prompt"
+  | "summary";
+
+export interface DebugArtifact {
+  id: string;
+  label: string;
+  category: DebugCategory;
+  available: boolean;
+  download_url: string;
+  filename: string;
+  content_type: string;
+}
