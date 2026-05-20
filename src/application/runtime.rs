@@ -22,7 +22,7 @@ use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
 };
-use crate::infrastructure::queue::JobQueue;
+use crate::infrastructure::queue::{Job, JobQueue};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
     INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL,
@@ -276,6 +276,17 @@ fn summary_retry_exhausted(
             true
         }
     }
+}
+
+fn retry_claimed_summary_job<Q: JobQueue>(
+    queue: &mut Q,
+    job: &Job,
+    error_message: String,
+    max_retries: u32,
+    phase: &str,
+) -> bool {
+    let retry_status = queue.retry(&job.id, error_message, max_retries);
+    summary_retry_exhausted(retry_status, &job.meeting_id, &job.id, phase)
 }
 
 fn recover_summary_job_for_startup<E: SqlExecutor>(
@@ -1083,19 +1094,6 @@ impl ScaffoldHandler {
             match effect {
                 RecoveryEffect::SummaryRequeued { .. }
                 | RecoveryEffect::StopConfirmedClientDisconnect { .. } => {
-                    // Merge per-user chunks into mixdown before ASR
-                    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir, self.whisper_resample_to_16k) {
-                        warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to merge audio chunks during recovery");
-                        let _ = self.post_failure_for_meeting(
-                            &ctx.http,
-                            &snapshot.meeting_id,
-                            &format!("音声チャンクのマージに失敗しました (recovery): {err}"),
-                        ).await;
-                        let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(&snapshot.meeting_id, MeetingStatus::Failed, None);
-                        let _ = service.store.set_error_message(&snapshot.meeting_id, Some(format!("merge failed during recovery: {err}")));
-                        continue;
-                    }
                     let job_id = format!("summary-{}", snapshot.meeting_id);
                     let job_available = {
                         let mut queue = self.queue.lock().await;
@@ -1768,9 +1766,8 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
-        let (meeting_dir, audio_path, using_legacy_audio) = {
+        let (meeting_dir, using_legacy_audio) = {
             let primary_dir = workspace.audio_dir();
-            let primary_mixdown = workspace.mixdown_path();
             let primary_has_chunks = fs::read_dir(&primary_dir)
                 .map(|entries| {
                     entries.filter_map(Result::ok).any(|entry| {
@@ -1787,20 +1784,19 @@ impl ScaffoldHandler {
                 })
                 .unwrap_or(false);
             if primary_has_chunks {
-                (primary_dir, primary_mixdown, false)
+                (primary_dir, false)
             } else {
                 let legacy_dir = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
                     &self.chunk_storage_dir,
                 )
                 .legacy_meeting_dir(&meeting.id);
-                let legacy_mixdown = legacy_dir.join("mixdown.wav");
-                (legacy_dir, legacy_mixdown, true)
+                (legacy_dir, true)
             }
         };
         if using_legacy_audio {
             warn!(
                 meeting_id = %meeting.id,
-                path = %audio_path.display(),
+                path = %meeting_dir.display(),
                 "falling back to legacy mixdown path"
             );
         }
@@ -1821,20 +1817,49 @@ impl ScaffoldHandler {
             );
         }
 
+        let audio_path =
+            match merge_user_chunks_to_mixdown(&meeting_dir, self.whisper_resample_to_16k) {
+                Ok(path) => path,
+                Err(err) => {
+                    let err_string = format!("merge failed: {err}");
+                    let mut queue = self.queue.lock().await;
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "merge",
+                    );
+                    drop(queue);
+                    if exhausted {
+                        let mut service = self.service.lock().await;
+                        let _ = service.store.set_meeting_status(
+                            &claimed_job.meeting_id,
+                            MeetingStatus::Failed,
+                            None,
+                        );
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
+                    }
+                    return Err(err_string);
+                }
+            };
+
         let speaker_audio =
             match build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k) {
                 Ok(value) => value,
                 Err(err) => {
                     let mut queue = self.queue.lock().await;
-                    let retry_status =
-                        queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
-                    drop(queue);
-                    if summary_retry_exhausted(
-                        retry_status,
-                        &claimed_job.meeting_id,
-                        &claimed_job.id,
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
+                        err.to_string(),
+                        self.summary_max_retries,
                         "transcription_input",
-                    ) {
+                    );
+                    drop(queue);
+                    if exhausted {
                         let mut service = self.service.lock().await;
                         let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
@@ -1873,7 +1898,7 @@ impl ScaffoldHandler {
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
             speaker_audio,
-            audio_path: audio_path.to_string_lossy().to_string(),
+            audio_path,
             language: self.whisper_language.clone(),
             workspace: workspace.clone(),
         };
@@ -1950,18 +1975,15 @@ impl ScaffoldHandler {
                 };
                 if reverted {
                     let mut queue = self.queue.lock().await;
-                    let retry_status = queue.retry(
-                        &claimed_job.id,
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
                         err_string.clone(),
                         self.summary_max_retries,
+                        "transcription",
                     );
                     drop(queue);
-                    if summary_retry_exhausted(
-                        retry_status,
-                        &claimed_job.meeting_id,
-                        &claimed_job.id,
-                        "transcription",
-                    ) {
+                    if exhausted {
                         let mut service = self.service.lock().await;
                         let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
@@ -2251,18 +2273,15 @@ impl ScaffoldHandler {
                 };
                 if reverted {
                     let mut queue = self.queue.lock().await;
-                    let retry_status = queue.retry(
-                        &claimed_job.id,
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
                         err_string.clone(),
                         self.summary_max_retries,
+                        "summary",
                     );
                     drop(queue);
-                    if summary_retry_exhausted(
-                        retry_status,
-                        &claimed_job.meeting_id,
-                        &claimed_job.id,
-                        "summary",
-                    ) {
+                    if exhausted {
                         let mut service = self.service.lock().await;
                         let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
@@ -2907,56 +2926,6 @@ async fn run_summary_background(
     http: &Http,
     meeting_id: &str,
 ) -> Result<(), String> {
-    let meeting = handler.load_meeting(meeting_id).await.ok();
-    let workspace = meeting.as_ref().map(|m| handler.workspace_for_meeting(m));
-    let primary_audio_dir = workspace.as_ref().map(|w| w.audio_dir());
-    let audio_dir = primary_audio_dir
-        .as_ref()
-        .filter(|dir| dir.exists())
-        .cloned()
-        .unwrap_or_else(|| {
-            crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
-                &handler.chunk_storage_dir,
-            )
-            .legacy_meeting_dir(meeting_id)
-        });
-    if let Some(primary) = primary_audio_dir
-        && !primary.exists()
-    {
-        warn!(
-            meeting_id = %meeting_id,
-            primary = %primary.display(),
-            fallback = %audio_dir.display(),
-            "workspace audio dir missing; falling back to legacy mixdown path"
-        );
-    }
-    if workspace.is_none() || !audio_dir.starts_with(&handler.chunk_storage_dir) {
-        warn!(
-            meeting_id = %meeting_id,
-            path = %audio_dir.display(),
-            "using legacy audio directory while merging chunks"
-        );
-    }
-
-    if let Err(err) = merge_user_chunks_to_mixdown(&audio_dir, handler.whisper_resample_to_16k) {
-        warn!(meeting_id = %meeting_id, error = %err, "failed to merge audio chunks");
-        let _ = handler
-            .post_failure_for_meeting(
-                http,
-                meeting_id,
-                &format!("音声チャンクのマージに失敗しました: {err}"),
-            )
-            .await;
-        let mut service = handler.service.lock().await;
-        let _ = service
-            .store
-            .set_meeting_status(meeting_id, MeetingStatus::Failed, None);
-        let _ = service
-            .store
-            .set_error_message(meeting_id, Some(format!("merge failed: {err}")));
-        return Err(err);
-    }
-
     handler.run_summary_and_notify(http, meeting_id).await
 }
 
@@ -3194,6 +3163,49 @@ mod status_message_tests {
         assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status IN"));
         assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("'failed'"));
         assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("updated_at <"));
+    }
+
+    fn running_summary_job() -> crate::infrastructure::queue::Job {
+        crate::infrastructure::queue::Job {
+            id: "summary-m1".to_owned(),
+            meeting_id: "m1".to_owned(),
+            job_type: crate::domain::JobType::Summarize,
+            status: crate::domain::JobStatus::Running,
+            retry_count: 0,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn merge_phase_error_requeues_claimed_summary_job_before_exhaustion() {
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let exhausted =
+            retry_claimed_summary_job(&mut queue, &job, "merge failed".to_owned(), 2, "merge");
+
+        assert!(!exhausted);
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
+        assert_eq!(updated.retry_count, 1);
+        assert_eq!(updated.error_message.as_deref(), Some("merge failed"));
+    }
+
+    #[test]
+    fn merge_phase_error_marks_claimed_summary_job_failed_after_exhaustion() {
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let exhausted =
+            retry_claimed_summary_job(&mut queue, &job, "merge failed".to_owned(), 0, "merge");
+
+        assert!(exhausted);
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+        assert_eq!(updated.retry_count, 1);
+        assert_eq!(updated.error_message.as_deref(), Some("merge failed"));
     }
 
     #[derive(Default)]
