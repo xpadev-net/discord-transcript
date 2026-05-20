@@ -254,7 +254,7 @@ fn summary_retry_exhausted(
     match retry_status {
         Ok(crate::domain::JobStatus::Failed) => true,
         Ok(_) => false,
-        Err(err) => {
+        Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
             warn!(
                 meeting_id,
                 job_id,
@@ -263,6 +263,16 @@ fn summary_retry_exhausted(
                 "failed to update summary job retry state; leaving meeting status unchanged"
             );
             false
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                job_id,
+                phase,
+                error = %err,
+                "summary job retry cannot be durably scheduled"
+            );
+            true
         }
     }
 }
@@ -3057,6 +3067,28 @@ mod status_message_tests {
             Err(crate::infrastructure::queue::QueueError::Backend(
                 "retry backend down".to_owned()
             )),
+            "m1",
+            "j1",
+            "summary"
+        ));
+    }
+
+    #[test]
+    fn summary_retry_missing_or_invalid_job_marks_exhausted() {
+        assert!(summary_retry_exhausted(
+            Err(crate::infrastructure::queue::QueueError::NotFound {
+                job_id: "j1".to_owned()
+            }),
+            "m1",
+            "j1",
+            "summary"
+        ));
+        assert!(summary_retry_exhausted(
+            Err(crate::infrastructure::queue::QueueError::InvalidState {
+                job_id: "j1".to_owned(),
+                expected: "running".to_owned(),
+                actual: "done".to_owned()
+            }),
             "m1",
             "j1",
             "summary"
