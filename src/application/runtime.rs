@@ -2919,7 +2919,7 @@ pub fn parse_stop_reason(value: &str) -> Result<StopReason, String> {
     StopReason::parse_str(value).ok_or_else(|| format!("invalid stop reason: {value}"))
 }
 
-/// Runs merge + summary + notify in a background context.
+/// Runs summary + notify in a background context (merge is handled inside the job).
 /// All errors are handled internally (failure notification + status update).
 async fn run_summary_background(
     handler: &ScaffoldHandler,
