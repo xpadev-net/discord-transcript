@@ -1348,24 +1348,25 @@ impl ScaffoldHandler {
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
 
-        // Flush remaining audio before stopping. Failed chunks stay attached
-        // to the session and will be retried on the next stop attempt.
-        {
+        let (stop_result, removed_session) = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
             let mut sessions = self.sessions.lock().await;
+            // Flush remaining audio before stopping. Failed chunks stay
+            // attached to the session and will be retried on the next stop
+            // attempt. Keep flush and removal under one sessions lock so a
+            // freshly started session cannot be removed by this teardown.
             if let Some(session) = sessions.get_mut(&guild_key) {
                 flush_session_for_teardown(session, &guild_key, "manual stop")?;
             }
-        }
-
-        let stop_result = {
-            let mut service = self.service.lock().await;
-            let mut queue = self.queue.lock().await;
-            stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)
-        }?;
-
-        let removed_session = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.remove(&guild_key)
+            let stop_result = stop_and_enqueue_summary_job(
+                &mut service,
+                &mut *queue,
+                &guild_key,
+                StopReason::Manual,
+            )?;
+            let removed_session = sessions.remove(&guild_key);
+            (stop_result, removed_session)
         };
         {
             let mut states = self.auto_stop_states.lock().await;
@@ -2516,7 +2517,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         }
                         // Flush remaining audio before stopping. Failed
                         // chunks stay attached to the session for retry.
-                        {
+                        let removed_session = {
                             let mut sessions = runtime.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&guild_key)
                                 && flush_session_for_teardown(
@@ -2528,9 +2529,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             {
                                 return;
                             }
-                        }
-                        let removed_session = {
-                            let mut sessions = runtime.sessions.lock().await;
                             sessions.remove(&guild_key)
                         };
                         {
