@@ -158,10 +158,15 @@ where
         })
         .map_err(|err| err.to_string())?;
 
-    if stop_result.outcome == StopOutcome::Owner {
+    if matches!(
+        stop_result.outcome,
+        StopOutcome::Owner | StopOutcome::AlreadyHandled
+    ) {
         let job_id = format!("summary-{}", stop_result.meeting_id);
-        enqueue_summary_job(queue, &job_id, &stop_result.meeting_id)
-            .map_err(|err| err.to_string())?;
+        match enqueue_summary_job(queue, &job_id, &stop_result.meeting_id) {
+            Ok(()) | Err(crate::application::worker::WorkerError::AlreadyExists) => {}
+            Err(err) => return Err(err.to_string()),
+        }
         info!(
             meeting_id = %stop_result.meeting_id,
             job_id = %job_id,
@@ -1280,6 +1285,12 @@ impl ScaffoldHandler {
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
 
+        let stop_result = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
+            stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)
+        }?;
+
         // Flush remaining audio before stopping
         let removed_session = {
             let mut sessions = self.sessions.lock().await;
@@ -1312,55 +1323,47 @@ impl ScaffoldHandler {
             session.persist_ssrc_mapping(&tracker);
         }
 
-        let stop_result = {
-            let mut service = self.service.lock().await;
-            let mut queue = self.queue.lock().await;
-            stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)
-        };
+        {
+            let result = stop_result;
+            let meeting_id = result.meeting_id.clone();
+            let outcome = result.outcome;
 
-        match stop_result {
-            Ok(result) => {
-                let meeting_id = result.meeting_id.clone();
-                let outcome = result.outcome;
-
-                if outcome == StopOutcome::Owner {
-                    if let Err(err) = self
-                        .update_status_message(
-                            &ctx.http,
-                            &meeting_id,
-                            StatusMessageUpdate::RecordingStopped,
-                        )
-                        .await
-                    {
-                        warn!(
-                            guild_id = %guild_key,
-                            meeting_id = %meeting_id,
-                            error = %err,
-                            "failed to update status message after manual stop"
-                        );
-                    }
-                    // Spawn summary processing in background — transcription and
-                    // AI summarization can take minutes, far beyond the interaction
-                    // response window, and should not block the command reply.
-                    let handler = self.clone();
-                    let http = Arc::clone(&ctx.http);
-                    tokio::spawn(async move {
-                        let result = run_summary_background(&handler, &http, &meeting_id).await;
-                        if let Err(err) = result {
-                            error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
-                        }
-                    });
+            if outcome == StopOutcome::Owner {
+                if let Err(err) = self
+                    .update_status_message(
+                        &ctx.http,
+                        &meeting_id,
+                        StatusMessageUpdate::RecordingStopped,
+                    )
+                    .await
+                {
+                    warn!(
+                        guild_id = %guild_key,
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "failed to update status message after manual stop"
+                    );
                 }
-
-                info!(
-                    guild_id = %guild_key,
-                    meeting_id = %result.meeting_id,
-                    outcome = ?outcome,
-                    "recording stop handled"
-                );
-                Ok(result.message)
+                // Spawn summary processing in background — transcription and
+                // AI summarization can take minutes, far beyond the interaction
+                // response window, and should not block the command reply.
+                let handler = self.clone();
+                let http = Arc::clone(&ctx.http);
+                tokio::spawn(async move {
+                    let result = run_summary_background(&handler, &http, &meeting_id).await;
+                    if let Err(err) = result {
+                        error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                    }
+                });
             }
-            Err(err) => Err(err),
+
+            info!(
+                guild_id = %guild_key,
+                meeting_id = %result.meeting_id,
+                outcome = ?outcome,
+                "recording stop handled"
+            );
+            Ok(result.message)
         }
     }
 

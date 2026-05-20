@@ -6,14 +6,47 @@ use discord_transcript::application::runtime::{
     run_guild_scoped_command, slash_command_specs, stop_and_enqueue_summary_job,
     validate_command_guild,
 };
-use discord_transcript::domain::{JobType, StopReason};
-use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
+use discord_transcript::domain::{JobStatus, JobType, MeetingStatus, StopReason};
+use discord_transcript::infrastructure::queue::{InMemoryJobQueue, Job, JobQueue, QueueError};
 use discord_transcript::infrastructure::storage::InMemoryMeetingStore;
 use serenity::all::GuildId;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+struct FailingEnqueueQueue;
+
+impl JobQueue for FailingEnqueueQueue {
+    fn enqueue(&mut self, _job: Job) -> Result<(), QueueError> {
+        Err(QueueError::Backend("enqueue failed".to_owned()))
+    }
+
+    fn claim_next(&mut self, _job_type: JobType) -> Result<Option<Job>, QueueError> {
+        Ok(None)
+    }
+
+    fn claim_by_id(&mut self, _job_id: &str) -> Result<Option<Job>, QueueError> {
+        Ok(None)
+    }
+
+    fn mark_done(&mut self, _job_id: &str) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    fn mark_failed(&mut self, _job_id: &str, _error_message: String) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    fn retry(
+        &mut self,
+        _job_id: &str,
+        _error_message: String,
+        _max_retries: u32,
+    ) -> Result<JobStatus, QueueError> {
+        Ok(JobStatus::Queued)
+    }
+}
 
 #[test]
 fn slash_command_specs_match_expected_names() {
@@ -213,6 +246,55 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
         .claim_next(JobType::Summarize)
         .expect("second claim should succeed");
     assert!(second_job.is_none());
+}
+
+#[test]
+fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
+    let store = InMemoryMeetingStore::new();
+    let mut service = BotCommandService::new(store);
+
+    dispatch_runtime_command(
+        &mut service,
+        RuntimeCommandInput::RecordStart(StartCommandInput {
+            meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            user_id: "u1".to_owned(),
+            command_channel_id: "c1".to_owned(),
+            user_voice_channel_id: Some("vc1".to_owned()),
+            permissions: PermissionSet {
+                can_connect_voice: true,
+                can_send_messages: true,
+            },
+        }),
+    )
+    .expect("start should succeed");
+
+    let mut failing_queue = FailingEnqueueQueue;
+    let first = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut failing_queue,
+        "g1",
+        StopReason::Manual,
+    );
+    assert!(first.is_err(), "enqueue failure should be surfaced");
+    assert_eq!(
+        service.store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Stopping
+    );
+
+    let mut queue = InMemoryJobQueue::new();
+    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+        .expect("retry should enqueue summary for already-stopping meeting");
+    assert_eq!(
+        second.outcome,
+        discord_transcript::application::stop::StopOutcome::AlreadyHandled
+    );
+
+    let claimed = queue
+        .claim_next(JobType::Summarize)
+        .expect("claim should succeed")
+        .expect("job should exist");
+    assert_eq!(claimed.meeting_id, "m1");
 }
 
 #[test]
