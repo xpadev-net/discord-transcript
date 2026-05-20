@@ -228,3 +228,21 @@ fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
     );
     assert_eq!(state.tick(120_000 + 60_000), AutoStopSignal::Trigger);
 }
+
+#[test]
+fn auto_stop_rearms_after_failed_stop_attempt() {
+    let mut state = AutoStopState::new(Duration::from_secs(60));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0, 1_000),
+        AutoStopSignal::StartTimer
+    );
+    assert_eq!(state.tick(61_000), AutoStopSignal::Trigger);
+
+    state.retry_after_failed_stop(61_000);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0, 61_001),
+        AutoStopSignal::AlreadyWaiting
+    );
+    assert_eq!(state.tick(120_999), AutoStopSignal::Idle);
+    assert_eq!(state.tick(121_000), AutoStopSignal::Trigger);
+}

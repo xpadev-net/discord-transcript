@@ -56,6 +56,13 @@ impl AutoStopState {
         self.timer_active = false;
     }
 
+    /// Re-arm the empty episode after a failed stop attempt so a later timer
+    /// can retry while the channel is still empty.
+    pub fn retry_after_failed_stop(&mut self, now_ms: u64) {
+        self.empty_since_ms = Some(now_ms);
+        self.timer_active = true;
+    }
+
     pub fn tick(&mut self, now_ms: u64) -> AutoStopSignal {
         let Some(empty_since_ms) = self.empty_since_ms else {
             return AutoStopSignal::Idle;

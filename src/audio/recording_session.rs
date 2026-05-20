@@ -31,6 +31,7 @@ pub struct RecordingSession<S: ChunkStorage> {
     recorder: RecorderEngine,
     storage: S,
     per_user_seq: HashMap<String, u64>,
+    pending_failed_chunks: Vec<RecorderOutputChunk>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +75,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
             recorder: RecorderEngine::new(receiver_config, sample_rate),
             storage,
             per_user_seq: HashMap::new(),
+            pending_failed_chunks: Vec::new(),
         }
     }
 
@@ -83,12 +85,20 @@ impl<S: ChunkStorage> RecordingSession<S> {
 
     pub fn flush_due(&mut self, now: Instant) -> Result<FlushResult, RecordingSessionError> {
         let chunks = self.recorder.flush_due(now)?;
-        Ok(self.persist_chunks(chunks))
+        Ok(self.persist_chunks_with_pending(chunks))
     }
 
     pub fn flush_all(&mut self) -> Result<FlushResult, RecordingSessionError> {
         let chunks = self.recorder.flush_all()?;
-        Ok(self.persist_chunks(chunks))
+        Ok(self.persist_chunks_with_pending(chunks))
+    }
+
+    fn persist_chunks_with_pending(&mut self, chunks: Vec<RecorderOutputChunk>) -> FlushResult {
+        let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
+        retry_chunks.extend(chunks);
+        let result = self.persist_chunks(retry_chunks);
+        self.pending_failed_chunks = result.failed.clone();
+        result
     }
 
     /// Persist chunks best-effort.  Successfully saved chunks are returned in

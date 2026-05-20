@@ -29,7 +29,7 @@ use crate::infrastructure::sql::{
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::infrastructure::storage::{MeetingStore, StatusMessageMetadata, StoredMeeting};
-use crate::infrastructure::storage_fs::LocalChunkStorage;
+use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
 use serenity::all::{
@@ -213,6 +213,32 @@ pub fn meeting_audio_path(
         .mixdown_path()
         .to_string_lossy()
         .to_string()
+}
+
+fn flush_session_for_teardown<S: ChunkStorage>(
+    session: &mut RecordingSession<S>,
+    guild_id: &str,
+    phase: &str,
+) -> Result<(), String> {
+    match session.flush_all() {
+        Ok(result) if result.failed.is_empty() => Ok(()),
+        Ok(result) => {
+            warn!(
+                guild_id = %guild_id,
+                failed = result.failed.len(),
+                phase,
+                "some chunks failed to persist during final flush; retaining session for retry"
+            );
+            Err(format!(
+                "failed to persist {} final audio chunk(s)",
+                result.failed.len()
+            ))
+        }
+        Err(err) => {
+            warn!(guild_id = %guild_id, error = %err, phase, "failed to flush final audio; retaining session for retry");
+            Err(err.to_string())
+        }
+    }
 }
 
 /// Place every chunk on a shared wall-clock timeline so speakers with
@@ -690,150 +716,156 @@ impl EventHandler for ScaffoldHandler {
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
             tokio::spawn(async move {
-                sleep(grace_for_task).await;
-                // Verify the same meeting is still active (not a new recording)
-                let current_meeting_id = handler.active_meeting_id().await;
-                if current_meeting_id != expected_meeting_id || expected_meeting_id.is_none() {
-                    // Clear timer flag before returning.
-                    let mut states = handler.auto_stop_states.lock().await;
-                    if let Some(state) = states.get_mut(&guild_for_task) {
-                        state.clear_timer_active();
-                    }
-                    return;
-                }
-                // Re-verify the voice channel state at fire time. A prior cache-miss
-                // in voice_state_update may have skipped cancelling this timer even
-                // after members rejoined, so we must not rely solely on the state
-                // machine's stale empty_since_ms here.
-                match count_non_bot_members_in_target_voice(
-                    &ctx_for_task,
-                    handler.guild_id,
-                    target_channel_for_task,
-                ) {
-                    None => {
-                        warn!(
-                            guild_id = %handler.guild_id,
-                            target_voice_channel_id = target_channel_for_task,
-                            "voice state cache unavailable at auto-stop grace expiry; skipping stop"
-                        );
+                loop {
+                    sleep(grace_for_task).await;
+                    // Verify the same meeting is still active (not a new recording)
+                    let current_meeting_id = handler.active_meeting_id().await;
+                    if current_meeting_id != expected_meeting_id || expected_meeting_id.is_none() {
+                        // Clear timer flag before returning.
                         let mut states = handler.auto_stop_states.lock().await;
                         if let Some(state) = states.get_mut(&guild_for_task) {
                             state.clear_timer_active();
                         }
                         return;
                     }
-                    Some(n) if n > 0 => {
-                        debug!(
-                            guild_id = %handler.guild_id,
-                            target_voice_channel_id = target_channel_for_task,
-                            non_bot = n,
-                            "members rejoined during grace period; cancelling auto-stop"
-                        );
+                    // Re-verify the voice channel state at fire time. A prior cache-miss
+                    // in voice_state_update may have skipped cancelling this timer even
+                    // after members rejoined, so we must not rely solely on the state
+                    // machine's stale empty_since_ms here.
+                    match count_non_bot_members_in_target_voice(
+                        &ctx_for_task,
+                        handler.guild_id,
+                        target_channel_for_task,
+                    ) {
+                        None => {
+                            warn!(
+                                    guild_id = %handler.guild_id,
+                                    target_voice_channel_id = target_channel_for_task,
+                                    "voice state cache unavailable at auto-stop grace expiry; skipping stop"
+                            );
+                            let mut states = handler.auto_stop_states.lock().await;
+                            if let Some(state) = states.get_mut(&guild_for_task) {
+                                state.clear_timer_active();
+                            }
+                            return;
+                        }
+                        Some(n) if n > 0 => {
+                            debug!(
+                                guild_id = %handler.guild_id,
+                                target_voice_channel_id = target_channel_for_task,
+                                non_bot = n,
+                                "members rejoined during grace period; cancelling auto-stop"
+                            );
+                            let mut states = handler.auto_stop_states.lock().await;
+                            if let Some(state) = states.get_mut(&guild_for_task) {
+                                let _ = state.on_non_bot_member_count_changed(n, now_ms());
+                            }
+                            return;
+                        }
+                        Some(_) => {}
+                    }
+                    let trigger = {
                         let mut states = handler.auto_stop_states.lock().await;
-                        if let Some(state) = states.get_mut(&guild_for_task) {
-                            let _ = state.on_non_bot_member_count_changed(n, now_ms());
+                        let Some(state) = states.get_mut(&guild_for_task) else {
+                            return;
+                        };
+                        let result = state.tick(now_ms()) == AutoStopSignal::Trigger;
+                        if !result {
+                            state.clear_timer_active();
                         }
-                        return;
-                    }
-                    Some(_) => {}
-                }
-                let trigger = {
-                    let mut states = handler.auto_stop_states.lock().await;
-                    let Some(state) = states.get_mut(&guild_for_task) else {
-                        return;
+                        result
                     };
-                    let result = state.tick(now_ms()) == AutoStopSignal::Trigger;
-                    if !result {
-                        state.clear_timer_active();
+                    if !trigger {
+                        return;
                     }
-                    result
-                };
-                if !trigger {
-                    return;
-                }
-                // Flush remaining audio before stopping
-                let removed_session = {
-                    let mut sessions = handler.sessions.lock().await;
-                    if let Some(session) = sessions.get_mut(&guild_for_task) {
-                        match session.flush_all() {
-                            Ok(result) if !result.failed.is_empty() => {
-                                warn!(guild_id = %guild_for_task, failed = result.failed.len(), "some chunks failed to persist on auto-stop");
+                    // Flush remaining audio before stopping. Failed chunks stay
+                    // attached to the session and can be retried by a later stop.
+                    {
+                        let mut sessions = handler.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&guild_for_task)
+                            && flush_session_for_teardown(session, &guild_for_task, "auto-stop")
+                                .is_err()
+                        {
+                            let mut states = handler.auto_stop_states.lock().await;
+                            if let Some(state) = states.get_mut(&guild_for_task) {
+                                state.retry_after_failed_stop(now_ms());
                             }
-                            Err(err) => {
-                                warn!(guild_id = %guild_for_task, error = %err, "failed to flush remaining audio on auto-stop");
-                            }
-                            _ => {}
+                            continue;
                         }
                     }
-                    sessions.remove(&guild_for_task)
-                };
-                {
-                    let mut states = handler.auto_stop_states.lock().await;
-                    states.remove(&guild_for_task);
-                }
-                if let Some(manager) = songbird::get(&ctx_for_task).await {
-                    let _ = manager.leave(handler.guild_id).await;
-                }
-                if let Some(session) = &removed_session {
-                    let tracker = handler.ssrc_tracker.lock().await;
-                    session.persist_ssrc_mapping(&tracker);
-                }
-                let stop_result = {
-                    let mut service = handler.service.lock().await;
-                    let mut queue = handler.queue.lock().await;
-                    stop_and_enqueue_summary_job(
-                        &mut service,
-                        &mut *queue,
-                        &guild_for_task,
-                        StopReason::AutoEmpty,
-                    )
-                };
-                match stop_result {
-                    Ok(result) => {
-                        if result.outcome == StopOutcome::Owner
-                            && let Err(err) = handler
-                                .update_status_message(
+                    let removed_session = {
+                        let mut sessions = handler.sessions.lock().await;
+                        sessions.remove(&guild_for_task)
+                    };
+                    {
+                        let mut states = handler.auto_stop_states.lock().await;
+                        states.remove(&guild_for_task);
+                    }
+                    if let Some(manager) = songbird::get(&ctx_for_task).await {
+                        let _ = manager.leave(handler.guild_id).await;
+                    }
+                    if let Some(session) = &removed_session {
+                        let tracker = handler.ssrc_tracker.lock().await;
+                        session.persist_ssrc_mapping(&tracker);
+                    }
+                    let stop_result = {
+                        let mut service = handler.service.lock().await;
+                        let mut queue = handler.queue.lock().await;
+                        stop_and_enqueue_summary_job(
+                            &mut service,
+                            &mut *queue,
+                            &guild_for_task,
+                            StopReason::AutoEmpty,
+                        )
+                    };
+                    match stop_result {
+                        Ok(result) => {
+                            if result.outcome == StopOutcome::Owner
+                                && let Err(err) = handler
+                                    .update_status_message(
+                                        &ctx_for_task.http,
+                                        &result.meeting_id,
+                                        StatusMessageUpdate::RecordingStopped,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = %result.meeting_id,
+                                    error = %err,
+                                    "failed to update status message after auto stop"
+                                );
+                            }
+                            info!(
+                                guild_id = %guild_for_task,
+                                meeting_id = %result.meeting_id,
+                                "auto stop triggered due to empty voice channel"
+                            );
+                            if result.outcome == StopOutcome::Owner
+                                && let Err(err) = run_summary_background(
+                                    &handler,
                                     &ctx_for_task.http,
                                     &result.meeting_id,
-                                    StatusMessageUpdate::RecordingStopped,
                                 )
                                 .await
-                        {
-                            warn!(
-                                guild_id = %guild_for_task,
-                                meeting_id = %result.meeting_id,
-                                error = %err,
-                                "failed to update status message after auto stop"
-                            );
+                            {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = %result.meeting_id,
+                                    error = %err,
+                                    "failed to process summary after auto stop"
+                                );
+                            }
                         }
-                        info!(
-                            guild_id = %guild_for_task,
-                            meeting_id = %result.meeting_id,
-                            "auto stop triggered due to empty voice channel"
-                        );
-                        if result.outcome == StopOutcome::Owner
-                            && let Err(err) = run_summary_background(
-                                &handler,
-                                &ctx_for_task.http,
-                                &result.meeting_id,
-                            )
-                            .await
-                        {
+                        Err(err) => {
                             warn!(
                                 guild_id = %guild_for_task,
-                                meeting_id = %result.meeting_id,
                                 error = %err,
-                                "failed to process summary after auto stop"
+                                "auto stop failed"
                             );
                         }
                     }
-                    Err(err) => {
-                        warn!(
-                            guild_id = %guild_for_task,
-                            error = %err,
-                            "auto stop failed"
-                        );
-                    }
+                    return;
                 }
             });
         }
@@ -1299,26 +1331,23 @@ impl ScaffoldHandler {
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
 
+        // Flush remaining audio before stopping. Failed chunks stay attached
+        // to the session and will be retried on the next stop attempt.
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&guild_key) {
+                flush_session_for_teardown(session, &guild_key, "manual stop")?;
+            }
+        }
+
         let stop_result = {
             let mut service = self.service.lock().await;
             let mut queue = self.queue.lock().await;
             stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)
         }?;
 
-        // Flush remaining audio before stopping
         let removed_session = {
             let mut sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&guild_key) {
-                match session.flush_all() {
-                    Ok(result) if !result.failed.is_empty() => {
-                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on stop");
-                    }
-                    Err(err) => {
-                        warn!(guild_id = %guild_key, error = %err, "failed to flush remaining audio on stop");
-                    }
-                    _ => {}
-                }
-            }
             sessions.remove(&guild_key)
         };
         {
@@ -2468,20 +2497,23 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         if reconnected || non_bot > 0 {
                             return;
                         }
-                        // Flush remaining audio and clean up session
+                        // Flush remaining audio before stopping. Failed
+                        // chunks stay attached to the session for retry.
+                        {
+                            let mut sessions = runtime.sessions.lock().await;
+                            if let Some(session) = sessions.get_mut(&guild_key)
+                                && flush_session_for_teardown(
+                                    session,
+                                    &guild_key,
+                                    "driver disconnect",
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         let removed_session = {
                             let mut sessions = runtime.sessions.lock().await;
-                            if let Some(session) = sessions.get_mut(&guild_key) {
-                                match session.flush_all() {
-                                    Ok(result) if !result.failed.is_empty() => {
-                                        warn!(guild_id = %guild_key, failed = result.failed.len(), "some chunks failed to persist on driver disconnect");
-                                    }
-                                    Err(err) => {
-                                        warn!(guild_id = %guild_key, error = %err, "failed to flush audio on driver disconnect");
-                                    }
-                                    _ => {}
-                                }
-                            }
                             sessions.remove(&guild_key)
                         };
                         {
@@ -2809,8 +2841,74 @@ async fn post_failure_to_report_channel(
 #[cfg(test)]
 mod status_message_tests {
     use super::*;
+    use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
+    use crate::infrastructure::storage_fs::{ChunkStorageError, SavedChunk};
     use serenity::async_trait;
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug, Clone)]
+    struct RuntimeFlakyChunkStorage {
+        failures_remaining: Arc<AtomicUsize>,
+    }
+
+    impl ChunkStorage for RuntimeFlakyChunkStorage {
+        fn save_chunk(
+            &self,
+            _meeting_id: &str,
+            user_id: &str,
+            sequence: u64,
+            start_ms: u64,
+            bytes: &[u8],
+        ) -> Result<SavedChunk, ChunkStorageError> {
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    if value > 0 { Some(value - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err(ChunkStorageError::Io("injected failure".to_owned()));
+            }
+            Ok(SavedChunk {
+                path: std::env::temp_dir().join(format!("{user_id}_{sequence}_{start_ms}.wav")),
+                size_bytes: bytes.len(),
+            })
+        }
+    }
+
+    fn session_with_one_flaky_chunk(failures: usize) -> RecordingSession<RuntimeFlakyChunkStorage> {
+        let mut session = RecordingSession::new(
+            "meeting-1".to_owned(),
+            RuntimeFlakyChunkStorage {
+                failures_remaining: Arc::new(AtomicUsize::new(failures)),
+            },
+            ReceiverConfig {
+                chunk_duration: Duration::from_secs(20),
+            },
+            48_000,
+        );
+        session.ingest_frame(
+            "u1",
+            BufferedFrame {
+                timestamp_ms: 1_000,
+                pcm_16le_bytes: vec![0, 0, 1, 0],
+            },
+        );
+        session
+    }
+
+    fn assert_final_flush_failure_is_retryable(phase: &str) {
+        let mut session = session_with_one_flaky_chunk(1);
+
+        assert!(flush_session_for_teardown(&mut session, "g1", phase).is_err());
+        assert!(
+            flush_session_for_teardown(&mut session, "g1", phase).is_ok(),
+            "{phase} should be able to retry retained failed chunks"
+        );
+    }
 
     #[derive(Default)]
     struct StubMessenger {
@@ -2847,6 +2945,21 @@ mod status_message_tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn manual_stop_final_flush_failure_blocks_teardown_and_can_retry() {
+        assert_final_flush_failure_is_retryable("manual stop");
+    }
+
+    #[test]
+    fn auto_stop_final_flush_failure_blocks_teardown_and_can_retry() {
+        assert_final_flush_failure_is_retryable("auto-stop");
+    }
+
+    #[test]
+    fn driver_disconnect_final_flush_failure_blocks_teardown_and_can_retry() {
+        assert_final_flush_failure_is_retryable("driver disconnect");
     }
 
     #[tokio::test]
