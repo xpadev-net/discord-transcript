@@ -168,6 +168,52 @@ fn recording_session_retries_failed_flush_chunks() {
 }
 
 #[test]
+fn recording_session_rekeys_pending_failed_chunks_before_retry() {
+    let base = unique_temp_dir("recording_session_rekey_pending_failed");
+    let storage = FlakyChunkStorage {
+        base: base.clone(),
+        failures_remaining: Arc::new(AtomicUsize::new(1)),
+    };
+    let mut session = RecordingSession::new(
+        "meeting-1".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(20),
+        },
+        48_000,
+    );
+
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![0, 0, 1, 0],
+        },
+    );
+
+    let first = session.flush_all().expect("flush should not fail hard");
+    assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.failed[0].user_id, "ssrc:100");
+
+    session.rekey_user("ssrc:100", "u1");
+
+    let second = session.flush_all().expect("retry flush should succeed");
+    assert!(second.failed.is_empty());
+    assert_eq!(second.persisted.len(), 1);
+    assert_eq!(second.persisted[0].user_id, "u1");
+    assert!(
+        second.persisted[0]
+            .saved
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("u1_1_1000"))
+    );
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
 fn recording_session_increments_sequence_per_user() {
     let base = unique_temp_dir("sequence");
     let layout = MeetingWorkspaceLayout::new(&base);

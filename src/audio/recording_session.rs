@@ -96,8 +96,9 @@ impl<S: ChunkStorage> RecordingSession<S> {
     fn persist_chunks_with_pending(&mut self, chunks: Vec<RecorderOutputChunk>) -> FlushResult {
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
-        let result = self.persist_chunks(retry_chunks);
-        self.pending_failed_chunks = result.failed.clone();
+        let mut result = self.persist_chunks(retry_chunks);
+        self.pending_failed_chunks = std::mem::take(&mut result.failed);
+        result.failed = self.pending_failed_chunks.clone();
         result
     }
 
@@ -164,6 +165,11 @@ impl<S: ChunkStorage> RecordingSession<S> {
     /// to `new_id`. Returns the number of in-memory frames moved.
     pub fn rekey_user(&mut self, old_id: &str, new_id: &str) -> usize {
         let moved = self.recorder.rekey_user(old_id, new_id);
+        for chunk in &mut self.pending_failed_chunks {
+            if chunk.user_id == old_id {
+                chunk.user_id = new_id.to_owned();
+            }
+        }
         if let Some(old_seq) = self.per_user_seq.remove(old_id) {
             let new_seq = self.per_user_seq.entry(new_id.to_owned()).or_insert(0);
             *new_seq = (*new_seq).max(old_seq);

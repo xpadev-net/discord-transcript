@@ -58,6 +58,7 @@ use tracing::{debug, error, info, warn};
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
+const AUTO_STOP_FINAL_FLUSH_MAX_RETRIES: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandSpec {
@@ -716,6 +717,7 @@ impl EventHandler for ScaffoldHandler {
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
             tokio::spawn(async move {
+                let mut final_flush_failures = 0u32;
                 loop {
                     sleep(grace_for_task).await;
                     // Verify the same meeting is still active (not a new recording)
@@ -786,8 +788,18 @@ impl EventHandler for ScaffoldHandler {
                             && flush_session_for_teardown(session, &guild_for_task, "auto-stop")
                                 .is_err()
                         {
+                            final_flush_failures += 1;
                             let mut states = handler.auto_stop_states.lock().await;
                             if let Some(state) = states.get_mut(&guild_for_task) {
+                                if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
+                                    warn!(
+                                        guild_id = %guild_for_task,
+                                        attempts = final_flush_failures,
+                                        "auto-stop final flush retry limit reached; retaining recording session for manual stop retry"
+                                    );
+                                    state.clear_timer_active();
+                                    return;
+                                }
                                 state.retry_after_failed_stop(now_ms());
                             }
                             continue;
