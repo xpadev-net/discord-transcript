@@ -8,6 +8,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_postgres::Client as PgClient;
@@ -397,6 +398,71 @@ struct MeetingAccess {
     voice_channel_id: String,
 }
 
+fn meeting_access_from_row(
+    guild_id: String,
+    voice_channel_id: String,
+    authenticated_guild_id: &str,
+) -> Result<MeetingAccess, StatusCode> {
+    if guild_id != authenticated_guild_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(MeetingAccess {
+        guild_id,
+        voice_channel_id,
+    })
+}
+
+async fn verify_meeting_access_after_row<Fut>(
+    guild_id: String,
+    channel_id: String,
+    authenticated_guild_id: &str,
+    user_id: &str,
+    permission_cache: &PermissionCache,
+    permission_check: Fut,
+) -> Result<MeetingAccess, StatusCode>
+where
+    Fut: Future<Output = Result<bool, StatusCode>>,
+{
+    let access = meeting_access_from_row(guild_id, channel_id.clone(), authenticated_guild_id)?;
+
+    // Check permission cache
+    let cache_key = (user_id.to_owned(), channel_id.clone());
+    {
+        let cache = permission_cache.read().await;
+        if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
+            && Instant::now() < expires_at
+        {
+            return if allowed {
+                Ok(access)
+            } else {
+                Err(StatusCode::FORBIDDEN)
+            };
+        }
+    }
+
+    // Cache miss — query Discord API
+    let allowed = permission_check.await?;
+
+    // Store result in cache (also evict expired entries periodically)
+    {
+        let mut cache = permission_cache.write().await;
+        let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+        cache.insert(cache_key, (allowed, expires_at));
+
+        // Evict expired entries if cache grows large
+        if cache.len() > 5000 {
+            let now = Instant::now();
+            cache.retain(|_, (_, exp)| *exp > now);
+        }
+    }
+
+    if allowed {
+        Ok(access)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
 /// Verify that the authenticated user has VIEW_CHANNEL permission on the
 /// voice channel where the meeting was recorded. Returns the meeting's
 /// guild/voice-channel IDs so callers can build paths without an extra
@@ -422,47 +488,15 @@ async fn verify_meeting_access(
         .ok_or(StatusCode::NOT_FOUND)?;
     let guild_id: String = row.get("guild_id");
     let channel_id: String = row.get("voice_channel_id");
-    let access = MeetingAccess {
+    verify_meeting_access_after_row(
         guild_id,
-        voice_channel_id: channel_id.clone(),
-    };
-
-    // Check permission cache
-    let cache_key = (user_id.to_owned(), channel_id.clone());
-    {
-        let cache = state.permission_cache.read().await;
-        if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
-            && Instant::now() < expires_at
-        {
-            return if allowed {
-                Ok(access)
-            } else {
-                Err(StatusCode::FORBIDDEN)
-            };
-        }
-    }
-
-    // Cache miss — query Discord API
-    let allowed = check_channel_permission(state, auth, &channel_id, user_id).await?;
-
-    // Store result in cache (also evict expired entries periodically)
-    {
-        let mut cache = state.permission_cache.write().await;
-        let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
-        cache.insert(cache_key, (allowed, expires_at));
-
-        // Evict expired entries if cache grows large
-        if cache.len() > 5000 {
-            let now = Instant::now();
-            cache.retain(|_, (_, exp)| *exp > now);
-        }
-    }
-
-    if allowed {
-        Ok(access)
-    } else {
-        Err(StatusCode::FORBIDDEN)
-    }
+        channel_id.clone(),
+        &auth.guild_id,
+        user_id,
+        &state.permission_cache,
+        check_channel_permission(state, auth, &channel_id, user_id),
+    )
+    .await
 }
 
 /// Fetch guild info with caching. Guild data is shared across all requests
@@ -2016,9 +2050,17 @@ async fn stream_file_range(
 #[cfg(test)]
 mod discord_channel_full_tests {
     use super::{
-        DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull, VIEW_CHANNEL,
-        build_content_disposition, compute_channel_permissions,
+        DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
+        PERMISSION_CACHE_TTL_SECS, PermissionCache, VIEW_CHANNEL, build_content_disposition,
+        compute_channel_permissions, meeting_access_from_row, verify_meeting_access_after_row,
     };
+    use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Instant;
 
     #[test]
     fn channel_full_permission_overwrites_omitted() {
@@ -2150,6 +2192,54 @@ mod discord_channel_full_tests {
         );
 
         assert_eq!(permissions & VIEW_CHANNEL, 0);
+    }
+
+    #[test]
+    fn meeting_access_rejects_mismatched_guild_before_permission_checks() {
+        let result =
+            meeting_access_from_row("other-guild".to_owned(), "voice".to_owned(), "auth-guild");
+
+        assert!(matches!(result, Err(StatusCode::NOT_FOUND)));
+    }
+
+    #[test]
+    fn meeting_access_accepts_authenticated_guild_row() {
+        let access =
+            meeting_access_from_row("auth-guild".to_owned(), "voice".to_owned(), "auth-guild")
+                .expect("matching guild should be allowed");
+
+        assert_eq!(access.guild_id, "auth-guild");
+        assert_eq!(access.voice_channel_id, "voice");
+    }
+
+    #[tokio::test]
+    async fn meeting_access_rejects_mismatched_guild_before_allowed_cache() {
+        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        cache.write().await.insert(
+            ("user".to_owned(), "voice".to_owned()),
+            (
+                true,
+                Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS),
+            ),
+        );
+        let permission_check_called = Arc::new(AtomicBool::new(false));
+        let permission_check_called_in_future = Arc::clone(&permission_check_called);
+
+        let result = verify_meeting_access_after_row(
+            "other-guild".to_owned(),
+            "voice".to_owned(),
+            "auth-guild",
+            "user",
+            &cache,
+            async move {
+                permission_check_called_in_future.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::NOT_FOUND)));
+        assert!(!permission_check_called.load(Ordering::SeqCst));
     }
 
     #[test]
