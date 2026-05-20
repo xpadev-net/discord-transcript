@@ -245,6 +245,28 @@ fn flush_session_for_teardown<S: ChunkStorage>(
     }
 }
 
+fn summary_retry_exhausted(
+    retry_status: Result<crate::domain::JobStatus, crate::infrastructure::queue::QueueError>,
+    meeting_id: &str,
+    job_id: &str,
+    phase: &str,
+) -> bool {
+    match retry_status {
+        Ok(crate::domain::JobStatus::Failed) => true,
+        Ok(_) => false,
+        Err(err) => {
+            warn!(
+                meeting_id,
+                job_id,
+                phase,
+                error = %err,
+                "failed to update summary job retry state; leaving meeting status unchanged"
+            );
+            false
+        }
+    }
+}
+
 /// Place every chunk on a shared wall-clock timeline so speakers with
 /// different join times (and thus independent per-user sequence numbers)
 /// stay aligned in the mixdown. `meeting_start_ms` anchors t=0 of the output.
@@ -1772,7 +1794,12 @@ impl ScaffoldHandler {
                     let retry_status =
                         queue.retry(&claimed_job.id, err.to_string(), self.summary_max_retries);
                     drop(queue);
-                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                    if summary_retry_exhausted(
+                        retry_status,
+                        &claimed_job.meeting_id,
+                        &claimed_job.id,
+                        "transcription_input",
+                    ) {
                         let mut service = self.service.lock().await;
                         let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
@@ -1894,7 +1921,12 @@ impl ScaffoldHandler {
                         self.summary_max_retries,
                     );
                     drop(queue);
-                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                    if summary_retry_exhausted(
+                        retry_status,
+                        &claimed_job.meeting_id,
+                        &claimed_job.id,
+                        "transcription",
+                    ) {
                         let mut service = self.service.lock().await;
                         let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
@@ -2190,7 +2222,12 @@ impl ScaffoldHandler {
                         self.summary_max_retries,
                     );
                     drop(queue);
-                    if retry_status.map_or(true, |s| s == crate::domain::JobStatus::Failed) {
+                    if summary_retry_exhausted(
+                        retry_status,
+                        &claimed_job.meeting_id,
+                        &claimed_job.id,
+                        "summary",
+                    ) {
                         let mut service = self.service.lock().await;
                         let _ = service.store.set_meeting_status(
                             &claimed_job.meeting_id,
@@ -2996,6 +3033,34 @@ mod status_message_tests {
             flush_session_for_teardown(&mut session, "g1", phase).is_ok(),
             "{phase} should be able to retry retained failed chunks"
         );
+    }
+
+    #[test]
+    fn summary_retry_exhaustion_only_on_durable_failed_status() {
+        assert!(summary_retry_exhausted(
+            Ok(crate::domain::JobStatus::Failed),
+            "m1",
+            "j1",
+            "summary"
+        ));
+        assert!(!summary_retry_exhausted(
+            Ok(crate::domain::JobStatus::Queued),
+            "m1",
+            "j1",
+            "summary"
+        ));
+    }
+
+    #[test]
+    fn summary_retry_backend_error_does_not_mark_exhausted() {
+        assert!(!summary_retry_exhausted(
+            Err(crate::infrastructure::queue::QueueError::Backend(
+                "retry backend down".to_owned()
+            )),
+            "m1",
+            "j1",
+            "summary"
+        ));
     }
 
     #[derive(Default)]
