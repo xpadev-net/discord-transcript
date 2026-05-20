@@ -8,7 +8,9 @@ use discord_transcript::application::runtime::{
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus, StopReason};
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, Job, JobQueue, QueueError};
-use discord_transcript::infrastructure::storage::InMemoryMeetingStore;
+use discord_transcript::infrastructure::storage::{
+    CreateMeetingRequest, InMemoryMeetingStore, MeetingStore,
+};
 use serenity::all::GuildId;
 use std::sync::{
     Arc,
@@ -295,6 +297,42 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
         .expect("claim should succeed")
         .expect("job should exist");
     assert_eq!(claimed.meeting_id, "m1");
+}
+
+#[test]
+fn stop_and_enqueue_summary_job_does_not_enqueue_for_scheduled_abort() {
+    let mut store = InMemoryMeetingStore::new();
+    store
+        .create_scheduled_meeting(CreateMeetingRequest {
+            id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc1".to_owned(),
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u1".to_owned(),
+        })
+        .expect("scheduled meeting should be created");
+    let mut service = BotCommandService::new(store);
+    let mut queue = InMemoryJobQueue::new();
+
+    let stop = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+        .expect("scheduled stop should abort without enqueue");
+
+    assert_eq!(
+        stop.outcome,
+        discord_transcript::application::stop::StopOutcome::AlreadyHandled
+    );
+    assert_eq!(
+        service.store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Aborted
+    );
+    assert!(
+        queue
+            .claim_next(JobType::Summarize)
+            .expect("claim should succeed")
+            .is_none()
+    );
 }
 
 #[test]

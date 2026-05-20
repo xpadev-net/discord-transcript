@@ -158,20 +158,34 @@ where
         })
         .map_err(|err| err.to_string())?;
 
-    if matches!(
-        stop_result.outcome,
-        StopOutcome::Owner | StopOutcome::AlreadyHandled
-    ) {
+    let should_enqueue = match stop_result.outcome {
+        StopOutcome::Owner => true,
+        StopOutcome::AlreadyHandled => service
+            .store
+            .get_meeting(&stop_result.meeting_id)
+            .map_err(|err| err.to_string())?
+            .is_some_and(|meeting| meeting.status == MeetingStatus::Stopping),
+    };
+
+    if should_enqueue {
         let job_id = format!("summary-{}", stop_result.meeting_id);
         match enqueue_summary_job(queue, &job_id, &stop_result.meeting_id) {
-            Ok(()) | Err(crate::application::worker::WorkerError::AlreadyExists) => {}
+            Ok(()) => {
+                info!(
+                    meeting_id = %stop_result.meeting_id,
+                    job_id = %job_id,
+                    "summary job enqueued after stop"
+                );
+            }
+            Err(crate::application::worker::WorkerError::AlreadyExists) => {
+                debug!(
+                    meeting_id = %stop_result.meeting_id,
+                    job_id = %job_id,
+                    "summary job already exists after stop"
+                );
+            }
             Err(err) => return Err(err.to_string()),
         }
-        info!(
-            meeting_id = %stop_result.meeting_id,
-            job_id = %job_id,
-            "summary job enqueued after stop"
-        );
     }
 
     Ok(stop_result)
