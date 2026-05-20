@@ -166,6 +166,7 @@ SELECT status
 FROM jobs
 WHERE id=$1
   AND job_type='summarize'
+LIMIT 1
 "#;
 
 pub const ENQUEUE_JOB_SQL: &str = r#"
