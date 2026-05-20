@@ -17,12 +17,26 @@ pub struct PersistedChunk {
 }
 
 /// Result of a flush operation.  Callers should inspect `failed` —
-/// those chunks have been drained from the recorder and could not be
-/// persisted.  The caller may retry storage or delay session teardown.
+/// those chunks have been retained by the session for retry, so callers
+/// can delay teardown without copying raw audio bytes.
 #[derive(Debug)]
 pub struct FlushResult {
     pub persisted: Vec<PersistedChunk>,
-    pub failed: Vec<RecorderOutputChunk>,
+    pub failed: Vec<FailedChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedChunk {
+    pub user_id: String,
+    pub start_ms: u64,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PersistChunksResult {
+    persisted: Vec<PersistedChunk>,
+    failed: Vec<FailedChunk>,
+    failed_chunks: Vec<RecorderOutputChunk>,
 }
 
 #[derive(Debug)]
@@ -97,16 +111,20 @@ impl<S: ChunkStorage> RecordingSession<S> {
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
         let result = self.persist_chunks(retry_chunks);
-        self.pending_failed_chunks = result.failed.clone();
-        result
+        self.pending_failed_chunks = result.failed_chunks;
+        FlushResult {
+            persisted: result.persisted,
+            failed: result.failed,
+        }
     }
 
     /// Persist chunks best-effort.  Successfully saved chunks are returned in
     /// `persisted`; chunks whose storage write failed are returned in `failed`
     /// so the caller can decide whether to retry or accept the loss.
-    fn persist_chunks(&mut self, chunks: Vec<RecorderOutputChunk>) -> FlushResult {
+    fn persist_chunks(&mut self, chunks: Vec<RecorderOutputChunk>) -> PersistChunksResult {
         let mut persisted = Vec::with_capacity(chunks.len());
         let mut failed = Vec::new();
+        let mut failed_chunks = Vec::new();
 
         for chunk in chunks {
             let saved = self.storage.save_chunk(
@@ -136,12 +154,21 @@ impl<S: ChunkStorage> RecordingSession<S> {
                         error = %err,
                         "failed to persist audio chunk — returning to caller for retry"
                     );
-                    failed.push(chunk);
+                    failed.push(FailedChunk {
+                        user_id: chunk.user_id.clone(),
+                        start_ms: chunk.start_ms,
+                        size_bytes: chunk.wav.bytes.len(),
+                    });
+                    failed_chunks.push(chunk);
                 }
             }
         }
 
-        FlushResult { persisted, failed }
+        PersistChunksResult {
+            persisted,
+            failed,
+            failed_chunks,
+        }
     }
 
     /// Returns the next sequence number without committing it.

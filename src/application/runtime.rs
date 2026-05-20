@@ -795,8 +795,11 @@ impl EventHandler for ScaffoldHandler {
                     };
                     if flush_failed {
                         final_flush_failures += 1;
-                        let mut states = handler.auto_stop_states.lock().await;
-                        if let Some(state) = states.get_mut(&guild_for_task) {
+                        let retry_limit_reached = {
+                            let mut states = handler.auto_stop_states.lock().await;
+                            let Some(state) = states.get_mut(&guild_for_task) else {
+                                continue;
+                            };
                             if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
                                 warn!(
                                     guild_id = %guild_for_task,
@@ -804,9 +807,33 @@ impl EventHandler for ScaffoldHandler {
                                     "auto-stop final flush retry limit reached; retaining recording session for manual stop retry"
                                 );
                                 state.clear_timer_active();
-                                return;
+                                true
+                            } else {
+                                state.retry_after_failed_stop(now_ms());
+                                false
                             }
-                            state.retry_after_failed_stop(now_ms());
+                        };
+                        if retry_limit_reached {
+                            if let Some(meeting_id) = handler.active_meeting_id().await
+                                && let Err(err) = handler
+                                    .update_status_message(
+                                        &ctx_for_task.http,
+                                        &meeting_id,
+                                        StatusMessageUpdate::Failed {
+                                            phase: "Recording persist",
+                                            error: "final audio flush kept failing; recording session is retained for manual stop retry",
+                                        },
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = %meeting_id,
+                                    error = %err,
+                                    "failed to notify final flush retry exhaustion"
+                                );
+                            }
+                            return;
                         }
                         continue;
                     }
@@ -1348,25 +1375,36 @@ impl ScaffoldHandler {
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
 
-        let (stop_result, removed_session) = {
-            let mut service = self.service.lock().await;
-            let mut queue = self.queue.lock().await;
+        let flushed_meeting_id = {
             let mut sessions = self.sessions.lock().await;
             // Flush remaining audio before stopping. Failed chunks stay
             // attached to the session and will be retried on the next stop
-            // attempt. Keep flush and removal under one sessions lock so a
-            // freshly started session cannot be removed by this teardown.
+            // attempt.
             if let Some(session) = sessions.get_mut(&guild_key) {
                 flush_session_for_teardown(session, &guild_key, "manual stop")?;
+                Some(session.meeting_id.clone())
+            } else {
+                None
             }
-            let stop_result = stop_and_enqueue_summary_job(
-                &mut service,
-                &mut *queue,
-                &guild_key,
-                StopReason::Manual,
-            )?;
-            let removed_session = sessions.remove(&guild_key);
-            (stop_result, removed_session)
+        };
+
+        let stop_result = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
+            stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)?
+        };
+
+        let removed_session = {
+            let mut sessions = self.sessions.lock().await;
+            match (
+                flushed_meeting_id.as_deref(),
+                sessions
+                    .get(&guild_key)
+                    .map(|session| session.meeting_id.as_str()),
+            ) {
+                (Some(flushed), Some(current)) if flushed == current => sessions.remove(&guild_key),
+                _ => None,
+            }
         };
         {
             let mut states = self.auto_stop_states.lock().await;
