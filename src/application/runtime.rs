@@ -25,7 +25,8 @@ use crate::infrastructure::integrations::{
 use crate::infrastructure::queue::JobQueue;
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
-    INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_SCAN_SQL,
+    INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL,
+    RECOVERY_SCAN_SQL, RECOVERY_SUMMARY_JOB_STATUS_SQL,
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::infrastructure::storage::{MeetingStore, StatusMessageMetadata, StoredMeeting};
@@ -273,6 +274,51 @@ fn summary_retry_exhausted(
                 "summary job retry cannot be durably scheduled"
             );
             true
+        }
+    }
+}
+
+fn recover_summary_job_for_startup<E: SqlExecutor>(
+    queue: &mut SqlJobQueue<E>,
+    job_id: &str,
+    meeting_id: &str,
+) -> bool {
+    if let Err(err) = queue.executor.execute(
+        RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL,
+        &[job_id.to_owned()],
+    ) {
+        warn!(meeting_id, job_id, error = %err, "failed to requeue stale running summary job during recovery");
+        return false;
+    }
+
+    match enqueue_summary_job(queue, job_id, meeting_id) {
+        Ok(()) => true,
+        Err(crate::application::worker::WorkerError::AlreadyExists) => {
+            recovery_existing_summary_job_is_claimable(queue, job_id, meeting_id)
+        }
+        Err(err) => {
+            warn!(meeting_id, job_id, error = %err, "failed to enqueue summary job during recovery");
+            false
+        }
+    }
+}
+
+fn recovery_existing_summary_job_is_claimable<E: SqlExecutor>(
+    queue: &mut SqlJobQueue<E>,
+    job_id: &str,
+    meeting_id: &str,
+) -> bool {
+    match queue
+        .executor
+        .query_rows(RECOVERY_SUMMARY_JOB_STATUS_SQL, &[job_id.to_owned()])
+    {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row.first())
+            .is_some_and(|status| status == "queued"),
+        Err(err) => {
+            warn!(meeting_id, job_id, error = %err, "failed to inspect existing summary job during recovery");
+            false
         }
     }
 }
@@ -1053,28 +1099,7 @@ impl ScaffoldHandler {
                     let job_id = format!("summary-{}", snapshot.meeting_id);
                     let job_available = {
                         let mut queue = self.queue.lock().await;
-                        // Reset any previously failed job to queued so it can be re-claimed.
-                        // If the reset itself fails we cannot know whether a claimable job
-                        // exists, so abort recovery for this meeting.
-                        if let Err(err) = queue.executor.execute(
-                            "UPDATE jobs SET status='queued', error_message=NULL, updated_at=NOW() WHERE id=$1 AND status IN ('failed', 'running')",
-                            std::slice::from_ref(&job_id),
-                        ) {
-                            warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to reset previously failed summary job during recovery");
-                            false
-                        } else {
-                            match enqueue_summary_job(&mut *queue, &job_id, &snapshot.meeting_id) {
-                                // Job freshly inserted — claimable.
-                                Ok(()) => true,
-                                // Job was already in the queue — also claimable.
-                                Err(crate::application::worker::WorkerError::AlreadyExists) => true,
-                                // Genuine failure — no job to claim.
-                                Err(err) => {
-                                    warn!(meeting_id = %snapshot.meeting_id, error = %err, "failed to enqueue summary job during recovery");
-                                    false
-                                }
-                            }
-                        }
+                        recover_summary_job_for_startup(&mut queue, &job_id, &snapshot.meeting_id)
                     };
                     if !job_available {
                         // No claimable job — skip run_summary_and_notify for this meeting.
@@ -3093,6 +3118,82 @@ mod status_message_tests {
             "j1",
             "summary"
         ));
+    }
+
+    fn fake_recovery_queue_with_existing_summary_job(
+        status: &str,
+    ) -> SqlJobQueue<crate::infrastructure::sql_store::FakeSqlExecutor> {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let job_id = "summary-m1";
+        let enqueue_key = format!(
+            "{}|{}",
+            crate::infrastructure::sql::ENQUEUE_JOB_SQL,
+            ["summary-m1", "m1", "summarize"].join("\u{1f}")
+        );
+        executor.execute_error.insert(
+            enqueue_key,
+            format!(
+                "{}duplicate job",
+                crate::infrastructure::sql_store::UNIQUE_VIOLATION_PREFIX
+            ),
+        );
+        let status_key = format!("{}|{}", RECOVERY_SUMMARY_JOB_STATUS_SQL, job_id);
+        executor
+            .query_rows_result
+            .insert(status_key, vec![vec![status.to_owned()]]);
+        SqlJobQueue::new(executor)
+    }
+
+    #[test]
+    fn recovery_existing_queued_summary_job_is_claimable() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("queued");
+
+        assert!(recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+    }
+
+    #[test]
+    fn recovery_existing_running_or_failed_summary_job_is_not_claimable() {
+        let mut running_queue = fake_recovery_queue_with_existing_summary_job("running");
+        assert!(!recover_summary_job_for_startup(
+            &mut running_queue,
+            "summary-m1",
+            "m1"
+        ));
+
+        let mut failed_queue = fake_recovery_queue_with_existing_summary_job("failed");
+        assert!(!recover_summary_job_for_startup(
+            &mut failed_queue,
+            "summary-m1",
+            "m1"
+        ));
+    }
+
+    #[test]
+    fn recovery_existing_summary_job_status_error_is_not_claimable() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("queued");
+        let status_key = format!("{}|{}", RECOVERY_SUMMARY_JOB_STATUS_SQL, "summary-m1");
+        queue
+            .executor
+            .query_rows_error
+            .insert(status_key, "status lookup failed".to_owned());
+
+        assert!(!recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+    }
+
+    #[test]
+    fn recovery_stale_running_reset_does_not_target_failed_jobs() {
+        assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status='running'"));
+        assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status IN"));
+        assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("'failed'"));
+        assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("updated_at <"));
     }
 
     #[derive(Default)]
