@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Instant;
 
+const MAX_PENDING_FAILED_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedChunk {
     pub user_id: String,
@@ -32,10 +34,19 @@ pub struct FailedChunk {
     pub size_bytes: usize,
 }
 
+impl FailedChunk {
+    fn from_chunk(chunk: &RecorderOutputChunk) -> Self {
+        Self {
+            user_id: chunk.user_id.clone(),
+            start_ms: chunk.start_ms,
+            size_bytes: chunk.wav.bytes.len(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PersistChunksResult {
     persisted: Vec<PersistedChunk>,
-    failed: Vec<FailedChunk>,
     failed_chunks: Vec<RecorderOutputChunk>,
 }
 
@@ -112,9 +123,49 @@ impl<S: ChunkStorage> RecordingSession<S> {
         retry_chunks.extend(chunks);
         let result = self.persist_chunks(retry_chunks);
         self.pending_failed_chunks = result.failed_chunks;
+        self.enforce_pending_failed_limit();
         FlushResult {
             persisted: result.persisted,
-            failed: result.failed,
+            failed: self
+                .pending_failed_chunks
+                .iter()
+                .map(FailedChunk::from_chunk)
+                .collect(),
+        }
+    }
+
+    fn enforce_pending_failed_limit(&mut self) {
+        let mut total_bytes: usize = self
+            .pending_failed_chunks
+            .iter()
+            .map(|chunk| chunk.wav.bytes.len())
+            .sum();
+        if total_bytes <= MAX_PENDING_FAILED_CHUNK_BYTES {
+            return;
+        }
+
+        let mut drop_count = 0usize;
+        let mut drop_bytes = 0usize;
+        for chunk in &self.pending_failed_chunks {
+            if total_bytes <= MAX_PENDING_FAILED_CHUNK_BYTES {
+                break;
+            }
+            let size = chunk.wav.bytes.len();
+            total_bytes = total_bytes.saturating_sub(size);
+            drop_bytes += size;
+            drop_count += 1;
+        }
+
+        if drop_count > 0 {
+            self.pending_failed_chunks.drain(0..drop_count);
+            tracing::warn!(
+                meeting_id = %self.meeting_id,
+                dropped_chunks = drop_count,
+                dropped_bytes = drop_bytes,
+                retained_bytes = total_bytes,
+                max_bytes = MAX_PENDING_FAILED_CHUNK_BYTES,
+                "pending failed audio chunk buffer exceeded memory limit; dropped oldest chunks"
+            );
         }
     }
 
@@ -123,7 +174,6 @@ impl<S: ChunkStorage> RecordingSession<S> {
     /// so the caller can decide whether to retry or accept the loss.
     fn persist_chunks(&mut self, chunks: Vec<RecorderOutputChunk>) -> PersistChunksResult {
         let mut persisted = Vec::with_capacity(chunks.len());
-        let mut failed = Vec::new();
         let mut failed_chunks = Vec::new();
 
         for chunk in chunks {
@@ -154,11 +204,6 @@ impl<S: ChunkStorage> RecordingSession<S> {
                         error = %err,
                         "failed to persist audio chunk — returning to caller for retry"
                     );
-                    failed.push(FailedChunk {
-                        user_id: chunk.user_id.clone(),
-                        start_ms: chunk.start_ms,
-                        size_bytes: chunk.wav.bytes.len(),
-                    });
                     failed_chunks.push(chunk);
                 }
             }
@@ -166,7 +211,6 @@ impl<S: ChunkStorage> RecordingSession<S> {
 
         PersistChunksResult {
             persisted,
-            failed,
             failed_chunks,
         }
     }

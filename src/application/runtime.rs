@@ -236,6 +236,9 @@ fn flush_session_for_teardown<S: ChunkStorage>(
             ))
         }
         Err(err) => {
+            // Recorder errors leave in-flight recorder buffers undrained. Treat
+            // them as retryable during teardown so we do not discard audio that
+            // was never moved into the session's pending failed chunk buffer.
             warn!(guild_id = %guild_id, error = %err, phase, "failed to flush final audio; retaining session for retry");
             Err(err.to_string())
         }
