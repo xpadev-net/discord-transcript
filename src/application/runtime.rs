@@ -702,12 +702,13 @@ impl EventHandler for ScaffoldHandler {
             return;
         };
         let grace = Duration::from_secs(self.auto_stop_grace_seconds);
-        let signal = {
+        let (signal, timer_generation) = {
             let mut states = self.auto_stop_states.lock().await;
             let state = states
                 .entry(guild_key.clone())
                 .or_insert_with(|| AutoStopState::new(grace));
-            state.on_non_bot_member_count_changed(non_bot, now_ms())
+            let signal = state.on_non_bot_member_count_changed(non_bot, now_ms());
+            (signal, state.timer_generation())
         };
 
         if signal == AutoStopSignal::StartTimer {
@@ -729,7 +730,7 @@ impl EventHandler for ScaffoldHandler {
                         // Clear timer flag before returning.
                         let mut states = handler.auto_stop_states.lock().await;
                         if let Some(state) = states.get_mut(&guild_for_task) {
-                            state.clear_timer_active();
+                            state.clear_timer_active_for_generation(timer_generation);
                         }
                         return;
                     }
@@ -750,7 +751,7 @@ impl EventHandler for ScaffoldHandler {
                             );
                             let mut states = handler.auto_stop_states.lock().await;
                             if let Some(state) = states.get_mut(&guild_for_task) {
-                                state.clear_timer_active();
+                                state.clear_timer_active_for_generation(timer_generation);
                             }
                             return;
                         }
@@ -777,6 +778,10 @@ impl EventHandler for ScaffoldHandler {
                         state.tick(now_ms()) == AutoStopSignal::Trigger
                     };
                     if !trigger {
+                        let mut states = handler.auto_stop_states.lock().await;
+                        if let Some(state) = states.get_mut(&guild_for_task) {
+                            state.clear_timer_active_for_generation(timer_generation);
+                        }
                         return;
                     }
                     // Flush remaining audio before stopping. Failed chunks stay
@@ -805,7 +810,7 @@ impl EventHandler for ScaffoldHandler {
                                     attempts = final_flush_failures,
                                     "auto-stop final flush retry limit reached; retaining recording session for manual stop retry"
                                 );
-                                state.clear_timer_active();
+                                state.clear_timer_active_for_generation(timer_generation);
                                 true
                             } else {
                                 state.retry_after_failed_stop(now_ms());

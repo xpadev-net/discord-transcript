@@ -207,7 +207,8 @@ impl<S: ChunkStorage> RecordingSession<S> {
                 &self.meeting_id,
                 &chunk.user_id,
                 // Sequence is assigned only after successful persistence to
-                // avoid gaps when a save fails.
+                // avoid gaps when a save fails. Downstream audio assembly sorts
+                // by start_ms first; sequence is only a filename/tie-breaker.
                 self.peek_next_sequence(&chunk.user_id),
                 chunk.start_ms,
                 &chunk.wav.bytes,
