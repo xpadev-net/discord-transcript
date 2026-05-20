@@ -774,11 +774,7 @@ impl EventHandler for ScaffoldHandler {
                         let Some(state) = states.get_mut(&guild_for_task) else {
                             return;
                         };
-                        let result = state.tick(now_ms()) == AutoStopSignal::Trigger;
-                        if !result {
-                            state.clear_timer_active();
-                        }
-                        result
+                        state.tick(now_ms()) == AutoStopSignal::Trigger
                     };
                     if !trigger {
                         return;

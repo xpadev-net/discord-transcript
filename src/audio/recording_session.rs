@@ -124,12 +124,14 @@ impl<S: ChunkStorage> RecordingSession<S> {
         retry_pending_without_new_chunks: bool,
     ) -> FlushResult {
         if chunks.is_empty() && !retry_pending_without_new_chunks {
+            // `flush_due` is called on every VoiceTick. Pending chunks remain
+            // retained internally, but no-op ticks report no fresh failures so
+            // callers do not warn on every tick during a storage outage.
             return FlushResult {
                 persisted: vec![],
                 failed: vec![],
             };
         }
-        self.enforce_pending_failed_limit();
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
         let result = self.persist_chunks(retry_chunks);
