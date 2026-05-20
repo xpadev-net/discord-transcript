@@ -407,9 +407,13 @@ struct CommandOutputTempPaths {
 
 impl CommandOutputTempPaths {
     fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = format!(
-            "discord_transcript_command_{}_{}",
+            "discord_transcript_command_{}_{}_{}",
             std::process::id(),
+            CALL_COUNTER.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
