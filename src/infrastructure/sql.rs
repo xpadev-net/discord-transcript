@@ -150,6 +150,24 @@ FROM meetings
 WHERE status IN ('recording', 'stopping', 'transcribing', 'summarizing')
 "#;
 
+pub const RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL: &str = r#"
+UPDATE jobs
+SET status='queued',
+    error_message=NULL,
+    updated_at=NOW()
+WHERE id=$1
+  AND job_type='summarize'
+  AND status='running'
+  AND updated_at < NOW() - INTERVAL '15 minutes'
+"#;
+
+pub const RECOVERY_SUMMARY_JOB_STATUS_SQL: &str = r#"
+SELECT status
+FROM jobs
+WHERE id=$1
+  AND job_type='summarize'
+"#;
+
 pub const ENQUEUE_JOB_SQL: &str = r#"
 INSERT INTO jobs (id, meeting_id, job_type, status, retry_count, created_at, updated_at)
 VALUES ($1, $2, $3, 'queued', 0, NOW(), NOW())
