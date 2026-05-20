@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     status_message_id TEXT,
     started_by_user_id TEXT NOT NULL,
     title TEXT,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('scheduled', 'recording', 'stopping', 'transcribing', 'summarizing', 'posted', 'failed', 'aborted')),
     stop_reason TEXT,
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     stopped_at TIMESTAMPTZ,
@@ -62,8 +62,8 @@ CREATE TABLE IF NOT EXISTS summaries (
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    job_type TEXT NOT NULL,
-    status TEXT NOT NULL,
+    job_type TEXT NOT NULL CHECK (job_type IN ('transcribe', 'summarize', 'cleanup')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'failed', 'done')),
     retry_count INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -99,6 +99,30 @@ DO $$
 BEGIN
     ALTER TABLE transcripts
     ADD CONSTRAINT transcripts_source_check CHECK (source IN ('voice', 'vc_text'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
+DO $$
+BEGIN
+    ALTER TABLE meetings
+    ADD CONSTRAINT meetings_status_check CHECK (status IN ('scheduled', 'recording', 'stopping', 'transcribing', 'summarizing', 'posted', 'failed', 'aborted'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
+DO $$
+BEGIN
+    ALTER TABLE jobs
+    ADD CONSTRAINT jobs_status_check CHECK (status IN ('queued', 'running', 'failed', 'done'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
+DO $$
+BEGIN
+    ALTER TABLE jobs
+    ADD CONSTRAINT jobs_job_type_check CHECK (job_type IN ('transcribe', 'summarize', 'cleanup'));
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END

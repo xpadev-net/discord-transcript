@@ -416,8 +416,8 @@ struct RecoverySnapshot {
     voice_channel_id: Option<u64>,
 }
 
-fn parse_meeting_status(value: &str) -> MeetingStatus {
-    MeetingStatus::parse_str(value).unwrap_or(MeetingStatus::Aborted)
+fn parse_meeting_status(value: &str) -> Result<MeetingStatus, String> {
+    MeetingStatus::parse_str(value).ok_or_else(|| format!("unknown meeting status: {value}"))
 }
 
 fn parse_u64_with_warning(meeting_id: &str, field_name: &str, value: &str) -> Option<u64> {
@@ -1025,13 +1025,13 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             let rows = service.store.executor.query_rows(RECOVERY_SCAN_SQL, &[])?;
             rows.into_iter()
-                .filter_map(|row| {
+                .map(|row| {
                     if row.len() < 3 {
-                        return None;
+                        return Err(format!("invalid recovery row length: {}", row.len()));
                     }
-                    Some(RecoverySnapshot {
+                    Ok(RecoverySnapshot {
                         meeting_id: row[0].clone(),
-                        status: parse_meeting_status(&row[1]),
+                        status: parse_meeting_status(&row[1])?,
                         voice_channel_id: parse_u64_with_warning(
                             &row[0],
                             "voice_channel_id",
@@ -1039,7 +1039,7 @@ impl ScaffoldHandler {
                         ),
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()?
         };
 
         for snapshot in snapshots {
@@ -3053,6 +3053,18 @@ mod status_message_tests {
             "j1",
             "summary"
         ));
+    }
+
+    #[test]
+    fn recovery_meeting_status_rejects_unknown_values() {
+        assert_eq!(
+            parse_meeting_status("recording"),
+            Ok(crate::domain::MeetingStatus::Recording)
+        );
+        assert_eq!(
+            parse_meeting_status("corrupt"),
+            Err("unknown meeting status: corrupt".to_owned())
+        );
     }
 
     #[test]
