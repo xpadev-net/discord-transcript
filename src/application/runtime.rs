@@ -2667,9 +2667,10 @@ pub fn ingest_voice_frames_into_session(
     session
         .flush_due(Instant::now())
         .map(|result| {
-            if !result.failed.is_empty() {
+            if result.newly_failed > 0 {
                 tracing::warn!(
                     failed_count = result.failed.len(),
+                    newly_failed = result.newly_failed,
                     "some audio chunks could not be persisted during ingest flush"
                 );
             }

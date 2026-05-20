@@ -156,6 +156,7 @@ fn recording_session_retries_failed_flush_chunks() {
 
     let first = session.flush_all().expect("flush should not fail hard");
     assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.newly_failed, 1);
     assert!(first.persisted.is_empty());
 
     failures_remaining.store(1, Ordering::SeqCst);
@@ -163,11 +164,13 @@ fn recording_session_retries_failed_flush_chunks() {
         .flush_due(Instant::now() + Duration::from_secs(1))
         .expect("no-op flush should not fail hard");
     assert!(no_new_chunks.failed.is_empty());
+    assert_eq!(no_new_chunks.newly_failed, 0);
     assert_eq!(failures_remaining.load(Ordering::SeqCst), 1);
 
     failures_remaining.store(0, Ordering::SeqCst);
     let second = session.flush_all().expect("retry flush should succeed");
     assert!(second.failed.is_empty());
+    assert_eq!(second.newly_failed, 0);
     assert_eq!(second.persisted.len(), 1);
     assert_eq!(second.persisted[0].sequence, 1);
     assert_eq!(second.persisted[0].start_ms, 1_000);
@@ -202,6 +205,7 @@ fn recording_session_rekeys_pending_failed_chunks_before_retry() {
 
     let first = session.flush_all().expect("flush should not fail hard");
     assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.newly_failed, 1);
     assert_eq!(first.failed[0].user_id, "ssrc:100");
 
     session.rekey_user("ssrc:100", "u1");

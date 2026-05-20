@@ -25,6 +25,7 @@ pub struct PersistedChunk {
 pub struct FlushResult {
     pub persisted: Vec<PersistedChunk>,
     pub failed: Vec<FailedChunk>,
+    pub newly_failed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ impl FailedChunk {
 struct PersistChunksResult {
     persisted: Vec<PersistedChunk>,
     failed_chunks: Vec<RecorderOutputChunk>,
+    newly_failed: usize,
 }
 
 #[derive(Debug)]
@@ -130,16 +132,19 @@ impl<S: ChunkStorage> RecordingSession<S> {
             return FlushResult {
                 persisted: vec![],
                 failed: vec![],
+                newly_failed: 0,
             };
         }
+        let existing_pending_count = self.pending_failed_chunks.len();
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
-        let result = self.persist_chunks(retry_chunks);
+        let result = self.persist_chunks(retry_chunks, existing_pending_count);
         self.pending_failed_chunks = result.failed_chunks;
         self.enforce_pending_failed_limit();
         FlushResult {
             persisted: result.persisted,
             failed: self.pending_failed_metadata(),
+            newly_failed: result.newly_failed,
         }
     }
 
@@ -188,11 +193,16 @@ impl<S: ChunkStorage> RecordingSession<S> {
     /// Persist chunks best-effort.  Successfully saved chunks are returned in
     /// `persisted`; chunks whose storage write failed are returned in `failed`
     /// so the caller can decide whether to retry or accept the loss.
-    fn persist_chunks(&mut self, chunks: Vec<RecorderOutputChunk>) -> PersistChunksResult {
+    fn persist_chunks(
+        &mut self,
+        chunks: Vec<RecorderOutputChunk>,
+        existing_pending_count: usize,
+    ) -> PersistChunksResult {
         let mut persisted = Vec::with_capacity(chunks.len());
         let mut failed_chunks = Vec::new();
+        let mut newly_failed = 0usize;
 
-        for chunk in chunks {
+        for (index, chunk) in chunks.into_iter().enumerate() {
             let saved = self.storage.save_chunk(
                 &self.meeting_id,
                 &chunk.user_id,
@@ -220,6 +230,9 @@ impl<S: ChunkStorage> RecordingSession<S> {
                         error = %err,
                         "failed to persist audio chunk — returning to caller for retry"
                     );
+                    if index >= existing_pending_count {
+                        newly_failed += 1;
+                    }
                     failed_chunks.push(chunk);
                 }
             }
@@ -228,6 +241,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
         PersistChunksResult {
             persisted,
             failed_chunks,
+            newly_failed,
         }
     }
 
