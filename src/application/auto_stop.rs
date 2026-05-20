@@ -7,6 +7,7 @@ pub struct AutoStopState {
     /// True while a grace-period timer task is in flight.
     /// Prevents spawning multiple concurrent timer tasks.
     timer_active: bool,
+    timer_generation: u64,
 }
 
 impl AutoStopState {
@@ -15,6 +16,7 @@ impl AutoStopState {
             grace_period,
             empty_since_ms: None,
             timer_active: false,
+            timer_generation: 0,
         }
     }
 
@@ -39,6 +41,7 @@ impl AutoStopState {
             }
             // Atomically reserve the timer slot and signal the caller to spawn.
             self.timer_active = true;
+            self.timer_generation = self.timer_generation.saturating_add(1);
             return AutoStopSignal::StartTimer;
         }
 
@@ -54,6 +57,23 @@ impl AutoStopState {
     /// Called when the timer task completes (regardless of outcome).
     pub fn clear_timer_active(&mut self) {
         self.timer_active = false;
+    }
+
+    pub fn clear_timer_active_for_generation(&mut self, generation: u64) {
+        if self.timer_generation == generation {
+            self.timer_active = false;
+        }
+    }
+
+    pub fn timer_generation(&self) -> u64 {
+        self.timer_generation
+    }
+
+    /// Re-arm the empty episode after a failed stop attempt so a later timer
+    /// can retry while the channel is still empty.
+    pub fn retry_after_failed_stop(&mut self, now_ms: u64) {
+        self.empty_since_ms = Some(now_ms);
+        self.timer_active = true;
     }
 
     pub fn tick(&mut self, now_ms: u64) -> AutoStopSignal {

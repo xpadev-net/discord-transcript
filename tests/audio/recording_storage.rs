@@ -1,9 +1,49 @@
 use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig};
 use discord_transcript::audio::recording_session::RecordingSession;
-use discord_transcript::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
+use discord_transcript::infrastructure::storage_fs::{
+    ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
+};
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+struct FlakyChunkStorage {
+    base: PathBuf,
+    failures_remaining: Arc<AtomicUsize>,
+}
+
+impl ChunkStorage for FlakyChunkStorage {
+    fn save_chunk(
+        &self,
+        _meeting_id: &str,
+        user_id: &str,
+        sequence: u64,
+        start_ms: u64,
+        bytes: &[u8],
+    ) -> Result<SavedChunk, ChunkStorageError> {
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                if value > 0 { Some(value - 1) } else { None }
+            })
+            .is_ok()
+        {
+            return Err(ChunkStorageError::Io("injected failure".to_owned()));
+        }
+        std::fs::create_dir_all(&self.base).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
+        let path = self.base.join(format!("{user_id}_{sequence}_{start_ms}.wav"));
+        std::fs::write(&path, bytes).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
+        Ok(SavedChunk {
+            path,
+            size_bytes: bytes.len(),
+        })
+    }
+}
 
 fn unique_temp_dir(test_name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -85,6 +125,103 @@ fn recording_session_flushes_and_persists_wav_chunks() {
     let bytes =
         std::fs::read(&result.persisted[0].saved.path).expect("saved wav should be readable");
     assert!(bytes.starts_with(b"RIFF"));
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn recording_session_retries_failed_flush_chunks() {
+    let base = unique_temp_dir("recording_session_retry_failed");
+    let failures_remaining = Arc::new(AtomicUsize::new(1));
+    let storage = FlakyChunkStorage {
+        base: base.clone(),
+        failures_remaining: Arc::clone(&failures_remaining),
+    };
+    let mut session = RecordingSession::new(
+        "meeting-1".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(20),
+        },
+        48_000,
+    );
+
+    session.ingest_frame(
+        "u1",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![0, 0, 1, 0],
+        },
+    );
+
+    let first = session.flush_all().expect("flush should not fail hard");
+    assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.newly_failed, 1);
+    assert!(first.persisted.is_empty());
+
+    failures_remaining.store(1, Ordering::SeqCst);
+    let no_new_chunks = session
+        .flush_due(Instant::now() + Duration::from_secs(1))
+        .expect("no-op flush should not fail hard");
+    assert!(no_new_chunks.failed.is_empty());
+    assert_eq!(no_new_chunks.newly_failed, 0);
+    assert_eq!(failures_remaining.load(Ordering::SeqCst), 1);
+
+    failures_remaining.store(0, Ordering::SeqCst);
+    let second = session.flush_all().expect("retry flush should succeed");
+    assert!(second.failed.is_empty());
+    assert_eq!(second.newly_failed, 0);
+    assert_eq!(second.persisted.len(), 1);
+    assert_eq!(second.persisted[0].sequence, 1);
+    assert_eq!(second.persisted[0].start_ms, 1_000);
+    assert!(second.persisted[0].saved.path.exists());
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn recording_session_rekeys_pending_failed_chunks_before_retry() {
+    let base = unique_temp_dir("recording_session_rekey_pending_failed");
+    let storage = FlakyChunkStorage {
+        base: base.clone(),
+        failures_remaining: Arc::new(AtomicUsize::new(1)),
+    };
+    let mut session = RecordingSession::new(
+        "meeting-1".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(20),
+        },
+        48_000,
+    );
+
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![0, 0, 1, 0],
+        },
+    );
+
+    let first = session.flush_all().expect("flush should not fail hard");
+    assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.newly_failed, 1);
+    assert_eq!(first.failed[0].user_id, "ssrc:100");
+
+    session.rekey_user("ssrc:100", "u1");
+
+    let second = session.flush_all().expect("retry flush should succeed");
+    assert!(second.failed.is_empty());
+    assert_eq!(second.persisted.len(), 1);
+    assert_eq!(second.persisted[0].user_id, "u1");
+    assert!(
+        second.persisted[0]
+            .saved
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("u1_1_1000"))
+    );
 
     let _ = std::fs::remove_dir_all(base);
 }
