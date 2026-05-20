@@ -129,6 +129,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
                 failed: self.pending_failed_metadata(),
             };
         }
+        self.enforce_pending_failed_limit();
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
         let result = self.persist_chunks(retry_chunks);
