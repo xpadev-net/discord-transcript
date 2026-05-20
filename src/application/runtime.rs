@@ -2568,6 +2568,26 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 )
                                 .is_err()
                             {
+                                drop(sessions);
+                                if let Some(meeting_id) = runtime.active_meeting_id().await
+                                    && let Err(err) = runtime
+                                        .update_status_message(
+                                            &http,
+                                            &meeting_id,
+                                            StatusMessageUpdate::Failed {
+                                                phase: "Recording persist",
+                                                error: "final audio flush failed after voice disconnect; recording session is retained for manual stop retry",
+                                            },
+                                        )
+                                        .await
+                                {
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = %meeting_id,
+                                        error = %err,
+                                        "failed to notify driver-disconnect final flush failure"
+                                    );
+                                }
                                 return;
                             }
                             sessions.remove(&guild_key)
