@@ -132,9 +132,10 @@ fn recording_session_flushes_and_persists_wav_chunks() {
 #[test]
 fn recording_session_retries_failed_flush_chunks() {
     let base = unique_temp_dir("recording_session_retry_failed");
+    let failures_remaining = Arc::new(AtomicUsize::new(1));
     let storage = FlakyChunkStorage {
         base: base.clone(),
-        failures_remaining: Arc::new(AtomicUsize::new(1)),
+        failures_remaining: Arc::clone(&failures_remaining),
     };
     let mut session = RecordingSession::new(
         "meeting-1".to_owned(),
@@ -157,6 +158,14 @@ fn recording_session_retries_failed_flush_chunks() {
     assert_eq!(first.failed.len(), 1);
     assert!(first.persisted.is_empty());
 
+    failures_remaining.store(1, Ordering::SeqCst);
+    let no_new_chunks = session
+        .flush_due(Instant::now() + Duration::from_secs(1))
+        .expect("no-op flush should not fail hard");
+    assert_eq!(no_new_chunks.failed.len(), 1);
+    assert_eq!(failures_remaining.load(Ordering::SeqCst), 1);
+
+    failures_remaining.store(0, Ordering::SeqCst);
     let second = session.flush_all().expect("retry flush should succeed");
     assert!(second.failed.is_empty());
     assert_eq!(second.persisted.len(), 1);

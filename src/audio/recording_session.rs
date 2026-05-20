@@ -110,15 +110,25 @@ impl<S: ChunkStorage> RecordingSession<S> {
 
     pub fn flush_due(&mut self, now: Instant) -> Result<FlushResult, RecordingSessionError> {
         let chunks = self.recorder.flush_due(now)?;
-        Ok(self.persist_chunks_with_pending(chunks))
+        Ok(self.persist_chunks_with_pending(chunks, false))
     }
 
     pub fn flush_all(&mut self) -> Result<FlushResult, RecordingSessionError> {
         let chunks = self.recorder.flush_all()?;
-        Ok(self.persist_chunks_with_pending(chunks))
+        Ok(self.persist_chunks_with_pending(chunks, true))
     }
 
-    fn persist_chunks_with_pending(&mut self, chunks: Vec<RecorderOutputChunk>) -> FlushResult {
+    fn persist_chunks_with_pending(
+        &mut self,
+        chunks: Vec<RecorderOutputChunk>,
+        retry_pending_without_new_chunks: bool,
+    ) -> FlushResult {
+        if chunks.is_empty() && !retry_pending_without_new_chunks {
+            return FlushResult {
+                persisted: vec![],
+                failed: self.pending_failed_metadata(),
+            };
+        }
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
         let result = self.persist_chunks(retry_chunks);
@@ -126,12 +136,15 @@ impl<S: ChunkStorage> RecordingSession<S> {
         self.enforce_pending_failed_limit();
         FlushResult {
             persisted: result.persisted,
-            failed: self
-                .pending_failed_chunks
-                .iter()
-                .map(FailedChunk::from_chunk)
-                .collect(),
+            failed: self.pending_failed_metadata(),
         }
+    }
+
+    fn pending_failed_metadata(&self) -> Vec<FailedChunk> {
+        self.pending_failed_chunks
+            .iter()
+            .map(FailedChunk::from_chunk)
+            .collect()
     }
 
     fn enforce_pending_failed_limit(&mut self) {
