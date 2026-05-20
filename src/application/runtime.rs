@@ -3173,6 +3173,22 @@ mod status_message_tests {
     }
 
     #[test]
+    fn recovery_existing_summary_job_status_error_is_not_claimable() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("queued");
+        let status_key = format!("{}|{}", RECOVERY_SUMMARY_JOB_STATUS_SQL, "summary-m1");
+        queue
+            .executor
+            .query_rows_error
+            .insert(status_key, "status lookup failed".to_owned());
+
+        assert!(!recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+    }
+
+    #[test]
     fn recovery_stale_running_reset_does_not_target_failed_jobs() {
         assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status='running'"));
         assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status IN"));

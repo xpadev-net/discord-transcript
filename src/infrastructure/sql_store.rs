@@ -31,6 +31,7 @@ pub struct FakeSqlExecutor {
     pub executed: Vec<(String, Vec<String>)>,
     pub active_by_guild: HashMap<String, StoredMeeting>,
     pub query_rows_result: HashMap<String, Vec<Vec<String>>>,
+    pub query_rows_error: HashMap<String, String>,
     pub execute_result: HashMap<String, u64>,
     pub execute_error: HashMap<String, String>,
 }
@@ -52,6 +53,9 @@ impl SqlExecutor for FakeSqlExecutor {
     fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String> {
         self.executed.push((sql.to_owned(), params.to_vec()));
         let key = format!("{}|{}", sql, params.join("\u{1f}"));
+        if let Some(err) = self.query_rows_error.get(&key) {
+            return Err(err.clone());
+        }
         Ok(self
             .query_rows_result
             .get(&key)
