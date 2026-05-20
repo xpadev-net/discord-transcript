@@ -96,9 +96,8 @@ impl<S: ChunkStorage> RecordingSession<S> {
     fn persist_chunks_with_pending(&mut self, chunks: Vec<RecorderOutputChunk>) -> FlushResult {
         let mut retry_chunks = std::mem::take(&mut self.pending_failed_chunks);
         retry_chunks.extend(chunks);
-        let mut result = self.persist_chunks(retry_chunks);
-        self.pending_failed_chunks = std::mem::take(&mut result.failed);
-        result.failed = self.pending_failed_chunks.clone();
+        let result = self.persist_chunks(retry_chunks);
+        self.pending_failed_chunks = result.failed.clone();
         result
     }
 

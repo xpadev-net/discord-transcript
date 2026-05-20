@@ -782,28 +782,33 @@ impl EventHandler for ScaffoldHandler {
                     }
                     // Flush remaining audio before stopping. Failed chunks stay
                     // attached to the session and can be retried by a later stop.
-                    {
+                    let flush_failed = {
                         let mut sessions = handler.sessions.lock().await;
                         if let Some(session) = sessions.get_mut(&guild_for_task)
                             && flush_session_for_teardown(session, &guild_for_task, "auto-stop")
                                 .is_err()
                         {
-                            final_flush_failures += 1;
-                            let mut states = handler.auto_stop_states.lock().await;
-                            if let Some(state) = states.get_mut(&guild_for_task) {
-                                if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
-                                    warn!(
-                                        guild_id = %guild_for_task,
-                                        attempts = final_flush_failures,
-                                        "auto-stop final flush retry limit reached; retaining recording session for manual stop retry"
-                                    );
-                                    state.clear_timer_active();
-                                    return;
-                                }
-                                state.retry_after_failed_stop(now_ms());
-                            }
-                            continue;
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    if flush_failed {
+                        final_flush_failures += 1;
+                        let mut states = handler.auto_stop_states.lock().await;
+                        if let Some(state) = states.get_mut(&guild_for_task) {
+                            if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    attempts = final_flush_failures,
+                                    "auto-stop final flush retry limit reached; retaining recording session for manual stop retry"
+                                );
+                                state.clear_timer_active();
+                                return;
+                            }
+                            state.retry_after_failed_stop(now_ms());
+                        }
+                        continue;
                     }
                     let removed_session = {
                         let mut sessions = handler.sessions.lock().await;
