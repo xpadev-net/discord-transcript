@@ -274,9 +274,13 @@ pub fn run_command_with_timeout(
     let stdout_file = temp_paths
         .create_stdout()
         .map_err(|err| IntegrationError::Io(err.to_string()))?;
-    let stderr_file = temp_paths
-        .create_stderr()
-        .map_err(|err| IntegrationError::Io(err.to_string()))?;
+    let stderr_file = match temp_paths.create_stderr() {
+        Ok(file) => file,
+        Err(err) => {
+            temp_paths.cleanup();
+            return Err(IntegrationError::Io(err.to_string()));
+        }
+    };
     let stdin_file = match stdin_input {
         Some(input) => match temp_paths.create_stdin(input) {
             Ok(file) => Some(file),
