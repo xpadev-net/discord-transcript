@@ -843,7 +843,17 @@ impl EventHandler for ScaffoldHandler {
                     }
                     let removed_session = {
                         let mut sessions = handler.sessions.lock().await;
-                        sessions.remove(&guild_for_task)
+                        match (
+                            expected_meeting_id.as_deref(),
+                            sessions
+                                .get(&guild_for_task)
+                                .map(|session| session.meeting_id.as_str()),
+                        ) {
+                            (Some(expected), Some(current)) if expected == current => {
+                                sessions.remove(&guild_for_task)
+                            }
+                            _ => None,
+                        }
                     };
                     {
                         let mut states = handler.auto_stop_states.lock().await;
