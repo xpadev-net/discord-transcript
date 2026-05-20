@@ -2,12 +2,17 @@ use discord_transcript::application::bot::{BotCommandService, StartCommandInput}
 use discord_transcript::application::command::PermissionSet;
 use discord_transcript::application::runtime::{
     RECORD_START_COMMAND, RECORD_STOP_COMMAND, RuntimeCommandInput, create_serenity_commands,
-    dispatch_runtime_command, meeting_audio_path, parse_stop_reason, slash_command_specs,
-    stop_and_enqueue_summary_job,
+    dispatch_runtime_command, meeting_audio_path, parse_stop_reason, run_guild_scoped_command,
+    slash_command_specs, stop_and_enqueue_summary_job, validate_command_guild,
 };
 use discord_transcript::domain::{JobType, StopReason};
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
 use discord_transcript::infrastructure::storage::InMemoryMeetingStore;
+use serenity::all::GuildId;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[test]
 fn slash_command_specs_match_expected_names() {
@@ -18,6 +23,40 @@ fn slash_command_specs_match_expected_names() {
 
     let builders = create_serenity_commands();
     assert_eq!(builders.len(), 2);
+}
+
+#[test]
+fn validate_command_guild_rejects_missing_or_wrong_guild() {
+    let configured = GuildId::new(123);
+
+    assert_eq!(
+        validate_command_guild(None, configured),
+        Err("guild_id is required for this command".to_owned())
+    );
+    assert_eq!(
+        validate_command_guild(Some(GuildId::new(456)), configured),
+        Err("command is not configured for this guild".to_owned())
+    );
+    assert_eq!(
+        validate_command_guild(Some(configured), configured),
+        Ok(configured)
+    );
+}
+
+#[tokio::test]
+async fn run_guild_scoped_command_does_not_invoke_work_for_wrong_guild() {
+    let invoked = Arc::new(AtomicBool::new(false));
+    let invoked_in_command = Arc::clone(&invoked);
+
+    let message =
+        run_guild_scoped_command(Some(GuildId::new(456)), GuildId::new(123), move |_| async move {
+            invoked_in_command.store(true, Ordering::SeqCst);
+            Ok("started".to_owned())
+        })
+        .await;
+
+    assert_eq!(message, "error: command is not configured for this guild");
+    assert!(!invoked.load(Ordering::SeqCst));
 }
 
 #[test]

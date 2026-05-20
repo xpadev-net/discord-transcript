@@ -46,6 +46,7 @@ use songbird::{
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -84,6 +85,37 @@ pub fn create_serenity_commands() -> Vec<CreateCommand> {
             _ => CreateCommand::new(spec.name).description(spec.description),
         })
         .collect()
+}
+
+pub fn validate_command_guild(
+    command_guild_id: Option<GuildId>,
+    configured_guild_id: GuildId,
+) -> Result<GuildId, String> {
+    let guild_id =
+        command_guild_id.ok_or_else(|| "guild_id is required for this command".to_owned())?;
+    if guild_id != configured_guild_id {
+        return Err("command is not configured for this guild".to_owned());
+    }
+    Ok(guild_id)
+}
+
+pub async fn run_guild_scoped_command<F, Fut>(
+    command_guild_id: Option<GuildId>,
+    configured_guild_id: GuildId,
+    command_work: F,
+) -> String
+where
+    F: FnOnce(GuildId) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    let result = match validate_command_guild(command_guild_id, configured_guild_id) {
+        Ok(guild_id) => command_work(guild_id).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(message) => message,
+        Err(err) => format!("error: {err}"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +584,7 @@ impl EventHandler for ScaffoldHandler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Command(command) = interaction {
             // Acknowledge immediately to avoid Discord's 3-second timeout
+            let guild_error = validate_command_guild(command.guild_id, self.guild_id).err();
             if let Err(err) = command
                 .create_response(
                     &ctx.http,
@@ -565,7 +598,10 @@ impl EventHandler for ScaffoldHandler {
                 return;
             }
 
-            let message = self.handle_command(&ctx, &command).await;
+            let message = match guild_error {
+                Some(err) => format!("error: {err}"),
+                None => self.handle_command(&ctx, &command).await,
+            };
 
             let mut delay = Duration::from_millis(200);
             let mut last_err = None;
@@ -1031,16 +1067,14 @@ impl ScaffoldHandler {
     }
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
-        let result = match command.data.name.as_str() {
-            RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
-            RECORD_STOP_COMMAND => self.handle_record_stop(ctx, command).await,
-            _ => Err("unsupported command".to_owned()),
-        };
-
-        match result {
-            Ok(message) => message,
-            Err(err) => format!("error: {err}"),
-        }
+        run_guild_scoped_command(command.guild_id, self.guild_id, |_| async {
+            match command.data.name.as_str() {
+                RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
+                RECORD_STOP_COMMAND => self.handle_record_stop(ctx, command).await,
+                _ => Err("unsupported command".to_owned()),
+            }
+        })
+        .await
     }
 
     async fn handle_record_start(
@@ -1048,9 +1082,7 @@ impl ScaffoldHandler {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<String, String> {
-        let guild_id = command
-            .guild_id
-            .ok_or_else(|| "guild_id is required for this command".to_owned())?;
+        let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let voice_channel_id_u64 = resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
 
         let meeting_id = format!("{}-{}", guild_id.get(), command.id.get());
@@ -1243,9 +1275,7 @@ impl ScaffoldHandler {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<String, String> {
-        let guild_id = command
-            .guild_id
-            .ok_or_else(|| "guild_id is required for this command".to_owned())?;
+        let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
 
         // Flush remaining audio before stopping
