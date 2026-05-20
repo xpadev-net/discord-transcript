@@ -110,6 +110,39 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
 }
 
 #[test]
+fn sql_store_get_meeting_rejects_unknown_status() {
+    let mut executor = FakeSqlExecutor::default();
+    let query_sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+                        to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                  FROM meetings WHERE id=$1 LIMIT 1";
+    executor.query_rows_result.insert(
+        format!("{query_sql}|m1"),
+        vec![vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+            "c1".to_owned(),
+            String::new(),
+            String::new(),
+            "u1".to_owned(),
+            String::new(),
+            "corrupt".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ]],
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let err = store
+        .get_meeting("m1")
+        .expect_err("unknown status should fail");
+    assert!(err.to_string().contains("invalid meeting status"));
+}
+
+#[test]
 fn sql_job_queue_parses_claimed_job_row() {
     let mut executor = FakeSqlExecutor::default();
     let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
@@ -136,6 +169,18 @@ fn sql_job_queue_parses_claimed_job_row() {
     assert_eq!(job.status, JobStatus::Running);
     assert_eq!(job.retry_count, 2);
     assert_eq!(job.error_message.as_deref(), Some("temporary error"));
+}
+
+#[test]
+fn schema_defines_enum_check_constraints() {
+    for schema in [
+        discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL,
+        discord_transcript::infrastructure::sql::INCREMENTAL_MIGRATIONS_SQL,
+    ] {
+        assert!(schema.contains("meetings_status_check") || schema.contains("status TEXT NOT NULL CHECK (status IN ('scheduled'"));
+        assert!(schema.contains("jobs_status_check") || schema.contains("status TEXT NOT NULL CHECK (status IN ('queued'"));
+        assert!(schema.contains("jobs_job_type_check") || schema.contains("job_type TEXT NOT NULL CHECK"));
+    }
 }
 
 #[test]

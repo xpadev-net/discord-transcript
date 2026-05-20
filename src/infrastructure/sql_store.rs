@@ -632,8 +632,10 @@ impl SqlExecutor for PgSqlExecutor {
             s.spawn(|| {
                 runtime
                     .block_on(client.query(sql, &[&guild_id]))
-                    .map(|rows| rows.first().map(row_to_stored_meeting))
-                    .map_err(|err| err.to_string())
+                    .map_err(|err| err.to_string())?
+                    .first()
+                    .map(row_to_stored_meeting)
+                    .transpose()
             })
             .join()
             .map_err(|_| "db query thread panicked".to_owned())?
@@ -678,18 +680,16 @@ impl SqlExecutor for PgSqlExecutor {
     }
 }
 
-fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
+fn row_to_stored_meeting(row: &Row) -> Result<StoredMeeting, String> {
     let status_str = row.get::<_, String>("status");
-    let status = MeetingStatus::parse_str(&status_str).unwrap_or_else(|| {
-        tracing::warn!(status = %status_str, "unknown meeting status in DB, defaulting to Aborted");
-        MeetingStatus::Aborted
-    });
+    let status = MeetingStatus::parse_str(&status_str)
+        .ok_or_else(|| format!("unknown meeting status in DB: {status_str}"))?;
     let stop_reason = row
         .get::<_, Option<String>>("stop_reason")
         .as_deref()
         .and_then(StopReason::parse_str);
 
-    StoredMeeting {
+    Ok(StoredMeeting {
         id: row.get("id"),
         guild_id: row.get("guild_id"),
         voice_channel_id: row.get("voice_channel_id"),
@@ -703,7 +703,7 @@ fn row_to_stored_meeting(row: &Row) -> StoredMeeting {
         error_message: row.get("error_message"),
         started_at: parse_optional_rfc3339(row.get::<_, Option<String>>("started_at")),
         stopped_at: parse_optional_rfc3339(row.get::<_, Option<String>>("stopped_at")),
-    }
+    })
 }
 
 fn parse_optional_rfc3339(value: Option<String>) -> Option<DateTime<Utc>> {
