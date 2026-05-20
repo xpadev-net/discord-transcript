@@ -19,7 +19,9 @@ use crate::domain::transcript::{
     render_for_summary,
 };
 use crate::domain::{MeetingStatus, StopReason};
-use crate::infrastructure::integrations::{CommandWhisperClient, HarnessCliSummaryClient};
+use crate::infrastructure::integrations::{
+    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
+};
 use crate::infrastructure::queue::JobQueue;
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
@@ -1578,12 +1580,14 @@ impl ScaffoldHandler {
             prompt: self.whisper_prompt.clone(),
             vad: self.whisper_vad,
             temperature: self.whisper_temperature,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
         let summary_client = HarnessCliSummaryClient {
             harness: self.summary_harness,
             command_path: self.summary_command.clone(),
             model: self.summary_model.clone(),
             retry_policy: self.integration_retry_policy,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
         let job_id = format!("summary-{meeting_id}");
         let meeting = self.load_meeting(meeting_id).await?;

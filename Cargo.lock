@@ -678,6 +678,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hmac",
+ "libc",
  "regex",
  "reqwest",
  "serde",
