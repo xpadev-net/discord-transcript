@@ -801,7 +801,7 @@ impl EventHandler for ScaffoldHandler {
                         let retry_limit_reached = {
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
-                                continue;
+                                return;
                             };
                             if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
                                 warn!(
