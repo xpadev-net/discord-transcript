@@ -126,7 +126,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
         if chunks.is_empty() && !retry_pending_without_new_chunks {
             return FlushResult {
                 persisted: vec![],
-                failed: self.pending_failed_metadata(),
+                failed: vec![],
             };
         }
         self.enforce_pending_failed_limit();

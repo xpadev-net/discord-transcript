@@ -817,11 +817,11 @@ impl EventHandler for ScaffoldHandler {
                             }
                         };
                         if retry_limit_reached {
-                            if let Some(meeting_id) = handler.active_meeting_id().await
+                            if let Some(meeting_id) = expected_meeting_id.as_deref()
                                 && let Err(err) = handler
                                     .update_status_message(
                                         &ctx_for_task.http,
-                                        &meeting_id,
+                                        meeting_id,
                                         StatusMessageUpdate::Failed {
                                             phase: "Recording persist",
                                             error: "final audio flush kept failing; recording session is retained for manual stop retry",
@@ -831,7 +831,7 @@ impl EventHandler for ScaffoldHandler {
                             {
                                 warn!(
                                     guild_id = %guild_for_task,
-                                    meeting_id = %meeting_id,
+                                    meeting_id,
                                     error = %err,
                                     "failed to notify final flush retry exhaustion"
                                 );
@@ -2569,11 +2569,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 .is_err()
                             {
                                 drop(sessions);
-                                if let Some(meeting_id) = runtime.active_meeting_id().await
+                                if let Some(meeting_id) = expected_meeting_id.as_deref()
                                     && let Err(err) = runtime
                                         .update_status_message(
                                             &http,
-                                            &meeting_id,
+                                            meeting_id,
                                             StatusMessageUpdate::Failed {
                                                 phase: "Recording persist",
                                                 error: "final audio flush failed after voice disconnect; recording session is retained for manual stop retry",
@@ -2583,7 +2583,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 {
                                     warn!(
                                         guild_id = %guild_key,
-                                        meeting_id = %meeting_id,
+                                        meeting_id,
                                         error = %err,
                                         "failed to notify driver-disconnect final flush failure"
                                     );

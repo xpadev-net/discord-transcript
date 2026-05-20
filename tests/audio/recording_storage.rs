@@ -162,7 +162,7 @@ fn recording_session_retries_failed_flush_chunks() {
     let no_new_chunks = session
         .flush_due(Instant::now() + Duration::from_secs(1))
         .expect("no-op flush should not fail hard");
-    assert_eq!(no_new_chunks.failed.len(), 1);
+    assert!(no_new_chunks.failed.is_empty());
     assert_eq!(failures_remaining.load(Ordering::SeqCst), 1);
 
     failures_remaining.store(0, Ordering::SeqCst);
