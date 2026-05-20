@@ -601,10 +601,7 @@ mod tests {
         let script_path = std::env::temp_dir().join(format!(
             "discord_transcript_curl_fail_{}_{}.sh",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uuid::Uuid::new_v4()
         ));
         std::fs::write(
             &script_path,
