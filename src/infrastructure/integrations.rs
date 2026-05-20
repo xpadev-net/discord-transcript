@@ -341,12 +341,20 @@ pub fn run_command_with_timeout(
 
     drop(stdout_file);
     drop(stderr_file);
-    let stdout = temp_paths
-        .read_stdout()
-        .map_err(|err| IntegrationError::Io(err.to_string()))?;
-    let stderr = temp_paths
-        .read_stderr()
-        .map_err(|err| IntegrationError::Io(err.to_string()))?;
+    let stdout = match temp_paths.read_stdout() {
+        Ok(stdout) => stdout,
+        Err(err) => {
+            temp_paths.cleanup();
+            return Err(IntegrationError::Io(err.to_string()));
+        }
+    };
+    let stderr = match temp_paths.read_stderr() {
+        Ok(stderr) => stderr,
+        Err(err) => {
+            temp_paths.cleanup();
+            return Err(IntegrationError::Io(err.to_string()));
+        }
+    };
     temp_paths.cleanup();
 
     Ok(Output {
