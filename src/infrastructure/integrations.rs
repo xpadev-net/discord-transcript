@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -125,10 +126,12 @@ fn sanitize_output(raw: &[u8]) -> String {
     // Collapse runs of whitespace (including newlines) into a single space.
     let collapsed: String = lossy.split_whitespace().collect::<Vec<_>>().join(" ");
     // Redact strings that look like API keys / bearer tokens.
-    let redacted =
+    static REDACT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = REDACT_RE.get_or_init(|| {
         regex::Regex::new(r"(?i)(sk-[a-zA-Z0-9\-_]{8,}|key-[a-zA-Z0-9]{8,}|bearer\s+\S{8,})")
-            .map(|re| re.replace_all(&collapsed, "[REDACTED]").into_owned())
-            .unwrap_or(collapsed);
+            .expect("hardcoded redaction regex is valid")
+    });
+    let redacted = re.replace_all(&collapsed, "[REDACTED]").into_owned();
 
     if redacted.len() <= SANITIZE_MAX_LEN {
         return redacted;
@@ -162,13 +165,7 @@ fn summarize_claude_stdin(
     workdir: Option<&Path>,
 ) -> Result<String, SummaryError> {
     let mut command = Command::new(&client.command_path);
-    command
-        .arg("--model")
-        .arg(&client.model)
-        .arg("-p")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.arg("--model").arg(&client.model).arg("-p");
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -202,9 +199,7 @@ fn summarize_opencode_argv(
         .arg("--model")
         .arg(&client.model)
         .arg(prompt)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdin(std::process::Stdio::null());
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -236,10 +231,7 @@ fn summarize_cursor_argv(
     if !client.model.trim().is_empty() {
         command.arg("--model").arg(&client.model);
     }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    command.stdin(std::process::Stdio::null());
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -329,18 +321,21 @@ pub fn run_command_with_timeout(
 
     let started = Instant::now();
     let status = loop {
-        match child
-            .try_wait()
-            .map_err(|err| IntegrationError::Io(err.to_string()))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
+        match child.try_wait() {
+            Err(err) => {
+                kill_child_process_group(&mut child);
+                let _ = child.wait();
+                temp_paths.cleanup();
+                return Err(IntegrationError::Io(err.to_string()));
+            }
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
                 kill_child_process_group(&mut child);
                 let _ = child.wait();
                 temp_paths.cleanup();
                 return Err(IntegrationError::Timeout { timeout });
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
     };
 
