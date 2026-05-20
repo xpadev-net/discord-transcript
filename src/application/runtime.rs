@@ -2611,40 +2611,54 @@ fn resolve_bot_permissions(
     use serenity::all::Permissions;
 
     let Some(guild) = ctx.cache.guild(guild_id) else {
-        warn!(guild_id = %guild_id, "guild not found in cache, assuming permissive permissions");
-        return PermissionSet {
-            can_connect_voice: true,
-            can_send_messages: true,
-        };
+        warn!(guild_id = %guild_id, "guild not found in cache, denying bot permissions");
+        return denied_bot_permissions();
     };
     let bot_id = ctx.cache.current_user().id;
     let Some(member) = guild.members.get(&bot_id) else {
-        warn!(guild_id = %guild_id, bot_id = %bot_id, "bot member not found in cache, assuming permissive permissions");
-        return PermissionSet {
-            can_connect_voice: true,
-            can_send_messages: true,
-        };
+        warn!(guild_id = %guild_id, bot_id = %bot_id, "bot member not found in cache, denying bot permissions");
+        return denied_bot_permissions();
     };
 
-    let can_connect_voice = voice_channel_id
-        .and_then(|vc_id| {
-            let channel = guild.channels.get(&ChannelId::new(vc_id))?;
-            let perms = guild.user_permissions_in(channel, member);
-            Some(perms.contains(Permissions::CONNECT))
-        })
-        .unwrap_or(true);
+    let voice_channel_permission = voice_channel_id.and_then(|vc_id| {
+        let channel = guild.channels.get(&ChannelId::new(vc_id))?;
+        let perms = guild.user_permissions_in(channel, member);
+        Some(perms.contains(Permissions::CONNECT))
+    });
 
-    let can_send_messages = text_channel_id
-        .and_then(|tc_id| {
-            let channel = guild.channels.get(&ChannelId::new(tc_id))?;
-            let perms = guild.user_permissions_in(channel, member);
-            Some(perms.contains(Permissions::SEND_MESSAGES))
-        })
-        .unwrap_or(true);
+    let text_channel_permission = text_channel_id.and_then(|tc_id| {
+        let channel = guild.channels.get(&ChannelId::new(tc_id))?;
+        let perms = guild.user_permissions_in(channel, member);
+        Some(perms.contains(Permissions::SEND_MESSAGES))
+    });
 
+    bot_permissions_from_cache_state(
+        true,
+        true,
+        voice_channel_permission,
+        text_channel_permission,
+    )
+}
+
+pub fn denied_bot_permissions() -> PermissionSet {
     PermissionSet {
-        can_connect_voice,
-        can_send_messages,
+        can_connect_voice: false,
+        can_send_messages: false,
+    }
+}
+
+pub fn bot_permissions_from_cache_state(
+    guild_present: bool,
+    bot_member_present: bool,
+    voice_channel_permission: Option<bool>,
+    text_channel_permission: Option<bool>,
+) -> PermissionSet {
+    if !guild_present || !bot_member_present {
+        return denied_bot_permissions();
+    }
+    PermissionSet {
+        can_connect_voice: voice_channel_permission.unwrap_or(false),
+        can_send_messages: text_channel_permission.unwrap_or(false),
     }
 }
 

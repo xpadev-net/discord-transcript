@@ -1,9 +1,10 @@
 use discord_transcript::application::bot::{BotCommandService, StartCommandInput};
 use discord_transcript::application::command::PermissionSet;
 use discord_transcript::application::runtime::{
-    RECORD_START_COMMAND, RECORD_STOP_COMMAND, RuntimeCommandInput, create_serenity_commands,
-    dispatch_runtime_command, meeting_audio_path, parse_stop_reason, run_guild_scoped_command,
-    slash_command_specs, stop_and_enqueue_summary_job, validate_command_guild,
+    RECORD_START_COMMAND, RECORD_STOP_COMMAND, RuntimeCommandInput, bot_permissions_from_cache_state,
+    create_serenity_commands, dispatch_runtime_command, meeting_audio_path, parse_stop_reason,
+    run_guild_scoped_command, slash_command_specs, stop_and_enqueue_summary_job,
+    validate_command_guild,
 };
 use discord_transcript::domain::{JobType, StopReason};
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
@@ -57,6 +58,49 @@ async fn run_guild_scoped_command_does_not_invoke_work_for_wrong_guild() {
 
     assert_eq!(message, "error: command is not configured for this guild");
     assert!(!invoked.load(Ordering::SeqCst));
+}
+
+#[test]
+fn bot_permissions_fail_closed_on_missing_cache_data() {
+    assert_eq!(
+        bot_permissions_from_cache_state(false, true, Some(true), Some(true)),
+        PermissionSet {
+            can_connect_voice: false,
+            can_send_messages: false,
+        }
+    );
+    assert_eq!(
+        bot_permissions_from_cache_state(true, false, Some(true), Some(true)),
+        PermissionSet {
+            can_connect_voice: false,
+            can_send_messages: false,
+        }
+    );
+    assert_eq!(
+        bot_permissions_from_cache_state(true, true, None, Some(true)),
+        PermissionSet {
+            can_connect_voice: false,
+            can_send_messages: true,
+        }
+    );
+    assert_eq!(
+        bot_permissions_from_cache_state(true, true, Some(true), None),
+        PermissionSet {
+            can_connect_voice: true,
+            can_send_messages: false,
+        }
+    );
+}
+
+#[test]
+fn bot_permissions_allow_only_when_all_cache_permissions_are_positive() {
+    assert_eq!(
+        bot_permissions_from_cache_state(true, true, Some(true), Some(true)),
+        PermissionSet {
+            can_connect_voice: true,
+            can_send_messages: true,
+        }
+    );
 }
 
 #[test]
