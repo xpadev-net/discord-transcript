@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroU32;
 
 use crate::domain::retention::RetentionPolicy;
 
@@ -167,12 +168,15 @@ impl AppConfig {
             discord_bot_admin_user_ids: parse_csv_list(optional_env("DISCORD_BOT_ADMIN_USER_IDS")),
             retention_policy: RetentionPolicy {
                 raw_audio_ttl_days: optional_env_parse_u32_nonzero("RETENTION_RAW_AUDIO_TTL_DAYS")?
+                    .map(validated_nonzero_u32)
                     .unwrap_or_else(|| RetentionPolicy::default().raw_audio_ttl_days),
                 transcript_ttl_days: optional_env_parse_u32_nonzero(
                     "RETENTION_TRANSCRIPT_TTL_DAYS",
                 )?
+                .map(validated_nonzero_u32)
                 .unwrap_or_else(|| RetentionPolicy::default().transcript_ttl_days),
-                summary_ttl_days: optional_env_parse_u32_nonzero("RETENTION_SUMMARY_TTL_DAYS")?,
+                summary_ttl_days: optional_env_parse_u32_nonzero("RETENTION_SUMMARY_TTL_DAYS")?
+                    .map(validated_nonzero_u32),
             },
         })
     }
@@ -270,19 +274,26 @@ impl AppConfig {
                     values,
                     "RETENTION_RAW_AUDIO_TTL_DAYS",
                 )?
+                .map(validated_nonzero_u32)
                 .unwrap_or_else(|| RetentionPolicy::default().raw_audio_ttl_days),
                 transcript_ttl_days: optional_from_map_parse_u32_nonzero(
                     values,
                     "RETENTION_TRANSCRIPT_TTL_DAYS",
                 )?
+                .map(validated_nonzero_u32)
                 .unwrap_or_else(|| RetentionPolicy::default().transcript_ttl_days),
                 summary_ttl_days: optional_from_map_parse_u32_nonzero(
                     values,
                     "RETENTION_SUMMARY_TTL_DAYS",
-                )?,
+                )?
+                .map(validated_nonzero_u32),
             },
         })
     }
+}
+
+fn validated_nonzero_u32(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("caller validated nonzero u32")
 }
 
 fn parse_csv_list(value: Option<String>) -> Vec<String> {

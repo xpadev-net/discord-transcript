@@ -231,8 +231,8 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
     executor: &mut E,
     policy: RetentionPolicy,
 ) -> RetentionCleanupPlan {
-    let raw_ttl = policy.raw_audio_ttl_days.to_string();
-    let transcript_ttl = policy.transcript_ttl_days.to_string();
+    let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
+    let transcript_ttl = policy.transcript_ttl_days.get().to_string();
     let mut errors = Vec::new();
 
     let raw_workspaces = collect_workspace_rows(
@@ -250,7 +250,7 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
     );
 
     let summary_workspaces = if let Some(summary_ttl_days) = policy.summary_ttl_days {
-        let summary_ttl = summary_ttl_days.to_string();
+        let summary_ttl = summary_ttl_days.get().to_string();
         collect_workspace_rows(
             executor,
             RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
@@ -356,8 +356,8 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let mut report = RetentionCleanupReport::default();
     let mut errors = Vec::new();
-    let raw_ttl = policy.raw_audio_ttl_days.to_string();
-    let transcript_ttl = policy.transcript_ttl_days.to_string();
+    let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
+    let transcript_ttl = policy.transcript_ttl_days.get().to_string();
 
     match executor.execute(
         RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
@@ -395,7 +395,7 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
     }
 
     if let Some(summary_ttl_days) = policy.summary_ttl_days {
-        let summary_ttl = summary_ttl_days.to_string();
+        let summary_ttl = summary_ttl_days.get().to_string();
         match executor.execute(
             RETENTION_DELETE_SUMMARIES_SQL,
             std::slice::from_ref(&summary_ttl),
@@ -521,8 +521,10 @@ fn remove_legacy_raw_audio(meeting_dir: &Path) -> Result<bool, String> {
         Ok(false) => {}
         Err(err) => errors.push(err),
     }
-    if let Err(err) = remove_empty_dir_if_present(meeting_dir) {
-        errors.push(err);
+    match remove_empty_dir_if_present(meeting_dir) {
+        Ok(true) => removed = true,
+        Ok(false) => {}
+        Err(err) => errors.push(err),
     }
     if errors.is_empty() {
         Ok(removed)

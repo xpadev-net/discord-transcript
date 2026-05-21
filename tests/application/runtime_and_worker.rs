@@ -11,6 +11,7 @@ use discord_transcript::infrastructure::asr::StubWhisperClient;
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 struct TempWorkspaceGuard {
@@ -56,6 +57,10 @@ fn base_env() -> HashMap<String, String> {
     values
 }
 
+fn nonzero(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("test value should be nonzero")
+}
+
 #[test]
 fn app_config_loads_from_map() {
     let values = base_env();
@@ -72,8 +77,8 @@ fn app_config_loads_from_map() {
     assert_eq!(config.chunk_storage_dir, "/tmp/chunks");
     assert_eq!(config.auto_stop_grace_seconds, 60);
     assert_eq!(config.summary_max_retries, 3);
-    assert_eq!(config.retention_policy.raw_audio_ttl_days, 7);
-    assert_eq!(config.retention_policy.transcript_ttl_days, 30);
+    assert_eq!(config.retention_policy.raw_audio_ttl_days.get(), 7);
+    assert_eq!(config.retention_policy.transcript_ttl_days.get(), 30);
     assert_eq!(config.retention_policy.summary_ttl_days, None);
     assert_eq!(config.integration_retry_max_attempts, 3);
     assert_eq!(config.integration_retry_initial_delay_ms, 200);
@@ -97,9 +102,9 @@ fn app_config_accepts_retention_policy_overrides() {
 
     let config = AppConfig::from_map(&values).expect("config should load");
 
-    assert_eq!(config.retention_policy.raw_audio_ttl_days, 3);
-    assert_eq!(config.retention_policy.transcript_ttl_days, 14);
-    assert_eq!(config.retention_policy.summary_ttl_days, Some(90));
+    assert_eq!(config.retention_policy.raw_audio_ttl_days.get(), 3);
+    assert_eq!(config.retention_policy.transcript_ttl_days.get(), 14);
+    assert_eq!(config.retention_policy.summary_ttl_days, Some(nonzero(90)));
 }
 
 #[test]

@@ -9,6 +9,7 @@ use discord_transcript::application::retention_cleanup::{
 use discord_transcript::domain::retention::RetentionPolicy;
 use discord_transcript::infrastructure::sql_store::FakeSqlExecutor;
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 struct TempWorkspaceGuard {
@@ -35,6 +36,10 @@ fn temp_layout(test_name: &str) -> (TempWorkspaceGuard, MeetingWorkspaceLayout) 
 
 fn query_key(sql: &str, params: &[&str]) -> String {
     format!("{}|{}", sql, params.join("\u{1f}"))
+}
+
+fn nonzero(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("test value should be nonzero")
 }
 
 #[test]
@@ -138,9 +143,9 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
         &mut executor,
         &layout,
         RetentionPolicy {
-            raw_audio_ttl_days: 7,
-            transcript_ttl_days: 30,
-            summary_ttl_days: Some(90),
+            raw_audio_ttl_days: nonzero(7),
+            transcript_ttl_days: nonzero(30),
+            summary_ttl_days: Some(nonzero(90)),
         },
     )
     .expect("cleanup should succeed");
@@ -244,9 +249,9 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
         &mut executor,
         &layout,
         RetentionPolicy {
-            raw_audio_ttl_days: 7,
-            transcript_ttl_days: 30,
-            summary_ttl_days: Some(90),
+            raw_audio_ttl_days: nonzero(7),
+            transcript_ttl_days: nonzero(30),
+            summary_ttl_days: Some(nonzero(90)),
         },
     )
     .expect_err("filesystem cleanup should report the failed meeting");
