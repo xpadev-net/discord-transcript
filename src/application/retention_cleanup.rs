@@ -180,11 +180,22 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
             Some(err.message)
         }
     };
-    report.merge(
-        apply_retention_database_cleanup(executor, policy)
-            .map_err(RetentionCleanupError::without_report)?,
-    );
-    if let Some(message) = filesystem_error {
+    let database_error = match apply_retention_database_cleanup(executor, policy) {
+        Ok(database_report) => {
+            report.merge(database_report);
+            None
+        }
+        Err(err) => Some(err),
+    };
+    let message = match (filesystem_error, database_error) {
+        (Some(fs_err), Some(db_err)) => {
+            Some(format!("{fs_err}; database cleanup failed: {db_err}"))
+        }
+        (Some(fs_err), None) => Some(fs_err),
+        (None, Some(db_err)) => Some(format!("database cleanup failed: {db_err}")),
+        (None, None) => None,
+    };
+    if let Some(message) = message {
         Err(RetentionCleanupError { report, message })
     } else {
         Ok(report)

@@ -262,3 +262,28 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
                 && params == &vec!["90".to_owned()])
     );
 }
+
+#[test]
+fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
+    let (_guard, layout) = temp_layout("db_failure_partial_report");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
+    executor.execute_error.insert(
+        query_key(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30"]),
+        "database unavailable".to_owned(),
+    );
+
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+        .expect_err("database cleanup should fail after filesystem cleanup runs");
+
+    assert!(err.message.contains("database cleanup failed"));
+    assert_eq!(err.report.raw_audio_dirs_removed, 1);
+    assert!(!workspace.audio_dir().exists());
+}
