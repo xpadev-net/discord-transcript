@@ -31,11 +31,7 @@ export function DebugDownloads({
     return (
       <div className="debug-downloads-section">
         <h3>デバッグデータ</h3>
-        <div
-          className="debug-downloads-loading"
-          role="status"
-          aria-live="polite"
-        >
+        <div className="debug-downloads-loading" role="status">
           読み込み中...
         </div>
       </div>
