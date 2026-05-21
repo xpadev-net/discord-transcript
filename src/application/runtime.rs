@@ -498,20 +498,37 @@ where
     S: MeetingStore,
     Q: JobQueue,
 {
+    if let Err(err) = store.set_meeting_status(
+        meeting_id,
+        MeetingStatus::Stopping,
+        Some(MeetingStatus::Transcribing),
+    ) {
+        warn!(
+            meeting_id,
+            job_id,
+            error = %err,
+            "transcript persist retry cannot restore meeting to retryable state; marking job failed"
+        );
+        let _ = queue.mark_failed(job_id, error_message.clone());
+        store
+            .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+            .map_err(|store_err| {
+                format!(
+                    "transcript persist retry status restore failed ({err}) and meeting failure update failed: {store_err}"
+                )
+            })?;
+        store
+            .set_error_message(meeting_id, Some(error_message))
+            .map_err(|store_err| {
+                format!(
+                    "transcript persist retry status restore failed ({err}) and error message update failed: {store_err}"
+                )
+            })?;
+        return Ok(true);
+    }
+
     match queue.retry(job_id, error_message.clone(), max_retries) {
         Ok(crate::domain::JobStatus::Queued) => {
-            if let Err(err) = store.set_meeting_status(
-                meeting_id,
-                MeetingStatus::Stopping,
-                Some(MeetingStatus::Transcribing),
-            ) {
-                warn!(
-                    meeting_id,
-                    job_id,
-                    error = %err,
-                    "transcript persist retry queued but meeting status update failed"
-                );
-            }
             if let Err(err) = store.set_error_message(meeting_id, Some(error_message)) {
                 warn!(
                     meeting_id,
@@ -569,6 +586,18 @@ where
                 error = %err,
                 "failed to durably retry transcript persist failure; leaving meeting status unchanged"
             );
+            if let Err(status_err) = store.set_meeting_status(
+                meeting_id,
+                MeetingStatus::Transcribing,
+                Some(MeetingStatus::Stopping),
+            ) {
+                warn!(
+                    meeting_id,
+                    job_id,
+                    error = %status_err,
+                    "failed to restore meeting status after transcript persist retry backend error"
+                );
+            }
             let _ = store.set_error_message(meeting_id, Some(error_message));
             Ok(false)
         }
@@ -3878,7 +3907,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn transcript_persist_retry_status_update_failure_stays_retry_scheduled() {
+    fn transcript_persist_retry_status_update_failure_marks_terminal() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = transcribing_meeting();
         meeting.status = crate::domain::MeetingStatus::Posted;
@@ -3895,14 +3924,14 @@ mod status_message_tests {
             "failed to persist transcript segments: database unavailable".to_owned(),
             2,
         )
-        .expect("queued retry should not become terminal when annotation fails");
+        .expect("status restore failure should be terminalized");
 
-        assert!(!exhausted);
+        assert!(exhausted);
         let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
-        assert_eq!(updated.retry_count, 1);
+        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+        assert_eq!(updated.retry_count, 0);
         let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
         assert_eq!(
             meeting.error_message.as_deref(),
             Some("failed to persist transcript segments: database unavailable")
