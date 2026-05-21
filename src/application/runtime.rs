@@ -57,6 +57,7 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -1017,6 +1018,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         command_gate: Arc::new(Mutex::new(())),
+        background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         shutting_down: Arc::new(AtomicBool::new(false)),
         task_tracker: TaskTracker::new(),
@@ -1085,6 +1087,7 @@ struct ScaffoldHandler {
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     command_gate: Arc<Mutex<()>>,
+    background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     task_tracker: TaskTracker,
@@ -1113,6 +1116,10 @@ impl ScaffoldHandler {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let _spawn_guard = self
+            .background_spawn_gate
+            .lock()
+            .expect("background spawn gate poisoned");
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
@@ -1129,9 +1136,15 @@ impl ScaffoldHandler {
 
     async fn shutdown(&self, voice_manager: Arc<songbird::Songbird>, grace: Duration) {
         self.shutting_down.store(true, Ordering::Release);
-        self.task_tracker.close();
 
         let _command_guard = self.command_gate.lock().await;
+        {
+            let _spawn_guard = self
+                .background_spawn_gate
+                .lock()
+                .expect("background spawn gate poisoned");
+            self.task_tracker.close();
+        }
 
         if let Err(err) = voice_manager.leave(self.guild_id).await {
             warn!(
@@ -1173,7 +1186,16 @@ async fn shutdown_signal() {
     {
         use tokio::signal::unix::{SignalKind, signal};
 
-        let mut terminate = signal(SignalKind::terminate()).ok();
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => Some(signal),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to register SIGTERM handler; only CTRL-C will trigger graceful shutdown"
+                );
+                None
+            }
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = async {
