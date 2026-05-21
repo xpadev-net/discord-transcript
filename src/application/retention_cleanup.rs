@@ -37,45 +37,66 @@ WHERE s.created_at < NOW() - (($1 || ' days')::interval)
 "#;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
-UPDATE transcripts
+UPDATE transcripts t
 SET is_deleted=TRUE
-WHERE is_deleted=FALSE
-  AND created_at < NOW() - (($1 || ' days')::interval)
+FROM meetings m
+WHERE t.meeting_id = m.id
+  AND t.is_deleted=FALSE
+  AND t.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_SUMMARIES_SQL: &str = r#"
-DELETE FROM summaries
-WHERE created_at < NOW() - (($1 || ' days')::interval)
+DELETE FROM summaries s
+USING meetings m
+WHERE s.meeting_id = m.id
+  AND s.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL: &str = r#"
-DELETE FROM artifacts
-WHERE expires_at IS NOT NULL
-  AND expires_at <= NOW()
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND a.expires_at IS NOT NULL
+  AND a.expires_at <= NOW()
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_RAW_ARTIFACTS_SQL: &str = r#"
-DELETE FROM artifacts
-WHERE kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')
-  AND created_at < NOW() - (($1 || ' days')::interval)
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')
+  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL: &str = r#"
-DELETE FROM artifacts
-WHERE kind IN ('transcript', 'masked_transcript')
-  AND created_at < NOW() - (($1 || ' days')::interval)
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND a.kind IN ('transcript', 'masked_transcript')
+  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL: &str = r#"
-DELETE FROM artifacts
-WHERE kind IN ('summary', 'summary_markdown')
-  AND created_at < NOW() - (($1 || ' days')::interval)
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND a.kind IN ('summary', 'summary_markdown')
+  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_DEBUG_ARTIFACTS_SQL: &str = r#"
-DELETE FROM artifacts
-WHERE kind IN ('debug', 'debug_artifact', 'whisper_debug')
-  AND created_at < NOW() - (($1 || ' days')::interval)
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')
+  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
