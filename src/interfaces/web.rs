@@ -1743,8 +1743,9 @@ async fn api_debug_file(
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
     if debug_artifact_requires_admin(&artifact_id) {
         authorize_debug_artifact_download(
-            &artifact_id,
-            verify_raw_debug_artifact_access(&state, &access, &user_id).await?,
+            verify_raw_debug_artifact_access(&state, &access, &user_id)
+                .await
+                .unwrap_or(false),
         )?;
     }
 
@@ -1772,11 +1773,8 @@ async fn verify_raw_debug_artifact_access(
     check_channel_admin_permission(state, auth, &access.voice_channel_id, user_id).await
 }
 
-fn authorize_debug_artifact_download(
-    artifact_id: &str,
-    raw_debug_allowed: bool,
-) -> Result<(), StatusCode> {
-    if debug_artifact_requires_admin(artifact_id) && !raw_debug_allowed {
+fn authorize_debug_artifact_download(raw_debug_allowed: bool) -> Result<(), StatusCode> {
+    if !raw_debug_allowed {
         Err(StatusCode::FORBIDDEN)
     } else {
         Ok(())
@@ -2322,21 +2320,14 @@ mod discord_channel_full_tests {
     #[test]
     fn normal_viewer_cannot_download_raw_whisper_debug_artifacts() {
         assert_eq!(
-            authorize_debug_artifact_download("whisper_mixdown", false),
+            authorize_debug_artifact_download(false),
             Err(StatusCode::FORBIDDEN)
         );
         assert_eq!(
-            authorize_debug_artifact_download("whisper~speaker-1", false),
+            authorize_debug_artifact_download(false),
             Err(StatusCode::FORBIDDEN)
         );
-        assert_eq!(
-            authorize_debug_artifact_download("mixdown_audio", false),
-            Ok(())
-        );
-        assert_eq!(
-            authorize_debug_artifact_download("whisper_mixdown", true),
-            Ok(())
-        );
+        assert_eq!(authorize_debug_artifact_download(true), Ok(()));
     }
 
     #[test]
