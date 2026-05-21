@@ -35,9 +35,9 @@ type PermissionCache =
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CachedChannelPermission {
-    can_view: bool,
-    is_admin: bool,
+pub struct CachedChannelPermission {
+    pub can_view: bool,
+    pub is_admin: bool,
 }
 
 #[derive(Clone)]
