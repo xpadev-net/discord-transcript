@@ -62,6 +62,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
@@ -1021,6 +1022,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         shutting_down: Arc::new(AtomicBool::new(false)),
+        shutdown_token: CancellationToken::new(),
         task_tracker: TaskTracker::new(),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
@@ -1090,6 +1092,7 @@ struct ScaffoldHandler {
     background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
     chunk_storage_dir: String,
     auto_stop_grace_seconds: u64,
@@ -1121,6 +1124,7 @@ impl ScaffoldHandler {
             .lock()
             .expect("background spawn gate poisoned");
         if self.shutting_down.load(Ordering::Acquire) {
+            debug!("spawn_background: shutdown in progress, dropping background task");
             return;
         }
         self.task_tracker.spawn(future);
@@ -1136,6 +1140,7 @@ impl ScaffoldHandler {
 
     async fn shutdown(&self, voice_manager: Arc<songbird::Songbird>, grace: Duration) {
         self.shutting_down.store(true, Ordering::Release);
+        self.shutdown_token.cancel();
 
         let _command_guard = self.command_gate.lock().await;
         {
@@ -1350,7 +1355,12 @@ impl EventHandler for ScaffoldHandler {
             self.spawn_background(async move {
                 let mut final_flush_failures = 0u32;
                 loop {
-                    sleep(grace_for_task).await;
+                    tokio::select! {
+                        _ = sleep(grace_for_task) => {}
+                        _ = handler.shutdown_token.cancelled() => {
+                            return;
+                        }
+                    }
                     if handler.shutting_down.load(Ordering::Acquire) {
                         return;
                     }
@@ -3380,7 +3390,12 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let expected_meeting_id = runtime.active_meeting_id().await;
                     let grace = Duration::from_secs(runtime.auto_stop_grace_seconds);
                     self.runtime.spawn_background(async move {
-                        sleep(grace).await;
+                        tokio::select! {
+                            _ = sleep(grace) => {}
+                            _ = runtime.shutdown_token.cancelled() => {
+                                return;
+                            }
+                        }
                         if runtime.shutting_down.load(Ordering::Acquire) {
                             return;
                         }
