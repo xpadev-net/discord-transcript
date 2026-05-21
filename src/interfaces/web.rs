@@ -31,6 +31,7 @@ const PERMISSION_CACHE_TTL_SECS: u64 = 300;
 const GUILD_CACHE_TTL_SECS: u64 = 300;
 
 type PermissionCache = Arc<tokio::sync::RwLock<HashMap<(String, String), (bool, Instant)>>>;
+type AdminPermissionCache = Arc<tokio::sync::RwLock<HashMap<(String, String), (bool, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
 
 #[derive(Clone)]
@@ -41,6 +42,8 @@ pub struct WebState {
     pub http_client: reqwest::Client,
     /// Cache: (user_id, channel_id) → (allowed, expires_at)
     pub permission_cache: PermissionCache,
+    /// Cache: (user_id, channel_id) -> (has administrator permission, expires_at)
+    admin_permission_cache: AdminPermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
     pub static_files_dir: String,
@@ -60,6 +63,7 @@ impl WebState {
             auth,
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            admin_permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             static_files_dir,
         }
@@ -681,10 +685,30 @@ async fn check_channel_admin_permission(
     channel_id: &str,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
+    let cache_key = (user_id.to_owned(), channel_id.to_owned());
+    {
+        let cache = state.admin_permission_cache.read().await;
+        if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
+            && Instant::now() < expires_at
+        {
+            return Ok(allowed);
+        }
+    }
+
     let Some(perms) = resolve_channel_permissions(state, auth, channel_id, user_id).await? else {
         return Ok(false);
     };
-    Ok(perms & ADMINISTRATOR != 0)
+    let allowed = perms & ADMINISTRATOR != 0;
+    {
+        let mut cache = state.admin_permission_cache.write().await;
+        let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+        cache.insert(cache_key, (allowed, expires_at));
+        if cache.len() > 5000 {
+            let now = Instant::now();
+            cache.retain(|_, (_, exp)| *exp > now);
+        }
+    }
+    Ok(allowed)
 }
 
 // Discord API response types for permission checking
@@ -2319,10 +2343,6 @@ mod discord_channel_full_tests {
 
     #[test]
     fn normal_viewer_cannot_download_raw_whisper_debug_artifacts() {
-        assert_eq!(
-            authorize_debug_artifact_download(false),
-            Err(StatusCode::FORBIDDEN)
-        );
         assert_eq!(
             authorize_debug_artifact_download(false),
             Err(StatusCode::FORBIDDEN)
