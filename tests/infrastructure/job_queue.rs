@@ -404,7 +404,7 @@ fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() 
 }
 
 #[test]
-fn sql_job_queue_claim_done_and_retry_flow() {
+fn sql_job_queue_done_job_rejects_retry() {
     let mut executor = FakeSqlExecutor::default();
     let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
     executor.query_rows_result.insert(
@@ -419,9 +419,7 @@ fn sql_job_queue_claim_done_and_retry_flow() {
         ]],
     );
     let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
-    executor
-        .query_rows_result
-        .insert(retry_key, vec![vec!["queued".to_owned()]]);
+    executor.query_rows_result.insert(retry_key, Vec::new());
 
     let mut queue = SqlJobQueue::new(executor);
     enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
@@ -436,8 +434,29 @@ fn sql_job_queue_claim_done_and_retry_flow() {
     queue
         .mark_done(&claimed.id)
         .expect("mark done should succeed");
-    let status = queue
+    let err = queue
         .retry(&claimed.id, "failed once".to_owned(), 2)
-        .expect("retry should succeed");
+        .expect_err("done jobs should not be retryable by SQL");
+    assert_eq!(
+        err,
+        discord_transcript::infrastructure::queue::QueueError::NotFound {
+            job_id: "j1".to_owned()
+        }
+    );
+}
+
+#[test]
+fn sql_job_queue_running_job_retry_returns_queued() {
+    let mut executor = FakeSqlExecutor::default();
+    let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
+    executor
+        .query_rows_result
+        .insert(retry_key, vec![vec!["queued".to_owned()]]);
+
+    let mut queue = SqlJobQueue::new(executor);
+    let status = queue
+        .retry("j1", "failed once".to_owned(), 2)
+        .expect("running SQL job should retry");
+
     assert_eq!(status, JobStatus::Queued);
 }
