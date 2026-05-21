@@ -292,3 +292,35 @@ fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
     assert_eq!(err.report.transcripts_marked_deleted, 3);
     assert!(!workspace.audio_dir().exists());
 }
+
+#[test]
+fn retention_cleanup_uses_partial_plan_when_one_workspace_query_fails() {
+    let (_guard, layout) = temp_layout("partial_plan_query_failure");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
+    executor.query_rows_error.insert(
+        query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
+        "transcript query unavailable".to_owned(),
+    );
+
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+        .expect_err("plan query error should be reported after partial cleanup");
+
+    assert!(err.message.contains("transcript query unavailable"));
+    assert_eq!(err.report.raw_audio_dirs_removed, 1);
+    assert!(!workspace.audio_dir().exists());
+    assert!(
+        executor
+            .executed
+            .iter()
+            .any(|(sql, params)| sql == RETENTION_MARK_TRANSCRIPTS_DELETED_SQL
+                && params == &vec!["30".to_owned()])
+    );
+}

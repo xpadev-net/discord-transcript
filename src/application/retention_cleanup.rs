@@ -20,10 +20,12 @@ WHERE stopped_at IS NOT NULL
 pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
 SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
 FROM meetings m
-JOIN transcripts t ON t.meeting_id = m.id
-WHERE t.is_deleted = FALSE
-  AND t.created_at < NOW() - (($1 || ' days')::interval)
-  AND m.status IN ('posted', 'failed', 'aborted')
+LEFT JOIN transcripts t ON t.meeting_id = m.id
+WHERE m.status IN ('posted', 'failed', 'aborted')
+  AND (
+    (t.meeting_id IS NULL AND m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - (($1 || ' days')::interval))
+    OR (t.is_deleted = FALSE AND t.created_at < NOW() - (($1 || ' days')::interval))
+  )
 "#;
 
 // Summary workspace cleanup is gated by RETENTION_SUMMARY_TTL_DAYS and uses
@@ -31,9 +33,12 @@ WHERE t.is_deleted = FALSE
 pub const RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
 SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
 FROM meetings m
-JOIN summaries s ON s.meeting_id = m.id
-WHERE s.created_at < NOW() - (($1 || ' days')::interval)
-  AND m.status IN ('posted', 'failed', 'aborted')
+LEFT JOIN summaries s ON s.meeting_id = m.id
+WHERE m.status IN ('posted', 'failed', 'aborted')
+  AND (
+    (s.meeting_id IS NULL AND m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - (($1 || ' days')::interval))
+    OR (s.created_at < NOW() - (($1 || ' days')::interval))
+  )
 "#;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
@@ -138,15 +143,6 @@ pub struct RetentionCleanupError {
     pub message: String,
 }
 
-impl RetentionCleanupError {
-    fn without_report(message: String) -> Self {
-        Self {
-            report: RetentionCleanupReport::default(),
-            message,
-        }
-    }
-}
-
 impl std::fmt::Display for RetentionCleanupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -160,6 +156,7 @@ pub struct RetentionCleanupPlan {
     pub raw_workspaces: Vec<ExpiredWorkspaceRow>,
     pub transcript_workspaces: Vec<ExpiredWorkspaceRow>,
     pub summary_workspaces: Vec<ExpiredWorkspaceRow>,
+    pub errors: Vec<String>,
 }
 
 pub fn enforce_retention_policy<E: SqlExecutor>(
@@ -167,8 +164,8 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
     workspace_layout: &MeetingWorkspaceLayout,
     policy: RetentionPolicy,
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
-    let plan = collect_retention_cleanup_plan(executor, policy)
-        .map_err(RetentionCleanupError::without_report)?;
+    let plan = collect_retention_cleanup_plan(executor, policy);
+    let plan_errors = plan.errors.clone();
     let mut report = RetentionCleanupReport::default();
     let filesystem_result = apply_retention_filesystem_cleanup(workspace_layout, &plan);
     let filesystem_error = match filesystem_result {
@@ -191,13 +188,17 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
             Some(err.message)
         }
     };
-    let message = match (filesystem_error, database_error) {
-        (Some(fs_err), Some(db_err)) => {
-            Some(format!("{fs_err}; database cleanup failed: {db_err}"))
-        }
-        (Some(fs_err), None) => Some(fs_err),
-        (None, Some(db_err)) => Some(format!("database cleanup failed: {db_err}")),
-        (None, None) => None,
+    let mut messages = plan_errors;
+    if let Some(fs_err) = filesystem_error {
+        messages.push(fs_err);
+    }
+    if let Some(db_err) = database_error {
+        messages.push(format!("database cleanup failed: {db_err}"));
+    }
+    let message = if messages.is_empty() {
+        None
+    } else {
+        Some(messages.join("; "))
     };
     if let Some(message) = message {
         Err(RetentionCleanupError { report, message })
@@ -209,47 +210,43 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
 pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
     executor: &mut E,
     policy: RetentionPolicy,
-) -> Result<RetentionCleanupPlan, String> {
+) -> RetentionCleanupPlan {
     let raw_ttl = policy.raw_audio_ttl_days.to_string();
     let transcript_ttl = policy.transcript_ttl_days.to_string();
+    let mut errors = Vec::new();
 
-    let expired_raw_workspaces = executor.query_rows(
+    let raw_workspaces = collect_workspace_rows(
+        executor,
         RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
         std::slice::from_ref(&raw_ttl),
-    )?;
-    let raw_workspaces = expired_raw_workspaces
-        .into_iter()
-        .map(|row| parse_workspace_row(&row))
-        .collect::<Result<Vec<_>, _>>()?;
+        &mut errors,
+    );
 
-    let expired_transcript_workspaces = executor.query_rows(
+    let transcript_workspaces = collect_workspace_rows(
+        executor,
         RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
         std::slice::from_ref(&transcript_ttl),
-    )?;
-    let transcript_workspaces = expired_transcript_workspaces
-        .into_iter()
-        .map(|row| parse_workspace_row(&row))
-        .collect::<Result<Vec<_>, _>>()?;
+        &mut errors,
+    );
 
     let summary_workspaces = if let Some(summary_ttl_days) = policy.summary_ttl_days {
         let summary_ttl = summary_ttl_days.to_string();
-        executor
-            .query_rows(
-                RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
-                std::slice::from_ref(&summary_ttl),
-            )?
-            .into_iter()
-            .map(|row| parse_workspace_row(&row))
-            .collect::<Result<Vec<_>, _>>()?
+        collect_workspace_rows(
+            executor,
+            RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+            std::slice::from_ref(&summary_ttl),
+            &mut errors,
+        )
     } else {
         Vec::new()
     };
 
-    Ok(RetentionCleanupPlan {
+    RetentionCleanupPlan {
         raw_workspaces,
         transcript_workspaces,
         summary_workspaces,
-    })
+        errors,
+    }
 }
 
 pub fn apply_retention_filesystem_cleanup(
@@ -419,6 +416,31 @@ fn parse_workspace_row(row: &[String]) -> Result<ExpiredWorkspaceRow, String> {
         guild_id: row[1].clone(),
         voice_channel_id: row[2].clone(),
     })
+}
+
+fn collect_workspace_rows<E: SqlExecutor>(
+    executor: &mut E,
+    sql: &str,
+    params: &[String],
+    errors: &mut Vec<String>,
+) -> Vec<ExpiredWorkspaceRow> {
+    let rows = match executor.query_rows(sql, params) {
+        Ok(rows) => rows,
+        Err(err) => {
+            errors.push(err);
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .filter_map(|row| match parse_workspace_row(&row) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                errors.push(err);
+                None
+            }
+        })
+        .collect()
 }
 
 fn remove_dir_if_present(path: &Path) -> Result<bool, String> {

@@ -1403,7 +1403,13 @@ impl ScaffoldHandler {
         let policy = self.retention_policy;
         let plan = {
             let mut service = self.service.lock().await;
-            collect_retention_cleanup_plan(&mut service.store.executor, policy)?
+            collect_retention_cleanup_plan(&mut service.store.executor, policy)
+        };
+        if !plan.errors.is_empty() {
+            warn!(
+                errors = %plan.errors.join("; "),
+                "retention cleanup plan collection had errors; continuing with partial plan"
+            );
         };
         let chunk_storage_dir = self.chunk_storage_dir.clone();
         let filesystem_result = tokio::task::spawn_blocking(move || {
