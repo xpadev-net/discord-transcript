@@ -210,3 +210,53 @@ fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
                 && params == &vec!["30".to_owned()])
     );
 }
+
+#[test]
+fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
+    let (_guard, layout) = temp_layout("fs_failure_continues");
+    let failed = layout.for_meeting("g1", "vc1", "m1");
+    std::fs::create_dir_all(failed.root()).expect("create failed workspace root");
+    std::fs::write(failed.audio_dir(), b"not a directory").expect("write audio path as file");
+
+    let retained = layout.for_meeting("g1", "vc1", "m2");
+    retained.ensure_base_dirs().expect("create retained workspace");
+    std::fs::write(retained.masked_transcript_path(), b"masked").expect("write transcript");
+    std::fs::write(retained.summary_dir().join("summary.md"), b"summary")
+        .expect("write summary");
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
+        vec![vec!["m2".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, &["90"]),
+        vec![vec!["m2".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
+
+    let err = enforce_retention_policy(
+        &mut executor,
+        &layout,
+        RetentionPolicy {
+            raw_audio_ttl_days: 7,
+            transcript_ttl_days: 30,
+            summary_ttl_days: Some(90),
+        },
+    )
+    .expect_err("filesystem cleanup should report the failed meeting");
+
+    assert!(err.contains("failed to remove"));
+    assert!(!retained.transcript_dir().exists());
+    assert!(!retained.summary_dir().exists());
+    assert!(
+        executor
+            .executed
+            .iter()
+            .any(|(sql, params)| sql == RETENTION_DELETE_SUMMARIES_SQL
+                && params == &vec!["90".to_owned()])
+    );
+}

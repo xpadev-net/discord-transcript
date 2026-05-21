@@ -201,6 +201,7 @@ pub fn apply_retention_filesystem_cleanup(
     plan: &RetentionCleanupPlan,
 ) -> Result<RetentionCleanupReport, String> {
     let mut report = RetentionCleanupReport::default();
+    let mut errors = Vec::new();
     for meeting in &plan.raw_workspaces {
         report.raw_workspaces_scanned += 1;
         let workspace = workspace_layout.for_meeting(
@@ -208,21 +209,31 @@ pub fn apply_retention_filesystem_cleanup(
             &meeting.voice_channel_id,
             &meeting.meeting_id,
         );
-        if remove_dir_if_present(&workspace.audio_dir())? {
-            report.raw_audio_dirs_removed += 1;
-        }
-        if remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id))? {
-            report.legacy_raw_audio_removed += 1;
-        }
-        if remove_dir_if_present(&workspace.speakers_dir())? {
-            report.speaker_dirs_removed += 1;
-        }
-        if remove_dir_if_present(&workspace.context_dir())? {
-            report.context_dirs_removed += 1;
-        }
-        if remove_dir_if_present(&workspace.debug_dir())? {
-            report.debug_dirs_removed += 1;
-        }
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.audio_dir()),
+            || report.raw_audio_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
+            || report.legacy_raw_audio_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.speakers_dir()),
+            || report.speaker_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.context_dir()),
+            || report.context_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.debug_dir()),
+            || report.debug_dirs_removed += 1,
+        );
     }
 
     for meeting in &plan.transcript_workspaces {
@@ -231,9 +242,11 @@ pub fn apply_retention_filesystem_cleanup(
             &meeting.voice_channel_id,
             &meeting.meeting_id,
         );
-        if remove_dir_if_present(&workspace.transcript_dir())? {
-            report.transcript_dirs_removed += 1;
-        }
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.transcript_dir()),
+            || report.transcript_dirs_removed += 1,
+        );
     }
 
     for meeting in &plan.summary_workspaces {
@@ -242,11 +255,18 @@ pub fn apply_retention_filesystem_cleanup(
             &meeting.voice_channel_id,
             &meeting.meeting_id,
         );
-        if remove_dir_if_present(&workspace.summary_dir())? {
-            report.summary_dirs_removed += 1;
-        }
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.summary_dir()),
+            || report.summary_dirs_removed += 1,
+        );
     }
-    Ok(report)
+
+    if errors.is_empty() {
+        Ok(report)
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub fn apply_retention_database_cleanup<E: SqlExecutor>(
@@ -318,6 +338,18 @@ fn remove_dir_if_present(path: &Path) -> Result<bool, String> {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(format!("failed to remove {}: {err}", path.display())),
+    }
+}
+
+fn record_cleanup_result(
+    errors: &mut Vec<String>,
+    result: Result<bool, String>,
+    mut on_removed: impl FnMut(),
+) {
+    match result {
+        Ok(true) => on_removed(),
+        Ok(false) => {}
+        Err(err) => errors.push(err),
     }
 }
 
