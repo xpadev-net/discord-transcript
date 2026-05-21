@@ -1,147 +1,18 @@
-pub const INITIAL_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS meetings (
-    id TEXT PRIMARY KEY,
-    guild_id TEXT NOT NULL,
-    voice_channel_id TEXT NOT NULL,
-    report_channel_id TEXT NOT NULL,
-    status_message_channel_id TEXT,
-    status_message_id TEXT,
-    started_by_user_id TEXT NOT NULL,
-    title TEXT,
-    status TEXT NOT NULL CHECK (status IN ('scheduled', 'recording', 'stopping', 'transcribing', 'summarizing', 'posted', 'failed', 'aborted')),
-    stop_reason TEXT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    stopped_at TIMESTAMPTZ,
-    meeting_duration_seconds INTEGER,
-    error_message TEXT,
-    retention_raw_cleaned_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_meetings_guild_status
-    ON meetings (guild_id, status);
-
-CREATE TABLE IF NOT EXISTS transcripts (
-    id TEXT PRIMARY KEY,
-    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    speaker_id TEXT NOT NULL,
-    start_ms INTEGER NOT NULL,
-    end_ms INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    confidence DOUBLE PRECISION,
-    is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
-    source TEXT NOT NULL DEFAULT 'voice',
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
-    ON transcripts (meeting_id, start_ms);
-
-CREATE TABLE IF NOT EXISTS meeting_speakers (
-    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    speaker_id TEXT NOT NULL,
-    username TEXT,
-    nickname TEXT,
-    display_name TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (meeting_id, speaker_id)
-);
-
-CREATE TABLE IF NOT EXISTS summaries (
-    id TEXT PRIMARY KEY,
-    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    version INTEGER NOT NULL,
-    markdown TEXT NOT NULL,
-    raw_json JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (meeting_id, version)
-);
-
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    job_type TEXT NOT NULL CHECK (job_type IN ('transcribe', 'summarize', 'cleanup')),
-    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'failed', 'done')),
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_jobs_meeting_type_status
-    ON jobs (meeting_id, job_type, status);
-
-CREATE INDEX IF NOT EXISTS idx_jobs_claim
-    ON jobs (job_type, status, created_at);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-    id TEXT PRIMARY KEY,
-    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL,
-    storage_url TEXT NOT NULL,
-    size_bytes BIGINT NOT NULL,
-    expires_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_artifacts_meeting_kind
-    ON artifacts (meeting_id, kind);
-"#;
+pub const INITIAL_SCHEMA_SQL: &str = include_str!("../../migrations/0001_mvp_schema.sql");
 
 /// Incremental migrations applied after the initial schema.
 /// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
-pub const INCREMENTAL_MIGRATIONS_SQL: &str = r#"
-ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS is_noisy BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'voice';
-DO $$
-BEGIN
-    ALTER TABLE transcripts
-    ADD CONSTRAINT transcripts_source_check CHECK (source IN ('voice', 'vc_text'));
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END
-$$;
-DO $$
-BEGIN
-    ALTER TABLE meetings
-    ADD CONSTRAINT meetings_status_check CHECK (status IN ('scheduled', 'recording', 'stopping', 'transcribing', 'summarizing', 'posted', 'failed', 'aborted'));
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END
-$$;
-DO $$
-BEGIN
-    ALTER TABLE jobs
-    ADD CONSTRAINT jobs_status_check CHECK (status IN ('queued', 'running', 'failed', 'done'));
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END
-$$;
-DO $$
-BEGIN
-    ALTER TABLE jobs
-    ADD CONSTRAINT jobs_job_type_check CHECK (job_type IN ('transcribe', 'summarize', 'cleanup'));
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END
-$$;
-ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_channel_id TEXT;
-ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_id TEXT;
-ALTER TABLE meetings ADD COLUMN IF NOT EXISTS retention_raw_cleaned_at TIMESTAMPTZ;
-CREATE TABLE IF NOT EXISTS meeting_speakers (
-    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    speaker_id TEXT NOT NULL,
-    username TEXT,
-    nickname TEXT,
-    display_name TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (meeting_id, speaker_id)
+pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
+    include_str!("../../migrations/0002_add_is_noisy.sql"),
+    "\n",
+    include_str!("../../migrations/0003_add_meeting_speakers.sql"),
+    "\n",
+    include_str!("../../migrations/0004_add_transcript_source.sql"),
+    "\n",
+    include_str!("../../migrations/0005_add_enum_constraints.sql"),
+    "\n",
+    include_str!("../../migrations/0006_add_status_messages_and_retention.sql"),
 );
-"#;
 
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
 UPDATE meetings

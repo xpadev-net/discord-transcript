@@ -26,7 +26,11 @@ PostgreSQL にデータベースを作成し、マイグレーションを適用
 
 ```bash
 createdb discord_transcript
-psql -d discord_transcript -f migrations/0001_mvp_schema.sql
+migration_files=$(find migrations -maxdepth 1 -name "*.sql" | sort)
+[ -n "$migration_files" ] || { echo "No migration files found in migrations/"; exit 1; }
+printf '%s\n' "$migration_files" | while IFS= read -r f; do
+  psql -d discord_transcript -f "$f" || exit 1
+done
 ```
 
 ### 3. 環境変数の設定
@@ -245,7 +249,7 @@ src/
     web.rs             # Web API
     posting.rs         # Discord メッセージ投稿
 migrations/
-  0001_mvp_schema.sql  # DB スキーマ
+  *.sql                # DB schema migrations (runtime and Docker apply these)
 tests/
   application/         # 統合テスト本体（機能別）
   audio/

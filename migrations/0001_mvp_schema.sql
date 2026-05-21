@@ -3,14 +3,17 @@ CREATE TABLE IF NOT EXISTS meetings (
     guild_id TEXT NOT NULL,
     voice_channel_id TEXT NOT NULL,
     report_channel_id TEXT NOT NULL,
+    status_message_channel_id TEXT,
+    status_message_id TEXT,
     started_by_user_id TEXT NOT NULL,
     title TEXT,
-    status TEXT NOT NULL CHECK (status IN ('scheduled', 'recording', 'stopping', 'transcribing', 'summarizing', 'posted', 'failed', 'aborted')),
+    status TEXT NOT NULL,
     stop_reason TEXT,
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     stopped_at TIMESTAMPTZ,
     meeting_duration_seconds INTEGER,
     error_message TEXT,
+    retention_raw_cleaned_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -31,15 +34,6 @@ CREATE TABLE IF NOT EXISTS transcripts (
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-DO $$
-BEGIN
-    ALTER TABLE transcripts
-    ADD CONSTRAINT transcripts_source_check
-    CHECK (source IN ('voice', 'vc_text'));
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END
-$$;
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
@@ -57,8 +51,8 @@ CREATE TABLE IF NOT EXISTS summaries (
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-    job_type TEXT NOT NULL CHECK (job_type IN ('transcribe', 'summarize', 'cleanup')),
-    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'failed', 'done')),
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL,
     retry_count INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
