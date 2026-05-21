@@ -2,8 +2,9 @@ use discord_transcript::application::retention_cleanup::{
     RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
     RETENTION_DELETE_RAW_ARTIFACTS_SQL, RETENTION_DELETE_SUMMARIES_SQL,
     RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
-    RETENTION_EXPIRED_RAW_WORKSPACES_SQL, RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
-    RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, enforce_retention_policy,
+    RETENTION_EXPIRED_RAW_WORKSPACES_SQL, RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+    RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
+    enforce_retention_policy,
 };
 use discord_transcript::domain::retention::RetentionPolicy;
 use discord_transcript::infrastructure::sql_store::FakeSqlExecutor;
@@ -44,6 +45,9 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
     std::fs::write(workspace.debug_dir().join("summary_prompt.txt"), b"prompt")
         .expect("write debug");
+    std::fs::write(workspace.speakers_dir().join("u1_speaker.wav"), b"speaker")
+        .expect("write speaker");
+    std::fs::write(workspace.context_dir().join("vc_text.json"), b"{}").expect("write context");
     std::fs::write(workspace.masked_transcript_path(), b"masked").expect("write transcript");
     std::fs::write(workspace.transcript_manifest_path(), b"{}").expect("write manifest");
     let legacy_dir = layout.legacy_meeting_dir("m1");
@@ -85,12 +89,16 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     assert_eq!(report.raw_workspaces_scanned, 1);
     assert_eq!(report.raw_audio_dirs_removed, 1);
     assert_eq!(report.legacy_raw_audio_removed, 1);
+    assert_eq!(report.speaker_dirs_removed, 1);
+    assert_eq!(report.context_dirs_removed, 1);
     assert_eq!(report.transcript_dirs_removed, 1);
     assert_eq!(report.debug_dirs_removed, 1);
     assert_eq!(report.transcripts_marked_deleted, 3);
     assert_eq!(report.artifacts_deleted, 12);
     assert!(!workspace.audio_dir().exists());
     assert!(!workspace.debug_dir().exists());
+    assert!(!workspace.speakers_dir().exists());
+    assert!(!workspace.context_dir().exists());
     assert!(!workspace.transcript_dir().exists());
     assert!(!legacy_dir.join("mixdown.wav").exists());
     assert!(!legacy_dir.join("speakers").exists());
@@ -107,7 +115,15 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
 #[test]
 fn retention_cleanup_applies_summary_ttl_when_configured() {
     let (_guard, layout) = temp_layout("summary_ttl");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.summary_dir().join("summary.md"), b"summary")
+        .expect("write summary");
     let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, &["90"]),
+        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
     executor.execute_result.insert(
         query_key(RETENTION_DELETE_SUMMARIES_SQL, &["90"]),
         6,
@@ -129,9 +145,11 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
     .expect("cleanup should succeed");
 
     assert_eq!(report.summaries_deleted, 6);
+    assert_eq!(report.summary_dirs_removed, 1);
     // Four unregistered artifact-delete queries each return FakeSqlExecutor's
     // default of 1; only the summary-artifact query (7) is explicitly set.
     assert_eq!(report.artifacts_deleted, 11); // 1 + 1 + 1 + 1 + 7
+    assert!(!workspace.summary_dir().exists());
     assert!(
         executor
             .executed
@@ -156,6 +174,9 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
     assert_eq!(report.raw_workspaces_scanned, 1);
     assert_eq!(report.raw_audio_dirs_removed, 0);
     assert_eq!(report.legacy_raw_audio_removed, 0);
+    assert_eq!(report.speaker_dirs_removed, 0);
+    assert_eq!(report.context_dirs_removed, 0);
     assert_eq!(report.transcript_dirs_removed, 0);
+    assert_eq!(report.summary_dirs_removed, 0);
     assert_eq!(report.debug_dirs_removed, 0);
 }

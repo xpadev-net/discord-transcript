@@ -3,7 +3,7 @@ use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandI
 use crate::application::command::{CommandError, PermissionSet, authorize_record_stop_for_meeting};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::retention_cleanup::{
-    apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
+    RetentionCleanupReport, apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
     collect_retention_cleanup_plan,
 };
 use crate::application::stop::StopOutcome;
@@ -1406,13 +1406,23 @@ impl ScaffoldHandler {
             collect_retention_cleanup_plan(&mut service.store.executor, policy)?
         };
         let chunk_storage_dir = self.chunk_storage_dir.clone();
-        let mut report = tokio::task::spawn_blocking(move || {
+        let filesystem_result = tokio::task::spawn_blocking(move || {
             let layout =
                 crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&chunk_storage_dir);
             apply_retention_filesystem_cleanup(&layout, &plan)
         })
         .await
-        .map_err(|err| format!("retention filesystem cleanup task failed: {err}"))??;
+        .map_err(|err| format!("retention filesystem cleanup task failed: {err}"))?;
+        let mut report = match filesystem_result {
+            Ok(report) => report,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "retention filesystem cleanup failed; continuing with database cleanup"
+                );
+                RetentionCleanupReport::default()
+            }
+        };
         let database_report = {
             let mut service = self.service.lock().await;
             apply_retention_database_cleanup(&mut service.store.executor, policy)?
@@ -1422,7 +1432,10 @@ impl ScaffoldHandler {
             raw_workspaces_scanned = report.raw_workspaces_scanned,
             raw_audio_dirs_removed = report.raw_audio_dirs_removed,
             legacy_raw_audio_removed = report.legacy_raw_audio_removed,
+            speaker_dirs_removed = report.speaker_dirs_removed,
+            context_dirs_removed = report.context_dirs_removed,
             transcript_dirs_removed = report.transcript_dirs_removed,
+            summary_dirs_removed = report.summary_dirs_removed,
             debug_dirs_removed = report.debug_dirs_removed,
             transcripts_marked_deleted = report.transcripts_marked_deleted,
             summaries_deleted = report.summaries_deleted,

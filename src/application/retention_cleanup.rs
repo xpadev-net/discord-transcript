@@ -25,6 +25,16 @@ WHERE stopped_at IS NOT NULL
   AND status IN ('posted', 'failed', 'aborted')
 "#;
 
+// Summary workspace cleanup is gated by RETENTION_SUMMARY_TTL_DAYS and uses
+// its own constant so future summary-specific filters can diverge.
+pub const RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
+SELECT id, guild_id, voice_channel_id
+FROM meetings
+WHERE stopped_at IS NOT NULL
+  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND status IN ('posted', 'failed', 'aborted')
+"#;
+
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts
 SET is_deleted=TRUE
@@ -72,7 +82,10 @@ pub struct RetentionCleanupReport {
     pub raw_workspaces_scanned: usize,
     pub raw_audio_dirs_removed: usize,
     pub legacy_raw_audio_removed: usize,
+    pub speaker_dirs_removed: usize,
+    pub context_dirs_removed: usize,
     pub transcript_dirs_removed: usize,
+    pub summary_dirs_removed: usize,
     pub debug_dirs_removed: usize,
     pub transcripts_marked_deleted: u64,
     pub summaries_deleted: u64,
@@ -84,7 +97,10 @@ impl RetentionCleanupReport {
         self.raw_workspaces_scanned += other.raw_workspaces_scanned;
         self.raw_audio_dirs_removed += other.raw_audio_dirs_removed;
         self.legacy_raw_audio_removed += other.legacy_raw_audio_removed;
+        self.speaker_dirs_removed += other.speaker_dirs_removed;
+        self.context_dirs_removed += other.context_dirs_removed;
         self.transcript_dirs_removed += other.transcript_dirs_removed;
+        self.summary_dirs_removed += other.summary_dirs_removed;
         self.debug_dirs_removed += other.debug_dirs_removed;
         self.transcripts_marked_deleted += other.transcripts_marked_deleted;
         self.summaries_deleted += other.summaries_deleted;
@@ -96,6 +112,7 @@ impl RetentionCleanupReport {
 pub struct RetentionCleanupPlan {
     pub raw_workspaces: Vec<ExpiredWorkspaceRow>,
     pub transcript_workspaces: Vec<ExpiredWorkspaceRow>,
+    pub summary_workspaces: Vec<ExpiredWorkspaceRow>,
 }
 
 pub fn enforce_retention_policy<E: SqlExecutor>(
@@ -135,9 +152,24 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
         .map(|row| parse_workspace_row(&row))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let summary_workspaces = if let Some(summary_ttl_days) = policy.summary_ttl_days {
+        let summary_ttl = summary_ttl_days.to_string();
+        executor
+            .query_rows(
+                RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+                std::slice::from_ref(&summary_ttl),
+            )?
+            .into_iter()
+            .map(|row| parse_workspace_row(&row))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
     Ok(RetentionCleanupPlan {
         raw_workspaces,
         transcript_workspaces,
+        summary_workspaces,
     })
 }
 
@@ -159,6 +191,12 @@ pub fn apply_retention_filesystem_cleanup(
         if remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id))? {
             report.legacy_raw_audio_removed += 1;
         }
+        if remove_dir_if_present(&workspace.speakers_dir())? {
+            report.speaker_dirs_removed += 1;
+        }
+        if remove_dir_if_present(&workspace.context_dir())? {
+            report.context_dirs_removed += 1;
+        }
         if remove_dir_if_present(&workspace.debug_dir())? {
             report.debug_dirs_removed += 1;
         }
@@ -172,6 +210,17 @@ pub fn apply_retention_filesystem_cleanup(
         );
         if remove_dir_if_present(&workspace.transcript_dir())? {
             report.transcript_dirs_removed += 1;
+        }
+    }
+
+    for meeting in &plan.summary_workspaces {
+        let workspace = workspace_layout.for_meeting(
+            &meeting.guild_id,
+            &meeting.voice_channel_id,
+            &meeting.meeting_id,
+        );
+        if remove_dir_if_present(&workspace.summary_dir())? {
+            report.summary_dirs_removed += 1;
         }
     }
     Ok(report)
