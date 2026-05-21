@@ -94,6 +94,7 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     assert!(!workspace.transcript_dir().exists());
     assert!(!legacy_dir.join("mixdown.wav").exists());
     assert!(!legacy_dir.join("speakers").exists());
+    assert!(!legacy_dir.exists());
     assert!(
         executor
             .executed

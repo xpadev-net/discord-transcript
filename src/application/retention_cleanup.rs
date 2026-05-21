@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = r#"
+pub const RETENTION_EXPIRED_WORKSPACES_SQL: &str = r#"
 SELECT id, guild_id, voice_channel_id
 FROM meetings
 WHERE stopped_at IS NOT NULL
@@ -13,13 +13,8 @@ WHERE stopped_at IS NOT NULL
   AND status IN ('posted', 'failed', 'aborted')
 "#;
 
-pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
-SELECT id, guild_id, voice_channel_id
-FROM meetings
-WHERE stopped_at IS NOT NULL
-  AND stopped_at < NOW() - (($1 || ' days')::interval)
-  AND status IN ('posted', 'failed', 'aborted')
-"#;
+pub const RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = RETENTION_EXPIRED_WORKSPACES_SQL;
+pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = RETENTION_EXPIRED_WORKSPACES_SQL;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts
@@ -207,5 +202,15 @@ fn remove_legacy_raw_audio(meeting_dir: &Path) -> Result<bool, String> {
     if remove_dir_if_present(&meeting_dir.join("speakers"))? {
         removed = true;
     }
+    remove_empty_dir_if_present(meeting_dir)?;
     Ok(removed)
+}
+
+fn remove_empty_dir_if_present(path: &Path) -> Result<bool, String> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(err) => Err(format!("failed to remove empty {}: {err}", path.display())),
+    }
 }
