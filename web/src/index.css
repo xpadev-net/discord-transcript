@@ -267,7 +267,7 @@ audio::-webkit-media-controls-panel {
   align-items: center;
   min-height: 160px;
   gap: 12px;
-  color: var(--danger);
+  color: var(--speaker-2);
   font-size: 0.95rem;
   text-align: center;
 }
@@ -275,8 +275,8 @@ audio::-webkit-media-controls-panel {
 .panel-error button {
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--panel);
-  color: var(--text);
+  background: var(--bg-panel);
+  color: var(--text-primary);
   padding: 6px 12px;
   cursor: pointer;
 }
