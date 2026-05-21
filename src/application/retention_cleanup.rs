@@ -111,6 +111,7 @@ pub struct RetentionCleanupReport {
     pub speaker_dirs_removed: usize,
     pub context_dirs_removed: usize,
     pub transcript_dirs_removed: usize,
+    pub empty_summary_dirs_removed: usize,
     pub summary_dirs_removed: usize,
     pub debug_dirs_removed: usize,
     pub transcripts_marked_deleted: u64,
@@ -126,6 +127,7 @@ impl RetentionCleanupReport {
         self.speaker_dirs_removed += other.speaker_dirs_removed;
         self.context_dirs_removed += other.context_dirs_removed;
         self.transcript_dirs_removed += other.transcript_dirs_removed;
+        self.empty_summary_dirs_removed += other.empty_summary_dirs_removed;
         self.summary_dirs_removed += other.summary_dirs_removed;
         self.debug_dirs_removed += other.debug_dirs_removed;
         self.transcripts_marked_deleted += other.transcripts_marked_deleted;
@@ -285,7 +287,7 @@ pub fn apply_retention_filesystem_cleanup(
         record_cleanup_result(
             &mut errors,
             remove_empty_dir_if_present(&workspace.summary_dir()),
-            || report.summary_dirs_removed += 1,
+            || report.empty_summary_dirs_removed += 1,
         );
         record_cleanup_result(
             &mut errors,
