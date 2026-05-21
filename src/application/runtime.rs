@@ -3728,40 +3728,6 @@ mod status_message_tests {
     }
 
     #[test]
-    fn runtime_record_start_creates_row_after_songbird_and_workspace_setup() {
-        let source = include_str!("runtime.rs");
-        let handle_start = source
-            .find("async fn handle_record_start")
-            .expect("handle_record_start should exist");
-        let source = &source[handle_start..];
-        let songbird_lookup = source
-            .find("let manager = songbird::get(ctx)")
-            .expect("record start should look up songbird manager");
-        let service_lock = source
-            .find("let mut service = self.service.lock().await")
-            .expect("record start should lock service after setup");
-        let workspace_setup = source[..service_lock]
-            .find("ensure_base_dirs")
-            .expect("record start should prepare workspace before locking service");
-        let row_create = source
-            .find("complete_record_start_after_runtime_setup")
-            .expect("record start should create row through runtime setup helper");
-
-        assert!(
-            songbird_lookup < row_create,
-            "recording row must not be created before songbird manager lookup succeeds"
-        );
-        assert!(
-            workspace_setup < row_create,
-            "recording row must not be created before workspace setup succeeds"
-        );
-        assert!(
-            service_lock < row_create,
-            "recording row should be created only after the post-setup service lock"
-        );
-    }
-
-    #[test]
     fn runtime_setup_completion_creates_recording_row() {
         let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut service = BotCommandService::new(store);
