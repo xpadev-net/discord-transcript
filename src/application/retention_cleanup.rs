@@ -49,11 +49,21 @@ WHERE m.status IN ('posted', 'failed', 'aborted')
 // Summary workspace cleanup is gated by RETENTION_SUMMARY_TTL_DAYS and uses
 // its own constant so future summary-specific filters can diverge.
 pub const RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
-SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
+SELECT m.id, m.guild_id, m.voice_channel_id
 FROM meetings m
-JOIN summaries s ON s.meeting_id = m.id
-WHERE s.created_at < NOW() - (($1 || ' days')::interval)
-  AND m.status IN ('posted', 'failed', 'aborted')
+WHERE m.status IN ('posted', 'failed', 'aborted')
+  AND NOT EXISTS (
+    SELECT 1
+    FROM summaries active_s
+    WHERE active_s.meeting_id = m.id
+      AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM summaries expired_s
+    WHERE expired_s.meeting_id = m.id
+      AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+  )
 "#;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
