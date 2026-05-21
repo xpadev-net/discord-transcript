@@ -31,7 +31,13 @@ export function DebugDownloads({
     return (
       <div className="debug-downloads-section">
         <h3>デバッグデータ</h3>
-        <div className="debug-downloads-loading">読み込み中...</div>
+        <div
+          className="debug-downloads-loading"
+          role="status"
+          aria-live="polite"
+        >
+          読み込み中...
+        </div>
       </div>
     );
   }
@@ -40,7 +46,9 @@ export function DebugDownloads({
     return (
       <div className="debug-downloads-section">
         <h3>デバッグデータ</h3>
-        <div className="debug-downloads-error">取得に失敗しました</div>
+        <div className="debug-downloads-error" role="alert">
+          取得に失敗しました
+        </div>
       </div>
     );
   }
