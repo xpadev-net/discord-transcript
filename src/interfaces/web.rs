@@ -554,14 +554,14 @@ async fn get_guild_info(
     Ok(guild)
 }
 
-/// Query Discord API for channel permission. Returns Ok(true) if allowed,
-/// Ok(false) if denied, Err on API failure.
-async fn check_channel_permission(
+/// Query Discord API for resolved channel permissions. Returns Ok(None) when
+/// the user or channel is inaccessible, Err on upstream API failure.
+async fn resolve_channel_permissions(
     state: &WebState,
     auth: &AuthConfig,
     channel_id: &str,
     user_id: &str,
-) -> Result<bool, StatusCode> {
+) -> Result<Option<u64>, StatusCode> {
     let bot_auth = format!("Bot {}", auth.bot_token);
 
     // Fetch guild from cache, channel and member from API in parallel
@@ -604,7 +604,7 @@ async fn check_channel_permission(
         || channel_status == reqwest::StatusCode::FORBIDDEN
         || channel_status == reqwest::StatusCode::UNAUTHORIZED
     {
-        return Ok(false);
+        return Ok(None);
     }
     if channel_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         warn!(
@@ -640,7 +640,7 @@ async fn check_channel_permission(
     if member_resp.status() == reqwest::StatusCode::NOT_FOUND
         || member_resp.status() == reqwest::StatusCode::FORBIDDEN
     {
-        return Ok(false);
+        return Ok(None);
     }
     if !member_resp.status().is_success() {
         warn!(status = %member_resp.status(), "discord member API non-success");
@@ -651,16 +651,40 @@ async fn check_channel_permission(
         StatusCode::BAD_GATEWAY
     })?;
 
-    let perms = compute_channel_permissions(
+    Ok(Some(compute_channel_permissions(
         user_id,
         &guild.owner_id,
         &auth.guild_id,
         &member.roles,
         &guild.roles,
         &channel.permission_overwrites,
-    );
+    )))
+}
 
+/// Query Discord API for channel permission. Returns Ok(true) if allowed,
+/// Ok(false) if denied, Err on API failure.
+async fn check_channel_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let Some(perms) = resolve_channel_permissions(state, auth, channel_id, user_id).await? else {
+        return Ok(false);
+    };
     Ok(perms & VIEW_CHANNEL != 0 || perms & ADMINISTRATOR != 0)
+}
+
+async fn check_channel_admin_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let Some(perms) = resolve_channel_permissions(state, auth, channel_id, user_id).await? else {
+        return Ok(false);
+    };
+    Ok(perms & ADMINISTRATOR != 0)
 }
 
 // Discord API response types for permission checking
@@ -1460,6 +1484,9 @@ async fn api_debug_manifest(
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<DebugArtifactEntry>>, StatusCode> {
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    let raw_debug_allowed = verify_raw_debug_artifact_access(&state, &access, &user_id)
+        .await
+        .unwrap_or(false);
 
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
@@ -1593,29 +1620,33 @@ async fn api_debug_manifest(
             content_type: "audio/wav",
         });
 
+        if raw_debug_allowed {
+            entries.push(DebugArtifactEntry {
+                id: format!("whisper~{safe_speaker}"),
+                label: format!("Whisperレスポンス ({label_base})"),
+                category: "whisper",
+                available: whisper_available,
+                download_url: format!("{base_url}/whisper~{safe_speaker}"),
+                filename: format!("whisper_{safe_speaker}.json"),
+                content_type: "application/json",
+            });
+        }
+    }
+
+    if raw_debug_allowed {
         entries.push(DebugArtifactEntry {
-            id: format!("whisper~{safe_speaker}"),
-            label: format!("Whisperレスポンス ({label_base})"),
+            id: StaticDebugArtifactKind::WhisperMixdown.as_id().to_owned(),
+            label: "Whisperレスポンス (mixdown)".to_owned(),
             category: "whisper",
-            available: whisper_available,
-            download_url: format!("{base_url}/whisper~{safe_speaker}"),
-            filename: format!("whisper_{safe_speaker}.json"),
+            available: mixdown_whisper_exists.unwrap_or(false),
+            download_url: format!(
+                "{base_url}/{}",
+                StaticDebugArtifactKind::WhisperMixdown.as_id()
+            ),
+            filename: "whisper_mixdown.json".to_owned(),
             content_type: "application/json",
         });
     }
-
-    entries.push(DebugArtifactEntry {
-        id: StaticDebugArtifactKind::WhisperMixdown.as_id().to_owned(),
-        label: "Whisperレスポンス (mixdown)".to_owned(),
-        category: "whisper",
-        available: mixdown_whisper_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::WhisperMixdown.as_id()
-        ),
-        filename: "whisper_mixdown.json".to_owned(),
-        content_type: "application/json",
-    });
 
     entries.push(DebugArtifactEntry {
         id: StaticDebugArtifactKind::TranscriptPreCorrection
@@ -1710,6 +1741,12 @@ async fn api_debug_file(
     Path((meeting_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    if debug_artifact_requires_admin(&artifact_id) {
+        authorize_debug_artifact_download(
+            &artifact_id,
+            verify_raw_debug_artifact_access(&state, &access, &user_id).await?,
+        )?;
+    }
 
     let source = resolve_debug_artifact(&state, &meeting_id, &access, &artifact_id).await?;
     match source {
@@ -1724,6 +1761,36 @@ async fn api_debug_file(
             content_type,
         } => Ok(build_inline_debug_response(bytes, &filename, content_type)),
     }
+}
+
+async fn verify_raw_debug_artifact_access(
+    state: &WebState,
+    access: &MeetingAccess,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    check_channel_admin_permission(state, auth, &access.voice_channel_id, user_id).await
+}
+
+fn authorize_debug_artifact_download(
+    artifact_id: &str,
+    raw_debug_allowed: bool,
+) -> Result<(), StatusCode> {
+    if debug_artifact_requires_admin(artifact_id) && !raw_debug_allowed {
+        Err(StatusCode::FORBIDDEN)
+    } else {
+        Ok(())
+    }
+}
+
+fn debug_artifact_requires_admin(artifact_id: &str) -> bool {
+    if let Some((kind, _)) = artifact_id.split_once('~') {
+        return kind == "whisper";
+    }
+    matches!(
+        StaticDebugArtifactKind::parse(artifact_id),
+        Some(StaticDebugArtifactKind::WhisperMixdown)
+    )
 }
 
 async fn resolve_debug_artifact(
@@ -2051,8 +2118,9 @@ async fn stream_file_range(
 mod discord_channel_full_tests {
     use super::{
         DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
-        PERMISSION_CACHE_TTL_SECS, PermissionCache, VIEW_CHANNEL, build_content_disposition,
-        compute_channel_permissions, meeting_access_from_row, verify_meeting_access_after_row,
+        PERMISSION_CACHE_TTL_SECS, PermissionCache, VIEW_CHANNEL,
+        authorize_debug_artifact_download, build_content_disposition, compute_channel_permissions,
+        debug_artifact_requires_admin, meeting_access_from_row, verify_meeting_access_after_row,
     };
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -2240,6 +2308,35 @@ mod discord_channel_full_tests {
 
         assert!(matches!(result, Err(StatusCode::NOT_FOUND)));
         assert!(!permission_check_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn raw_whisper_debug_artifacts_require_admin_access() {
+        assert!(debug_artifact_requires_admin("whisper_mixdown"));
+        assert!(debug_artifact_requires_admin("whisper~speaker-1"));
+        assert!(!debug_artifact_requires_admin("mixdown_audio"));
+        assert!(!debug_artifact_requires_admin("speaker_audio~speaker-1"));
+        assert!(!debug_artifact_requires_admin("transcript_post_correction"));
+    }
+
+    #[test]
+    fn normal_viewer_cannot_download_raw_whisper_debug_artifacts() {
+        assert_eq!(
+            authorize_debug_artifact_download("whisper_mixdown", false),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            authorize_debug_artifact_download("whisper~speaker-1", false),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            authorize_debug_artifact_download("mixdown_audio", false),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_debug_artifact_download("whisper_mixdown", true),
+            Ok(())
+        );
     }
 
     #[test]
