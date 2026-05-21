@@ -238,6 +238,38 @@ fn record_stop_rejects_non_starter_member() {
 }
 
 #[test]
+fn record_stop_rejects_started_meeting_role_without_matching_user() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-1".to_owned(),
+        report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "starter".to_owned(),
+        title: None,
+        status: MeetingStatus::Recording,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+
+    let error = record_stop(
+        &mut store,
+        RecordStopRequest {
+            guild_id: "g1".to_owned(),
+            caller_user_id: "other-member".to_owned(),
+            caller_role: UserRole::StartedMeeting,
+            reason: StopReason::Manual,
+        },
+    )
+    .expect_err("StartedMeeting role still requires ownership");
+    assert_eq!(error, CommandError::Unauthorized("stop recording"));
+}
+
+#[test]
 fn auto_stop_triggers_after_grace_period_and_can_cancel() {
     let mut state = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(

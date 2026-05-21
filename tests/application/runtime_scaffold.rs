@@ -202,6 +202,7 @@ fn stop_and_enqueue_summary_job_enqueues_on_owner_stop() {
         "g1",
         "u1",
         UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     )
         .expect("stop and enqueue should succeed");
@@ -243,6 +244,7 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
         "g1",
         "u1",
         UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     )
         .expect("first stop should succeed");
@@ -256,6 +258,7 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
         "g1",
         "u1",
         UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     )
         .expect("second stop should succeed (idempotent)");
@@ -304,6 +307,7 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
         "g1",
         "u1",
         UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     );
     assert!(first.is_err(), "enqueue failure should be surfaced");
@@ -319,6 +323,7 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
         "g1",
         "u1",
         UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     )
         .expect("retry should enqueue summary for already-stopping meeting");
@@ -357,6 +362,7 @@ fn stop_and_enqueue_summary_job_does_not_enqueue_for_scheduled_abort() {
         "g1",
         "u1",
         UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     )
         .expect("scheduled stop should abort without enqueue");

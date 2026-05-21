@@ -185,12 +185,16 @@ pub fn authorize_record_stop_for_meeting(
     caller_user_id: &str,
     caller_role: UserRole,
 ) -> Result<(), CommandError> {
-    let effective_role =
-        if caller_role == UserRole::Member && meeting.started_by_user_id == caller_user_id {
-            UserRole::StartedMeeting
-        } else {
-            caller_role
-        };
+    let effective_role = match caller_role {
+        UserRole::BotAdmin | UserRole::GuildAdmin => caller_role,
+        UserRole::Member | UserRole::StartedMeeting => {
+            if meeting.started_by_user_id == caller_user_id {
+                UserRole::StartedMeeting
+            } else {
+                UserRole::Member
+            }
+        }
+    };
     if is_allowed(effective_role, Action::StopRecording) {
         Ok(())
     } else {

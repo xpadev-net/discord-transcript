@@ -160,12 +160,27 @@ pub fn stop_and_enqueue_summary_job<S, Q>(
     guild_id: &str,
     user_id: &str,
     caller_role: UserRole,
+    expected_meeting_id: Option<&str>,
     reason: StopReason,
 ) -> Result<crate::application::bot::StopCommandResult, String>
 where
     S: MeetingStore,
     Q: crate::infrastructure::queue::JobQueue,
 {
+    if let Some(expected_meeting_id) = expected_meeting_id {
+        let active = service
+            .store
+            .find_active_meeting_by_guild(guild_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
+        if active.id != expected_meeting_id {
+            return Err(format!(
+                "active meeting changed before stop: expected={expected_meeting_id}, actual={}",
+                active.id
+            ));
+        }
+    }
+
     let stop_result = service
         .handle_record_stop_result(StopCommandInput {
             guild_id: guild_id.to_owned(),
@@ -985,6 +1000,7 @@ impl EventHandler for ScaffoldHandler {
                             &guild_for_task,
                             "auto-stop",
                             UserRole::BotAdmin,
+                            None,
                             StopReason::AutoEmpty,
                         )
                     };
@@ -1520,6 +1536,7 @@ impl ScaffoldHandler {
                 &guild_key,
                 &caller_user_id,
                 caller_role,
+                Some(&authorized_meeting_id),
                 StopReason::Manual,
             )?
         };
@@ -2774,6 +2791,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 &guild_key,
                                 "driver-disconnect",
                                 UserRole::BotAdmin,
+                                None,
                                 StopReason::ClientDisconnect,
                             )
                         };
