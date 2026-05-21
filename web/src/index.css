@@ -260,6 +260,31 @@ audio::-webkit-media-controls-panel {
   text-align: center;
 }
 
+.panel-error {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  min-height: 160px;
+  gap: 12px;
+  color: var(--danger);
+  font-size: 0.95rem;
+  text-align: center;
+}
+
+.panel-error button {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.panel-error button:hover {
+  border-color: var(--accent);
+}
+
 /* Summary panel */
 .summary-header {
   font-size: 0.8rem;

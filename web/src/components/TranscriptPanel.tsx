@@ -7,10 +7,28 @@ interface Props {
   segments: TranscriptSegment[] | null;
   activeIndex: number;
   onSeek: (startMs: number) => void;
+  error: string | null;
+  onRetry: () => void;
 }
 
 export const TranscriptPanel = forwardRef<HTMLDivElement, Props>(
-  function TranscriptPanel({ segments, activeIndex, onSeek }, ref) {
+  function TranscriptPanel(
+    { segments, activeIndex, onSeek, error, onRetry },
+    ref,
+  ) {
+    if (error) {
+      return (
+        <div className="transcript-container" ref={ref}>
+          <div className="panel-error" role="alert">
+            <div>{error}</div>
+            <button type="button" onClick={onRetry}>
+              {"\u518d\u8a66\u884c"}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     if (segments === null) {
       return (
         <div className="transcript-container" ref={ref}>
