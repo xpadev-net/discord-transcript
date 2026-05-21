@@ -88,7 +88,7 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
 
     assert_eq!(report.raw_workspaces_scanned, 1);
     assert_eq!(report.raw_audio_dirs_removed, 1);
-    assert_eq!(report.legacy_raw_audio_removed, 1);
+    assert_eq!(report.legacy_meetings_cleaned, 1);
     assert_eq!(report.speaker_dirs_removed, 1);
     assert_eq!(report.context_dirs_removed, 1);
     assert_eq!(report.transcript_dirs_removed, 1);
@@ -173,7 +173,7 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
 
     assert_eq!(report.raw_workspaces_scanned, 1);
     assert_eq!(report.raw_audio_dirs_removed, 0);
-    assert_eq!(report.legacy_raw_audio_removed, 0);
+    assert_eq!(report.legacy_meetings_cleaned, 0);
     assert_eq!(report.speaker_dirs_removed, 0);
     assert_eq!(report.context_dirs_removed, 0);
     assert_eq!(report.transcript_dirs_removed, 0);

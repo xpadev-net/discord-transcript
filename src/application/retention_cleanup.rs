@@ -96,7 +96,8 @@ DELETE FROM artifacts a
 USING meetings m
 WHERE a.meeting_id = m.id
   AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')
-  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.stopped_at IS NOT NULL
+  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
@@ -104,7 +105,7 @@ WHERE a.meeting_id = m.id
 pub struct RetentionCleanupReport {
     pub raw_workspaces_scanned: usize,
     pub raw_audio_dirs_removed: usize,
-    pub legacy_raw_audio_removed: usize,
+    pub legacy_meetings_cleaned: usize,
     pub speaker_dirs_removed: usize,
     pub context_dirs_removed: usize,
     pub transcript_dirs_removed: usize,
@@ -119,7 +120,7 @@ impl RetentionCleanupReport {
     pub fn merge(&mut self, other: RetentionCleanupReport) {
         self.raw_workspaces_scanned += other.raw_workspaces_scanned;
         self.raw_audio_dirs_removed += other.raw_audio_dirs_removed;
-        self.legacy_raw_audio_removed += other.legacy_raw_audio_removed;
+        self.legacy_meetings_cleaned += other.legacy_meetings_cleaned;
         self.speaker_dirs_removed += other.speaker_dirs_removed;
         self.context_dirs_removed += other.context_dirs_removed;
         self.transcript_dirs_removed += other.transcript_dirs_removed;
@@ -269,7 +270,7 @@ pub fn apply_retention_filesystem_cleanup(
         record_cleanup_result(
             &mut errors,
             remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
-            || report.legacy_raw_audio_removed += 1,
+            || report.legacy_meetings_cleaned += 1,
         );
         record_cleanup_result(
             &mut errors,

@@ -1432,7 +1432,7 @@ impl ScaffoldHandler {
         info!(
             raw_workspaces_scanned = report.raw_workspaces_scanned,
             raw_audio_dirs_removed = report.raw_audio_dirs_removed,
-            legacy_raw_audio_removed = report.legacy_raw_audio_removed,
+            legacy_meetings_cleaned = report.legacy_meetings_cleaned,
             speaker_dirs_removed = report.speaker_dirs_removed,
             context_dirs_removed = report.context_dirs_removed,
             transcript_dirs_removed = report.transcript_dirs_removed,
