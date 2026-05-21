@@ -60,7 +60,7 @@ impl WhisperClient for CommandWhisperClient {
         &self,
         request: &WhisperInferenceRequest,
     ) -> Result<WhisperTranscriptionResult, WhisperParseError> {
-        retry_with_backoff(self.retry_policy, |_| {
+        let output = retry_with_backoff(self.retry_policy, |_| {
             let mut cmd = Command::new(&self.curl_bin);
             cmd.arg("-sS")
                 .arg("-X")
@@ -84,24 +84,29 @@ impl WhisperClient for CommandWhisperClient {
             cmd.arg("-F")
                 .arg(format!("temperature={}", self.temperature));
 
-            let output = run_command_with_timeout(&mut cmd, None, self.command_timeout)
-                .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
-            if !output.status.success() {
-                return Err(WhisperParseError::InvalidJson(format!(
-                    "whisper command failed: status={:?}, stderr={}",
-                    output.status.code(),
-                    sanitize_output(&output.stderr)
-                )));
-            }
+            run_command_with_timeout(&mut cmd, None, self.command_timeout)
+                .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))
+                .and_then(|output| {
+                    if output.status.success() {
+                        Ok(output)
+                    } else {
+                        Err(WhisperParseError::InvalidJson(format!(
+                            "whisper command failed: status={:?}, stderr={}",
+                            output.status.code(),
+                            sanitize_output(&output.stderr)
+                        )))
+                    }
+                })
+        })?;
 
-            let body = String::from_utf8(output.stdout)
-                .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
-            parse_whisper_response(&body).map_err(|err| {
-                let preview: String = body.chars().take(200).collect();
-                WhisperParseError::InvalidJson(format!(
-                    "{err} (response body preview: {preview:?})"
-                ))
-            })
+        let body = String::from_utf8(output.stdout)
+            .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
+        parse_whisper_response(&body).map_err(|err| match err {
+            WhisperParseError::InvalidJson(message) => WhisperParseError::InvalidJson(format!(
+                "{message} (response body length: {} bytes)",
+                body.len()
+            )),
+            other => other,
         })
     }
 }
@@ -634,9 +639,123 @@ mod tests {
         let err = client.infer(&request).expect_err("command should fail");
         let _ = std::fs::remove_file(&script_path);
 
-        let WhisperParseError::InvalidJson(message) = err;
-        assert!(message.contains("[REDACTED]"));
+        let message = match err {
+            WhisperParseError::InvalidJson(message) => message,
+            other => panic!("unexpected error: {other}"),
+        };
         assert!(!message.contains("sk-secret123456789"));
+    }
+
+    #[test]
+    fn whisper_parse_errors_do_not_retry_command() {
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_parse_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_malformed_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf '{{}}'\n",
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+        };
+
+        let err = client
+            .infer(&request)
+            .expect_err("malformed response should fail");
+        let attempts = std::fs::read_to_string(&marker_path)
+            .expect("marker should be written")
+            .len();
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert!(err.to_string().contains("missing field"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn whisper_nonzero_exit_still_retries_command() {
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_exit_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_retry_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nexit 7\n",
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+        };
+
+        let err = client
+            .infer(&request)
+            .expect_err("non-zero command should fail after retries");
+        let attempts = std::fs::read_to_string(&marker_path)
+            .expect("marker should be written")
+            .len();
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert!(err.to_string().contains("whisper command failed"));
+        assert!(attempts > 1, "non-zero command should be retried");
     }
 
     #[cfg(unix)]

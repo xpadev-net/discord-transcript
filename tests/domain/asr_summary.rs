@@ -152,6 +152,51 @@ fn parse_whisper_response_extracts_segments() {
 }
 
 #[test]
+fn parse_whisper_response_rejects_empty_object() {
+    let err = parse_whisper_response("{}").expect_err("empty object must be rejected");
+    assert!(err.to_string().contains("missing field"));
+}
+
+#[test]
+fn parse_whisper_response_rejects_missing_segments() {
+    let err =
+        parse_whisper_response(r#"{"text":"hello"}"#).expect_err("segments field is required");
+    assert!(err.to_string().contains("missing field"));
+}
+
+#[test]
+fn parse_whisper_response_accepts_explicit_empty_segments() {
+    let parsed = parse_whisper_response(r#"{"text":"","segments":[]}"#)
+        .expect("explicit empty response should be valid");
+
+    assert_eq!(parsed.text, "");
+    assert!(parsed.segments.is_empty());
+}
+
+#[test]
+fn parse_whisper_response_rejects_non_empty_text_without_segments() {
+    let err = parse_whisper_response(r#"{"text":"hello","segments":[]}"#)
+        .expect_err("non-empty text requires matching segments");
+    assert!(err.to_string().contains("non-empty text but no segments"));
+}
+
+#[test]
+fn parse_whisper_response_rejects_invalid_segment_values() {
+    for json in [
+        r#"{"text":"bad","segments":[{"start":-1.0,"end":1.0,"text":"x"}]}"#,
+        r#"{"text":"bad","segments":[{"start":2.0,"end":1.0,"text":"x"}]}"#,
+        r#"{"text":"bad","segments":[{"start":0.0,"end":0.0,"text":"x"}]}"#,
+        r#"{"text":"bad","segments":[{"start":0.0001,"end":0.0002,"text":"x"}]}"#,
+        r#"{"text":"bad","segments":[{"end":1.0,"text":"x"}]}"#,
+        r#"{"text":"bad","segments":[{"start":0.0,"end":1.0}]}"#,
+        r#"{"text":"bad","segments":[{"start":0.0,"end":1.0,"text":"   "}]}"#,
+    ] {
+        let result = parse_whisper_response(json);
+        assert!(result.is_err(), "invalid segment unexpectedly parsed: {json}");
+    }
+}
+
+#[test]
 fn build_correction_prompt_includes_japanese_rules_when_language_is_ja() {
     let prompt = build_correction_prompt("hi", Some("ja"));
     assert!(
