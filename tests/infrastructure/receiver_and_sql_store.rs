@@ -173,14 +173,15 @@ fn sql_job_queue_parses_claimed_job_row() {
 
 #[test]
 fn schema_defines_enum_check_constraints() {
-    for schema in [
-        discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL,
-        discord_transcript::infrastructure::sql::INCREMENTAL_MIGRATIONS_SQL,
-    ] {
-        assert!(schema.contains("meetings_status_check") || schema.contains("status TEXT NOT NULL CHECK (status IN ('scheduled'"));
-        assert!(schema.contains("jobs_status_check") || schema.contains("status TEXT NOT NULL CHECK (status IN ('queued'"));
-        assert!(schema.contains("jobs_job_type_check") || schema.contains("job_type TEXT NOT NULL CHECK"));
-    }
+    let schema = discord_transcript::infrastructure::sql::INCREMENTAL_MIGRATIONS_SQL;
+
+    assert!(schema.contains("meetings_status_check"));
+    assert!(schema.contains("jobs_status_check"));
+    assert!(schema.contains("jobs_job_type_check"));
+    assert!(!discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
+        .contains("status TEXT NOT NULL CHECK"));
+    assert!(!discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
+        .contains("job_type TEXT NOT NULL CHECK"));
 }
 
 #[test]
