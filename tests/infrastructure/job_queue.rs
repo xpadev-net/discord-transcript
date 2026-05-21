@@ -94,6 +94,17 @@ fn write_empty_wav_chunk(base: &Path, meeting_id: &str) {
     std::fs::write(meeting_dir.join("u1_1_0.wav"), wav).expect("wav should write");
 }
 
+fn write_temp_wav_chunk(base: &Path, meeting_id: &str) {
+    use discord_transcript::audio::build_wav_bytes_raw;
+    let meeting_dir =
+        discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout::new(base)
+            .for_meeting("g1", "vc1", meeting_id)
+            .audio_dir();
+    std::fs::create_dir_all(&meeting_dir).expect("meeting dir should be created");
+    let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
+    std::fs::write(meeting_dir.join("u1_1_0.wav.tmp"), wav).expect("tmp wav should write");
+}
+
 fn write_nonempty_pcm_chunk(base: &Path, meeting_id: &str) {
     let meeting_dir =
         discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout::new(base)
@@ -246,6 +257,52 @@ fn worker_job_processing_rejects_empty_chunks() {
         },
     );
     let err = result.expect_err("should fail when only empty chunks exist");
+    assert!(
+        err.to_string().contains("no non-empty audio chunks found"),
+        "unexpected error: {err}"
+    );
+    let job = queue.get("j1").expect("job exists");
+    assert_eq!(job.status, JobStatus::Failed);
+    let saved = store.get("m1").expect("meeting exists");
+    assert_eq!(saved.status, MeetingStatus::Failed);
+}
+
+#[test]
+fn worker_job_processing_ignores_temporary_wav_chunks() {
+    let base = unique_temp_dir("worker_tmp_chunk");
+    write_temp_wav_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "ignored".to_owned(),
+    };
+
+    let err = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 0,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: None,
+            resample_to_16k: false,
+        },
+    )
+    .expect_err("temporary chunks must not be processed as complete audio");
+
     assert!(
         err.to_string().contains("no non-empty audio chunks found"),
         "unexpected error: {err}"

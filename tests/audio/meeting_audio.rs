@@ -1,6 +1,6 @@
 use discord_transcript::audio::receiver::BufferedFrame;
 use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
-use discord_transcript::audio::meeting_audio::build_speaker_audio_inputs;
+use discord_transcript::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
 use discord_transcript::audio::wav::resample_pcm_16le;
 use std::fs;
 use std::path::PathBuf;
@@ -172,6 +172,20 @@ fn speaker_audio_handles_legacy_chunk_names() {
     let outputs = build_speaker_audio_inputs(&base, false).expect("legacy naming should be supported");
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].speaker_id, "legacyuser");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_ignores_temporary_chunk_files() {
+    let base = unique_temp_dir("ignore_tmp");
+    fs::create_dir_all(&base).expect("dir should be created");
+    let wav = build_wav_bytes_raw(&[0; 96], 48_000, 1, 16).unwrap();
+    fs::write(base.join("user_1_0.wav.tmp"), &wav).unwrap();
+    fs::write(base.join("mixdown.wav.tmp"), &wav).unwrap();
+
+    let err = load_chunks(&base).expect_err("only temporary files should not count as chunks");
+    assert!(err.contains("no audio chunks found"));
 
     let _ = fs::remove_dir_all(base);
 }
