@@ -30,9 +30,15 @@ const ADMINISTRATOR: u64 = 1 << 3;
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
 const GUILD_CACHE_TTL_SECS: u64 = 300;
 
-type PermissionCache = Arc<tokio::sync::RwLock<HashMap<(String, String), (bool, Instant)>>>;
-type AdminPermissionCache = Arc<tokio::sync::RwLock<HashMap<(String, String), (bool, Instant)>>>;
+type PermissionCache =
+    Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedChannelPermission {
+    can_view: bool,
+    is_admin: bool,
+}
 
 #[derive(Clone)]
 pub struct WebState {
@@ -40,10 +46,8 @@ pub struct WebState {
     pub chunk_storage_dir: String,
     pub auth: Option<Arc<AuthConfig>>,
     pub http_client: reqwest::Client,
-    /// Cache: (user_id, channel_id) → (allowed, expires_at)
+    /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
-    /// Cache: (user_id, channel_id) -> (has administrator permission, expires_at)
-    admin_permission_cache: AdminPermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
     pub static_files_dir: String,
@@ -63,7 +67,6 @@ impl WebState {
             auth,
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            admin_permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             static_files_dir,
         }
@@ -425,7 +428,7 @@ async fn verify_meeting_access_after_row<Fut>(
     permission_check: Fut,
 ) -> Result<MeetingAccess, StatusCode>
 where
-    Fut: Future<Output = Result<bool, StatusCode>>,
+    Fut: Future<Output = Result<CachedChannelPermission, StatusCode>>,
 {
     let access = meeting_access_from_row(guild_id, channel_id.clone(), authenticated_guild_id)?;
 
@@ -433,10 +436,10 @@ where
     let cache_key = (user_id.to_owned(), channel_id.clone());
     {
         let cache = permission_cache.read().await;
-        if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
+        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
         {
-            return if allowed {
+            return if permission.can_view {
                 Ok(access)
             } else {
                 Err(StatusCode::FORBIDDEN)
@@ -445,13 +448,13 @@ where
     }
 
     // Cache miss — query Discord API
-    let allowed = permission_check.await?;
+    let permission = permission_check.await?;
 
     // Store result in cache (also evict expired entries periodically)
     {
         let mut cache = permission_cache.write().await;
         let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
-        cache.insert(cache_key, (allowed, expires_at));
+        cache.insert(cache_key, (permission, expires_at));
 
         // Evict expired entries if cache grows large
         if cache.len() > 5000 {
@@ -460,7 +463,7 @@ where
         }
     }
 
-    if allowed {
+    if permission.can_view {
         Ok(access)
     } else {
         Err(StatusCode::FORBIDDEN)
@@ -498,7 +501,7 @@ async fn verify_meeting_access(
         &auth.guild_id,
         user_id,
         &state.permission_cache,
-        check_channel_permission(state, auth, &channel_id, user_id),
+        resolve_channel_permission_flags(state, auth, &channel_id, user_id),
     )
     .await
 }
@@ -665,18 +668,24 @@ async fn resolve_channel_permissions(
     )))
 }
 
-/// Query Discord API for channel permission. Returns Ok(true) if allowed,
-/// Ok(false) if denied, Err on API failure.
-async fn check_channel_permission(
+/// Query Discord API for channel permission flags.
+async fn resolve_channel_permission_flags(
     state: &WebState,
     auth: &AuthConfig,
     channel_id: &str,
     user_id: &str,
-) -> Result<bool, StatusCode> {
+) -> Result<CachedChannelPermission, StatusCode> {
     let Some(perms) = resolve_channel_permissions(state, auth, channel_id, user_id).await? else {
-        return Ok(false);
+        return Ok(CachedChannelPermission {
+            can_view: false,
+            is_admin: false,
+        });
     };
-    Ok(perms & VIEW_CHANNEL != 0 || perms & ADMINISTRATOR != 0)
+    let is_admin = perms & ADMINISTRATOR != 0;
+    Ok(CachedChannelPermission {
+        can_view: perms & VIEW_CHANNEL != 0 || is_admin,
+        is_admin,
+    })
 }
 
 async fn check_channel_admin_permission(
@@ -687,28 +696,25 @@ async fn check_channel_admin_permission(
 ) -> Result<bool, StatusCode> {
     let cache_key = (user_id.to_owned(), channel_id.to_owned());
     {
-        let cache = state.admin_permission_cache.read().await;
-        if let Some(&(allowed, expires_at)) = cache.get(&cache_key)
+        let cache = state.permission_cache.read().await;
+        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
         {
-            return Ok(allowed);
+            return Ok(permission.is_admin);
         }
     }
 
-    let Some(perms) = resolve_channel_permissions(state, auth, channel_id, user_id).await? else {
-        return Ok(false);
-    };
-    let allowed = perms & ADMINISTRATOR != 0;
+    let permission = resolve_channel_permission_flags(state, auth, channel_id, user_id).await?;
     {
-        let mut cache = state.admin_permission_cache.write().await;
+        let mut cache = state.permission_cache.write().await;
         let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
-        cache.insert(cache_key, (allowed, expires_at));
+        cache.insert(cache_key, (permission, expires_at));
         if cache.len() > 5000 {
             let now = Instant::now();
             cache.retain(|_, (_, exp)| *exp > now);
         }
     }
-    Ok(allowed)
+    Ok(permission.is_admin)
 }
 
 // Discord API response types for permission checking
@@ -2136,8 +2142,8 @@ async fn stream_file_range(
 #[cfg(test)]
 mod discord_channel_full_tests {
     use super::{
-        DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
-        PERMISSION_CACHE_TTL_SECS, PermissionCache, VIEW_CHANNEL,
+        CachedChannelPermission, DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType,
+        DiscordRoleFull, PERMISSION_CACHE_TTL_SECS, PermissionCache, VIEW_CHANNEL,
         authorize_debug_artifact_download, build_content_disposition, compute_channel_permissions,
         debug_artifact_requires_admin, meeting_access_from_row, verify_meeting_access_after_row,
     };
@@ -2305,7 +2311,10 @@ mod discord_channel_full_tests {
         cache.write().await.insert(
             ("user".to_owned(), "voice".to_owned()),
             (
-                true,
+                CachedChannelPermission {
+                    can_view: true,
+                    is_admin: false,
+                },
                 Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS),
             ),
         );
@@ -2320,7 +2329,10 @@ mod discord_channel_full_tests {
             &cache,
             async move {
                 permission_check_called_in_future.store(true, Ordering::SeqCst);
-                Ok(true)
+                Ok(CachedChannelPermission {
+                    can_view: true,
+                    is_admin: false,
+                })
             },
         )
         .await;
