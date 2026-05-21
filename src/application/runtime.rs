@@ -1081,12 +1081,16 @@ impl EventHandler for ScaffoldHandler {
             error!(error = %err, "failed to register guild commands");
         }
 
+        let retention_handler = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = retention_handler.run_startup_retention_cleanup().await {
+                error!(error = %err, "startup retention cleanup failed");
+            }
+        });
+
         let recovery_handler = self.clone();
         let recovery_ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(err) = recovery_handler.run_startup_retention_cleanup().await {
-                error!(error = %err, "startup retention cleanup failed");
-            }
             if let Err(err) = recovery_handler.run_startup_recovery(&recovery_ctx).await {
                 error!(error = %err, "startup recovery failed");
             }

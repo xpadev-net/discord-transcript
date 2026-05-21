@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+// Raw-audio and transcript workspace queries share the same filters today, but
+// stay separate so their retention scopes can diverge without changing callers.
 pub const RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = r#"
 SELECT id, guild_id, voice_channel_id
 FROM meetings
@@ -13,6 +15,8 @@ WHERE stopped_at IS NOT NULL
   AND status IN ('posted', 'failed', 'aborted')
 "#;
 
+// See RETENTION_EXPIRED_RAW_WORKSPACES_SQL for why this intentionally mirrors
+// the raw-audio workspace query instead of aliasing it.
 pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
 SELECT id, guild_id, voice_channel_id
 FROM meetings
