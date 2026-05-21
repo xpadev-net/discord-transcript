@@ -3,7 +3,7 @@ use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandI
 use crate::application::command::{CommandError, PermissionSet, authorize_record_stop_for_meeting};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::retention_cleanup::{
-    RetentionCleanupReport, apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
+    apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
     collect_retention_cleanup_plan,
 };
 use crate::application::stop::StopOutcome;
@@ -1416,11 +1416,12 @@ impl ScaffoldHandler {
         let mut report = match filesystem_result {
             Ok(report) => report,
             Err(err) => {
+                let report = err.report;
                 warn!(
-                    error = %err,
+                    error = %err.message,
                     "retention filesystem cleanup failed; continuing with database cleanup"
                 );
-                RetentionCleanupReport::default()
+                report
             }
         };
         let database_report = {

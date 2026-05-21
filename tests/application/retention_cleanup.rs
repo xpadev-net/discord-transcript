@@ -201,7 +201,7 @@ fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
     let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
         .expect_err("filesystem cleanup should fail after database cleanup runs");
 
-    assert!(err.contains("failed to remove"));
+    assert!(err.message.contains("failed to remove"));
     assert!(
         executor
             .executed
@@ -249,7 +249,9 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
     )
     .expect_err("filesystem cleanup should report the failed meeting");
 
-    assert!(err.contains("failed to remove"));
+    assert!(err.message.contains("failed to remove"));
+    assert_eq!(err.report.transcript_dirs_removed, 1);
+    assert_eq!(err.report.summary_dirs_removed, 1);
     assert!(!retained.transcript_dir().exists());
     assert!(!retained.summary_dir().exists());
     assert!(

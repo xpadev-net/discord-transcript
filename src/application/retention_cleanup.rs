@@ -130,6 +130,29 @@ impl RetentionCleanupReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionCleanupError {
+    pub report: RetentionCleanupReport,
+    pub message: String,
+}
+
+impl RetentionCleanupError {
+    fn without_report(message: String) -> Self {
+        Self {
+            report: RetentionCleanupReport::default(),
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for RetentionCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RetentionCleanupError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionCleanupPlan {
     pub raw_workspaces: Vec<ExpiredWorkspaceRow>,
@@ -141,13 +164,30 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
     executor: &mut E,
     workspace_layout: &MeetingWorkspaceLayout,
     policy: RetentionPolicy,
-) -> Result<RetentionCleanupReport, String> {
-    let plan = collect_retention_cleanup_plan(executor, policy)?;
+) -> Result<RetentionCleanupReport, RetentionCleanupError> {
+    let plan = collect_retention_cleanup_plan(executor, policy)
+        .map_err(RetentionCleanupError::without_report)?;
     let mut report = RetentionCleanupReport::default();
     let filesystem_result = apply_retention_filesystem_cleanup(workspace_layout, &plan);
-    report.merge(apply_retention_database_cleanup(executor, policy)?);
-    report.merge(filesystem_result?);
-    Ok(report)
+    let filesystem_error = match filesystem_result {
+        Ok(filesystem_report) => {
+            report.merge(filesystem_report);
+            None
+        }
+        Err(err) => {
+            report.merge(err.report);
+            Some(err.message)
+        }
+    };
+    report.merge(
+        apply_retention_database_cleanup(executor, policy)
+            .map_err(RetentionCleanupError::without_report)?,
+    );
+    if let Some(message) = filesystem_error {
+        Err(RetentionCleanupError { report, message })
+    } else {
+        Ok(report)
+    }
 }
 
 pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
@@ -199,7 +239,7 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
 pub fn apply_retention_filesystem_cleanup(
     workspace_layout: &MeetingWorkspaceLayout,
     plan: &RetentionCleanupPlan,
-) -> Result<RetentionCleanupReport, String> {
+) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let mut report = RetentionCleanupReport::default();
     let mut errors = Vec::new();
     for meeting in &plan.raw_workspaces {
@@ -265,7 +305,10 @@ pub fn apply_retention_filesystem_cleanup(
     if errors.is_empty() {
         Ok(report)
     } else {
-        Err(errors.join("; "))
+        Err(RetentionCleanupError {
+            report,
+            message: errors.join("; "),
+        })
     }
 }
 
