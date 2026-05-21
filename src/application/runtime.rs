@@ -392,6 +392,7 @@ fn persist_transcript_segments<E: SqlExecutor>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SummaryJobRunError {
     Terminal(String),
+    TerminalStatusUpdated(String),
     RetryScheduled(String),
 }
 
@@ -2014,6 +2015,11 @@ impl ScaffoldHandler {
                 Ok(())
             }
             Err(SummaryJobRunError::RetryScheduled(err)) => Err(err),
+            Err(SummaryJobRunError::TerminalStatusUpdated(err)) => {
+                let _ =
+                    post_failure_to_report_channel(http, report_channel_id, meeting_id, &err).await;
+                Err(err)
+            }
             Err(SummaryJobRunError::Terminal(err)) => {
                 // process_enqueued_summary_job already handles Failed/retry status.
                 // Also update the status message so users see the failure.
@@ -2510,7 +2516,7 @@ impl ScaffoldHandler {
                 );
             }
             if exhausted {
-                return Err(SummaryJobRunError::Terminal(err));
+                return Err(SummaryJobRunError::TerminalStatusUpdated(err));
             }
             return Err(SummaryJobRunError::RetryScheduled(err));
         }
