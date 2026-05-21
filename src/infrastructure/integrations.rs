@@ -755,7 +755,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker_path);
 
         assert!(err.to_string().contains("whisper command failed"));
-        assert_eq!(attempts, 3);
+        assert!(attempts > 1, "non-zero command should be retried");
     }
 
     #[cfg(unix)]

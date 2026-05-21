@@ -77,7 +77,7 @@ pub fn parse_whisper_response(body: &str) -> Result<WhisperTranscriptionResult, 
         .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
 
     if parsed.segments.is_empty() && !parsed.text.trim().is_empty() {
-        return Err(WhisperParseError::InvalidJson(
+        return Err(WhisperParseError::InvalidSegment(
             "whisper response has non-empty text but no segments".to_owned(),
         ));
     }
@@ -138,14 +138,9 @@ fn validate_segment_timing(
             "segment {index} end must be finite and non-negative"
         )));
     }
-    if end < start {
+    if end <= start {
         return Err(WhisperParseError::InvalidSegment(format!(
-            "segment {index} end must be greater than or equal to start"
-        )));
-    }
-    if end == start {
-        return Err(WhisperParseError::InvalidSegment(format!(
-            "segment {index} duration must be greater than zero"
+            "segment {index} end must be strictly greater than start"
         )));
     }
     if end_ms <= start_ms {
