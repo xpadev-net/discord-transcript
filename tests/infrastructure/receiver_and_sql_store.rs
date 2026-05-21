@@ -178,10 +178,15 @@ fn schema_defines_enum_check_constraints() {
     assert!(schema.contains("meetings_status_check"));
     assert!(schema.contains("jobs_status_check"));
     assert!(schema.contains("jobs_job_type_check"));
+    assert!(schema.contains("transcripts_source_check"));
     assert!(!discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
         .contains("status TEXT NOT NULL CHECK"));
     assert!(!discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
         .contains("job_type TEXT NOT NULL CHECK"));
+    assert!(
+        !discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
+            .contains("transcripts_source_check")
+    );
 }
 
 #[test]
