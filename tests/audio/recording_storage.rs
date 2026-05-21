@@ -74,6 +74,18 @@ fn local_chunk_storage_writes_expected_file() {
     assert_eq!(saved.size_bytes, 3);
     let loaded = std::fs::read(saved.path).expect("file should be readable");
     assert_eq!(loaded, b"abc");
+    let tmp_files: Vec<_> = std::fs::read_dir(layout.for_meeting("g1", "vc1", "m1").audio_dir())
+        .expect("audio dir readable")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        })
+        .collect();
+    assert!(tmp_files.is_empty(), "temporary chunk files should not remain");
 
     let _ = std::fs::remove_dir_all(base);
 }

@@ -1,7 +1,8 @@
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
 use std::fmt::{Display, Formatter};
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedChunk {
@@ -57,6 +58,42 @@ impl LocalChunkStorage {
     }
 }
 
+fn temp_chunk_file_path(file_path: &Path) -> Result<PathBuf, ChunkStorageError> {
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ChunkStorageError::Io("chunk path has no file name".to_owned()))?;
+    Ok(file_path.with_file_name(format!("{file_name}.tmp")))
+}
+
+fn write_chunk_atomically(file_path: &Path, bytes: &[u8]) -> Result<(), ChunkStorageError> {
+    let temp_path = temp_chunk_file_path(file_path)?;
+    let write_result = (|| {
+        let mut file =
+            File::create(&temp_path).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
+        file.write_all(bytes)
+            .map_err(|err| ChunkStorageError::Io(err.to_string()))?;
+        file.sync_all()
+            .map_err(|err| ChunkStorageError::Io(err.to_string()))
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    fs::rename(&temp_path, file_path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        ChunkStorageError::Io(err.to_string())
+    })?;
+
+    if let Some(dir) = file_path.parent()
+        && let Ok(dir_file) = File::open(dir)
+    {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
 pub fn sanitize_path_component(input: &str) -> String {
     let sanitized: String = input
         .replace(['/', '\\'], "_")
@@ -109,7 +146,7 @@ impl ChunkStorage for LocalChunkStorage {
             ));
         };
         fs::create_dir_all(dir).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
-        fs::write(&file_path, bytes).map_err(|err| ChunkStorageError::Io(err.to_string()))?;
+        write_chunk_atomically(&file_path, bytes)?;
 
         Ok(SavedChunk {
             path: file_path,
