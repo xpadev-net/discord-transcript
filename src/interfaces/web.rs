@@ -719,35 +719,36 @@ async fn check_channel_admin_permission(
 
 // Discord API response types for permission checking
 
-fn zero_perm_string() -> String {
-    "0".to_string()
+fn zero_permission_bits() -> u64 {
+    0
 }
 
 /// Discord API returns permission values as either strings or integers
 /// depending on the API version and context. Accept both.
-fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_permission_bits<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de;
 
-    struct StringOrNumber;
-    impl<'de> de::Visitor<'de> for StringOrNumber {
-        type Value = String;
+    struct PermissionBitsVisitor;
+    impl<'de> de::Visitor<'de> for PermissionBitsVisitor {
+        type Value = u64;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a string or number")
+            f.write_str("a non-negative u64 permission bitset as a string or number")
         }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
-            Ok(v.to_owned())
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            v.parse::<u64>()
+                .map_err(|_| E::custom(format!("invalid permission bitset: {v}")))
         }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
-            Ok(v.to_string())
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
         }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
-            Ok(v.to_string())
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(|_| E::custom(format!("invalid permission bitset: {v}")))
         }
     }
-    deserializer.deserialize_any(StringOrNumber)
+    deserializer.deserialize_any(PermissionBitsVisitor)
 }
 
 #[derive(Deserialize, Clone)]
@@ -759,8 +760,8 @@ struct DiscordGuildFull {
 #[derive(Deserialize, Clone)]
 struct DiscordRoleFull {
     id: String,
-    #[serde(deserialize_with = "deserialize_string_or_number")]
-    permissions: String,
+    #[serde(deserialize_with = "deserialize_permission_bits")]
+    permissions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -820,15 +821,15 @@ struct DiscordOverwrite {
     #[serde(rename = "type")]
     type_: DiscordOverwriteType,
     #[serde(
-        default = "zero_perm_string",
-        deserialize_with = "deserialize_string_or_number"
+        default = "zero_permission_bits",
+        deserialize_with = "deserialize_permission_bits"
     )]
-    allow: String,
+    allow: u64,
     #[serde(
-        default = "zero_perm_string",
-        deserialize_with = "deserialize_string_or_number"
+        default = "zero_permission_bits",
+        deserialize_with = "deserialize_permission_bits"
     )]
-    deny: String,
+    deny: u64,
 }
 
 fn deserialize_permission_overwrites<'de, D>(
@@ -871,13 +872,13 @@ fn compute_channel_permissions(
     let mut permissions: u64 = guild_roles
         .iter()
         .find(|r| r.id == guild_id)
-        .and_then(|r| r.permissions.parse().ok())
+        .map(|r| r.permissions)
         .unwrap_or(0);
 
     // Add permissions from member's roles
     for role in guild_roles {
         if member_roles.contains(&role.id) {
-            permissions |= role.permissions.parse::<u64>().unwrap_or(0);
+            permissions |= role.permissions;
         }
     }
 
@@ -891,8 +892,8 @@ fn compute_channel_permissions(
         .iter()
         .find(|o| matches!(o.type_, DiscordOverwriteType::Role) && o.id == guild_id)
     {
-        let allow = ow.allow.parse::<u64>().unwrap_or(0);
-        let deny = ow.deny.parse::<u64>().unwrap_or(0);
+        let allow = ow.allow;
+        let deny = ow.deny;
         permissions &= !deny;
         permissions |= allow;
     }
@@ -905,8 +906,8 @@ fn compute_channel_permissions(
             && o.id != guild_id
             && member_roles.contains(&o.id)
     }) {
-        role_allow |= ow.allow.parse::<u64>().unwrap_or(0);
-        role_deny |= ow.deny.parse::<u64>().unwrap_or(0);
+        role_allow |= ow.allow;
+        role_deny |= ow.deny;
     }
     permissions &= !role_deny;
     permissions |= role_allow;
@@ -916,8 +917,8 @@ fn compute_channel_permissions(
         .iter()
         .find(|o| matches!(o.type_, DiscordOverwriteType::Member) && o.id == user_id)
     {
-        let allow = ow.allow.parse::<u64>().unwrap_or(0);
-        let deny = ow.deny.parse::<u64>().unwrap_or(0);
+        let allow = ow.allow;
+        let deny = ow.deny;
         permissions &= !deny;
         permissions |= allow;
     }
@@ -2180,8 +2181,8 @@ mod discord_channel_full_tests {
             ch.permission_overwrites[0].type_,
             DiscordOverwriteType::Role
         );
-        assert_eq!(ch.permission_overwrites[0].allow, "1024");
-        assert_eq!(ch.permission_overwrites[0].deny, "0");
+        assert_eq!(ch.permission_overwrites[0].allow, 1024);
+        assert_eq!(ch.permission_overwrites[0].deny, 0);
     }
 
     #[test]
@@ -2202,8 +2203,8 @@ mod discord_channel_full_tests {
             ch.permission_overwrites[1].type_,
             DiscordOverwriteType::Member
         );
-        assert_eq!(ch.permission_overwrites[0].allow, "1024");
-        assert_eq!(ch.permission_overwrites[1].allow, "1");
+        assert_eq!(ch.permission_overwrites[0].allow, 1024);
+        assert_eq!(ch.permission_overwrites[1].allow, 1);
     }
 
     #[test]
@@ -2217,12 +2218,12 @@ mod discord_channel_full_tests {
         )
         .unwrap();
         assert_eq!(ch.permission_overwrites.len(), 3);
-        assert_eq!(ch.permission_overwrites[0].allow, "1024");
-        assert_eq!(ch.permission_overwrites[0].deny, "0");
-        assert_eq!(ch.permission_overwrites[1].allow, "1");
-        assert_eq!(ch.permission_overwrites[1].deny, "0");
-        assert_eq!(ch.permission_overwrites[2].allow, "0");
-        assert_eq!(ch.permission_overwrites[2].deny, "2");
+        assert_eq!(ch.permission_overwrites[0].allow, 1024);
+        assert_eq!(ch.permission_overwrites[0].deny, 0);
+        assert_eq!(ch.permission_overwrites[1].allow, 1);
+        assert_eq!(ch.permission_overwrites[1].deny, 0);
+        assert_eq!(ch.permission_overwrites[2].allow, 0);
+        assert_eq!(ch.permission_overwrites[2].deny, 2);
     }
 
     #[test]
@@ -2240,6 +2241,53 @@ mod discord_channel_full_tests {
     }
 
     #[test]
+    fn overwrite_invalid_permission_bitsets_rejected() {
+        for field in ["allow", "deny"] {
+            for value in [r#""not-a-number""#, r#""-1""#, "-1"] {
+                let json = format!(
+                    r#"{{"permission_overwrites":[{{"id":"1","type":0,"{field}":{value}}}]}}"#
+                );
+                let result = serde_json::from_str::<DiscordChannelFull>(&json);
+                assert!(
+                    result.is_err(),
+                    "{field}={value} unexpectedly parsed as permission bits"
+                );
+                let err = result.err().unwrap();
+                assert!(err.to_string().contains("invalid permission bitset"));
+            }
+        }
+    }
+
+    #[test]
+    fn role_invalid_permission_bitsets_rejected() {
+        for value in [r#""not-a-number""#, r#""-1""#, "-1"] {
+            let json = format!(
+                r#"{{"owner_id":"owner","roles":[{{"id":"guild","permissions":{value}}}]}}"#
+            );
+            let result = serde_json::from_str::<super::DiscordGuildFull>(&json);
+            assert!(
+                result.is_err(),
+                "role permissions={value} unexpectedly parsed"
+            );
+            let err = result.err().unwrap();
+            assert!(err.to_string().contains("invalid permission bitset"));
+        }
+    }
+
+    #[test]
+    fn role_permission_bitsets_accept_strings_and_numbers() {
+        for value in [r#""1024""#, "1024"] {
+            let json = format!(
+                r#"{{"owner_id":"owner","roles":[{{"id":"guild","permissions":{value}}}]}}"#
+            );
+            let guild: super::DiscordGuildFull =
+                serde_json::from_str(&json).expect("valid permission bitset should parse");
+
+            assert_eq!(guild.roles[0].permissions, 1024);
+        }
+    }
+
+    #[test]
     fn compute_channel_permissions_applies_role_and_member_overwrites() {
         let guild_id = "guild";
         let user_id = "user";
@@ -2247,31 +2295,31 @@ mod discord_channel_full_tests {
         let guild_roles = vec![
             DiscordRoleFull {
                 id: guild_id.to_owned(),
-                permissions: "0".to_owned(),
+                permissions: 0,
             },
             DiscordRoleFull {
                 id: "role-a".to_owned(),
-                permissions: "0".to_owned(),
+                permissions: 0,
             },
         ];
         let overwrites = vec![
             DiscordOverwrite {
                 id: guild_id.to_owned(),
                 type_: DiscordOverwriteType::Role,
-                allow: "0".to_owned(),
-                deny: "0".to_owned(),
+                allow: 0,
+                deny: 0,
             },
             DiscordOverwrite {
                 id: "role-a".to_owned(),
                 type_: DiscordOverwriteType::Role,
-                allow: VIEW_CHANNEL.to_string(),
-                deny: "0".to_owned(),
+                allow: VIEW_CHANNEL,
+                deny: 0,
             },
             DiscordOverwrite {
                 id: user_id.to_owned(),
                 type_: DiscordOverwriteType::Member,
-                allow: "0".to_owned(),
-                deny: VIEW_CHANNEL.to_string(),
+                allow: 0,
+                deny: VIEW_CHANNEL,
             },
         ];
 
