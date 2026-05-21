@@ -18,21 +18,22 @@ WHERE stopped_at IS NOT NULL
 // See RETENTION_EXPIRED_RAW_WORKSPACES_SQL for why this intentionally mirrors
 // the raw-audio workspace query instead of aliasing it.
 pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
-SELECT id, guild_id, voice_channel_id
-FROM meetings
-WHERE stopped_at IS NOT NULL
-  AND stopped_at < NOW() - (($1 || ' days')::interval)
-  AND status IN ('posted', 'failed', 'aborted')
+SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
+FROM meetings m
+JOIN transcripts t ON t.meeting_id = m.id
+WHERE t.is_deleted = FALSE
+  AND t.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 // Summary workspace cleanup is gated by RETENTION_SUMMARY_TTL_DAYS and uses
 // its own constant so future summary-specific filters can diverge.
 pub const RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
-SELECT id, guild_id, voice_channel_id
-FROM meetings
-WHERE stopped_at IS NOT NULL
-  AND stopped_at < NOW() - (($1 || ' days')::interval)
-  AND status IN ('posted', 'failed', 'aborted')
+SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
+FROM meetings m
+JOIN summaries s ON s.meeting_id = m.id
+WHERE s.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
