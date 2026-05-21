@@ -544,9 +544,23 @@ where
                 meeting_id,
                 job_id,
                 status = %status.as_str(),
-                "unexpected transcript persist retry status; leaving meeting status unchanged"
+                "unexpected transcript persist retry status; marking meeting failed"
             );
-            Ok(false)
+            store
+                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+                .map_err(|err| {
+                    format!(
+                        "transcript persist retry returned unexpected status {status:?} and meeting failure update failed: {err}"
+                    )
+                })?;
+            store
+                .set_error_message(meeting_id, Some(error_message))
+                .map_err(|err| {
+                    format!(
+                        "transcript persist retry returned unexpected status {status:?} and error message update failed: {err}"
+                    )
+                })?;
+            Ok(true)
         }
         Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
             warn!(
@@ -3889,6 +3903,86 @@ mod status_message_tests {
         assert_eq!(updated.retry_count, 1);
         let meeting = store.get("m1").expect("meeting should remain");
         assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("failed to persist transcript segments: database unavailable")
+        );
+    }
+
+    struct UnexpectedRetryStatusQueue;
+
+    impl crate::infrastructure::queue::JobQueue for UnexpectedRetryStatusQueue {
+        fn enqueue(
+            &mut self,
+            _job: crate::infrastructure::queue::Job,
+        ) -> Result<(), crate::infrastructure::queue::QueueError> {
+            Ok(())
+        }
+
+        fn claim_next(
+            &mut self,
+            _job_type: crate::domain::JobType,
+        ) -> Result<
+            Option<crate::infrastructure::queue::Job>,
+            crate::infrastructure::queue::QueueError,
+        > {
+            Ok(None)
+        }
+
+        fn claim_by_id(
+            &mut self,
+            _job_id: &str,
+        ) -> Result<
+            Option<crate::infrastructure::queue::Job>,
+            crate::infrastructure::queue::QueueError,
+        > {
+            Ok(None)
+        }
+
+        fn mark_done(
+            &mut self,
+            _job_id: &str,
+        ) -> Result<(), crate::infrastructure::queue::QueueError> {
+            Ok(())
+        }
+
+        fn mark_failed(
+            &mut self,
+            _job_id: &str,
+            _error_message: String,
+        ) -> Result<(), crate::infrastructure::queue::QueueError> {
+            Ok(())
+        }
+
+        fn retry(
+            &mut self,
+            _job_id: &str,
+            _error_message: String,
+            _max_retries: u32,
+        ) -> Result<crate::domain::JobStatus, crate::infrastructure::queue::QueueError> {
+            Ok(crate::domain::JobStatus::Running)
+        }
+    }
+
+    #[test]
+    fn transcript_persist_unexpected_retry_status_marks_meeting_failed() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(transcribing_meeting());
+        let mut queue = UnexpectedRetryStatusQueue;
+
+        let exhausted = retry_summary_job_after_transcript_persist_failure(
+            &mut store,
+            &mut queue,
+            "m1",
+            "summary-m1",
+            "failed to persist transcript segments: database unavailable".to_owned(),
+            2,
+        )
+        .expect("unexpected retry status should be terminalized");
+
+        assert!(exhausted);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
         assert_eq!(
             meeting.error_message.as_deref(),
             Some("failed to persist transcript segments: database unavailable")
