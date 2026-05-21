@@ -2,7 +2,10 @@ use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
 use crate::application::command::{CommandError, PermissionSet, authorize_record_stop_for_meeting};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
-use crate::application::retention_cleanup::enforce_retention_policy;
+use crate::application::retention_cleanup::{
+    apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
+    collect_retention_cleanup_plan,
+};
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::enqueue_summary_job;
@@ -1393,13 +1396,24 @@ impl EventHandler for ScaffoldHandler {
 
 impl ScaffoldHandler {
     async fn run_startup_retention_cleanup(&self) -> Result<(), String> {
-        let report = {
+        let policy = self.retention_policy;
+        let plan = {
             let mut service = self.service.lock().await;
-            let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
-                &self.chunk_storage_dir,
-            );
-            enforce_retention_policy(&mut service.store.executor, &layout, self.retention_policy)?
+            collect_retention_cleanup_plan(&mut service.store.executor, policy)?
         };
+        let chunk_storage_dir = self.chunk_storage_dir.clone();
+        let mut report = tokio::task::spawn_blocking(move || {
+            let layout =
+                crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&chunk_storage_dir);
+            apply_retention_filesystem_cleanup(&layout, &plan)
+        })
+        .await
+        .map_err(|err| format!("retention filesystem cleanup task failed: {err}"))??;
+        let database_report = {
+            let mut service = self.service.lock().await;
+            apply_retention_database_cleanup(&mut service.store.executor, policy)?
+        };
+        report.merge(database_report);
         info!(
             raw_workspaces_scanned = report.raw_workspaces_scanned,
             raw_audio_dirs_removed = report.raw_audio_dirs_removed,

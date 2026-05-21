@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const RETENTION_EXPIRED_WORKSPACES_SQL: &str = r#"
+pub const RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = r#"
 SELECT id, guild_id, voice_channel_id
 FROM meetings
 WHERE stopped_at IS NOT NULL
@@ -13,8 +13,13 @@ WHERE stopped_at IS NOT NULL
   AND status IN ('posted', 'failed', 'aborted')
 "#;
 
-pub const RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = RETENTION_EXPIRED_WORKSPACES_SQL;
-pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = RETENTION_EXPIRED_WORKSPACES_SQL;
+pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
+SELECT id, guild_id, voice_channel_id
+FROM meetings
+WHERE stopped_at IS NOT NULL
+  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND status IN ('posted', 'failed', 'aborted')
+"#;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts
@@ -70,12 +75,41 @@ pub struct RetentionCleanupReport {
     pub artifacts_deleted: u64,
 }
 
+impl RetentionCleanupReport {
+    pub fn merge(&mut self, other: RetentionCleanupReport) {
+        self.raw_workspaces_scanned += other.raw_workspaces_scanned;
+        self.raw_audio_dirs_removed += other.raw_audio_dirs_removed;
+        self.legacy_raw_audio_removed += other.legacy_raw_audio_removed;
+        self.transcript_dirs_removed += other.transcript_dirs_removed;
+        self.debug_dirs_removed += other.debug_dirs_removed;
+        self.transcripts_marked_deleted += other.transcripts_marked_deleted;
+        self.summaries_deleted += other.summaries_deleted;
+        self.artifacts_deleted += other.artifacts_deleted;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetentionCleanupPlan {
+    pub raw_workspaces: Vec<ExpiredWorkspaceRow>,
+    pub transcript_workspaces: Vec<ExpiredWorkspaceRow>,
+}
+
 pub fn enforce_retention_policy<E: SqlExecutor>(
     executor: &mut E,
     workspace_layout: &MeetingWorkspaceLayout,
     policy: RetentionPolicy,
 ) -> Result<RetentionCleanupReport, String> {
+    let plan = collect_retention_cleanup_plan(executor, policy)?;
     let mut report = RetentionCleanupReport::default();
+    report.merge(apply_retention_filesystem_cleanup(workspace_layout, &plan)?);
+    report.merge(apply_retention_database_cleanup(executor, policy)?);
+    Ok(report)
+}
+
+pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
+    executor: &mut E,
+    policy: RetentionPolicy,
+) -> Result<RetentionCleanupPlan, String> {
     let raw_ttl = policy.raw_audio_ttl_days.to_string();
     let transcript_ttl = policy.transcript_ttl_days.to_string();
 
@@ -83,8 +117,32 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
         RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
         std::slice::from_ref(&raw_ttl),
     )?;
-    for row in expired_raw_workspaces {
-        let meeting = parse_workspace_row(&row)?;
+    let raw_workspaces = expired_raw_workspaces
+        .into_iter()
+        .map(|row| parse_workspace_row(&row))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let expired_transcript_workspaces = executor.query_rows(
+        RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+        std::slice::from_ref(&transcript_ttl),
+    )?;
+    let transcript_workspaces = expired_transcript_workspaces
+        .into_iter()
+        .map(|row| parse_workspace_row(&row))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RetentionCleanupPlan {
+        raw_workspaces,
+        transcript_workspaces,
+    })
+}
+
+pub fn apply_retention_filesystem_cleanup(
+    workspace_layout: &MeetingWorkspaceLayout,
+    plan: &RetentionCleanupPlan,
+) -> Result<RetentionCleanupReport, String> {
+    let mut report = RetentionCleanupReport::default();
+    for meeting in &plan.raw_workspaces {
         report.raw_workspaces_scanned += 1;
         let workspace = workspace_layout.for_meeting(
             &meeting.guild_id,
@@ -102,12 +160,7 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
         }
     }
 
-    let expired_transcript_workspaces = executor.query_rows(
-        RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
-        std::slice::from_ref(&transcript_ttl),
-    )?;
-    for row in expired_transcript_workspaces {
-        let meeting = parse_workspace_row(&row)?;
+    for meeting in &plan.transcript_workspaces {
         let workspace = workspace_layout.for_meeting(
             &meeting.guild_id,
             &meeting.voice_channel_id,
@@ -117,6 +170,16 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
             report.transcript_dirs_removed += 1;
         }
     }
+    Ok(report)
+}
+
+pub fn apply_retention_database_cleanup<E: SqlExecutor>(
+    executor: &mut E,
+    policy: RetentionPolicy,
+) -> Result<RetentionCleanupReport, String> {
+    let mut report = RetentionCleanupReport::default();
+    let raw_ttl = policy.raw_audio_ttl_days.to_string();
+    let transcript_ttl = policy.transcript_ttl_days.to_string();
 
     report.transcripts_marked_deleted += executor.execute(
         RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
@@ -152,10 +215,10 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpiredWorkspaceRow {
-    meeting_id: String,
-    guild_id: String,
-    voice_channel_id: String,
+pub struct ExpiredWorkspaceRow {
+    pub meeting_id: String,
+    pub guild_id: String,
+    pub voice_channel_id: String,
 }
 
 fn parse_workspace_row(row: &[String]) -> Result<ExpiredWorkspaceRow, String> {
