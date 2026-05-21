@@ -157,12 +157,10 @@ pub fn dispatch_runtime_command<S: MeetingStore>(
 fn complete_record_start_after_runtime_setup<S>(
     service: &mut BotCommandService<S>,
     input: StartCommandInput,
-    setup_result: Result<(), String>,
 ) -> Result<String, String>
 where
     S: MeetingStore,
 {
-    setup_result?;
     service
         .handle_record_start(input)
         .map_err(|err| err.to_string())
@@ -1435,7 +1433,6 @@ impl ScaffoldHandler {
                 permissions,
                 caller_role,
             },
-            Ok(()),
         )?;
         drop(service);
 
@@ -3738,11 +3735,14 @@ mod status_message_tests {
             .expect("handle_record_start should exist");
         let source = &source[handle_start..];
         let songbird_lookup = source
-            .find("songbird::get(ctx)")
+            .find("let manager = songbird::get(ctx)")
             .expect("record start should look up songbird manager");
         let workspace_setup = source
-            .find(".ensure_base_dirs()")
+            .find("workspace\n            .ensure_base_dirs()")
             .expect("record start should prepare workspace");
+        let service_lock = source
+            .find("let mut service = self.service.lock().await")
+            .expect("record start should lock service after setup");
         let row_create = source
             .find("complete_record_start_after_runtime_setup")
             .expect("record start should create row through runtime setup helper");
@@ -3755,6 +3755,10 @@ mod status_message_tests {
             workspace_setup < row_create,
             "recording row must not be created before workspace setup succeeds"
         );
+        assert!(
+            service_lock < row_create,
+            "recording row should be created only after the post-setup service lock"
+        );
     }
 
     #[test]
@@ -3765,7 +3769,6 @@ mod status_message_tests {
         let result = complete_record_start_after_runtime_setup(
             &mut service,
             start_input_for_runtime_setup_test(),
-            Ok(()),
         )
         .expect("start should succeed after setup");
 
