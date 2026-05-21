@@ -72,6 +72,9 @@ fn app_config_loads_from_map() {
     assert_eq!(config.chunk_storage_dir, "/tmp/chunks");
     assert_eq!(config.auto_stop_grace_seconds, 60);
     assert_eq!(config.summary_max_retries, 3);
+    assert_eq!(config.retention_policy.raw_audio_ttl_days, 7);
+    assert_eq!(config.retention_policy.transcript_ttl_days, 30);
+    assert_eq!(config.retention_policy.summary_ttl_days, None);
     assert_eq!(config.integration_retry_max_attempts, 3);
     assert_eq!(config.integration_retry_initial_delay_ms, 200);
     assert_eq!(config.integration_retry_backoff_multiplier, 2);
@@ -83,6 +86,36 @@ fn app_config_loads_from_map() {
     assert!(config.whisper_vad);
     assert_eq!(config.whisper_temperature, 0.0);
     assert!(config.whisper_resample_to_16k);
+}
+
+#[test]
+fn app_config_accepts_retention_policy_overrides() {
+    let mut values = base_env();
+    values.insert("RETENTION_RAW_AUDIO_TTL_DAYS".to_owned(), "3".to_owned());
+    values.insert("RETENTION_TRANSCRIPT_TTL_DAYS".to_owned(), "14".to_owned());
+    values.insert("RETENTION_SUMMARY_TTL_DAYS".to_owned(), "90".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+
+    assert_eq!(config.retention_policy.raw_audio_ttl_days, 3);
+    assert_eq!(config.retention_policy.transcript_ttl_days, 14);
+    assert_eq!(config.retention_policy.summary_ttl_days, Some(90));
+}
+
+#[test]
+fn app_config_rejects_zero_retention_ttl() {
+    let mut values = base_env();
+    values.insert("RETENTION_RAW_AUDIO_TTL_DAYS".to_owned(), "0".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "RETENTION_RAW_AUDIO_TTL_DAYS",
+            value: "0".to_owned()
+        }
+    );
 }
 
 #[test]

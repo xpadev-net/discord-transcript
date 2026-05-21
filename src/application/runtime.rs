@@ -2,6 +2,7 @@ use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
 use crate::application::command::{CommandError, PermissionSet, authorize_record_stop_for_meeting};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
+use crate::application::retention_cleanup::enforce_retention_policy;
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::enqueue_summary_job;
@@ -1005,6 +1006,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         whisper_temperature: config.whisper_temperature,
         whisper_resample_to_16k: config.whisper_resample_to_16k,
         summary_max_retries: config.summary_max_retries,
+        retention_policy: config.retention_policy,
         integration_retry_policy: RetryPolicy {
             max_attempts: config.integration_retry_max_attempts,
             initial_delay: std::time::Duration::from_millis(
@@ -1058,6 +1060,7 @@ struct ScaffoldHandler {
     whisper_temperature: f32,
     whisper_resample_to_16k: bool,
     summary_max_retries: u32,
+    retention_policy: crate::domain::retention::RetentionPolicy,
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
     bot_admin_user_ids: HashSet<String>,
@@ -1078,6 +1081,9 @@ impl EventHandler for ScaffoldHandler {
         let recovery_handler = self.clone();
         let recovery_ctx = ctx.clone();
         tokio::spawn(async move {
+            if let Err(err) = recovery_handler.run_startup_retention_cleanup().await {
+                error!(error = %err, "startup retention cleanup failed");
+            }
             if let Err(err) = recovery_handler.run_startup_recovery(&recovery_ctx).await {
                 error!(error = %err, "startup recovery failed");
             }
@@ -1386,6 +1392,28 @@ impl EventHandler for ScaffoldHandler {
 }
 
 impl ScaffoldHandler {
+    async fn run_startup_retention_cleanup(&self) -> Result<(), String> {
+        let report = {
+            let mut service = self.service.lock().await;
+            let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
+                &self.chunk_storage_dir,
+            );
+            enforce_retention_policy(&mut service.store.executor, &layout, self.retention_policy)?
+        };
+        info!(
+            raw_workspaces_scanned = report.raw_workspaces_scanned,
+            raw_audio_dirs_removed = report.raw_audio_dirs_removed,
+            legacy_raw_audio_removed = report.legacy_raw_audio_removed,
+            transcript_dirs_removed = report.transcript_dirs_removed,
+            debug_dirs_removed = report.debug_dirs_removed,
+            transcripts_marked_deleted = report.transcripts_marked_deleted,
+            summaries_deleted = report.summaries_deleted,
+            artifacts_deleted = report.artifacts_deleted,
+            "startup retention cleanup completed"
+        );
+        Ok(())
+    }
+
     async fn run_startup_recovery(&self, ctx: &Context) -> Result<(), String> {
         let snapshots: Vec<RecoverySnapshot> = {
             let mut service = self.service.lock().await;

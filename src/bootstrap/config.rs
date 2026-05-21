@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
 
+use crate::domain::retention::RetentionPolicy;
+
 /// Which CLI drives meeting summary and transcript correction (`summarize` integration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryHarness {
@@ -71,6 +73,7 @@ pub struct AppConfig {
     pub web_session_secret: Option<String>,
     pub static_files_dir: String,
     pub discord_bot_admin_user_ids: Vec<String>,
+    pub retention_policy: RetentionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +165,15 @@ impl AppConfig {
             static_files_dir: optional_env("STATIC_FILES_DIR")
                 .unwrap_or_else(|| "web/dist".to_owned()),
             discord_bot_admin_user_ids: parse_csv_list(optional_env("DISCORD_BOT_ADMIN_USER_IDS")),
+            retention_policy: RetentionPolicy {
+                raw_audio_ttl_days: optional_env_parse_u32_nonzero("RETENTION_RAW_AUDIO_TTL_DAYS")?
+                    .unwrap_or_else(|| RetentionPolicy::default().raw_audio_ttl_days),
+                transcript_ttl_days: optional_env_parse_u32_nonzero(
+                    "RETENTION_TRANSCRIPT_TTL_DAYS",
+                )?
+                .unwrap_or_else(|| RetentionPolicy::default().transcript_ttl_days),
+                summary_ttl_days: optional_env_parse_u32_nonzero("RETENTION_SUMMARY_TTL_DAYS")?,
+            },
         })
     }
 
@@ -253,6 +265,22 @@ impl AppConfig {
                 values,
                 "DISCORD_BOT_ADMIN_USER_IDS",
             )),
+            retention_policy: RetentionPolicy {
+                raw_audio_ttl_days: optional_from_map_parse_u32_nonzero(
+                    values,
+                    "RETENTION_RAW_AUDIO_TTL_DAYS",
+                )?
+                .unwrap_or_else(|| RetentionPolicy::default().raw_audio_ttl_days),
+                transcript_ttl_days: optional_from_map_parse_u32_nonzero(
+                    values,
+                    "RETENTION_TRANSCRIPT_TTL_DAYS",
+                )?
+                .unwrap_or_else(|| RetentionPolicy::default().transcript_ttl_days),
+                summary_ttl_days: optional_from_map_parse_u32_nonzero(
+                    values,
+                    "RETENTION_SUMMARY_TTL_DAYS",
+                )?,
+            },
         })
     }
 }
