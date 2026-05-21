@@ -326,25 +326,41 @@ fn retry_summary_job_after_posting_failure<S, Q>(
     job_id: &str,
     error_message: String,
     max_retries: u32,
-) -> bool
+) -> Result<bool, String>
 where
     S: MeetingStore,
     Q: JobQueue,
 {
     match queue.retry(job_id, error_message.clone(), max_retries) {
         Ok(crate::domain::JobStatus::Queued) => {
-            let _ = store.set_meeting_status(
-                meeting_id,
-                MeetingStatus::Stopping,
-                Some(MeetingStatus::Summarizing),
-            );
-            let _ = store.set_error_message(meeting_id, Some(error_message));
-            false
+            store
+                .set_meeting_status(
+                    meeting_id,
+                    MeetingStatus::Stopping,
+                    Some(MeetingStatus::Summarizing),
+                )
+                .map_err(|err| {
+                    format!("summary post retry queued but meeting status update failed: {err}")
+                })?;
+            store
+                .set_error_message(meeting_id, Some(error_message))
+                .map_err(|err| {
+                    format!("summary post retry queued but error message update failed: {err}")
+                })?;
+            Ok(false)
         }
         Ok(crate::domain::JobStatus::Failed) => {
-            let _ = store.set_meeting_status(meeting_id, MeetingStatus::Failed, None);
-            let _ = store.set_error_message(meeting_id, Some(error_message));
-            true
+            store
+                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+                .map_err(|err| {
+                    format!("summary post retry exhausted but meeting failure update failed: {err}")
+                })?;
+            store
+                .set_error_message(meeting_id, Some(error_message))
+                .map_err(|err| {
+                    format!("summary post retry exhausted but error message update failed: {err}")
+                })?;
+            Ok(true)
         }
         Ok(status) => {
             warn!(
@@ -353,7 +369,7 @@ where
                 status = %status.as_str(),
                 "unexpected summary post retry status; leaving meeting status unchanged"
             );
-            false
+            Ok(false)
         }
         Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
             warn!(
@@ -363,7 +379,7 @@ where
                 "failed to durably retry summary post failure; leaving meeting status unchanged"
             );
             let _ = store.set_error_message(meeting_id, Some(error_message));
-            false
+            Ok(false)
         }
         Err(err) => {
             warn!(
@@ -372,9 +388,21 @@ where
                 error = %err,
                 "summary post retry cannot be durably scheduled"
             );
-            let _ = store.set_meeting_status(meeting_id, MeetingStatus::Failed, None);
-            let _ = store.set_error_message(meeting_id, Some(error_message));
-            true
+            store
+                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+                .map_err(|store_err| {
+                    format!(
+                        "summary post retry failed ({err}) and meeting failure update failed: {store_err}"
+                    )
+                })?;
+            store
+                .set_error_message(meeting_id, Some(error_message))
+                .map_err(|store_err| {
+                    format!(
+                        "summary post retry failed ({err}) and error message update failed: {store_err}"
+                    )
+                })?;
+            Ok(true)
         }
     }
 }
@@ -1714,6 +1742,7 @@ impl ScaffoldHandler {
                             self.summary_max_retries,
                         )
                     };
+                    let exhausted = exhausted.map_err(|state_err| format!("{err}; {state_err}"))?;
                     if let Err(status_err) = self
                         .update_status_message(
                             http,
@@ -3459,7 +3488,8 @@ mod status_message_tests {
             &job.id,
             "summary posting failed: discord 500".to_owned(),
             2,
-        );
+        )
+        .expect("retry should update meeting");
 
         assert!(!exhausted);
         let updated = queue.get(&job.id).expect("job should remain");
@@ -3488,7 +3518,8 @@ mod status_message_tests {
             &job.id,
             "summary posting failed: discord 500".to_owned(),
             0,
-        );
+        )
+        .expect("retry exhaustion should update meeting");
 
         assert!(exhausted);
         let updated = queue.get(&job.id).expect("job should remain");
@@ -3572,7 +3603,8 @@ mod status_message_tests {
             "summary-m1",
             "summary posting failed: discord 500".to_owned(),
             2,
-        );
+        )
+        .expect("backend retry failure should leave meeting unchanged");
 
         assert!(!exhausted);
         let meeting = store.get("m1").expect("meeting should remain");
@@ -3581,6 +3613,37 @@ mod status_message_tests {
             meeting.error_message.as_deref(),
             Some("summary posting failed: discord 500")
         );
+    }
+
+    #[test]
+    fn summary_post_retry_surfaces_meeting_update_failure() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = summarizing_meeting();
+        meeting.status = crate::domain::MeetingStatus::Posted;
+        store.insert(meeting);
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let result = retry_summary_job_after_posting_failure(
+            &mut store,
+            &mut queue,
+            "m1",
+            &job.id,
+            "summary posting failed: discord 500".to_owned(),
+            2,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("status update should fail")
+                .contains("meeting status update failed")
+        );
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
     }
 
     #[derive(Default)]
