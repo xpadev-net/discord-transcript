@@ -1,4 +1,4 @@
-use crate::domain::transcript::{TranscriptSegment, TranscriptSource};
+use crate::domain::transcript::{MAX_DB_TIMESTAMP_MS, TranscriptSegment, TranscriptSource};
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
 
@@ -146,6 +146,11 @@ fn validate_segment_timing(
     if end_ms <= start_ms {
         return Err(WhisperParseError::InvalidSegment(format!(
             "segment {index} duration must be at least one millisecond"
+        )));
+    }
+    if start_ms > MAX_DB_TIMESTAMP_MS || end_ms > MAX_DB_TIMESTAMP_MS {
+        return Err(WhisperParseError::InvalidSegment(format!(
+            "segment {index} timestamp exceeds database integer range"
         )));
     }
     if let Some(confidence) = confidence

@@ -1,6 +1,8 @@
 use crate::domain::speaker::{SpeakerProfile, display_label_for_id};
 use std::collections::HashMap;
 
+pub const MAX_DB_TIMESTAMP_MS: u64 = i32::MAX as u64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSource {
     Voice,
