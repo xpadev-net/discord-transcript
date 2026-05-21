@@ -1019,6 +1019,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         command_gate: Arc::new(RwLock::new(())),
+        voice_event_gate: Arc::new(RwLock::new(())),
         background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -1090,6 +1091,7 @@ struct ScaffoldHandler {
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     command_gate: Arc<RwLock<()>>,
+    voice_event_gate: Arc<RwLock<()>>,
     background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -1144,6 +1146,7 @@ impl ScaffoldHandler {
         self.shutdown_token.cancel();
 
         let _command_guard = self.command_gate.write().await;
+        let _voice_event_guard = self.voice_event_gate.write().await;
         {
             let _spawn_guard = self
                 .background_spawn_gate
@@ -1203,7 +1206,18 @@ async fn shutdown_signal() {
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "failed to register CTRL-C handler; waiting for other shutdown signals"
+                        );
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {}
             _ = async {
                 if let Some(signal) = terminate.as_mut() {
                     signal.recv().await;
@@ -1216,7 +1230,13 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(
+                error = %err,
+                "failed to register CTRL-C handler; graceful shutdown signal disabled"
+            );
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -1878,7 +1898,6 @@ impl ScaffoldHandler {
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
         run_guild_scoped_command(command.guild_id, self.guild_id, |_| async {
-            let _command_guard = self.command_gate.read().await;
             self.reject_if_shutting_down()?;
             match command.data.name.as_str() {
                 RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
@@ -1928,6 +1947,7 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
+        let _command_guard = self.command_gate.read().await;
         self.reject_if_shutting_down()?;
 
         let mut service = self.service.lock().await;
@@ -2122,6 +2142,7 @@ impl ScaffoldHandler {
                 .map_err(|err| err.to_string())?;
             meeting.id
         };
+        let _command_guard = self.command_gate.read().await;
         self.reject_if_shutting_down()?;
 
         let flushed_meeting_id = {
@@ -3335,6 +3356,10 @@ struct VoiceReceiveHandler {
 #[serenity::async_trait]
 impl SongbirdEventHandler for VoiceReceiveHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self.runtime.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
+        let _voice_event_guard = self.runtime.voice_event_gate.read().await;
         if self.runtime.shutting_down.load(Ordering::Acquire) {
             return None;
         }
