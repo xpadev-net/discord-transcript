@@ -1424,11 +1424,20 @@ impl ScaffoldHandler {
                 report
             }
         };
-        let database_report = {
+        let database_result = {
             let mut service = self.service.lock().await;
-            apply_retention_database_cleanup(&mut service.store.executor, policy)?
+            apply_retention_database_cleanup(&mut service.store.executor, policy)
         };
-        report.merge(database_report);
+        let database_error = match database_result {
+            Ok(database_report) => {
+                report.merge(database_report);
+                None
+            }
+            Err(err) => {
+                report.merge(err.report);
+                Some(err.message)
+            }
+        };
         info!(
             raw_workspaces_scanned = report.raw_workspaces_scanned,
             raw_audio_dirs_removed = report.raw_audio_dirs_removed,
@@ -1443,7 +1452,11 @@ impl ScaffoldHandler {
             artifacts_deleted = report.artifacts_deleted,
             "startup retention cleanup completed"
         );
-        Ok(())
+        if let Some(err) = database_error {
+            Err(format!("retention database cleanup failed: {err}"))
+        } else {
+            Ok(())
+        }
     }
 
     async fn run_startup_recovery(&self, ctx: &Context) -> Result<(), String> {

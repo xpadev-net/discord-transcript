@@ -276,8 +276,12 @@ fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
         vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
     );
     executor.execute_error.insert(
-        query_key(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30"]),
+        query_key(RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL, &[]),
         "database unavailable".to_owned(),
+    );
+    executor.execute_result.insert(
+        query_key(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30"]),
+        3,
     );
 
     let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
@@ -285,5 +289,6 @@ fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
 
     assert!(err.message.contains("database cleanup failed"));
     assert_eq!(err.report.raw_audio_dirs_removed, 1);
+    assert_eq!(err.report.transcripts_marked_deleted, 3);
     assert!(!workspace.audio_dir().exists());
 }

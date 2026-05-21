@@ -186,7 +186,10 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
             report.merge(database_report);
             None
         }
-        Err(err) => Some(err),
+        Err(err) => {
+            report.merge(err.report);
+            Some(err.message)
+        }
     };
     let message = match (filesystem_error, database_error) {
         (Some(fs_err), Some(db_err)) => {
@@ -328,41 +331,97 @@ pub fn apply_retention_filesystem_cleanup(
 pub fn apply_retention_database_cleanup<E: SqlExecutor>(
     executor: &mut E,
     policy: RetentionPolicy,
-) -> Result<RetentionCleanupReport, String> {
+) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let mut report = RetentionCleanupReport::default();
     let raw_ttl = policy.raw_audio_ttl_days.to_string();
     let transcript_ttl = policy.transcript_ttl_days.to_string();
 
-    report.transcripts_marked_deleted += executor.execute(
+    match executor.execute(
         RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
         std::slice::from_ref(&transcript_ttl),
-    )?;
-    report.artifacts_deleted += executor.execute(RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL, &[])?;
-    report.artifacts_deleted += executor.execute(
+    ) {
+        Ok(count) => report.transcripts_marked_deleted += count,
+        Err(err) => {
+            return Err(RetentionCleanupError {
+                report,
+                message: err,
+            });
+        }
+    }
+    match executor.execute(RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL, &[]) {
+        Ok(count) => report.artifacts_deleted += count,
+        Err(err) => {
+            return Err(RetentionCleanupError {
+                report,
+                message: err,
+            });
+        }
+    }
+    match executor.execute(
         RETENTION_DELETE_RAW_ARTIFACTS_SQL,
         std::slice::from_ref(&raw_ttl),
-    )?;
-    report.artifacts_deleted += executor.execute(
+    ) {
+        Ok(count) => report.artifacts_deleted += count,
+        Err(err) => {
+            return Err(RetentionCleanupError {
+                report,
+                message: err,
+            });
+        }
+    }
+    match executor.execute(
         RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
         std::slice::from_ref(&transcript_ttl),
-    )?;
+    ) {
+        Ok(count) => report.artifacts_deleted += count,
+        Err(err) => {
+            return Err(RetentionCleanupError {
+                report,
+                message: err,
+            });
+        }
+    }
     // Debug artifacts intentionally share the raw-audio TTL; add a
     // dedicated RETENTION_DEBUG_TTL_DAYS if independent control is needed.
-    report.artifacts_deleted += executor.execute(
+    match executor.execute(
         RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
         std::slice::from_ref(&raw_ttl),
-    )?;
+    ) {
+        Ok(count) => report.artifacts_deleted += count,
+        Err(err) => {
+            return Err(RetentionCleanupError {
+                report,
+                message: err,
+            });
+        }
+    }
 
     if let Some(summary_ttl_days) = policy.summary_ttl_days {
         let summary_ttl = summary_ttl_days.to_string();
-        report.summaries_deleted += executor.execute(
+        match executor.execute(
             RETENTION_DELETE_SUMMARIES_SQL,
             std::slice::from_ref(&summary_ttl),
-        )?;
-        report.artifacts_deleted += executor.execute(
+        ) {
+            Ok(count) => report.summaries_deleted += count,
+            Err(err) => {
+                return Err(RetentionCleanupError {
+                    report,
+                    message: err,
+                });
+            }
+        }
+        match executor.execute(
             RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
             std::slice::from_ref(&summary_ttl),
-        )?;
+        ) {
+            Ok(count) => report.artifacts_deleted += count,
+            Err(err) => {
+                return Err(RetentionCleanupError {
+                    report,
+                    message: err,
+                });
+            }
+        }
     }
 
     Ok(report)
