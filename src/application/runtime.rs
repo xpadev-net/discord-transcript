@@ -341,11 +341,7 @@ fn db_safe_transcript_timestamp_ms(
             "transcript segment {segment_index} {field} timestamp {value}ms exceeds database integer range"
         ));
     }
-    i32::try_from(value).map_err(|_| {
-        format!(
-            "transcript segment {segment_index} {field} timestamp {value}ms exceeds database integer range"
-        )
-    })
+    Ok(value as i32)
 }
 
 fn persist_transcript_segments<E: SqlExecutor>(
