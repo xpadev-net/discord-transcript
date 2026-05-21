@@ -33,12 +33,9 @@ WHERE m.status IN ('posted', 'failed', 'aborted')
 pub const RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
 SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
 FROM meetings m
-LEFT JOIN summaries s ON s.meeting_id = m.id
-WHERE m.status IN ('posted', 'failed', 'aborted')
-  AND (
-    (s.meeting_id IS NULL AND m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - (($1 || ' days')::interval))
-    OR (s.created_at < NOW() - (($1 || ' days')::interval))
-  )
+JOIN summaries s ON s.meeting_id = m.id
+WHERE s.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
@@ -159,6 +156,9 @@ pub struct RetentionCleanupPlan {
     pub errors: Vec<String>,
 }
 
+/// Enforces retention synchronously, including blocking filesystem deletion.
+/// Async callers should run the filesystem phase through `spawn_blocking` like
+/// `run_startup_retention_cleanup` does.
 pub fn enforce_retention_policy<E: SqlExecutor>(
     executor: &mut E,
     workspace_layout: &MeetingWorkspaceLayout,
@@ -281,6 +281,11 @@ pub fn apply_retention_filesystem_cleanup(
             &mut errors,
             remove_dir_if_present(&workspace.context_dir()),
             || report.context_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_empty_dir_if_present(&workspace.summary_dir()),
+            || report.summary_dirs_removed += 1,
         );
         record_cleanup_result(
             &mut errors,
