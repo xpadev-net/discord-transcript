@@ -7,6 +7,7 @@ use discord_transcript::application::runtime::{
     validate_command_guild,
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus, StopReason};
+use discord_transcript::domain::authz::UserRole;
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, Job, JobQueue, QueueError};
 use discord_transcript::infrastructure::storage::{
     CreateMeetingRequest, InMemoryMeetingStore, MeetingStore,
@@ -155,6 +156,7 @@ fn runtime_dispatch_routes_record_start() {
                 can_connect_voice: true,
                 can_send_messages: true,
             },
+            caller_role: UserRole::GuildAdmin,
         }),
     )
     .expect("dispatch should succeed");
@@ -189,11 +191,20 @@ fn stop_and_enqueue_summary_job_enqueues_on_owner_stop() {
                 can_connect_voice: true,
                 can_send_messages: true,
             },
+            caller_role: UserRole::GuildAdmin,
         }),
     )
     .expect("start should succeed");
 
-    let stop = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+    let stop = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut queue,
+        "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
+        StopReason::Manual,
+    )
         .expect("stop and enqueue should succeed");
     assert_eq!(stop.meeting_id, "m1");
 
@@ -222,17 +233,34 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
                 can_connect_voice: true,
                 can_send_messages: true,
             },
+            caller_role: UserRole::GuildAdmin,
         }),
     )
     .expect("start should succeed");
 
-    let first = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+    let first = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut queue,
+        "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
+        StopReason::Manual,
+    )
         .expect("first stop should succeed");
     assert_eq!(first.meeting_id, "m1");
 
     // After stop, meeting is Stopping but still found by find_active_meeting_by_guild.
     // stop_meeting CAS returns AlreadyHandled (no new job enqueued).
-    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+    let second = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut queue,
+        "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
+        StopReason::Manual,
+    )
         .expect("second stop should succeed (idempotent)");
     assert_eq!(
         second.outcome,
@@ -267,6 +295,7 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
                 can_connect_voice: true,
                 can_send_messages: true,
             },
+            caller_role: UserRole::GuildAdmin,
         }),
     )
     .expect("start should succeed");
@@ -276,6 +305,9 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
         &mut service,
         &mut failing_queue,
         "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
         StopReason::Manual,
     );
     assert!(first.is_err(), "enqueue failure should be surfaced");
@@ -285,7 +317,15 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
     );
 
     let mut queue = InMemoryJobQueue::new();
-    let second = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+    let second = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut queue,
+        "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
+        StopReason::Manual,
+    )
         .expect("retry should enqueue summary for already-stopping meeting");
     assert_eq!(
         second.outcome,
@@ -316,7 +356,15 @@ fn stop_and_enqueue_summary_job_does_not_enqueue_for_scheduled_abort() {
     let mut service = BotCommandService::new(store);
     let mut queue = InMemoryJobQueue::new();
 
-    let stop = stop_and_enqueue_summary_job(&mut service, &mut queue, "g1", StopReason::Manual)
+    let stop = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut queue,
+        "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
+        StopReason::Manual,
+    )
         .expect("scheduled stop should abort without enqueue");
 
     assert_eq!(

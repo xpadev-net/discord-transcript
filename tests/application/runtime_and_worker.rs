@@ -6,6 +6,7 @@ use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSumm
 use discord_transcript::application::worker::{ProcessMeetingInput, process_meeting_summary};
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
+use discord_transcript::domain::authz::UserRole;
 use discord_transcript::infrastructure::asr::StubWhisperClient;
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
@@ -366,6 +367,7 @@ fn bot_command_service_start_and_stop_flow() {
                 can_connect_voice: true,
                 can_send_messages: true,
             },
+            caller_role: UserRole::GuildAdmin,
         })
         .expect("start should pass");
     assert!(start_message.contains("meeting_id=m1"));
@@ -373,6 +375,8 @@ fn bot_command_service_start_and_stop_flow() {
     let stop_message = service
         .handle_record_stop(StopCommandInput {
             guild_id: "g1".to_owned(),
+            user_id: "u1".to_owned(),
+            caller_role: UserRole::Member,
             reason: StopReason::Manual,
         })
         .expect("stop should pass");
@@ -395,12 +399,15 @@ fn bot_command_service_idempotent_stop() {
                 can_connect_voice: true,
                 can_send_messages: true,
             },
+            caller_role: UserRole::GuildAdmin,
         })
         .expect("start should pass");
 
     service
         .handle_record_stop(StopCommandInput {
             guild_id: "g1".to_owned(),
+            user_id: "u1".to_owned(),
+            caller_role: UserRole::Member,
             reason: StopReason::Manual,
         })
         .expect("stop should pass");
@@ -410,6 +417,8 @@ fn bot_command_service_idempotent_stop() {
     let second = service
         .handle_record_stop_result(StopCommandInput {
             guild_id: "g1".to_owned(),
+            user_id: "u1".to_owned(),
+            caller_role: UserRole::Member,
             reason: StopReason::Manual,
         })
         .expect("second stop should succeed (idempotent)");

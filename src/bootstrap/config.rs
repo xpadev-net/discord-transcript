@@ -70,6 +70,7 @@ pub struct AppConfig {
     pub discord_client_secret: Option<String>,
     pub web_session_secret: Option<String>,
     pub static_files_dir: String,
+    pub discord_bot_admin_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +161,7 @@ impl AppConfig {
             web_session_secret: optional_env("WEB_SESSION_SECRET"),
             static_files_dir: optional_env("STATIC_FILES_DIR")
                 .unwrap_or_else(|| "web/dist".to_owned()),
+            discord_bot_admin_user_ids: parse_csv_list(optional_env("DISCORD_BOT_ADMIN_USER_IDS")),
         })
     }
 
@@ -247,8 +249,22 @@ impl AppConfig {
             web_session_secret: optional_from_map(values, "WEB_SESSION_SECRET"),
             static_files_dir: optional_from_map(values, "STATIC_FILES_DIR")
                 .unwrap_or_else(|| "web/dist".to_owned()),
+            discord_bot_admin_user_ids: parse_csv_list(optional_from_map(
+                values,
+                "DISCORD_BOT_ADMIN_USER_IDS",
+            )),
         })
     }
+}
+
+fn parse_csv_list(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn resolve_summary_settings(

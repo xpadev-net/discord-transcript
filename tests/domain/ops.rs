@@ -57,6 +57,18 @@ fn recovery_runner_marks_failed_when_recording_missing_file() {
 }
 
 #[test]
+fn command_authorization_policies_cover_command_roles() {
+    assert!(!is_allowed(UserRole::Member, Action::StartRecording));
+    assert!(!is_allowed(UserRole::Member, Action::StopRecording));
+    assert!(is_allowed(UserRole::StartedMeeting, Action::StopRecording));
+    assert!(!is_allowed(UserRole::StartedMeeting, Action::StartRecording));
+    assert!(is_allowed(UserRole::GuildAdmin, Action::StartRecording));
+    assert!(is_allowed(UserRole::GuildAdmin, Action::StopRecording));
+    assert!(is_allowed(UserRole::BotAdmin, Action::StartRecording));
+    assert!(is_allowed(UserRole::BotAdmin, Action::StopRecording));
+}
+
+#[test]
 fn recovery_runner_requeues_asr_for_stopping_meeting() {
     let mut store = InMemoryMeetingStore::new();
     let mut meeting = recording_meeting("m1");

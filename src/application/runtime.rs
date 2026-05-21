@@ -1,6 +1,6 @@
 use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
-use crate::application::command::{CommandError, PermissionSet};
+use crate::application::command::{CommandError, PermissionSet, authorize_record_stop_for_meeting};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
@@ -12,6 +12,7 @@ use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::RecordingSession;
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
 use crate::bootstrap::config::{AppConfig, SummaryHarness};
+use crate::domain::authz::UserRole;
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::{
@@ -36,7 +37,7 @@ use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    EditMessage, GatewayIntents, GuildId, Interaction, Ready, UserId, VoiceState,
+    EditMessage, GatewayIntents, GuildId, Interaction, Member, Ready, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -127,6 +128,8 @@ pub enum RuntimeCommandInput {
     RecordStart(StartCommandInput),
     RecordStop {
         guild_id: String,
+        user_id: String,
+        caller_role: UserRole,
         reason: StopReason,
     },
 }
@@ -137,9 +140,17 @@ pub fn dispatch_runtime_command<S: MeetingStore>(
 ) -> Result<String, CommandError> {
     match input {
         RuntimeCommandInput::RecordStart(value) => service.handle_record_start(value),
-        RuntimeCommandInput::RecordStop { guild_id, reason } => {
-            service.handle_record_stop(StopCommandInput { guild_id, reason })
-        }
+        RuntimeCommandInput::RecordStop {
+            guild_id,
+            user_id,
+            caller_role,
+            reason,
+        } => service.handle_record_stop(StopCommandInput {
+            guild_id,
+            user_id,
+            caller_role,
+            reason,
+        }),
     }
 }
 
@@ -147,15 +158,34 @@ pub fn stop_and_enqueue_summary_job<S, Q>(
     service: &mut BotCommandService<S>,
     queue: &mut Q,
     guild_id: &str,
+    user_id: &str,
+    caller_role: UserRole,
+    expected_meeting_id: Option<&str>,
     reason: StopReason,
 ) -> Result<crate::application::bot::StopCommandResult, String>
 where
     S: MeetingStore,
     Q: crate::infrastructure::queue::JobQueue,
 {
+    if let Some(expected_meeting_id) = expected_meeting_id {
+        let active = service
+            .store
+            .find_active_meeting_by_guild(guild_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
+        if active.id != expected_meeting_id {
+            return Err(format!(
+                "active meeting changed before stop: expected={expected_meeting_id}, actual={}",
+                active.id
+            ));
+        }
+    }
+
     let stop_result = service
         .handle_record_stop_result(StopCommandInput {
             guild_id: guild_id.to_owned(),
+            user_id: user_id.to_owned(),
+            caller_role,
             reason,
         })
         .map_err(|err| err.to_string())?;
@@ -657,6 +687,11 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
             max_delay: std::time::Duration::from_millis(config.integration_retry_max_delay_ms),
         },
         public_base_url: config.public_base_url.clone(),
+        bot_admin_user_ids: config
+            .discord_bot_admin_user_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
@@ -698,6 +733,7 @@ struct ScaffoldHandler {
     summary_max_retries: u32,
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
+    bot_admin_user_ids: HashSet<String>,
 }
 
 #[async_trait]
@@ -962,6 +998,9 @@ impl EventHandler for ScaffoldHandler {
                             &mut service,
                             &mut *queue,
                             &guild_for_task,
+                            "auto-stop",
+                            UserRole::BotAdmin,
+                            None,
                             StopReason::AutoEmpty,
                         )
                     };
@@ -1258,6 +1297,13 @@ impl ScaffoldHandler {
             voice_channel_id_u64,
             Some(command.channel_id.get()),
         );
+        let caller_role = resolve_command_user_role(
+            ctx,
+            guild_id,
+            command.user.id,
+            command.member.as_deref(),
+            &self.bot_admin_user_ids,
+        );
         let mut service = self.service.lock().await;
         let response = service
             .handle_record_start(StartCommandInput {
@@ -1267,6 +1313,7 @@ impl ScaffoldHandler {
                 command_channel_id: command.channel_id.get().to_string(),
                 user_voice_channel_id: voice_channel_id_u64.map(|v| v.to_string()),
                 permissions,
+                caller_role,
             })
             .map_err(|err| err.to_string())?;
         drop(service);
@@ -1443,13 +1490,36 @@ impl ScaffoldHandler {
     ) -> Result<String, String> {
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
+        let caller_role = resolve_command_user_role(
+            ctx,
+            guild_id,
+            command.user.id,
+            command.member.as_deref(),
+            &self.bot_admin_user_ids,
+        );
+        let caller_user_id = command.user.id.get().to_string();
+
+        let authorized_meeting_id = {
+            let mut service = self.service.lock().await;
+            let meeting = service
+                .store
+                .find_active_meeting_by_guild(&guild_key)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
+            authorize_record_stop_for_meeting(&meeting, &caller_user_id, caller_role)
+                .map_err(|err| err.to_string())?;
+            meeting.id
+        };
 
         let flushed_meeting_id = {
             let mut sessions = self.sessions.lock().await;
             // Flush remaining audio before stopping. Failed chunks stay
             // attached to the session and will be retried on the next stop
             // attempt.
-            if let Some(session) = sessions.get_mut(&guild_key) {
+            if let Some(session) = sessions
+                .get_mut(&guild_key)
+                .filter(|session| session.meeting_id == authorized_meeting_id)
+            {
                 flush_session_for_teardown(session, &guild_key, "manual stop")?;
                 Some(session.meeting_id.clone())
             } else {
@@ -1460,7 +1530,15 @@ impl ScaffoldHandler {
         let stop_result = {
             let mut service = self.service.lock().await;
             let mut queue = self.queue.lock().await;
-            stop_and_enqueue_summary_job(&mut service, &mut *queue, &guild_key, StopReason::Manual)?
+            stop_and_enqueue_summary_job(
+                &mut service,
+                &mut *queue,
+                &guild_key,
+                &caller_user_id,
+                caller_role,
+                Some(&authorized_meeting_id),
+                StopReason::Manual,
+            )?
         };
 
         let removed_session = {
@@ -2711,6 +2789,9 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 &mut service,
                                 &mut *queue,
                                 &guild_key,
+                                "driver-disconnect",
+                                UserRole::BotAdmin,
+                                None,
                                 StopReason::ClientDisconnect,
                             )
                         };
@@ -2870,6 +2951,63 @@ fn resolve_bot_permissions(
         voice_channel_permission,
         text_channel_permission,
     )
+}
+
+fn resolve_command_user_role(
+    ctx: &Context,
+    guild_id: GuildId,
+    user_id: UserId,
+    interaction_member: Option<&Member>,
+    bot_admin_user_ids: &HashSet<String>,
+) -> UserRole {
+    use serenity::all::{Permissions, RoleId};
+
+    if bot_admin_user_ids.contains(&user_id.get().to_string()) {
+        return UserRole::BotAdmin;
+    }
+
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return interaction_member
+            .and_then(|member| member.permissions)
+            .filter(|permissions| permissions.contains(Permissions::ADMINISTRATOR))
+            .map(|_| UserRole::GuildAdmin)
+            .unwrap_or_else(|| {
+                warn!(guild_id = %guild_id, user_id = %user_id, "guild not found in cache, treating command user as member");
+                UserRole::Member
+            });
+    };
+    if guild.owner_id == user_id {
+        return UserRole::GuildAdmin;
+    }
+    if interaction_member
+        .and_then(|member| member.permissions)
+        .is_some_and(|permissions| permissions.contains(Permissions::ADMINISTRATOR))
+    {
+        return UserRole::GuildAdmin;
+    }
+    let cached_member = guild.members.get(&user_id);
+    let role_ids = interaction_member
+        .map(|member| member.roles.as_slice())
+        .or_else(|| cached_member.map(|member| member.roles.as_slice()));
+    let Some(role_ids) = role_ids else {
+        warn!(guild_id = %guild_id, user_id = %user_id, "command user not found in cache, treating as member");
+        return UserRole::Member;
+    };
+    let everyone_is_admin = guild
+        .roles
+        .get(&RoleId::new(guild_id.get()))
+        .is_some_and(|role| role.permissions.contains(Permissions::ADMINISTRATOR));
+    let role_is_admin = role_ids.iter().any(|role_id| {
+        guild
+            .roles
+            .get(role_id)
+            .is_some_and(|role| role.permissions.contains(Permissions::ADMINISTRATOR))
+    });
+    if everyone_is_admin || role_is_admin {
+        UserRole::GuildAdmin
+    } else {
+        UserRole::Member
+    }
 }
 
 pub fn denied_bot_permissions() -> PermissionSet {
