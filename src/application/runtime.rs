@@ -344,11 +344,25 @@ fn db_safe_transcript_timestamp_ms(
     Ok(value as i32)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TranscriptPersistError {
+    Validation(String),
+    Database(String),
+}
+
+impl std::fmt::Display for TranscriptPersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(message) | Self::Database(message) => f.write_str(message),
+        }
+    }
+}
+
 fn persist_transcript_segments<E: SqlExecutor>(
     executor: &mut E,
     meeting_id: &str,
     segments: &[TranscriptSegment],
-) -> Result<(), String> {
+) -> Result<(), TranscriptPersistError> {
     if segments.is_empty() {
         executor
             .execute(
@@ -356,7 +370,11 @@ fn persist_transcript_segments<E: SqlExecutor>(
                 &[meeting_id.to_owned()],
             )
             .map(|_| ())
-            .map_err(|err| format!("failed to clear old transcript segments: {err}"))?;
+            .map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to clear old transcript segments: {err}"
+                ))
+            })?;
         return Ok(());
     }
 
@@ -366,8 +384,10 @@ fn persist_transcript_segments<E: SqlExecutor>(
     let mut params = Vec::with_capacity(segments.len() * 9 + 1);
     params.push(meeting_id.to_owned());
     for (i, seg) in segments.iter().enumerate() {
-        let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)?;
-        let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)?;
+        let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)
+            .map_err(TranscriptPersistError::Validation)?;
+        let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)
+            .map_err(TranscriptPersistError::Validation)?;
         params.push(format!("{meeting_id}-t-{i}"));
         params.push(meeting_id.to_owned());
         params.push(seg.speaker_id.clone());
@@ -379,10 +399,9 @@ fn persist_transcript_segments<E: SqlExecutor>(
         params.push(seg.source.as_str().to_owned());
     }
 
-    executor
-        .execute(&sql, &params)
-        .map(|_| ())
-        .map_err(|err| format!("failed to persist transcript segments: {err}"))
+    executor.execute(&sql, &params).map(|_| ()).map_err(|err| {
+        TranscriptPersistError::Database(format!("failed to persist transcript segments: {err}"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2508,6 +2527,47 @@ impl ScaffoldHandler {
                 &transcription.segments,
             )
         } {
+            let err = match err {
+                TranscriptPersistError::Validation(message) => {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %message,
+                        "invalid transcript segment timestamps; failing summary job without retry"
+                    );
+                    {
+                        let mut service = self.service.lock().await;
+                        let mut queue = self.queue.lock().await;
+                        let _ = queue.mark_failed(&claimed_job.id, message.clone());
+                        let _ = service.store.set_meeting_status(
+                            &claimed_job.meeting_id,
+                            MeetingStatus::Failed,
+                            None,
+                        );
+                        let _ = service
+                            .store
+                            .set_error_message(&claimed_job.meeting_id, Some(message.clone()));
+                    }
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "transcript_persist",
+                                error: &message,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %status_err,
+                            "failed to update status message after transcript validation failure"
+                        );
+                    }
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(message));
+                }
+                TranscriptPersistError::Database(message) => message,
+            };
             warn!(
                 meeting_id = %claimed_job.meeting_id,
                 error = %err,
@@ -3716,7 +3776,8 @@ mod status_message_tests {
         )
         .expect_err("overflowing transcript timestamp should fail before SQL");
 
-        assert!(err.contains("exceeds database integer range"));
+        assert!(matches!(err, TranscriptPersistError::Validation(_)));
+        assert!(err.to_string().contains("exceeds database integer range"));
         assert!(
             executor.executed.is_empty(),
             "invalid timestamps should not reach the SQL executor"
@@ -3750,8 +3811,12 @@ mod status_message_tests {
         let err = persist_transcript_segments(&mut executor, "m1", &[segment])
             .expect_err("insert failure should be surfaced");
 
-        assert!(err.contains("failed to persist transcript segments"));
-        assert!(err.contains("integer out of range"));
+        assert!(matches!(err, TranscriptPersistError::Database(_)));
+        assert!(
+            err.to_string()
+                .contains("failed to persist transcript segments")
+        );
+        assert!(err.to_string().contains("integer out of range"));
     }
 
     #[test]
