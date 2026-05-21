@@ -57,6 +57,7 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -995,6 +996,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
+        retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
@@ -1049,6 +1051,7 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
+    retention_cleanup_running: Arc<AtomicBool>,
     chunk_storage_dir: String,
     auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
@@ -1081,12 +1084,23 @@ impl EventHandler for ScaffoldHandler {
             error!(error = %err, "failed to register guild commands");
         }
 
-        let retention_handler = self.clone();
-        tokio::spawn(async move {
-            if let Err(err) = retention_handler.run_startup_retention_cleanup().await {
-                error!(error = %err, "startup retention cleanup failed");
-            }
-        });
+        if self
+            .retention_cleanup_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let retention_handler = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = retention_handler.run_startup_retention_cleanup().await {
+                    error!(error = %err, "startup retention cleanup failed");
+                }
+                retention_handler
+                    .retention_cleanup_running
+                    .store(false, Ordering::Release);
+            });
+        } else {
+            info!("startup retention cleanup already running; skipping duplicate ready event");
+        }
 
         let recovery_handler = self.clone();
         let recovery_ctx = ctx.clone();

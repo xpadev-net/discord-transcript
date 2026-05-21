@@ -148,7 +148,9 @@ impl AppConfig {
             )?
             .unwrap_or(5_000),
             whisper_language: optional_env_language("WHISPER_LANGUAGE")?,
-            whisper_beam_size: optional_env_parse_u32_nonzero("WHISPER_BEAM_SIZE")?.unwrap_or(5),
+            whisper_beam_size: optional_env_parse_u32_nonzero("WHISPER_BEAM_SIZE")?
+                .map(NonZeroU32::get)
+                .unwrap_or(5),
             whisper_suppress_non_speech: optional_env_parse_bool(
                 "WHISPER_SUPPRESS_NON_SPEECH",
                 true,
@@ -168,15 +170,12 @@ impl AppConfig {
             discord_bot_admin_user_ids: parse_csv_list(optional_env("DISCORD_BOT_ADMIN_USER_IDS")),
             retention_policy: RetentionPolicy {
                 raw_audio_ttl_days: optional_env_parse_u32_nonzero("RETENTION_RAW_AUDIO_TTL_DAYS")?
-                    .map(validated_nonzero_u32)
                     .unwrap_or_else(|| RetentionPolicy::default().raw_audio_ttl_days),
                 transcript_ttl_days: optional_env_parse_u32_nonzero(
                     "RETENTION_TRANSCRIPT_TTL_DAYS",
                 )?
-                .map(validated_nonzero_u32)
                 .unwrap_or_else(|| RetentionPolicy::default().transcript_ttl_days),
-                summary_ttl_days: optional_env_parse_u32_nonzero("RETENTION_SUMMARY_TTL_DAYS")?
-                    .map(validated_nonzero_u32),
+                summary_ttl_days: optional_env_parse_u32_nonzero("RETENTION_SUMMARY_TTL_DAYS")?,
             },
         })
     }
@@ -241,6 +240,7 @@ impl AppConfig {
             .unwrap_or(5_000),
             whisper_language: optional_from_map_language(values, "WHISPER_LANGUAGE")?,
             whisper_beam_size: optional_from_map_parse_u32_nonzero(values, "WHISPER_BEAM_SIZE")?
+                .map(NonZeroU32::get)
                 .unwrap_or(5),
             whisper_suppress_non_speech: optional_from_map_parse_bool(
                 values,
@@ -274,26 +274,19 @@ impl AppConfig {
                     values,
                     "RETENTION_RAW_AUDIO_TTL_DAYS",
                 )?
-                .map(validated_nonzero_u32)
                 .unwrap_or_else(|| RetentionPolicy::default().raw_audio_ttl_days),
                 transcript_ttl_days: optional_from_map_parse_u32_nonzero(
                     values,
                     "RETENTION_TRANSCRIPT_TTL_DAYS",
                 )?
-                .map(validated_nonzero_u32)
                 .unwrap_or_else(|| RetentionPolicy::default().transcript_ttl_days),
                 summary_ttl_days: optional_from_map_parse_u32_nonzero(
                     values,
                     "RETENTION_SUMMARY_TTL_DAYS",
-                )?
-                .map(validated_nonzero_u32),
+                )?,
             },
         })
     }
-}
-
-fn validated_nonzero_u32(value: u32) -> NonZeroU32 {
-    NonZeroU32::new(value).expect("caller validated nonzero u32")
 }
 
 fn parse_csv_list(value: Option<String>) -> Vec<String> {
@@ -386,7 +379,7 @@ fn optional_env_parse_u32(key: &'static str) -> Result<Option<u32>, ConfigError>
         .map_err(|_| ConfigError::InvalidEnv { key, value })
 }
 
-fn optional_env_parse_u32_nonzero(key: &'static str) -> Result<Option<u32>, ConfigError> {
+fn optional_env_parse_u32_nonzero(key: &'static str) -> Result<Option<NonZeroU32>, ConfigError> {
     let Some(value) = optional_env(key) else {
         return Ok(None);
     };
@@ -397,7 +390,7 @@ fn optional_env_parse_u32_nonzero(key: &'static str) -> Result<Option<u32>, Conf
     if parsed == 0 {
         return Err(ConfigError::InvalidEnv { key, value });
     }
-    Ok(Some(parsed))
+    Ok(NonZeroU32::new(parsed))
 }
 
 fn optional_env_parse_u64(key: &'static str) -> Result<Option<u64>, ConfigError> {
@@ -440,7 +433,7 @@ fn optional_from_map_parse_u32(
 fn optional_from_map_parse_u32_nonzero(
     values: &HashMap<String, String>,
     key: &'static str,
-) -> Result<Option<u32>, ConfigError> {
+) -> Result<Option<NonZeroU32>, ConfigError> {
     let Some(value) = optional_from_map(values, key) else {
         return Ok(None);
     };
@@ -451,7 +444,7 @@ fn optional_from_map_parse_u32_nonzero(
     if parsed == 0 {
         return Err(ConfigError::InvalidEnv { key, value });
     }
-    Ok(Some(parsed))
+    Ok(NonZeroU32::new(parsed))
 }
 
 fn optional_from_map_parse_u64(
