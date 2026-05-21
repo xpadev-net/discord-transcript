@@ -444,3 +444,19 @@ fn sql_job_queue_done_job_rejects_retry() {
         }
     );
 }
+
+#[test]
+fn sql_job_queue_running_job_retry_returns_queued() {
+    let mut executor = FakeSqlExecutor::default();
+    let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
+    executor
+        .query_rows_result
+        .insert(retry_key, vec![vec!["queued".to_owned()]]);
+
+    let mut queue = SqlJobQueue::new(executor);
+    let status = queue
+        .retry("j1", "failed once".to_owned(), 2)
+        .expect("running SQL job should retry");
+
+    assert_eq!(status, JobStatus::Queued);
+}
