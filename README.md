@@ -26,9 +26,9 @@ PostgreSQL にデータベースを作成し、マイグレーションを適用
 
 ```bash
 createdb discord_transcript
-mapfile -t migration_files < <(find migrations -maxdepth 1 -name "*.sql" | sort)
-[ ${#migration_files[@]} -gt 0 ] || { echo "No migration files found in migrations/"; exit 1; }
-for f in "${migration_files[@]}"; do
+migration_files=$(find migrations -maxdepth 1 -name "*.sql" | sort)
+[ -n "$migration_files" ] || { echo "No migration files found in migrations/"; exit 1; }
+printf '%s\n' "$migration_files" | while IFS= read -r f; do
   psql -d discord_transcript -f "$f" || exit 1
 done
 ```
