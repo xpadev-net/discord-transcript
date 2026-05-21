@@ -3815,14 +3815,19 @@ mod status_message_tests {
 
         fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String> {
             self.inner.executed.push((sql.to_owned(), params.to_vec()));
+            let key = format!("{}|{}", sql, params.join("\u{1f}"));
+            if let Some(err) = self.inner.query_rows_error.get(&key) {
+                return Err(err.clone());
+            }
             if sql == RECOVERY_SUMMARY_JOB_STATUS_SQL {
-                let key = format!("{}|{}", sql, params.join("\u{1f}"));
-                if let Some(err) = self.inner.query_rows_error.get(&key) {
-                    return Err(err.clone());
-                }
                 return Ok(vec![vec![self.job_status.clone()]]);
             }
-            self.inner.query_rows(sql, params)
+            Ok(self
+                .inner
+                .query_rows_result
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn run_migration(&mut self, migration_sql: &str) -> Result<(), String> {
