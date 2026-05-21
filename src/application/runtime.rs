@@ -3737,12 +3737,12 @@ mod status_message_tests {
         let songbird_lookup = source
             .find("let manager = songbird::get(ctx)")
             .expect("record start should look up songbird manager");
-        let workspace_setup = source
-            .find("workspace\n            .ensure_base_dirs()")
-            .expect("record start should prepare workspace");
         let service_lock = source
             .find("let mut service = self.service.lock().await")
             .expect("record start should lock service after setup");
+        let workspace_setup = source[..service_lock]
+            .find("ensure_base_dirs")
+            .expect("record start should prepare workspace before locking service");
         let row_create = source
             .find("complete_record_start_after_runtime_setup")
             .expect("record start should create row through runtime setup helper");
