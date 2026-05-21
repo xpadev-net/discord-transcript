@@ -154,6 +154,20 @@ pub fn dispatch_runtime_command<S: MeetingStore>(
     }
 }
 
+fn complete_record_start_after_runtime_setup<S>(
+    service: &mut BotCommandService<S>,
+    input: StartCommandInput,
+    setup_result: Result<(), String>,
+) -> Result<String, String>
+where
+    S: MeetingStore,
+{
+    setup_result?;
+    service
+        .handle_record_start(input)
+        .map_err(|err| err.to_string())
+}
+
 pub fn stop_and_enqueue_summary_job<S, Q>(
     service: &mut BotCommandService<S>,
     queue: &mut Q,
@@ -1392,22 +1406,8 @@ impl ScaffoldHandler {
             command.member.as_deref(),
             &self.bot_admin_user_ids,
         );
-        let mut service = self.service.lock().await;
-        let response = service
-            .handle_record_start(StartCommandInput {
-                meeting_id: meeting_id.clone(),
-                guild_id: guild_id.get().to_string(),
-                user_id: command.user.id.get().to_string(),
-                command_channel_id: command.channel_id.get().to_string(),
-                user_voice_channel_id: voice_channel_id_u64.map(|v| v.to_string()),
-                permissions,
-                caller_role,
-            })
-            .map_err(|err| err.to_string())?;
-        drop(service);
-
-        let voice_channel_id_u64 = voice_channel_id_u64
-            .ok_or_else(|| "voice_channel_id unexpectedly None after record_start".to_owned())?;
+        let voice_channel_id_u64 =
+            voice_channel_id_u64.ok_or_else(|| CommandError::UserNotInVoice.to_string())?;
 
         let manager = songbird::get(ctx)
             .await
@@ -1422,6 +1422,23 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
+
+        let mut service = self.service.lock().await;
+        let response = complete_record_start_after_runtime_setup(
+            &mut service,
+            StartCommandInput {
+                meeting_id: meeting_id.clone(),
+                guild_id: guild_id.get().to_string(),
+                user_id: command.user.id.get().to_string(),
+                command_channel_id: command.channel_id.get().to_string(),
+                user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
+                permissions,
+                caller_role,
+            },
+            Ok(()),
+        )?;
+        drop(service);
+
         // Reset SSRC tracker so stale mappings from previous recordings
         // cannot mis-attribute audio when Discord reuses an SSRC value.
         {
@@ -3696,6 +3713,70 @@ mod status_message_tests {
     #[test]
     fn driver_disconnect_final_flush_failure_blocks_teardown_and_can_retry() {
         assert_final_flush_failure_is_retryable("driver disconnect");
+    }
+
+    fn start_input_for_runtime_setup_test() -> StartCommandInput {
+        StartCommandInput {
+            meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            user_id: "u1".to_owned(),
+            command_channel_id: "c1".to_owned(),
+            user_voice_channel_id: Some("vc1".to_owned()),
+            permissions: PermissionSet {
+                can_connect_voice: true,
+                can_send_messages: true,
+            },
+            caller_role: UserRole::GuildAdmin,
+        }
+    }
+
+    #[test]
+    fn runtime_record_start_creates_row_after_songbird_and_workspace_setup() {
+        let source = include_str!("runtime.rs");
+        let handle_start = source
+            .find("async fn handle_record_start")
+            .expect("handle_record_start should exist");
+        let source = &source[handle_start..];
+        let songbird_lookup = source
+            .find("songbird::get(ctx)")
+            .expect("record start should look up songbird manager");
+        let workspace_setup = source
+            .find(".ensure_base_dirs()")
+            .expect("record start should prepare workspace");
+        let row_create = source
+            .find("complete_record_start_after_runtime_setup")
+            .expect("record start should create row through runtime setup helper");
+
+        assert!(
+            songbird_lookup < row_create,
+            "recording row must not be created before songbird manager lookup succeeds"
+        );
+        assert!(
+            workspace_setup < row_create,
+            "recording row must not be created before workspace setup succeeds"
+        );
+    }
+
+    #[test]
+    fn runtime_setup_completion_creates_recording_row() {
+        let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut service = BotCommandService::new(store);
+
+        let result = complete_record_start_after_runtime_setup(
+            &mut service,
+            start_input_for_runtime_setup_test(),
+            Ok(()),
+        )
+        .expect("start should succeed after setup");
+
+        assert!(result.contains("meeting_id=m1"));
+        let meeting = service
+            .store
+            .find_active_meeting_by_guild("g1")
+            .expect("store lookup should succeed")
+            .expect("meeting should exist");
+        assert_eq!(meeting.id, "m1");
+        assert_eq!(meeting.status, MeetingStatus::Recording);
     }
 
     #[tokio::test]
