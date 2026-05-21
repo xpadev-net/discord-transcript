@@ -2,6 +2,10 @@ use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
 use crate::application::command::{CommandError, PermissionSet, authorize_record_stop_for_meeting};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
+use crate::application::retention_cleanup::{
+    apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
+    collect_retention_cleanup_plan,
+};
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::enqueue_summary_job;
@@ -53,6 +57,7 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -991,6 +996,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
+        retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
@@ -1005,6 +1011,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         whisper_temperature: config.whisper_temperature,
         whisper_resample_to_16k: config.whisper_resample_to_16k,
         summary_max_retries: config.summary_max_retries,
+        retention_policy: config.retention_policy,
         integration_retry_policy: RetryPolicy {
             max_attempts: config.integration_retry_max_attempts,
             initial_delay: std::time::Duration::from_millis(
@@ -1044,6 +1051,7 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
+    retention_cleanup_running: Arc<AtomicBool>,
     chunk_storage_dir: String,
     auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
@@ -1058,6 +1066,7 @@ struct ScaffoldHandler {
     whisper_temperature: f32,
     whisper_resample_to_16k: bool,
     summary_max_retries: u32,
+    retention_policy: crate::domain::retention::RetentionPolicy,
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
     bot_admin_user_ids: HashSet<String>,
@@ -1073,6 +1082,24 @@ impl EventHandler for ScaffoldHandler {
             .map(|_| ())
         {
             error!(error = %err, "failed to register guild commands");
+        }
+
+        if self
+            .retention_cleanup_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let retention_handler = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = retention_handler.run_startup_retention_cleanup().await {
+                    error!(error = %err, "startup retention cleanup failed");
+                }
+                retention_handler
+                    .retention_cleanup_running
+                    .store(false, Ordering::Release);
+            });
+        } else {
+            info!("startup retention cleanup already running; skipping duplicate ready event");
         }
 
         let recovery_handler = self.clone();
@@ -1386,6 +1413,95 @@ impl EventHandler for ScaffoldHandler {
 }
 
 impl ScaffoldHandler {
+    async fn run_startup_retention_cleanup(&self) -> Result<(), String> {
+        let policy = self.retention_policy;
+        let plan = {
+            let mut service = self.service.lock().await;
+            collect_retention_cleanup_plan(&mut service.store.executor, policy)
+        };
+        if !plan.errors.is_empty() {
+            warn!(
+                errors = %plan.errors.join("; "),
+                "retention cleanup plan collection had errors; continuing with partial plan"
+            );
+        };
+        let chunk_storage_dir = self.chunk_storage_dir.clone();
+        let filesystem_result = tokio::task::spawn_blocking(move || {
+            let layout =
+                crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&chunk_storage_dir);
+            apply_retention_filesystem_cleanup(&layout, &plan)
+        })
+        .await
+        .map_err(|err| format!("retention filesystem cleanup task failed: {err}"))?;
+        let mut report = match filesystem_result {
+            Ok(report) => report,
+            Err(err) => {
+                let report = *err.report;
+                warn!(
+                    error = %err.message,
+                    "retention filesystem cleanup failed; continuing with database cleanup"
+                );
+                report
+            }
+        };
+        let database_result = {
+            let mut service = self.service.lock().await;
+            apply_retention_database_cleanup(
+                &mut service.store.executor,
+                policy,
+                &report.raw_workspace_cleaned_meeting_ids,
+            )
+        };
+        let database_error = match database_result {
+            Ok(database_report) => {
+                report.merge(database_report);
+                None
+            }
+            Err(err) => {
+                report.merge(*err.report);
+                Some(err.message)
+            }
+        };
+        if let Some(err) = database_error {
+            warn!(
+                raw_workspaces_scanned = report.raw_workspaces_scanned,
+                raw_audio_dirs_removed = report.raw_audio_dirs_removed,
+                legacy_meetings_cleaned = report.legacy_meetings_cleaned,
+                raw_workspaces_marked_cleaned = report.raw_workspaces_marked_cleaned,
+                speaker_dirs_removed = report.speaker_dirs_removed,
+                context_dirs_removed = report.context_dirs_removed,
+                transcript_dirs_removed = report.transcript_dirs_removed,
+                empty_summary_dirs_removed = report.empty_summary_dirs_removed,
+                summary_dirs_removed = report.summary_dirs_removed,
+                debug_dirs_removed = report.debug_dirs_removed,
+                transcripts_marked_deleted = report.transcripts_marked_deleted,
+                summaries_deleted = report.summaries_deleted,
+                artifacts_deleted = report.artifacts_deleted,
+                error = %err,
+                "startup retention cleanup failed after partial work"
+            );
+            Err(format!("retention database cleanup failed: {err}"))
+        } else {
+            info!(
+                raw_workspaces_scanned = report.raw_workspaces_scanned,
+                raw_audio_dirs_removed = report.raw_audio_dirs_removed,
+                legacy_meetings_cleaned = report.legacy_meetings_cleaned,
+                raw_workspaces_marked_cleaned = report.raw_workspaces_marked_cleaned,
+                speaker_dirs_removed = report.speaker_dirs_removed,
+                context_dirs_removed = report.context_dirs_removed,
+                transcript_dirs_removed = report.transcript_dirs_removed,
+                empty_summary_dirs_removed = report.empty_summary_dirs_removed,
+                summary_dirs_removed = report.summary_dirs_removed,
+                debug_dirs_removed = report.debug_dirs_removed,
+                transcripts_marked_deleted = report.transcripts_marked_deleted,
+                summaries_deleted = report.summaries_deleted,
+                artifacts_deleted = report.artifacts_deleted,
+                "startup retention cleanup completed"
+            );
+            Ok(())
+        }
+    }
+
     async fn run_startup_recovery(&self, ctx: &Context) -> Result<(), String> {
         let snapshots: Vec<RecoverySnapshot> = {
             let mut service = self.service.lock().await;

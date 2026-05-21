@@ -3,6 +3,7 @@ pub mod bot;
 pub mod command;
 pub mod meeting_flow;
 pub mod recovery_runner;
+pub mod retention_cleanup;
 pub mod runtime;
 pub mod stop;
 pub mod summary;

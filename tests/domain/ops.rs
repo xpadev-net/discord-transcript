@@ -10,6 +10,11 @@ use discord_transcript::domain::retention::{
     should_delete_artifact,
 };
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use std::num::NonZeroU32;
+
+fn nonzero(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("test value should be nonzero")
+}
 
 fn recording_meeting(id: &str) -> StoredMeeting {
     StoredMeeting {
@@ -184,9 +189,9 @@ fn recovery_marks_failed_for_transcribing_without_recording() {
 fn retention_policy_selects_expected_cleanup_targets() {
     let now = 10_000_000u64;
     let policy = RetentionPolicy {
-        raw_audio_ttl_days: 7,
-        transcript_ttl_days: 30,
-        summary_ttl_days: Some(90),
+        raw_audio_ttl_days: nonzero(7),
+        transcript_ttl_days: nonzero(30),
+        summary_ttl_days: Some(nonzero(90)),
     };
     let records = vec![
         ArtifactRecord {

@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionKind {
     RawAudio,
@@ -7,16 +9,16 @@ pub enum RetentionKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
-    pub raw_audio_ttl_days: u32,
-    pub transcript_ttl_days: u32,
-    pub summary_ttl_days: Option<u32>,
+    pub raw_audio_ttl_days: NonZeroU32,
+    pub transcript_ttl_days: NonZeroU32,
+    pub summary_ttl_days: Option<NonZeroU32>,
 }
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            raw_audio_ttl_days: 7,
-            transcript_ttl_days: 30,
+            raw_audio_ttl_days: NonZeroU32::new(7).expect("default raw audio TTL is nonzero"),
+            transcript_ttl_days: NonZeroU32::new(30).expect("default transcript TTL is nonzero"),
             summary_ttl_days: None,
         }
     }
@@ -41,11 +43,11 @@ pub fn should_delete_artifact(
 ) -> bool {
     let age_days = (now_unix_seconds.saturating_sub(record.created_at_unix_seconds)) / 86_400;
     match record.kind {
-        RetentionKind::RawAudio => age_days >= policy.raw_audio_ttl_days as u64,
-        RetentionKind::Transcript => age_days >= policy.transcript_ttl_days as u64,
+        RetentionKind::RawAudio => age_days >= policy.raw_audio_ttl_days.get() as u64,
+        RetentionKind::Transcript => age_days >= policy.transcript_ttl_days.get() as u64,
         RetentionKind::Summary => policy
             .summary_ttl_days
-            .is_some_and(|days| age_days >= days as u64),
+            .is_some_and(|days| age_days >= days.get() as u64),
     }
 }
 
