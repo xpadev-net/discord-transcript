@@ -4,6 +4,7 @@ use crate::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::fs;
 use std::io;
 use std::path::Path;
+use tracing::warn;
 
 // Raw-audio and transcript workspace queries share the same filters today, but
 // stay separate so their retention scopes can diverge without changing callers.
@@ -315,20 +316,28 @@ pub fn apply_retention_filesystem_cleanup(
             &meeting.voice_channel_id,
             &meeting.meeting_id,
         );
-        record_cleanup_result(
-            &mut errors,
-            remove_dir_if_present(&workspace.audio_dir()),
-            || report.raw_audio_dirs_removed += 1,
-        );
+        let speaker_cleanup = remove_dir_if_present(&workspace.speakers_dir());
+        let speaker_cleanup_failed = speaker_cleanup.is_err();
+        record_cleanup_result(&mut errors, speaker_cleanup, || {
+            report.speaker_dirs_removed += 1
+        });
+        if speaker_cleanup_failed {
+            warn!(
+                meeting_id = %meeting.meeting_id,
+                path = %workspace.audio_dir().display(),
+                "skipping parent audio cleanup after speaker directory cleanup failed"
+            );
+        } else {
+            record_cleanup_result(
+                &mut errors,
+                remove_dir_if_present(&workspace.audio_dir()),
+                || report.raw_audio_dirs_removed += 1,
+            );
+        }
         record_cleanup_result(
             &mut errors,
             remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
             || report.legacy_meetings_cleaned += 1,
-        );
-        record_cleanup_result(
-            &mut errors,
-            remove_dir_if_present(&workspace.speakers_dir()),
-            || report.speaker_dirs_removed += 1,
         );
         record_cleanup_result(
             &mut errors,
