@@ -15,8 +15,16 @@ export function MeetingPage() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
 
-  const { meeting, transcript, summary, loading, error } =
-    useMeetingData(meetingId);
+  const {
+    meeting,
+    transcript,
+    summary,
+    error,
+    transcriptError,
+    summaryError,
+    retryTranscript,
+    retrySummary,
+  } = useMeetingData(meetingId);
   const { activeIndex, seekTo } = useAudioSync(
     audioRef,
     transcriptContainerRef,
@@ -96,11 +104,15 @@ export function MeetingPage() {
             segments={transcript}
             activeIndex={activeIndex}
             onSeek={seekTo}
+            error={transcriptError}
+            onRetry={retryTranscript}
           />
         </div>
         <SummaryPanel
           markdown={summary?.markdown}
-          loading={loading && summary === null}
+          loading={!!meetingId && summary === null && summaryError === null}
+          error={summaryError}
+          onRetry={retrySummary}
         />
       </div>
     </>
