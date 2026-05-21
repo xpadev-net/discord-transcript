@@ -1145,39 +1145,41 @@ impl ScaffoldHandler {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown_token.cancel();
 
-        let _command_guard = self.command_gate.write().await;
-        let _voice_event_guard = self.voice_event_gate.write().await;
         {
-            let _spawn_guard = self
-                .background_spawn_gate
-                .lock()
-                .expect("background spawn gate poisoned");
-            self.task_tracker.close();
-        }
-
-        if let Err(err) = voice_manager.leave(self.guild_id).await {
-            warn!(
-                guild_id = %self.guild_id,
-                error = %err,
-                "failed to leave voice channel during shutdown"
-            );
-        }
-
-        {
-            let tracker = self.ssrc_tracker.lock().await.clone();
-            let mut sessions = self.sessions.lock().await;
-            let flushed = flush_sessions_for_shutdown(&mut sessions);
-            for session in sessions.values() {
-                session.persist_ssrc_mapping(&tracker);
+            let _command_guard = self.command_gate.write().await;
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            {
+                let _spawn_guard = self
+                    .background_spawn_gate
+                    .lock()
+                    .expect("background spawn gate poisoned");
+                self.task_tracker.close();
             }
-            info!(
-                sessions = sessions.len(),
-                flushed, "recording sessions drained during shutdown"
-            );
-        }
-        {
-            let mut states = self.auto_stop_states.lock().await;
-            states.clear();
+
+            if let Err(err) = voice_manager.leave(self.guild_id).await {
+                warn!(
+                    guild_id = %self.guild_id,
+                    error = %err,
+                    "failed to leave voice channel during shutdown"
+                );
+            }
+
+            {
+                let tracker = self.ssrc_tracker.lock().await.clone();
+                let mut sessions = self.sessions.lock().await;
+                let flushed = flush_sessions_for_shutdown(&mut sessions);
+                for session in sessions.values() {
+                    session.persist_ssrc_mapping(&tracker);
+                }
+                info!(
+                    sessions = sessions.len(),
+                    flushed, "recording sessions drained during shutdown"
+                );
+            }
+            {
+                let mut states = self.auto_stop_states.lock().await;
+                states.clear();
+            }
         }
 
         match timeout(grace, self.task_tracker.wait()).await {
@@ -2229,10 +2231,17 @@ impl ScaffoldHandler {
                 // response window, and should not block the command reply.
                 let handler = self.clone();
                 let http = Arc::clone(&ctx.http);
+                let shutdown_token = handler.shutdown_token.clone();
                 self.spawn_background(async move {
-                    let result = run_summary_background(&handler, &http, &meeting_id).await;
-                    if let Err(err) = result {
-                        error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                    tokio::select! {
+                        result = run_summary_background(&handler, &http, &meeting_id) => {
+                            if let Err(err) = result {
+                                error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                            }
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            debug!(meeting_id = %meeting_id, "summary background task deferred by shutdown");
+                        }
                     }
                 });
             }
@@ -3536,17 +3545,30 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         "failed to update status message after driver disconnect stop"
                                     );
                                 }
-                                if result.outcome == StopOutcome::Owner
-                                    && let Err(err) =
-                                        run_summary_background(&runtime, &http, &result.meeting_id)
-                                            .await
-                                {
-                                    warn!(
-                                        guild_id = %guild_key,
-                                        meeting_id = %result.meeting_id,
-                                        error = %err,
-                                        "failed to process summary after driver disconnect"
-                                    );
+                                if result.outcome == StopOutcome::Owner {
+                                    tokio::select! {
+                                        summary_result = run_summary_background(
+                                            &runtime,
+                                            &http,
+                                            &result.meeting_id,
+                                        ) => {
+                                            if let Err(err) = summary_result {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    meeting_id = %result.meeting_id,
+                                                    error = %err,
+                                                    "failed to process summary after driver disconnect"
+                                                );
+                                            }
+                                        }
+                                        _ = runtime.shutdown_token.cancelled() => {
+                                            debug!(
+                                                guild_id = %guild_key,
+                                                meeting_id = %result.meeting_id,
+                                                "driver-disconnect summary task deferred by shutdown"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(err) => {
