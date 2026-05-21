@@ -2491,8 +2491,8 @@ impl ScaffoldHandler {
                     true
                 }
             };
-            if exhausted {
-                if let Err(status_err) = self
+            if exhausted
+                && let Err(status_err) = self
                     .update_status_message(
                         http,
                         &claimed_job.meeting_id,
@@ -2502,13 +2502,12 @@ impl ScaffoldHandler {
                         },
                     )
                     .await
-                {
-                    warn!(
-                        meeting_id = %claimed_job.meeting_id,
-                        error = %status_err,
-                        "failed to update status message after transcript persist failure"
-                    );
-                }
+            {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %status_err,
+                    "failed to update status message after transcript persist failure"
+                );
             }
             if exhausted {
                 return Err(SummaryJobRunError::Terminal(err));
