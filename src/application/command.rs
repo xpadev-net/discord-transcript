@@ -1,6 +1,9 @@
 use crate::application::stop::{StopMeetingError, StopOutcome, stop_meeting};
 use crate::domain::StopReason;
-use crate::infrastructure::storage::{CreateMeetingRequest, MeetingStore, StoreError};
+use crate::domain::authz::{Action, UserRole, is_allowed};
+use crate::infrastructure::storage::{
+    CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting,
+};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +20,7 @@ pub struct RecordStartRequest {
     pub command_channel_id: String,
     pub user_voice_channel_id: Option<String>,
     pub permissions: PermissionSet,
+    pub caller_role: UserRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +34,8 @@ pub struct RecordStartResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordStopRequest {
     pub guild_id: String,
+    pub caller_user_id: String,
+    pub caller_role: UserRole,
     pub reason: StopReason,
 }
 
@@ -43,6 +49,7 @@ pub struct RecordStopResult {
 pub enum CommandError {
     UserNotInVoice,
     MissingPermission(&'static str),
+    Unauthorized(&'static str),
     ActiveMeetingExists {
         meeting_id: String,
     },
@@ -60,6 +67,7 @@ impl Display for CommandError {
         match self {
             Self::UserNotInVoice => write!(f, "user is not connected to a voice channel"),
             Self::MissingPermission(kind) => write!(f, "missing required permission: {kind}"),
+            Self::Unauthorized(action) => write!(f, "not authorized to {action}"),
             Self::ActiveMeetingExists { meeting_id } => {
                 write!(f, "an active meeting already exists: {meeting_id}")
             }
@@ -104,6 +112,9 @@ pub fn record_start<S: MeetingStore>(
     if !request.permissions.can_send_messages {
         return Err(CommandError::MissingPermission("send_messages"));
     }
+    if !is_allowed(request.caller_role, Action::StartRecording) {
+        return Err(CommandError::Unauthorized("start recording"));
+    }
 
     if let Some(active) = store.find_active_meeting_by_guild(&request.guild_id)? {
         // find_active_meeting_by_guild returns Scheduled/Recording/Stopping.
@@ -145,6 +156,7 @@ pub fn record_stop<S: MeetingStore>(
     let meeting = store
         .find_active_meeting_by_guild(&request.guild_id)?
         .ok_or(CommandError::NoActiveMeeting)?;
+    authorize_record_stop_for_meeting(&meeting, &request.caller_user_id, request.caller_role)?;
 
     // A Scheduled meeting was never actually recording — abort it directly
     // rather than sending it through the stop_meeting CAS path which only
@@ -166,4 +178,22 @@ pub fn record_stop<S: MeetingStore>(
         meeting_id: meeting.id,
         outcome,
     })
+}
+
+pub fn authorize_record_stop_for_meeting(
+    meeting: &StoredMeeting,
+    caller_user_id: &str,
+    caller_role: UserRole,
+) -> Result<(), CommandError> {
+    let effective_role =
+        if caller_role == UserRole::Member && meeting.started_by_user_id == caller_user_id {
+            UserRole::StartedMeeting
+        } else {
+            caller_role
+        };
+    if is_allowed(effective_role, Action::StopRecording) {
+        Ok(())
+    } else {
+        Err(CommandError::Unauthorized("stop recording"))
+    }
 }

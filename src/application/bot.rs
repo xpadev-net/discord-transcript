@@ -3,6 +3,7 @@ use crate::application::command::{
 };
 use crate::application::stop::StopOutcome;
 use crate::domain::StopReason;
+use crate::domain::authz::UserRole;
 use crate::infrastructure::storage::MeetingStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,11 +14,14 @@ pub struct StartCommandInput {
     pub command_channel_id: String,
     pub user_voice_channel_id: Option<String>,
     pub permissions: PermissionSet,
+    pub caller_role: UserRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopCommandInput {
     pub guild_id: String,
+    pub user_id: String,
+    pub caller_role: UserRole,
     pub reason: StopReason,
 }
 
@@ -50,6 +54,7 @@ impl<S: MeetingStore> BotCommandService<S> {
                 command_channel_id: input.command_channel_id,
                 user_voice_channel_id: input.user_voice_channel_id,
                 permissions: input.permissions,
+                caller_role: input.caller_role,
             },
         )?;
 
@@ -72,6 +77,8 @@ impl<S: MeetingStore> BotCommandService<S> {
             &mut self.store,
             RecordStopRequest {
                 guild_id: input.guild_id,
+                caller_user_id: input.user_id,
+                caller_role: input.caller_role,
                 reason: input.reason,
             },
         )?;

@@ -5,6 +5,7 @@ use discord_transcript::application::command::{
 use discord_transcript::application::stop::StopOutcome;
 use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::StopReason;
+use discord_transcript::domain::authz::UserRole;
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ fn record_start_persists_report_channel_and_moves_to_recording() {
         command_channel_id: "report-chan".to_owned(),
         user_voice_channel_id: Some("vc-1".to_owned()),
         permissions: default_permissions(),
+        caller_role: UserRole::GuildAdmin,
     };
 
     let result = record_start(&mut store, request).expect("start should succeed");
@@ -47,6 +49,7 @@ fn record_start_rejects_when_user_not_in_voice() {
         command_channel_id: "report-chan".to_owned(),
         user_voice_channel_id: None,
         permissions: default_permissions(),
+        caller_role: UserRole::GuildAdmin,
     };
 
     let error = record_start(&mut store, request).expect_err("must fail");
@@ -79,6 +82,7 @@ fn record_start_rejects_if_active_meeting_exists() {
         command_channel_id: "report-chan".to_owned(),
         user_voice_channel_id: Some("vc-2".to_owned()),
         permissions: default_permissions(),
+        caller_role: UserRole::GuildAdmin,
     };
 
     let error = record_start(&mut store, request).expect_err("must fail");
@@ -88,6 +92,23 @@ fn record_start_rejects_if_active_meeting_exists() {
             meeting_id: "existing".to_owned()
         }
     );
+}
+
+#[test]
+fn record_start_rejects_plain_member() {
+    let mut store = InMemoryMeetingStore::new();
+    let request = RecordStartRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        started_by_user_id: "u1".to_owned(),
+        command_channel_id: "report-chan".to_owned(),
+        user_voice_channel_id: Some("vc-1".to_owned()),
+        permissions: default_permissions(),
+        caller_role: UserRole::Member,
+    };
+
+    let error = record_start(&mut store, request).expect_err("member must not start");
+    assert_eq!(error, CommandError::Unauthorized("start recording"));
 }
 
 #[test]
@@ -118,6 +139,7 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
         command_channel_id: "report-chan".to_owned(),
         user_voice_channel_id: Some("vc-2".to_owned()),
         permissions: default_permissions(),
+        caller_role: UserRole::GuildAdmin,
     };
 
     let result = record_start(&mut store, request)
@@ -151,6 +173,8 @@ fn record_stop_is_idempotent_for_same_meeting() {
         &mut store,
         RecordStopRequest {
             guild_id: "g1".to_owned(),
+            caller_user_id: "u1".to_owned(),
+            caller_role: UserRole::Member,
             reason: StopReason::Manual,
         },
     )
@@ -163,6 +187,8 @@ fn record_stop_is_idempotent_for_same_meeting() {
         &mut store,
         RecordStopRequest {
             guild_id: "g1".to_owned(),
+            caller_user_id: "u1".to_owned(),
+            caller_role: UserRole::Member,
             reason: StopReason::AutoEmpty,
         },
     )
@@ -177,6 +203,38 @@ fn record_stop_is_idempotent_for_same_meeting() {
     // Verify original stop_reason was preserved
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.stop_reason, Some(StopReason::Manual));
+}
+
+#[test]
+fn record_stop_rejects_non_starter_member() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-1".to_owned(),
+        report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "starter".to_owned(),
+        title: None,
+        status: MeetingStatus::Recording,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+
+    let error = record_stop(
+        &mut store,
+        RecordStopRequest {
+            guild_id: "g1".to_owned(),
+            caller_user_id: "other-member".to_owned(),
+            caller_role: UserRole::Member,
+            reason: StopReason::Manual,
+        },
+    )
+    .expect_err("non-starter member must not stop");
+    assert_eq!(error, CommandError::Unauthorized("stop recording"));
 }
 
 #[test]
