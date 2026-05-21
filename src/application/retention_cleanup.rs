@@ -317,6 +317,11 @@ pub fn apply_retention_filesystem_cleanup(
         );
         record_cleanup_result(
             &mut errors,
+            remove_dir_if_present(&workspace.speakers_dir()),
+            || report.speaker_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
             remove_dir_if_present(&workspace.audio_dir()),
             || report.raw_audio_dirs_removed += 1,
         );
@@ -324,11 +329,6 @@ pub fn apply_retention_filesystem_cleanup(
             &mut errors,
             remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
             || report.legacy_meetings_cleaned += 1,
-        );
-        record_cleanup_result(
-            &mut errors,
-            remove_dir_if_present(&workspace.speakers_dir()),
-            || report.speaker_dirs_removed += 1,
         );
         record_cleanup_result(
             &mut errors,

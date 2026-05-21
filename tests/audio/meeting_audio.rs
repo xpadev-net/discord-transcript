@@ -2,6 +2,7 @@ use discord_transcript::audio::receiver::BufferedFrame;
 use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
 use discord_transcript::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
 use discord_transcript::audio::wav::resample_pcm_16le;
+use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::fs;
 use std::path::PathBuf;
 
@@ -61,6 +62,28 @@ fn speaker_audio_builds_offsets_and_gaps_per_user() {
     assert_eq!(bob_bytes.len(), 1_044);
 
     let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn speaker_audio_writes_to_workspace_speakers_dir() {
+    let root = unique_temp_dir("workspace_speakers");
+    let workspace =
+        MeetingWorkspaceLayout::new(root.to_string_lossy().as_ref()).for_meeting("g1", "vc1", "m1");
+    fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+
+    let chunk = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(workspace.audio_dir().join("alice_1_1000.wav"), &chunk).unwrap();
+
+    let outputs = build_speaker_audio_inputs(&workspace.audio_dir(), false)
+        .expect("speaker audio should build");
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        PathBuf::from(&outputs[0].audio_path),
+        workspace.speakers_dir().join("alice_speaker.wav")
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

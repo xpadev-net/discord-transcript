@@ -82,7 +82,7 @@ impl MeetingWorkspacePaths {
     }
 
     pub fn speakers_dir(&self) -> PathBuf {
-        self.root.join("speakers")
+        self.audio_dir().join("speakers")
     }
 
     pub fn masked_transcript_path(&self) -> PathBuf {
