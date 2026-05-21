@@ -1766,11 +1766,8 @@ async fn api_debug_file(
 ) -> Result<Response, StatusCode> {
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
     if debug_artifact_requires_admin(&artifact_id) {
-        authorize_debug_artifact_download(
-            verify_raw_debug_artifact_access(&state, &access, &user_id)
-                .await
-                .unwrap_or(false),
-        )?;
+        let allowed = verify_raw_debug_artifact_access(&state, &access, &user_id).await?;
+        authorize_debug_artifact_download(allowed)?;
     }
 
     let source = resolve_debug_artifact(&state, &meeting_id, &access, &artifact_id).await?;
