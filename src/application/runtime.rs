@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -1018,7 +1018,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
-        command_gate: Arc::new(Mutex::new(())),
+        command_gate: Arc::new(RwLock::new(())),
         background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -1068,6 +1068,7 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
 
     tokio::select! {
         result = client.start() => {
+            handler.shutdown(Arc::clone(&voice_manager), SHUTDOWN_GRACE_TIMEOUT).await;
             result.map_err(|err| RuntimeError::ClientRun(err.to_string()))
         }
         () = shutdown_signal() => {
@@ -1088,7 +1089,7 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
-    command_gate: Arc<Mutex<()>>,
+    command_gate: Arc<RwLock<()>>,
     background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -1142,7 +1143,7 @@ impl ScaffoldHandler {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown_token.cancel();
 
-        let _command_guard = self.command_gate.lock().await;
+        let _command_guard = self.command_gate.write().await;
         {
             let _spawn_guard = self
                 .background_spawn_gate
@@ -1877,7 +1878,7 @@ impl ScaffoldHandler {
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
         run_guild_scoped_command(command.guild_id, self.guild_id, |_| async {
-            let _command_guard = self.command_gate.lock().await;
+            let _command_guard = self.command_gate.read().await;
             self.reject_if_shutting_down()?;
             match command.data.name.as_str() {
                 RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
