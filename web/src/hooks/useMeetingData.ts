@@ -41,6 +41,8 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     setLoading(true);
     setError(null);
     setMeeting(null);
+    setTranscriptRetryCount(0);
+    setSummaryRetryCount(0);
 
     Promise.all([
       fetchMeeting(meetingId, controller.signal)

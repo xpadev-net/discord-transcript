@@ -110,7 +110,7 @@ export function MeetingPage() {
         </div>
         <SummaryPanel
           markdown={summary?.markdown}
-          loading={summary === null && summaryError === null}
+          loading={!!meetingId && summary === null && summaryError === null}
           error={summaryError}
           onRetry={retrySummary}
         />
