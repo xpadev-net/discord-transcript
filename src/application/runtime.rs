@@ -70,6 +70,7 @@ pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
 const AUTO_STOP_FINAL_FLUSH_MAX_RETRIES: u32 = 10;
 const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandSpec {
@@ -1156,12 +1157,27 @@ impl ScaffoldHandler {
                 self.task_tracker.close();
             }
 
-            if let Err(err) = voice_manager.leave(self.guild_id).await {
-                warn!(
-                    guild_id = %self.guild_id,
-                    error = %err,
-                    "failed to leave voice channel during shutdown"
-                );
+            match timeout(
+                SHUTDOWN_VOICE_LEAVE_TIMEOUT,
+                voice_manager.leave(self.guild_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!(
+                        guild_id = %self.guild_id,
+                        error = %err,
+                        "failed to leave voice channel during shutdown"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        guild_id = %self.guild_id,
+                        timeout_secs = SHUTDOWN_VOICE_LEAVE_TIMEOUT.as_secs(),
+                        "timed out leaving voice channel during shutdown"
+                    );
+                }
             }
 
             {
