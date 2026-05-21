@@ -1444,24 +1444,24 @@ impl ScaffoldHandler {
                 Some(err.message)
             }
         };
-        info!(
-            raw_workspaces_scanned = report.raw_workspaces_scanned,
-            raw_audio_dirs_removed = report.raw_audio_dirs_removed,
-            legacy_meetings_cleaned = report.legacy_meetings_cleaned,
-            speaker_dirs_removed = report.speaker_dirs_removed,
-            context_dirs_removed = report.context_dirs_removed,
-            transcript_dirs_removed = report.transcript_dirs_removed,
-            empty_summary_dirs_removed = report.empty_summary_dirs_removed,
-            summary_dirs_removed = report.summary_dirs_removed,
-            debug_dirs_removed = report.debug_dirs_removed,
-            transcripts_marked_deleted = report.transcripts_marked_deleted,
-            summaries_deleted = report.summaries_deleted,
-            artifacts_deleted = report.artifacts_deleted,
-            "startup retention cleanup completed"
-        );
         if let Some(err) = database_error {
             Err(format!("retention database cleanup failed: {err}"))
         } else {
+            info!(
+                raw_workspaces_scanned = report.raw_workspaces_scanned,
+                raw_audio_dirs_removed = report.raw_audio_dirs_removed,
+                legacy_meetings_cleaned = report.legacy_meetings_cleaned,
+                speaker_dirs_removed = report.speaker_dirs_removed,
+                context_dirs_removed = report.context_dirs_removed,
+                transcript_dirs_removed = report.transcript_dirs_removed,
+                empty_summary_dirs_removed = report.empty_summary_dirs_removed,
+                summary_dirs_removed = report.summary_dirs_removed,
+                debug_dirs_removed = report.debug_dirs_removed,
+                transcripts_marked_deleted = report.transcripts_marked_deleted,
+                summaries_deleted = report.summaries_deleted,
+                artifacts_deleted = report.artifacts_deleted,
+                "startup retention cleanup completed"
+            );
             Ok(())
         }
     }

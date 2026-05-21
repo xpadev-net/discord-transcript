@@ -18,13 +18,31 @@ WHERE stopped_at IS NOT NULL
 // See RETENTION_EXPIRED_RAW_WORKSPACES_SQL for why this intentionally mirrors
 // the raw-audio workspace query instead of aliasing it.
 pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
-SELECT DISTINCT m.id, m.guild_id, m.voice_channel_id
+SELECT m.id, m.guild_id, m.voice_channel_id
 FROM meetings m
-LEFT JOIN transcripts t ON t.meeting_id = m.id
 WHERE m.status IN ('posted', 'failed', 'aborted')
   AND (
-    (t.meeting_id IS NULL AND m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - (($1 || ' days')::interval))
-    OR (t.is_deleted = FALSE AND t.created_at < NOW() - (($1 || ' days')::interval))
+    NOT EXISTS (
+      SELECT 1
+      FROM transcripts active_t
+      WHERE active_t.meeting_id = m.id
+        AND active_t.is_deleted = FALSE
+        AND active_t.created_at >= NOW() - (($1 || ' days')::interval)
+    )
+  )
+  AND (
+    EXISTS (
+      SELECT 1
+      FROM transcripts expired_t
+      WHERE expired_t.meeting_id = m.id
+        AND expired_t.is_deleted = FALSE
+        AND expired_t.created_at < NOW() - (($1 || ' days')::interval)
+    )
+    OR (
+      NOT EXISTS (SELECT 1 FROM transcripts any_t WHERE any_t.meeting_id = m.id)
+      AND m.stopped_at IS NOT NULL
+      AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+    )
   )
 "#;
 
