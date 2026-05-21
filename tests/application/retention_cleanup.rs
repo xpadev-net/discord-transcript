@@ -180,3 +180,33 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
     assert_eq!(report.summary_dirs_removed, 0);
     assert_eq!(report.debug_dirs_removed, 0);
 }
+
+#[test]
+fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
+    let (_guard, layout) = temp_layout("fs_failure_keeps_db_cleanup");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    std::fs::create_dir_all(workspace.root()).expect("create workspace root");
+    std::fs::write(workspace.audio_dir(), b"not a directory").expect("write audio path as file");
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+    );
+    executor.execute_result.insert(
+        query_key(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30"]),
+        3,
+    );
+
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+        .expect_err("filesystem cleanup should fail after database cleanup runs");
+
+    assert!(err.contains("failed to remove"));
+    assert!(
+        executor
+            .executed
+            .iter()
+            .any(|(sql, params)| sql == RETENTION_MARK_TRANSCRIPTS_DELETED_SQL
+                && params == &vec!["30".to_owned()])
+    );
+}

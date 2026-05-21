@@ -122,8 +122,9 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
 ) -> Result<RetentionCleanupReport, String> {
     let plan = collect_retention_cleanup_plan(executor, policy)?;
     let mut report = RetentionCleanupReport::default();
-    report.merge(apply_retention_filesystem_cleanup(workspace_layout, &plan)?);
+    let filesystem_result = apply_retention_filesystem_cleanup(workspace_layout, &plan);
     report.merge(apply_retention_database_cleanup(executor, policy)?);
+    report.merge(filesystem_result?);
     Ok(report)
 }
 
