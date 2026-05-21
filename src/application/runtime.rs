@@ -3628,6 +3628,7 @@ async fn post_failure_to_report_channel(
 mod status_message_tests {
     use super::*;
     use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
+    use crate::infrastructure::sql_store::{FakeSqlExecutor, SqlExecutor};
     use crate::infrastructure::storage_fs::{ChunkStorageError, SavedChunk};
     use serenity::async_trait;
     use std::sync::{
@@ -3758,33 +3759,103 @@ mod status_message_tests {
         ));
     }
 
+    #[derive(Debug)]
+    struct RecoverySummaryJobExecutor {
+        inner: FakeSqlExecutor,
+        job_status: String,
+        stale_running: bool,
+    }
+
+    impl RecoverySummaryJobExecutor {
+        fn new(job_status: &str, stale_running: bool) -> Self {
+            let mut inner = FakeSqlExecutor::default();
+            let enqueue_key = format!(
+                "{}|{}",
+                crate::infrastructure::sql::ENQUEUE_JOB_SQL,
+                ["summary-m1", "m1", "summarize"].join("\u{1f}")
+            );
+            inner.execute_error.insert(
+                enqueue_key,
+                format!(
+                    "{}duplicate job",
+                    crate::infrastructure::sql_store::UNIQUE_VIOLATION_PREFIX
+                ),
+            );
+            Self {
+                inner,
+                job_status: job_status.to_owned(),
+                stale_running,
+            }
+        }
+    }
+
+    impl SqlExecutor for RecoverySummaryJobExecutor {
+        fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String> {
+            self.inner.executed.push((sql.to_owned(), params.to_vec()));
+            if sql == RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL {
+                if self.job_status == "running" && self.stale_running {
+                    self.job_status = "queued".to_owned();
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
+            let key = format!("{}|{}", sql, params.join("\u{1f}"));
+            if let Some(err) = self.inner.execute_error.get(&key) {
+                return Err(err.clone());
+            }
+            Ok(*self.inner.execute_result.get(&key).unwrap_or(&1))
+        }
+
+        fn query_active_meeting(
+            &mut self,
+            guild_id: &str,
+        ) -> Result<Option<crate::infrastructure::storage::StoredMeeting>, String> {
+            self.inner.query_active_meeting(guild_id)
+        }
+
+        fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String> {
+            self.inner.executed.push((sql.to_owned(), params.to_vec()));
+            let key = format!("{}|{}", sql, params.join("\u{1f}"));
+            if let Some(err) = self.inner.query_rows_error.get(&key) {
+                return Err(err.clone());
+            }
+            if sql == RECOVERY_SUMMARY_JOB_STATUS_SQL {
+                return Ok(vec![vec![self.job_status.clone()]]);
+            }
+            Ok(self
+                .inner
+                .query_rows_result
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn run_migration(&mut self, migration_sql: &str) -> Result<(), String> {
+            self.inner.run_migration(migration_sql)
+        }
+    }
+
+    type RecoverySummaryJobQueue = SqlJobQueue<RecoverySummaryJobExecutor>;
+
+    fn fake_recovery_queue_with_existing_summary_job_status(
+        inspected_status: &str,
+    ) -> RecoverySummaryJobQueue {
+        fake_recovery_queue_with_existing_summary_job(inspected_status, false)
+    }
+
     fn fake_recovery_queue_with_existing_summary_job(
-        status: &str,
-    ) -> SqlJobQueue<crate::infrastructure::sql_store::FakeSqlExecutor> {
-        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
-        let job_id = "summary-m1";
-        let enqueue_key = format!(
-            "{}|{}",
-            crate::infrastructure::sql::ENQUEUE_JOB_SQL,
-            ["summary-m1", "m1", "summarize"].join("\u{1f}")
-        );
-        executor.execute_error.insert(
-            enqueue_key,
-            format!(
-                "{}duplicate job",
-                crate::infrastructure::sql_store::UNIQUE_VIOLATION_PREFIX
-            ),
-        );
-        let status_key = format!("{}|{}", RECOVERY_SUMMARY_JOB_STATUS_SQL, job_id);
-        executor
-            .query_rows_result
-            .insert(status_key, vec![vec![status.to_owned()]]);
-        SqlJobQueue::new(executor)
+        initial_status: &str,
+        stale_running: bool,
+    ) -> RecoverySummaryJobQueue {
+        SqlJobQueue::new(RecoverySummaryJobExecutor::new(
+            initial_status,
+            stale_running,
+        ))
     }
 
     #[test]
     fn recovery_existing_queued_summary_job_is_claimable() {
-        let mut queue = fake_recovery_queue_with_existing_summary_job("queued");
+        let mut queue = fake_recovery_queue_with_existing_summary_job_status("queued");
 
         assert!(recover_summary_job_for_startup(
             &mut queue,
@@ -3795,14 +3866,14 @@ mod status_message_tests {
 
     #[test]
     fn recovery_existing_running_or_failed_summary_job_is_not_claimable() {
-        let mut running_queue = fake_recovery_queue_with_existing_summary_job("running");
+        let mut running_queue = fake_recovery_queue_with_existing_summary_job_status("running");
         assert!(!recover_summary_job_for_startup(
             &mut running_queue,
             "summary-m1",
             "m1"
         ));
 
-        let mut failed_queue = fake_recovery_queue_with_existing_summary_job("failed");
+        let mut failed_queue = fake_recovery_queue_with_existing_summary_job_status("failed");
         assert!(!recover_summary_job_for_startup(
             &mut failed_queue,
             "summary-m1",
@@ -3812,10 +3883,11 @@ mod status_message_tests {
 
     #[test]
     fn recovery_existing_summary_job_status_error_is_not_claimable() {
-        let mut queue = fake_recovery_queue_with_existing_summary_job("queued");
+        let mut queue = fake_recovery_queue_with_existing_summary_job_status("queued");
         let status_key = format!("{}|{}", RECOVERY_SUMMARY_JOB_STATUS_SQL, "summary-m1");
         queue
             .executor
+            .inner
             .query_rows_error
             .insert(status_key, "status lookup failed".to_owned());
 
@@ -3824,6 +3896,46 @@ mod status_message_tests {
             "summary-m1",
             "m1"
         ));
+    }
+
+    #[test]
+    fn recovery_stale_running_summary_job_becomes_claimable() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("running", true);
+
+        assert!(recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+        assert_eq!(queue.executor.job_status, "queued");
+        assert!(queue.executor.inner.executed.iter().any(|(sql, params)| {
+            sql == RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL
+                && params == &vec!["summary-m1".to_owned()]
+        }));
+    }
+
+    #[test]
+    fn recovery_failed_summary_job_is_not_requeued_as_stale_running() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("failed", false);
+
+        assert!(!recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+        assert_eq!(queue.executor.job_status, "failed");
+    }
+
+    #[test]
+    fn recovery_fresh_running_summary_job_is_not_requeued_as_stale_running() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("running", false);
+
+        assert!(!recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+        assert_eq!(queue.executor.job_status, "running");
     }
 
     #[test]
