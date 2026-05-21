@@ -187,6 +187,7 @@ fn parse_whisper_response_rejects_invalid_segment_values() {
         r#"{"text":"bad","segments":[{"start":2.0,"end":1.0,"text":"x"}]}"#,
         r#"{"text":"bad","segments":[{"start":0.0,"end":0.0,"text":"x"}]}"#,
         r#"{"text":"bad","segments":[{"start":0.0001,"end":0.0002,"text":"x"}]}"#,
+        r#"{"text":"bad","segments":[{"start":3000000.0,"end":3000001.0,"text":"x"}]}"#,
         r#"{"text":"bad","segments":[{"end":1.0,"text":"x"}]}"#,
         r#"{"text":"bad","segments":[{"start":0.0,"end":1.0}]}"#,
         r#"{"text":"bad","segments":[{"start":0.0,"end":1.0,"text":"   "}]}"#,

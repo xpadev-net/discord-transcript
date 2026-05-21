@@ -16,8 +16,8 @@ use crate::domain::authz::UserRole;
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::{
-    NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments,
-    render_for_summary,
+    MAX_DB_TIMESTAMP_MS, NormalizationConfig, TranscriptSegment, TranscriptSource,
+    normalize_segments, render_for_summary,
 };
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::integrations::{
@@ -331,6 +331,76 @@ fn retry_claimed_summary_job<Q: JobQueue>(
     summary_retry_exhausted(retry_status, &job.meeting_id, &job.id, phase)
 }
 
+fn db_safe_transcript_timestamp_ms(
+    segment_index: usize,
+    field: &str,
+    value: u64,
+) -> Result<i32, String> {
+    if value > MAX_DB_TIMESTAMP_MS {
+        return Err(format!(
+            "transcript segment {segment_index} {field} timestamp {value}ms exceeds database integer range"
+        ));
+    }
+    i32::try_from(value).map_err(|_| {
+        format!(
+            "transcript segment {segment_index} {field} timestamp {value}ms exceeds database integer range"
+        )
+    })
+}
+
+fn persist_transcript_segments<E: SqlExecutor>(
+    executor: &mut E,
+    meeting_id: &str,
+    segments: &[TranscriptSegment],
+) -> Result<(), String> {
+    if segments.is_empty() {
+        executor
+            .execute(
+                "DELETE FROM transcripts WHERE meeting_id=$1",
+                &[meeting_id.to_owned()],
+            )
+            .map(|_| ())
+            .map_err(|err| format!("failed to clear old transcript segments: {err}"))?;
+        return Ok(());
+    }
+
+    let base_sql =
+        crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(segments.len(), 1);
+    let sql = format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
+    let mut params = Vec::with_capacity(segments.len() * 9 + 1);
+    params.push(meeting_id.to_owned());
+    for (i, seg) in segments.iter().enumerate() {
+        let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)?;
+        let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)?;
+        params.push(format!("{meeting_id}-t-{i}"));
+        params.push(meeting_id.to_owned());
+        params.push(seg.speaker_id.clone());
+        params.push(start_ms.to_string());
+        params.push(end_ms.to_string());
+        params.push(seg.text.clone());
+        params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
+        params.push(seg.is_noisy.to_string());
+        params.push(seg.source.as_str().to_owned());
+    }
+
+    executor
+        .execute(&sql, &params)
+        .map(|_| ())
+        .map_err(|err| format!("failed to persist transcript segments: {err}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SummaryJobRunError {
+    Terminal(String),
+    RetryScheduled(String),
+}
+
+impl From<String> for SummaryJobRunError {
+    fn from(value: String) -> Self {
+        Self::Terminal(value)
+    }
+}
+
 fn retry_summary_job_after_posting_failure<S, Q>(
     store: &mut S,
     queue: &mut Q,
@@ -412,6 +482,104 @@ where
                 .map_err(|store_err| {
                     format!(
                         "summary post retry failed ({err}) and error message update failed: {store_err}"
+                    )
+                })?;
+            Ok(true)
+        }
+    }
+}
+
+fn retry_summary_job_after_transcript_persist_failure<S, Q>(
+    store: &mut S,
+    queue: &mut Q,
+    meeting_id: &str,
+    job_id: &str,
+    error_message: String,
+    max_retries: u32,
+) -> Result<bool, String>
+where
+    S: MeetingStore,
+    Q: JobQueue,
+{
+    match queue.retry(job_id, error_message.clone(), max_retries) {
+        Ok(crate::domain::JobStatus::Queued) => {
+            if let Err(err) = store.set_meeting_status(
+                meeting_id,
+                MeetingStatus::Stopping,
+                Some(MeetingStatus::Transcribing),
+            ) {
+                warn!(
+                    meeting_id,
+                    job_id,
+                    error = %err,
+                    "transcript persist retry queued but meeting status update failed"
+                );
+            }
+            if let Err(err) = store.set_error_message(meeting_id, Some(error_message)) {
+                warn!(
+                    meeting_id,
+                    job_id,
+                    error = %err,
+                    "transcript persist retry queued but error message update failed"
+                );
+            }
+            Ok(false)
+        }
+        Ok(crate::domain::JobStatus::Failed) => {
+            store
+                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+                .map_err(|err| {
+                    format!(
+                        "transcript persist retry exhausted but meeting failure update failed: {err}"
+                    )
+                })?;
+            store
+                .set_error_message(meeting_id, Some(error_message))
+                .map_err(|err| {
+                    format!(
+                        "transcript persist retry exhausted but error message update failed: {err}"
+                    )
+                })?;
+            Ok(true)
+        }
+        Ok(status) => {
+            warn!(
+                meeting_id,
+                job_id,
+                status = %status.as_str(),
+                "unexpected transcript persist retry status; leaving meeting status unchanged"
+            );
+            Ok(false)
+        }
+        Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
+            warn!(
+                meeting_id,
+                job_id,
+                error = %err,
+                "failed to durably retry transcript persist failure; leaving meeting status unchanged"
+            );
+            let _ = store.set_error_message(meeting_id, Some(error_message));
+            Ok(false)
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                job_id,
+                error = %err,
+                "transcript persist retry cannot be durably scheduled"
+            );
+            store
+                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+                .map_err(|store_err| {
+                    format!(
+                        "transcript persist retry failed ({err}) and meeting failure update failed: {store_err}"
+                    )
+                })?;
+            store
+                .set_error_message(meeting_id, Some(error_message))
+                .map_err(|store_err| {
+                    format!(
+                        "transcript persist retry failed ({err}) and error message update failed: {store_err}"
                     )
                 })?;
             Ok(true)
@@ -1845,7 +2013,8 @@ impl ScaffoldHandler {
                 }
                 Ok(())
             }
-            Err(err) => {
+            Err(SummaryJobRunError::RetryScheduled(err)) => Err(err),
+            Err(SummaryJobRunError::Terminal(err)) => {
                 // process_enqueued_summary_job already handles Failed/retry status.
                 // Also update the status message so users see the failure.
                 if let Err(status_err) = self
@@ -1930,7 +2099,7 @@ impl ScaffoldHandler {
         &self,
         http: &Http,
         meeting_id: &str,
-    ) -> Result<crate::application::worker::ProcessMeetingOutput, String> {
+    ) -> Result<crate::application::worker::ProcessMeetingOutput, SummaryJobRunError> {
         let whisper = CommandWhisperClient {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
@@ -1995,7 +2164,9 @@ impl ScaffoldHandler {
             queue.claim_by_id(&job_id).map_err(|err| err.to_string())?
         };
         let Some(claimed_job) = claimed_job else {
-            return Err(format!("summary job was not available for job_id={job_id}"));
+            return Err(SummaryJobRunError::Terminal(format!(
+                "summary job was not available for job_id={job_id}"
+            )));
         };
         if claimed_job.meeting_id != meeting_id {
             warn!(
@@ -2031,7 +2202,7 @@ impl ScaffoldHandler {
                             .store
                             .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
                     }
-                    return Err(err_string);
+                    return Err(SummaryJobRunError::Terminal(err_string));
                 }
             };
 
@@ -2077,7 +2248,7 @@ impl ScaffoldHandler {
                             );
                         }
                     }
-                    return Err(err);
+                    return Err(SummaryJobRunError::Terminal(err));
                 }
             };
 
@@ -2125,7 +2296,7 @@ impl ScaffoldHandler {
                     "failed to update status message after summary start CAS failure"
                 );
             }
-            return Err(cas_err_string);
+            return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
         if let Err(err) = self
@@ -2228,7 +2399,7 @@ impl ScaffoldHandler {
                         );
                     }
                 }
-                return Err(err_string);
+                return Err(SummaryJobRunError::Terminal(err_string));
             }
         };
 
@@ -2284,48 +2455,65 @@ impl ScaffoldHandler {
             );
         }
 
-        // Persist transcript segments to DB (best-effort)
-        if transcription.segments.is_empty() {
+        if let Err(err) = {
             let mut service = self.service.lock().await;
-            if let Err(err) = service.store.executor.execute(
-                "DELETE FROM transcripts WHERE meeting_id=$1",
-                std::slice::from_ref(&claimed_job.meeting_id),
-            ) {
-                warn!(
-                    meeting_id = %claimed_job.meeting_id,
-                    error = %err,
-                    "failed to clear old transcript segments for empty transcription persist"
-                );
-            }
-        }
-        if !transcription.segments.is_empty() {
-            let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(
-                transcription.segments.len(),
-                1,
+            persist_transcript_segments(
+                &mut service.store.executor,
+                &claimed_job.meeting_id,
+                &transcription.segments,
+            )
+        } {
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                error = %err,
+                "failed to persist transcript segments"
             );
-            let sql =
-                format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
-            let mut params = Vec::with_capacity(transcription.segments.len() * 9 + 1);
-            params.push(claimed_job.meeting_id.clone());
-            for (i, seg) in transcription.segments.iter().enumerate() {
-                params.push(format!("{}-t-{i}", claimed_job.meeting_id));
-                params.push(claimed_job.meeting_id.clone());
-                params.push(seg.speaker_id.clone());
-                params.push(seg.start_ms.to_string());
-                params.push(seg.end_ms.to_string());
-                params.push(seg.text.clone());
-                params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
-                params.push(seg.is_noisy.to_string());
-                params.push(seg.source.as_str().to_owned());
+            let retry_result = {
+                let mut service = self.service.lock().await;
+                let mut queue = self.queue.lock().await;
+                retry_summary_job_after_transcript_persist_failure(
+                    &mut service.store,
+                    &mut *queue,
+                    &claimed_job.meeting_id,
+                    &claimed_job.id,
+                    err.clone(),
+                    self.summary_max_retries,
+                )
+            };
+            let exhausted = match retry_result {
+                Ok(exhausted) => exhausted,
+                Err(retry_err) => {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %retry_err,
+                        "failed to update transcript persist retry state"
+                    );
+                    true
+                }
+            };
+            if exhausted {
+                if let Err(status_err) = self
+                    .update_status_message(
+                        http,
+                        &claimed_job.meeting_id,
+                        StatusMessageUpdate::Failed {
+                            phase: "transcript_persist",
+                            error: &err,
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %status_err,
+                        "failed to update status message after transcript persist failure"
+                    );
+                }
             }
-            let mut service = self.service.lock().await;
-            if let Err(err) = service.store.executor.execute(&sql, &params) {
-                warn!(
-                    meeting_id = %claimed_job.meeting_id,
-                    error = %err,
-                    "failed to persist transcript segments"
-                );
+            if exhausted {
+                return Err(SummaryJobRunError::Terminal(err));
             }
+            return Err(SummaryJobRunError::RetryScheduled(err));
         }
 
         // Resolve speaker labels for summarization and snapshot to DB (best-effort)
@@ -2429,7 +2617,7 @@ impl ScaffoldHandler {
                     "failed to update status message after summary start CAS failure"
                 );
             }
-            return Err(cas_err_string);
+            return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
         let markdown = tokio::task::block_in_place(|| {
@@ -2524,7 +2712,7 @@ impl ScaffoldHandler {
                         );
                     }
                 }
-                return Err(err_string);
+                return Err(SummaryJobRunError::Terminal(err_string));
             }
         };
 
@@ -3455,6 +3643,73 @@ mod status_message_tests {
         }
     }
 
+    fn transcribing_meeting() -> crate::infrastructure::storage::StoredMeeting {
+        let mut meeting = summarizing_meeting();
+        meeting.status = crate::domain::MeetingStatus::Transcribing;
+        meeting
+    }
+
+    fn transcript_segment(start_ms: u64, end_ms: u64) -> TranscriptSegment {
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms,
+            end_ms,
+            text: "hello".to_owned(),
+            confidence: Some(0.9),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        }
+    }
+
+    #[test]
+    fn transcript_persist_rejects_timestamp_above_db_integer_range() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let err = persist_transcript_segments(
+            &mut executor,
+            "m1",
+            &[transcript_segment(0, MAX_DB_TIMESTAMP_MS + 1)],
+        )
+        .expect_err("overflowing transcript timestamp should fail before SQL");
+
+        assert!(err.contains("exceeds database integer range"));
+        assert!(
+            executor.executed.is_empty(),
+            "invalid timestamps should not reach the SQL executor"
+        );
+    }
+
+    #[test]
+    fn transcript_persist_surfaces_insert_failure() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let segment = transcript_segment(0, 1_000);
+        let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(1, 1);
+        let sql =
+            format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
+        let params = vec![
+            "m1".to_owned(),
+            "m1-t-0".to_owned(),
+            "m1".to_owned(),
+            "alice".to_owned(),
+            "0".to_owned(),
+            "1000".to_owned(),
+            "hello".to_owned(),
+            "0.9".to_owned(),
+            "false".to_owned(),
+            "voice".to_owned(),
+        ];
+        let key = format!("{}|{}", sql, params.join("\u{1f}"));
+        executor
+            .execute_error
+            .insert(key, "integer out of range".to_owned());
+
+        let err = persist_transcript_segments(&mut executor, "m1", &[segment])
+            .expect_err("insert failure should be surfaced");
+
+        assert!(err.contains("failed to persist transcript segments"));
+        assert!(err.contains("integer out of range"));
+    }
+
     #[test]
     fn merge_phase_error_requeues_claimed_summary_job_before_exhaustion() {
         let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
@@ -3544,6 +3799,98 @@ mod status_message_tests {
         assert_eq!(
             meeting.error_message.as_deref(),
             Some("summary posting failed: discord 500")
+        );
+    }
+
+    #[test]
+    fn transcript_persist_error_requeues_job_and_reverts_meeting_before_exhaustion() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(transcribing_meeting());
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let exhausted = retry_summary_job_after_transcript_persist_failure(
+            &mut store,
+            &mut queue,
+            "m1",
+            &job.id,
+            "failed to persist transcript segments: integer out of range".to_owned(),
+            2,
+        )
+        .expect("retry should update meeting");
+
+        assert!(!exhausted);
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
+        assert_eq!(updated.retry_count, 1);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("failed to persist transcript segments: integer out of range")
+        );
+    }
+
+    #[test]
+    fn transcript_persist_error_marks_job_and_meeting_failed_after_exhaustion() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(transcribing_meeting());
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let exhausted = retry_summary_job_after_transcript_persist_failure(
+            &mut store,
+            &mut queue,
+            "m1",
+            &job.id,
+            "failed to persist transcript segments: integer out of range".to_owned(),
+            0,
+        )
+        .expect("retry exhaustion should update meeting");
+
+        assert!(exhausted);
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+        assert_eq!(updated.retry_count, 1);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("failed to persist transcript segments: integer out of range")
+        );
+    }
+
+    #[test]
+    fn transcript_persist_retry_status_update_failure_stays_retry_scheduled() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = transcribing_meeting();
+        meeting.status = crate::domain::MeetingStatus::Posted;
+        store.insert(meeting);
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let exhausted = retry_summary_job_after_transcript_persist_failure(
+            &mut store,
+            &mut queue,
+            "m1",
+            &job.id,
+            "failed to persist transcript segments: database unavailable".to_owned(),
+            2,
+        )
+        .expect("queued retry should not become terminal when annotation fails");
+
+        assert!(!exhausted);
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
+        assert_eq!(updated.retry_count, 1);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("failed to persist transcript segments: database unavailable")
         );
     }
 
