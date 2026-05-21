@@ -68,7 +68,8 @@ DELETE FROM artifacts a
 USING meetings m
 WHERE a.meeting_id = m.id
   AND a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')
-  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.stopped_at IS NOT NULL
+  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
@@ -398,28 +399,45 @@ fn record_cleanup_result(
 
 fn remove_legacy_raw_audio(meeting_dir: &Path) -> Result<bool, String> {
     let mut removed = false;
+    let mut errors = Vec::new();
     match fs::read_dir(meeting_dir) {
         Ok(entries) => {
             for entry in entries {
-                let entry = entry
-                    .map_err(|err| format!("failed to read {}: {err}", meeting_dir.display()))?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        errors.push(format!("failed to read {}: {err}", meeting_dir.display()));
+                        continue;
+                    }
+                };
                 let path = entry.path();
                 if path.extension().and_then(|ext| ext.to_str()) == Some("wav") {
-                    fs::remove_file(&path)
-                        .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
-                    removed = true;
+                    match fs::remove_file(&path) {
+                        Ok(()) => removed = true,
+                        Err(err) => {
+                            errors.push(format!("failed to remove {}: {err}", path.display()))
+                        }
+                    }
                 }
             }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(format!("failed to read {}: {err}", meeting_dir.display())),
+        Err(err) => errors.push(format!("failed to read {}: {err}", meeting_dir.display())),
     }
 
-    if remove_dir_if_present(&meeting_dir.join("speakers"))? {
-        removed = true;
+    match remove_dir_if_present(&meeting_dir.join("speakers")) {
+        Ok(true) => removed = true,
+        Ok(false) => {}
+        Err(err) => errors.push(err),
     }
-    remove_empty_dir_if_present(meeting_dir)?;
-    Ok(removed)
+    if let Err(err) = remove_empty_dir_if_present(meeting_dir) {
+        errors.push(err);
+    }
+    if errors.is_empty() {
+        Ok(removed)
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn remove_empty_dir_if_present(path: &Path) -> Result<bool, String> {
