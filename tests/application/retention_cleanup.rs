@@ -129,7 +129,9 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
     .expect("cleanup should succeed");
 
     assert_eq!(report.summaries_deleted, 6);
-    assert_eq!(report.artifacts_deleted, 11);
+    // Four unregistered artifact-delete queries each return FakeSqlExecutor's
+    // default of 1; only the summary-artifact query (7) is explicitly set.
+    assert_eq!(report.artifacts_deleted, 11); // 1 + 1 + 1 + 1 + 7
     assert!(
         executor
             .executed

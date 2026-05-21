@@ -198,6 +198,8 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
         RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
         std::slice::from_ref(&transcript_ttl),
     )?;
+    // Debug artifacts intentionally share the raw-audio TTL; add a
+    // dedicated RETENTION_DEBUG_TTL_DAYS if independent control is needed.
     report.artifacts_deleted += executor.execute(
         RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
         std::slice::from_ref(&raw_ttl),
