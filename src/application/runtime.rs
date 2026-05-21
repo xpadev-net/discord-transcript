@@ -57,15 +57,20 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
 const AUTO_STOP_FINAL_FLUSH_MAX_RETRIES: u32 = 10;
+const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandSpec {
@@ -291,6 +296,24 @@ fn flush_session_for_teardown<S: ChunkStorage>(
             Err(err.to_string())
         }
     }
+}
+
+fn flush_sessions_for_shutdown<S: ChunkStorage>(
+    sessions: &mut HashMap<String, RecordingSession<S>>,
+) -> usize {
+    let mut flushed = 0usize;
+    for (guild_id, session) in sessions.iter_mut() {
+        match flush_session_for_teardown(session, guild_id, "shutdown") {
+            Ok(()) => flushed += 1,
+            Err(err) => warn!(
+                guild_id = %guild_id,
+                meeting_id = %session.meeting_id,
+                error = %err,
+                "failed to drain recording session during shutdown"
+            ),
+        }
+    }
+    flushed
 }
 
 fn summary_retry_exhausted(
@@ -996,7 +1019,13 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
+        command_gate: Arc::new(RwLock::new(())),
+        voice_event_gate: Arc::new(RwLock::new(())),
+        background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        shutdown_token: CancellationToken::new(),
+        task_tracker: TaskTracker::new(),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
@@ -1031,16 +1060,27 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let songbird_config =
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
+    let voice_manager = songbird::Songbird::serenity_from_config(songbird_config);
     let mut client = Client::builder(&config.discord_token, intents)
-        .event_handler(handler)
-        .register_songbird_from_config(songbird_config)
+        .event_handler(handler.clone())
+        .register_songbird_with(Arc::clone(&voice_manager))
         .await
         .map_err(|err| RuntimeError::ClientInit(err.to_string()))?;
+    let shard_manager = Arc::clone(&client.shard_manager);
 
-    client
-        .start()
-        .await
-        .map_err(|err| RuntimeError::ClientRun(err.to_string()))
+    tokio::select! {
+        result = client.start() => {
+            handler.shutdown(Arc::clone(&voice_manager), SHUTDOWN_GRACE_TIMEOUT).await;
+            result.map_err(|err| RuntimeError::ClientRun(err.to_string()))
+        }
+        () = shutdown_signal() => {
+            info!("shutdown signal received");
+            handler.shutting_down.store(true, Ordering::Release);
+            shard_manager.shutdown_all().await;
+            handler.shutdown(voice_manager, SHUTDOWN_GRACE_TIMEOUT).await;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1051,7 +1091,13 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
+    command_gate: Arc<RwLock<()>>,
+    voice_event_gate: Arc<RwLock<()>>,
+    background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_token: CancellationToken,
+    task_tracker: TaskTracker,
     chunk_storage_dir: String,
     auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
@@ -1072,6 +1118,146 @@ struct ScaffoldHandler {
     bot_admin_user_ids: HashSet<String>,
 }
 
+impl ScaffoldHandler {
+    fn spawn_background<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let _spawn_guard = self
+            .background_spawn_gate
+            .lock()
+            .expect("background spawn gate poisoned");
+        if self.shutting_down.load(Ordering::Acquire) {
+            debug!("spawn_background: shutdown in progress, dropping background task");
+            return;
+        }
+        self.task_tracker.spawn(future);
+    }
+
+    fn reject_if_shutting_down(&self) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err("shutdown in progress; try again after restart".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn shutdown(&self, voice_manager: Arc<songbird::Songbird>, grace: Duration) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.shutdown_token.cancel();
+
+        {
+            let _command_guard = self.command_gate.write().await;
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            {
+                let _spawn_guard = self
+                    .background_spawn_gate
+                    .lock()
+                    .expect("background spawn gate poisoned");
+                self.task_tracker.close();
+            }
+
+            match timeout(
+                SHUTDOWN_VOICE_LEAVE_TIMEOUT,
+                voice_manager.leave(self.guild_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!(
+                        guild_id = %self.guild_id,
+                        error = %err,
+                        "failed to leave voice channel during shutdown"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        guild_id = %self.guild_id,
+                        timeout_secs = SHUTDOWN_VOICE_LEAVE_TIMEOUT.as_secs(),
+                        "timed out leaving voice channel during shutdown"
+                    );
+                }
+            }
+
+            {
+                let tracker = self.ssrc_tracker.lock().await.clone();
+                let mut sessions = self.sessions.lock().await;
+                let flushed = flush_sessions_for_shutdown(&mut sessions);
+                for session in sessions.values() {
+                    session.persist_ssrc_mapping(&tracker);
+                }
+                info!(
+                    sessions = sessions.len(),
+                    flushed, "recording sessions drained during shutdown"
+                );
+            }
+            {
+                let mut states = self.auto_stop_states.lock().await;
+                states.clear();
+            }
+        }
+
+        match timeout(grace, self.task_tracker.wait()).await {
+            Ok(()) => info!("background tasks drained during shutdown"),
+            Err(_) => warn!(
+                timeout_secs = grace.as_secs(),
+                "timed out waiting for background tasks during shutdown"
+            ),
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => Some(signal),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to register SIGTERM handler; only CTRL-C will trigger graceful shutdown"
+                );
+                None
+            }
+        };
+        tokio::select! {
+            _ = async {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "failed to register CTRL-C handler; waiting for other shutdown signals"
+                        );
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {}
+            _ = async {
+                if let Some(signal) = terminate.as_mut() {
+                    signal.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(
+                error = %err,
+                "failed to register CTRL-C handler; graceful shutdown signal disabled"
+            );
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[async_trait]
 impl EventHandler for ScaffoldHandler {
     async fn ready(&self, ctx: Context, _data_about_bot: Ready) {
@@ -1090,7 +1276,7 @@ impl EventHandler for ScaffoldHandler {
             .is_ok()
         {
             let retention_handler = self.clone();
-            tokio::spawn(async move {
+            self.spawn_background(async move {
                 if let Err(err) = retention_handler.run_startup_retention_cleanup().await {
                     error!(error = %err, "startup retention cleanup failed");
                 }
@@ -1104,7 +1290,7 @@ impl EventHandler for ScaffoldHandler {
 
         let recovery_handler = self.clone();
         let recovery_ctx = ctx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             if let Err(err) = recovery_handler.run_startup_recovery(&recovery_ctx).await {
                 error!(error = %err, "startup recovery failed");
             }
@@ -1130,6 +1316,9 @@ impl EventHandler for ScaffoldHandler {
 
             let message = match guild_error {
                 Some(err) => format!("error: {err}"),
+                None if self.shutting_down.load(Ordering::Acquire) => {
+                    "error: shutdown in progress; try again after restart".to_owned()
+                }
                 None => self.handle_command(&ctx, &command).await,
             };
 
@@ -1161,6 +1350,9 @@ impl EventHandler for ScaffoldHandler {
     }
 
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, _new: VoiceState) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         if _new.guild_id != Some(self.guild_id) {
             return;
         }
@@ -1199,10 +1391,18 @@ impl EventHandler for ScaffoldHandler {
             let expected_meeting_id = self.active_meeting_id().await;
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
-            tokio::spawn(async move {
+            self.spawn_background(async move {
                 let mut final_flush_failures = 0u32;
                 loop {
-                    sleep(grace_for_task).await;
+                    tokio::select! {
+                        _ = sleep(grace_for_task) => {}
+                        _ = handler.shutdown_token.cancelled() => {
+                            return;
+                        }
+                    }
+                    if handler.shutting_down.load(Ordering::Acquire) {
+                        return;
+                    }
                     // Verify the same meeting is still active (not a new recording)
                     let current_meeting_id = handler.active_meeting_id().await;
                     if current_meeting_id != expected_meeting_id || expected_meeting_id.is_none() {
@@ -1716,6 +1916,7 @@ impl ScaffoldHandler {
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
         run_guild_scoped_command(command.guild_id, self.guild_id, |_| async {
+            self.reject_if_shutting_down()?;
             match command.data.name.as_str() {
                 RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
                 RECORD_STOP_COMMAND => self.handle_record_stop(ctx, command).await,
@@ -1730,6 +1931,7 @@ impl ScaffoldHandler {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<String, String> {
+        self.reject_if_shutting_down()?;
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let voice_channel_id_u64 = resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
 
@@ -1763,6 +1965,8 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
+        let _command_guard = self.command_gate.read().await;
+        self.reject_if_shutting_down()?;
 
         let mut service = self.service.lock().await;
         let response = complete_record_start_after_runtime_setup(
@@ -1933,6 +2137,7 @@ impl ScaffoldHandler {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<String, String> {
+        self.reject_if_shutting_down()?;
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
         let caller_role = resolve_command_user_role(
@@ -1955,6 +2160,8 @@ impl ScaffoldHandler {
                 .map_err(|err| err.to_string())?;
             meeting.id
         };
+        let _command_guard = self.command_gate.read().await;
+        self.reject_if_shutting_down()?;
 
         let flushed_meeting_id = {
             let mut sessions = self.sessions.lock().await;
@@ -2040,10 +2247,17 @@ impl ScaffoldHandler {
                 // response window, and should not block the command reply.
                 let handler = self.clone();
                 let http = Arc::clone(&ctx.http);
-                tokio::spawn(async move {
-                    let result = run_summary_background(&handler, &http, &meeting_id).await;
-                    if let Err(err) = result {
-                        error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                let shutdown_token = handler.shutdown_token.clone();
+                self.spawn_background(async move {
+                    tokio::select! {
+                        result = run_summary_background(&handler, &http, &meeting_id) => {
+                            if let Err(err) = result {
+                                error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                            }
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            debug!(meeting_id = %meeting_id, "summary background task deferred by shutdown");
+                        }
                     }
                 });
             }
@@ -3167,6 +3381,13 @@ struct VoiceReceiveHandler {
 #[serenity::async_trait]
 impl SongbirdEventHandler for VoiceReceiveHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self.runtime.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
+        let _voice_event_guard = self.runtime.voice_event_gate.read().await;
+        if self.runtime.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         match ctx {
             EventContext::SpeakingStateUpdate(evt) => {
                 if let Some(user_id) = evt.user_id {
@@ -3219,8 +3440,16 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let ctx_for_task = self.ctx.clone();
                     let expected_meeting_id = runtime.active_meeting_id().await;
                     let grace = Duration::from_secs(runtime.auto_stop_grace_seconds);
-                    tokio::spawn(async move {
-                        sleep(grace).await;
+                    self.runtime.spawn_background(async move {
+                        tokio::select! {
+                            _ = sleep(grace) => {}
+                            _ = runtime.shutdown_token.cancelled() => {
+                                return;
+                            }
+                        }
+                        if runtime.shutting_down.load(Ordering::Acquire) {
+                            return;
+                        }
                         let current_meeting_id = runtime.active_meeting_id().await;
                         if current_meeting_id != expected_meeting_id || current_meeting_id.is_none()
                         {
@@ -3332,17 +3561,30 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         "failed to update status message after driver disconnect stop"
                                     );
                                 }
-                                if result.outcome == StopOutcome::Owner
-                                    && let Err(err) =
-                                        run_summary_background(&runtime, &http, &result.meeting_id)
-                                            .await
-                                {
-                                    warn!(
-                                        guild_id = %guild_key,
-                                        meeting_id = %result.meeting_id,
-                                        error = %err,
-                                        "failed to process summary after driver disconnect"
-                                    );
+                                if result.outcome == StopOutcome::Owner {
+                                    tokio::select! {
+                                        summary_result = run_summary_background(
+                                            &runtime,
+                                            &http,
+                                            &result.meeting_id,
+                                        ) => {
+                                            if let Err(err) = summary_result {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    meeting_id = %result.meeting_id,
+                                                    error = %err,
+                                                    "failed to process summary after driver disconnect"
+                                                );
+                                            }
+                                        }
+                                        _ = runtime.shutdown_token.cancelled() => {
+                                            debug!(
+                                                guild_id = %guild_key,
+                                                meeting_id = %result.meeting_id,
+                                                "driver-disconnect summary task deferred by shutdown"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -3639,6 +3881,7 @@ mod status_message_tests {
     #[derive(Debug, Clone)]
     struct RuntimeFlakyChunkStorage {
         failures_remaining: Arc<AtomicUsize>,
+        saved_chunks: Arc<AtomicUsize>,
     }
 
     impl ChunkStorage for RuntimeFlakyChunkStorage {
@@ -3659,6 +3902,7 @@ mod status_message_tests {
             {
                 return Err(ChunkStorageError::Io("injected failure".to_owned()));
             }
+            self.saved_chunks.fetch_add(1, Ordering::SeqCst);
             Ok(SavedChunk {
                 path: std::env::temp_dir().join(format!("{user_id}_{sequence}_{start_ms}.wav")),
                 size_bytes: bytes.len(),
@@ -3667,10 +3911,18 @@ mod status_message_tests {
     }
 
     fn session_with_one_flaky_chunk(failures: usize) -> RecordingSession<RuntimeFlakyChunkStorage> {
+        session_with_one_flaky_chunk_and_counter(failures, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn session_with_one_flaky_chunk_and_counter(
+        failures: usize,
+        saved_chunks: Arc<AtomicUsize>,
+    ) -> RecordingSession<RuntimeFlakyChunkStorage> {
         let mut session = RecordingSession::new(
             "meeting-1".to_owned(),
             RuntimeFlakyChunkStorage {
                 failures_remaining: Arc::new(AtomicUsize::new(failures)),
+                saved_chunks,
             },
             ReceiverConfig {
                 chunk_duration: Duration::from_secs(20),
@@ -3695,6 +3947,16 @@ mod status_message_tests {
             flush_session_for_teardown(&mut session, "g1", phase).is_ok(),
             "{phase} should be able to retry retained failed chunks"
         );
+    }
+
+    #[test]
+    fn shutdown_flushes_pending_recording_chunks() {
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let session = session_with_one_flaky_chunk_and_counter(0, Arc::clone(&saved_chunks));
+        let mut sessions = HashMap::from([("g1".to_owned(), session)]);
+
+        assert_eq!(flush_sessions_for_shutdown(&mut sessions), 1);
+        assert_eq!(saved_chunks.load(Ordering::SeqCst), 1);
     }
 
     #[test]
