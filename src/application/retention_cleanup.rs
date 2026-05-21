@@ -13,6 +13,7 @@ FROM meetings
 WHERE stopped_at IS NOT NULL
   AND stopped_at < NOW() - (($1 || ' days')::interval)
   AND status IN ('posted', 'failed', 'aborted')
+  AND retention_raw_cleaned_at IS NULL
 "#;
 
 // See RETENTION_EXPIRED_RAW_WORKSPACES_SQL for why this intentionally mirrors
@@ -131,11 +132,21 @@ WHERE a.meeting_id = m.id
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
+pub const RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL: &str = r#"
+UPDATE meetings
+SET retention_raw_cleaned_at=NOW(),
+    updated_at=NOW()
+WHERE id=$1
+  AND retention_raw_cleaned_at IS NULL
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionCleanupReport {
     pub raw_workspaces_scanned: usize,
     pub raw_audio_dirs_removed: usize,
     pub legacy_meetings_cleaned: usize,
+    pub raw_workspaces_marked_cleaned: u64,
+    pub raw_workspace_cleaned_meeting_ids: Vec<String>,
     pub speaker_dirs_removed: usize,
     pub context_dirs_removed: usize,
     pub transcript_dirs_removed: usize,
@@ -152,6 +163,9 @@ impl RetentionCleanupReport {
         self.raw_workspaces_scanned += other.raw_workspaces_scanned;
         self.raw_audio_dirs_removed += other.raw_audio_dirs_removed;
         self.legacy_meetings_cleaned += other.legacy_meetings_cleaned;
+        self.raw_workspaces_marked_cleaned += other.raw_workspaces_marked_cleaned;
+        self.raw_workspace_cleaned_meeting_ids
+            .extend(other.raw_workspace_cleaned_meeting_ids);
         self.speaker_dirs_removed += other.speaker_dirs_removed;
         self.context_dirs_removed += other.context_dirs_removed;
         self.transcript_dirs_removed += other.transcript_dirs_removed;
@@ -166,7 +180,7 @@ impl RetentionCleanupReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionCleanupError {
-    pub report: RetentionCleanupReport,
+    pub report: Box<RetentionCleanupReport>,
     pub message: String,
 }
 
@@ -204,17 +218,22 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
             None
         }
         Err(err) => {
-            report.merge(err.report);
+            report.merge(*err.report);
             Some(err.message)
         }
     };
-    let database_error = match apply_retention_database_cleanup(executor, policy) {
+    let raw_workspace_cleaned_meeting_ids = report.raw_workspace_cleaned_meeting_ids.clone();
+    let database_error = match apply_retention_database_cleanup(
+        executor,
+        policy,
+        &raw_workspace_cleaned_meeting_ids,
+    ) {
         Ok(database_report) => {
             report.merge(database_report);
             None
         }
         Err(err) => {
-            report.merge(err.report);
+            report.merge(*err.report);
             Some(err.message)
         }
     };
@@ -231,7 +250,10 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
         Some(messages.join("; "))
     };
     if let Some(message) = message {
-        Err(RetentionCleanupError { report, message })
+        Err(RetentionCleanupError {
+            report: Box::new(report),
+            message,
+        })
     } else {
         Ok(report)
     }
@@ -286,6 +308,7 @@ pub fn apply_retention_filesystem_cleanup(
     let mut report = RetentionCleanupReport::default();
     let mut errors = Vec::new();
     for meeting in &plan.raw_workspaces {
+        let error_count_before = errors.len();
         report.raw_workspaces_scanned += 1;
         let workspace = workspace_layout.for_meeting(
             &meeting.guild_id,
@@ -322,6 +345,11 @@ pub fn apply_retention_filesystem_cleanup(
             remove_dir_if_present(&workspace.debug_dir()),
             || report.debug_dirs_removed += 1,
         );
+        if errors.len() == error_count_before {
+            report
+                .raw_workspace_cleaned_meeting_ids
+                .push(meeting.meeting_id.clone());
+        }
     }
 
     for meeting in &plan.transcript_workspaces {
@@ -354,7 +382,7 @@ pub fn apply_retention_filesystem_cleanup(
         Ok(report)
     } else {
         Err(RetentionCleanupError {
-            report,
+            report: Box::new(report),
             message: errors.join("; "),
         })
     }
@@ -363,11 +391,22 @@ pub fn apply_retention_filesystem_cleanup(
 pub fn apply_retention_database_cleanup<E: SqlExecutor>(
     executor: &mut E,
     policy: RetentionPolicy,
+    raw_workspace_cleaned_meeting_ids: &[String],
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let mut report = RetentionCleanupReport::default();
     let mut errors = Vec::new();
     let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
     let transcript_ttl = policy.transcript_ttl_days.get().to_string();
+
+    for meeting_id in raw_workspace_cleaned_meeting_ids {
+        match executor.execute(
+            RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL,
+            std::slice::from_ref(meeting_id),
+        ) {
+            Ok(count) => report.raw_workspaces_marked_cleaned += count,
+            Err(err) => errors.push(err),
+        }
+    }
 
     match executor.execute(
         RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
@@ -426,7 +465,7 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
         Ok(report)
     } else {
         Err(RetentionCleanupError {
-            report,
+            report: Box::new(report),
             message: errors.join("; "),
         })
     }

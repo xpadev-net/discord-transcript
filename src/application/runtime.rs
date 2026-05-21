@@ -1422,7 +1422,7 @@ impl ScaffoldHandler {
         let mut report = match filesystem_result {
             Ok(report) => report,
             Err(err) => {
-                let report = err.report;
+                let report = *err.report;
                 warn!(
                     error = %err.message,
                     "retention filesystem cleanup failed; continuing with database cleanup"
@@ -1432,7 +1432,11 @@ impl ScaffoldHandler {
         };
         let database_result = {
             let mut service = self.service.lock().await;
-            apply_retention_database_cleanup(&mut service.store.executor, policy)
+            apply_retention_database_cleanup(
+                &mut service.store.executor,
+                policy,
+                &report.raw_workspace_cleaned_meeting_ids,
+            )
         };
         let database_error = match database_result {
             Ok(database_report) => {
@@ -1440,7 +1444,7 @@ impl ScaffoldHandler {
                 None
             }
             Err(err) => {
-                report.merge(err.report);
+                report.merge(*err.report);
                 Some(err.message)
             }
         };
@@ -1449,6 +1453,7 @@ impl ScaffoldHandler {
                 raw_workspaces_scanned = report.raw_workspaces_scanned,
                 raw_audio_dirs_removed = report.raw_audio_dirs_removed,
                 legacy_meetings_cleaned = report.legacy_meetings_cleaned,
+                raw_workspaces_marked_cleaned = report.raw_workspaces_marked_cleaned,
                 speaker_dirs_removed = report.speaker_dirs_removed,
                 context_dirs_removed = report.context_dirs_removed,
                 transcript_dirs_removed = report.transcript_dirs_removed,
@@ -1467,6 +1472,7 @@ impl ScaffoldHandler {
                 raw_workspaces_scanned = report.raw_workspaces_scanned,
                 raw_audio_dirs_removed = report.raw_audio_dirs_removed,
                 legacy_meetings_cleaned = report.legacy_meetings_cleaned,
+                raw_workspaces_marked_cleaned = report.raw_workspaces_marked_cleaned,
                 speaker_dirs_removed = report.speaker_dirs_removed,
                 context_dirs_removed = report.context_dirs_removed,
                 transcript_dirs_removed = report.transcript_dirs_removed,

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     stopped_at TIMESTAMPTZ,
     meeting_duration_seconds INTEGER,
     error_message TEXT,
+    retention_raw_cleaned_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -129,6 +130,7 @@ END
 $$;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_channel_id TEXT;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS status_message_id TEXT;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS retention_raw_cleaned_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS meeting_speakers (
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     speaker_id TEXT NOT NULL,
