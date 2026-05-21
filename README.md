@@ -26,8 +26,8 @@ PostgreSQL にデータベースを作成し、マイグレーションを適用
 
 ```bash
 createdb discord_transcript
-find migrations -maxdepth 1 -name "*.sql" | sort | while read -r f; do
-  psql -d discord_transcript -f "$f"
+for f in $(find migrations -maxdepth 1 -name "*.sql" | sort); do
+  psql -d discord_transcript -f "$f" || exit 1
 done
 ```
 
