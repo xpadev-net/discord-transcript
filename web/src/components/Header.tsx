@@ -10,9 +10,10 @@ const STATUS_LABELS: Record<string, string> = {
 export function Header({ meeting }: { meeting: MeetingResponse | null }) {
   const title = meeting?.title || "--";
   const date = meeting?.started_at ? formatDate(meeting.started_at) : "--";
-  const duration = meeting?.duration_seconds
-    ? formatDuration(meeting.duration_seconds)
-    : "--";
+  const duration =
+    meeting?.duration_seconds != null
+      ? formatDuration(meeting.duration_seconds)
+      : "--";
   const statusText = meeting?.status || "unknown";
   const statusLabel = STATUS_LABELS[statusText] || statusText;
 
