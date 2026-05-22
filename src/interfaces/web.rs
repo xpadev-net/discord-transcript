@@ -24,6 +24,7 @@ type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 const SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
+const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 30;
 const OAUTH_NONCE_COOKIE_NAME: &str = "dt_oauth_nonce";
 const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
 const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
@@ -38,6 +39,7 @@ const GUILD_CACHE_TTL_SECS: u64 = 300;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
+type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedChannelPermission {
@@ -55,6 +57,8 @@ pub struct WebState {
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
+    /// In-flight guild membership re-verification per user id
+    membership_reverify_inflight: MembershipReverifyInflight,
     pub static_files_dir: String,
 }
 
@@ -73,6 +77,7 @@ impl WebState {
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             static_files_dir,
         }
     }
@@ -156,8 +161,12 @@ async fn require_auth(
     }
 
     let mut refreshed_session_cookie = None;
-    if session_needs_membership_reverify(&session) {
-        match is_guild_member(&state, auth, &session.uid).await {
+    if session_needs_membership_reverify(&session)
+        && begin_membership_reverify(&state.membership_reverify_inflight, &session.uid).await
+    {
+        let membership = is_guild_member(&state, auth, &session.uid).await;
+        end_membership_reverify(&state.membership_reverify_inflight, &session.uid).await;
+        match membership {
             Ok(true) => {
                 refreshed_session_cookie = Some(session_cookie_with_membership(
                     &session.uid,
@@ -245,6 +254,27 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn begin_membership_reverify(inflight: &MembershipReverifyInflight, user_id: &str) -> bool {
+    let mut map = inflight.lock().await;
+    let now = Instant::now();
+    if let Some(started) = map.get(user_id)
+        && now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
+    {
+        return false;
+    }
+    map.insert(user_id.to_owned(), now);
+    if map.len() > 5000 {
+        map.retain(|_, started| {
+            now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
+        });
+    }
+    true
+}
+
+async fn end_membership_reverify(inflight: &MembershipReverifyInflight, user_id: &str) {
+    inflight.lock().await.remove(user_id);
 }
 
 fn session_needs_membership_reverify(session: &SessionPayload) -> bool {
