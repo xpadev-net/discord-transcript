@@ -296,9 +296,10 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                 "invalid meeting status for id={meeting_id}: {status_raw}"
             ))
         })?;
-        let stop_reason = parse_stop_reason_column(row.get(9).and_then(|v| v.clone()), &format!(
-            "meeting_id={meeting_id}"
-        ))
+        let stop_reason = parse_stop_reason_column(
+            row.get(9).and_then(|v| v.clone()),
+            &format!("meeting_id={meeting_id}"),
+        )
         .map_err(StoreError::Backend)?;
         Ok(Some(StoredMeeting {
             id: require(0, "id")?,
@@ -733,4 +734,16 @@ fn pg_row_to_optional_strings(row: Row) -> Result<SqlRow, String> {
         return Err(format!("unsupported postgres column type at index {idx}"));
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod stop_reason_parse_tests {
+    use super::parse_stop_reason_column;
+
+    #[test]
+    fn parse_stop_reason_column_rejects_unknown_values() {
+        let err = parse_stop_reason_column(Some("bogus".to_owned()), "meeting_id=m1")
+            .expect_err("unknown stop_reason should error");
+        assert!(err.contains("invalid stop_reason"));
+    }
 }
