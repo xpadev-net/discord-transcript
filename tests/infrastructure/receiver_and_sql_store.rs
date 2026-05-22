@@ -8,7 +8,7 @@ use discord_transcript::infrastructure::sql::{
     CLAIM_JOB_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
-    FakeSqlExecutor, SqlJobQueue, SqlMeetingStore,
+    FakeSqlExecutor, SqlJobQueue, SqlMeetingStore, sql_row_from_strings,
 };
 use discord_transcript::infrastructure::storage::{
     CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting,
@@ -118,7 +118,7 @@ fn sql_store_get_meeting_rejects_unknown_status() {
                   FROM meetings WHERE id=$1 LIMIT 1";
     executor.query_rows_result.insert(
         format!("{query_sql}|m1"),
-        vec![vec![
+        vec![sql_row_from_strings(vec![
             "m1".to_owned(),
             "g1".to_owned(),
             "vc1".to_owned(),
@@ -132,7 +132,7 @@ fn sql_store_get_meeting_rejects_unknown_status() {
             String::new(),
             String::new(),
             String::new(),
-        ]],
+        ])],
     );
 
     let mut store = SqlMeetingStore::new(executor);
@@ -148,14 +148,14 @@ fn sql_job_queue_parses_claimed_job_row() {
     let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
     executor.query_rows_result.insert(
         claim_key,
-        vec![vec![
+        vec![sql_row_from_strings(vec![
             "j-1".to_owned(),
             "m-1".to_owned(),
             "summarize".to_owned(),
             "running".to_owned(),
             "2".to_owned(),
             "temporary error".to_owned(),
-        ]],
+        ])],
     );
 
     let mut queue = SqlJobQueue::new(executor);
@@ -195,7 +195,7 @@ fn sql_job_queue_retry_returns_failed_status() {
     let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j-1\u{1f}still failing\u{1f}1");
     executor
         .query_rows_result
-        .insert(retry_key, vec![vec!["failed".to_owned()]]);
+        .insert(retry_key, vec![sql_row_from_strings(vec!["failed".to_owned()])]);
     let mut queue = SqlJobQueue::new(executor);
 
     let status = queue
@@ -214,7 +214,7 @@ fn sql_store_set_status_with_cas_returns_not_found_when_meeting_missing() {
     );
     executor
         .query_rows_result
-        .insert(cas_key, vec![vec!["not_found".to_owned()]]);
+        .insert(cas_key, vec![sql_row_from_strings(vec!["not_found".to_owned()])]);
 
     let mut store = SqlMeetingStore::new(executor);
     let result = store.set_meeting_status(
@@ -241,7 +241,7 @@ fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
     );
     executor
         .query_rows_result
-        .insert(cas_key, vec![vec!["conflict".to_owned()]]);
+        .insert(cas_key, vec![sql_row_from_strings(vec!["conflict".to_owned()])]);
 
     let mut store = SqlMeetingStore::new(executor);
     let result = store.set_meeting_status(
@@ -264,11 +264,11 @@ fn sql_store_reads_and_sets_status_message_metadata() {
     let query_sql = "SELECT report_channel_id, status_message_channel_id, status_message_id FROM meetings WHERE id=$1 LIMIT 1";
     executor.query_rows_result.insert(
         format!("{query_sql}|{}", "m1"),
-        vec![vec![
+        vec![sql_row_from_strings(vec![
             "c-report".to_owned(),
             "c-status".to_owned(),
             "m-status".to_owned(),
-        ]],
+        ])],
     );
 
     let mut store = SqlMeetingStore::new(executor);
@@ -292,4 +292,52 @@ fn sql_store_reads_and_sets_status_message_metadata() {
         }),
         "set_status_message should execute update SQL"
     );
+}
+
+fn meeting_row_for_title_test(title: Option<String>) -> discord_transcript::infrastructure::sql_store::SqlRow {
+    vec![
+        Some("m1".to_owned()),
+        Some("g1".to_owned()),
+        Some("vc1".to_owned()),
+        Some("c1".to_owned()),
+        None,
+        None,
+        Some("u1".to_owned()),
+        title,
+        Some("recording".to_owned()),
+        None,
+        None,
+        None,
+        None,
+    ]
+}
+
+#[test]
+fn sql_store_get_meeting_distinguishes_null_title_from_empty_string() {
+    let query_sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+                        to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                  FROM meetings WHERE id=$1 LIMIT 1";
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        format!("{query_sql}|m-null"),
+        vec![meeting_row_for_title_test(None)],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+    let null_title = store
+        .get_meeting("m-null")
+        .expect("meeting should load")
+        .expect("row should exist");
+    assert_eq!(null_title.title, None);
+
+    store.executor.query_rows_result.insert(
+        format!("{query_sql}|m-empty"),
+        vec![meeting_row_for_title_test(Some(String::new()))],
+    );
+    let empty_title = store
+        .get_meeting("m-empty")
+        .expect("meeting should load")
+        .expect("row should exist");
+    assert_eq!(empty_title.title.as_deref(), Some(""));
 }

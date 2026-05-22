@@ -6,7 +6,9 @@ use discord_transcript::domain::{JobStatus, JobType, MeetingStatus};
 use discord_transcript::infrastructure::asr::StubWhisperClient;
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
 use discord_transcript::infrastructure::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
-use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, SqlJobQueue};
+use discord_transcript::infrastructure::sql_store::{
+    FakeSqlExecutor, SqlJobQueue, sql_row_from_strings,
+};
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -409,14 +411,14 @@ fn sql_job_queue_done_job_rejects_retry() {
     let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
     executor.query_rows_result.insert(
         claim_key,
-        vec![vec![
+        vec![sql_row_from_strings(vec![
             "j1".to_owned(),
             "m1".to_owned(),
             "summarize".to_owned(),
             "running".to_owned(),
             "0".to_owned(),
             String::new(),
-        ]],
+        ])],
     );
     let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
     executor.query_rows_result.insert(retry_key, Vec::new());
@@ -451,7 +453,7 @@ fn sql_job_queue_running_job_retry_returns_queued() {
     let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
     executor
         .query_rows_result
-        .insert(retry_key, vec![vec!["queued".to_owned()]]);
+        .insert(retry_key, vec![sql_row_from_strings(vec!["queued".to_owned()])]);
 
     let mut queue = SqlJobQueue::new(executor);
     let status = queue

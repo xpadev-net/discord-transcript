@@ -487,17 +487,24 @@ pub struct ExpiredWorkspaceRow {
     pub voice_channel_id: String,
 }
 
-fn parse_workspace_row(row: &[String]) -> Result<ExpiredWorkspaceRow, String> {
+fn parse_workspace_row(
+    row: &crate::infrastructure::sql_store::SqlRow,
+) -> Result<ExpiredWorkspaceRow, String> {
     if row.len() < 3 {
         return Err(format!(
             "invalid retention workspace row length: {}",
             row.len()
         ));
     }
+    let require = |idx: usize, field: &str| -> Result<String, String> {
+        row.get(idx)
+            .and_then(|v| v.clone())
+            .ok_or_else(|| format!("{field} is NULL"))
+    };
     Ok(ExpiredWorkspaceRow {
-        meeting_id: row[0].clone(),
-        guild_id: row[1].clone(),
-        voice_channel_id: row[2].clone(),
+        meeting_id: require(0, "meeting_id")?,
+        guild_id: require(1, "guild_id")?,
+        voice_channel_id: require(2, "voice_channel_id")?,
     })
 }
 
