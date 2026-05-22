@@ -2604,6 +2604,7 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     let start_str = parts.next()?.trim();
     let end_str = parts.next()?.trim();
     let is_suffix_probe = start_str.is_empty();
+    let is_open_ended = !start_str.is_empty() && end_str.is_empty();
 
     let (start, end) = if is_suffix_probe {
         let suffix_len: u64 = end_str.parse().ok()?;
@@ -2629,7 +2630,11 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     };
 
     let length = end.saturating_sub(start).saturating_add(1);
-    if !is_suffix_probe && file_size > MIN_AUDIO_RANGE_BYTES && length < MIN_AUDIO_RANGE_BYTES {
+    if !is_suffix_probe
+        && !is_open_ended
+        && file_size > MIN_AUDIO_RANGE_BYTES
+        && length < MIN_AUDIO_RANGE_BYTES
+    {
         return None;
     }
     Some((start, end))
