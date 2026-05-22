@@ -727,23 +727,39 @@ fn mix_chunks_by_wallclock(
     chunks: &[crate::audio::meeting_audio::LoadedChunk],
     sample_rate: u32,
 ) -> Vec<u8> {
+    use crate::audio::meeting_audio::MAX_MEETING_AUDIO_SPAN_MS;
+
     let meeting_start_ms = compute_meeting_start_ms(chunks);
-    // Derive buffer length from actual PCM byte counts rather than
-    // duration_ms so that sub-millisecond tails aren't truncated by the
-    // round-trip through integer milliseconds.
-    let offset_samples_for = |start_ms: u64| -> usize {
+    let offset_samples_for = |start_ms: u64| -> Option<usize> {
         let offset_ms = start_ms.saturating_sub(meeting_start_ms);
-        ((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize
+        if offset_ms > MAX_MEETING_AUDIO_SPAN_MS {
+            warn!(
+                start_ms,
+                meeting_start_ms,
+                offset_ms,
+                "skipping chunk with wall-clock offset beyond meeting cap"
+            );
+            return None;
+        }
+        Some(((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize)
     };
     let total_samples = chunks
         .iter()
-        .map(|c| offset_samples_for(c.start_ms) + c.pcm.len() / 2)
+        .filter_map(|c| {
+            let offset = offset_samples_for(c.start_ms)?;
+            Some(offset + c.pcm.len() / 2)
+        })
         .max()
         .unwrap_or(0);
+    let capped_total_samples = total_samples.min(
+        ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize,
+    );
 
-    let mut mixed = vec![0i32; total_samples];
+    let mut mixed = vec![0i32; capped_total_samples];
     for chunk in chunks {
-        let offset_samples = offset_samples_for(chunk.start_ms);
+        let Some(offset_samples) = offset_samples_for(chunk.start_ms) else {
+            continue;
+        };
         let chunk_samples = chunk.pcm.len() / 2;
         for i in 0..chunk_samples {
             let sample = i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;

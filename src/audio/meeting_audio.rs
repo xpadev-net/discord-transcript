@@ -9,6 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+/// Maximum wall-clock span for a single meeting mixdown (24 hours).
+pub const MAX_MEETING_AUDIO_SPAN_MS: u64 = 24 * 3600 * 1000;
+
 #[derive(Debug, Clone)]
 pub struct LoadedChunk {
     pub user_id: String,
@@ -197,6 +200,7 @@ pub(crate) fn compute_meeting_start_ms(chunks: &[LoadedChunk]) -> u64 {
 }
 
 fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
+    let duration_ms = duration_ms.min(MAX_MEETING_AUDIO_SPAN_MS);
     let samples = (duration_ms as u128)
         .saturating_mul(sample_rate as u128)
         .saturating_div(1_000) as usize;

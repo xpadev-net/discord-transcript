@@ -250,6 +250,30 @@ fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
 }
 
 #[test]
+fn mixdown_skips_chunks_beyond_meeting_wall_clock_cap() {
+    let base = unique_temp_dir("cap_offset");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("alice_1_1000.wav"), &good).unwrap();
+    let far_future = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(
+        base.join(&format!(
+            "bad_2_{}",
+            discord_transcript::audio::meeting_audio::MAX_MEETING_AUDIO_SPAN_MS + 60_000
+        )),
+        &far_future,
+    )
+    .unwrap();
+
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should ignore far-future chunk");
+    assert!(PathBuf::from(mixdown).exists());
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn load_chunks_reports_skipped_count_when_all_chunks_are_corrupt() {
     let base = unique_temp_dir("all_corrupt");
     fs::create_dir_all(&base).expect("dir should be created");
