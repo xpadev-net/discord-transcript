@@ -191,7 +191,8 @@ async fn auth_login(State(state): State<WebState>, Query(params): Query<LoginPar
 fn prepare_oauth_login(redirect: &str, auth: &AuthConfig) -> (String, String, String) {
     let nonce = Uuid::new_v4().to_string();
     let state_param = sign_oauth_state(redirect, &nonce, &auth.session_secret);
-    let oauth_nonce_cookie = format_oauth_nonce_cookie(&nonce, auth.secure_cookie, OAUTH_STATE_TTL_SECS);
+    let oauth_nonce_cookie =
+        format_oauth_nonce_cookie(&nonce, auth.secure_cookie, OAUTH_STATE_TTL_SECS);
     let url = format!(
         "https://discord.com/api/oauth2/authorize\
          ?client_id={}\
@@ -236,7 +237,8 @@ async fn auth_callback(
         return (StatusCode::SERVICE_UNAVAILABLE, "OAuth not configured").into_response();
     };
 
-    let redirect = match verify_oauth_callback_preexchange(&params, &headers, &auth.session_secret) {
+    let redirect = match verify_oauth_callback_preexchange(&params, &headers, &auth.session_secret)
+    {
         Ok(redirect) => redirect,
         Err((status, message)) => {
             return oauth_callback_failure_response(status, message, auth.secure_cookie);
@@ -251,7 +253,10 @@ async fn auth_callback(
             ("client_id", auth.client_id.as_str()),
             ("client_secret", auth.client_secret.as_str()),
             ("grant_type", "authorization_code"),
-            ("code", params.code.as_deref().expect("preexchange ensures code")),
+            (
+                "code",
+                params.code.as_deref().expect("preexchange ensures code"),
+            ),
             ("redirect_uri", auth.redirect_uri.as_str()),
         ])
         .send()
@@ -259,9 +264,21 @@ async fn auth_callback(
     {
         Ok(resp) if resp.status().is_success() => match resp.json().await {
             Ok(t) => t,
-            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid token response").into_response(),
+            Err(_) => {
+                return oauth_callback_failure_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid token response",
+                    auth.secure_cookie,
+                );
+            }
         },
-        _ => return (StatusCode::BAD_GATEWAY, "token exchange failed").into_response(),
+        _ => {
+            return oauth_callback_failure_response(
+                StatusCode::BAD_GATEWAY,
+                "token exchange failed",
+                auth.secure_cookie,
+            );
+        }
     };
 
     let bearer = format!("Bearer {}", token.access_token);
@@ -283,21 +300,49 @@ async fn auth_callback(
     let user: DiscordUserInfo = match user_res {
         Ok(resp) if resp.status().is_success() => match resp.json().await {
             Ok(u) => u,
-            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid user response").into_response(),
+            Err(_) => {
+                return oauth_callback_failure_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid user response",
+                    auth.secure_cookie,
+                );
+            }
         },
-        _ => return (StatusCode::BAD_GATEWAY, "failed to fetch user").into_response(),
+        _ => {
+            return oauth_callback_failure_response(
+                StatusCode::BAD_GATEWAY,
+                "failed to fetch user",
+                auth.secure_cookie,
+            );
+        }
     };
 
     let guilds: Vec<DiscordGuild> = match guilds_res {
         Ok(resp) if resp.status().is_success() => match resp.json().await {
             Ok(g) => g,
-            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid guilds response").into_response(),
+            Err(_) => {
+                return oauth_callback_failure_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid guilds response",
+                    auth.secure_cookie,
+                );
+            }
         },
-        _ => return (StatusCode::BAD_GATEWAY, "failed to fetch guilds").into_response(),
+        _ => {
+            return oauth_callback_failure_response(
+                StatusCode::BAD_GATEWAY,
+                "failed to fetch guilds",
+                auth.secure_cookie,
+            );
+        }
     };
 
     if !guilds.iter().any(|g| g.id == auth.guild_id) {
-        return (StatusCode::FORBIDDEN, "not a member of this server").into_response();
+        return oauth_callback_failure_response(
+            StatusCode::FORBIDDEN,
+            "not a member of this server",
+            auth.secure_cookie,
+        );
     }
 
     // Create session cookie with user ID
@@ -2630,7 +2675,8 @@ mod oauth_state_tests {
             code: Some("code".to_owned()),
             state: Some(state),
         };
-        let err = verify_oauth_callback_preexchange(&params, &HeaderMap::new(), SECRET).unwrap_err();
+        let err =
+            verify_oauth_callback_preexchange(&params, &HeaderMap::new(), SECRET).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "missing oauth nonce");
     }
@@ -2647,8 +2693,7 @@ mod oauth_state_tests {
             code: Some("code".to_owned()),
             state: Some(state),
         };
-        let err =
-            verify_oauth_callback_preexchange(&params, &headers, SECRET).unwrap_err();
+        let err = verify_oauth_callback_preexchange(&params, &headers, SECRET).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "invalid state");
     }
