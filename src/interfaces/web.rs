@@ -183,6 +183,13 @@ async fn require_auth(
                     user_id = %session.uid,
                     "guild membership re-verify unavailable; allowing stale session"
                 );
+                refreshed_session_cookie = Some(session_cookie_with_exp(
+                    &session.uid,
+                    &auth.guild_id,
+                    auth,
+                    session.exp,
+                    unix_now_secs(),
+                ));
             }
         }
     }
@@ -549,6 +556,7 @@ fn sign_session_with_exp(
     format!("{payload_hex}.{sig_hex}")
 }
 
+#[cfg(test)]
 fn sign_session(user_id: &str, guild_id: &str, secret: &str, now: u64, verified_at: u64) -> String {
     sign_session_with_exp(
         user_id,
