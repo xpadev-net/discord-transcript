@@ -250,6 +250,21 @@ fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
 }
 
 #[test]
+fn load_chunks_reports_skipped_count_when_all_chunks_are_corrupt() {
+    let base = unique_temp_dir("all_corrupt");
+    fs::create_dir_all(&base).expect("dir should be created");
+    fs::write(base.join("bad_1_1000.wav"), []).expect("zero-byte wav should be written");
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("bad_2_2000.wav"), &good[..80]).unwrap();
+
+    let err = load_chunks(&base).expect_err("only corrupt chunks should fail");
+    assert!(err.contains("no audio chunks found for meeting"));
+    assert!(err.contains("skipped 2 corrupt chunk(s)"));
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn load_chunks_ignores_temporary_chunk_files() {
     let base = unique_temp_dir("ignore_tmp");
     fs::create_dir_all(&base).expect("dir should be created");

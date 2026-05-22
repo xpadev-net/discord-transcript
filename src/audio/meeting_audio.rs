@@ -157,6 +157,9 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
         ));
     }
     let data_chunk_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as usize;
+    if data_chunk_size == 0 {
+        return Err(format!("empty PCM data chunk in {}", path.display()));
+    }
     let pcm_start = 44usize;
     let pcm_end = pcm_start.saturating_add(data_chunk_size);
     if pcm_end > data.len() {
