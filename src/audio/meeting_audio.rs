@@ -156,7 +156,17 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
             path.display()
         ));
     }
-    Ok((sample_rate, data[44..].to_vec()))
+    let data_chunk_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as usize;
+    let pcm_start = 44usize;
+    let pcm_end = pcm_start.saturating_add(data_chunk_size);
+    if pcm_end > data.len() {
+        return Err(format!(
+            "truncated PCM data in {}: expected {data_chunk_size} bytes, found {}",
+            path.display(),
+            data.len().saturating_sub(pcm_start)
+        ));
+    }
+    Ok((sample_rate, data[pcm_start..pcm_end].to_vec()))
 }
 
 fn fallback_start_ms(path: &Path, duration_ms: u64) -> u64 {

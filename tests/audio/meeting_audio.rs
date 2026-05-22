@@ -1,5 +1,6 @@
 use discord_transcript::audio::receiver::BufferedFrame;
 use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
+use discord_transcript::application::runtime::merge_user_chunks_to_mixdown;
 use discord_transcript::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
 use discord_transcript::audio::wav::resample_pcm_16le;
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
@@ -212,7 +213,11 @@ fn load_chunks_skips_zero_byte_wav_and_builds_mixdown_from_remaining_chunks() {
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].user_id, "alice");
 
-    let outputs = build_speaker_audio_inputs(&base, false).expect("mixdown should succeed");
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should succeed with one chunk");
+    assert!(PathBuf::from(mixdown).exists());
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should succeed");
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].speaker_id, "alice");
 
@@ -225,7 +230,7 @@ fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
     fs::create_dir_all(&base).expect("dir should be created");
 
     let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
-    let truncated = good[..30].to_vec();
+    let truncated = good[..80].to_vec();
     fs::write(base.join("bad_2_2000.wav"), &truncated).expect("truncated wav should be written");
     fs::write(base.join("alice_1_1000.wav"), &good).unwrap();
 
@@ -233,7 +238,11 @@ fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].user_id, "alice");
 
-    let outputs = build_speaker_audio_inputs(&base, false).expect("mixdown should succeed");
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should succeed with one chunk");
+    assert!(PathBuf::from(mixdown).exists());
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should succeed");
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].speaker_id, "alice");
 
