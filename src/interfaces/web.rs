@@ -962,11 +962,11 @@ async fn get_guild_info(
         warn!(
             error = %err,
             status = %guild_status,
-            body_len = discord_response_body_len(&guild_body),
+            body_len = guild_body.len(),
             "discord guild API response parse failed"
         );
         tracing::debug!(
-            body_len = discord_response_body_len(&guild_body),
+            body_len = guild_body.len(),
             body_prefix = %utf8_safe_byte_prefix(&guild_body, 500),
             "discord guild API response parse debug"
         );
@@ -1035,7 +1035,7 @@ async fn resolve_channel_permissions(
         warn!(
             status = %channel_status,
             retry_after = retry_after_header.as_deref(),
-            body_len = discord_response_body_len(&channel_body),
+            body_len = channel_body.len(),
             "discord channel API rate limited"
         );
         return Err(StatusCode::BAD_GATEWAY);
@@ -1043,7 +1043,7 @@ async fn resolve_channel_permissions(
     if !channel_status.is_success() {
         warn!(
             status = %channel_status,
-            body_len = discord_response_body_len(&channel_body),
+            body_len = channel_body.len(),
             "discord channel API non-success"
         );
         return Err(StatusCode::BAD_GATEWAY);
@@ -1053,11 +1053,11 @@ async fn resolve_channel_permissions(
         warn!(
             error = %err,
             status = %channel_status,
-            body_len = discord_response_body_len(&channel_body),
+            body_len = channel_body.len(),
             "discord channel API response parse failed"
         );
         tracing::debug!(
-            body_len = discord_response_body_len(&channel_body),
+            body_len = channel_body.len(),
             body_prefix = %utf8_safe_byte_prefix(&channel_body, 500),
             "discord channel API response parse debug"
         );
@@ -2514,10 +2514,6 @@ fn build_content_disposition(display_label: &str) -> String {
     )
 }
 
-fn discord_response_body_len(body: &str) -> usize {
-    body.len()
-}
-
 fn utf8_safe_byte_prefix(body: &str, max_bytes: usize) -> &str {
     if body.len() <= max_bytes {
         return body;
@@ -3186,9 +3182,12 @@ mod discord_log_safety_tests {
 
     #[test]
     fn utf8_safe_byte_prefix_avoids_mid_codepoint_panic() {
-        let body = format!("{}語", "a".repeat(497));
+        let body = format!("{}語", "a".repeat(498));
+        assert_eq!(body.len(), 501);
         let prefix = utf8_safe_byte_prefix(&body, 500);
+        assert_eq!(prefix.len(), 498);
         assert!(prefix.is_char_boundary(prefix.len()));
         assert!(std::str::from_utf8(prefix.as_bytes()).is_ok());
+        assert!(prefix.ends_with('a'));
     }
 }
