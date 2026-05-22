@@ -159,8 +159,13 @@ async fn require_auth(
     if session_needs_membership_reverify(session.verified_at) {
         match is_guild_member(&state, auth, &session.uid).await {
             Ok(true) => {
-                refreshed_session_cookie =
-                    Some(session_cookie_value(&session.uid, &auth.guild_id, auth));
+                refreshed_session_cookie = Some(session_cookie_with_exp(
+                    &session.uid,
+                    &auth.guild_id,
+                    auth,
+                    session.exp,
+                    unix_now_secs(),
+                ));
             }
             Ok(false) => {
                 invalidate_permission_cache_for_user(&state.permission_cache, &session.uid).await;
@@ -506,24 +511,52 @@ struct SessionPayload {
 
 fn session_cookie_value(user_id: &str, guild_id: &str, auth: &AuthConfig) -> String {
     let now = unix_now_secs();
-    let session_value = sign_session(user_id, guild_id, &auth.session_secret, now, now);
+    session_cookie_with_exp(user_id, guild_id, auth, now + SESSION_TTL_SECS, now)
+}
+
+fn session_cookie_with_exp(
+    user_id: &str,
+    guild_id: &str,
+    auth: &AuthConfig,
+    exp: u64,
+    verified_at: u64,
+) -> String {
+    let session_value =
+        sign_session_with_exp(user_id, guild_id, &auth.session_secret, exp, verified_at);
     let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
+    let max_age = exp.saturating_sub(unix_now_secs()).max(1);
     format!(
-        "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}{secure_flag}",
+        "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure_flag}",
     )
 }
 
-fn sign_session(user_id: &str, guild_id: &str, secret: &str, now: u64, verified_at: u64) -> String {
+fn sign_session_with_exp(
+    user_id: &str,
+    guild_id: &str,
+    secret: &str,
+    exp: u64,
+    verified_at: u64,
+) -> String {
     let payload = SessionPayload {
         uid: user_id.to_owned(),
         gid: guild_id.to_owned(),
-        exp: now + SESSION_TTL_SECS,
+        exp,
         verified_at,
     };
     let json = serde_json::to_string(&payload).unwrap_or_default();
     let payload_hex = to_hex(json.as_bytes());
     let sig_hex = hmac_hex(secret, &payload_hex);
     format!("{payload_hex}.{sig_hex}")
+}
+
+fn sign_session(user_id: &str, guild_id: &str, secret: &str, now: u64, verified_at: u64) -> String {
+    sign_session_with_exp(
+        user_id,
+        guild_id,
+        secret,
+        now + SESSION_TTL_SECS,
+        verified_at,
+    )
 }
 
 fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
@@ -2864,13 +2897,16 @@ mod session_reverify_tests {
             session.exp.saturating_sub(SESSION_TTL_SECS)
         );
         assert!(!session_needs_membership_reverify(session.verified_at));
-        let _ = now;
     }
 
     #[test]
-    fn kicked_member_status_is_not_membership() {
-        assert!(!guild_member_status_indicates_membership(HttpStatus::NOT_FOUND));
-        assert!(!guild_member_status_indicates_membership(HttpStatus::FORBIDDEN));
+    fn non_success_member_status_is_not_positive_membership() {
+        assert!(!guild_member_status_indicates_membership(
+            HttpStatus::NOT_FOUND
+        ));
+        assert!(!guild_member_status_indicates_membership(
+            HttpStatus::FORBIDDEN
+        ));
     }
 
     #[test]
