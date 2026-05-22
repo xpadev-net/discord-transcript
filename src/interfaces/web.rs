@@ -258,7 +258,7 @@ fn session_needs_membership_reverify(session: &SessionPayload) -> bool {
 }
 
 fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool {
-    status.is_success()
+    status == reqwest::StatusCode::OK
 }
 
 async fn is_guild_member(
