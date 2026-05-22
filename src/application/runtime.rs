@@ -752,7 +752,8 @@ fn mix_chunks_by_wallclock(
         .max()
         .unwrap_or(0);
     let capped_total_samples = total_samples.min(
-        ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize,
+        ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128) / 1_000u128)
+            as usize,
     );
 
     let mut mixed = vec![0i32; capped_total_samples];
