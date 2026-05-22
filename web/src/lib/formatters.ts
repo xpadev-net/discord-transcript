@@ -16,6 +16,9 @@ export function formatTimestamp(ms: number): string {
 
 export function formatDate(isoString: string): string {
   const d = new Date(isoString);
+  if (Number.isNaN(d.getTime())) {
+    return "--";
+  }
   const y = d.getFullYear();
   const m = d.getMonth() + 1;
   const day = d.getDate();
