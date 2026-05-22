@@ -169,7 +169,8 @@ async fn require_auth(
                     guild_id = %auth.guild_id,
                     "denying session after failed guild membership re-verification"
                 );
-                return auth_required_redirect_or_unauthorized(&request);
+                return auth_required_redirect_or_unauthorized(&request)
+                    .with_cleared_session_cookie(auth.secure_cookie);
             }
             Err(status) => return status.into_response(),
         }
@@ -179,12 +180,30 @@ async fn require_auth(
         .extensions_mut()
         .insert(AuthUserId(session.uid.clone()));
     let mut response = next.run(request).await;
-    if let Some(cookie) = refreshed_session_cookie {
-        if let Ok(value) = header::HeaderValue::from_str(&cookie) {
-            response.headers_mut().append(header::SET_COOKIE, value);
-        }
+    if let Some(cookie) = refreshed_session_cookie
+        && let Ok(value) = header::HeaderValue::from_str(&cookie)
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
+}
+
+fn cleared_session_cookie(secure_cookie: bool) -> String {
+    let secure_flag = if secure_cookie { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_flag}")
+}
+
+trait AuthFailureResponse {
+    fn with_cleared_session_cookie(self, secure_cookie: bool) -> Response;
+}
+
+impl AuthFailureResponse for Response {
+    fn with_cleared_session_cookie(mut self, secure_cookie: bool) -> Response {
+        if let Ok(value) = header::HeaderValue::from_str(&cleared_session_cookie(secure_cookie)) {
+            self.headers_mut().append(header::SET_COOKIE, value);
+        }
+        self
+    }
 }
 
 fn auth_required_redirect_or_unauthorized(request: &axum::extract::Request) -> Response {
@@ -241,7 +260,7 @@ async fn is_guild_member(
     if guild_member_status_indicates_membership(status) {
         return Ok(true);
     }
-    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(false);
     }
 
@@ -509,13 +528,13 @@ fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
         return None;
     }
     let payload_bytes = from_hex(payload_hex)?;
-    let payload: SessionPayload = serde_json::from_slice(&payload_bytes).ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let mut payload: SessionPayload = serde_json::from_slice(&payload_bytes).ok()?;
+    let now = unix_now_secs();
     if now > payload.exp {
         return None;
+    }
+    if payload.verified_at == 0 {
+        payload.verified_at = payload.exp.saturating_sub(SESSION_TTL_SECS);
     }
     Some(payload)
 }
@@ -2808,7 +2827,7 @@ mod oauth_state_tests {
 #[cfg(test)]
 mod session_reverify_tests {
     use super::{
-        SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS, SessionPayload,
+        SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS, SESSION_TTL_SECS,
         guild_member_status_indicates_membership, session_needs_membership_reverify, sign_session,
         verify_session,
     };
@@ -2831,18 +2850,22 @@ mod session_reverify_tests {
     }
 
     #[test]
-    fn legacy_session_without_verified_at_requires_reverify() {
-        assert!(session_needs_membership_reverify(0));
+    fn legacy_session_without_verified_at_uses_issue_time_estimate() {
+        let now = super::unix_now_secs();
+        let cookie = sign_session("user-1", "guild-1", SECRET, 0);
+        let session = verify_session(&cookie, SECRET).expect("session should verify");
+        assert_eq!(
+            session.verified_at,
+            session.exp.saturating_sub(SESSION_TTL_SECS)
+        );
+        assert!(!session_needs_membership_reverify(session.verified_at));
+        let _ = now;
     }
 
     #[test]
     fn kicked_member_status_is_not_membership() {
-        assert!(!guild_member_status_indicates_membership(
-            HttpStatus::NOT_FOUND
-        ));
-        assert!(!guild_member_status_indicates_membership(
-            HttpStatus::FORBIDDEN
-        ));
+        assert!(!guild_member_status_indicates_membership(HttpStatus::NOT_FOUND));
+        assert!(!guild_member_status_indicates_membership(HttpStatus::FORBIDDEN));
     }
 
     #[test]
