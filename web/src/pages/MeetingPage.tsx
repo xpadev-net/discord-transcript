@@ -101,7 +101,7 @@ export function MeetingPage() {
             />
           )}
           {seekNotice ? (
-            <div className="panel-error seek-notice" role="status">
+            <div className="seek-notice" role="status">
               {seekNotice}
             </div>
           ) : null}

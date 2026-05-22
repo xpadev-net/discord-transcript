@@ -285,6 +285,17 @@ audio::-webkit-media-controls-panel {
   border-color: var(--accent);
 }
 
+.seek-notice {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--speaker-2);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
 /* Summary panel */
 .summary-header {
   font-size: 0.8rem;
