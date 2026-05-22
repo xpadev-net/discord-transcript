@@ -101,7 +101,9 @@ export function MeetingPage() {
             />
           )}
           <ErrorBoundary
-            title={"\u30c8\u30e9\u30f3\u30b9\u30af\u30ea\u30d7\u30c8\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"}
+            title={
+              "\u30c8\u30e9\u30f3\u30b9\u30af\u30ea\u30d7\u30c8\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+            }
           >
             <TranscriptPanel
               ref={transcriptContainerRef}
@@ -114,7 +116,9 @@ export function MeetingPage() {
           </ErrorBoundary>
         </div>
         <ErrorBoundary
-          title={"\u30b5\u30de\u30ea\u30fc\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"}
+          title={
+            "\u30b5\u30de\u30ea\u30fc\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+          }
         >
           <SummaryPanel
             markdown={summary?.markdown}
