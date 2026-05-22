@@ -2,7 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,10 @@ pub fn create_router(state: WebState) -> Router {
     let auth_routes = Router::new()
         .route("/auth/login", get(auth_login))
         .route("/auth/callback", get(auth_callback))
-        .route("/auth/logout", get(auth_logout));
+        .route(
+            "/auth/logout",
+            post(auth_logout).get(auth_logout_get_rejected),
+        );
 
     let protected = Router::new()
         .route("/api/meetings/{meeting_id}", get(api_meeting))
@@ -159,6 +162,21 @@ async fn require_auth(
     if session.gid != auth.guild_id {
         return auth_required_redirect_or_unauthorized(&request);
     }
+    match session_is_revoked(&state.db, &session.uid, session.issued_at).await {
+        Ok(true) => {
+            return auth_required_redirect_or_unauthorized(&request)
+                .with_cleared_session_cookie(auth.secure_cookie);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                error = %err,
+                user_id = %session.uid,
+                "failed to check session revocation"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
 
     let mut refreshed_session_cookie = None;
     if session_needs_membership_reverify(&session)
@@ -173,6 +191,7 @@ async fn require_auth(
                     &auth.guild_id,
                     auth,
                     session.exp,
+                    session.issued_at,
                     unix_now_secs(),
                     0,
                 ));
@@ -198,6 +217,7 @@ async fn require_auth(
                     &auth.guild_id,
                     auth,
                     session.exp,
+                    session.issued_at,
                     session.verified_at,
                     unix_now_secs(),
                 ));
@@ -534,20 +554,63 @@ async fn auth_callback(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-async fn auth_logout(State(state): State<WebState>) -> Response {
+async fn auth_logout_get_rejected() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
+}
+
+async fn auth_logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
     let secure_flag = if state.auth.as_ref().is_some_and(|a| a.secure_cookie) {
         "; Secure"
     } else {
         ""
     };
+    if let Some(ref auth) = state.auth
+        && let Some(cookie_val) = get_cookie(&headers, SESSION_COOKIE_NAME)
+        && let Some(session) = verify_session(&cookie_val, &auth.session_secret)
+        && let Err(err) = revoke_session(&state.db, &session.uid, session.issued_at).await
+    {
+        warn!(
+            error = %err,
+            user_id = %session.uid,
+            "failed to persist session revocation"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let cookie =
         format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_flag}",);
     Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
+        .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, "/")
         .header(header::SET_COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn revoke_session(
+    db: &PgClient,
+    user_id: &str,
+    issued_at: u64,
+) -> Result<(), tokio_postgres::Error> {
+    db.execute(
+        crate::infrastructure::sql::REVOKE_SESSION_SQL,
+        &[&user_id, &(issued_at as i64)],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn session_is_revoked(
+    db: &PgClient,
+    user_id: &str,
+    issued_at: u64,
+) -> Result<bool, tokio_postgres::Error> {
+    let row = db
+        .query_opt(
+            crate::infrastructure::sql::SESSION_IS_REVOKED_SQL,
+            &[&user_id, &(issued_at as i64)],
+        )
+        .await?;
+    Ok(row.is_some())
 }
 
 // ========== Auth: session helpers ==========
@@ -561,11 +624,13 @@ struct SessionPayload {
     verified_at: u64,
     #[serde(default)]
     reverify_attempt_at: u64,
+    #[serde(default)]
+    issued_at: u64,
 }
 
 fn session_cookie_value(user_id: &str, guild_id: &str, auth: &AuthConfig) -> String {
     let now = unix_now_secs();
-    session_cookie_with_membership(user_id, guild_id, auth, now + SESSION_TTL_SECS, now, 0)
+    session_cookie_with_membership(user_id, guild_id, auth, now + SESSION_TTL_SECS, now, now, 0)
 }
 
 fn session_cookie_with_membership(
@@ -573,6 +638,7 @@ fn session_cookie_with_membership(
     guild_id: &str,
     auth: &AuthConfig,
     exp: u64,
+    issued_at: u64,
     verified_at: u64,
     reverify_attempt_at: u64,
 ) -> String {
@@ -581,6 +647,7 @@ fn session_cookie_with_membership(
         guild_id,
         &auth.session_secret,
         exp,
+        issued_at,
         verified_at,
         reverify_attempt_at,
     );
@@ -596,6 +663,7 @@ fn sign_session_with_exp(
     guild_id: &str,
     secret: &str,
     exp: u64,
+    issued_at: u64,
     verified_at: u64,
     reverify_attempt_at: u64,
 ) -> String {
@@ -603,6 +671,7 @@ fn sign_session_with_exp(
         uid: user_id.to_owned(),
         gid: guild_id.to_owned(),
         exp,
+        issued_at,
         verified_at,
         reverify_attempt_at,
     };
@@ -619,6 +688,7 @@ fn sign_session(user_id: &str, guild_id: &str, secret: &str, now: u64, verified_
         guild_id,
         secret,
         now + SESSION_TTL_SECS,
+        now,
         verified_at,
         0,
     )
@@ -636,8 +706,11 @@ fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
     if now >= payload.exp {
         return None;
     }
+    if payload.issued_at == 0 {
+        payload.issued_at = payload.exp.saturating_sub(SESSION_TTL_SECS);
+    }
     if payload.verified_at == 0 {
-        payload.verified_at = payload.exp.saturating_sub(SESSION_TTL_SECS);
+        payload.verified_at = payload.issued_at;
     }
     Some(payload)
 }
@@ -2947,6 +3020,7 @@ mod session_reverify_tests {
             exp: now + super::SESSION_TTL_SECS,
             verified_at: now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 60),
             reverify_attempt_at: 0,
+            issued_at: now,
         };
         assert!(session_needs_membership_reverify(&session));
     }
@@ -2960,6 +3034,7 @@ mod session_reverify_tests {
             exp: now + super::SESSION_TTL_SECS,
             verified_at: now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS / 2),
             reverify_attempt_at: 0,
+            issued_at: now,
         };
         assert!(!session_needs_membership_reverify(&session));
     }
@@ -2973,6 +3048,7 @@ mod session_reverify_tests {
             exp: now + super::SESSION_TTL_SECS,
             verified_at: now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 60),
             reverify_attempt_at: now.saturating_sub(60),
+            issued_at: now,
         };
         assert!(!session_needs_membership_reverify(&session));
     }
@@ -3014,10 +3090,30 @@ mod session_reverify_tests {
     }
 
     #[test]
+    fn legacy_session_backfills_issued_at_from_exp() {
+        let now = super::unix_now_secs();
+        let cookie = super::sign_session_with_exp(
+            "user-1",
+            "guild-1",
+            SECRET,
+            now + SESSION_TTL_SECS,
+            0,
+            now,
+            0,
+        );
+        let session = verify_session(&cookie, SECRET).expect("session should verify");
+        assert_eq!(
+            session.issued_at,
+            session.exp.saturating_sub(SESSION_TTL_SECS)
+        );
+    }
+
+    #[test]
     fn stale_verified_at_session_still_parses_for_reverify_gate() {
         let now = super::unix_now_secs();
         let stale = now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 120);
         let cookie = sign_session("user-1", "guild-1", SECRET, stale, stale);
+        // issued_at preserved separately from verified_at in production cookies
         let session = verify_session(&cookie, SECRET).expect("session should verify");
         assert!(session_needs_membership_reverify(&session));
     }
