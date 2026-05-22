@@ -30,8 +30,9 @@ use crate::infrastructure::integrations::{
 use crate::infrastructure::queue::{Job, JobQueue};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
-    INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL,
-    RECOVERY_SCAN_SQL, RECOVERY_SUMMARY_JOB_STATUS_SQL,
+    HEARTBEAT_RUNNING_JOB_SQL, INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL,
+    RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
+    RECOVERY_SUMMARY_JOB_STATUS_SQL,
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::infrastructure::storage::{MeetingStore, StatusMessageMetadata, StoredMeeting};
@@ -2571,6 +2572,42 @@ impl ScaffoldHandler {
             );
         }
 
+        let heartbeat_job_id = claimed_job.id.clone();
+        let heartbeat_queue = self.queue.clone();
+        let heartbeat_shutdown = self.shutdown_token.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let result = {
+                            let mut queue = heartbeat_queue.lock().await;
+                            queue.executor.execute(
+                                HEARTBEAT_RUNNING_JOB_SQL,
+                                std::slice::from_ref(&heartbeat_job_id),
+                            )
+                        };
+                        if let Err(err) = result {
+                            warn!(
+                                job_id = %heartbeat_job_id,
+                                error = %err,
+                                "failed to refresh summary job lease heartbeat"
+                            );
+                        }
+                    }
+                    _ = heartbeat_shutdown.cancelled() => break,
+                }
+            }
+        });
+        struct SummaryJobHeartbeatGuard(tokio::task::JoinHandle<()>);
+        impl Drop for SummaryJobHeartbeatGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _heartbeat_guard = SummaryJobHeartbeatGuard(heartbeat_task);
+
         let audio_path =
             match merge_user_chunks_to_mixdown(&meeting_dir, self.whisper_resample_to_16k) {
                 Ok(path) => path,
@@ -4205,7 +4242,18 @@ mod status_message_tests {
         assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status='running'"));
         assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("status IN"));
         assert!(!RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("'failed'"));
-        assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("updated_at <"));
+        assert!(RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL.contains("leased_until"));
+    }
+
+    #[test]
+    fn recovery_requeues_running_job_when_lease_expired_before_updated_at_stale() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job("running", true);
+        assert!(recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1"
+        ));
+        assert_eq!(queue.executor.job_status, "queued");
     }
 
     fn running_summary_job() -> crate::infrastructure::queue::Job {
