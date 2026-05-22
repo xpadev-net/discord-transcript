@@ -85,26 +85,32 @@ mod is_retriable_tests {
 
     #[test]
     fn client_http_errors_are_not_retriable() {
-        assert!(!WhisperParseError::InvalidJson(
-            "whisper command failed: status=400 HTTP/1.1 400 Bad Request".to_owned()
-        )
-        .is_retriable());
+        assert!(
+            !WhisperParseError::InvalidJson(
+                "whisper command failed: status=400 HTTP/1.1 400 Bad Request".to_owned()
+            )
+            .is_retriable()
+        );
     }
 
     #[test]
     fn server_http_errors_are_retriable() {
-        assert!(WhisperParseError::InvalidJson(
-            "whisper command failed: status=500 HTTP/1.1 500 Internal Server Error".to_owned()
-        )
-        .is_retriable());
+        assert!(
+            WhisperParseError::InvalidJson(
+                "whisper command failed: status=500 HTTP/1.1 500 Internal Server Error".to_owned()
+            )
+            .is_retriable()
+        );
     }
 
     #[test]
     fn rate_limit_responses_remain_retriable() {
-        assert!(WhisperParseError::InvalidJson(
-            "whisper command failed: status=429 HTTP/1.1 429 Too Many Requests".to_owned()
-        )
-        .is_retriable());
+        assert!(
+            WhisperParseError::InvalidJson(
+                "whisper command failed: status=429 HTTP/1.1 429 Too Many Requests".to_owned()
+            )
+            .is_retriable()
+        );
     }
 }
 
