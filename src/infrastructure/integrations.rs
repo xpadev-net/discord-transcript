@@ -4,7 +4,7 @@ use crate::infrastructure::asr::{
     WhisperClient, WhisperInferenceRequest, WhisperParseError, WhisperTranscriptionResult,
     parse_whisper_response,
 };
-use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff};
+use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff, retry_with_backoff_if};
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -60,44 +60,48 @@ impl WhisperClient for CommandWhisperClient {
         &self,
         request: &WhisperInferenceRequest,
     ) -> Result<WhisperTranscriptionResult, WhisperParseError> {
-        let output = retry_with_backoff(self.retry_policy, |_| {
-            let mut cmd = Command::new(&self.curl_bin);
-            cmd.arg("-sS")
-                .arg("-X")
-                .arg("POST")
-                .arg(format!("{}/inference", self.endpoint.trim_end_matches('/')))
-                .arg("-F")
-                .arg(format!("file=@{}", request.audio_path))
-                .arg("-F")
-                .arg("response_format=verbose_json");
+        let output = retry_with_backoff_if(
+            self.retry_policy,
+            |_| {
+                let mut cmd = Command::new(&self.curl_bin);
+                cmd.arg("-sS")
+                    .arg("-X")
+                    .arg("POST")
+                    .arg(format!("{}/inference", self.endpoint.trim_end_matches('/')))
+                    .arg("-F")
+                    .arg(format!("file=@{}", request.audio_path))
+                    .arg("-F")
+                    .arg("response_format=verbose_json");
 
-            if let Some(language) = &request.language {
-                cmd.arg("-F").arg(format!("language={language}"));
-            }
-            cmd.arg("-F").arg(format!("beam_size={}", self.beam_size));
-            cmd.arg("-F")
-                .arg(format!("suppress_non_speech={}", self.suppress_non_speech));
-            if let Some(p) = &self.prompt {
-                cmd.arg("--form-string").arg(format!("prompt={p}"));
-            }
-            cmd.arg("-F").arg(format!("vad={}", self.vad));
-            cmd.arg("-F")
-                .arg(format!("temperature={}", self.temperature));
+                if let Some(language) = &request.language {
+                    cmd.arg("-F").arg(format!("language={language}"));
+                }
+                cmd.arg("-F").arg(format!("beam_size={}", self.beam_size));
+                cmd.arg("-F")
+                    .arg(format!("suppress_non_speech={}", self.suppress_non_speech));
+                if let Some(p) = &self.prompt {
+                    cmd.arg("--form-string").arg(format!("prompt={p}"));
+                }
+                cmd.arg("-F").arg(format!("vad={}", self.vad));
+                cmd.arg("-F")
+                    .arg(format!("temperature={}", self.temperature));
 
-            run_command_with_timeout(&mut cmd, None, self.command_timeout)
-                .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))
-                .and_then(|output| {
-                    if output.status.success() {
-                        Ok(output)
-                    } else {
-                        Err(WhisperParseError::InvalidJson(format!(
-                            "whisper command failed: status={:?}, stderr={}",
-                            output.status.code(),
-                            sanitize_output(&output.stderr)
-                        )))
-                    }
-                })
-        })?;
+                run_command_with_timeout(&mut cmd, None, self.command_timeout)
+                    .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))
+                    .and_then(|output| {
+                        if output.status.success() {
+                            Ok(output)
+                        } else {
+                            Err(WhisperParseError::InvalidJson(format!(
+                                "whisper command failed: status={:?}, stderr={}",
+                                output.status.code(),
+                                sanitize_output(&output.stderr)
+                            )))
+                        }
+                    })
+            },
+            |err| err.is_retriable(),
+        )?;
 
         let body = String::from_utf8(output.stdout)
             .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
