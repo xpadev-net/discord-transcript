@@ -265,7 +265,7 @@ async fn begin_membership_reverify(inflight: &MembershipReverifyInflight, user_i
         return false;
     }
     map.insert(user_id.to_owned(), now);
-    if map.len() > 5000 {
+    if map.len() >= 5000 {
         map.retain(|_, started| {
             now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
         });
