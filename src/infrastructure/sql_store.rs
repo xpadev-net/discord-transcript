@@ -19,18 +19,25 @@ use tokio_postgres::{Client as PgClient, NoTls, Row};
 /// instead of locale-dependent string matching.
 pub const UNIQUE_VIOLATION_PREFIX: &str = "UNIQUE_VIOLATION: ";
 
+pub type SqlRow = Vec<Option<String>>;
+
 pub trait SqlExecutor {
     fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String>;
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String>;
-    fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String>;
+    fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<SqlRow>, String>;
     fn run_migration(&mut self, migration_sql: &str) -> Result<(), String>;
+}
+
+/// Test helper: map plain strings to `Some` columns (SQL non-NULL values).
+pub fn sql_row_from_strings(values: Vec<String>) -> SqlRow {
+    values.into_iter().map(Some).collect()
 }
 
 #[derive(Debug, Default)]
 pub struct FakeSqlExecutor {
     pub executed: Vec<(String, Vec<String>)>,
     pub active_by_guild: HashMap<String, StoredMeeting>,
-    pub query_rows_result: HashMap<String, Vec<Vec<String>>>,
+    pub query_rows_result: HashMap<String, Vec<SqlRow>>,
     pub query_rows_error: HashMap<String, String>,
     pub execute_result: HashMap<String, u64>,
     pub execute_error: HashMap<String, String>,
@@ -50,7 +57,7 @@ impl SqlExecutor for FakeSqlExecutor {
         Ok(self.active_by_guild.get(guild_id).cloned())
     }
 
-    fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String> {
+    fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<SqlRow>, String> {
         self.executed.push((sql.to_owned(), params.to_vec()));
         let key = format!("{}|{}", sql, params.join("\u{1f}"));
         if let Some(err) = self.query_rows_error.get(&key) {
@@ -183,8 +190,9 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         };
         let status_value = row
             .first()
+            .and_then(|v| v.clone())
             .ok_or_else(|| QueueError::Backend("retry returned no status".to_owned()))?;
-        JobStatus::parse_str(status_value).ok_or_else(|| {
+        JobStatus::parse_str(&status_value).ok_or_else(|| {
             QueueError::Backend(format!(
                 "unknown job status in retry result: {status_value}"
             ))
@@ -192,33 +200,41 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
     }
 }
 
-fn parse_job_row(row: &[String]) -> Result<Job, QueueError> {
+fn require_job_column(
+    row: &[Option<String>],
+    idx: usize,
+    field: &str,
+) -> Result<String, QueueError> {
+    row.get(idx)
+        .and_then(|v| v.clone())
+        .ok_or_else(|| QueueError::Backend(format!("{field} is NULL")))
+}
+
+fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
     if row.len() < 6 {
         return Err(QueueError::Backend(format!(
             "invalid claimed job row length: {}",
             row.len()
         )));
     }
-    let job_type = JobType::parse_str(&row[2])
-        .ok_or_else(|| QueueError::Backend(format!("unknown job type: {}", row[2])))?;
-    let status = JobStatus::parse_str(&row[3])
-        .ok_or_else(|| QueueError::Backend(format!("unknown job status: {}", row[3])))?;
-    let retry_count = row[4]
-        .parse::<u32>()
-        .map_err(|err| QueueError::Backend(format!("invalid retry_count '{}': {err}", row[4])))?;
-    let error_message = if row[5].trim().is_empty() {
-        None
-    } else {
-        Some(row[5].clone())
-    };
+    let job_type_raw = require_job_column(row, 2, "job_type")?;
+    let job_type = JobType::parse_str(&job_type_raw)
+        .ok_or_else(|| QueueError::Backend(format!("unknown job type: {job_type_raw}")))?;
+    let status_raw = require_job_column(row, 3, "status")?;
+    let status = JobStatus::parse_str(&status_raw)
+        .ok_or_else(|| QueueError::Backend(format!("unknown job status: {status_raw}")))?;
+    let retry_count_raw = require_job_column(row, 4, "retry_count")?;
+    let retry_count = retry_count_raw.parse::<u32>().map_err(|err| {
+        QueueError::Backend(format!("invalid retry_count '{retry_count_raw}': {err}"))
+    })?;
 
     Ok(Job {
-        id: row[0].clone(),
-        meeting_id: row[1].clone(),
+        id: require_job_column(row, 0, "id")?,
+        meeting_id: require_job_column(row, 1, "meeting_id")?,
         job_type,
         status,
         retry_count,
-        error_message,
+        error_message: row.get(5).and_then(|v| v.clone()),
     })
 }
 
@@ -269,60 +285,37 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                 row.len()
             )));
         }
-        let status = MeetingStatus::parse_str(&row[8]).ok_or_else(|| {
+        let require = |idx: usize, field: &str| -> Result<String, StoreError> {
+            row.get(idx)
+                .and_then(|v| v.clone())
+                .ok_or_else(|| StoreError::Backend(format!("{field} is NULL for id={meeting_id}")))
+        };
+        let status_raw = require(8, "status")?;
+        let status = MeetingStatus::parse_str(&status_raw).ok_or_else(|| {
             StoreError::Backend(format!(
-                "invalid meeting status for id={meeting_id}: {}",
-                row[8]
+                "invalid meeting status for id={meeting_id}: {status_raw}"
             ))
         })?;
-        let stop_reason = if row[9].trim().is_empty() {
-            None
-        } else {
-            Some(StopReason::parse_str(&row[9]).ok_or_else(|| {
-                StoreError::Backend(format!(
-                    "invalid stop_reason for id={meeting_id}: {}",
-                    row[9]
-                ))
-            })?)
+        let stop_reason = match row.get(9).and_then(|v| v.clone()) {
+            None => None,
+            Some(value) => Some(StopReason::parse_str(&value).ok_or_else(|| {
+                StoreError::Backend(format!("invalid stop_reason for id={meeting_id}: {value}"))
+            })?),
         };
         Ok(Some(StoredMeeting {
-            id: row[0].clone(),
-            guild_id: row[1].clone(),
-            voice_channel_id: row[2].clone(),
-            report_channel_id: row[3].clone(),
-            status_message_channel_id: if row[4].trim().is_empty() {
-                None
-            } else {
-                Some(row[4].clone())
-            },
-            status_message_id: if row[5].trim().is_empty() {
-                None
-            } else {
-                Some(row[5].clone())
-            },
-            started_by_user_id: row[6].clone(),
-            title: if row[7].trim().is_empty() {
-                None
-            } else {
-                Some(row[7].clone())
-            },
+            id: require(0, "id")?,
+            guild_id: require(1, "guild_id")?,
+            voice_channel_id: require(2, "voice_channel_id")?,
+            report_channel_id: require(3, "report_channel_id")?,
+            status_message_channel_id: row.get(4).and_then(|v| v.clone()),
+            status_message_id: row.get(5).and_then(|v| v.clone()),
+            started_by_user_id: require(6, "started_by_user_id")?,
+            title: row.get(7).and_then(|v| v.clone()),
             status,
             stop_reason,
-            error_message: if row[10].trim().is_empty() {
-                None
-            } else {
-                Some(row[10].clone())
-            },
-            started_at: parse_optional_rfc3339(if row[11].trim().is_empty() {
-                None
-            } else {
-                Some(row[11].clone())
-            }),
-            stopped_at: parse_optional_rfc3339(if row[12].trim().is_empty() {
-                None
-            } else {
-                Some(row[12].clone())
-            }),
+            error_message: row.get(10).and_then(|v| v.clone()),
+            started_at: parse_optional_rfc3339(row.get(11).and_then(|v| v.clone())),
+            stopped_at: parse_optional_rfc3339(row.get(12).and_then(|v| v.clone())),
         }))
     }
 
@@ -407,7 +400,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                 let outcome = rows
                     .first()
                     .and_then(|row| row.first())
-                    .map(|value| value.as_str())
+                    .and_then(|value| value.as_deref())
                     .ok_or_else(|| {
                         StoreError::Backend(
                             "set_meeting_status CAS query returned no outcome".to_owned(),
@@ -481,27 +474,13 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             });
         };
 
-        let report_channel_id = row.first().cloned().ok_or_else(|| {
+        let report_channel_id = row.first().and_then(|v| v.clone()).ok_or_else(|| {
             StoreError::Backend(format!(
                 "report_channel_id missing in status metadata row for meeting_id={meeting_id}"
             ))
         })?;
-        let status_message_channel_id = row.get(1).and_then(|v| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        });
-        let status_message_id = row.get(2).and_then(|v| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        });
+        let status_message_channel_id = row.get(1).and_then(|v| v.clone());
+        let status_message_id = row.get(2).and_then(|v| v.clone());
 
         Ok(StatusMessageMetadata {
             report_channel_id,
@@ -642,7 +621,7 @@ impl SqlExecutor for PgSqlExecutor {
         })
     }
 
-    fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String> {
+    fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<SqlRow>, String> {
         let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
             .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -656,7 +635,7 @@ impl SqlExecutor for PgSqlExecutor {
                     .map_err(|err| err.to_string())
                     .and_then(|rows| {
                         rows.into_iter()
-                            .map(pg_row_to_strings)
+                            .map(pg_row_to_optional_strings)
                             .collect::<Result<Vec<_>, _>>()
                     })
             })
@@ -713,31 +692,31 @@ fn parse_optional_rfc3339(value: Option<String>) -> Option<DateTime<Utc>> {
         .map(|ts| ts.with_timezone(&Utc))
 }
 
-fn pg_row_to_strings(row: Row) -> Result<Vec<String>, String> {
+fn pg_row_to_optional_strings(row: Row) -> Result<SqlRow, String> {
     let mut values = Vec::with_capacity(row.len());
     for idx in 0..row.len() {
         if let Ok(v) = row.try_get::<usize, Option<String>>(idx) {
-            values.push(v.unwrap_or_default());
-            continue;
-        }
-        if let Ok(v) = row.try_get::<usize, String>(idx) {
             values.push(v);
             continue;
         }
+        if let Ok(v) = row.try_get::<usize, String>(idx) {
+            values.push(Some(v));
+            continue;
+        }
         if let Ok(v) = row.try_get::<usize, i32>(idx) {
-            values.push(v.to_string());
+            values.push(Some(v.to_string()));
             continue;
         }
         if let Ok(v) = row.try_get::<usize, i64>(idx) {
-            values.push(v.to_string());
+            values.push(Some(v.to_string()));
             continue;
         }
         if let Ok(v) = row.try_get::<usize, bool>(idx) {
-            values.push(v.to_string());
+            values.push(Some(v.to_string()));
             continue;
         }
         if let Ok(v) = row.try_get::<usize, f64>(idx) {
-            values.push(v.to_string());
+            values.push(Some(v.to_string()));
             continue;
         }
         return Err(format!("unsupported postgres column type at index {idx}"));

@@ -712,7 +712,7 @@ fn recovery_existing_summary_job_is_claimable<E: SqlExecutor>(
         Ok(rows) => rows
             .first()
             .and_then(|row| row.first())
-            .is_some_and(|status| status == "queued"),
+            .is_some_and(|status| status.as_deref() == Some("queued")),
         Err(err) => {
             warn!(meeting_id, job_id, error = %err, "failed to inspect existing summary job during recovery");
             false
@@ -1737,14 +1737,22 @@ impl ScaffoldHandler {
                     if row.len() < 3 {
                         return Err(format!("invalid recovery row length: {}", row.len()));
                     }
+                    let meeting_id = row
+                        .first()
+                        .and_then(|v| v.clone())
+                        .ok_or_else(|| "recovery row missing meeting_id".to_owned())?;
+                    let status_raw = row
+                        .get(1)
+                        .and_then(|v| v.clone())
+                        .ok_or_else(|| "recovery row missing status".to_owned())?;
+                    let voice_channel_id =
+                        row.get(2).and_then(|v| v.as_deref()).and_then(|value| {
+                            parse_u64_with_warning(&meeting_id, "voice_channel_id", value)
+                        });
                     Ok(RecoverySnapshot {
-                        meeting_id: row[0].clone(),
-                        status: parse_meeting_status(&row[1])?,
-                        voice_channel_id: parse_u64_with_warning(
-                            &row[0],
-                            "voice_channel_id",
-                            &row[2],
-                        ),
+                        meeting_id,
+                        status: parse_meeting_status(&status_raw)?,
+                        voice_channel_id,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?
@@ -3401,32 +3409,26 @@ impl ScaffoldHandler {
         let guild_id = guild_row
             .into_iter()
             .next()
-            .and_then(|row| row.into_iter().next());
+            .and_then(|row| row.first().cloned().flatten());
 
         let mut profiles = HashMap::new();
         for row in speaker_rows {
             if row.len() < 4 {
                 continue;
             }
+            let Some(speaker_id) = row.first().and_then(|v| v.clone()) else {
+                continue;
+            };
             let profile = SpeakerProfile {
-                speaker_id: row[0].clone(),
-                username: optional_string(&row[1]),
-                nickname: optional_string(&row[2]),
-                display_name: optional_string(&row[3]),
+                speaker_id: speaker_id.clone(),
+                username: row.get(1).and_then(|v| v.clone()),
+                nickname: row.get(2).and_then(|v| v.clone()),
+                display_name: row.get(3).and_then(|v| v.clone()),
             };
             profiles.insert(profile.speaker_id.clone(), profile);
         }
 
         (guild_id, profiles)
-    }
-}
-
-fn optional_string(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
     }
 }
 
@@ -4137,14 +4139,18 @@ mod status_message_tests {
             self.inner.query_active_meeting(guild_id)
         }
 
-        fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<Vec<String>>, String> {
+        fn query_rows(
+            &mut self,
+            sql: &str,
+            params: &[String],
+        ) -> Result<Vec<crate::infrastructure::sql_store::SqlRow>, String> {
             self.inner.executed.push((sql.to_owned(), params.to_vec()));
             let key = format!("{}|{}", sql, params.join("\u{1f}"));
             if let Some(err) = self.inner.query_rows_error.get(&key) {
                 return Err(err.clone());
             }
             if sql == RECOVERY_SUMMARY_JOB_STATUS_SQL {
-                return Ok(vec![vec![self.job_status.clone()]]);
+                return Ok(vec![vec![Some(self.job_status.clone())]]);
             }
             Ok(self
                 .inner

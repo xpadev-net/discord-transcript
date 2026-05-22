@@ -7,7 +7,7 @@ use discord_transcript::application::retention_cleanup::{
     enforce_retention_policy,
 };
 use discord_transcript::domain::retention::RetentionPolicy;
-use discord_transcript::infrastructure::sql_store::FakeSqlExecutor;
+use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -64,11 +64,19 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.execute_result.insert(
         query_key(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30"]),
@@ -128,7 +136,11 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, &["90"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.execute_result.insert(
         query_key(RETENTION_DELETE_SUMMARIES_SQL, &["90"]),
@@ -171,7 +183,11 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
 
     let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
@@ -198,7 +214,11 @@ fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.execute_result.insert(
         query_key(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30"]),
@@ -234,15 +254,27 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
-        vec![vec!["m2".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m2".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, &["90"]),
-        vec![vec!["m2".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m2".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
 
     let err = enforce_retention_policy(
@@ -280,7 +312,11 @@ fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.execute_error.insert(
         query_key(RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL, &[]),
@@ -310,7 +346,11 @@ fn retention_cleanup_uses_partial_plan_when_one_workspace_query_fails() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
-        vec![vec!["m1".to_owned(), "g1".to_owned(), "vc1".to_owned()]],
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
     );
     executor.query_rows_error.insert(
         query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
