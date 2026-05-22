@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoStopState {
     grace_period: Duration,
-    empty_since_ms: Option<u64>,
+    empty_since: Option<Instant>,
     /// True while a grace-period timer task is in flight.
     /// Prevents spawning multiple concurrent timer tasks.
     timer_active: bool,
@@ -14,7 +14,7 @@ impl AutoStopState {
     pub fn new(grace_period: Duration) -> Self {
         Self {
             grace_period,
-            empty_since_ms: None,
+            empty_since: None,
             timer_active: false,
             timer_generation: 0,
         }
@@ -29,25 +29,21 @@ impl AutoStopState {
     pub fn on_non_bot_member_count_changed(
         &mut self,
         non_bot_member_count: usize,
-        now_ms: u64,
     ) -> AutoStopSignal {
         if non_bot_member_count == 0 {
-            if self.empty_since_ms.is_none() {
-                self.empty_since_ms = Some(now_ms);
+            if self.empty_since.is_none() {
+                self.empty_since = Some(Instant::now());
             }
-            // If a timer task is already in flight, don't request another one.
             if self.timer_active {
                 return AutoStopSignal::AlreadyWaiting;
             }
-            // Atomically reserve the timer slot and signal the caller to spawn.
             self.timer_active = true;
             self.timer_generation = self.timer_generation.saturating_add(1);
             return AutoStopSignal::StartTimer;
         }
 
-        // Members returned — cancel any pending grace period.
         self.timer_active = false;
-        if self.empty_since_ms.take().is_some() {
+        if self.empty_since.take().is_some() {
             return AutoStopSignal::Cancelled;
         }
 
@@ -71,24 +67,27 @@ impl AutoStopState {
 
     /// Re-arm the empty episode after a failed stop attempt so a later timer
     /// can retry while the channel is still empty.
-    pub fn retry_after_failed_stop(&mut self, now_ms: u64) {
-        self.empty_since_ms = Some(now_ms);
+    pub fn retry_after_failed_stop(&mut self) {
+        self.empty_since = Some(Instant::now());
         self.timer_active = true;
     }
 
-    pub fn tick(&mut self, now_ms: u64) -> AutoStopSignal {
-        let Some(empty_since_ms) = self.empty_since_ms else {
+    pub fn tick(&mut self) -> AutoStopSignal {
+        let Some(empty_since) = self.empty_since else {
             return AutoStopSignal::Idle;
         };
 
-        let elapsed = now_ms.saturating_sub(empty_since_ms);
-        let grace_ms = u64::try_from(self.grace_period.as_millis()).unwrap_or(u64::MAX);
-        if elapsed >= grace_ms {
-            self.empty_since_ms = None;
+        if empty_since.elapsed() >= self.grace_period {
+            self.empty_since = None;
             return AutoStopSignal::Trigger;
         }
 
         AutoStopSignal::Idle
+    }
+
+    #[doc(hidden)]
+    pub fn set_empty_since_elapsed_for_test(&mut self, elapsed: Duration) {
+        self.empty_since = Some(Instant::now() - elapsed);
     }
 }
 

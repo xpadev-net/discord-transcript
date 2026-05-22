@@ -273,25 +273,25 @@ fn record_stop_rejects_started_meeting_role_without_matching_user() {
 fn auto_stop_triggers_after_grace_period_and_can_cancel() {
     let mut state = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(
-        state.on_non_bot_member_count_changed(0, 1_000),
+        state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
-    assert_eq!(state.tick(1_000 + 59_000), AutoStopSignal::Idle);
-    assert_eq!(state.tick(1_000 + 60_000), AutoStopSignal::Trigger);
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(59));
+    assert_eq!(state.tick(), AutoStopSignal::Idle);
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(60));
+    assert_eq!(state.tick(), AutoStopSignal::Trigger);
 
-    // Simulate the timer task completing (as the runtime would do).
     state.clear_timer_active();
 
-    // second cycle: empty -> rejoin cancels auto stop
     assert_eq!(
-        state.on_non_bot_member_count_changed(0, 20_000),
+        state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
     assert_eq!(
-        state.on_non_bot_member_count_changed(1, 25_000),
+        state.on_non_bot_member_count_changed(1),
         AutoStopSignal::Cancelled
     );
-    assert_eq!(state.tick(40_000), AutoStopSignal::Idle);
+    assert_eq!(state.tick(), AutoStopSignal::Idle);
 }
 
 #[test]
@@ -302,37 +302,50 @@ fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
     // state machine, and must allow a fresh timer for a subsequent empty episode.
     let mut state = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(
-        state.on_non_bot_member_count_changed(0, 1_000),
+        state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
-    // Fire-time re-verification observes members present and pushes that into state.
     assert_eq!(
-        state.on_non_bot_member_count_changed(2, 1_000 + 60_000),
+        state.on_non_bot_member_count_changed(2),
         AutoStopSignal::Cancelled
     );
 
-    // A later empty episode must be able to start a new timer.
     assert_eq!(
-        state.on_non_bot_member_count_changed(0, 120_000),
+        state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
-    assert_eq!(state.tick(120_000 + 60_000), AutoStopSignal::Trigger);
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(60));
+    assert_eq!(state.tick(), AutoStopSignal::Trigger);
 }
 
 #[test]
 fn auto_stop_rearms_after_failed_stop_attempt() {
     let mut state = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(
-        state.on_non_bot_member_count_changed(0, 1_000),
+        state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
-    assert_eq!(state.tick(61_000), AutoStopSignal::Trigger);
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(61));
+    assert_eq!(state.tick(), AutoStopSignal::Trigger);
 
-    state.retry_after_failed_stop(61_000);
+    state.retry_after_failed_stop();
     assert_eq!(
-        state.on_non_bot_member_count_changed(0, 61_001),
+        state.on_non_bot_member_count_changed(0),
         AutoStopSignal::AlreadyWaiting
     );
-    assert_eq!(state.tick(120_999), AutoStopSignal::Idle);
-    assert_eq!(state.tick(121_000), AutoStopSignal::Trigger);
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(59));
+    assert_eq!(state.tick(), AutoStopSignal::Idle);
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(60));
+    assert_eq!(state.tick(), AutoStopSignal::Trigger);
+}
+
+#[test]
+fn auto_stop_grace_uses_monotonic_elapsed_not_wall_clock_ms() {
+    let mut state = AutoStopState::new(Duration::from_secs(60));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    state.set_empty_since_elapsed_for_test(Duration::from_secs(60));
+    assert_eq!(state.tick(), AutoStopSignal::Trigger);
 }
