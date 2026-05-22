@@ -268,7 +268,16 @@ fn mixdown_skips_chunks_beyond_meeting_wall_clock_cap() {
 
     let mixdown =
         merge_user_chunks_to_mixdown(&base, false).expect("mixdown should ignore far-future chunk");
-    assert!(PathBuf::from(mixdown).exists());
+    let mixdown_path = PathBuf::from(mixdown);
+    assert!(mixdown_path.exists());
+
+    let wav = fs::read(&mixdown_path).expect("mixdown wav should be readable");
+    let data_chunk_size =
+        u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
+    assert_eq!(
+        data_chunk_size, 2_000,
+        "mixdown should contain only the in-cap chunk PCM"
+    );
 
     let _ = fs::remove_dir_all(base);
 }
