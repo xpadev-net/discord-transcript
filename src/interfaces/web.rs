@@ -953,6 +953,7 @@ async fn get_guild_info(
             StatusCode::BAD_GATEWAY
         })?;
 
+    let guild_status = guild_resp.status();
     let guild_body = guild_resp.text().await.map_err(|err| {
         warn!(error = %err, "discord guild API response read failed");
         StatusCode::BAD_GATEWAY
@@ -960,8 +961,14 @@ async fn get_guild_info(
     let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
         warn!(
             error = %err,
-            body_preview = %&guild_body[..guild_body.len().min(500)],
+            status = %guild_status,
+            body_len = guild_body.len(),
             "discord guild API response parse failed"
+        );
+        tracing::debug!(
+            body_len = guild_body.len(),
+            body_prefix = %utf8_safe_byte_prefix(&guild_body, 500),
+            "discord guild API response parse debug"
         );
         StatusCode::BAD_GATEWAY
     })?;
@@ -1028,7 +1035,7 @@ async fn resolve_channel_permissions(
         warn!(
             status = %channel_status,
             retry_after = retry_after_header.as_deref(),
-            body_preview = %&channel_body[..channel_body.len().min(500)],
+            body_len = channel_body.len(),
             "discord channel API rate limited"
         );
         return Err(StatusCode::BAD_GATEWAY);
@@ -1036,7 +1043,7 @@ async fn resolve_channel_permissions(
     if !channel_status.is_success() {
         warn!(
             status = %channel_status,
-            body_preview = %&channel_body[..channel_body.len().min(500)],
+            body_len = channel_body.len(),
             "discord channel API non-success"
         );
         return Err(StatusCode::BAD_GATEWAY);
@@ -1045,8 +1052,14 @@ async fn resolve_channel_permissions(
     let channel: DiscordChannelFull = serde_json::from_str(&channel_body).map_err(|err| {
         warn!(
             error = %err,
-            body_preview = %&channel_body[..channel_body.len().min(500)],
+            status = %channel_status,
+            body_len = channel_body.len(),
             "discord channel API response parse failed"
+        );
+        tracing::debug!(
+            body_len = channel_body.len(),
+            body_prefix = %utf8_safe_byte_prefix(&channel_body, 500),
+            "discord channel API response parse debug"
         );
         StatusCode::BAD_GATEWAY
     })?;
@@ -2501,6 +2514,17 @@ fn build_content_disposition(display_label: &str) -> String {
     )
 }
 
+fn utf8_safe_byte_prefix(body: &str, max_bytes: usize) -> &str {
+    if body.len() <= max_bytes {
+        return body;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
 fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     if file_size == 0 {
         return None;
@@ -3149,5 +3173,21 @@ mod transcript_source_api_tests {
     fn api_transcript_source_rejects_unknown_and_null() {
         assert!(transcript_source_for_api(Some("unknown".to_owned())).is_err());
         assert!(transcript_source_for_api(None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod discord_log_safety_tests {
+    use super::utf8_safe_byte_prefix;
+
+    #[test]
+    fn utf8_safe_byte_prefix_avoids_mid_codepoint_panic() {
+        let body = format!("{}語", "a".repeat(498));
+        assert_eq!(body.len(), 501);
+        let prefix = utf8_safe_byte_prefix(&body, 500);
+        assert_eq!(prefix.len(), 498);
+        assert!(prefix.is_char_boundary(prefix.len()));
+        assert!(std::str::from_utf8(prefix.as_bytes()).is_ok());
+        assert!(prefix.ends_with('a'));
     }
 }
