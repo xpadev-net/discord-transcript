@@ -26,7 +26,7 @@ export function MeetingPage() {
     retryTranscript,
     retrySummary,
   } = useMeetingData(meetingId);
-  const { activeIndex, seekTo } = useAudioSync(
+  const { activeIndex, seekTo, seekNotice } = useAudioSync(
     audioRef,
     transcriptContainerRef,
     transcript,
@@ -100,6 +100,11 @@ export function MeetingPage() {
               error={debugError}
             />
           )}
+          {seekNotice ? (
+            <div className="panel-error seek-notice" role="status">
+              {seekNotice}
+            </div>
+          ) : null}
           <ErrorBoundary
             title={
               "\u30c8\u30e9\u30f3\u30b9\u30af\u30ea\u30d7\u30c8\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
