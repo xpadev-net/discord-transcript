@@ -3291,6 +3291,15 @@ mod parse_range_tests {
         let end = LARGE_FILE - 1;
         assert_eq!(parse_range("bytes=0-", LARGE_FILE), Some((0, end)));
     }
+
+    #[test]
+    fn parse_range_accepts_open_ended_tail_seek_under_min_chunk() {
+        let start = LARGE_FILE - (32 * 1024);
+        assert_eq!(
+            parse_range(&format!("bytes={start}-"), LARGE_FILE),
+            Some((start, LARGE_FILE - 1))
+        );
+    }
 }
 
 #[cfg(test)]
