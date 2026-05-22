@@ -43,6 +43,7 @@ impl WhisperParseError {
                     return true;
                 }
                 let lower = message.to_ascii_lowercase();
+<<<<<<< Updated upstream
                 !lower.contains("http/1.1 4")
                     && !lower.contains("http/2 4")
                     && !lower.contains(" 40")
@@ -50,6 +51,14 @@ impl WhisperParseError {
                     && !lower.contains(" 42")
                     && !lower.contains(" 43")
                     && !lower.contains(" 44")
+=======
+                const NON_RETRIABLE_STATUS: &[&str] = &[
+                    " 400", " 401", " 403", " 404", " 405", " 413", " 415", " 422",
+                ];
+                !lower.contains("http/1.1 4")
+                    && !lower.contains("http/2 4")
+                    && !NON_RETRIABLE_STATUS.iter().any(|code| lower.contains(code))
+>>>>>>> Stashed changes
             }
         }
     }
