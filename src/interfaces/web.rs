@@ -172,7 +172,13 @@ async fn require_auth(
                 return auth_required_redirect_or_unauthorized(&request)
                     .with_cleared_session_cookie(auth.secure_cookie);
             }
-            Err(status) => return status.into_response(),
+            Err(status) => {
+                warn!(
+                    status = %status,
+                    user_id = %session.uid,
+                    "guild membership re-verify unavailable; allowing stale session"
+                );
+            }
         }
     }
 
@@ -229,7 +235,7 @@ fn unix_now_secs() -> u64 {
 
 fn session_needs_membership_reverify(verified_at: u64) -> bool {
     let now = unix_now_secs();
-    verified_at == 0 || now.saturating_sub(verified_at) >= SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS
+    now.saturating_sub(verified_at) >= SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS
 }
 
 fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool {
@@ -500,15 +506,14 @@ struct SessionPayload {
 
 fn session_cookie_value(user_id: &str, guild_id: &str, auth: &AuthConfig) -> String {
     let now = unix_now_secs();
-    let session_value = sign_session(user_id, guild_id, &auth.session_secret, now);
+    let session_value = sign_session(user_id, guild_id, &auth.session_secret, now, now);
     let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}{secure_flag}",
     )
 }
 
-fn sign_session(user_id: &str, guild_id: &str, secret: &str, verified_at: u64) -> String {
-    let now = unix_now_secs();
+fn sign_session(user_id: &str, guild_id: &str, secret: &str, now: u64, verified_at: u64) -> String {
     let payload = SessionPayload {
         uid: user_id.to_owned(),
         gid: guild_id.to_owned(),
@@ -530,7 +535,7 @@ fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
     let payload_bytes = from_hex(payload_hex)?;
     let mut payload: SessionPayload = serde_json::from_slice(&payload_bytes).ok()?;
     let now = unix_now_secs();
-    if now > payload.exp {
+    if now >= payload.exp {
         return None;
     }
     if payload.verified_at == 0 {
@@ -2852,7 +2857,7 @@ mod session_reverify_tests {
     #[test]
     fn legacy_session_without_verified_at_uses_issue_time_estimate() {
         let now = super::unix_now_secs();
-        let cookie = sign_session("user-1", "guild-1", SECRET, 0);
+        let cookie = sign_session("user-1", "guild-1", SECRET, now, 0);
         let session = verify_session(&cookie, SECRET).expect("session should verify");
         assert_eq!(
             session.verified_at,
@@ -2876,7 +2881,7 @@ mod session_reverify_tests {
     #[test]
     fn refreshed_session_carries_new_verified_at() {
         let now = super::unix_now_secs();
-        let cookie = sign_session("user-1", "guild-1", SECRET, now);
+        let cookie = sign_session("user-1", "guild-1", SECRET, now, now);
         let session = verify_session(&cookie, SECRET).expect("session should verify");
         assert_eq!(session.uid, "user-1");
         assert_eq!(session.verified_at, now);
@@ -2886,7 +2891,7 @@ mod session_reverify_tests {
     fn stale_verified_at_session_still_parses_for_reverify_gate() {
         let now = super::unix_now_secs();
         let stale = now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 120);
-        let cookie = sign_session("user-1", "guild-1", SECRET, stale);
+        let cookie = sign_session("user-1", "guild-1", SECRET, stale, stale);
         let session = verify_session(&cookie, SECRET).expect("session should verify");
         assert!(session_needs_membership_reverify(session.verified_at));
     }
