@@ -23,6 +23,8 @@ use crate::infrastructure::storage_fs::sanitize_path_component;
 type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
+const SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
+const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 30;
 const OAUTH_NONCE_COOKIE_NAME: &str = "dt_oauth_nonce";
 const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
 const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
@@ -37,6 +39,7 @@ const GUILD_CACHE_TTL_SECS: u64 = 300;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
+type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedChannelPermission {
@@ -54,6 +57,8 @@ pub struct WebState {
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
+    /// In-flight guild membership re-verification per user id
+    membership_reverify_inflight: MembershipReverifyInflight,
     pub static_files_dir: String,
 }
 
@@ -72,6 +77,7 @@ impl WebState {
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             static_files_dir,
         }
     }
@@ -144,14 +150,92 @@ async fn require_auth(
         return (StatusCode::SERVICE_UNAVAILABLE, "OAuth not configured").into_response();
     };
 
-    if let Some(cookie_val) = get_cookie(&headers, SESSION_COOKIE_NAME)
-        && let Some(session) = verify_session(&cookie_val, &auth.session_secret)
-        && session.gid == auth.guild_id
-    {
-        request.extensions_mut().insert(AuthUserId(session.uid));
-        return next.run(request).await;
+    let Some(cookie_val) = get_cookie(&headers, SESSION_COOKIE_NAME) else {
+        return auth_required_redirect_or_unauthorized(&request);
+    };
+    let Some(session) = verify_session(&cookie_val, &auth.session_secret) else {
+        return auth_required_redirect_or_unauthorized(&request);
+    };
+    if session.gid != auth.guild_id {
+        return auth_required_redirect_or_unauthorized(&request);
     }
 
+    let mut refreshed_session_cookie = None;
+    if session_needs_membership_reverify(&session)
+        && begin_membership_reverify(&state.membership_reverify_inflight, &session.uid).await
+    {
+        let membership = is_guild_member(&state, auth, &session.uid).await;
+        end_membership_reverify(&state.membership_reverify_inflight, &session.uid).await;
+        match membership {
+            Ok(true) => {
+                refreshed_session_cookie = Some(session_cookie_with_membership(
+                    &session.uid,
+                    &auth.guild_id,
+                    auth,
+                    session.exp,
+                    unix_now_secs(),
+                    0,
+                ));
+            }
+            Ok(false) => {
+                invalidate_permission_cache_for_user(&state.permission_cache, &session.uid).await;
+                warn!(
+                    user_id = %session.uid,
+                    guild_id = %auth.guild_id,
+                    "denying session after failed guild membership re-verification"
+                );
+                return auth_required_redirect_or_unauthorized(&request)
+                    .with_cleared_session_cookie(auth.secure_cookie);
+            }
+            Err(status) => {
+                warn!(
+                    status = %status,
+                    user_id = %session.uid,
+                    "guild membership re-verify unavailable; allowing stale session"
+                );
+                refreshed_session_cookie = Some(session_cookie_with_membership(
+                    &session.uid,
+                    &auth.guild_id,
+                    auth,
+                    session.exp,
+                    session.verified_at,
+                    unix_now_secs(),
+                ));
+            }
+        }
+    }
+
+    request
+        .extensions_mut()
+        .insert(AuthUserId(session.uid.clone()));
+    let mut response = next.run(request).await;
+    if let Some(cookie) = refreshed_session_cookie
+        && let Ok(value) = header::HeaderValue::from_str(&cookie)
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+fn cleared_session_cookie(secure_cookie: bool) -> String {
+    let secure_flag = if secure_cookie { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_flag}")
+}
+
+trait AuthFailureResponse {
+    fn with_cleared_session_cookie(self, secure_cookie: bool) -> Response;
+}
+
+impl AuthFailureResponse for Response {
+    fn with_cleared_session_cookie(mut self, secure_cookie: bool) -> Response {
+        if let Ok(value) = header::HeaderValue::from_str(&cleared_session_cookie(secure_cookie)) {
+            self.headers_mut().append(header::SET_COOKIE, value);
+        }
+        self
+    }
+}
+
+fn auth_required_redirect_or_unauthorized(request: &axum::extract::Request) -> Response {
     let path = request
         .uri()
         .path_and_query()
@@ -163,6 +247,97 @@ async fn require_auth(
 
     let login_url = format!("/auth/login?redirect={}", percent_encode(&path));
     Redirect::temporary(&login_url).into_response()
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn begin_membership_reverify(inflight: &MembershipReverifyInflight, user_id: &str) -> bool {
+    let mut map = inflight.lock().await;
+    let now = Instant::now();
+    if let Some(started) = map.get(user_id)
+        && now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
+    {
+        return false;
+    }
+    map.insert(user_id.to_owned(), now);
+    if map.len() >= 5000 {
+        map.retain(|_, started| {
+            now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
+        });
+    }
+    true
+}
+
+async fn end_membership_reverify(inflight: &MembershipReverifyInflight, user_id: &str) {
+    inflight.lock().await.remove(user_id);
+}
+
+fn session_needs_membership_reverify(session: &SessionPayload) -> bool {
+    let now = unix_now_secs();
+    if now.saturating_sub(session.verified_at) < SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS {
+        return false;
+    }
+    session.reverify_attempt_at == 0
+        || now.saturating_sub(session.reverify_attempt_at)
+            >= SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS
+}
+
+fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::OK
+}
+
+async fn is_guild_member(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let bot_auth = format!("Bot {}", auth.bot_token);
+    let response = state
+        .http_client
+        .get(format!(
+            "https://discord.com/api/guilds/{}/members/{user_id}",
+            auth.guild_id
+        ))
+        .header("Authorization", &bot_auth)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, user_id = %user_id, "discord guild member re-verify request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let status = response.status();
+    if guild_member_status_indicates_membership(status) {
+        return Ok(true);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
+        warn!(
+            status = %status,
+            user_id = %user_id,
+            "discord guild member re-verify forbidden; check bot token and GUILD_MEMBERS intent"
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    warn!(
+        status = %status,
+        user_id = %user_id,
+        "discord guild member re-verify returned unexpected status"
+    );
+    Err(StatusCode::BAD_GATEWAY)
+}
+
+async fn invalidate_permission_cache_for_user(cache: &PermissionCache, user_id: &str) {
+    let mut cache = cache.write().await;
+    cache.retain(|(uid, _), _| uid != user_id);
 }
 
 // ========== Auth: handlers ==========
@@ -347,11 +522,7 @@ async fn auth_callback(
 
     // Create session cookie with user ID
     let redirect = sanitize_redirect(&redirect);
-    let session_value = sign_session(&user.id, &auth.guild_id, &auth.session_secret);
-    let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
-    let session_cookie = format!(
-        "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}{secure_flag}",
-    );
+    let session_cookie = session_cookie_value(&user.id, &auth.guild_id, auth);
     let clear_oauth_nonce_cookie = format_oauth_nonce_cookie("", auth.secure_cookie, 0);
 
     Response::builder()
@@ -386,22 +557,71 @@ struct SessionPayload {
     uid: String,
     gid: String,
     exp: u64,
+    #[serde(default)]
+    verified_at: u64,
+    #[serde(default)]
+    reverify_attempt_at: u64,
 }
 
-fn sign_session(user_id: &str, guild_id: &str, secret: &str) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+fn session_cookie_value(user_id: &str, guild_id: &str, auth: &AuthConfig) -> String {
+    let now = unix_now_secs();
+    session_cookie_with_membership(user_id, guild_id, auth, now + SESSION_TTL_SECS, now, 0)
+}
+
+fn session_cookie_with_membership(
+    user_id: &str,
+    guild_id: &str,
+    auth: &AuthConfig,
+    exp: u64,
+    verified_at: u64,
+    reverify_attempt_at: u64,
+) -> String {
+    let session_value = sign_session_with_exp(
+        user_id,
+        guild_id,
+        &auth.session_secret,
+        exp,
+        verified_at,
+        reverify_attempt_at,
+    );
+    let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
+    let max_age = exp.saturating_sub(unix_now_secs()).max(1);
+    format!(
+        "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure_flag}",
+    )
+}
+
+fn sign_session_with_exp(
+    user_id: &str,
+    guild_id: &str,
+    secret: &str,
+    exp: u64,
+    verified_at: u64,
+    reverify_attempt_at: u64,
+) -> String {
     let payload = SessionPayload {
         uid: user_id.to_owned(),
         gid: guild_id.to_owned(),
-        exp: now + SESSION_TTL_SECS,
+        exp,
+        verified_at,
+        reverify_attempt_at,
     };
     let json = serde_json::to_string(&payload).unwrap_or_default();
     let payload_hex = to_hex(json.as_bytes());
     let sig_hex = hmac_hex(secret, &payload_hex);
     format!("{payload_hex}.{sig_hex}")
+}
+
+#[cfg(test)]
+fn sign_session(user_id: &str, guild_id: &str, secret: &str, now: u64, verified_at: u64) -> String {
+    sign_session_with_exp(
+        user_id,
+        guild_id,
+        secret,
+        now + SESSION_TTL_SECS,
+        verified_at,
+        0,
+    )
 }
 
 fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
@@ -411,13 +631,13 @@ fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
         return None;
     }
     let payload_bytes = from_hex(payload_hex)?;
-    let payload: SessionPayload = serde_json::from_slice(&payload_bytes).ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now > payload.exp {
+    let mut payload: SessionPayload = serde_json::from_slice(&payload_bytes).ok()?;
+    let now = unix_now_secs();
+    if now >= payload.exp {
         return None;
+    }
+    if payload.verified_at == 0 {
+        payload.verified_at = payload.exp.saturating_sub(SESSION_TTL_SECS);
     }
     Some(payload)
 }
@@ -2704,5 +2924,101 @@ mod oauth_state_tests {
         assert!(cleared.contains("dt_oauth_nonce=;"));
         assert!(cleared.contains(&format!("Path={OAUTH_NONCE_COOKIE_PATH}")));
         assert!(cleared.contains("Max-Age=0"));
+    }
+}
+
+#[cfg(test)]
+mod session_reverify_tests {
+    use super::{
+        SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS, SESSION_TTL_SECS, SessionPayload,
+        guild_member_status_indicates_membership, session_needs_membership_reverify, sign_session,
+        verify_session,
+    };
+    use reqwest::StatusCode as HttpStatus;
+
+    const SECRET: &str = "test-session-secret";
+
+    #[test]
+    fn session_needs_reverify_after_interval() {
+        let now = super::unix_now_secs();
+        let session = SessionPayload {
+            uid: "u".to_owned(),
+            gid: "g".to_owned(),
+            exp: now + super::SESSION_TTL_SECS,
+            verified_at: now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 60),
+            reverify_attempt_at: 0,
+        };
+        assert!(session_needs_membership_reverify(&session));
+    }
+
+    #[test]
+    fn session_skips_reverify_within_interval() {
+        let now = super::unix_now_secs();
+        let session = SessionPayload {
+            uid: "u".to_owned(),
+            gid: "g".to_owned(),
+            exp: now + super::SESSION_TTL_SECS,
+            verified_at: now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS / 2),
+            reverify_attempt_at: 0,
+        };
+        assert!(!session_needs_membership_reverify(&session));
+    }
+
+    #[test]
+    fn session_skips_reverify_until_attempt_backoff_elapses() {
+        let now = super::unix_now_secs();
+        let session = SessionPayload {
+            uid: "u".to_owned(),
+            gid: "g".to_owned(),
+            exp: now + super::SESSION_TTL_SECS,
+            verified_at: now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 60),
+            reverify_attempt_at: now.saturating_sub(60),
+        };
+        assert!(!session_needs_membership_reverify(&session));
+    }
+
+    #[test]
+    fn legacy_session_without_verified_at_uses_issue_time_estimate() {
+        let now = super::unix_now_secs();
+        let cookie = sign_session("user-1", "guild-1", SECRET, now, 0);
+        let session = verify_session(&cookie, SECRET).expect("session should verify");
+        assert_eq!(
+            session.verified_at,
+            session.exp.saturating_sub(SESSION_TTL_SECS)
+        );
+        assert!(!session_needs_membership_reverify(&session));
+    }
+
+    #[test]
+    fn non_success_member_status_is_not_positive_membership() {
+        assert!(!guild_member_status_indicates_membership(
+            HttpStatus::NOT_FOUND
+        ));
+        assert!(!guild_member_status_indicates_membership(
+            HttpStatus::FORBIDDEN
+        ));
+    }
+
+    #[test]
+    fn active_member_status_is_membership() {
+        assert!(guild_member_status_indicates_membership(HttpStatus::OK));
+    }
+
+    #[test]
+    fn refreshed_session_carries_new_verified_at() {
+        let now = super::unix_now_secs();
+        let cookie = sign_session("user-1", "guild-1", SECRET, now, now);
+        let session = verify_session(&cookie, SECRET).expect("session should verify");
+        assert_eq!(session.uid, "user-1");
+        assert_eq!(session.verified_at, now);
+    }
+
+    #[test]
+    fn stale_verified_at_session_still_parses_for_reverify_gate() {
+        let now = super::unix_now_secs();
+        let stale = now.saturating_sub(SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS + 120);
+        let cookie = sign_session("user-1", "guild-1", SECRET, stale, stale);
+        let session = verify_session(&cookie, SECRET).expect("session should verify");
+        assert!(session_needs_membership_reverify(&session));
     }
 }
