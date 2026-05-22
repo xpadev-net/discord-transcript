@@ -139,7 +139,10 @@ export function useAudioSync(
         );
         return;
       }
-      void audio.play().catch(() => {
+      void audio.play().catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return;
+        }
         showSeekNotice(
           "\u97f3\u58f0\u306e\u518d\u751f\u3092\u958b\u59cb\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f",
         );
