@@ -259,7 +259,7 @@ fn mixdown_skips_chunks_beyond_meeting_wall_clock_cap() {
     let far_future = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
     fs::write(
         base.join(format!(
-            "bad_2_{}",
+            "bad_2_{}.wav",
             discord_transcript::audio::meeting_audio::MAX_MEETING_AUDIO_SPAN_MS + 60_000
         )),
         &far_future,

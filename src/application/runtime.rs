@@ -762,7 +762,18 @@ fn mix_chunks_by_wallclock(
             continue;
         };
         let chunk_samples = chunk.pcm.len() / 2;
-        for i in 0..chunk_samples {
+        let usable_samples = chunk_samples.min(capped_total_samples.saturating_sub(offset_samples));
+        if usable_samples < chunk_samples {
+            warn!(
+                start_ms = chunk.start_ms,
+                offset_samples,
+                chunk_samples,
+                usable_samples,
+                capped_total_samples,
+                "truncating chunk PCM tail beyond meeting wall-clock cap"
+            );
+        }
+        for i in 0..usable_samples {
             let sample = i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;
             mixed[offset_samples + i] = mixed[offset_samples + i].saturating_add(sample);
         }
