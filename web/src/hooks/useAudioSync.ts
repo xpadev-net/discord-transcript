@@ -131,6 +131,10 @@ export function useAudioSync(
         );
         return;
       }
+      setSeekNotice(null);
+      if (seekNoticeTimeoutRef.current) {
+        clearTimeout(seekNoticeTimeoutRef.current);
+      }
       try {
         audio.currentTime = startMs / 1000;
       } catch {
