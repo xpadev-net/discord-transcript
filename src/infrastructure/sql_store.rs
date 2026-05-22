@@ -200,7 +200,11 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
     }
 }
 
-fn require_job_column(row: &[Option<String>], idx: usize, field: &str) -> Result<String, QueueError> {
+fn require_job_column(
+    row: &[Option<String>],
+    idx: usize,
+    field: &str,
+) -> Result<String, QueueError> {
     row.get(idx)
         .and_then(|v| v.clone())
         .ok_or_else(|| QueueError::Backend(format!("{field} is NULL")))
@@ -220,9 +224,9 @@ fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
     let status = JobStatus::parse_str(&status_raw)
         .ok_or_else(|| QueueError::Backend(format!("unknown job status: {status_raw}")))?;
     let retry_count_raw = require_job_column(row, 4, "retry_count")?;
-    let retry_count = retry_count_raw
-        .parse::<u32>()
-        .map_err(|err| QueueError::Backend(format!("invalid retry_count '{retry_count_raw}': {err}")))?;
+    let retry_count = retry_count_raw.parse::<u32>().map_err(|err| {
+        QueueError::Backend(format!("invalid retry_count '{retry_count_raw}': {err}"))
+    })?;
 
     Ok(Job {
         id: require_job_column(row, 0, "id")?,
@@ -295,9 +299,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let stop_reason = match row.get(9).and_then(|v| v.clone()) {
             None => None,
             Some(value) => Some(StopReason::parse_str(&value).ok_or_else(|| {
-                StoreError::Backend(format!(
-                    "invalid stop_reason for id={meeting_id}: {value}"
-                ))
+                StoreError::Backend(format!("invalid stop_reason for id={meeting_id}: {value}"))
             })?),
         };
         Ok(Some(StoredMeeting {
@@ -472,14 +474,11 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             });
         };
 
-        let report_channel_id = row
-            .first()
-            .and_then(|v| v.clone())
-            .ok_or_else(|| {
-                StoreError::Backend(format!(
-                    "report_channel_id missing in status metadata row for meeting_id={meeting_id}"
-                ))
-            })?;
+        let report_channel_id = row.first().and_then(|v| v.clone()).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "report_channel_id missing in status metadata row for meeting_id={meeting_id}"
+            ))
+        })?;
         let status_message_channel_id = row.get(1).and_then(|v| v.clone());
         let status_message_id = row.get(2).and_then(|v| v.clone());
 

@@ -1745,9 +1745,10 @@ impl ScaffoldHandler {
                         .get(1)
                         .and_then(|v| v.clone())
                         .ok_or_else(|| "recovery row missing status".to_owned())?;
-                    let voice_channel_id = row.get(2).and_then(|v| v.as_deref()).and_then(|value| {
-                        parse_u64_with_warning(&meeting_id, "voice_channel_id", value)
-                    });
+                    let voice_channel_id =
+                        row.get(2).and_then(|v| v.as_deref()).and_then(|value| {
+                            parse_u64_with_warning(&meeting_id, "voice_channel_id", value)
+                        });
                     Ok(RecoverySnapshot {
                         meeting_id,
                         status: parse_meeting_status(&status_raw)?,
