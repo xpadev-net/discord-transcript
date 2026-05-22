@@ -9,6 +9,8 @@ export function useAudioSync(
   segments: TranscriptSegment[] | null,
 ) {
   const [activeIndex, setActiveIndex] = useState(-1);
+  const [seekNotice, setSeekNotice] = useState<string | null>(null);
+  const seekNoticeTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const prevIndexRef = useRef(-1);
   const userScrolledRef = useRef(false);
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -20,6 +22,10 @@ export function useAudioSync(
       prevIndexRef.current = -1;
       userScrolledRef.current = false;
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+      setSeekNotice(null);
+      if (seekNoticeTimeoutRef.current) {
+        clearTimeout(seekNoticeTimeoutRef.current);
+      }
     }
   }, [segments]);
 
@@ -94,16 +100,68 @@ export function useAudioSync(
     return () => audio.removeEventListener("timeupdate", handleTimeUpdate);
   }, [audioRef, containerRef, segments]);
 
+  const showSeekNotice = useCallback((message: string) => {
+    setSeekNotice(message);
+    if (seekNoticeTimeoutRef.current) {
+      clearTimeout(seekNoticeTimeoutRef.current);
+    }
+    seekNoticeTimeoutRef.current = setTimeout(() => {
+      setSeekNotice(null);
+    }, 4000);
+  }, []);
+
   const seekTo = useCallback(
     (startMs: number) => {
       const audio = audioRef.current;
-      if (audio) {
-        audio.currentTime = startMs / 1000;
-        audio.play().catch(() => {});
+      if (!audio) {
+        showSeekNotice(
+          "\u97f3\u58f0\u30d7\u30ec\u30fc\u30e4\u30fc\u304c\u5229\u7528\u3067\u304d\u307e\u305b\u3093",
+        );
+        return;
       }
+      if (audio.error) {
+        showSeekNotice(
+          "\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+        );
+        return;
+      }
+      if (audio.readyState < HTMLMediaElement.HAVE_METADATA) {
+        showSeekNotice(
+          "\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u304c\u5b8c\u4e86\u3057\u3066\u3044\u307e\u305b\u3093",
+        );
+        return;
+      }
+      setSeekNotice(null);
+      if (seekNoticeTimeoutRef.current) {
+        clearTimeout(seekNoticeTimeoutRef.current);
+      }
+      try {
+        audio.currentTime = startMs / 1000;
+      } catch {
+        showSeekNotice(
+          "\u518d\u751f\u4f4d\u7f6e\u306e\u79fb\u52d5\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+        );
+        return;
+      }
+      void audio.play().catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return;
+        }
+        showSeekNotice(
+          "\u97f3\u58f0\u306e\u518d\u751f\u3092\u958b\u59cb\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f",
+        );
+      });
     },
-    [audioRef],
+    [audioRef, showSeekNotice],
   );
 
-  return { activeIndex, seekTo };
+  useEffect(() => {
+    return () => {
+      if (seekNoticeTimeoutRef.current) {
+        clearTimeout(seekNoticeTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  return { activeIndex, seekTo, seekNotice };
 }
