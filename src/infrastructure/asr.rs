@@ -34,6 +34,27 @@ impl Display for WhisperParseError {
 
 impl std::error::Error for WhisperParseError {}
 
+impl WhisperParseError {
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::InvalidSegment(_) => false,
+            Self::InvalidJson(message) => {
+                if !message.contains("whisper command failed") {
+                    return true;
+                }
+                let lower = message.to_ascii_lowercase();
+                !lower.contains("http/1.1 4")
+                    && !lower.contains("http/2 4")
+                    && !lower.contains(" 40")
+                    && !lower.contains(" 41")
+                    && !lower.contains(" 42")
+                    && !lower.contains(" 43")
+                    && !lower.contains(" 44")
+            }
+        }
+    }
+}
+
 pub trait WhisperClient {
     fn infer(
         &self,

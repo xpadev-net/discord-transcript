@@ -39,9 +39,21 @@ fn jittered_delay(base: Duration, attempt: u32, seed: u64) -> Duration {
 /// **Note:** This function uses `std::thread::sleep` and is intended for use
 /// inside `tokio::task::block_in_place` or `spawn_blocking` contexts where the
 /// caller has already signalled to the tokio runtime that blocking is expected.
-pub fn retry_with_backoff<T, E, F>(policy: RetryPolicy, mut operation: F) -> Result<T, E>
+pub fn retry_with_backoff<T, E, F>(policy: RetryPolicy, operation: F) -> Result<T, E>
 where
     F: FnMut(u32) -> Result<T, E>,
+{
+    retry_with_backoff_if(policy, operation, |_| true)
+}
+
+pub fn retry_with_backoff_if<T, E, F, P>(
+    policy: RetryPolicy,
+    mut operation: F,
+    mut should_retry: P,
+) -> Result<T, E>
+where
+    F: FnMut(u32) -> Result<T, E>,
+    P: FnMut(&E) -> bool,
 {
     // Per-invocation seed: use the stack address of a local variable as a cheap
     // source of per-call-site entropy.  Different threads have different stacks,
@@ -64,7 +76,7 @@ where
         match operation(attempt) {
             Ok(value) => return Ok(value),
             Err(err) => {
-                if attempt >= policy.max_attempts {
+                if !should_retry(&err) || attempt >= policy.max_attempts {
                     return Err(err);
                 }
 
