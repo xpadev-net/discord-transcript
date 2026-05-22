@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { AudioPlayer } from "../components/AudioPlayer";
-import { ErrorBoundary } from "../components/ErrorBoundary";
 import { DebugDownloads } from "../components/DebugDownloads";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { Header } from "../components/Header";
 import { SummaryPanel } from "../components/SummaryPanel";
 import { TranscriptPanel } from "../components/TranscriptPanel";
