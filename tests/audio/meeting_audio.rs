@@ -1,5 +1,6 @@
 use discord_transcript::audio::receiver::BufferedFrame;
 use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
+use discord_transcript::application::runtime::merge_user_chunks_to_mixdown;
 use discord_transcript::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
 use discord_transcript::audio::wav::resample_pcm_16le;
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
@@ -195,6 +196,70 @@ fn speaker_audio_handles_legacy_chunk_names() {
     let outputs = build_speaker_audio_inputs(&base, false).expect("legacy naming should be supported");
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].speaker_id, "legacyuser");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_skips_zero_byte_wav_and_builds_mixdown_from_remaining_chunks() {
+    let base = unique_temp_dir("skip_zero_byte");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    fs::write(base.join("bad_2_1000.wav"), []).expect("zero-byte wav should be written");
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("alice_1_1000.wav"), &good).unwrap();
+
+    let chunks = load_chunks(&base).expect("valid chunk should survive corrupt neighbor");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_id, "alice");
+
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should succeed with one chunk");
+    assert!(PathBuf::from(mixdown).exists());
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should succeed");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].speaker_id, "alice");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
+    let base = unique_temp_dir("skip_truncated");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    let truncated = good[..80].to_vec();
+    fs::write(base.join("bad_2_2000.wav"), &truncated).expect("truncated wav should be written");
+    fs::write(base.join("alice_1_1000.wav"), &good).unwrap();
+
+    let chunks = load_chunks(&base).expect("valid chunk should survive truncated neighbor");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_id, "alice");
+
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should succeed with one chunk");
+    assert!(PathBuf::from(mixdown).exists());
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should succeed");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].speaker_id, "alice");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_reports_skipped_count_when_all_chunks_are_corrupt() {
+    let base = unique_temp_dir("all_corrupt");
+    fs::create_dir_all(&base).expect("dir should be created");
+    fs::write(base.join("bad_1_1000.wav"), []).expect("zero-byte wav should be written");
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("bad_2_2000.wav"), &good[..80]).unwrap();
+
+    let err = load_chunks(&base).expect_err("only corrupt chunks should fail");
+    assert!(err.contains("no audio chunks found for meeting"));
+    assert!(err.contains("skipped 2 corrupt chunk(s)"));
 
     let _ = fs::remove_dir_all(base);
 }
