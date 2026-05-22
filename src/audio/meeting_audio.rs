@@ -29,6 +29,7 @@ struct ParsedFilename {
 
 pub fn load_chunks(meeting_dir: &Path) -> Result<Vec<LoadedChunk>, String> {
     let mut chunks = Vec::new();
+    let mut skipped_chunks = 0u32;
     let entries = fs::read_dir(meeting_dir).map_err(|err| {
         format!(
             "failed to read meeting dir {}: {err}",
@@ -47,29 +48,58 @@ pub fn load_chunks(meeting_dir: &Path) -> Result<Vec<LoadedChunk>, String> {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
             && path.file_stem().and_then(|s| s.to_str()) != Some("mixdown")
         {
-            let parsed = parse_chunk_filename(&path)?;
-            let (sample_rate, pcm) = read_wav_pcm(&path)?;
-            let duration_ms = pcm_duration_ms(&pcm, sample_rate);
-            let start_ms = parsed
-                .start_ms
-                .unwrap_or_else(|| fallback_start_ms(&path, duration_ms));
-            chunks.push(LoadedChunk {
-                user_id: parsed.user_id,
-                sequence: parsed.sequence,
-                start_ms,
-                duration_ms,
-                sample_rate,
-                pcm,
-                path,
-            });
+            match load_single_chunk(&path) {
+                Ok(chunk) => chunks.push(chunk),
+                Err(reason) => {
+                    skipped_chunks += 1;
+                    warn!(
+                        meeting_dir = %meeting_dir.display(),
+                        chunk_path = %path.display(),
+                        skipped_chunks,
+                        reason = %reason,
+                        "skipping corrupt audio chunk"
+                    );
+                }
+            }
         }
     }
 
     if chunks.is_empty() {
-        return Err("no audio chunks found for meeting".to_owned());
+        return Err(if skipped_chunks > 0 {
+            format!("no audio chunks found for meeting (skipped {skipped_chunks} corrupt chunk(s))")
+        } else {
+            "no audio chunks found for meeting".to_owned()
+        });
+    }
+
+    if skipped_chunks > 0 {
+        warn!(
+            meeting_dir = %meeting_dir.display(),
+            loaded_chunks = chunks.len(),
+            skipped_chunks,
+            "loaded meeting audio with skipped corrupt chunks"
+        );
     }
 
     Ok(chunks)
+}
+
+fn load_single_chunk(path: &Path) -> Result<LoadedChunk, String> {
+    let parsed = parse_chunk_filename(path)?;
+    let (sample_rate, pcm) = read_wav_pcm(path)?;
+    let duration_ms = pcm_duration_ms(&pcm, sample_rate);
+    let start_ms = parsed
+        .start_ms
+        .unwrap_or_else(|| fallback_start_ms(path, duration_ms));
+    Ok(LoadedChunk {
+        user_id: parsed.user_id,
+        sequence: parsed.sequence,
+        start_ms,
+        duration_ms,
+        sample_rate,
+        pcm,
+        path: path.to_path_buf(),
+    })
 }
 
 fn parse_chunk_filename(path: &Path) -> Result<ParsedFilename, String> {

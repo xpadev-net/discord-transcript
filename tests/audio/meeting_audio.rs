@@ -200,6 +200,47 @@ fn speaker_audio_handles_legacy_chunk_names() {
 }
 
 #[test]
+fn load_chunks_skips_zero_byte_wav_and_builds_mixdown_from_remaining_chunks() {
+    let base = unique_temp_dir("skip_zero_byte");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    fs::write(base.join("bad_2_1000.wav"), []).expect("zero-byte wav should be written");
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("alice_1_1000.wav"), &good).unwrap();
+
+    let chunks = load_chunks(&base).expect("valid chunk should survive corrupt neighbor");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_id, "alice");
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("mixdown should succeed");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].speaker_id, "alice");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
+    let base = unique_temp_dir("skip_truncated");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let good = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    let truncated = good[..30].to_vec();
+    fs::write(base.join("bad_2_2000.wav"), &truncated).expect("truncated wav should be written");
+    fs::write(base.join("alice_1_1000.wav"), &good).unwrap();
+
+    let chunks = load_chunks(&base).expect("valid chunk should survive truncated neighbor");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_id, "alice");
+
+    let outputs = build_speaker_audio_inputs(&base, false).expect("mixdown should succeed");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].speaker_id, "alice");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn load_chunks_ignores_temporary_chunk_files() {
     let base = unique_temp_dir("ignore_tmp");
     fs::create_dir_all(&base).expect("dir should be created");
