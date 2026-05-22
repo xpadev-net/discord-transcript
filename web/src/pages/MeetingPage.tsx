@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { AudioPlayer } from "../components/AudioPlayer";
 import { DebugDownloads } from "../components/DebugDownloads";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { Header } from "../components/Header";
 import { SummaryPanel } from "../components/SummaryPanel";
 import { TranscriptPanel } from "../components/TranscriptPanel";
@@ -99,21 +100,33 @@ export function MeetingPage() {
               error={debugError}
             />
           )}
-          <TranscriptPanel
-            ref={transcriptContainerRef}
-            segments={transcript}
-            activeIndex={activeIndex}
-            onSeek={seekTo}
-            error={transcriptError}
-            onRetry={retryTranscript}
-          />
+          <ErrorBoundary
+            title={
+              "\u30c8\u30e9\u30f3\u30b9\u30af\u30ea\u30d7\u30c8\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+            }
+          >
+            <TranscriptPanel
+              ref={transcriptContainerRef}
+              segments={transcript}
+              activeIndex={activeIndex}
+              onSeek={seekTo}
+              error={transcriptError}
+              onRetry={retryTranscript}
+            />
+          </ErrorBoundary>
         </div>
-        <SummaryPanel
-          markdown={summary?.markdown}
-          loading={!!meetingId && summary === null && summaryError === null}
-          error={summaryError}
-          onRetry={retrySummary}
-        />
+        <ErrorBoundary
+          title={
+            "\u30b5\u30de\u30ea\u30fc\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+          }
+        >
+          <SummaryPanel
+            markdown={summary?.markdown}
+            loading={!!meetingId && summary === null && summaryError === null}
+            error={summaryError}
+            onRetry={retrySummary}
+          />
+        </ErrorBoundary>
       </div>
     </>
   );
