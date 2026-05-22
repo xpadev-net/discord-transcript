@@ -116,24 +116,11 @@ fn sql_store_get_meeting_rejects_unknown_status() {
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
                         to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
                   FROM meetings WHERE id=$1 LIMIT 1";
-    executor.query_rows_result.insert(
-        format!("{query_sql}|m1"),
-        vec![sql_row_from_strings(vec![
-            "m1".to_owned(),
-            "g1".to_owned(),
-            "vc1".to_owned(),
-            "c1".to_owned(),
-            String::new(),
-            String::new(),
-            "u1".to_owned(),
-            String::new(),
-            "corrupt".to_owned(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ])],
-    );
+    let mut corrupt_status_row = meeting_row_for_title_test(None);
+    corrupt_status_row[8] = Some("corrupt".to_owned());
+    executor
+        .query_rows_result
+        .insert(format!("{query_sql}|m1"), vec![corrupt_status_row]);
 
     let mut store = SqlMeetingStore::new(executor);
     let err = store

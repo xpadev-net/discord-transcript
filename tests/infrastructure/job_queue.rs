@@ -411,14 +411,14 @@ fn sql_job_queue_done_job_rejects_retry() {
     let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
     executor.query_rows_result.insert(
         claim_key,
-        vec![sql_row_from_strings(vec![
-            "j1".to_owned(),
-            "m1".to_owned(),
-            "summarize".to_owned(),
-            "running".to_owned(),
-            "0".to_owned(),
-            String::new(),
-        ])],
+        vec![vec![
+            Some("j1".to_owned()),
+            Some("m1".to_owned()),
+            Some("summarize".to_owned()),
+            Some("running".to_owned()),
+            Some("0".to_owned()),
+            None,
+        ]],
     );
     let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
     executor.query_rows_result.insert(retry_key, Vec::new());
