@@ -16,6 +16,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0007_session_revocations.sql"),
     "\n",
     include_str!("../../migrations/0008_add_job_lease.sql"),
+    "\n",
+    include_str!("../../migrations/0009_add_stop_reason_check.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
