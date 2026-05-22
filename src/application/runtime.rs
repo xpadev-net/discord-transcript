@@ -2583,9 +2583,10 @@ impl ScaffoldHandler {
                     _ = interval.tick() => {
                         let result = {
                             let mut queue = heartbeat_queue.lock().await;
-                            queue
-                                .executor
-                                .execute(HEARTBEAT_RUNNING_JOB_SQL, &[heartbeat_job_id.clone()])
+                            queue.executor.execute(
+                                HEARTBEAT_RUNNING_JOB_SQL,
+                                std::slice::from_ref(&heartbeat_job_id),
+                            )
                         };
                         if let Err(err) = result {
                             warn!(
