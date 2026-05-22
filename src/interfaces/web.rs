@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
@@ -35,11 +36,51 @@ const ADMINISTRATOR: u64 = 1 << 3;
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
 const GUILD_CACHE_TTL_SECS: u64 = 300;
+const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
+const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
+const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
+
+#[derive(Debug, Default)]
+struct AudioRangeRateLimiter {
+    buckets: HashMap<String, AudioRangeBucket>,
+}
+
+#[derive(Debug)]
+struct AudioRangeBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl AudioRangeRateLimiter {
+    fn allow(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        let idle_secs = AUDIO_RANGE_BUCKET_CAPACITY / AUDIO_RANGE_REFILL_PER_SEC;
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill).as_secs_f64() < idle_secs);
+        let bucket = self
+            .buckets
+            .entry(key.to_owned())
+            .or_insert(AudioRangeBucket {
+                tokens: AUDIO_RANGE_BUCKET_CAPACITY,
+                last_refill: now,
+            });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens =
+            (bucket.tokens + elapsed * AUDIO_RANGE_REFILL_PER_SEC).min(AUDIO_RANGE_BUCKET_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedChannelPermission {
@@ -59,6 +100,7 @@ pub struct WebState {
     guild_cache: GuildCache,
     /// In-flight guild membership re-verification per user id
     membership_reverify_inflight: MembershipReverifyInflight,
+    audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     pub static_files_dir: String,
 }
 
@@ -78,8 +120,26 @@ impl WebState {
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             static_files_dir,
         }
+    }
+}
+
+fn audio_range_rate_limited_response() -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::RETRY_AFTER, "1")
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
+}
+
+async fn check_audio_range_rate_limit(state: &WebState, user_id: &str) -> Result<(), Response> {
+    let mut limiter = state.audio_range_limiter.lock().await;
+    if limiter.allow(user_id) {
+        Ok(())
+    } else {
+        Err(audio_range_rate_limited_response())
     }
 }
 
@@ -1641,6 +1701,9 @@ async fn api_audio(
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
         match parse_range(range_str, file_size) {
             Some((start, end)) => {
+                if let Err(resp) = check_audio_range_rate_limit(&state, &user_id).await {
+                    return Ok(resp);
+                }
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
@@ -1828,6 +1891,9 @@ async fn api_speaker_audio(
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
         match parse_range(range_str, file_size) {
             Some((start, end)) => {
+                if let Err(resp) = check_audio_range_rate_limit(&state, &user_id).await {
+                    return Ok(resp);
+                }
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
@@ -2529,19 +2595,24 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     if file_size == 0 {
         return None;
     }
-    let range_str = range_str.strip_prefix("bytes=")?;
-    let mut parts = range_str.splitn(2, '-');
+    let trimmed = range_str.trim();
+    let range_spec = trimmed.strip_prefix("bytes=")?;
+    if range_spec.contains(',') {
+        return None;
+    }
+    let mut parts = range_spec.splitn(2, '-');
     let start_str = parts.next()?.trim();
     let end_str = parts.next()?.trim();
+    let is_suffix_probe = start_str.is_empty();
+    let is_open_ended = !start_str.is_empty() && end_str.is_empty();
 
-    if start_str.is_empty() {
-        // Suffix range: bytes=-N
+    let (start, end) = if is_suffix_probe {
         let suffix_len: u64 = end_str.parse().ok()?;
         if suffix_len == 0 {
             return None;
         }
         let start = file_size.saturating_sub(suffix_len);
-        Some((start, file_size - 1))
+        (start, file_size - 1)
     } else {
         let start: u64 = start_str.parse().ok()?;
         if start >= file_size {
@@ -2555,8 +2626,18 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
         if start > end {
             return None;
         }
-        Some((start, end))
+        (start, end)
+    };
+
+    let length = end.saturating_sub(start).saturating_add(1);
+    if !is_suffix_probe
+        && !is_open_ended
+        && file_size > MIN_AUDIO_RANGE_BYTES
+        && length < MIN_AUDIO_RANGE_BYTES
+    {
+        return None;
     }
+    Some((start, end))
 }
 
 /// Stream a byte range from a file. Seeks to `start` and limits the reader
@@ -3173,6 +3254,51 @@ mod transcript_source_api_tests {
     fn api_transcript_source_rejects_unknown_and_null() {
         assert!(transcript_source_for_api(Some("unknown".to_owned())).is_err());
         assert!(transcript_source_for_api(None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod parse_range_tests {
+    use super::parse_range;
+
+    const LARGE_FILE: u64 = 256 * 1024;
+
+    #[test]
+    fn parse_range_rejects_multipart_specs() {
+        assert!(parse_range("bytes=0-99,200-299", LARGE_FILE).is_none());
+    }
+
+    #[test]
+    fn parse_range_rejects_short_ranges_on_large_files() {
+        assert!(parse_range("bytes=0-1", LARGE_FILE).is_none());
+    }
+
+    #[test]
+    fn parse_range_allows_suffix_tail_probe() {
+        assert_eq!(
+            parse_range("bytes=-4096", LARGE_FILE),
+            Some((258_048, 262_143))
+        );
+    }
+
+    #[test]
+    fn parse_range_rejects_garbage_after_spec() {
+        assert!(parse_range("bytes=0-10 garbage", LARGE_FILE).is_none());
+    }
+
+    #[test]
+    fn parse_range_accepts_open_ended_range() {
+        let end = LARGE_FILE - 1;
+        assert_eq!(parse_range("bytes=0-", LARGE_FILE), Some((0, end)));
+    }
+
+    #[test]
+    fn parse_range_accepts_open_ended_tail_seek_under_min_chunk() {
+        let start = LARGE_FILE - (32 * 1024);
+        assert_eq!(
+            parse_range(&format!("bytes={start}-"), LARGE_FILE),
+            Some((start, LARGE_FILE - 1))
+        );
     }
 }
 
