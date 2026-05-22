@@ -59,13 +59,19 @@ struct AudioRangeBucket {
 impl AudioRangeRateLimiter {
     fn allow(&mut self, key: &str) -> bool {
         let now = Instant::now();
-        let bucket = self.buckets.entry(key.to_owned()).or_insert(AudioRangeBucket {
-            tokens: AUDIO_RANGE_BUCKET_CAPACITY,
-            last_refill: now,
-        });
+        let idle_secs = AUDIO_RANGE_BUCKET_CAPACITY / AUDIO_RANGE_REFILL_PER_SEC;
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill).as_secs_f64() < idle_secs);
+        let bucket = self
+            .buckets
+            .entry(key.to_owned())
+            .or_insert(AudioRangeBucket {
+                tokens: AUDIO_RANGE_BUCKET_CAPACITY,
+                last_refill: now,
+            });
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * AUDIO_RANGE_REFILL_PER_SEC)
-            .min(AUDIO_RANGE_BUCKET_CAPACITY);
+        bucket.tokens =
+            (bucket.tokens + elapsed * AUDIO_RANGE_REFILL_PER_SEC).min(AUDIO_RANGE_BUCKET_CAPACITY);
         bucket.last_refill = now;
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -120,12 +126,20 @@ impl WebState {
     }
 }
 
-async fn check_audio_range_rate_limit(state: &WebState, user_id: &str) -> Result<(), StatusCode> {
+fn audio_range_rate_limited_response() -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::RETRY_AFTER, "1")
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
+}
+
+async fn check_audio_range_rate_limit(state: &WebState, user_id: &str) -> Result<(), Response> {
     let mut limiter = state.audio_range_limiter.lock().await;
     if limiter.allow(user_id) {
         Ok(())
     } else {
-        Err(StatusCode::TOO_MANY_REQUESTS)
+        Err(audio_range_rate_limited_response())
     }
 }
 
@@ -1653,9 +1667,6 @@ async fn api_audio(
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
-    if headers.get(header::RANGE).is_some() {
-        check_audio_range_rate_limit(&state, &user_id).await?;
-    }
 
     let row = state
         .db
@@ -1690,6 +1701,9 @@ async fn api_audio(
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
         match parse_range(range_str, file_size) {
             Some((start, end)) => {
+                if let Err(resp) = check_audio_range_rate_limit(&state, &user_id).await {
+                    return Ok(resp);
+                }
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
@@ -1820,9 +1834,6 @@ async fn api_speaker_audio(
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
-    if headers.get(header::RANGE).is_some() {
-        check_audio_range_rate_limit(&state, &user_id).await?;
-    }
 
     let row = state
         .db
@@ -1880,6 +1891,9 @@ async fn api_speaker_audio(
         let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
         match parse_range(range_str, file_size) {
             Some((start, end)) => {
+                if let Err(resp) = check_audio_range_rate_limit(&state, &user_id).await {
+                    return Ok(resp);
+                }
                 let length = end - start + 1;
                 let content_range = format!("bytes {start}-{end}/{file_size}");
 
@@ -3256,7 +3270,10 @@ mod parse_range_tests {
 
     #[test]
     fn parse_range_allows_suffix_tail_probe() {
-        assert_eq!(parse_range("bytes=-4096", LARGE_FILE), Some((258_048, 262_143)));
+        assert_eq!(
+            parse_range("bytes=-4096", LARGE_FILE),
+            Some((258_048, 262_143))
+        );
     }
 
     #[test]
