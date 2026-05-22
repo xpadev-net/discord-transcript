@@ -34,6 +34,12 @@ impl Display for WhisperParseError {
 
 impl std::error::Error for WhisperParseError {}
 
+fn message_contains_http_status(message: &str, status: u16) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let spaced = format!(" {status} ");
+    lower.contains(&spaced) || lower.contains(&format!(" {status}\r"))
+}
+
 impl WhisperParseError {
     pub fn is_retriable(&self) -> bool {
         match self {
@@ -42,15 +48,63 @@ impl WhisperParseError {
                 if !message.contains("whisper command failed") {
                     return true;
                 }
-                let lower = message.to_ascii_lowercase();
-                const NON_RETRIABLE_STATUS: &[&str] = &[
-                    " 400", " 401", " 403", " 404", " 405", " 413", " 415", " 422",
-                ];
-                !lower.contains("http/1.1 4")
-                    && !lower.contains("http/2 4")
-                    && !NON_RETRIABLE_STATUS.iter().any(|code| lower.contains(code))
+                const NON_RETRIABLE_STATUS: &[u16] = &[400, 401, 403, 404, 405, 413, 415, 422];
+                !NON_RETRIABLE_STATUS
+                    .iter()
+                    .any(|code| message_contains_http_status(message, *code))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod is_retriable_tests {
+    use super::{WhisperParseError, message_contains_http_status};
+
+    #[test]
+    fn http_status_match_ignores_port_numbers() {
+        assert!(!message_contains_http_status(
+            "Failed to connect to localhost port 404: Connection refused",
+            404
+        ));
+        assert!(message_contains_http_status(
+            "whisper command failed: status=404 HTTP/1.1 404 Not Found",
+            404
+        ));
+    }
+
+    #[test]
+    fn io_errors_are_retriable() {
+        assert!(WhisperParseError::InvalidJson("curl: timeout".to_owned()).is_retriable());
+    }
+
+    #[test]
+    fn segment_parse_errors_are_not_retriable() {
+        assert!(!WhisperParseError::InvalidSegment("bad segment".to_owned()).is_retriable());
+    }
+
+    #[test]
+    fn client_http_errors_are_not_retriable() {
+        assert!(!WhisperParseError::InvalidJson(
+            "whisper command failed: status=400 HTTP/1.1 400 Bad Request".to_owned()
+        )
+        .is_retriable());
+    }
+
+    #[test]
+    fn server_http_errors_are_retriable() {
+        assert!(WhisperParseError::InvalidJson(
+            "whisper command failed: status=500 HTTP/1.1 500 Internal Server Error".to_owned()
+        )
+        .is_retriable());
+    }
+
+    #[test]
+    fn rate_limit_responses_remain_retriable() {
+        assert!(WhisperParseError::InvalidJson(
+            "whisper command failed: status=429 HTTP/1.1 429 Too Many Requests".to_owned()
+        )
+        .is_retriable());
     }
 }
 
