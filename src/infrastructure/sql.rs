@@ -12,7 +12,23 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0005_add_enum_constraints.sql"),
     "\n",
     include_str!("../../migrations/0006_add_status_messages_and_retention.sql"),
+    "\n",
+    include_str!("../../migrations/0007_session_revocations.sql"),
 );
+
+pub const REVOKE_SESSION_SQL: &str = r#"
+INSERT INTO session_revocations (user_id, issued_at)
+VALUES ($1, $2)
+ON CONFLICT (user_id, issued_at) DO NOTHING
+"#;
+
+pub const SESSION_IS_REVOKED_SQL: &str = r#"
+SELECT 1
+FROM session_revocations
+WHERE user_id = $1
+  AND issued_at = $2
+LIMIT 1
+"#;
 
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
 UPDATE meetings
