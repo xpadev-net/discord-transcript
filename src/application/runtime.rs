@@ -1378,7 +1378,7 @@ impl EventHandler for ScaffoldHandler {
             let state = states
                 .entry(guild_key.clone())
                 .or_insert_with(|| AutoStopState::new(grace));
-            let signal = state.on_non_bot_member_count_changed(non_bot, now_ms());
+            let signal = state.on_non_bot_member_count_changed(non_bot);
             (signal, state.timer_generation())
         };
 
@@ -1443,7 +1443,7 @@ impl EventHandler for ScaffoldHandler {
                             );
                             let mut states = handler.auto_stop_states.lock().await;
                             if let Some(state) = states.get_mut(&guild_for_task) {
-                                let _ = state.on_non_bot_member_count_changed(n, now_ms());
+                                let _ = state.on_non_bot_member_count_changed(n);
                             }
                             return;
                         }
@@ -1454,7 +1454,7 @@ impl EventHandler for ScaffoldHandler {
                         let Some(state) = states.get_mut(&guild_for_task) else {
                             return;
                         };
-                        state.tick(now_ms()) == AutoStopSignal::Trigger
+                        state.tick() == AutoStopSignal::Trigger
                     };
                     if !trigger {
                         let mut states = handler.auto_stop_states.lock().await;
@@ -1492,7 +1492,7 @@ impl EventHandler for ScaffoldHandler {
                                 state.clear_timer_active_for_generation(timer_generation);
                                 true
                             } else {
-                                state.retry_after_failed_stop(now_ms());
+                                state.retry_after_failed_stop();
                                 false
                             }
                         };
