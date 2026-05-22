@@ -22,6 +22,10 @@ export function useAudioSync(
       prevIndexRef.current = -1;
       userScrolledRef.current = false;
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+      setSeekNotice(null);
+      if (seekNoticeTimeoutRef.current) {
+        clearTimeout(seekNoticeTimeoutRef.current);
+      }
     }
   }, [segments]);
 
@@ -117,7 +121,7 @@ export function useAudioSync(
         showSeekNotice("\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f");
         return;
       }
-      if (audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      if (audio.readyState < HTMLMediaElement.HAVE_METADATA) {
         showSeekNotice("\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u304c\u5b8c\u4e86\u3057\u3066\u3044\u307e\u305b\u3093");
         return;
       }
@@ -142,5 +146,5 @@ export function useAudioSync(
     };
   }, []);
 
-  return { activeIndex, seekTo, seekNotice, clearSeekNotice: () => setSeekNotice(null) };
+  return { activeIndex, seekTo, seekNotice };
 }
