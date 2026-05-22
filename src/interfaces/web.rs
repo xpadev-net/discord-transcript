@@ -1500,6 +1500,18 @@ async fn api_meeting(
     }))
 }
 
+fn transcript_source_for_api(raw: Option<String>) -> Result<String, ()> {
+    let Some(value) = raw else {
+        warn!("transcript row has NULL source");
+        return Err(());
+    };
+    let Some(parsed) = TranscriptSource::parse_str(&value) else {
+        warn!(source = %value, "unknown transcript source");
+        return Err(());
+    };
+    Ok(parsed.as_str().to_owned())
+}
+
 async fn api_transcript(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -1522,38 +1534,35 @@ async fn api_transcript(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let segments: Vec<TranscriptSegmentResponse> = rows
-        .iter()
-        .map(|row| {
-            let speaker_id: String = row.get("speaker_id");
-            let profile = SpeakerProfile {
-                speaker_id: speaker_id.clone(),
-                username: row.get::<_, Option<String>>("username"),
-                nickname: row.get::<_, Option<String>>("nickname"),
-                display_name: row.get::<_, Option<String>>("display_name"),
-            };
+    let mut segments = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let speaker_id: String = row.get("speaker_id");
+        let profile = SpeakerProfile {
+            speaker_id: speaker_id.clone(),
+            username: row.get::<_, Option<String>>("username"),
+            nickname: row.get::<_, Option<String>>("nickname"),
+            display_name: row.get::<_, Option<String>>("display_name"),
+        };
+        let source = transcript_source_for_api(row.get("source"))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            TranscriptSegmentResponse {
-                speaker_id,
-                speaker: SpeakerResponse {
-                    id: profile.speaker_id.clone(),
-                    username: profile.username.clone(),
-                    nickname: profile.nickname.clone(),
-                    display_name: profile.display_name.clone(),
-                    display_label: profile.display_label(),
-                },
-                start_ms: row.get("start_ms"),
-                end_ms: row.get("end_ms"),
-                text: row.get("text"),
-                confidence: row.get("confidence"),
-                is_noisy: row.get("is_noisy"),
-                source: row
-                    .get::<_, Option<String>>("source")
-                    .and_then(|s| TranscriptSource::parse_str(&s).map(|v| v.as_str().to_owned()))
-                    .unwrap_or_else(|| TranscriptSource::Voice.as_str().to_owned()),
-            }
-        })
-        .collect();
+        segments.push(TranscriptSegmentResponse {
+            speaker_id,
+            speaker: SpeakerResponse {
+                id: profile.speaker_id.clone(),
+                username: profile.username.clone(),
+                nickname: profile.nickname.clone(),
+                display_name: profile.display_name.clone(),
+                display_label: profile.display_label(),
+            },
+            start_ms: row.get("start_ms"),
+            end_ms: row.get("end_ms"),
+            text: row.get("text"),
+            confidence: row.get("confidence"),
+            is_noisy: row.get("is_noisy"),
+            source,
+        });
+    }
 
     Ok(Json(segments))
 }
@@ -3116,5 +3125,29 @@ mod session_reverify_tests {
         // issued_at preserved separately from verified_at in production cookies
         let session = verify_session(&cookie, SECRET).expect("session should verify");
         assert!(session_needs_membership_reverify(&session));
+    }
+}
+
+#[cfg(test)]
+mod transcript_source_api_tests {
+    use super::transcript_source_for_api;
+    use crate::domain::transcript::TranscriptSource;
+
+    #[test]
+    fn api_transcript_source_accepts_known_values() {
+        assert_eq!(
+            transcript_source_for_api(Some("voice".to_owned())).unwrap(),
+            TranscriptSource::Voice.as_str()
+        );
+        assert_eq!(
+            transcript_source_for_api(Some("vc_text".to_owned())).unwrap(),
+            TranscriptSource::VcText.as_str()
+        );
+    }
+
+    #[test]
+    fn api_transcript_source_rejects_unknown_and_null() {
+        assert!(transcript_source_for_api(Some("unknown".to_owned())).is_err());
+        assert!(transcript_source_for_api(None).is_err());
     }
 }
