@@ -14,6 +14,7 @@ use std::time::Instant;
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
@@ -22,6 +23,9 @@ use crate::infrastructure::storage_fs::sanitize_path_component;
 type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
+const OAUTH_NONCE_COOKIE_NAME: &str = "dt_oauth_nonce";
+const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
+const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
 const VIEW_CHANNEL: u64 = 1 << 10;
 const ADMINISTRATOR: u64 = 1 << 3;
 
@@ -174,7 +178,12 @@ async fn auth_login(State(state): State<WebState>, Query(params): Query<LoginPar
     };
 
     let redirect = sanitize_redirect(params.redirect.as_deref().unwrap_or("/"));
-    let state_param = sign_oauth_state(&redirect, &auth.session_secret);
+    let nonce = Uuid::new_v4().to_string();
+    let state_param = sign_oauth_state(&redirect, &nonce, &auth.session_secret);
+    let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
+    let oauth_nonce_cookie = format!(
+        "{OAUTH_NONCE_COOKIE_NAME}={nonce}; HttpOnly; SameSite=Lax; Path={OAUTH_NONCE_COOKIE_PATH}; Max-Age={OAUTH_STATE_TTL_SECS}{secure_flag}",
+    );
 
     let url = format!(
         "https://discord.com/api/oauth2/authorize\
@@ -188,7 +197,12 @@ async fn auth_login(State(state): State<WebState>, Query(params): Query<LoginPar
         percent_encode(&state_param),
     );
 
-    Redirect::temporary(&url).into_response()
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, url)
+        .header(header::SET_COOKIE, oauth_nonce_cookie)
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[derive(Deserialize)]
@@ -214,6 +228,7 @@ struct DiscordGuild {
 
 async fn auth_callback(
     State(state): State<WebState>,
+    headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Response {
     let Some(ref auth) = state.auth else {
@@ -227,7 +242,14 @@ async fn auth_callback(
         return (StatusCode::BAD_REQUEST, "missing state").into_response();
     };
 
-    let Some(redirect) = verify_oauth_state(state_param, &auth.session_secret) else {
+    let Some(cookie_nonce) = get_cookie(&headers, OAUTH_NONCE_COOKIE_NAME) else {
+        return (StatusCode::BAD_REQUEST, "missing oauth nonce").into_response();
+    };
+    if cookie_nonce.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing oauth nonce").into_response();
+    }
+
+    let Some(redirect) = verify_oauth_state(state_param, &cookie_nonce, &auth.session_secret) else {
         return (StatusCode::BAD_REQUEST, "invalid state").into_response();
     };
 
@@ -292,14 +314,18 @@ async fn auth_callback(
     let redirect = sanitize_redirect(&redirect);
     let session_value = sign_session(&user.id, &auth.guild_id, &auth.session_secret);
     let secure_flag = if auth.secure_cookie { "; Secure" } else { "" };
-    let cookie = format!(
+    let session_cookie = format!(
         "{SESSION_COOKIE_NAME}={session_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}{secure_flag}",
+    );
+    let clear_oauth_nonce_cookie = format!(
+        "{OAUTH_NONCE_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path={OAUTH_NONCE_COOKIE_PATH}; Max-Age=0{secure_flag}",
     );
 
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, &redirect)
-        .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, session_cookie)
+        .header(header::SET_COOKIE, clear_oauth_nonce_cookie)
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -363,20 +389,23 @@ fn verify_session(cookie: &str, secret: &str) -> Option<SessionPayload> {
     Some(payload)
 }
 
-const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
+fn oauth_nonce_digest(secret: &str, nonce: &str) -> String {
+    hmac_hex(secret, &format!("oauth-nonce:{nonce}"))
+}
 
-fn sign_oauth_state(redirect: &str, secret: &str) -> String {
+fn sign_oauth_state(redirect: &str, nonce: &str, secret: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let json = serde_json::json!({"r": redirect, "t": now}).to_string();
+    let digest = oauth_nonce_digest(secret, nonce);
+    let json = serde_json::json!({"r": redirect, "t": now, "n": digest}).to_string();
     let payload_hex = to_hex(json.as_bytes());
     let sig_hex = hmac_hex(secret, &payload_hex);
     format!("{payload_hex}.{sig_hex}")
 }
 
-fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
+fn verify_oauth_state(state: &str, cookie_nonce: &str, secret: &str) -> Option<String> {
     let (payload_hex, sig_hex) = state.rsplit_once('.')?;
     let expected = hmac_hex(secret, payload_hex);
     if !constant_time_eq(sig_hex.as_bytes(), expected.as_bytes()) {
@@ -390,6 +419,11 @@ fn verify_oauth_state(state: &str, secret: &str) -> Option<String> {
         .unwrap_or_default()
         .as_secs();
     if now.saturating_sub(created) > OAUTH_STATE_TTL_SECS {
+        return None;
+    }
+    let state_digest = value.get("n")?.as_str()?;
+    let expected_digest = oauth_nonce_digest(secret, cookie_nonce);
+    if !constant_time_eq(state_digest.as_bytes(), expected_digest.as_bytes()) {
         return None;
     }
     value.get("r")?.as_str().map(|s| s.to_owned())
@@ -2435,6 +2469,72 @@ mod discord_channel_full_tests {
         assert!(
             !cd.contains('\r') && !cd.contains('\n'),
             "control chars leaked into header"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oauth_state_tests {
+    use super::{get_cookie, sign_oauth_state, verify_oauth_state};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    const SECRET: &str = "test-session-secret";
+
+    #[test]
+    fn oauth_state_round_trip_with_matching_nonce() {
+        let nonce = "browser-a-nonce";
+        let state = sign_oauth_state("/meetings/1", nonce, SECRET);
+        let redirect = verify_oauth_state(&state, nonce, SECRET).expect("valid state");
+        assert_eq!(redirect, "/meetings/1");
+    }
+
+    #[test]
+    fn oauth_state_rejects_missing_cookie_nonce() {
+        let state = sign_oauth_state("/", "nonce-a", SECRET);
+        assert!(verify_oauth_state(&state, "", SECRET).is_none());
+    }
+
+    #[test]
+    fn oauth_state_rejects_mismatched_browser_nonce() {
+        let state = sign_oauth_state("/", "nonce-a", SECRET);
+        assert!(verify_oauth_state(&state, "nonce-b", SECRET).is_none());
+    }
+
+    #[test]
+    fn oauth_state_rejects_replayed_state_from_other_browser() {
+        let attacker_state = sign_oauth_state("/", "attacker-nonce", SECRET);
+        assert!(
+            verify_oauth_state(&attacker_state, "victim-nonce", SECRET).is_none(),
+            "victim cookie must not unlock attacker state"
+        );
+    }
+
+    #[test]
+    fn oauth_state_rejects_legacy_state_without_nonce_binding() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let json = serde_json::json!({"r": "/", "t": now}).to_string();
+        let payload_hex = super::to_hex(json.as_bytes());
+        let sig_hex = super::hmac_hex(SECRET, &payload_hex);
+        let legacy_state = format!("{payload_hex}.{sig_hex}");
+        assert!(
+            verify_oauth_state(&legacy_state, "any-nonce", SECRET).is_none(),
+            "pre-binding states must be rejected"
+        );
+    }
+
+    #[test]
+    fn oauth_nonce_cookie_parser_reads_callback_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("dt_oauth_nonce=abc123; dt_session=ignored"),
+        );
+        assert_eq!(
+            get_cookie(&headers, "dt_oauth_nonce").as_deref(),
+            Some("abc123")
         );
     }
 }
