@@ -532,6 +532,61 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
 }
 
 #[test]
+fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc".to_owned(),
+        report_channel_id: "c1".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Transcribing,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "## Summary\nretry ok".to_owned(),
+    };
+    let temp = temp_workspace("m1_retry_transcribing");
+    let workspace = temp.workspace().clone();
+    let output = process_meeting_summary(
+        &mut store,
+        &whisper,
+        &claude,
+        &ProcessMeetingInput {
+            meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc".to_owned(),
+            title: None,
+            audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+            speaker_audio: vec![SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "audio.wav".to_owned(),
+                offset_ms: 0,
+            }],
+            language: None,
+            workspace: workspace.clone(),
+        },
+    )
+    .expect("retry should reach whisper when meeting is still transcribing");
+
+    assert!(!output.chunks.is_empty());
+}
+
+#[test]
 fn worker_pipeline_leaves_summarizing_until_posting() {
     let mut store = InMemoryMeetingStore::new();
     store.insert(StoredMeeting {

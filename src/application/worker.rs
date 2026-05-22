@@ -77,6 +77,48 @@ impl From<SummaryError> for WorkerError {
     }
 }
 
+fn advance_to_transcribing<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+) -> Result<(), WorkerError> {
+    for expected in [
+        MeetingStatus::Stopping,
+        MeetingStatus::Transcribing,
+        MeetingStatus::Summarizing,
+    ] {
+        match store.set_meeting_status(meeting_id, MeetingStatus::Transcribing, Some(expected)) {
+            Ok(()) => return Ok(()),
+            Err(StoreError::CasConflict { .. }) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(WorkerError::Store(format!(
+        "could not advance meeting {meeting_id} to transcribing"
+    )))
+}
+
+fn revert_to_stopping_for_retry<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    from: MeetingStatus,
+) {
+    if let Err(err) = store.set_meeting_status(meeting_id, MeetingStatus::Stopping, Some(from)) {
+        warn!(
+            meeting_id = %meeting_id,
+            from = ?from,
+            error = %err,
+            "failed to revert meeting to stopping after pipeline error"
+        );
+        if let Err(force_err) = store.set_meeting_status(meeting_id, MeetingStatus::Failed, None) {
+            warn!(
+                meeting_id = %meeting_id,
+                error = %force_err,
+                "failed to mark meeting failed after stopping revert conflict"
+            );
+        }
+    }
+}
+
 pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSummaryClient>(
     store: &mut S,
     whisper: &W,
@@ -96,21 +138,12 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         workspace: input.workspace.clone(),
     };
 
-    store.set_meeting_status(
-        &input.meeting_id,
-        MeetingStatus::Transcribing,
-        Some(MeetingStatus::Stopping),
-    )?;
+    advance_to_transcribing(store, &input.meeting_id)?;
     let transcription = match run_transcription(whisper, &request) {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "transcription failed");
-            // Revert to Stopping so the next retry attempt's CAS guard succeeds.
-            let _ = store.set_meeting_status(
-                &input.meeting_id,
-                MeetingStatus::Stopping,
-                Some(MeetingStatus::Transcribing),
-            );
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Transcribing);
             return Err(WorkerError::from(err));
         }
     };
@@ -160,11 +193,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "transcript materialization failed");
-            let _ = store.set_meeting_status(
-                &input.meeting_id,
-                MeetingStatus::Stopping,
-                Some(MeetingStatus::Summarizing),
-            );
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
             return Err(WorkerError::from(err));
         }
     };
@@ -174,12 +203,7 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summarization failed");
-            // Revert to Stopping so the next retry attempt starts from a consistent state.
-            let _ = store.set_meeting_status(
-                &input.meeting_id,
-                MeetingStatus::Stopping,
-                Some(MeetingStatus::Summarizing),
-            );
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
             return Err(WorkerError::from(err));
         }
     };
