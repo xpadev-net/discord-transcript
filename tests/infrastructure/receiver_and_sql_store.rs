@@ -130,6 +130,27 @@ fn sql_store_get_meeting_rejects_unknown_status() {
 }
 
 #[test]
+fn sql_store_get_meeting_rejects_unknown_stop_reason() {
+    let mut executor = FakeSqlExecutor::default();
+    let query_sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+                        to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                  FROM meetings WHERE id=$1 LIMIT 1";
+    let mut row = meeting_row_for_title_test(None);
+    row[8] = Some("recording".to_owned());
+    row[9] = Some("bogus".to_owned());
+    executor
+        .query_rows_result
+        .insert(format!("{query_sql}|m1"), vec![row]);
+
+    let mut store = SqlMeetingStore::new(executor);
+    let err = store
+        .get_meeting("m1")
+        .expect_err("unknown stop_reason should fail");
+    assert!(err.to_string().contains("invalid stop_reason"));
+}
+
+#[test]
 fn sql_job_queue_parses_claimed_job_row() {
     let mut executor = FakeSqlExecutor::default();
     let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");

@@ -296,12 +296,11 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                 "invalid meeting status for id={meeting_id}: {status_raw}"
             ))
         })?;
-        let stop_reason = match row.get(9).and_then(|v| v.clone()) {
-            None => None,
-            Some(value) => Some(StopReason::parse_str(&value).ok_or_else(|| {
-                StoreError::Backend(format!("invalid stop_reason for id={meeting_id}: {value}"))
-            })?),
-        };
+        let stop_reason = parse_stop_reason_column(
+            row.get(9).and_then(|v| v.clone()),
+            &format!("meeting_id={meeting_id}"),
+        )
+        .map_err(StoreError::Backend)?;
         Ok(Some(StoredMeeting {
             id: require(0, "id")?,
             guild_id: require(1, "guild_id")?,
@@ -659,14 +658,27 @@ impl SqlExecutor for PgSqlExecutor {
     }
 }
 
+fn parse_stop_reason_column(
+    value: Option<String>,
+    context: &str,
+) -> Result<Option<StopReason>, String> {
+    match value {
+        None => Ok(None),
+        Some(raw) => StopReason::parse_str(&raw)
+            .map(Some)
+            .ok_or_else(|| format!("invalid stop_reason for {context}: {raw}")),
+    }
+}
+
 fn row_to_stored_meeting(row: &Row) -> Result<StoredMeeting, String> {
+    let meeting_id: String = row.get("id");
     let status_str = row.get::<_, String>("status");
     let status = MeetingStatus::parse_str(&status_str)
         .ok_or_else(|| format!("unknown meeting status in DB: {status_str}"))?;
-    let stop_reason = row
-        .get::<_, Option<String>>("stop_reason")
-        .as_deref()
-        .and_then(StopReason::parse_str);
+    let stop_reason = parse_stop_reason_column(
+        row.get::<_, Option<String>>("stop_reason"),
+        &format!("meeting_id={meeting_id}"),
+    )?;
 
     Ok(StoredMeeting {
         id: row.get("id"),
@@ -722,4 +734,16 @@ fn pg_row_to_optional_strings(row: Row) -> Result<SqlRow, String> {
         return Err(format!("unsupported postgres column type at index {idx}"));
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod stop_reason_parse_tests {
+    use super::parse_stop_reason_column;
+
+    #[test]
+    fn parse_stop_reason_column_rejects_unknown_values() {
+        let err = parse_stop_reason_column(Some("bogus".to_owned()), "meeting_id=m1")
+            .expect_err("unknown stop_reason should error");
+        assert!(err.contains("invalid stop_reason"));
+    }
 }
