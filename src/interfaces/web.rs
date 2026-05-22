@@ -162,12 +162,20 @@ async fn require_auth(
     if session.gid != auth.guild_id {
         return auth_required_redirect_or_unauthorized(&request);
     }
-    if session_is_revoked(&state.db, &session.uid, session.issued_at)
-        .await
-        .unwrap_or(false)
-    {
-        return auth_required_redirect_or_unauthorized(&request)
-            .with_cleared_session_cookie(auth.secure_cookie);
+    match session_is_revoked(&state.db, &session.uid, session.issued_at).await {
+        Ok(true) => {
+            return auth_required_redirect_or_unauthorized(&request)
+                .with_cleared_session_cookie(auth.secure_cookie);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                error = %err,
+                user_id = %session.uid,
+                "failed to check session revocation"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
 
     let mut refreshed_session_cookie = None;
@@ -547,7 +555,11 @@ async fn auth_callback(
 }
 
 async fn auth_logout_get_rejected() -> Response {
-    StatusCode::METHOD_NOT_ALLOWED.into_response()
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "POST")],
+    )
+        .into_response()
 }
 
 async fn auth_logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
@@ -559,14 +571,13 @@ async fn auth_logout(State(state): State<WebState>, headers: HeaderMap) -> Respo
     if let Some(ref auth) = state.auth
         && let Some(cookie_val) = get_cookie(&headers, SESSION_COOKIE_NAME)
         && let Some(session) = verify_session(&cookie_val, &auth.session_secret)
+        && let Err(err) = revoke_session(&state.db, &session.uid, session.issued_at).await
     {
-        if let Err(err) = revoke_session(&state.db, &session.uid, session.issued_at).await {
-            warn!(
-                error = %err,
-                user_id = %session.uid,
-                "failed to persist session revocation"
-            );
-        }
+        warn!(
+            error = %err,
+            user_id = %session.uid,
+            "failed to persist session revocation"
+        );
     }
     let cookie =
         format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_flag}",);
