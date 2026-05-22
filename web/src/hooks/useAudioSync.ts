@@ -114,25 +114,35 @@ export function useAudioSync(
     (startMs: number) => {
       const audio = audioRef.current;
       if (!audio) {
-        showSeekNotice("\u97f3\u58f0\u30d7\u30ec\u30fc\u30e4\u30fc\u304c\u5229\u7528\u3067\u304d\u307e\u305b\u3093");
+        showSeekNotice(
+          "\u97f3\u58f0\u30d7\u30ec\u30fc\u30e4\u30fc\u304c\u5229\u7528\u3067\u304d\u307e\u305b\u3093",
+        );
         return;
       }
       if (audio.error) {
-        showSeekNotice("\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f");
+        showSeekNotice(
+          "\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+        );
         return;
       }
       if (audio.readyState < HTMLMediaElement.HAVE_METADATA) {
-        showSeekNotice("\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u304c\u5b8c\u4e86\u3057\u3066\u3044\u307e\u305b\u3093");
+        showSeekNotice(
+          "\u97f3\u58f0\u306e\u8aad\u307f\u8fbc\u307f\u304c\u5b8c\u4e86\u3057\u3066\u3044\u307e\u305b\u3093",
+        );
         return;
       }
       try {
         audio.currentTime = startMs / 1000;
       } catch {
-        showSeekNotice("\u518d\u751f\u4f4d\u7f6e\u306e\u79fb\u52d5\u306b\u5931\u6557\u3057\u307e\u3057\u305f");
+        showSeekNotice(
+          "\u518d\u751f\u4f4d\u7f6e\u306e\u79fb\u52d5\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+        );
         return;
       }
       void audio.play().catch(() => {
-        showSeekNotice("\u97f3\u58f0\u306e\u518d\u751f\u3092\u958b\u59cb\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f");
+        showSeekNotice(
+          "\u97f3\u58f0\u306e\u518d\u751f\u3092\u958b\u59cb\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f",
+        );
       });
     },
     [audioRef, showSeekNotice],
