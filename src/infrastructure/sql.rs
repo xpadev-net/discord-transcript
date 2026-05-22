@@ -14,6 +14,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0006_add_status_messages_and_retention.sql"),
     "\n",
     include_str!("../../migrations/0007_session_revocations.sql"),
+    "\n",
+    include_str!("../../migrations/0008_add_job_lease.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -67,11 +69,26 @@ pub const RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL: &str = r#"
 UPDATE jobs
 SET status='queued',
     error_message=NULL,
+    leased_until=NULL,
     updated_at=NOW()
 WHERE id=$1
   AND job_type='summarize'
   AND status='running'
-  AND updated_at < NOW() - INTERVAL '15 minutes'
+  AND (
+    (leased_until IS NOT NULL AND leased_until < NOW())
+    OR (
+      leased_until IS NULL
+      AND updated_at < NOW() - INTERVAL '15 minutes'
+    )
+  )
+"#;
+
+pub const HEARTBEAT_RUNNING_JOB_SQL: &str = r#"
+UPDATE jobs
+SET leased_until = NOW() + INTERVAL '90 seconds',
+    updated_at = NOW()
+WHERE id = $1
+  AND status = 'running'
 "#;
 
 pub const RECOVERY_SUMMARY_JOB_STATUS_SQL: &str = r#"
@@ -90,6 +107,7 @@ VALUES ($1, $2, $3, 'queued', 0, NOW(), NOW())
 pub const CLAIM_JOB_SQL: &str = r#"
 UPDATE jobs
 SET status = 'running',
+    leased_until = NOW() + INTERVAL '90 seconds',
     updated_at = NOW()
 WHERE id = (
     SELECT id
@@ -106,6 +124,7 @@ RETURNING id, meeting_id, job_type, status, retry_count, error_message
 pub const CLAIM_JOB_BY_ID_SQL: &str = r#"
 UPDATE jobs
 SET status = 'running',
+    leased_until = NOW() + INTERVAL '90 seconds',
     updated_at = NOW()
 WHERE id = $1
   AND status = 'queued'
