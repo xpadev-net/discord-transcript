@@ -252,11 +252,23 @@ pub fn build_speaker_audio_inputs(
 
     // Resolve any SSRC-based user IDs using persisted mapping
     let ssrc_mapping = load_ssrc_mapping(meeting_dir);
+    let mut unresolved_fallback = 0u32;
     for chunk in &mut chunks {
         if let Some(real_id) = ssrc_mapping.get(&chunk.user_id) {
             chunk.user_id = real_id.clone();
+        } else if SsrcTracker::parse_ssrc_fallback(&chunk.user_id).is_some() {
+            unresolved_fallback += 1;
         }
     }
+
+    if unresolved_fallback > 0 {
+        warn!(
+            meeting_dir = %meeting_dir.display(),
+            unresolved_chunks = unresolved_fallback,
+            "speaker audio build encountered unresolved SSRC fallback IDs; resulting filenames may be anonymized"
+        );
+    }
+
     let sample_rate = chunks.first().map(|c| c.sample_rate).unwrap_or(48_000);
     if chunks.iter().any(|c| c.sample_rate != sample_rate) {
         return Err("mixed sample rates are not supported".to_owned());

@@ -5,6 +5,7 @@ use crate::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::time::Instant;
 
@@ -283,7 +284,17 @@ impl RecordingSession<LocalChunkStorage> {
     /// Persist the SSRC-to-user mapping as a JSON file in the audio directory.
     /// Only mappings for users recorded in this session are included.
     pub fn persist_ssrc_mapping(&self, tracker: &SsrcTracker) {
-        let filtered = tracker.filtered_by_users(self.per_user_seq.keys().map(String::as_str));
+        let users: HashSet<&str> = self
+            .per_user_seq
+            .keys()
+            .map(String::as_str)
+            .chain(
+                self.pending_failed_chunks
+                    .iter()
+                    .map(|chunk| chunk.user_id.as_str()),
+            )
+            .collect();
+        let filtered = tracker.filtered_by_users(users);
         if filtered.all_mappings().is_empty() {
             return;
         }

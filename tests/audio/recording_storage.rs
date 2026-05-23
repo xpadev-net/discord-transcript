@@ -1,9 +1,12 @@
 use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig};
 use discord_transcript::audio::recording_session::RecordingSession;
+use discord_transcript::audio::songbird_adapter::SsrcTracker;
 use discord_transcript::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
-use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
+use discord_transcript::infrastructure::workspace::{
+    MeetingWorkspaceLayout, SSRC_MAPPING_FILENAME,
+};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -398,6 +401,60 @@ fn recording_session_rekey_user_keeps_higher_sequence() {
     assert_eq!(result.persisted[0].user_id, "12345");
     // Should be 4 (max(3,1) + 1), not 2 (1 + 1)
     assert_eq!(result.persisted[0].sequence, 4);
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn recording_session_persists_ssrc_mapping_for_rekeyed_pending_failed_chunks() {
+    let base = unique_temp_dir("recording_session_pending_failed_mapping");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let meeting_dir = layout.for_meeting("g1", "vc1", "meeting-mapping");
+    let storage = LocalChunkStorage::new(meeting_dir.clone(), "meeting-mapping");
+
+    std::fs::create_dir_all(meeting_dir.root())
+        .expect("meeting root should be creatable");
+
+    // Make the first write fail by blocking `audio/` as a file path.
+    let audio_dir = meeting_dir.audio_dir();
+    std::fs::write(&audio_dir, b"blocked")
+        .expect("setting up blocked audio dir for forced save failure");
+
+    let mut session = RecordingSession::new(
+        "meeting-mapping".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(20),
+        },
+        48_000,
+    );
+
+    session.ingest_frame(
+        "ssrc:100",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![0, 0, 1, 0],
+        },
+    );
+
+    let failed = session.flush_all().expect("flush should return retryable failure");
+    assert_eq!(failed.failed.len(), 1);
+
+    assert!(
+        std::fs::remove_file(&audio_dir).is_ok(),
+        "blocked audio directory should exist as file"
+    );
+    std::fs::create_dir_all(&audio_dir).expect("recreate audio dir for mapping persist");
+
+    let mut tracker = SsrcTracker::new();
+    tracker.update_mapping(100, 12345);
+    session.rekey_user("ssrc:100", "12345");
+    session.persist_ssrc_mapping(&tracker);
+
+    let mapping_path = meeting_dir.audio_dir().join(SSRC_MAPPING_FILENAME);
+    let mapping_data = std::fs::read(&mapping_path).expect("mapping file should be written");
+    let parsed: SsrcTracker = serde_json::from_slice(&mapping_data).expect("mapping should parse");
+    assert_eq!(parsed.resolve_user(100), Some("12345"));
 
     let _ = std::fs::remove_dir_all(base);
 }
