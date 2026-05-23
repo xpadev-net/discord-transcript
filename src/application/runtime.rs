@@ -1964,6 +1964,34 @@ impl ScaffoldHandler {
         .await
     }
 
+    /// Register voice event handlers on the Call for this guild.
+    /// Uses `remove_all_global_events` first to ensure a clean slate
+    /// (avoids handler accumulation across consecutive recordings).
+    async fn register_voice_handlers(
+        &self,
+        manager: &songbird::Songbird,
+        ctx: &Context,
+        guild_id: GuildId,
+    ) {
+        let call = manager.get_or_insert(guild_id);
+        let mut lock = call.lock().await;
+        lock.remove_all_global_events();
+        let voice_handler = VoiceReceiveHandler {
+            tracker: Arc::clone(&self.ssrc_tracker),
+            sessions: Arc::clone(&self.sessions),
+            guild_id: guild_id.get().to_string(),
+            runtime: self.clone(),
+            http: Arc::clone(&ctx.http),
+            ctx: ctx.clone(),
+        };
+        lock.add_global_event(
+            Event::Core(CoreEvent::SpeakingStateUpdate),
+            voice_handler.clone(),
+        );
+        lock.add_global_event(Event::Core(CoreEvent::VoiceTick), voice_handler.clone());
+        lock.add_global_event(Event::Core(CoreEvent::DriverDisconnect), voice_handler);
+    }
+
     async fn handle_record_start(
         &self,
         ctx: &Context,
@@ -2041,7 +2069,12 @@ impl ScaffoldHandler {
             );
         }
 
-        let call_lock = {
+        // Register handlers BEFORE voice WS connects to capture initial SSRC
+        // mappings (SpeakingStateUpdate for users already speaking).
+        self.register_voice_handlers(manager.as_ref(), ctx, guild_id)
+            .await;
+
+        let _call = {
             let channel_id = ChannelId::new(voice_channel_id_u64);
             let mut join_delay = Duration::from_millis(500);
             let mut last_err = None;
@@ -2072,6 +2105,11 @@ impl ScaffoldHandler {
                                 "failed to leave voice channel during retry cleanup"
                             );
                         }
+                        // Re-register after leave in case it cleared the Call's
+                        // event handlers (defensive: Songbird docs say handlers
+                        // survive leave(), but guard against implementation drift).
+                        self.register_voice_handlers(manager.as_ref(), ctx, guild_id)
+                            .await;
                         if attempt < 3 {
                             sleep(join_delay).await;
                             join_delay *= 2;
@@ -2102,6 +2140,7 @@ impl ScaffoldHandler {
                             .set_meeting_status(&meeting_id, MeetingStatus::Failed, None)
                     {
                         error!(
+                            guild_id = %guild_id.get(),
                             meeting_id = %meeting_id,
                             error = %e,
                             "failed to mark meeting as failed in database"
@@ -2112,6 +2151,7 @@ impl ScaffoldHandler {
                         .set_error_message(&meeting_id, Some(err_msg.clone()))
                     {
                         error!(
+                            guild_id = %guild_id.get(),
                             meeting_id = %meeting_id,
                             error = %e,
                             "failed to persist error message in database"
@@ -2121,23 +2161,6 @@ impl ScaffoldHandler {
                 }
             }
         };
-        {
-            let mut call = call_lock.lock().await;
-            let voice_handler = VoiceReceiveHandler {
-                tracker: Arc::clone(&self.ssrc_tracker),
-                sessions: Arc::clone(&self.sessions),
-                guild_id: guild_id.get().to_string(),
-                runtime: self.clone(),
-                http: Arc::clone(&ctx.http),
-                ctx: ctx.clone(),
-            };
-            call.add_global_event(
-                Event::Core(CoreEvent::SpeakingStateUpdate),
-                voice_handler.clone(),
-            );
-            call.add_global_event(Event::Core(CoreEvent::VoiceTick), voice_handler.clone());
-            call.add_global_event(Event::Core(CoreEvent::DriverDisconnect), voice_handler);
-        }
 
         info!(
             guild_id = %guild_id.get(),
