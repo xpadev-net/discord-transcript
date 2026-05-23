@@ -1573,7 +1573,6 @@ impl EventHandler for ScaffoldHandler {
                         let _ = manager.leave(handler.guild_id).await;
                     }
                     if let Some(session) = &removed_session {
-                        let tracker = handler.ssrc_tracker.lock().await;
                         session.persist_ssrc_mapping(&tracker);
                     }
                     let stop_result = {
