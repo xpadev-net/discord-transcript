@@ -326,7 +326,8 @@ fn recording_session_rekey_user_transfers_sequence_counter() {
     );
 
     // Re-key: sequence counter (1) should transfer to the real user ID
-    session.rekey_user("ssrc:100", "12345");
+    let moved = session.rekey_user("ssrc:100", "12345");
+    assert_eq!(moved, 1);
 
     // Flush the remaining frame — should use the new user ID and
     // continue the sequence (2) from the transferred counter

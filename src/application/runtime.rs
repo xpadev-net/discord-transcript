@@ -3477,6 +3477,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     };
 
                     // Re-key any in-memory frames buffered under the SSRC fallback ID
+                    // `should_persist_mapping` can be false for repeated updates
+                    // when the mapping already points to this user. In that case,
+                    // frames are expected to already be keyed to the user ID for
+                    // the current session, so no re-key/persist is needed.
                     let ssrc_key = SsrcTracker::fallback_key(evt.ssrc);
                     if should_persist_mapping {
                         let mut sessions = self.sessions.lock().await;
