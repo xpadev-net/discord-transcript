@@ -1491,12 +1491,17 @@ impl EventHandler for ScaffoldHandler {
                     }
                     // Flush remaining audio before stopping. Failed chunks stay
                     // attached to the session and can be retried by a later stop.
+                    let tracker = {
+                        let tracker = handler.ssrc_tracker.lock().await;
+                        tracker.clone()
+                    };
                     let flush_failed = {
                         let mut sessions = handler.sessions.lock().await;
                         if let Some(session) = sessions.get_mut(&guild_for_task)
                             && flush_session_for_teardown(session, &guild_for_task, "auto-stop")
                                 .is_err()
                         {
+                            session.persist_ssrc_mapping(&tracker);
                             true
                         } else {
                             false
@@ -2197,6 +2202,11 @@ impl ScaffoldHandler {
         let _command_guard = self.command_gate.read().await;
         self.reject_if_shutting_down()?;
 
+        let tracker = {
+            let tracker = self.ssrc_tracker.lock().await;
+            tracker.clone()
+        };
+
         let flushed_meeting_id = {
             let mut sessions = self.sessions.lock().await;
             // Flush remaining audio before stopping. Failed chunks stay
@@ -2206,7 +2216,9 @@ impl ScaffoldHandler {
                 .get_mut(&guild_key)
                 .filter(|session| session.meeting_id == authorized_meeting_id)
             {
-                flush_session_for_teardown(session, &guild_key, "manual stop")?;
+                let result = flush_session_for_teardown(session, &guild_key, "manual stop")?;
+                session.persist_ssrc_mapping(&tracker);
+                result?;
                 Some(session.meeting_id.clone())
             } else {
                 None
@@ -2251,7 +2263,6 @@ impl ScaffoldHandler {
         // Persist SSRC mapping after voice teardown so all events
         // received up to disconnect are captured in the tracker.
         if let Some(session) = &removed_session {
-            let tracker = self.ssrc_tracker.lock().await;
             session.persist_ssrc_mapping(&tracker);
         }
 
@@ -3455,24 +3466,31 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
         match ctx {
             EventContext::SpeakingStateUpdate(evt) => {
                 if let Some(user_id) = evt.user_id {
-                    let mut tracker = self.tracker.lock().await;
                     let user_id_u64 = user_id.0;
                     let user_id_str = user_id_u64.to_string();
-                    tracker.update_mapping(evt.ssrc, user_id_u64);
-                    drop(tracker);
+                    let (should_persist_mapping, snapshot_tracker) = {
+                        let mut tracker = self.tracker.lock().await;
+                        let previous_user = tracker.resolve_user(evt.ssrc).map(ToOwned::to_owned);
+                        tracker.update_mapping(evt.ssrc, user_id_u64);
+                        let changed = previous_user != Some(user_id_str.clone());
+                        (changed, tracker.clone())
+                    };
 
                     // Re-key any in-memory frames buffered under the SSRC fallback ID
                     let ssrc_key = SsrcTracker::fallback_key(evt.ssrc);
-                    let mut sessions = self.sessions.lock().await;
-                    if let Some(session) = sessions.get_mut(&self.guild_id) {
-                        let moved = session.rekey_user(&ssrc_key, &user_id_str);
-                        if moved > 0 {
-                            info!(
-                                ssrc = evt.ssrc,
-                                user_id = user_id_u64,
-                                frames_moved = moved,
-                                "re-keyed in-memory audio frames from SSRC fallback to user ID"
-                            );
+                    if should_persist_mapping {
+                        let mut sessions = self.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&self.guild_id) {
+                            let moved = session.rekey_user(&ssrc_key, &user_id_str);
+                            if moved > 0 {
+                                info!(
+                                    ssrc = evt.ssrc,
+                                    user_id = user_id_u64,
+                                    frames_moved = moved,
+                                    "re-keyed in-memory audio frames from SSRC fallback to user ID"
+                                );
+                            }
+                            session.persist_ssrc_mapping(&snapshot_tracker);
                         }
                     }
                 }
@@ -3550,6 +3568,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         }
                         // Flush remaining audio before stopping. Failed
                         // chunks stay attached to the session for retry.
+                        let tracker = {
+                            let tracker = runtime.ssrc_tracker.lock().await;
+                            tracker.clone()
+                        };
                         let removed_session = {
                             let mut sessions = runtime.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&guild_key)
@@ -3560,6 +3582,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 )
                                 .is_err()
                             {
+                                session.persist_ssrc_mapping(&tracker);
                                 drop(sessions);
                                 if let Some(meeting_id) = expected_meeting_id.as_deref()
                                     && let Err(err) = runtime
@@ -3591,7 +3614,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         // Persist SSRC mapping after session removal so all
                         // events received up to disconnect are captured.
                         if let Some(session) = &removed_session {
-                            let tracker = runtime.ssrc_tracker.lock().await;
                             session.persist_ssrc_mapping(&tracker);
                         }
                         let stop_result = {
