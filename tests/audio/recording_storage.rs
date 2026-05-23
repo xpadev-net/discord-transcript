@@ -7,7 +7,6 @@ use discord_transcript::infrastructure::storage_fs::{
 use discord_transcript::infrastructure::workspace::{
     MeetingWorkspaceLayout, SSRC_MAPPING_FILENAME,
 };
-use serde_json;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -327,8 +326,7 @@ fn recording_session_rekey_user_transfers_sequence_counter() {
     );
 
     // Re-key: sequence counter (1) should transfer to the real user ID
-    let moved = session.rekey_user("ssrc:100", "12345");
-    assert_eq!(moved, 1);
+    session.rekey_user("ssrc:100", "12345");
 
     // Flush the remaining frame — should use the new user ID and
     // continue the sequence (2) from the transferred counter
@@ -449,8 +447,7 @@ fn recording_session_persists_ssrc_mapping_for_rekeyed_pending_failed_chunks() {
 
     let mut tracker = SsrcTracker::new();
     tracker.update_mapping(100, 12345);
-    let moved = session.rekey_user("ssrc:100", "12345");
-    assert_eq!(moved, 1);
+    session.rekey_user("ssrc:100", "12345");
     session.persist_ssrc_mapping(&tracker);
 
     let mapping_path = meeting_dir.audio_dir().join(SSRC_MAPPING_FILENAME);

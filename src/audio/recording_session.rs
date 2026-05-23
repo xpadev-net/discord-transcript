@@ -5,8 +5,8 @@ use crate::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
 use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
 use std::time::Instant;
 
 const MAX_PENDING_FAILED_CHUNK_BYTES: usize = 512 * 1024 * 1024;

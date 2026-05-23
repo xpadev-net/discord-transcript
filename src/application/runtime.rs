@@ -2216,9 +2216,9 @@ impl ScaffoldHandler {
                 .get_mut(&guild_key)
                 .filter(|session| session.meeting_id == authorized_meeting_id)
             {
-                let result = flush_session_for_teardown(session, &guild_key, "manual stop")?;
+                let flush_result = flush_session_for_teardown(session, &guild_key, "manual stop");
                 session.persist_ssrc_mapping(&tracker);
-                result?;
+                flush_result?;
                 Some(session.meeting_id.clone())
             } else {
                 None
