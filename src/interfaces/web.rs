@@ -1243,6 +1243,11 @@ async fn check_guild_admin_permission(
         return Ok(false);
     }
 
+    if !resp_status.is_success() {
+        warn!(status = %resp_status, "discord member API non-success");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
     let member: DiscordMemberFull = match member_resp.unwrap().json().await {
         Ok(m) => m,
         Err(err) => {
