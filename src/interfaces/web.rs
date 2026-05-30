@@ -189,7 +189,10 @@ pub fn create_router(state: WebState) -> Router {
     let protected = Router::new()
         .route("/api/me", get(api_me))
         .route("/api/guild/meetings", get(api_guild_meetings))
-        .route("/api/guild/settings", get(api_guild_settings).put(api_update_guild_settings))
+        .route(
+            "/api/guild/settings",
+            get(api_guild_settings).put(api_update_guild_settings),
+        )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
@@ -1746,40 +1749,43 @@ async fn api_guild_meetings(
 
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(20).min(100);
-   let offset = (page - 1) * limit;
+    let offset = (page - 1) * limit;
 
     // Get total count for pagination metadata
-    let count_rows = state.db.query(
-        COUNT_GUILD_MEETINGS_SQL,
-        &[&auth.guild_id],
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let count_rows = state
+        .db
+        .query(COUNT_GUILD_MEETINGS_SQL, &[&auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let total: u64 = count_rows.first()
+    let total: u64 = count_rows
+        .first()
         .map(|row| row.get::<_, i64>(0) as u64)
         .unwrap_or(0);
 
     // Get meetings with pagination
     let limit_i32 = limit as i32;
     let offset_i32 = offset as i32;
-    let rows = state.db.query(
-        LIST_GUILD_MEETINGS_SQL,
-        &[&auth.guild_id, &limit_i32, &offset_i32],
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = state
+        .db
+        .query(
+            LIST_GUILD_MEETINGS_SQL,
+            &[&auth.guild_id, &limit_i32, &offset_i32],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let meetings: Vec<MeetingListItem> = rows.iter().map(|row| {
-        MeetingListItem {
+    let meetings: Vec<MeetingListItem> = rows
+        .iter()
+        .map(|row| MeetingListItem {
             id: row.get("id"),
             status: row.get("status"),
             title: row.get("title"),
             started_at: row.get("started_at"),
             stopped_at: row.get("stopped_at"),
             duration_seconds: row.get("meeting_duration_seconds"),
-        }
-    }).collect();
+        })
+        .collect();
 
     Ok(Json(MeetingListResponse {
         meetings,
@@ -1794,26 +1800,27 @@ async fn api_guild_settings(
     State(state): State<WebState>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
-    
-    // Query guild settings from DB
-    let row = state.db.query(
-        GET_GUILD_SETTINGS_SQL,
-        &[&auth.guild_id],
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .into_iter()
-    .next();
 
-    let settings = row.map(|r| GuildSettingsResponse {
-        whisper_language: r.get("whisper_language"),
-        whisper_language_explicit: r.get("whisper_language_explicit"),
-        whisper_vad: r.get("whisper_vad"),
-        auto_stop_grace_seconds: r.get("auto_stop_grace_seconds"),
-        retention_raw_audio_ttl_days: r.get("retention_raw_audio_ttl_days"),
-        retention_transcript_ttl_days: r.get("retention_transcript_ttl_days"),
-        summary_enabled: r.get("summary_enabled"),
-    }).unwrap_or_default();
+    // Query guild settings from DB
+    let row = state
+        .db
+        .query(GET_GUILD_SETTINGS_SQL, &[&auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .next();
+
+    let settings = row
+        .map(|r| GuildSettingsResponse {
+            whisper_language: r.get("whisper_language"),
+            whisper_language_explicit: r.get("whisper_language_explicit"),
+            whisper_vad: r.get("whisper_vad"),
+            auto_stop_grace_seconds: r.get("auto_stop_grace_seconds"),
+            retention_raw_audio_ttl_days: r.get("retention_raw_audio_ttl_days"),
+            retention_transcript_ttl_days: r.get("retention_transcript_ttl_days"),
+            summary_enabled: r.get("summary_enabled"),
+        })
+        .unwrap_or_default();
 
     Ok(Json(settings))
 }
@@ -1833,61 +1840,62 @@ async fn api_update_guild_settings(
     }
 
     // Validate input values
-    if let Some(ref lang) = body.whisper_language {
-        if !is_iso639_1_format(lang) {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    if let Some(ref lang) = body.whisper_language
+        && !is_iso639_1_format(lang)
+    {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
-    if let Some(grace) = body.auto_stop_grace_seconds {
-        if grace < 10 || grace > 3600 {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    if let Some(grace) = body.auto_stop_grace_seconds
+        && !(10..=3600).contains(&grace)
+    {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
-    if let Some(ttl) = body.retention_raw_audio_ttl_days {
-        if ttl < 1 || ttl > 365 {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    if let Some(ttl) = body.retention_raw_audio_ttl_days
+        && !(1..=365).contains(&ttl)
+    {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
-    if let Some(ttl) = body.retention_transcript_ttl_days {
-        if ttl < 1 || ttl > 365 {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    if let Some(ttl) = body.retention_transcript_ttl_days
+        && !(1..=365).contains(&ttl)
+    {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     // Upsert guild settings
     let grace_i64 = body.auto_stop_grace_seconds.map(|v| v as i64);
     let raw_ttl_i32 = body.retention_raw_audio_ttl_days.map(|v| v as i32);
     let transcript_ttl_i32 = body.retention_transcript_ttl_days.map(|v| v as i32);
-    
-    state.db.query(
-        UPSERT_GUILD_SETTINGS_SQL,
-        &[
-            &auth.guild_id,
-            &body.whisper_language.as_ref().map(|s| s.as_str()),
-            &body.whisper_language_explicit.unwrap_or(false),
-            &body.whisper_vad.unwrap_or(true),
-            &grace_i64,
-            &raw_ttl_i32,
-            &transcript_ttl_i32,
-            &body.summary_enabled,
-        ],
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    state
+        .db
+        .query(
+            UPSERT_GUILD_SETTINGS_SQL,
+            &[
+                &auth.guild_id,
+                &body.whisper_language.as_deref(),
+                &body.whisper_language_explicit.unwrap_or(false),
+                &body.whisper_vad.unwrap_or(true),
+                &grace_i64,
+                &raw_ttl_i32,
+                &transcript_ttl_i32,
+                &body.summary_enabled,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Return updated settings
-    let row = state.db.query(
-        GET_GUILD_SETTINGS_SQL,
-        &[&auth.guild_id],
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .into_iter()
-    .next()
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let row = state
+        .db
+        .query(GET_GUILD_SETTINGS_SQL, &[&auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .next()
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     let settings = GuildSettingsResponse {
         whisper_language: row.get("whisper_language"),
