@@ -17,7 +17,6 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/0008_add_job_lease.sql"),
     "\n",
-    "\n",
     include_str!("../../migrations/0009_add_stop_reason_check.sql"),
     "\n",
     include_str!("../../migrations/0010_guild_settings.sql"),
@@ -254,7 +253,7 @@ WHERE guild_id = $1
 "#;
 
 pub const LIST_GUILD_MEETINGS_SQL: &str = r#"
-SELECT id, status, started_at, stopped_at, duration_seconds, title, stop_reason
+SELECT id, status, started_at, stopped_at, meeting_duration_seconds, title, stop_reason
 FROM meetings
 WHERE guild_id = $1
 ORDER BY started_at DESC
