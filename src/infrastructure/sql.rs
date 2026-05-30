@@ -18,6 +18,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0008_add_job_lease.sql"),
     "\n",
     include_str!("../../migrations/0009_add_stop_reason_check.sql"),
+    "\n",
+    include_str!("../../migrations/0010_guild_settings.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -224,3 +226,53 @@ pub fn build_insert_transcripts_sql_with_offset(count: usize, param_offset: usiz
 pub fn build_insert_transcripts_sql(count: usize) -> String {
     build_insert_transcripts_sql_with_offset(count, 0)
 }
+
+pub const UPSERT_GUILD_SETTINGS_SQL: &str = r#"
+INSERT INTO guild_settings (
+    guild_id,
+    whisper_language,
+    whisper_language_explicit,
+    whisper_vad,
+    auto_stop_grace_seconds,
+    retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days,
+    summary_enabled,
+    updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+ON CONFLICT (guild_id) DO UPDATE SET
+    whisper_language = EXCLUDED.whisper_language,
+    whisper_language_explicit = EXCLUDED.whisper_language_explicit,
+    whisper_vad = EXCLUDED.whisper_vad,
+    auto_stop_grace_seconds = EXCLUDED.auto_stop_grace_seconds,
+    retention_raw_audio_ttl_days = EXCLUDED.retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days = EXCLUDED.retention_transcript_ttl_days,
+    summary_enabled = EXCLUDED.summary_enabled,
+    updated_at = NOW()
+"#;
+
+pub const GET_GUILD_SETTINGS_SQL: &str = r#"
+SELECT
+    guild_id,
+    whisper_language,
+    whisper_language_explicit,
+    whisper_vad,
+    auto_stop_grace_seconds,
+    retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days,
+    summary_enabled,
+    updated_at
+FROM guild_settings
+WHERE guild_id = $1
+"#;
+
+pub const LIST_GUILD_MEETINGS_SQL: &str = r#"
+SELECT id, status, title, started_at, stopped_at, meeting_duration_seconds
+FROM meetings
+WHERE guild_id = $1
+ORDER BY started_at DESC
+LIMIT $2 OFFSET $3
+"#;
+
+pub const COUNT_GUILD_MEETINGS_SQL: &str = r#"
+SELECT COUNT(*) FROM meetings WHERE guild_id = $1
+"#;
