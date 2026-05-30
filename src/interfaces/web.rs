@@ -1185,6 +1185,87 @@ async fn resolve_channel_permission_flags(
     })
 }
 
+async fn check_guild_admin_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let cache_key = (user_id.to_owned(), "__guild__".to_owned());
+    {
+        let cache = state.permission_cache.read().await;
+        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
+            && Instant::now() < expires_at
+        {
+            return Ok(permission.is_admin);
+        }
+    }
+
+    // Fast path: check if user is guild owner
+    let guild = get_guild_info(state, auth).await?;
+    if user_id == &guild.owner_id {
+        cache_guild_admin_permission(state, true).await;
+        return Ok(true);
+    }
+
+    // Slow path: fetch member roles and check ADMINISTRATOR bit
+    let bot_auth = format!("Bot {}", auth.bot_token);
+    let member_resp = state
+        .http_client
+        .get(format!(
+            "https://discord.com/api/guilds/{}/members/{user_id}",
+            auth.guild_id
+        ))
+        .header("Authorization", &bot_auth)
+        .send()
+        .await;
+
+    if let Err(err) = member_resp {
+        warn!(error = %err, "discord member API request failed");
+        cache_guild_admin_permission(state, false).await;
+        return Ok(false);
+    }
+
+    let resp_status = member_resp.as_ref().unwrap().status();
+    if resp_status == reqwest::StatusCode::NOT_FOUND
+        || resp_status == reqwest::StatusCode::FORBIDDEN
+    {
+        cache_guild_admin_permission(state, false).await;
+        return Ok(false);
+    }
+
+    let member: DiscordMemberFull = match member_resp.unwrap().json().await {
+        Ok(m) => m,
+        Err(err) => {
+            warn!(error = %err, "discord member API response parse failed");
+            cache_guild_admin_permission(state, false).await;
+            return Ok(false);
+        }
+    };
+
+    // Check if any role has ADMINISTRATOR bit
+    let is_admin = member.roles.iter().any(|role_id| {
+        guild
+            .roles
+            .iter()
+            .find(|r| r.id == *role_id)
+            .map(|r| r.permissions & ADMINISTRATOR != 0)
+            .unwrap_or(false)
+    });
+
+    cache_guild_admin_permission(state, is_admin).await;
+    Ok(is_admin)
+}
+
+async fn cache_guild_admin_permission(state: &WebState, is_admin: bool) {
+    let mut cache = state.permission_cache.write().await;
+    // Use a special key for guild-level admin checks
+    let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+    cache.insert(
+        ("__guild_admin__".to_owned(), "__guild__".to_owned()),
+        (CachedChannelPermission { can_view: true, is_admin }, expires_at),
+    );
+}
+
 async fn check_channel_admin_permission(
     state: &WebState,
     auth: &AuthConfig,
