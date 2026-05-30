@@ -1,9 +1,13 @@
 import type {
   DebugArtifact,
+  GuildSettingsResponse,
+  MeResponse,
+  MeetingListResponse,
   MeetingResponse,
   SpeakerAudioInfo,
   SummaryResponse,
   TranscriptSegment,
+  UpdateGuildSettingsRequest,
 } from "./types";
 
 function basePath(meetingId: string): string {
@@ -77,4 +81,42 @@ export function fetchDebugManifest(
   return fetch(`${basePath(meetingId)}/debug/manifest`, { signal }).then(
     handleResponse<DebugArtifact[]>,
   );
+}
+
+// Guild dashboard API functions
+
+export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
+  return fetch("/api/me", { signal }).then(handleResponse<MeResponse>);
+}
+
+export function fetchGuildMeetings(
+  page: number = 1,
+  limit: number = 20,
+  signal?: AbortSignal,
+): Promise<MeetingListResponse> {
+  const url = `/api/guild/meetings?page=${page}&limit=${limit}`;
+  return fetch(url, { signal }).then(handleResponse<MeetingListResponse>);
+}
+
+export function fetchGuildSettings(
+  signal?: AbortSignal,
+): Promise<GuildSettingsResponse> {
+  return fetch("/api/guild/settings", { signal }).then(
+    handleResponse<GuildSettingsResponse>,
+  );
+}
+
+export function updateGuildSettings(
+  settings: UpdateGuildSettingsRequest,
+): Promise<GuildSettingsResponse> {
+  return fetch("/api/guild/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  }).then((response) => {
+    if (response.status === 403) {
+      return Promise.reject(new Error("forbidden"));
+    }
+    return handleResponse<GuildSettingsResponse>(response);
+  });
 }
