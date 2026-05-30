@@ -88,6 +88,15 @@ pub struct CachedChannelPermission {
     pub is_admin: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct GuildSettingsDefaults {
+    pub whisper_language: Option<String>,
+    pub whisper_vad: bool,
+    pub auto_stop_grace_seconds: i64,
+    pub retention_raw_audio_ttl_days: i32,
+    pub retention_transcript_ttl_days: i32,
+}
+
 #[derive(Clone)]
 pub struct WebState {
     pub db: Arc<PgClient>,
@@ -102,6 +111,8 @@ pub struct WebState {
     membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     pub static_files_dir: String,
+    /// Default guild settings used when a guild has no custom settings
+    pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
 }
 
 impl WebState {
@@ -111,6 +122,7 @@ impl WebState {
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
         static_files_dir: String,
+        guild_settings_defaults: GuildSettingsDefaults,
     ) -> Self {
         Self {
             db,
@@ -122,6 +134,7 @@ impl WebState {
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             static_files_dir,
+            guild_settings_defaults: Arc::new(guild_settings_defaults),
         }
     }
 }

@@ -99,6 +99,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
         config.static_files_dir.clone(),
+        web::GuildSettingsDefaults {
+            whisper_language: config.whisper_language.clone(),
+            whisper_vad: config.whisper_vad,
+            auto_stop_grace_seconds: i64::try_from(config.auto_stop_grace_seconds)
+                .expect("auto_stop_grace_seconds exceeds i64::MAX"),
+            retention_raw_audio_ttl_days: i32::try_from(
+                config.retention_policy.raw_audio_ttl_days.get(),
+            )
+            .expect("retention_raw_audio_ttl_days exceeds i32::MAX"),
+            retention_transcript_ttl_days: i32::try_from(
+                config.retention_policy.transcript_ttl_days.get(),
+            )
+            .expect("retention_transcript_ttl_days exceeds i32::MAX"),
+        },
     );
     let router = web::create_router(web_state);
 
