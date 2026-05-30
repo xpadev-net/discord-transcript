@@ -99,6 +99,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
         config.static_files_dir.clone(),
+        web::GuildSettingsDefaults {
+            whisper_language: config.whisper_language.clone(),
+            whisper_vad: config.whisper_vad,
+            auto_stop_grace_seconds: config.auto_stop_grace_seconds as i64,
+            retention_raw_audio_ttl_days: config.retention_policy.raw_audio_ttl_days.get() as i32,
+            retention_transcript_ttl_days: config.retention_policy.transcript_ttl_days.get() as i32,
+        },
     );
     let router = web::create_router(web_state);
 
