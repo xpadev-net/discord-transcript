@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -88,6 +89,15 @@ pub struct CachedChannelPermission {
     pub is_admin: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct GuildSettingsDefaults {
+    pub whisper_language: Option<String>,
+    pub whisper_vad: bool,
+    pub auto_stop_grace_seconds: u64,
+    pub retention_raw_audio_ttl_days: NonZeroU32,
+    pub retention_transcript_ttl_days: NonZeroU32,
+}
+
 #[derive(Clone)]
 pub struct WebState {
     pub db: Arc<PgClient>,
@@ -102,6 +112,7 @@ pub struct WebState {
     membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     pub static_files_dir: String,
+    pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
 }
 
 impl WebState {
@@ -111,6 +122,7 @@ impl WebState {
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
         static_files_dir: String,
+        guild_settings_defaults: GuildSettingsDefaults,
     ) -> Self {
         Self {
             db,
@@ -122,6 +134,7 @@ impl WebState {
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             static_files_dir,
+            guild_settings_defaults: Arc::new(guild_settings_defaults),
         }
     }
 }

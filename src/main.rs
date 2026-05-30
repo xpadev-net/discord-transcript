@@ -90,6 +90,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let guild_settings_defaults = web::GuildSettingsDefaults {
+        whisper_language: config.whisper_language.clone(),
+        whisper_vad: config.whisper_vad,
+        auto_stop_grace_seconds: config.auto_stop_grace_seconds,
+        retention_raw_audio_ttl_days: config.retention_policy.raw_audio_ttl_days,
+        retention_transcript_ttl_days: config.retention_policy.transcript_ttl_days,
+    };
+
     let web_state = web::WebState::new(
         Arc::new(db_client),
         config.chunk_storage_dir.clone(),
@@ -99,6 +107,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
         config.static_files_dir.clone(),
+        guild_settings_defaults,
     );
     let router = web::create_router(web_state);
 
