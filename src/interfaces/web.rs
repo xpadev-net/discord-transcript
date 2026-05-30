@@ -1191,6 +1191,8 @@ async fn check_guild_admin_permission(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let cache_key = (user_id.to_owned(), "__guild__".to_owned());
+
+    // Check cache first
     {
         let cache = state.permission_cache.read().await;
         if let Some(&(permission, expires_at)) = cache.get(&cache_key)
@@ -1203,7 +1205,7 @@ async fn check_guild_admin_permission(
     // Fast path: check if user is guild owner
     let guild = get_guild_info(state, auth).await?;
     if user_id == &guild.owner_id {
-        cache_guild_admin_permission(state, true).await;
+        cache_guild_admin_permission(state, user_id, true).await;
         return Ok(true);
     }
 
@@ -1219,17 +1221,25 @@ async fn check_guild_admin_permission(
         .send()
         .await;
 
+    // Handle request errors - don't cache failures, return false but allow retry
     if let Err(err) = member_resp {
         warn!(error = %err, "discord member API request failed");
-        cache_guild_admin_permission(state, false).await;
         return Ok(false);
     }
 
     let resp_status = member_resp.as_ref().unwrap().status();
+    
+    // Handle rate limiting as error (don't cache), treat 404/403 as not admin
+    if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!(status = %resp_status, "discord member API rate limited");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
     if resp_status == reqwest::StatusCode::NOT_FOUND
         || resp_status == reqwest::StatusCode::FORBIDDEN
+        || resp_status == reqwest::StatusCode::UNAUTHORIZED
     {
-        cache_guild_admin_permission(state, false).await;
+        cache_guild_admin_permission(state, user_id, false).await;
         return Ok(false);
     }
 
@@ -1237,7 +1247,7 @@ async fn check_guild_admin_permission(
         Ok(m) => m,
         Err(err) => {
             warn!(error = %err, "discord member API response parse failed");
-            cache_guild_admin_permission(state, false).await;
+            cache_guild_admin_permission(state, user_id, false).await;
             return Ok(false);
         }
     };
@@ -1252,18 +1262,23 @@ async fn check_guild_admin_permission(
             .unwrap_or(false)
     });
 
-    cache_guild_admin_permission(state, is_admin).await;
+    cache_guild_admin_permission(state, user_id, is_admin).await;
     Ok(is_admin)
 }
 
-async fn cache_guild_admin_permission(state: &WebState, is_admin: bool) {
+async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
     let mut cache = state.permission_cache.write().await;
-    // Use a special key for guild-level admin checks
     let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
     cache.insert(
-        ("__guild_admin__".to_owned(), "__guild__".to_owned()),
-        (CachedChannelPermission { can_view: true, is_admin }, expires_at),
+        (user_id.to_owned(), "__guild__".to_owned()),
+        (CachedChannelPermission { can_view: is_admin, is_admin }, expires_at),
     );
+
+    // Evict old entries if cache is too large (same pattern as check_channel_admin_permission)
+    if cache.len() > 5000 {
+        let now = Instant::now();
+        cache.retain(|_, (_, exp)| *exp > now);
+    }
 }
 
 async fn check_channel_admin_permission(
