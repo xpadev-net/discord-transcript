@@ -18,8 +18,13 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
+use crate::infrastructure::sql::{
+    COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL, LIST_GUILD_MEETINGS_SQL,
+    UPSERT_GUILD_SETTINGS_SQL,
+};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -182,6 +187,9 @@ pub fn create_router(state: WebState) -> Router {
         );
 
     let protected = Router::new()
+        .route("/api/me", get(api_me))
+        .route("/api/guild/meetings", get(api_guild_meetings))
+        .route("/api/guild/settings", get(api_guild_settings).put(api_update_guild_settings))
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
@@ -1185,6 +1193,105 @@ async fn resolve_channel_permission_flags(
     })
 }
 
+async fn check_guild_admin_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let cache_key = (user_id.to_owned(), auth.guild_id.clone());
+    // Check cache first
+    {
+        let cache = state.permission_cache.read().await;
+        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
+            && Instant::now() < expires_at
+        {
+            return Ok(permission.is_admin);
+        }
+    }
+
+    // Guild owner check (fast path - no API call needed)
+    let guild = get_guild_info(state, auth).await?;
+    if guild.owner_id == user_id {
+        cache_guild_admin_check(
+            state,
+            &cache_key,
+            CachedChannelPermission {
+                can_view: true,
+                is_admin: true,
+            },
+        )
+        .await;
+        return Ok(true);
+    }
+
+    // Fetch member roles from Discord API
+    let bot_auth = format!("Bot {}", auth.bot_token);
+    let member_resp = state
+        .http_client
+        .get(format!(
+            "https://discord.com/api/guilds/{}/members/{user_id}",
+            auth.guild_id
+        ))
+        .header("Authorization", &bot_auth)
+        .send()
+        .await;
+
+    let member_roles = match member_resp {
+        Ok(resp) if resp.status().is_success() => {
+            let member: DiscordMemberFull = resp.json().await.map_err(|err| {
+                warn!(error = %err, "discord member API response parse failed");
+                StatusCode::BAD_GATEWAY
+            })?;
+            member.roles
+        }
+        _ => {
+            // Cache miss/false for 1 minute on failure
+            cache_guild_admin_check(
+                state,
+                &cache_key,
+                CachedChannelPermission {
+                    can_view: false,
+                    is_admin: false,
+                },
+            )
+            .await;
+            return Ok(false);
+        }
+    };
+
+    // Check ADMINISTRATOR bit across all member roles
+    let guild_roles = &guild.roles;
+    let is_admin = member_roles.iter().any(|role_id| {
+        guild_roles
+            .iter()
+            .find(|r| r.id == *role_id)
+            .map(|r| r.permissions & ADMINISTRATOR != 0)
+            .unwrap_or(false)
+    });
+
+    let permission = CachedChannelPermission {
+        can_view: true,
+        is_admin,
+    };
+
+    cache_guild_admin_check(state, &cache_key, permission).await;
+    Ok(is_admin)
+}
+
+async fn cache_guild_admin_check(
+    state: &WebState,
+    cache_key: &(String, String),
+    permission: CachedChannelPermission,
+) {
+    let mut cache = state.permission_cache.write().await;
+    let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+    cache.insert(cache_key.clone(), (permission, expires_at));
+    if cache.len() > 5000 {
+        let now = Instant::now();
+        cache.retain(|_, (_, exp)| *exp > now);
+    }
+}
+
 async fn check_channel_admin_permission(
     state: &WebState,
     auth: &AuthConfig,
@@ -1496,6 +1603,64 @@ fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 // ---------- Response types ----------
 
+/// GET /api/me response
+#[derive(Serialize)]
+struct MeResponse {
+    user_id: String,
+    is_guild_admin: bool,
+}
+
+/// Query params for /api/guild/meetings
+#[derive(Deserialize)]
+struct GuildMeetingsQuery {
+    page: Option<u64>,
+    limit: Option<u64>,
+}
+
+/// Single meeting in the guild meetings list
+#[derive(Serialize)]
+struct MeetingListItem {
+    id: String,
+    status: String,
+    title: Option<String>,
+    started_at: Option<String>,
+    stopped_at: Option<String>,
+    duration_seconds: Option<i32>,
+}
+
+/// GET /api/guild/meetings response
+#[derive(Serialize)]
+struct MeetingListResponse {
+    meetings: Vec<MeetingListItem>,
+    total: u64,
+    page: u64,
+    limit: u64,
+}
+
+/// GET/PUT /api/guild/settings response
+#[derive(Serialize, Default)]
+struct GuildSettingsResponse {
+    whisper_language: Option<String>,
+    whisper_language_explicit: bool,
+    whisper_vad: Option<bool>,
+    auto_stop_grace_seconds: Option<i64>,
+    retention_raw_audio_ttl_days: Option<u32>,
+    retention_transcript_ttl_days: Option<u32>,
+    summary_enabled: Option<bool>,
+}
+
+/// PUT /api/guild/settings request body
+#[derive(Deserialize)]
+struct UpdateGuildSettingsRequest {
+    whisper_language: Option<String>,
+    whisper_language_explicit: Option<bool>,
+    whisper_vad: Option<bool>,
+    auto_stop_grace_seconds: Option<u64>,
+    retention_raw_audio_ttl_days: Option<u32>,
+    retention_transcript_ttl_days: Option<u32>,
+    summary_enabled: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct MeetingResponse {
     id: String,
@@ -1554,6 +1719,188 @@ struct DebugArtifactEntry {
 }
 
 // ---------- Handlers ----------
+
+/// GET /api/me → `{ user_id, is_guild_admin }`
+async fn api_me(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<MeResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
+    let is_guild_admin = check_guild_admin_permission(&state, auth, &user_id).await?;
+
+    Ok(Json(MeResponse {
+        user_id,
+        is_guild_admin,
+    }))
+}
+
+/// GET /api/guild/meetings?page=&limit=
+async fn api_guild_meetings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Query(query): Query<GuildMeetingsQuery>,
+) -> Result<Json<MeetingListResponse>, StatusCode> {
+    // Verify user has access to the guild (via auth)
+    let _ = &user_id;
+    let auth = state.auth.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(20).min(100);
+   let offset = (page - 1) * limit;
+
+    // Get total count for pagination metadata
+    let count_rows = state.db.query(
+        COUNT_GUILD_MEETINGS_SQL,
+        &[&auth.guild_id],
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let total: u64 = count_rows.first()
+        .map(|row| row.get::<_, i64>(0) as u64)
+        .unwrap_or(0);
+
+    // Get meetings with pagination
+    let limit_i32 = limit as i32;
+    let offset_i32 = offset as i32;
+    let rows = state.db.query(
+        LIST_GUILD_MEETINGS_SQL,
+        &[&auth.guild_id, &limit_i32, &offset_i32],
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let meetings: Vec<MeetingListItem> = rows.iter().map(|row| {
+        MeetingListItem {
+            id: row.get("id"),
+            status: row.get("status"),
+            title: row.get("title"),
+            started_at: row.get("started_at"),
+            stopped_at: row.get("stopped_at"),
+            duration_seconds: row.get("meeting_duration_seconds"),
+        }
+    }).collect();
+
+    Ok(Json(MeetingListResponse {
+        meetings,
+        total,
+        page,
+        limit,
+    }))
+}
+
+/// GET /api/guild/settings
+async fn api_guild_settings(
+    State(state): State<WebState>,
+) -> Result<Json<GuildSettingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
+    
+    // Query guild settings from DB
+    let row = state.db.query(
+        GET_GUILD_SETTINGS_SQL,
+        &[&auth.guild_id],
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .into_iter()
+    .next();
+
+    let settings = row.map(|r| GuildSettingsResponse {
+        whisper_language: r.get("whisper_language"),
+        whisper_language_explicit: r.get("whisper_language_explicit"),
+        whisper_vad: r.get("whisper_vad"),
+        auto_stop_grace_seconds: r.get("auto_stop_grace_seconds"),
+        retention_raw_audio_ttl_days: r.get("retention_raw_audio_ttl_days"),
+        retention_transcript_ttl_days: r.get("retention_transcript_ttl_days"),
+        summary_enabled: r.get("summary_enabled"),
+    }).unwrap_or_default();
+
+    Ok(Json(settings))
+}
+
+/// PUT /api/guild/settings
+async fn api_update_guild_settings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Json(body): Json<UpdateGuildSettingsRequest>,
+) -> Result<Json<GuildSettingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Check guild admin permission
+    let is_admin = check_guild_admin_permission(&state, auth, &user_id).await?;
+    if !is_admin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Validate input values
+    if let Some(ref lang) = body.whisper_language {
+        if !is_iso639_1_format(lang) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    if let Some(grace) = body.auto_stop_grace_seconds {
+        if grace < 10 || grace > 3600 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    if let Some(ttl) = body.retention_raw_audio_ttl_days {
+        if ttl < 1 || ttl > 365 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    if let Some(ttl) = body.retention_transcript_ttl_days {
+        if ttl < 1 || ttl > 365 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Upsert guild settings
+    let grace_i64 = body.auto_stop_grace_seconds.map(|v| v as i64);
+    let raw_ttl_i32 = body.retention_raw_audio_ttl_days.map(|v| v as i32);
+    let transcript_ttl_i32 = body.retention_transcript_ttl_days.map(|v| v as i32);
+    
+    state.db.query(
+        UPSERT_GUILD_SETTINGS_SQL,
+        &[
+            &auth.guild_id,
+            &body.whisper_language.as_ref().map(|s| s.as_str()),
+            &body.whisper_language_explicit.unwrap_or(false),
+            &body.whisper_vad.unwrap_or(true),
+            &grace_i64,
+            &raw_ttl_i32,
+            &transcript_ttl_i32,
+            &body.summary_enabled,
+        ],
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Return updated settings
+    let row = state.db.query(
+        GET_GUILD_SETTINGS_SQL,
+        &[&auth.guild_id],
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .into_iter()
+    .next()
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let settings = GuildSettingsResponse {
+        whisper_language: row.get("whisper_language"),
+        whisper_language_explicit: row.get("whisper_language_explicit"),
+        whisper_vad: row.get("whisper_vad"),
+        auto_stop_grace_seconds: row.get("auto_stop_grace_seconds"),
+        retention_raw_audio_ttl_days: row.get("retention_raw_audio_ttl_days"),
+        retention_transcript_ttl_days: row.get("retention_transcript_ttl_days"),
+        summary_enabled: row.get("summary_enabled"),
+    };
+
+    Ok(Json(settings))
+}
 
 async fn api_meeting(
     State(state): State<WebState>,
