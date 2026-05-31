@@ -23,6 +23,38 @@ Purpose:
 
 ## Entries
 
+## 2026-05-31 - Avoid Snapshot Overwrites During Live Merge  [tags: review, ui-e2e]
+
+Context:
+
+- Plan: docs/coding-agent/plans/active/task-42-live-meeting-page-plan.md
+- Task/Wave: gh-review-hook follow-up
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+
+- `gh-review-hook` found the initial transcript snapshot could briefly overwrite SSE-merged live segments, and Dashboard auto-refresh depended on a fresh array reference.
+
+Root cause:
+
+- Snapshot fetch and live stream merge semantics were not harmonized, and the refresh effect dependency used raw fetched data instead of a stable derived flag.
+
+Fix applied:
+
+- Live snapshot fetches now merge into current transcript state, and Dashboard refresh depends on `hasLiveMeetings`.
+
+Prevention:
+
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: When a page combines snapshots and live deltas, verify both paths use compatible state update semantics.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+
+- Frontend lint, TypeScript, and production build passed after the fix.
+
 ## 2026-05-31 - Index Polling Cursors  [tags: review, performance]
 
 Context:

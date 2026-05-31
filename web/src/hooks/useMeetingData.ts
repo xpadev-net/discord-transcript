@@ -145,7 +145,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     setTranscriptError(null);
     fetchTranscript(meetingId, controller.signal)
       .then((response) => {
-        setTranscript(response.segments);
+        setTranscript((current) =>
+          shouldStreamTranscript
+            ? mergeTranscriptSegments(current, response.segments)
+            : response.segments,
+        );
         applyTranscriptStatus(response);
       })
       .catch(() => {
@@ -158,7 +162,12 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         }
       });
     return () => controller.abort();
-  }, [meetingId, transcriptRetryCount, applyTranscriptStatus]);
+  }, [
+    meetingId,
+    transcriptRetryCount,
+    shouldStreamTranscript,
+    applyTranscriptStatus,
+  ]);
 
   useEffect(() => {
     if (!meetingId || !shouldStreamTranscript) {

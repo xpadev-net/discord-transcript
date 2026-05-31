@@ -82,13 +82,13 @@ export function DashboardPage() {
     data && data.total > 0
       ? `${showingFrom}-${showingTo} / ${data.total}`
       : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
+  const hasLiveMeetings =
+    data?.meetings.some((meeting) =>
+      LIVE_MEETING_STATUSES.has(meeting.status),
+    ) ?? false;
 
   useEffect(() => {
-    if (
-      !data?.meetings.some((meeting) =>
-        LIVE_MEETING_STATUSES.has(meeting.status),
-      )
-    ) {
+    if (!hasLiveMeetings) {
       return;
     }
     const timer = window.setInterval(() => {
@@ -98,7 +98,7 @@ export function DashboardPage() {
       }));
     }, 15000);
     return () => window.clearInterval(timer);
-  }, [data?.meetings]);
+  }, [hasLiveMeetings]);
 
   return (
     <main className="dashboard-page">

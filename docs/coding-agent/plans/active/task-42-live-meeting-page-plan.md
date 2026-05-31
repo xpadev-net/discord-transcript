@@ -254,6 +254,11 @@
   - Validation evidence: `cargo fmt --all -- --check` pass; `cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `cargo test --workspace --all-targets --all-features` pass.
   - Notes: Hook rerun pending after validation, additive commit, and push.
 
+- 2026-05-31 Fourth gh-review-hook fix in progress: [Task_4]
+  - Summary: Harmonized live snapshot fetch with SSE merge semantics and changed Dashboard auto-refresh to depend on a stable `hasLiveMeetings` flag.
+  - Validation evidence: `pnpm run lint` pass; `pnpm exec tsc --noEmit` pass; `pnpm run build` pass.
+  - Notes: Hook rerun pending after additive commit and push.
+
 ## Decision Log (append-only; re-plans and major discoveries)
 
 - 2026-05-31 Decision:
