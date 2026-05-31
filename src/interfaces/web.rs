@@ -2059,6 +2059,7 @@ async fn api_transcript_events(
 
             match load_transcript_response(&state, &meeting_id, cursor.as_ref()).await {
                 Ok((response, next_cursor)) => {
+                    let is_final = response.is_final;
                     let event = match serde_json::to_string(&response) {
                         Ok(data) => Event::default().event("segments").data(data),
                         Err(err) => Event::default()
@@ -2073,7 +2074,7 @@ async fn api_transcript_events(
                             meeting_id,
                             next_cursor.or(cursor),
                             interval,
-                            false,
+                            is_final,
                         ),
                     ))
                 }

@@ -2,16 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchGuildMeetings } from "../lib/api";
 import { formatDate, formatDuration } from "../lib/formatters";
+import { LIVE_MEETING_STATUSES } from "../lib/meetingStatus";
 import type { MeetingListItem, MeetingListResponse } from "../lib/types";
 
 const PAGE_SIZE = 20;
-const LIVE_MEETING_STATUSES = new Set([
-  "recording",
-  "stopping",
-  "transcribing",
-  "summarizing",
-  "processing",
-]);
 
 const STATUS_LABELS: Record<string, string> = {
   scheduled: "\u4e88\u5b9a",

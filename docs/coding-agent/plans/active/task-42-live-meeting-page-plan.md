@@ -228,6 +228,11 @@
   - Validation evidence: `cargo fmt --all -- --check` pass; `cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `cargo test --workspace --all-targets --all-features` pass; `pnpm run lint` pass; `pnpm exec tsc --noEmit` pass; `pnpm run build` pass.
   - Notes: One chained command was rerun as separate `rtk` commands and is not counted as evidence.
 
+- 2026-05-31 gh-review-hook fixes in progress: [Task_4]
+  - Summary: `gh-review-hook 63` requested 404/not_found terminal handling, stable live-status effect dependencies, server-side stream termination on final status, and shared live status definitions.
+  - Validation evidence: `cargo fmt --all -- --check` pass; `pnpm run lint` pass; `pnpm exec tsc --noEmit` pass; `pnpm run build` pass.
+  - Notes: Full backend checks and hook rerun pending after amend/push.
+
 ## Decision Log (append-only; re-plans and major discoveries)
 
 - 2026-05-31 Decision:

@@ -5,6 +5,7 @@ import {
   fetchTranscript,
   getTranscriptEventsUrl,
 } from "../lib/api";
+import { isLiveMeetingStatus } from "../lib/meetingStatus";
 import type {
   MeetingResponse,
   SummaryResponse,
@@ -25,18 +26,6 @@ interface MeetingData {
   transcriptStreamError: string | null;
   retryTranscript: () => void;
   retrySummary: () => void;
-}
-
-const LIVE_MEETING_STATUSES = new Set([
-  "recording",
-  "stopping",
-  "transcribing",
-  "summarizing",
-  "processing",
-]);
-
-function isLiveMeetingStatus(status: string | undefined): boolean {
-  return status != null && LIVE_MEETING_STATUSES.has(status);
 }
 
 function transcriptSegmentKey(segment: TranscriptSegment): string {
@@ -90,6 +79,10 @@ function isForbiddenError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("403");
 }
 
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("404");
+}
+
 export function useMeetingData(meetingId: string | undefined): MeetingData {
   const [meeting, setMeeting] = useState<MeetingResponse | null>(null);
   const [transcript, setTranscript] = useState<TranscriptSegment[] | null>(
@@ -107,6 +100,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   >(null);
   const [transcriptRetryCount, setTranscriptRetryCount] = useState(0);
   const [summaryRetryCount, setSummaryRetryCount] = useState(0);
+  const shouldStreamTranscript = isLiveMeetingStatus(meeting?.status);
 
   const applyTranscriptStatus = useCallback((response: TranscriptResponse) => {
     if (response.status === "unknown") {
@@ -180,7 +174,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   }, [meetingId, transcriptRetryCount, applyTranscriptStatus]);
 
   useEffect(() => {
-    if (!meetingId || !isLiveMeetingStatus(meeting?.status)) {
+    if (!meetingId || !shouldStreamTranscript) {
       setTranscriptStreamState("idle");
       setTranscriptStreamError(null);
       return;
@@ -246,6 +240,14 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
             );
             return;
           }
+          if (isNotFoundError(err)) {
+            closeStream();
+            setTranscriptStreamState("error");
+            setTranscriptStreamError(
+              "\u4f1a\u8b70\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093",
+            );
+            return;
+          }
           scheduleReconnect();
         });
     };
@@ -305,11 +307,18 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
           // Keep the generic error code.
         }
         if (code === "forbidden") {
-          closed = true;
-          source?.close();
+          closeStream();
           setTranscriptStreamState("forbidden");
           setTranscriptStreamError(
             "\u3053\u306e\u4f1a\u8b70\u306e\u6587\u5b57\u8d77\u3053\u3057\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093",
+          );
+          return;
+        }
+        if (code === "not_found") {
+          closeStream();
+          setTranscriptStreamState("error");
+          setTranscriptStreamError(
+            "\u4f1a\u8b70\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093",
           );
           return;
         }
@@ -334,7 +343,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       closeStream();
       setTranscriptStreamState("closed");
     };
-  }, [meetingId, meeting?.status, applyTranscriptStatus]);
+  }, [meetingId, shouldStreamTranscript, applyTranscriptStatus]);
 
   useEffect(() => {
     const retryAttempt = summaryRetryCount;
@@ -343,7 +352,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       setSummaryError(null);
       return;
     }
-    if (isLiveMeetingStatus(meeting?.status)) {
+    if (shouldStreamTranscript) {
       setSummary(null);
       setSummaryError(null);
       return;
@@ -364,7 +373,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         }
       });
     return () => controller.abort();
-  }, [meetingId, meeting?.status, summaryRetryCount]);
+  }, [meetingId, shouldStreamTranscript, summaryRetryCount]);
 
   return {
     meeting,

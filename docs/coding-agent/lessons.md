@@ -21,6 +21,64 @@ Purpose:
 
 ## Entries
 
+## 2026-05-31 - Never Amend Open PR Branches  [tags: tooling, ci]
+
+Context:
+- Plan: docs/coding-agent/plans/active/task-42-live-meeting-page-plan.md
+- Task/Wave: gh-review-hook fix commit
+- Roles involved: Orchestrator
+
+Symptom:
+- After PR creation, the Orchestrator used `git commit --amend` on the PR branch.
+
+Root cause:
+- The Orchestrator treated review-hook fixes like pre-PR cleanup and failed to re-check the open-PR no-history-rewrite rule before amending.
+
+Fix applied:
+- No force push was performed. The amended state was saved to a backup branch, the PR branch was restored to `origin/codex/task-42-live-meeting-page`, and the hook fixes were reapplied as a normal follow-up commit.
+
+Prevention:
+- Dispatch/plan guardrail:
+  - After PR creation, every fix must be a new normal commit; do not use amend/rebase/squash on the PR branch.
+- Repo rule candidate:
+  - audience: common
+  - proposed rule: Once a branch has an open PR, all review fixes must be additive commits unless the user explicitly authorizes history rewriting.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- Backup branch `codex/task-42-live-meeting-page-amend-backup` was created before restoring the PR branch and applying the hook-fix patch as an additive commit.
+
+## 2026-05-31 - Treat 404 As Terminal In Live Streams  [tags: review, validation]
+
+Context:
+- Plan: docs/coding-agent/plans/active/task-42-live-meeting-page-plan.md
+- Task/Wave: gh-review-hook
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+- `gh-review-hook` found that a deleted meeting could leave the live transcript UI retrying forever because 404/not_found was not terminal.
+- It also found stream restarts on every live-to-live status change and server-side SSE polling after final status.
+
+Root cause:
+- The reconnect design classified only 403 as terminal and used the raw status value as an effect dependency instead of the live/non-live category.
+
+Fix applied:
+- The frontend now treats 404/not_found as terminal, keys the SSE effect on the live/non-live boolean, and shares live status definitions from `web/src/lib/meetingStatus.ts`.
+- The backend now ends the SSE stream after emitting a final transcript envelope.
+
+Prevention:
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: Live-stream retry review must classify terminal resource states such as 403 and 404, not only transient network failures.
+- Dispatch/plan guardrail:
+  - For React stream effects, depend on stable lifecycle categories when live-to-live transitions should not restart the transport.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- `gh-review-hook 63` exited 2 with the findings; fixes were applied and frontend lint/typecheck/build plus Rust format passed before rerunning wider checks.
+
 ## 2026-05-31 - Do Not Chain Validation Commands Under RTK Rule  [tags: tooling, validation]
 
 Context:

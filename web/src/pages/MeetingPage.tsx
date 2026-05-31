@@ -9,19 +9,8 @@ import { TranscriptPanel } from "../components/TranscriptPanel";
 import { useAudioSync } from "../hooks/useAudioSync";
 import { useMeetingData } from "../hooks/useMeetingData";
 import { fetchDebugManifest, getAudioUrl } from "../lib/api";
+import { isLiveMeetingStatus } from "../lib/meetingStatus";
 import type { DebugArtifact } from "../lib/types";
-
-const LIVE_MEETING_STATUSES = new Set([
-  "recording",
-  "stopping",
-  "transcribing",
-  "summarizing",
-  "processing",
-]);
-
-function isLiveMeetingStatus(status: string | undefined): boolean {
-  return status != null && LIVE_MEETING_STATUSES.has(status);
-}
 
 function inProgressMessage(status: string | undefined): string | null {
   if (status === "recording") {
