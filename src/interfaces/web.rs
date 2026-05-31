@@ -602,32 +602,51 @@ async fn verify_current_guild_member(
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
-    if let Some(membership) = cached_guild_membership(&state.membership_cache, user_id).await {
+    verify_guild_membership_reverify_with(
+        &state.membership_cache,
+        &state.membership_reverify_inflight,
+        user_id,
+        true,
+        || is_guild_member(state, auth, user_id),
+    )
+    .await
+}
+
+async fn verify_guild_membership_reverify_with<F, Fut>(
+    cache: &MembershipCache,
+    inflight: &MembershipReverifyInflight,
+    user_id: &str,
+    use_cached_result: bool,
+    verify: F,
+) -> Result<bool, StatusCode>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<bool, StatusCode>>,
+{
+    if use_cached_result && let Some(membership) = cached_guild_membership(cache, user_id).await {
         return membership;
     }
-
     loop {
-        if let Some(membership) = cached_guild_membership(&state.membership_cache, user_id).await {
+        if use_cached_result && let Some(membership) = cached_guild_membership(cache, user_id).await
+        {
             return membership;
         }
-        match begin_membership_reverify(&state.membership_reverify_inflight, user_id).await {
+        match begin_membership_reverify(inflight, user_id).await {
             MembershipReverifyStart::Follower(notify) => {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(MEMBERSHIP_REVERIFY_INFLIGHT_SECS),
                     notify.notified(),
                 )
                 .await;
-                if let Some(membership) =
-                    cached_guild_membership(&state.membership_cache, user_id).await
-                {
+                if let Some(membership) = cached_guild_membership(cache, user_id).await {
                     return membership;
                 }
             }
             MembershipReverifyStart::Leader(leader_notify) => {
-                let membership = is_guild_member(state, auth, user_id).await;
+                let membership = verify().await;
                 if publish_membership_reverify_result(
-                    &state.membership_reverify_inflight,
-                    &state.membership_cache,
+                    inflight,
+                    cache,
                     user_id,
                     &leader_notify,
                     membership,
@@ -718,7 +737,14 @@ async fn verify_current_guild_member_for_settings_recovery(
         "guild-scoped bot token membership verification failed; trying global token for settings recovery"
     );
     let global_bot_auth = format!("Bot {}", auth.bot_token);
-    is_guild_member_with_bot_auth(state, auth, user_id, &global_bot_auth).await
+    verify_guild_membership_reverify_with(
+        &state.membership_cache,
+        &state.membership_reverify_inflight,
+        user_id,
+        false,
+        || is_guild_member_with_bot_auth(state, auth, user_id, &global_bot_auth),
+    )
+    .await
 }
 
 fn should_retry_settings_membership_check_with_global(result: &Result<bool, StatusCode>) -> bool {
@@ -4853,12 +4879,14 @@ mod session_reverify_tests {
         cached_guild_membership, guild_member_status_indicates_membership,
         guild_membership_forbidden_response, publish_membership_reverify_result,
         session_matches_guild, session_needs_cookie_refresh,
-        should_retry_settings_membership_check_with_global, sign_session, verify_session,
+        should_retry_settings_membership_check_with_global, sign_session,
+        verify_guild_membership_reverify_with, verify_session,
     };
     use axum::http::StatusCode as AxumStatusCode;
     use reqwest::StatusCode as HttpStatus;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -4903,6 +4931,31 @@ mod session_reverify_tests {
         assert!(!should_retry_settings_membership_check_with_global(&Ok(
             true
         )));
+    }
+
+    #[tokio::test]
+    async fn forced_membership_reverify_replaces_cached_retriable_error() {
+        let cache = membership_cache();
+        let inflight = membership_inflight();
+        let calls = Arc::new(AtomicUsize::new(0));
+        cache_guild_membership(&cache, "user-1", Err(AxumStatusCode::BAD_GATEWAY)).await;
+
+        let result =
+            verify_guild_membership_reverify_with(&cache, &inflight, "user-1", false, || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            })
+            .await;
+
+        assert_eq!(result, Ok(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cached_guild_membership(&cache, "user-1").await,
+            Some(Ok(true))
+        );
     }
 
     #[test]
