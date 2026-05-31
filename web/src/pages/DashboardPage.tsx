@@ -83,12 +83,12 @@ export function DashboardPage() {
     if (!data) {
       return 1;
     }
-    return Math.max(1, Math.ceil(data.total / data.limit));
+    return Math.max(1, Math.ceil(data.total / PAGE_SIZE));
   }, [data]);
 
   const showingFrom =
-    data && data.total > 0 ? (data.page - 1) * data.limit + 1 : 0;
-  const showingTo = data ? Math.min(data.page * data.limit, data.total) : 0;
+    data && data.total > 0 ? (request.page - 1) * PAGE_SIZE + 1 : 0;
+  const showingTo = data ? Math.min(request.page * PAGE_SIZE, data.total) : 0;
 
   return (
     <main className="dashboard-page">

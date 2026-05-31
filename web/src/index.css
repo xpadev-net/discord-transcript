@@ -89,16 +89,22 @@ button {
     color 0.15s ease;
 }
 
-.app-nav-link:hover,
-.app-nav-link:focus-visible,
+.app-nav-link:not(.disabled):hover,
+.app-nav-link:not(.disabled):focus-visible,
 .app-nav-link.active {
   background: var(--bg-panel);
   color: var(--text-primary);
 }
 
-.app-nav-link:focus-visible {
+.app-nav-link:not(.disabled):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+.app-nav-link.disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 /* Scrollbar */
