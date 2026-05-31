@@ -1185,6 +1185,112 @@ async fn resolve_channel_permission_flags(
     })
 }
 
+async fn check_guild_admin_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let cache_key = (user_id.to_owned(), "__guild__".to_owned());
+
+    // Check cache first
+    {
+        let cache = state.permission_cache.read().await;
+        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
+            && Instant::now() < expires_at
+        {
+            return Ok(permission.is_admin);
+        }
+    }
+
+    // Fast path: check if user is guild owner
+    let guild = get_guild_info(state, auth).await?;
+    if user_id == guild.owner_id {
+        cache_guild_admin_permission(state, user_id, true).await;
+        return Ok(true);
+    }
+
+    // Slow path: fetch member roles and check ADMINISTRATOR bit
+    let bot_auth = format!("Bot {}", auth.bot_token);
+    let member_resp = state
+        .http_client
+        .get(format!(
+            "https://discord.com/api/guilds/{}/members/{user_id}",
+            auth.guild_id
+        ))
+        .header("Authorization", &bot_auth)
+        .send()
+        .await;
+
+    // Handle request errors as retryable upstream failures.
+    if let Err(err) = member_resp {
+        warn!(error = %err, "discord member API request failed");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let resp_status = member_resp.as_ref().unwrap().status();
+
+    // Handle rate limiting as error (don't cache), treat 404/403 as not admin
+    if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!(status = %resp_status, "discord member API rate limited");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    if resp_status == reqwest::StatusCode::NOT_FOUND
+        || resp_status == reqwest::StatusCode::FORBIDDEN
+        || resp_status == reqwest::StatusCode::UNAUTHORIZED
+    {
+        cache_guild_admin_permission(state, user_id, false).await;
+        return Ok(false);
+    }
+
+    if !resp_status.is_success() {
+        warn!(status = %resp_status, "discord member API non-success");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let member: DiscordMemberFull = match member_resp.unwrap().json().await {
+        Ok(m) => m,
+        Err(err) => {
+            warn!(error = %err, "discord member API response parse failed");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    let permissions = compute_channel_permissions(
+        user_id,
+        &guild.owner_id,
+        &auth.guild_id,
+        &member.roles,
+        &guild.roles,
+        &[],
+    );
+    let is_admin = permissions & ADMINISTRATOR != 0;
+
+    cache_guild_admin_permission(state, user_id, is_admin).await;
+    Ok(is_admin)
+}
+
+async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
+    let mut cache = state.permission_cache.write().await;
+    let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+    cache.insert(
+        (user_id.to_owned(), "__guild__".to_owned()),
+        (
+            CachedChannelPermission {
+                can_view: is_admin,
+                is_admin,
+            },
+            expires_at,
+        ),
+    );
+
+    // Evict old entries if cache is too large (same pattern as check_channel_admin_permission)
+    if cache.len() > 5000 {
+        let now = Instant::now();
+        cache.retain(|_, (_, exp)| *exp > now);
+    }
+}
+
 async fn check_channel_admin_permission(
     state: &WebState,
     auth: &AuthConfig,
@@ -2310,6 +2416,9 @@ async fn verify_raw_debug_artifact_access(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if check_guild_admin_permission(state, auth, user_id).await? {
+        return Ok(true);
+    }
     check_channel_admin_permission(state, auth, &access.voice_channel_id, user_id).await
 }
 
