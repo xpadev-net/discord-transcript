@@ -107,6 +107,34 @@ button {
   opacity: 0.65;
 }
 
+.primary-button {
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-weight: 700;
+  transition:
+    background 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.primary-button:hover:not(:disabled),
+.primary-button:focus-visible {
+  background: color-mix(in srgb, var(--accent) 80%, #000 20%);
+}
+
+.primary-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
@@ -192,6 +220,116 @@ button {
 .dashboard-header p {
   color: var(--text-secondary);
   font-size: 0.9rem;
+}
+
+/* Settings */
+.settings-page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 28px 24px 40px;
+}
+
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.settings-header h1 {
+  font-size: 1.35rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.settings-header p {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.settings-panel-message,
+.settings-notice,
+.settings-success {
+  margin-bottom: 14px;
+}
+
+.settings-notice,
+.settings-success {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  padding: 12px 14px;
+}
+
+.settings-success {
+  border-color: rgba(152, 195, 121, 0.45);
+  color: #b7d99a;
+}
+
+.settings-form {
+  display: grid;
+  gap: 16px;
+}
+
+.settings-section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  padding: 18px;
+}
+
+.settings-section h2 {
+  color: var(--text-primary);
+  font-size: 1rem;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+.settings-field,
+.settings-checkbox {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.settings-field {
+  flex-direction: column;
+}
+
+.settings-checkbox {
+  align-items: center;
+}
+
+.settings-field input[type="text"],
+.settings-field input[type="number"] {
+  width: min(100%, 320px);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  padding: 8px 10px;
+}
+
+.settings-field input:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-field input:disabled,
+.settings-checkbox input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .secondary-button {

@@ -2,6 +2,7 @@ import { Route, Routes } from "react-router-dom";
 import { Nav } from "./components/Nav";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
+import { SettingsPage } from "./pages/SettingsPage";
 
 export function App() {
   return (
@@ -9,6 +10,7 @@ export function App() {
       <Nav />
       <Routes>
         <Route path="/" element={<DashboardPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
         <Route
           path="*"
