@@ -16,9 +16,15 @@ function basePath(meetingId: string): string {
   return `/api/meetings/${encodeURIComponent(meetingId)}`;
 }
 
+export function buildLoginRedirectUrl(path: string): string {
+  return `/auth/login?redirect=${encodeURIComponent(path)}`;
+}
+
 function handleResponse<T>(response: Response): Promise<T> {
   if (response.status === 401) {
-    window.location.href = `/auth/login?redirect=${encodeURIComponent(window.location.pathname + window.location.search + window.location.hash)}`;
+    window.location.href = buildLoginRedirectUrl(
+      window.location.pathname + window.location.search + window.location.hash,
+    );
     return new Promise(() => {});
   }
   if (!response.ok) {

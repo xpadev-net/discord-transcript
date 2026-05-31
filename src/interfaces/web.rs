@@ -33,7 +33,6 @@ type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 const SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
-const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 30;
 const OAUTH_NONCE_COOKIE_NAME: &str = "dt_oauth_nonce";
 const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
 const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
@@ -51,7 +50,6 @@ const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
-type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
 
 #[derive(Debug, Default)]
 struct AudioRangeRateLimiter {
@@ -116,8 +114,6 @@ pub struct WebState {
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
-    /// In-flight guild membership re-verification per user id
-    membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
@@ -140,7 +136,6 @@ impl WebState {
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
-            membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
@@ -255,7 +250,7 @@ async fn require_auth(
     let Some(session) = verify_session(&cookie_val, &auth.session_secret) else {
         return auth_required_redirect_or_unauthorized(&request);
     };
-    if session.gid != auth.guild_id {
+    if !session_matches_guild(&session, &auth.guild_id) {
         return auth_required_redirect_or_unauthorized(&request);
     }
     match session_is_revoked(&state.db, &session.uid, session.issued_at).await {
@@ -274,15 +269,11 @@ async fn require_auth(
         }
     }
 
-    let mut refreshed_session_cookie = None;
-    if session_needs_membership_reverify(&session)
-        && begin_membership_reverify(&state.membership_reverify_inflight, &session.uid).await
-    {
-        let membership = is_guild_member(&state, auth, &session.uid).await;
-        end_membership_reverify(&state.membership_reverify_inflight, &session.uid).await;
-        match membership {
-            Ok(true) => {
-                refreshed_session_cookie = Some(session_cookie_with_membership(
+    let membership = is_guild_member(&state, auth, &session.uid).await;
+    let refreshed_session_cookie = match membership {
+        Ok(true) => {
+            if session_needs_membership_reverify(&session) {
+                Some(session_cookie_with_membership(
                     &session.uid,
                     &auth.guild_id,
                     auth,
@@ -290,36 +281,30 @@ async fn require_auth(
                     session.issued_at,
                     unix_now_secs(),
                     0,
-                ));
-            }
-            Ok(false) => {
-                invalidate_permission_cache_for_user(&state.permission_cache, &session.uid).await;
-                warn!(
-                    user_id = %session.uid,
-                    guild_id = %auth.guild_id,
-                    "denying session after failed guild membership re-verification"
-                );
-                return auth_required_redirect_or_unauthorized(&request)
-                    .with_cleared_session_cookie(auth.secure_cookie);
-            }
-            Err(status) => {
-                warn!(
-                    status = %status,
-                    user_id = %session.uid,
-                    "guild membership re-verify unavailable; allowing stale session"
-                );
-                refreshed_session_cookie = Some(session_cookie_with_membership(
-                    &session.uid,
-                    &auth.guild_id,
-                    auth,
-                    session.exp,
-                    session.issued_at,
-                    session.verified_at,
-                    unix_now_secs(),
-                ));
+                ))
+            } else {
+                None
             }
         }
-    }
+        Ok(false) => {
+            invalidate_permission_cache_for_user(&state.permission_cache, &session.uid).await;
+            warn!(
+                user_id = %session.uid,
+                guild_id = %auth.guild_id,
+                "denying session after failed guild membership verification"
+            );
+            return guild_membership_forbidden_response()
+                .with_cleared_session_cookie(auth.secure_cookie);
+        }
+        Err(status) => {
+            warn!(
+                status = %status,
+                user_id = %session.uid,
+                "guild membership verification unavailable; denying protected request"
+            );
+            return status.into_response();
+        }
+    };
 
     request
         .extensions_mut()
@@ -365,32 +350,19 @@ fn auth_required_redirect_or_unauthorized(request: &axum::extract::Request) -> R
     Redirect::temporary(&login_url).into_response()
 }
 
+fn guild_membership_forbidden_response() -> Response {
+    StatusCode::FORBIDDEN.into_response()
+}
+
+fn session_matches_guild(session: &SessionPayload, guild_id: &str) -> bool {
+    session.gid == guild_id
+}
+
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-async fn begin_membership_reverify(inflight: &MembershipReverifyInflight, user_id: &str) -> bool {
-    let mut map = inflight.lock().await;
-    let now = Instant::now();
-    if let Some(started) = map.get(user_id)
-        && now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
-    {
-        return false;
-    }
-    map.insert(user_id.to_owned(), now);
-    if map.len() >= 5000 {
-        map.retain(|_, started| {
-            now.duration_since(*started).as_secs() < MEMBERSHIP_REVERIFY_INFLIGHT_SECS
-        });
-    }
-    true
-}
-
-async fn end_membership_reverify(inflight: &MembershipReverifyInflight, user_id: &str) {
-    inflight.lock().await.remove(user_id);
 }
 
 fn session_needs_membership_reverify(session: &SessionPayload) -> bool {
@@ -1836,6 +1808,29 @@ async fn current_user_is_guild_admin(state: &WebState, user_id: &str) -> Result<
     check_guild_admin_permission(state, auth, user_id).await
 }
 
+fn guild_admin_required_result(is_admin: bool) -> Result<(), StatusCode> {
+    if is_admin {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+async fn require_current_user_is_guild_admin(
+    state: &WebState,
+    user_id: &str,
+) -> Result<(), StatusCode> {
+    guild_admin_required_result(current_user_is_guild_admin(state, user_id).await?)
+}
+
+fn validate_authorized_guild_settings_update(
+    is_admin: bool,
+    request: &GuildSettingsUpdateRequest,
+) -> Result<(), StatusCode> {
+    guild_admin_required_result(is_admin)?;
+    validate_guild_settings_update(request)
+}
+
 async fn api_me(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -1920,13 +1915,13 @@ async fn api_guild_settings(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     let stored = load_guild_settings(&state, &auth.guild_id).await?;
 
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        is_admin,
+        true,
     )))
 }
 
@@ -1935,11 +1930,9 @@ async fn api_update_guild_settings(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Json(request): Json<GuildSettingsUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
-    validate_guild_settings_update(&request)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    if !check_guild_admin_permission(&state, auth, &user_id).await? {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
+    validate_authorized_guild_settings_update(is_admin, &request)?;
 
     let whisper_language_explicit = request.whisper_language.is_some();
     state
@@ -3332,8 +3325,8 @@ async fn stream_file_range(
 mod guild_api_tests {
     use super::{
         GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
-        guild_settings_response, normalize_guild_meetings_pagination,
-        validate_guild_settings_update,
+        guild_admin_required_result, guild_settings_response, normalize_guild_meetings_pagination,
+        validate_authorized_guild_settings_update, validate_guild_settings_update,
     };
     use axum::http::StatusCode;
 
@@ -3457,6 +3450,30 @@ mod guild_api_tests {
         assert_eq!(response.retention_transcript_ttl_days, 90);
         assert!(!response.summary_enabled);
         assert!(response.is_admin);
+    }
+
+    #[test]
+    fn guild_settings_access_requires_admin() {
+        assert_eq!(guild_admin_required_result(true), Ok(()));
+        assert_eq!(
+            guild_admin_required_result(false),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn guild_settings_update_checks_admin_before_domain_validation() {
+        let mut request = valid_settings_request();
+        request.auto_stop_grace_seconds = 0;
+
+        assert_eq!(
+            validate_authorized_guild_settings_update(false, &request),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_authorized_guild_settings_update(true, &request),
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[test]
@@ -3938,8 +3955,8 @@ mod oauth_state_tests {
 mod session_reverify_tests {
     use super::{
         SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS, SESSION_TTL_SECS, SessionPayload,
-        guild_member_status_indicates_membership, session_needs_membership_reverify, sign_session,
-        verify_session,
+        guild_member_status_indicates_membership, guild_membership_forbidden_response,
+        session_matches_guild, session_needs_membership_reverify, sign_session, verify_session,
     };
     use reqwest::StatusCode as HttpStatus;
 
@@ -4015,6 +4032,14 @@ mod session_reverify_tests {
     }
 
     #[test]
+    fn api_membership_denial_uses_forbidden_status() {
+        assert_eq!(
+            guild_membership_forbidden_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
     fn refreshed_session_carries_new_verified_at() {
         let now = super::unix_now_secs();
         let cookie = sign_session("user-1", "guild-1", SECRET, now, now);
@@ -4040,6 +4065,32 @@ mod session_reverify_tests {
             session.issued_at,
             session.exp.saturating_sub(SESSION_TTL_SECS)
         );
+    }
+
+    #[test]
+    fn expired_session_cookie_is_rejected() {
+        let now = super::unix_now_secs();
+        let cookie = super::sign_session_with_exp(
+            "user-1",
+            "guild-1",
+            SECRET,
+            now.saturating_sub(1),
+            now.saturating_sub(SESSION_TTL_SECS),
+            now.saturating_sub(SESSION_TTL_SECS),
+            0,
+        );
+
+        assert!(verify_session(&cookie, SECRET).is_none());
+    }
+
+    #[test]
+    fn signed_session_must_match_configured_guild() {
+        let now = super::unix_now_secs();
+        let cookie = sign_session("user-1", "guild-1", SECRET, now, now);
+        let session = verify_session(&cookie, SECRET).expect("session should verify");
+
+        assert!(session_matches_guild(&session, "guild-1"));
+        assert!(!session_matches_guild(&session, "guild-2"));
     }
 
     #[test]
