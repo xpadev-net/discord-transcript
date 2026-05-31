@@ -2062,9 +2062,13 @@ async fn api_transcript_events(
                     let is_final = response.is_final;
                     let event = match serde_json::to_string(&response) {
                         Ok(data) => Event::default().event("segments").data(data),
-                        Err(err) => Event::default()
-                            .event("stream-error")
-                            .data(format!(r#"{{"code":"encode","message":"{err}"}}"#)),
+                        Err(err) => Event::default().event("stream-error").data(
+                            serde_json::json!({
+                                "code": "encode",
+                                "message": err.to_string(),
+                            })
+                            .to_string(),
+                        ),
                     };
                     Some((
                         Ok(event),

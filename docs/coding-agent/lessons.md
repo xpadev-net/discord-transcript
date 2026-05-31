@@ -5,11 +5,13 @@ Purpose:
 - enable "read once, don't repeat" improvements
 
 ## How to use
+
 - Append a new entry after any user correction or significant miss.
 - Keep entries short and actionable.
 - Promote repeated/high-severity lessons into repo rules, harness migration candidates, troubleshooting notes, or accepted residual-risk records.
 
 ## Tags (recommended)
+
 - planning
 - validation
 - delegation
@@ -20,6 +22,38 @@ Purpose:
 - scope-owns
 
 ## Entries
+
+## 2026-05-31 - Keep Hook Fixes Minimal But Complete  [tags: review, validation]
+
+Context:
+
+- Plan: docs/coding-agent/plans/active/task-42-live-meeting-page-plan.md
+- Task/Wave: gh-review-hook rerun
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+
+- A second `gh-review-hook` pass found smaller consistency issues: unsafe JSON diagnostic formatting, audio rendering before availability, duplicate status helpers, duplicate transcript response normalization, and Markdown heading spacing.
+
+Root cause:
+
+- Earlier fixes addressed the major reconnect loop but left adjacent consistency and documentation-lint details for the hook to catch.
+
+Fix applied:
+
+- Shared status helpers and transcript response normalization were centralized, audio/debug rendering was limited to `posted`, SSE encode errors now use `serde_json`, SummaryCompleted link text now says "詳細ページ", and Markdown headings were normalized.
+
+Prevention:
+
+- Repo rule candidate:
+  - audience: common
+  - proposed rule: When review fixes introduce a shared concept, scan for existing duplicate helpers in adjacent files before rerunning external review.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+
+- After fixes, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-targets --all-features`, `pnpm run lint`, `pnpm exec tsc --noEmit`, and `pnpm run build` passed.
 
 ## 2026-05-31 - Never Amend Open PR Branches  [tags: tooling, ci]
 

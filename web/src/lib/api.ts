@@ -99,7 +99,7 @@ export function fetchTranscript(
   );
 }
 
-function normalizeTranscriptResponse(
+export function normalizeTranscriptResponse(
   response: TranscriptSegment[] | TranscriptResponse,
 ): TranscriptResponse {
   if (Array.isArray(response)) {

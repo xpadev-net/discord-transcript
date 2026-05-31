@@ -4,6 +4,7 @@ import {
   fetchSummary,
   fetchTranscript,
   getTranscriptEventsUrl,
+  normalizeTranscriptResponse,
 } from "../lib/api";
 import { isLiveMeetingStatus } from "../lib/meetingStatus";
 import type {
@@ -59,20 +60,6 @@ function mergeTranscriptSegments(
       a.speaker_id.localeCompare(b.speaker_id) ||
       transcriptSegmentKey(a).localeCompare(transcriptSegmentKey(b)),
   );
-}
-
-function normalizeTranscriptStreamPayload(
-  payload: TranscriptSegment[] | TranscriptResponse,
-): TranscriptResponse {
-  if (Array.isArray(payload)) {
-    return {
-      segments: payload,
-      status: "unknown",
-      is_final: false,
-      updated_at: null,
-    };
-  }
-  return payload;
 }
 
 function isForbiddenError(error: unknown): boolean {
@@ -271,7 +258,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       source.addEventListener("segments", (event) => {
         const message = event as MessageEvent<string>;
         try {
-          const response = normalizeTranscriptStreamPayload(
+          const response = normalizeTranscriptResponse(
             JSON.parse(message.data) as
               | TranscriptSegment[]
               | TranscriptResponse,

@@ -58,7 +58,7 @@ export function MeetingPage() {
   const [debugError, setDebugError] = useState(false);
   const isLive = isLiveMeetingStatus(meeting?.status);
   const progressMessage = inProgressMessage(meeting?.status);
-  const showAudioAndDebug = meeting?.status !== "recording";
+  const showAudioAndDebug = meeting?.status === "posted";
 
   useEffect(() => {
     if (meetingId) {

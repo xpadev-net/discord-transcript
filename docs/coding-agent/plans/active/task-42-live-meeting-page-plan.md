@@ -6,10 +6,12 @@
 - work_type: code
 
 ## Goal
+
 - Users can open a meeting page from the Discord status message and dashboard while a meeting is still recording or transcribing.
 - The meeting page displays in-progress status, live transcript updates via SSE, reconnection state, and permission/error states without assuming final audio/summary artifacts exist.
 
 ## Definition of Done
+
 - Discord status messages include a meeting URL when `PUBLIC_BASE_URL` is configured during recording/transcribing/completion.
 - `/meetings/:id` renders useful in-progress UI for `recording`, `stopping`, `transcribing`, and `summarizing`.
 - A protected SSE transcript endpoint streams existing and newly persisted transcript rows from the current `transcripts` table without depending on Task 41-only schema.
@@ -17,6 +19,7 @@
 - Required checks pass, independent Reviewer reports no blocking findings, PR is created, `gh-review-hook` exits 0, and the PR is merged.
 
 ## Scope / Non-goals
+
 - Scope:
   - `src/interfaces/web.rs`
   - `src/application/runtime.rs`
@@ -34,6 +37,7 @@
   - Avoid broad changes in `src/application/worker.rs`, `src/infrastructure/asr.rs`, and `src/infrastructure/sql.rs`.
 
 ## Context (workspace)
+
 - Related files/areas:
   - `src/application/runtime.rs` status message updates and `PUBLIC_BASE_URL` support.
   - `src/interfaces/web.rs` authenticated meeting/transcript APIs and channel permission checks.
@@ -54,9 +58,11 @@
   - `.github/workflows/ci.yml`
 
 ## Open Questions (max 3)
+
 - Q1: None blocking. Task 41 public API/DB shape is not yet available in this worktree.
 
 ## Assumptions
+
 - A1: Until Task 41 lands, live transcript segments are represented by rows in the existing `transcripts` table; frontend parsing remains compatible with both the old transcript array and Task 41's planned `{ segments, status, is_final, updated_at }` response.
 - A2: SSE can poll the current DB at a modest interval and emit only rows beyond the last emitted tuple.
 - A3: User approval for this plan is covered by the delegated task request to proceed through merge.
@@ -64,6 +70,7 @@
 ## Tasks
 
 ### Task_1: Research and Design Boundary
+
 - type: research
 - owns:
   - docs/coding-agent/plans/active/task-42-live-meeting-page-plan.md
@@ -82,6 +89,7 @@
     detail: "Plan documents Task 41 dependency boundary and validation commands."
 
 ### Task_2: Backend Live Transcript and Status Message URL
+
 - type: impl
 - owns:
   - src/interfaces/web.rs
@@ -110,6 +118,7 @@
     detail: "cargo test transcript"
 
 ### Task_3: Frontend Live Meeting UX
+
 - type: impl
 - owns:
   - web/src/lib/api.ts
@@ -146,6 +155,7 @@
     detail: "Review affected UI behavior and, where runnable, capture browser evidence for in-progress status, loading, errors, and reconnection state."
 
 ### Task_4: Review, PR, Hook, Merge
+
 - type: review
 - owns:
   - none
@@ -198,6 +208,7 @@
   - No seeded backend fixture exists yet; browser evidence may require mocked/static review if DB/auth setup is unavailable.
 
 ## Rollback / Safety
+
 - Revert the Task 42 commit(s) to remove the SSE route and frontend live-stream connection.
 - The backend route is additive and does not alter DB schema or existing transcript REST behavior.
 
@@ -233,6 +244,11 @@
   - Validation evidence: `cargo fmt --all -- --check` pass; `pnpm run lint` pass; `pnpm exec tsc --noEmit` pass; `pnpm run build` pass.
   - Notes: Full backend checks and hook rerun pending after amend/push.
 
+- 2026-05-31 Second gh-review-hook fixes in progress: [Task_4]
+  - Summary: Fixed unsafe JSON diagnostic formatting, audio/debug availability gating, duplicated status/normalization helpers, SummaryCompleted link label, and Markdown heading spacing.
+  - Validation evidence: `cargo fmt --all -- --check` pass; `cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `cargo test --workspace --all-targets --all-features` pass; `pnpm run lint` pass; `pnpm exec tsc --noEmit` pass; `pnpm run build` pass.
+  - Notes: Hook rerun pending after additive commit and push.
+
 ## Decision Log (append-only; re-plans and major discoveries)
 
 - 2026-05-31 Decision:
@@ -254,6 +270,7 @@
   - User approval: yes, via delegated integration-risk update.
 
 ## Notes
+
 - Risks:
   - SSE polling must be bounded and must not bypass meeting permissions.
   - Frontend cannot use native `EventSource` with custom abort signals; cleanup must close the connection.

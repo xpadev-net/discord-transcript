@@ -944,7 +944,7 @@ fn format_status_message_content(
             with_meeting_url(
                 summary_url
                     .as_deref()
-                    .map_or(base.clone(), |url| format!("{base}\n要約ページ: {url}")),
+                    .map_or(base.clone(), |url| format!("{base}\n詳細ページ: {url}")),
             )
         }
         StatusMessageUpdate::Failed { phase, error } => {
