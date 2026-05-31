@@ -120,6 +120,8 @@ export function SettingsPage() {
   const [activeOperation, setActiveOperation] = useState<
     "settings" | "token-save" | "token-delete" | null
   >(null);
+  const [tokenDeleteConfirmPending, setTokenDeleteConfirmPending] =
+    useState(false);
   const [error, setError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -173,12 +175,14 @@ export function SettingsPage() {
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
+    setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
   }
 
   function updateBotTokenValue(value: string) {
     setBotTokenValue(value);
+    setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
   }
@@ -189,6 +193,7 @@ export function SettingsPage() {
       return;
     }
 
+    setTokenDeleteConfirmPending(false);
     const validationError = validateForm(form);
     if (validationError) {
       setError(validationError);
@@ -231,6 +236,7 @@ export function SettingsPage() {
     }
 
     setActiveOperation("token-save");
+    setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
 
@@ -257,15 +263,17 @@ export function SettingsPage() {
     if (!canEdit || !settings?.discord_bot_token_registered || isSavingAny) {
       return;
     }
-    if (
-      !window.confirm(
-        "Discord Bot token \u306e\u30ae\u30eb\u30c9\u500b\u5225\u8a2d\u5b9a\u3092\u524a\u9664\u3057\u307e\u3059\u304b",
-      )
-    ) {
+    if (!tokenDeleteConfirmPending) {
+      setTokenDeleteConfirmPending(true);
+      setError(null);
+      setMessage(
+        "Discord Bot token \u306e\u524a\u9664\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044",
+      );
       return;
     }
 
     setActiveOperation("token-delete");
+    setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
 
@@ -284,6 +292,7 @@ export function SettingsPage() {
         ),
       );
     } finally {
+      setTokenDeleteConfirmPending(false);
       setActiveOperation(null);
     }
   }
@@ -535,7 +544,9 @@ export function SettingsPage() {
               >
                 {activeOperation === "token-delete"
                   ? "\u524a\u9664\u4e2d"
-                  : "\u524a\u9664"}
+                  : tokenDeleteConfirmPending
+                    ? "\u524a\u9664\u3092\u78ba\u5b9a"
+                    : "\u524a\u9664"}
               </button>
             </div>
           </form>
