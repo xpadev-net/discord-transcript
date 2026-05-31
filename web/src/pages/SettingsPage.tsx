@@ -106,13 +106,21 @@ export function SettingsPage() {
     setError(null);
     setMessage(null);
 
-    Promise.all([
-      fetchMe(controller.signal),
-      fetchGuildSettings(controller.signal),
-    ])
-      .then(([meResponse, settingsResponse]) => {
+    fetchMe(controller.signal)
+      .then((meResponse) => {
         if (!controller.signal.aborted) {
           setMe(meResponse);
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setMe(null);
+        }
+      });
+
+    fetchGuildSettings(controller.signal)
+      .then((settingsResponse) => {
+        if (!controller.signal.aborted) {
           setSettings(settingsResponse);
           setForm(formFromSettings(settingsResponse));
         }
