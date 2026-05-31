@@ -1,6 +1,6 @@
 # Plan: Task 43 Per-Guild Discord Bot Token
 
-- status: in_progress
+- status: done
 - generated: 2026-05-31
 - last_updated: 2026-05-31
 - work_type: mixed
@@ -220,6 +220,10 @@
   - Summary: Hook found `/api/me` did not use recovery-aware admin checks and the effective-token cache had no TTL.
   - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
   - Notes: `/api/me` now uses the same recovery-aware admin check and the token cache expires after 300 seconds.
+- 2026-05-31 gh-review-hook pass 4 completed: exit 0
+  - Summary: CI and AI review checks passed after the token cache TTL and `/api/me` recovery fixes.
+  - Validation evidence: `rtk gh-review-hook 65` exited 0.
+  - Notes: Ready to merge after plan lifecycle move.
 
 ## Decision Log
 - 2026-05-31 Decision:
