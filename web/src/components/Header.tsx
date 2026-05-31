@@ -1,11 +1,6 @@
 import { formatDate, formatDuration } from "../lib/formatters";
+import { statusClassName, statusLabel } from "../lib/meetingStatus";
 import type { MeetingResponse } from "../lib/types";
-
-const STATUS_LABELS: Record<string, string> = {
-  posted: "\u5b8c\u4e86",
-  recording: "\u9332\u97f3\u4e2d",
-  processing: "\u51e6\u7406\u4e2d",
-};
 
 export function Header({ meeting }: { meeting: MeetingResponse | null }) {
   const title = meeting?.title || "--";
@@ -15,7 +10,7 @@ export function Header({ meeting }: { meeting: MeetingResponse | null }) {
       ? formatDuration(meeting.duration_seconds)
       : "--";
   const statusText = meeting?.status || "unknown";
-  const statusLabel = STATUS_LABELS[statusText] || statusText;
+  const displayStatus = statusLabel(statusText);
 
   return (
     <div className="header">
@@ -31,8 +26,10 @@ export function Header({ meeting }: { meeting: MeetingResponse | null }) {
             <span>{duration}</span>
           </div>
           <div className="header-meta-item">
-            <span className={`status-badge status-${statusText}`}>
-              {statusLabel}
+            <span
+              className={`status-badge status-${statusClassName(statusText)}`}
+            >
+              {displayStatus}
             </span>
           </div>
         </div>

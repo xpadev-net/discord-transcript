@@ -1,16 +1,19 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
@@ -196,6 +199,10 @@ pub fn create_router(state: WebState) -> Router {
         )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
+        .route(
+            "/api/meetings/{meeting_id}/transcript/events",
+            get(api_transcript_events),
+        )
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
         .route("/api/meetings/{meeting_id}/audio", get(api_audio))
         .route("/api/meetings/{meeting_id}/speakers", get(api_speakers))
@@ -1700,6 +1707,7 @@ struct SpeakerResponse {
 
 #[derive(Serialize)]
 struct TranscriptSegmentResponse {
+    id: String,
     speaker_id: String,
     speaker: SpeakerResponse,
     start_ms: i32,
@@ -1708,6 +1716,20 @@ struct TranscriptSegmentResponse {
     confidence: Option<f64>,
     is_noisy: bool,
     source: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptResponse {
+    segments: Vec<TranscriptSegmentResponse>,
+    status: String,
+    is_final: bool,
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptStreamCursor {
+    created_at: String,
+    id: String,
 }
 
 #[derive(Serialize)]
@@ -1989,26 +2011,164 @@ async fn api_transcript(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
-) -> Result<Json<Vec<TranscriptSegmentResponse>>, StatusCode> {
+) -> Result<Json<TranscriptResponse>, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let (response, _) = load_transcript_response(&state, &meeting_id, None).await?;
+    Ok(Json(response))
+}
+
+async fn api_transcript_events(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let stream = stream::unfold(
+        (
+            state,
+            user_id,
+            meeting_id,
+            None::<TranscriptStreamCursor>,
+            tokio::time::interval(Duration::from_secs(2)),
+            false,
+        ),
+        |(state, user_id, meeting_id, cursor, mut interval, finished)| async move {
+            if finished {
+                return None;
+            }
+
+            interval.tick().await;
+
+            if let Err(status) = verify_meeting_access(&state, &meeting_id, &user_id).await {
+                let code = match status {
+                    StatusCode::FORBIDDEN => "forbidden",
+                    StatusCode::NOT_FOUND => "not_found",
+                    StatusCode::SERVICE_UNAVAILABLE => "auth_unavailable",
+                    _ => "unavailable",
+                };
+                let event = Event::default()
+                    .event("stream-error")
+                    .data(format!(r#"{{"code":"{code}"}}"#));
+                return Some((
+                    Ok(event),
+                    (state, user_id, meeting_id, cursor, interval, true),
+                ));
+            }
+
+            match load_transcript_response(&state, &meeting_id, cursor.as_ref()).await {
+                Ok((response, next_cursor)) => {
+                    let is_final = response.is_final;
+                    let event = match serde_json::to_string(&response) {
+                        Ok(data) => Event::default().event("segments").data(data),
+                        Err(err) => Event::default().event("stream-error").data(
+                            serde_json::json!({
+                                "code": "encode",
+                                "message": err.to_string(),
+                            })
+                            .to_string(),
+                        ),
+                    };
+                    Some((
+                        Ok(event),
+                        (
+                            state,
+                            user_id,
+                            meeting_id,
+                            next_cursor.or(cursor),
+                            interval,
+                            is_final,
+                        ),
+                    ))
+                }
+                Err(_) => {
+                    let event = Event::default()
+                        .event("stream-error")
+                        .data(r#"{"code":"transcript_unavailable"}"#);
+                    Some((
+                        Ok(event),
+                        (state, user_id, meeting_id, cursor, interval, false),
+                    ))
+                }
+            }
+        },
+    );
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn load_transcript_response(
+    state: &WebState,
+    meeting_id: &str,
+    cursor: Option<&TranscriptStreamCursor>,
+) -> Result<(TranscriptResponse, Option<TranscriptStreamCursor>), StatusCode> {
+    let status = load_meeting_status_for_transcript(state, meeting_id).await?;
+    let (segments, next_cursor) = load_transcript_segments_after(state, meeting_id, cursor).await?;
+    let updated_at = next_cursor.as_ref().map(|cursor| cursor.created_at.clone());
+    let is_final = matches!(status.as_str(), "posted" | "failed" | "aborted");
+
+    Ok((
+        TranscriptResponse {
+            segments,
+            status,
+            is_final,
+            updated_at,
+        },
+        next_cursor,
+    ))
+}
+
+async fn load_meeting_status_for_transcript(
+    state: &WebState,
+    meeting_id: &str,
+) -> Result<String, StatusCode> {
+    let row = state
+        .db
+        .query_opt("SELECT status FROM meetings WHERE id=$1", &[&meeting_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(row.get("status"))
+}
+
+async fn load_transcript_segments_after(
+    state: &WebState,
+    meeting_id: &str,
+    cursor: Option<&TranscriptStreamCursor>,
+) -> Result<
+    (
+        Vec<TranscriptSegmentResponse>,
+        Option<TranscriptStreamCursor>,
+    ),
+    StatusCode,
+> {
+    let cursor_created_at = cursor.map(|value| value.created_at.as_str());
+    let cursor_id = cursor.map(|value| value.id.as_str()).unwrap_or("");
 
     let rows = state
         .db
         .query(
-            "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, \
+            "SELECT t.id, t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, \
+                    to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at, \
                     ms.username, ms.nickname, ms.display_name \
              FROM transcripts t \
              LEFT JOIN meeting_speakers ms \
                ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
-             WHERE t.meeting_id=$1 AND NOT t.is_deleted \
-             ORDER BY t.start_ms, t.end_ms, t.speaker_id, t.id",
-            &[&meeting_id],
+             WHERE t.meeting_id=$1 \
+               AND NOT t.is_deleted \
+               AND ($2::text IS NULL OR (t.created_at, t.id) > (($2::text)::timestamptz, $3)) \
+             ORDER BY t.created_at, t.id",
+            &[&meeting_id, &cursor_created_at, &cursor_id],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut segments = Vec::with_capacity(rows.len());
+    let mut next_cursor = cursor.cloned();
     for row in &rows {
+        let id: String = row.get("id");
         let speaker_id: String = row.get("speaker_id");
         let profile = SpeakerProfile {
             speaker_id: speaker_id.clone(),
@@ -2020,6 +2180,7 @@ async fn api_transcript(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         segments.push(TranscriptSegmentResponse {
+            id: id.clone(),
             speaker_id,
             speaker: SpeakerResponse {
                 id: profile.speaker_id.clone(),
@@ -2035,9 +2196,21 @@ async fn api_transcript(
             is_noisy: row.get("is_noisy"),
             source,
         });
+        next_cursor = Some(TranscriptStreamCursor {
+            created_at: row.get("created_at"),
+            id,
+        });
     }
 
-    Ok(Json(segments))
+    segments.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(a.speaker_id.cmp(&b.speaker_id))
+            .then(a.id.cmp(&b.id))
+    });
+
+    Ok((segments, next_cursor))
 }
 
 async fn api_summary(

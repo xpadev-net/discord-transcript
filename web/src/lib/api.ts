@@ -6,6 +6,7 @@ import type {
   MeResponse,
   SpeakerAudioInfo,
   SummaryResponse,
+  TranscriptResponse,
   TranscriptSegment,
   UpdateGuildSettingsRequest,
 } from "./types";
@@ -89,10 +90,31 @@ export function fetchMeeting(
 export function fetchTranscript(
   meetingId: string,
   signal?: AbortSignal,
-): Promise<TranscriptSegment[]> {
+): Promise<TranscriptResponse> {
   return fetch(`${basePath(meetingId)}/transcript`, { signal }).then(
-    handleResponse<TranscriptSegment[]>,
+    (response) =>
+      handleResponse<TranscriptSegment[] | TranscriptResponse>(response).then(
+        normalizeTranscriptResponse,
+      ),
   );
+}
+
+export function normalizeTranscriptResponse(
+  response: TranscriptSegment[] | TranscriptResponse,
+): TranscriptResponse {
+  if (Array.isArray(response)) {
+    return {
+      segments: response,
+      status: "unknown",
+      is_final: false,
+      updated_at: null,
+    };
+  }
+  return response;
+}
+
+export function getTranscriptEventsUrl(meetingId: string): string {
+  return `${basePath(meetingId)}/transcript/events`;
 }
 
 export function fetchSummary(

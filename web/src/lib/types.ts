@@ -60,6 +60,7 @@ export interface SpeakerResponse {
 }
 
 export interface TranscriptSegment {
+  id?: string;
   speaker_id: string;
   speaker: SpeakerResponse;
   start_ms: number;
@@ -69,6 +70,22 @@ export interface TranscriptSegment {
   is_noisy: boolean;
   source: "voice" | "vc_text";
 }
+
+export interface TranscriptResponse {
+  segments: TranscriptSegment[];
+  status: string;
+  is_final: boolean;
+  updated_at: string | null;
+}
+
+export type TranscriptStreamState =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "closed"
+  | "error"
+  | "forbidden";
 
 export interface SummaryResponse {
   markdown: string | null;

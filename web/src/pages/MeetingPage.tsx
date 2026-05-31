@@ -9,7 +9,24 @@ import { TranscriptPanel } from "../components/TranscriptPanel";
 import { useAudioSync } from "../hooks/useAudioSync";
 import { useMeetingData } from "../hooks/useMeetingData";
 import { fetchDebugManifest, getAudioUrl } from "../lib/api";
+import { isLiveMeetingStatus } from "../lib/meetingStatus";
 import type { DebugArtifact } from "../lib/types";
+
+function inProgressMessage(status: string | undefined): string | null {
+  if (status === "recording") {
+    return "\u9332\u97f3\u4e2d\u3067\u3059\u3002\u6587\u5b57\u8d77\u3053\u3057\u304c\u5230\u7740\u3059\u308b\u3068\u3053\u306e\u30da\u30fc\u30b8\u306b\u8ffd\u52a0\u3055\u308c\u307e\u3059\u3002";
+  }
+  if (status === "stopping") {
+    return "\u9332\u97f3\u306e\u505c\u6b62\u51e6\u7406\u4e2d\u3067\u3059\u3002\u97f3\u58f0\u3068\u6587\u5b57\u8d77\u3053\u3057\u3092\u6e96\u5099\u3057\u3066\u3044\u307e\u3059\u3002";
+  }
+  if (status === "transcribing" || status === "processing") {
+    return "\u6587\u5b57\u8d77\u3053\u3057\u4e2d\u3067\u3059\u3002\u7d50\u679c\u306f\u9806\u6b21\u8ffd\u52a0\u3055\u308c\u307e\u3059\u3002";
+  }
+  if (status === "summarizing") {
+    return "\u8981\u7d04\u4e2d\u3067\u3059\u3002\u6587\u5b57\u8d77\u3053\u3057\u306f\u5f15\u304d\u7d9a\u304d\u78ba\u8a8d\u3067\u304d\u307e\u3059\u3002";
+  }
+  return null;
+}
 
 export function MeetingPage() {
   const { meetingId } = useParams<{ meetingId: string }>();
@@ -23,6 +40,8 @@ export function MeetingPage() {
     error,
     transcriptError,
     summaryError,
+    transcriptStreamState,
+    transcriptStreamError,
     retryTranscript,
     retrySummary,
   } = useMeetingData(meetingId);
@@ -37,6 +56,9 @@ export function MeetingPage() {
   );
   const [debugLoading, setDebugLoading] = useState(true);
   const [debugError, setDebugError] = useState(false);
+  const isLive = isLiveMeetingStatus(meeting?.status);
+  const progressMessage = inProgressMessage(meeting?.status);
+  const showAudioAndDebug = meeting?.status === "posted";
 
   useEffect(() => {
     if (meetingId) {
@@ -45,7 +67,7 @@ export function MeetingPage() {
   }, [meetingId, meeting?.title]);
 
   useEffect(() => {
-    if (!meetingId) {
+    if (!meetingId || !showAudioAndDebug) {
       setDebugArtifacts(null);
       setDebugLoading(false);
       setDebugError(false);
@@ -72,7 +94,7 @@ export function MeetingPage() {
         }
       });
     return () => controller.abort();
-  }, [meetingId]);
+  }, [meetingId, showAudioAndDebug]);
 
   if (error) {
     return (
@@ -88,18 +110,31 @@ export function MeetingPage() {
       <Header meeting={meeting} />
       <div className="main-container">
         <div className="left-panel">
-          <AudioPlayer
-            key={meetingId}
-            ref={audioRef}
-            src={meetingId ? getAudioUrl(meetingId) : ""}
-          />
-          {meetingId && (
+          {progressMessage ? (
+            <div className="meeting-progress-notice" role="status">
+              {progressMessage}
+            </div>
+          ) : null}
+          {showAudioAndDebug ? (
+            <AudioPlayer
+              key={meetingId}
+              ref={audioRef}
+              src={meetingId ? getAudioUrl(meetingId) : ""}
+            />
+          ) : (
+            <div className="audio-container audio-placeholder" role="status">
+              {
+                "\u97f3\u58f0\u30d7\u30ec\u30fc\u30e4\u30fc\u306f\u9332\u97f3\u7d42\u4e86\u5f8c\u306b\u5229\u7528\u3067\u304d\u307e\u3059"
+              }
+            </div>
+          )}
+          {meetingId && showAudioAndDebug ? (
             <DebugDownloads
               artifacts={debugArtifacts}
               loading={debugLoading}
               error={debugError}
             />
-          )}
+          ) : null}
           {seekNotice ? (
             <div className="seek-notice" role="status">
               {seekNotice}
@@ -117,6 +152,9 @@ export function MeetingPage() {
               onSeek={seekTo}
               error={transcriptError}
               onRetry={retryTranscript}
+              streamState={transcriptStreamState}
+              streamError={transcriptStreamError}
+              isLive={isLive}
             />
           </ErrorBoundary>
         </div>
@@ -127,7 +165,12 @@ export function MeetingPage() {
         >
           <SummaryPanel
             markdown={summary?.markdown}
-            loading={!!meetingId && summary === null && summaryError === null}
+            loading={
+              !isLive &&
+              !!meetingId &&
+              summary === null &&
+              summaryError === null
+            }
             error={summaryError}
             onRetry={retrySummary}
           />
