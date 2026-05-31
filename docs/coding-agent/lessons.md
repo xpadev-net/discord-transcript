@@ -301,3 +301,33 @@ Prevention:
 
 Evidence:
 - User correction received on 2026-05-31 in the Task 42 delegated thread.
+
+## 2026-05-31 - Integrate Parallel Task Merges Before PR Closeout  [tags: workflow, validation, merge]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: Task 43 PR merge recovery
+- Roles involved: Orchestrator
+
+Symptom:
+- Task 43 was left in a concrete conflict state after Task 44 merged, with `src/interfaces/web.rs` and `web/src/pages/SettingsPage.tsx` unresolved and Task 44 frontend/test files staged in the merge.
+- The parent Orchestrator had to restate that Task 43 token behavior and Task 44 guild access control behavior must both be preserved before PR closeout.
+
+Root cause:
+- The Task 43 closeout path focused on the latest hook findings and did not first complete a combined-behavior review of the sibling Task 44 merge.
+
+Fix applied:
+- Resolve the merge by preserving Task 44 `/api/me`, settings admin gating, forbidden UI, membership reverify cache, and frontend tests while integrating Task 43 token settings UI/API and token-recovery behavior.
+- Add validation coverage for the combined path, including settings-only recovery routing, no global fallback on rate limits, and no raw token redisplay in the settings UI.
+
+Prevention:
+- Repo rule candidate:
+  - audience: orchestrator
+  - proposed rule: After a parallel task branch merges into the base branch, resolve conflicts by reviewing the combined behavior before rerunning review hooks or claiming readiness.
+- Dispatch/plan guardrail:
+  - During PR closeout, treat unmerged files and sibling-task staged changes as blockers until the merged behavior is explicitly validated and independently reviewed.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- The combined Task 43/44 worktree reran Rust fmt/check/test/clippy and frontend install/lint/typecheck/build/test after conflict resolution.

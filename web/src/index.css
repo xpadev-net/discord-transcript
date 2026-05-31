@@ -681,6 +681,15 @@ audio::-webkit-media-controls-panel {
   border-color: var(--accent);
 }
 
+.forbidden-state {
+  min-height: 220px;
+}
+
+.forbidden-state strong {
+  color: var(--text-primary);
+  font-size: 1rem;
+}
+
 .seek-notice {
   margin: 8px 0;
   padding: 8px 12px;

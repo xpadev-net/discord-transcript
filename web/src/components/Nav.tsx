@@ -1,6 +1,10 @@
 import { NavLink } from "react-router-dom";
 
-export function Nav() {
+interface NavProps {
+  isAdmin: boolean;
+}
+
+export function Nav({ isAdmin }: NavProps) {
   return (
     <nav className="app-nav" aria-label="Primary">
       <div className="app-nav-content">
@@ -13,14 +17,16 @@ export function Nav() {
         >
           {"\u4f1a\u8b70\u4e00\u89a7"}
         </NavLink>
-        <NavLink
-          to="/settings"
-          className={({ isActive }) =>
-            `app-nav-link${isActive ? " active" : ""}`
-          }
-        >
-          {"\u8a2d\u5b9a"}
-        </NavLink>
+        {isAdmin ? (
+          <NavLink
+            to="/settings"
+            className={({ isActive }) =>
+              `app-nav-link${isActive ? " active" : ""}`
+            }
+          >
+            {"\u8a2d\u5b9a"}
+          </NavLink>
+        ) : null}
       </div>
     </nav>
   );

@@ -1,4 +1,5 @@
 import { type FormEvent, useEffect, useState } from "react";
+import { ForbiddenState } from "../components/ForbiddenState";
 import {
   deleteGuildBotToken,
   fetchGuildSettings,
@@ -120,6 +121,7 @@ export function SettingsPage() {
     "settings" | "token-save" | "token-delete" | null
   >(null);
   const [error, setError] = useState<string | null>(null);
+  const [forbidden, setForbidden] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
@@ -130,6 +132,7 @@ export function SettingsPage() {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setForbidden(false);
     setMessage(null);
 
     fetchGuildSettings(controller.signal)
@@ -143,12 +146,14 @@ export function SettingsPage() {
         if (controller.signal.aborted) {
           return;
         }
+        if (err instanceof Error && err.message === "forbidden") {
+          setForbidden(true);
+          return;
+        }
         setError(
-          err instanceof Error && err.message === "forbidden"
-            ? "\u3053\u306e\u30ae\u30eb\u30c9\u8a2d\u5b9a\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093"
-            : err instanceof Error
-              ? err.message
-              : "\u8a2d\u5b9a\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+          err instanceof Error
+            ? err.message
+            : "\u8a2d\u5b9a\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
         );
       })
       .finally(() => {
@@ -285,15 +290,33 @@ export function SettingsPage() {
     }
   }
 
+  if (!loading && forbidden) {
+    return (
+      <main className="settings-page">
+        <div className="settings-header">
+          <div>
+            <h1>{"\u30ae\u30eb\u30c9\u8a2d\u5b9a"}</h1>
+            <p>
+              {
+                "\u7ba1\u7406\u6a29\u9650\u304c\u3042\u308b\u30e6\u30fc\u30b6\u30fc\u306e\u307f\u8868\u793a\u3067\u304d\u307e\u3059"
+              }
+            </p>
+          </div>
+        </div>
+        <ForbiddenState message="\u3053\u306e\u30ae\u30eb\u30c9\u8a2d\u5b9a\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093" />
+      </main>
+    );
+  }
+
   return (
     <main className="settings-page">
       <div className="settings-header">
         <div>
           <h1>{"\u30ae\u30eb\u30c9\u8a2d\u5b9a"}</h1>
           <p>
-            {canEdit
-              ? "\u9332\u97f3\u3068\u8981\u7d04\u306e\u30c7\u30d5\u30a9\u30eb\u30c8\u52d5\u4f5c\u3092\u5909\u66f4\u3067\u304d\u307e\u3059"
-              : "\u8a2d\u5b9a\u306f\u8868\u793a\u306e\u307f\u3067\u3059"}
+            {
+              "\u9332\u97f3\u3068\u8981\u7d04\u306e\u30c7\u30d5\u30a9\u30eb\u30c8\u52d5\u4f5c\u3092\u5909\u66f4\u3067\u304d\u307e\u3059"
+            }
           </p>
         </div>
       </div>
@@ -308,14 +331,6 @@ export function SettingsPage() {
       {error ? (
         <div className="panel-error settings-panel-message" role="alert">
           {error}
-        </div>
-      ) : null}
-
-      {!canEdit && settings ? (
-        <div className="settings-notice" role="note">
-          {
-            "\u3053\u306e\u8a2d\u5b9a\u306e\u5909\u66f4\u306b\u306f\u30ae\u30eb\u30c9\u7ba1\u7406\u6a29\u9650\u304c\u5fc5\u8981\u3067\u3059"
-          }
         </div>
       ) : null}
 

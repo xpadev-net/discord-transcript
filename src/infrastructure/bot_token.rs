@@ -93,13 +93,13 @@ impl BotTokenCipher {
         if key_material.is_empty() {
             return Err(BotTokenCryptoError::MissingKey);
         }
-        let hk = Hkdf::<Sha256>::new(
-            Some(b"discord-transcript:guild-bot-token-key:v1"),
-            key_material.as_bytes(),
-        );
+        let hk = Hkdf::<Sha256>::new(None, key_material.as_bytes());
         let mut key = [0u8; 32];
-        hk.expand(b"guild-bot-token-aes-256-gcm", &mut key)
-            .map_err(|_| BotTokenCryptoError::KeyDerivationFailed)?;
+        hk.expand(
+            b"discord-transcript:guild-bot-token-key:v1/aes-256-gcm",
+            &mut key,
+        )
+        .map_err(|_| BotTokenCryptoError::KeyDerivationFailed)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| BotTokenCryptoError::MissingKey)?;
         Ok(Self { cipher })
