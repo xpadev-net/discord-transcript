@@ -7,7 +7,6 @@ import type {
 } from "../lib/types";
 
 interface SettingsForm {
-  whisper_language: string | null;
   whisper_vad: boolean;
   auto_stop_grace_seconds: string;
   retention_raw_audio_ttl_days: string;
@@ -19,7 +18,6 @@ interface SettingsForm {
 
 function formFromSettings(settings: GuildSettingsResponse): SettingsForm {
   return {
-    whisper_language: settings.whisper_language,
     whisper_language_enabled: settings.whisper_language_explicit,
     whisper_language_value: settings.whisper_language ?? "",
     whisper_vad: settings.whisper_vad,
