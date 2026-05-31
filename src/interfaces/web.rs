@@ -127,8 +127,8 @@ impl GuildAdminCheck {
     fn into_status_result(self) -> Result<bool, StatusCode> {
         match self {
             Self::Admin => Ok(true),
-            Self::NotAdmin | Self::BotAccessDenied => Ok(false),
-            Self::RateLimited => Err(StatusCode::BAD_GATEWAY),
+            Self::NotAdmin => Ok(false),
+            Self::BotAccessDenied | Self::RateLimited => Err(StatusCode::BAD_GATEWAY),
         }
     }
 }
@@ -4367,6 +4367,19 @@ mod guild_api_tests {
             guild_admin_member_status_decision(reqwest::StatusCode::OK),
             None
         );
+    }
+
+    #[test]
+    fn guild_admin_check_bot_access_denied_fails_closed() {
+        assert_eq!(
+            GuildAdminCheck::BotAccessDenied.into_status_result(),
+            Err(StatusCode::BAD_GATEWAY)
+        );
+        assert_eq!(
+            GuildAdminCheck::RateLimited.into_status_result(),
+            Err(StatusCode::BAD_GATEWAY)
+        );
+        assert_eq!(GuildAdminCheck::NotAdmin.into_status_result(), Ok(false));
     }
 
     #[test]
