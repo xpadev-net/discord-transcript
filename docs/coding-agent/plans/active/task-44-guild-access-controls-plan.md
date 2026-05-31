@@ -6,9 +6,11 @@
 - work_type: code
 
 ## Goal
+
 - Restrict guild dashboard data to current guild members and restrict guild settings UI/API access to guild admins.
 
 ## Definition of Done
+
 - Dashboard APIs re-check current guild membership on every protected API request and deny stale/non-member sessions.
 - Settings read and update APIs require guild admin permission.
 - Frontend does not expose settings navigation or settings controls to non-admin members.
@@ -17,6 +19,7 @@
 - Independent Reviewer approves the final diff and evidence.
 
 ## Scope / Non-goals
+
 - Scope:
   - `src/interfaces/web.rs` auth/session helpers, settings handlers, and focused tests.
   - `web/src/App.tsx`, `web/src/pages/DashboardPage.tsx`, `web/src/pages/SettingsPage.tsx`, and narrow supporting frontend files/tests.
@@ -28,6 +31,7 @@
   - Broad frontend redesign.
 
 ## Context (workspace)
+
 - Related files/areas:
   - `src/interfaces/web.rs`
   - `web/src/App.tsx`
@@ -47,9 +51,11 @@
   - Repo rule suite: absent (`docs/coding-agent/rules/` missing).
 
 ## Open Questions
+
 - None blocking. Decisions below record conservative defaults.
 
 ## Assumptions
+
 - A1: Settings route/API means both `GET` and `PUT /api/guild/settings` are admin-only.
 - A2: Signed sessions for a different configured guild remain authentication-invalid and return 401.
 - A3: Current guild membership verification failure for a valid session should fail closed rather than allow stale dashboard/settings access.
@@ -57,6 +63,7 @@
 ## Tasks
 
 ### Task_1: Backend Access-Control Gates
+
 - type: impl
 - owns:
   - src/interfaces/web.rs
@@ -84,6 +91,7 @@
     detail: "rtk cargo test session_reverify_tests"
 
 ### Task_2: Frontend Route And Settings UX Gates
+
 - type: impl
 - owns:
   - web/src/App.tsx
@@ -124,6 +132,7 @@
     detail: "frontend route/display tests"
 
 ### Task_3: Full Validation, Review, PR, Hook, Merge
+
 - type: review
 - owns:
   - docs/coding-agent/plans/active/task-44-guild-access-controls-plan.md
@@ -154,11 +163,13 @@
     detail: "Independent review against Task 44 acceptance criteria"
 
 ## Task Waves
+
 - Wave 1 (parallel): [Task_1]
 - Wave 2 (parallel): [Task_2]
 - Wave 3 (parallel): [Task_3]
 
 ## E2E / Visual Validation Spec
+
 - provider: unit/component tests plus reviewer source review; browser E2E only if test harness cannot cover route/display behavior.
 - artifact_root: n/a unless browser E2E is added.
 - base_url: n/a
@@ -175,9 +186,11 @@
 - known_flakiness: none known.
 
 ## Rollback / Safety
+
 - Revert this branch/PR to restore previous permissive settings read UI/API and cached membership behavior.
 
 ## Progress Log
+
 - 2026-05-31 00:00 Wave 0 completed: research and branch safety.
   - Summary: backend and frontend Researcher agents mapped routes, helpers, tests, and risks.
   - Validation evidence: `git fetch origin --prune`; branch created from `origin/master`; no open PR for branch.
@@ -232,6 +245,7 @@
   - Notes: Hook rerun pending.
 
 ## Decision Log
+
 - 2026-05-31 00:00 Decision: Proceed without separate plan approval.
   - Trigger / new insight: User delegated end-to-end implementation, PR, hook, and merge in this worker thread.
   - Plan delta: Marked plan `in_progress`.
@@ -269,6 +283,7 @@
   - User approval: implicit in required review fix.
 
 ## Notes
+
 - Risks:
   - Per-request Discord membership checks can add latency and rate-limit exposure.
   - Frontend test dependencies may need to be introduced because no route/display test harness exists.
