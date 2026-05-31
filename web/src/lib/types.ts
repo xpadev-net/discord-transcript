@@ -9,6 +9,7 @@ export interface MeetingResponse {
 
 export interface MeResponse {
   user_id: string;
+  // Returned by /api/me for future guild-scoped UI decisions.
   guild_id: string;
   is_admin: boolean;
 }

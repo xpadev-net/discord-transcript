@@ -144,6 +144,7 @@ export function SettingsPage() {
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
+    setError(null);
     setMessage(null);
   }
 
