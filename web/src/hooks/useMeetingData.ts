@@ -27,6 +27,15 @@ interface MeetingData {
 
 function shouldPollTranscript(state: TranscriptStateResponse | null): boolean {
   if (!state) return false;
+  if (
+    state.status === "failed" ||
+    state.status === "posted" ||
+    state.status === "aborted" ||
+    state.status === "scheduled" ||
+    state.status === "done"
+  ) {
+    return false;
+  }
   return (
     !state.is_final ||
     state.status === "recording" ||

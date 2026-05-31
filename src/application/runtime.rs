@@ -515,54 +515,74 @@ fn persist_live_transcription_success<E: SqlExecutor>(
     segments: &[TranscriptSegment],
 ) -> Result<(), TranscriptPersistError> {
     let chunk_id = live_chunk_id(chunk);
-    executor
-        .execute(
-            "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live' AND live_chunk_id=$2",
-            &[chunk.meeting_id.clone(), chunk_id.clone()],
-        )
-        .map_err(|err| {
-            TranscriptPersistError::Database(format!(
-                "failed to clear old live transcript chunk rows: {err}"
-            ))
-        })?;
+    executor.execute("BEGIN", &[]).map(|_| ()).map_err(|err| {
+        TranscriptPersistError::Database(format!(
+            "failed to begin live transcript transaction: {err}"
+        ))
+    })?;
 
-    if !segments.is_empty() {
-        let sql = build_live_insert_transcripts_sql(segments.len(), 0);
-        let mut params = Vec::with_capacity(segments.len() * 10);
-        for (i, seg) in segments.iter().enumerate() {
-            let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)
-                .map_err(TranscriptPersistError::Validation)?;
-            let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)
-                .map_err(TranscriptPersistError::Validation)?;
-            params.push(live_transcript_row_id(&chunk_id, i));
-            params.push(chunk.meeting_id.clone());
-            params.push(seg.speaker_id.clone());
-            params.push(start_ms.to_string());
-            params.push(end_ms.to_string());
-            params.push(seg.text.clone());
-            params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
-            params.push(seg.is_noisy.to_string());
-            params.push(seg.source.as_str().to_owned());
-            params.push(chunk_id.clone());
+    let result = (|| {
+        executor
+            .execute(
+                "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live' AND live_chunk_id=$2",
+                &[chunk.meeting_id.clone(), chunk_id.clone()],
+            )
+            .map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to clear old live transcript chunk rows: {err}"
+                ))
+            })?;
+
+        if !segments.is_empty() {
+            let sql = build_live_insert_transcripts_sql(segments.len(), 0);
+            let mut params = Vec::with_capacity(segments.len() * 10);
+            for (i, seg) in segments.iter().enumerate() {
+                let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)
+                    .map_err(TranscriptPersistError::Validation)?;
+                let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)
+                    .map_err(TranscriptPersistError::Validation)?;
+                params.push(live_transcript_row_id(&chunk_id, i));
+                params.push(chunk.meeting_id.clone());
+                params.push(seg.speaker_id.clone());
+                params.push(start_ms.to_string());
+                params.push(end_ms.to_string());
+                params.push(seg.text.clone());
+                params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
+                params.push(seg.is_noisy.to_string());
+                params.push(seg.source.as_str().to_owned());
+                params.push(chunk_id.clone());
+            }
+            executor.execute(&sql, &params).map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to persist live transcript segments: {err}"
+                ))
+            })?;
         }
-        executor.execute(&sql, &params).map_err(|err| {
-            TranscriptPersistError::Database(format!(
-                "failed to persist live transcript segments: {err}"
-            ))
-        })?;
-    }
 
-    executor
-        .execute(
-            "UPDATE live_transcription_chunks SET status='done', error_message=NULL, updated_at=NOW() WHERE id=$1",
-            &[chunk_id],
-        )
-        .map(|_| ())
-        .map_err(|err| {
+        executor
+            .execute(
+                "UPDATE live_transcription_chunks SET status='done', error_message=NULL, updated_at=NOW() WHERE id=$1",
+                &[chunk_id],
+            )
+            .map(|_| ())
+            .map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to mark live transcription chunk done: {err}"
+                ))
+            })
+    })();
+
+    match result {
+        Ok(()) => executor.execute("COMMIT", &[]).map(|_| ()).map_err(|err| {
             TranscriptPersistError::Database(format!(
-                "failed to mark live transcription chunk done: {err}"
+                "failed to commit live transcript transaction: {err}"
             ))
-        })
+        }),
+        Err(err) => {
+            let _ = executor.execute("ROLLBACK", &[]);
+            Err(err)
+        }
+    }
 }
 
 fn mark_live_transcription_chunk_failed<E: SqlExecutor>(
