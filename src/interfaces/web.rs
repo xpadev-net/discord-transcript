@@ -200,6 +200,10 @@ pub fn create_router(state: WebState) -> Router {
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route(
+            "/api/meetings/{meeting_id}/transcript/state",
+            get(api_transcript_state),
+        )
+        .route(
             "/api/meetings/{meeting_id}/transcript/events",
             get(api_transcript_events),
         )
@@ -1726,6 +1730,13 @@ struct TranscriptResponse {
     updated_at: Option<String>,
 }
 
+#[derive(Serialize)]
+struct TranscriptStateResponse {
+    status: String,
+    is_final: bool,
+    updated_at: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct TranscriptStreamCursor {
     created_at: String,
@@ -2007,6 +2018,38 @@ fn transcript_source_for_api(raw: Option<String>) -> Result<String, ()> {
     Ok(parsed.as_str().to_owned())
 }
 
+fn api_transcript_sql() -> &'static str {
+    "SELECT t.id, t.speaker_id, \
+            CASE WHEN t.transcript_stage='live' AND c.timeline_base_ms IS NOT NULL AND lb.min_base_ms IS NOT NULL \
+                 THEN (t.start_ms::BIGINT + (c.timeline_base_ms - lb.min_base_ms))::INTEGER \
+                 ELSE t.start_ms \
+            END AS start_ms, \
+            CASE WHEN t.transcript_stage='live' AND c.timeline_base_ms IS NOT NULL AND lb.min_base_ms IS NOT NULL \
+                 THEN (t.end_ms::BIGINT + (c.timeline_base_ms - lb.min_base_ms))::INTEGER \
+                 ELSE t.end_ms \
+            END AS end_ms, \
+            t.text, t.confidence, t.is_noisy, t.source, \
+            to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at, \
+            ms.username, ms.nickname, ms.display_name \
+     FROM transcripts t \
+     LEFT JOIN live_transcription_chunks c \
+       ON c.id = t.live_chunk_id AND c.status='done' \
+     LEFT JOIN LATERAL ( \
+       SELECT MIN(timeline_base_ms) AS min_base_ms \
+       FROM live_transcription_chunks \
+       WHERE meeting_id=$1 AND timeline_base_ms IS NOT NULL \
+     ) lb ON true \
+     LEFT JOIN LATERAL ( \
+       SELECT EXISTS (SELECT 1 FROM transcripts ft WHERE ft.meeting_id=$1 AND ft.transcript_stage='final' AND NOT ft.is_deleted) AS has_final_rows \
+     ) fb ON true \
+     LEFT JOIN meeting_speakers ms \
+       ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
+     WHERE t.meeting_id=$1 AND NOT t.is_deleted \
+       AND (t.transcript_stage='final' OR (NOT fb.has_final_rows AND c.id IS NOT NULL)) \
+       AND ($2::text IS NULL OR (t.created_at, t.id) > (($2::text)::timestamptz, $3)) \
+     ORDER BY t.created_at, t.id"
+}
+
 async fn api_transcript(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -2103,15 +2146,18 @@ async fn load_transcript_response(
     meeting_id: &str,
     cursor: Option<&TranscriptStreamCursor>,
 ) -> Result<(TranscriptResponse, Option<TranscriptStreamCursor>), StatusCode> {
-    let status = load_meeting_status_for_transcript(state, meeting_id).await?;
+    let metadata = load_transcript_metadata(state, meeting_id).await?;
     let (segments, next_cursor) = load_transcript_segments_after(state, meeting_id, cursor).await?;
-    let updated_at = next_cursor.as_ref().map(|cursor| cursor.created_at.clone());
-    let is_final = matches!(status.as_str(), "posted" | "failed" | "aborted");
+    let updated_at = next_cursor
+        .as_ref()
+        .map(|cursor| cursor.created_at.clone())
+        .or(metadata.updated_at.clone());
+    let is_final = transcript_metadata_is_final(&metadata);
 
     Ok((
         TranscriptResponse {
             segments,
-            status,
+            status: metadata.status,
             is_final,
             updated_at,
         },
@@ -2119,18 +2165,51 @@ async fn load_transcript_response(
     ))
 }
 
-async fn load_meeting_status_for_transcript(
+#[derive(Debug, Clone)]
+struct TranscriptMetadata {
+    status: String,
+    has_final_rows: bool,
+    has_live_rows: bool,
+    updated_at: Option<String>,
+}
+
+fn transcript_metadata_is_final(metadata: &TranscriptMetadata) -> bool {
+    metadata.has_final_rows
+        || matches!(
+            metadata.status.as_str(),
+            "posted" | "failed" | "aborted" | "done"
+        )
+        || (!metadata.has_live_rows
+            && !matches!(
+                metadata.status.as_str(),
+                "recording" | "stopping" | "transcribing" | "summarizing" | "processing"
+            ))
+}
+
+async fn load_transcript_metadata(
     state: &WebState,
     meeting_id: &str,
-) -> Result<String, StatusCode> {
+) -> Result<TranscriptMetadata, StatusCode> {
     let row = state
         .db
-        .query_opt("SELECT status FROM meetings WHERE id=$1", &[&meeting_id])
+        .query_opt(
+            "SELECT m.status, \
+                    EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id=m.id AND t.transcript_stage='final' AND NOT t.is_deleted) as has_final_rows, \
+                    EXISTS (SELECT 1 FROM transcripts t JOIN live_transcription_chunks c ON c.id=t.live_chunk_id AND c.status='done' WHERE t.meeting_id=m.id AND t.transcript_stage='live' AND NOT t.is_deleted) as has_live_rows, \
+                    to_char((SELECT MAX(created_at) FROM transcripts WHERE meeting_id=m.id AND NOT is_deleted) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as updated_at \
+             FROM meetings m WHERE m.id=$1",
+            &[&meeting_id],
+        )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(row.get("status"))
+    Ok(TranscriptMetadata {
+        status: row.get("status"),
+        has_final_rows: row.get("has_final_rows"),
+        has_live_rows: row.get("has_live_rows"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 async fn load_transcript_segments_after(
@@ -2150,16 +2229,7 @@ async fn load_transcript_segments_after(
     let rows = state
         .db
         .query(
-            "SELECT t.id, t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, \
-                    to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at, \
-                    ms.username, ms.nickname, ms.display_name \
-             FROM transcripts t \
-             LEFT JOIN meeting_speakers ms \
-               ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
-             WHERE t.meeting_id=$1 \
-               AND NOT t.is_deleted \
-               AND ($2::text IS NULL OR (t.created_at, t.id) > (($2::text)::timestamptz, $3)) \
-             ORDER BY t.created_at, t.id",
+            api_transcript_sql(),
             &[&meeting_id, &cursor_created_at, &cursor_id],
         )
         .await
@@ -2211,6 +2281,23 @@ async fn load_transcript_segments_after(
     });
 
     Ok((segments, next_cursor))
+}
+
+async fn api_transcript_state(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<TranscriptStateResponse>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let metadata = load_transcript_metadata(&state, &meeting_id).await?;
+    let is_final = transcript_metadata_is_final(&metadata);
+
+    Ok(Json(TranscriptStateResponse {
+        status: metadata.status,
+        is_final,
+        updated_at: metadata.updated_at,
+    }))
 }
 
 async fn api_summary(
@@ -3968,7 +4055,7 @@ mod session_reverify_tests {
 
 #[cfg(test)]
 mod transcript_source_api_tests {
-    use super::transcript_source_for_api;
+    use super::{api_transcript_sql, transcript_source_for_api};
     use crate::domain::transcript::TranscriptSource;
 
     #[test]
@@ -3987,6 +4074,30 @@ mod transcript_source_api_tests {
     fn api_transcript_source_rejects_unknown_and_null() {
         assert!(transcript_source_for_api(Some("unknown".to_owned())).is_err());
         assert!(transcript_source_for_api(None).is_err());
+    }
+
+    #[test]
+    fn api_transcript_orders_by_rebased_live_timestamps() {
+        let sql = api_transcript_sql();
+
+        assert!(sql.contains("END AS start_ms"));
+        assert!(sql.contains("END AS end_ms"));
+        assert!(
+            sql.contains("NOT fb.has_final_rows AND c.id IS NOT NULL"),
+            "live rows should not be exposed after final transcript rows exist"
+        );
+        assert!(
+            sql.contains("(t.created_at, t.id)"),
+            "streaming cursor should advance over stable transcript row identity"
+        );
+        assert!(
+            sql.contains("ORDER BY t.created_at, t.id"),
+            "database order must match the streaming cursor"
+        );
+        assert!(
+            !sql.contains("ORDER BY t.start_ms, t.end_ms"),
+            "raw live timestamps can be out of final timeline order after rebasing"
+        );
     }
 }
 

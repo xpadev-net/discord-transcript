@@ -12,12 +12,14 @@ import type {
   SummaryResponse,
   TranscriptResponse,
   TranscriptSegment,
+  TranscriptStateResponse,
   TranscriptStreamState,
 } from "../lib/types";
 
 interface MeetingData {
   meeting: MeetingResponse | null;
   transcript: TranscriptSegment[] | null;
+  transcriptState: TranscriptStateResponse | null;
   summary: SummaryResponse | null;
   loading: boolean;
   error: string | null;
@@ -27,6 +29,16 @@ interface MeetingData {
   transcriptStreamError: string | null;
   retryTranscript: () => void;
   retrySummary: () => void;
+}
+
+function transcriptStateFromResponse(
+  response: TranscriptResponse,
+): TranscriptStateResponse {
+  return {
+    status: response.status,
+    is_final: response.is_final,
+    updated_at: response.updated_at,
+  };
 }
 
 function transcriptSegmentKey(segment: TranscriptSegment): string {
@@ -75,6 +87,8 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   const [transcript, setTranscript] = useState<TranscriptSegment[] | null>(
     null,
   );
+  const [transcriptState, setTranscriptState] =
+    useState<TranscriptStateResponse | null>(null);
   const [summary, setSummary] = useState<SummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -90,6 +104,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   const shouldStreamTranscript = isLiveMeetingStatus(meeting?.status);
 
   const applyTranscriptStatus = useCallback((response: TranscriptResponse) => {
+    setTranscriptState(transcriptStateFromResponse(response));
     if (response.status === "unknown") {
       return;
     }
@@ -136,15 +151,18 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     const retryAttempt = transcriptRetryCount;
     if (!meetingId) {
       setTranscript(null);
+      setTranscriptState(null);
       setTranscriptError(null);
       return;
     }
 
     const controller = new AbortController();
     setTranscript(null);
+    setTranscriptState(null);
     setTranscriptError(null);
     fetchTranscript(meetingId, controller.signal)
       .then((response) => {
+        if (controller.signal.aborted) return;
         setTranscript((current) =>
           shouldStreamTranscript
             ? mergeTranscriptSegments(current, response.segments)
@@ -374,6 +392,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   return {
     meeting,
     transcript,
+    transcriptState,
     summary,
     loading,
     error,

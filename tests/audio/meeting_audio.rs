@@ -1,7 +1,10 @@
 use discord_transcript::audio::receiver::BufferedFrame;
 use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
 use discord_transcript::application::runtime::merge_user_chunks_to_mixdown;
-use discord_transcript::audio::meeting_audio::{build_speaker_audio_inputs, load_chunks};
+use discord_transcript::audio::meeting_audio::{
+    ProcessedAudioChunk, build_speaker_audio_inputs,
+    build_speaker_audio_inputs_excluding_processed_chunks, load_chunks,
+};
 use discord_transcript::audio::wav::resample_pcm_16le;
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::fs;
@@ -61,6 +64,38 @@ fn speaker_audio_builds_offsets_and_gaps_per_user() {
     let bob_bytes = fs::read(&bob.audio_path).expect("bob audio should exist");
     // 0.5s audio = 1_000 bytes + 44-byte header.
     assert_eq!(bob_bytes.len(), 1_044);
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn speaker_audio_excludes_processed_chunks_but_keeps_timeline_base() {
+    let base = unique_temp_dir("exclude_processed");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let chunk_one = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("alice_1_1000.wav"), &chunk_one).unwrap();
+
+    let chunk_two = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(base.join("bob_1_2500.wav"), &chunk_two).unwrap();
+
+    let outputs = build_speaker_audio_inputs_excluding_processed_chunks(
+        &base,
+        false,
+        &[ProcessedAudioChunk {
+            speaker_id: "alice".to_owned(),
+            sequence: 1,
+            start_ms: 1_000,
+        }],
+    )
+    .expect("speaker audio should build");
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].speaker_id, "bob");
+    assert_eq!(
+        outputs[0].offset_ms, 1_500,
+        "offset should stay relative to the full meeting, not the first unprocessed chunk"
+    );
 
     let _ = fs::remove_dir_all(base);
 }

@@ -23,6 +23,13 @@ pub struct LoadedChunk {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProcessedAudioChunk {
+    pub speaker_id: String,
+    pub sequence: u64,
+    pub start_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedFilename {
     user_id: String,
@@ -248,6 +255,14 @@ pub fn build_speaker_audio_inputs(
     meeting_dir: &Path,
     resample_to_16k: bool,
 ) -> Result<Vec<SpeakerAudioInput>, String> {
+    build_speaker_audio_inputs_excluding_processed_chunks(meeting_dir, resample_to_16k, &[])
+}
+
+pub fn build_speaker_audio_inputs_excluding_processed_chunks(
+    meeting_dir: &Path,
+    resample_to_16k: bool,
+    processed_chunks: &[ProcessedAudioChunk],
+) -> Result<Vec<SpeakerAudioInput>, String> {
     let mut chunks = load_chunks(meeting_dir)?;
 
     // Resolve any SSRC-based user IDs using persisted mapping
@@ -269,12 +284,35 @@ pub fn build_speaker_audio_inputs(
         );
     }
 
+    let meeting_start_ms = compute_meeting_start_ms(&chunks);
+
+    if !processed_chunks.is_empty() {
+        let processed = processed_chunks
+            .iter()
+            .map(|chunk| (chunk.speaker_id.as_str(), chunk.sequence, chunk.start_ms))
+            .collect::<std::collections::HashSet<_>>();
+        let before = chunks.len();
+        chunks.retain(|chunk| {
+            !processed.contains(&(chunk.user_id.as_str(), chunk.sequence, chunk.start_ms))
+        });
+        let skipped = before.saturating_sub(chunks.len());
+        if skipped > 0 {
+            debug!(
+                meeting_dir = %meeting_dir.display(),
+                skipped_chunks = skipped,
+                "skipping chunks already completed by live transcription"
+            );
+        }
+    }
+
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let sample_rate = chunks.first().map(|c| c.sample_rate).unwrap_or(48_000);
     if chunks.iter().any(|c| c.sample_rate != sample_rate) {
         return Err("mixed sample rates are not supported".to_owned());
     }
-
-    let meeting_start_ms = compute_meeting_start_ms(&chunks);
 
     let mut per_user: HashMap<String, Vec<LoadedChunk>> = HashMap::new();
     for chunk in chunks {

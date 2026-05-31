@@ -54,7 +54,8 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(20),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
     session.ingest_frame(

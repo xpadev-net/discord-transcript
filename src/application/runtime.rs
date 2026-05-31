@@ -10,10 +10,11 @@ use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::enqueue_summary_job;
 use crate::audio::meeting_audio::{
-    build_speaker_audio_inputs, compute_meeting_start_ms, load_chunks,
+    ProcessedAudioChunk, build_speaker_audio_inputs,
+    build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
 };
 use crate::audio::receiver::ReceiverConfig;
-use crate::audio::recording_session::RecordingSession;
+use crate::audio::recording_session::{PersistedChunk, RecordingSession};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
 use crate::bootstrap::config::{AppConfig, SummaryHarness};
 use crate::domain::authz::UserRole;
@@ -24,6 +25,7 @@ use crate::domain::transcript::{
     normalize_segments, render_for_summary,
 };
 use crate::domain::{MeetingStatus, StopReason};
+use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
 };
@@ -61,7 +63,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -431,6 +433,322 @@ fn persist_transcript_segments<E: SqlExecutor>(
     executor.execute(&sql, &params).map(|_| ()).map_err(|err| {
         TranscriptPersistError::Database(format!("failed to persist transcript segments: {err}"))
     })
+}
+
+fn live_chunk_id(chunk: &PersistedChunk) -> String {
+    format!(
+        "{}-{}-{}-{}",
+        chunk.meeting_id, chunk.user_id, chunk.sequence, chunk.start_ms
+    )
+}
+
+fn live_transcript_row_id(chunk_id: &str, segment_index: usize) -> String {
+    format!("{chunk_id}-seg-{segment_index}")
+}
+
+fn build_live_insert_transcripts_sql(count: usize, param_offset: usize) -> String {
+    let mut sql = String::from(
+        "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy, source, transcript_stage, live_chunk_id) VALUES ",
+    );
+    for i in 0..count {
+        let base = i * 10 + param_offset;
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!(
+            "(${}, ${}, ${}, ${}::TEXT::INTEGER, ${}::TEXT::INTEGER, ${}, NULLIF(${},'')::TEXT::DOUBLE PRECISION, ${}::TEXT::BOOLEAN, ${}, 'live', ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+        ));
+    }
+    sql.push_str(
+        " ON CONFLICT (id) DO UPDATE SET \
+        meeting_id = EXCLUDED.meeting_id, \
+        speaker_id = EXCLUDED.speaker_id, \
+        start_ms = EXCLUDED.start_ms, \
+        end_ms = EXCLUDED.end_ms, \
+        text = EXCLUDED.text, \
+        confidence = EXCLUDED.confidence, \
+        is_noisy = EXCLUDED.is_noisy, \
+        source = EXCLUDED.source, \
+        transcript_stage = EXCLUDED.transcript_stage, \
+        live_chunk_id = EXCLUDED.live_chunk_id",
+    );
+    sql
+}
+
+fn mark_live_transcription_chunk_running<E: SqlExecutor>(
+    executor: &mut E,
+    chunk: &PersistedChunk,
+    timeline_base_ms: u64,
+) -> Result<(), String> {
+    executor
+        .execute(
+            "INSERT INTO live_transcription_chunks \
+             (id, meeting_id, speaker_id, sequence, start_ms, timeline_base_ms, status, error_message, attempt_count, updated_at) \
+             VALUES ($1, $2, $3, $4::TEXT::BIGINT, $5::TEXT::BIGINT, $6::TEXT::BIGINT, 'running', NULL, 1, NOW()) \
+             ON CONFLICT (id) DO UPDATE SET \
+             status='running', error_message=NULL, timeline_base_ms=EXCLUDED.timeline_base_ms, attempt_count=live_transcription_chunks.attempt_count + 1, updated_at=NOW()",
+            &[
+                live_chunk_id(chunk),
+                chunk.meeting_id.clone(),
+                chunk.user_id.clone(),
+                chunk.sequence.to_string(),
+                chunk.start_ms.to_string(),
+                timeline_base_ms.to_string(),
+            ],
+        )
+        .map(|_| ())
+}
+
+fn persist_live_transcription_success<E: SqlExecutor>(
+    executor: &mut E,
+    chunk: &PersistedChunk,
+    segments: &[TranscriptSegment],
+) -> Result<(), TranscriptPersistError> {
+    let chunk_id = live_chunk_id(chunk);
+    executor.execute("BEGIN", &[]).map(|_| ()).map_err(|err| {
+        TranscriptPersistError::Database(format!(
+            "failed to begin live transcript transaction: {err}"
+        ))
+    })?;
+
+    let result = (|| {
+        executor
+            .execute(
+                "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live' AND live_chunk_id=$2",
+                &[chunk.meeting_id.clone(), chunk_id.clone()],
+            )
+            .map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to clear old live transcript chunk rows: {err}"
+                ))
+            })?;
+
+        if !segments.is_empty() {
+            let sql = build_live_insert_transcripts_sql(segments.len(), 0);
+            let mut params = Vec::with_capacity(segments.len() * 10);
+            for (i, seg) in segments.iter().enumerate() {
+                let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)
+                    .map_err(TranscriptPersistError::Validation)?;
+                let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)
+                    .map_err(TranscriptPersistError::Validation)?;
+                params.push(live_transcript_row_id(&chunk_id, i));
+                params.push(chunk.meeting_id.clone());
+                params.push(seg.speaker_id.clone());
+                params.push(start_ms.to_string());
+                params.push(end_ms.to_string());
+                params.push(seg.text.clone());
+                params.push(seg.confidence.map(|c| c.to_string()).unwrap_or_default());
+                params.push(seg.is_noisy.to_string());
+                params.push(seg.source.as_str().to_owned());
+                params.push(chunk_id.clone());
+            }
+            executor.execute(&sql, &params).map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to persist live transcript segments: {err}"
+                ))
+            })?;
+        }
+
+        executor
+            .execute(
+                "UPDATE live_transcription_chunks SET status='done', error_message=NULL, updated_at=NOW() WHERE id=$1",
+                &[chunk_id],
+            )
+            .map(|_| ())
+            .map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to mark live transcription chunk done: {err}"
+                ))
+            })
+    })();
+
+    match result {
+        Ok(()) => executor.execute("COMMIT", &[]).map(|_| ()).map_err(|err| {
+            TranscriptPersistError::Database(format!(
+                "failed to commit live transcript transaction: {err}"
+            ))
+        }),
+        Err(err) => {
+            let _ = executor.execute("ROLLBACK", &[]);
+            Err(err)
+        }
+    }
+}
+
+fn mark_live_transcription_chunk_failed<E: SqlExecutor>(
+    executor: &mut E,
+    chunk: &PersistedChunk,
+    error_message: &str,
+) -> Result<(), String> {
+    let chunk_id = live_chunk_id(chunk);
+    executor
+        .execute("BEGIN", &[])
+        .map_err(|err| format!("failed to begin live failure transaction: {err}"))?;
+    let result = (|| {
+        executor.execute(
+            "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live' AND live_chunk_id=$2",
+            &[chunk.meeting_id.clone(), chunk_id.clone()],
+        )?;
+        executor
+            .execute(
+                "UPDATE live_transcription_chunks SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
+                &[chunk_id, error_message.to_owned()],
+            )
+            .map(|_| ())
+    })();
+    match result {
+        Ok(()) => executor
+            .execute("COMMIT", &[])
+            .map(|_| ())
+            .map_err(|err| format!("failed to commit live failure transaction: {err}")),
+        Err(err) => {
+            let _ = executor.execute("ROLLBACK", &[]);
+            Err(err)
+        }
+    }
+}
+
+fn parse_transcript_row(row: &[Option<String>]) -> Result<TranscriptSegment, String> {
+    let get = |index: usize, name: &str| -> Result<String, String> {
+        row.get(index)
+            .and_then(|value| value.clone())
+            .ok_or_else(|| format!("transcript row missing {name}"))
+    };
+    let speaker_id = get(0, "speaker_id")?;
+    let start_ms = get(1, "start_ms")?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid transcript start_ms: {err}"))?;
+    let end_ms = get(2, "end_ms")?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid transcript end_ms: {err}"))?;
+    let text = get(3, "text")?;
+    let confidence = row
+        .get(4)
+        .and_then(|value| value.as_ref())
+        .map(|value| {
+            value
+                .parse::<f32>()
+                .map_err(|err| format!("invalid transcript confidence: {err}"))
+        })
+        .transpose()?;
+    let is_noisy = get(5, "is_noisy")?
+        .parse::<bool>()
+        .map_err(|err| format!("invalid transcript is_noisy: {err}"))?;
+    let source = TranscriptSource::parse_str(&get(6, "source")?)
+        .ok_or_else(|| "invalid transcript source".to_owned())?;
+    Ok(TranscriptSegment {
+        speaker_id,
+        start_ms,
+        end_ms,
+        text,
+        confidence,
+        is_noisy,
+        source,
+        merged_count: 1,
+    })
+}
+
+fn load_live_transcript_segments<E: SqlExecutor>(
+    executor: &mut E,
+    meeting_id: &str,
+    final_timeline_base_ms: u64,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let rows = executor.query_rows(
+        "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, c.timeline_base_ms \
+         FROM transcripts t \
+         INNER JOIN live_transcription_chunks c ON c.id = t.live_chunk_id AND c.status='done' \
+         WHERE t.meeting_id=$1 AND t.transcript_stage='live' AND NOT t.is_deleted \
+         ORDER BY t.start_ms, t.end_ms, t.speaker_id, t.id",
+        &[meeting_id.to_owned()],
+    )?;
+    let mut segments = rows
+        .iter()
+        .map(|row| {
+            let mut segment = parse_transcript_row(row)?;
+            if let Some(Some(base)) = row.get(7) {
+                let live_base = base
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid live timeline_base_ms: {err}"))?;
+                if live_base >= final_timeline_base_ms {
+                    let delta = live_base - final_timeline_base_ms;
+                    segment.start_ms = segment.start_ms.saturating_add(delta);
+                    segment.end_ms = segment.end_ms.saturating_add(delta);
+                } else {
+                    let delta = final_timeline_base_ms - live_base;
+                    segment.start_ms = segment.start_ms.saturating_sub(delta);
+                    segment.end_ms = segment.end_ms.saturating_sub(delta);
+                }
+            }
+            Ok(segment)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    segments.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(a.speaker_id.cmp(&b.speaker_id))
+    });
+    Ok(segments)
+}
+
+fn final_transcript_rows_exist<E: SqlExecutor>(
+    executor: &mut E,
+    meeting_id: &str,
+) -> Result<bool, String> {
+    executor
+        .query_rows(
+            "SELECT 1 FROM transcripts WHERE meeting_id=$1 AND transcript_stage='final' AND NOT is_deleted LIMIT 1",
+            &[meeting_id.to_owned()],
+        )
+        .map(|rows| !rows.is_empty())
+}
+
+fn load_completed_live_transcription_chunks<E: SqlExecutor>(
+    executor: &mut E,
+    meeting_id: &str,
+) -> Result<Vec<ProcessedAudioChunk>, String> {
+    let rows = executor.query_rows(
+        "SELECT speaker_id, sequence, start_ms \
+         FROM live_transcription_chunks \
+         WHERE meeting_id=$1 AND status='done' \
+         ORDER BY start_ms, speaker_id, sequence",
+        &[meeting_id.to_owned()],
+    )?;
+    rows.iter()
+        .map(|row| {
+            let speaker_id = row
+                .first()
+                .and_then(|value| value.clone())
+                .ok_or_else(|| "live chunk row missing speaker_id".to_owned())?;
+            let sequence = row
+                .get(1)
+                .and_then(|value| value.clone())
+                .ok_or_else(|| "live chunk row missing sequence".to_owned())?
+                .parse::<u64>()
+                .map_err(|err| format!("invalid live chunk sequence: {err}"))?;
+            let start_ms = row
+                .get(2)
+                .and_then(|value| value.clone())
+                .ok_or_else(|| "live chunk row missing start_ms".to_owned())?
+                .parse::<u64>()
+                .map_err(|err| format!("invalid live chunk start_ms: {err}"))?;
+            Ok(ProcessedAudioChunk {
+                speaker_id,
+                sequence,
+                start_ms,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1057,6 +1375,8 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
         ))),
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        live_transcription_bases: Arc::new(Mutex::new(HashMap::new())),
+        live_transcription_gate: Arc::new(Semaphore::new(1)),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         command_gate: Arc::new(RwLock::new(())),
         voice_event_gate: Arc::new(RwLock::new(())),
@@ -1129,6 +1449,8 @@ struct ScaffoldHandler {
     queue: Arc<Mutex<SqlJobQueue<PgSqlExecutor>>>,
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
+    live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
+    live_transcription_gate: Arc<Semaphore>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     command_gate: Arc<RwLock<()>>,
     voice_event_gate: Arc<RwLock<()>>,
@@ -1171,6 +1493,217 @@ impl ScaffoldHandler {
             return;
         }
         self.task_tracker.spawn(future);
+    }
+
+    async fn live_transcription_base_for_chunks(&self, chunks: &[PersistedChunk]) -> Option<u64> {
+        let base_start_ms = chunks.iter().map(|chunk| chunk.start_ms).min()?;
+        let mut bases = self.live_transcription_bases.lock().await;
+        let entry = bases
+            .entry(chunks[0].meeting_id.clone())
+            .or_insert(base_start_ms);
+        if base_start_ms < *entry {
+            *entry = base_start_ms;
+        }
+        Some(*entry)
+    }
+
+    fn spawn_live_transcription_tasks(&self, chunks: Vec<PersistedChunk>, base_start_ms: u64) {
+        for chunk in chunks {
+            let runtime = self.clone();
+            self.spawn_background(async move {
+                runtime
+                    .process_live_transcription_chunk(chunk, base_start_ms)
+                    .await;
+            });
+        }
+    }
+
+    async fn process_live_transcription_chunk(&self, chunk: PersistedChunk, base_start_ms: u64) {
+        let Ok(_permit) = Arc::clone(&self.live_transcription_gate)
+            .acquire_owned()
+            .await
+        else {
+            warn!(
+                meeting_id = %chunk.meeting_id,
+                user_id = %chunk.user_id,
+                sequence = chunk.sequence,
+                "live transcription semaphore closed; skipping chunk"
+            );
+            return;
+        };
+
+        if let Err(err) = {
+            let mut service = self.service.lock().await;
+            mark_live_transcription_chunk_running(
+                &mut service.store.executor,
+                &chunk,
+                base_start_ms,
+            )
+        } {
+            warn!(
+                meeting_id = %chunk.meeting_id,
+                user_id = %chunk.user_id,
+                sequence = chunk.sequence,
+                error = %err,
+                "failed to mark live transcription chunk running"
+            );
+            return;
+        }
+
+        let whisper = CommandWhisperClient {
+            endpoint: self.whisper_endpoint.clone(),
+            curl_bin: "curl".to_owned(),
+            retry_policy: self.integration_retry_policy,
+            beam_size: self.whisper_beam_size,
+            suppress_non_speech: self.whisper_suppress_non_speech,
+            prompt: self.whisper_prompt.clone(),
+            vad: self.whisper_vad,
+            temperature: self.whisper_temperature,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: chunk.saved.path.to_string_lossy().to_string(),
+            language: self.whisper_language.clone(),
+        };
+        let transcription = tokio::task::block_in_place(|| whisper.infer(&request));
+        let mut segments = match transcription {
+            Ok(output) => {
+                let offset_ms = chunk.start_ms.saturating_sub(base_start_ms);
+                let mut segments = output
+                    .segments
+                    .into_iter()
+                    .map(|mut segment| {
+                        segment.speaker_id = chunk.user_id.clone();
+                        segment.start_ms = segment.start_ms.saturating_add(offset_ms);
+                        segment.end_ms = segment.end_ms.saturating_add(offset_ms);
+                        segment
+                    })
+                    .collect::<Vec<_>>();
+                segments.sort_by(|a, b| {
+                    a.start_ms
+                        .cmp(&b.start_ms)
+                        .then(a.end_ms.cmp(&b.end_ms))
+                        .then(a.speaker_id.cmp(&b.speaker_id))
+                });
+                normalize_segments(&segments, NormalizationConfig::default())
+            }
+            Err(err) => {
+                let error_message = err.to_string();
+                let mark_result = {
+                    let mut service = self.service.lock().await;
+                    mark_live_transcription_chunk_failed(
+                        &mut service.store.executor,
+                        &chunk,
+                        &error_message,
+                    )
+                };
+                if let Err(mark_err) = mark_result {
+                    warn!(
+                        meeting_id = %chunk.meeting_id,
+                        user_id = %chunk.user_id,
+                        sequence = chunk.sequence,
+                        error = %mark_err,
+                        "failed to mark live transcription chunk failed"
+                    );
+                }
+                warn!(
+                    meeting_id = %chunk.meeting_id,
+                    user_id = %chunk.user_id,
+                    sequence = chunk.sequence,
+                    error = %error_message,
+                    "live transcription chunk failed; final transcription will retry this audio"
+                );
+                return;
+            }
+        };
+        segments.retain(|segment| !segment.text.trim().is_empty());
+
+        let persist_result = {
+            let mut service = self.service.lock().await;
+            // Keep the finalization admission check and live row write in one
+            // critical section. Final transcript persistence uses the same
+            // service lock, so it cannot interleave between the status check
+            // and the live insert.
+            let status_allows_live_write = service
+                .store
+                .get_meeting(&chunk.meeting_id)
+                .ok()
+                .flatten()
+                .is_some_and(|meeting| {
+                    matches!(
+                        meeting.status,
+                        MeetingStatus::Recording | MeetingStatus::Stopping
+                    )
+                });
+            let final_rows_exist =
+                match final_transcript_rows_exist(&mut service.store.executor, &chunk.meeting_id) {
+                    Ok(exists) => exists,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %chunk.meeting_id,
+                            user_id = %chunk.user_id,
+                            sequence = chunk.sequence,
+                            error = %err,
+                            "failed to inspect final transcript rows before live write"
+                        );
+                        true
+                    }
+                };
+            let live_write_allowed = status_allows_live_write && !final_rows_exist;
+            if !live_write_allowed {
+                let error_message =
+                    "live transcription finished after final transcription started".to_owned();
+                let mark_result = mark_live_transcription_chunk_failed(
+                    &mut service.store.executor,
+                    &chunk,
+                    &error_message,
+                );
+                if let Err(mark_err) = mark_result {
+                    warn!(
+                        meeting_id = %chunk.meeting_id,
+                        user_id = %chunk.user_id,
+                        sequence = chunk.sequence,
+                        error = %mark_err,
+                        "failed to mark late live transcription chunk failed"
+                    );
+                }
+                debug!(
+                    meeting_id = %chunk.meeting_id,
+                    user_id = %chunk.user_id,
+                    sequence = chunk.sequence,
+                    "discarded late live transcription result"
+                );
+                return;
+            }
+            persist_live_transcription_success(&mut service.store.executor, &chunk, &segments)
+        };
+        if let Err(err) = persist_result {
+            let error_message = err.to_string();
+            let mark_result = {
+                let mut service = self.service.lock().await;
+                mark_live_transcription_chunk_failed(
+                    &mut service.store.executor,
+                    &chunk,
+                    &error_message,
+                )
+            };
+            if let Err(mark_err) = mark_result {
+                warn!(
+                    meeting_id = %chunk.meeting_id,
+                    user_id = %chunk.user_id,
+                    sequence = chunk.sequence,
+                    error = %mark_err,
+                    "failed to mark live transcription persist failure"
+                );
+            }
+            warn!(
+                meeting_id = %chunk.meeting_id,
+                user_id = %chunk.user_id,
+                sequence = chunk.sequence,
+                error = %error_message,
+                "failed to persist live transcription chunk"
+            );
+        }
     }
 
     fn reject_if_shutting_down(&self) -> Result<(), String> {
@@ -2075,6 +2608,10 @@ impl ScaffoldHandler {
             let mut tracker = self.ssrc_tracker.lock().await;
             *tracker = SsrcTracker::new();
         }
+        {
+            let mut bases = self.live_transcription_bases.lock().await;
+            bases.remove(&meeting_id);
+        }
         // Insert session BEFORE joining VC so voice events aren't dropped
         {
             let mut sessions = self.sessions.lock().await;
@@ -2721,51 +3258,104 @@ impl ScaffoldHandler {
                 }
             };
 
-        let speaker_audio =
-            match build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k) {
+        let final_timeline_base_ms = match load_chunks(&meeting_dir) {
+            Ok(chunks) => compute_meeting_start_ms(&chunks),
+            Err(err) => {
+                warn!(
+                    meeting_id = %meeting.id,
+                    error = %err,
+                    "failed to compute final transcript timeline base; live transcript rows will not be timeline-adjusted"
+                );
+                0
+            }
+        };
+
+        let (live_segments, completed_live_chunks) = {
+            let mut service = self.service.lock().await;
+            let live_segments = match load_live_transcript_segments(
+                &mut service.store.executor,
+                &meeting.id,
+                final_timeline_base_ms,
+            ) {
                 Ok(value) => value,
                 Err(err) => {
-                    let mut queue = self.queue.lock().await;
-                    let exhausted = retry_claimed_summary_job(
-                        &mut *queue,
-                        &claimed_job,
-                        err.to_string(),
-                        self.summary_max_retries,
-                        "transcription_input",
+                    warn!(
+                        meeting_id = %meeting.id,
+                        error = %err,
+                        "failed to load live transcript segments; final transcription will process all audio"
                     );
-                    drop(queue);
-                    if exhausted {
-                        let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(
-                            &claimed_job.meeting_id,
-                            MeetingStatus::Failed,
-                            None,
-                        );
-                        let _ = service
-                            .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
-                        drop(service);
-                        if let Err(status_err) = self
-                            .update_status_message(
-                                http,
-                                &claimed_job.meeting_id,
-                                StatusMessageUpdate::Failed {
-                                    phase: "transcription_input",
-                                    error: &err,
-                                },
-                            )
-                            .await
-                        {
-                            warn!(
-                                meeting_id = %claimed_job.meeting_id,
-                                error = %status_err,
-                                "failed to update status message after speaker audio error"
-                            );
-                        }
-                    }
-                    return Err(SummaryJobRunError::Terminal(err));
+                    Vec::new()
                 }
             };
+            let completed_live_chunks = match load_completed_live_transcription_chunks(
+                &mut service.store.executor,
+                &meeting.id,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting.id,
+                        error = %err,
+                        "failed to load completed live chunks; final transcription will process all audio"
+                    );
+                    Vec::new()
+                }
+            };
+            (live_segments, completed_live_chunks)
+        };
+
+        let speaker_audio = match if completed_live_chunks.is_empty() {
+            build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k)
+        } else {
+            build_speaker_audio_inputs_excluding_processed_chunks(
+                &meeting_dir,
+                self.whisper_resample_to_16k,
+                &completed_live_chunks,
+            )
+        } {
+            Ok(value) => value,
+            Err(err) => {
+                let mut queue = self.queue.lock().await;
+                let exhausted = retry_claimed_summary_job(
+                    &mut *queue,
+                    &claimed_job,
+                    err.to_string(),
+                    self.summary_max_retries,
+                    "transcription_input",
+                );
+                drop(queue);
+                if exhausted {
+                    let mut service = self.service.lock().await;
+                    let _ = service.store.set_meeting_status(
+                        &claimed_job.meeting_id,
+                        MeetingStatus::Failed,
+                        None,
+                    );
+                    let _ = service
+                        .store
+                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
+                    drop(service);
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "transcription_input",
+                                error: &err,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %status_err,
+                            "failed to update status message after speaker audio error"
+                        );
+                    }
+                }
+                return Err(SummaryJobRunError::Terminal(err));
+            }
+        };
 
         let request = crate::application::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
@@ -2829,9 +3419,27 @@ impl ScaffoldHandler {
             );
         }
 
-        let transcription = tokio::task::block_in_place(|| {
-            crate::application::summary::run_transcription(&whisper, &request)
-        });
+        let transcription = if request.speaker_audio.is_empty() && !completed_live_chunks.is_empty()
+        {
+            crate::application::summary::build_transcription_output(live_segments.clone())
+        } else {
+            tokio::task::block_in_place(|| {
+                crate::application::summary::run_transcription(&whisper, &request)
+            })
+            .and_then(|mut output| {
+                if live_segments.is_empty() {
+                    return Ok(output);
+                }
+                output.segments.extend(live_segments.clone());
+                output.segments.sort_by(|a, b| {
+                    a.start_ms
+                        .cmp(&b.start_ms)
+                        .then(a.end_ms.cmp(&b.end_ms))
+                        .then(a.speaker_id.cmp(&b.speaker_id))
+                });
+                crate::application::summary::build_transcription_output(output.segments)
+            })
+        };
         let mut transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
@@ -3544,11 +4152,28 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                 let tracker = self.tracker.lock().await;
                 let adapted = adapt_voice_tick(tick, ts, &tracker);
                 drop(tracker);
-                let mut sessions = self.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&self.guild_id)
-                    && let Err(err) = ingest_voice_frames_into_session(session, &adapted)
+                let persisted_chunks = {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&self.guild_id) {
+                        match ingest_voice_frames_into_session(session, &adapted) {
+                            Ok(chunks) => chunks,
+                            Err(err) => {
+                                warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if !persisted_chunks.is_empty()
+                    && let Some(base_start_ms) = self
+                        .runtime
+                        .live_transcription_base_for_chunks(&persisted_chunks)
+                        .await
                 {
-                    warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
+                    self.runtime
+                        .spawn_live_transcription_tasks(persisted_chunks, base_start_ms);
                 }
             }
             EventContext::DriverDisconnect(data) => {
@@ -3737,7 +4362,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
 pub fn ingest_voice_frames_into_session(
     session: &mut RecordingSession<LocalChunkStorage>,
     adapted: &AdaptedVoiceFrames,
-) -> Result<usize, String> {
+) -> Result<Vec<PersistedChunk>, String> {
     for (user_id, frame) in &adapted.per_user {
         session.ingest_frame(user_id, frame.clone());
     }
@@ -3752,7 +4377,7 @@ pub fn ingest_voice_frames_into_session(
                     "some audio chunks could not be persisted during ingest flush"
                 );
             }
-            result.persisted.len()
+            result.persisted
         })
         .map_err(|err| err.to_string())
 }
@@ -4056,6 +4681,7 @@ mod status_message_tests {
             },
             ReceiverConfig {
                 chunk_duration: Duration::from_secs(20),
+                silence_flush_duration: Duration::from_secs(30),
             },
             48_000,
         );
@@ -4401,6 +5027,19 @@ mod status_message_tests {
         }
     }
 
+    fn persisted_chunk_for_live_test() -> PersistedChunk {
+        PersistedChunk {
+            meeting_id: "m1".to_owned(),
+            user_id: "alice".to_owned(),
+            sequence: 7,
+            start_ms: 1_000_000,
+            saved: SavedChunk {
+                path: std::env::temp_dir().join("live-test.wav"),
+                size_bytes: 44,
+            },
+        }
+    }
+
     #[test]
     fn transcript_persist_rejects_timestamp_above_db_integer_range() {
         let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
@@ -4452,6 +5091,118 @@ mod status_message_tests {
                 .contains("failed to persist transcript segments")
         );
         assert!(err.to_string().contains("integer out of range"));
+    }
+
+    #[test]
+    fn live_transcript_success_marks_chunk_done_and_uses_live_stage() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let chunk = persisted_chunk_for_live_test();
+        let segment = transcript_segment(500, 1_000);
+
+        persist_live_transcription_success(&mut executor, &chunk, &[segment])
+            .expect("live transcript should persist");
+
+        assert!(
+            executor.executed.iter().any(|(sql, params)| sql
+                .contains("transcript_stage, live_chunk_id")
+                && sql.contains("'live'")
+                && params.contains(&"m1-alice-7-1000000".to_owned())),
+            "live transcript insert should mark rows as live and link the source chunk"
+        );
+        assert!(
+            executor.executed.iter().any(|(sql, params)| {
+                sql.contains("UPDATE live_transcription_chunks SET status='done'")
+                    && params == &vec!["m1-alice-7-1000000".to_owned()]
+            }),
+            "source chunk should be marked done after row persistence"
+        );
+    }
+
+    #[test]
+    fn failed_live_chunk_deletes_any_staged_rows() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let chunk = persisted_chunk_for_live_test();
+
+        mark_live_transcription_chunk_failed(&mut executor, &chunk, "boom")
+            .expect("failed chunk should be marked");
+
+        assert!(
+            executor.executed.iter().any(|(sql, params)| {
+                sql.contains("DELETE FROM transcripts")
+                    && sql.contains("transcript_stage='live'")
+                    && params == &vec!["m1".to_owned(), "m1-alice-7-1000000".to_owned()]
+            }),
+            "failed live chunks should remove staged live rows"
+        );
+        assert!(
+            executor.executed.iter().any(|(sql, params)| {
+                sql.contains("UPDATE live_transcription_chunks SET status='failed'")
+                    && params == &vec!["m1-alice-7-1000000".to_owned(), "boom".to_owned()]
+            }),
+            "source chunk should be marked failed"
+        );
+    }
+
+    #[test]
+    fn final_transcript_rows_block_late_live_writes() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let sql = "SELECT 1 FROM transcripts WHERE meeting_id=$1 AND transcript_stage='final' AND NOT is_deleted LIMIT 1";
+        executor.query_rows_result.insert(
+            format!("{}|{}", sql, "m1"),
+            vec![vec![Some("1".to_owned())]],
+        );
+
+        assert!(
+            final_transcript_rows_exist(&mut executor, "m1")
+                .expect("final row check should succeed")
+        );
+    }
+
+    #[test]
+    fn live_transcript_loader_rebases_and_sorts_rows_to_final_timeline() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let sql = "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, c.timeline_base_ms \
+         FROM transcripts t \
+         INNER JOIN live_transcription_chunks c ON c.id = t.live_chunk_id AND c.status='done' \
+         WHERE t.meeting_id=$1 AND t.transcript_stage='live' AND NOT t.is_deleted \
+         ORDER BY t.start_ms, t.end_ms, t.speaker_id, t.id";
+        let key = format!("{}|{}", sql, "m1");
+        executor.query_rows_result.insert(
+            key,
+            vec![
+                vec![
+                    Some("later".to_owned()),
+                    Some("0".to_owned()),
+                    Some("500".to_owned()),
+                    Some("later".to_owned()),
+                    Some("0.9".to_owned()),
+                    Some("false".to_owned()),
+                    Some("voice".to_owned()),
+                    Some("2000".to_owned()),
+                ],
+                vec![
+                    Some("earlier".to_owned()),
+                    Some("0".to_owned()),
+                    Some("500".to_owned()),
+                    Some("earlier".to_owned()),
+                    Some("0.9".to_owned()),
+                    Some("false".to_owned()),
+                    Some("voice".to_owned()),
+                    Some("1000".to_owned()),
+                ],
+            ],
+        );
+
+        let segments = load_live_transcript_segments(&mut executor, "m1", 1_000)
+            .expect("live transcript should load");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].speaker_id, "earlier");
+        assert_eq!(segments[0].start_ms, 0);
+        assert_eq!(segments[0].end_ms, 500);
+        assert_eq!(segments[1].speaker_id, "later");
+        assert_eq!(segments[1].start_ms, 1_000);
+        assert_eq!(segments[1].end_ms, 1_500);
     }
 
     #[test]

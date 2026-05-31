@@ -10,7 +10,8 @@ fn recorder_engine_flushes_wav_chunk_when_due() {
     let mut engine = RecorderEngine::new(
         ReceiverConfig {
             chunk_duration: Duration::from_secs(20),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 

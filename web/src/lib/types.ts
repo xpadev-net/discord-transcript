@@ -78,6 +78,12 @@ export interface TranscriptResponse {
   updated_at: string | null;
 }
 
+export interface TranscriptStateResponse {
+  status: string;
+  is_final: boolean;
+  updated_at: string | null;
+}
+
 export type TranscriptStreamState =
   | "idle"
   | "connecting"
