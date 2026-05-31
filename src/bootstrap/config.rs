@@ -562,7 +562,7 @@ fn optional_from_map_parse_bool(
     parse_bool(&value).ok_or(ConfigError::InvalidEnv { key, value })
 }
 
-fn is_iso639_1_format(s: &str) -> bool {
+pub(crate) fn is_iso639_1_format(s: &str) -> bool {
     s.len() == 2 && s.bytes().all(|b| b.is_ascii_lowercase())
 }
 
