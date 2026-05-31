@@ -122,7 +122,7 @@ button {
 
 .primary-button:hover:not(:disabled),
 .primary-button:focus-visible {
-  background: #3b7fe2;
+  background: color-mix(in srgb, var(--accent) 80%, #000 20%);
 }
 
 .primary-button:focus-visible {
