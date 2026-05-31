@@ -1,16 +1,19 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
@@ -199,6 +202,10 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/meetings/{meeting_id}/transcript/state",
             get(api_transcript_state),
+        )
+        .route(
+            "/api/meetings/{meeting_id}/transcript/events",
+            get(api_transcript_events),
         )
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
         .route("/api/meetings/{meeting_id}/audio", get(api_audio))
@@ -1704,6 +1711,7 @@ struct SpeakerResponse {
 
 #[derive(Serialize)]
 struct TranscriptSegmentResponse {
+    id: String,
     speaker_id: String,
     speaker: SpeakerResponse,
     start_ms: i32,
@@ -1715,10 +1723,24 @@ struct TranscriptSegmentResponse {
 }
 
 #[derive(Serialize)]
+struct TranscriptResponse {
+    segments: Vec<TranscriptSegmentResponse>,
+    status: String,
+    is_final: bool,
+    updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
 struct TranscriptStateResponse {
     status: String,
     is_final: bool,
     updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptStreamCursor {
+    created_at: String,
+    id: String,
 }
 
 #[derive(Serialize)]
@@ -1997,7 +2019,7 @@ fn transcript_source_for_api(raw: Option<String>) -> Result<String, ()> {
 }
 
 fn api_transcript_sql() -> &'static str {
-    "SELECT t.speaker_id, \
+    "SELECT t.id, t.speaker_id, \
             CASE WHEN t.transcript_stage='live' AND c.timeline_base_ms IS NOT NULL AND lb.min_base_ms IS NOT NULL \
                  THEN (t.start_ms::BIGINT + (c.timeline_base_ms - lb.min_base_ms))::INTEGER \
                  ELSE t.start_ms \
@@ -2007,6 +2029,7 @@ fn api_transcript_sql() -> &'static str {
                  ELSE t.end_ms \
             END AS end_ms, \
             t.text, t.confidence, t.is_noisy, t.source, \
+            to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at, \
             ms.username, ms.nickname, ms.display_name \
      FROM transcripts t \
      LEFT JOIN live_transcription_chunks c \
@@ -2023,24 +2046,199 @@ fn api_transcript_sql() -> &'static str {
        ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id \
      WHERE t.meeting_id=$1 AND NOT t.is_deleted \
        AND (t.transcript_stage='final' OR (NOT fb.has_final_rows AND c.id IS NOT NULL)) \
-     ORDER BY start_ms, end_ms, t.speaker_id, t.id"
+       AND ($2::text IS NULL OR (t.created_at, t.id) > (($2::text)::timestamptz, $3)) \
+     ORDER BY t.created_at, t.id"
 }
 
 async fn api_transcript(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
-) -> Result<Json<Vec<TranscriptSegmentResponse>>, StatusCode> {
+) -> Result<Json<TranscriptResponse>, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let (response, _) = load_transcript_response(&state, &meeting_id, None).await?;
+    Ok(Json(response))
+}
+
+async fn api_transcript_events(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+
+    let stream = stream::unfold(
+        (
+            state,
+            user_id,
+            meeting_id,
+            None::<TranscriptStreamCursor>,
+            tokio::time::interval(Duration::from_secs(2)),
+            false,
+        ),
+        |(state, user_id, meeting_id, cursor, mut interval, finished)| async move {
+            if finished {
+                return None;
+            }
+
+            interval.tick().await;
+
+            if let Err(status) = verify_meeting_access(&state, &meeting_id, &user_id).await {
+                let code = match status {
+                    StatusCode::FORBIDDEN => "forbidden",
+                    StatusCode::NOT_FOUND => "not_found",
+                    StatusCode::SERVICE_UNAVAILABLE => "auth_unavailable",
+                    _ => "unavailable",
+                };
+                let event = Event::default()
+                    .event("stream-error")
+                    .data(format!(r#"{{"code":"{code}"}}"#));
+                return Some((
+                    Ok(event),
+                    (state, user_id, meeting_id, cursor, interval, true),
+                ));
+            }
+
+            match load_transcript_response(&state, &meeting_id, cursor.as_ref()).await {
+                Ok((response, next_cursor)) => {
+                    let is_final = response.is_final;
+                    let event = match serde_json::to_string(&response) {
+                        Ok(data) => Event::default().event("segments").data(data),
+                        Err(err) => Event::default().event("stream-error").data(
+                            serde_json::json!({
+                                "code": "encode",
+                                "message": err.to_string(),
+                            })
+                            .to_string(),
+                        ),
+                    };
+                    Some((
+                        Ok(event),
+                        (
+                            state,
+                            user_id,
+                            meeting_id,
+                            next_cursor.or(cursor),
+                            interval,
+                            is_final,
+                        ),
+                    ))
+                }
+                Err(_) => {
+                    let event = Event::default()
+                        .event("stream-error")
+                        .data(r#"{"code":"transcript_unavailable"}"#);
+                    Some((
+                        Ok(event),
+                        (state, user_id, meeting_id, cursor, interval, false),
+                    ))
+                }
+            }
+        },
+    );
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn load_transcript_response(
+    state: &WebState,
+    meeting_id: &str,
+    cursor: Option<&TranscriptStreamCursor>,
+) -> Result<(TranscriptResponse, Option<TranscriptStreamCursor>), StatusCode> {
+    let metadata = load_transcript_metadata(state, meeting_id).await?;
+    let (segments, next_cursor) = load_transcript_segments_after(state, meeting_id, cursor).await?;
+    let updated_at = next_cursor
+        .as_ref()
+        .map(|cursor| cursor.created_at.clone())
+        .or(metadata.updated_at.clone());
+    let is_final = transcript_metadata_is_final(&metadata);
+
+    Ok((
+        TranscriptResponse {
+            segments,
+            status: metadata.status,
+            is_final,
+            updated_at,
+        },
+        next_cursor,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptMetadata {
+    status: String,
+    has_final_rows: bool,
+    has_live_rows: bool,
+    updated_at: Option<String>,
+}
+
+fn transcript_metadata_is_final(metadata: &TranscriptMetadata) -> bool {
+    metadata.has_final_rows
+        || matches!(
+            metadata.status.as_str(),
+            "posted" | "failed" | "aborted" | "done"
+        )
+        || (!metadata.has_live_rows
+            && !matches!(
+                metadata.status.as_str(),
+                "recording" | "stopping" | "transcribing" | "summarizing" | "processing"
+            ))
+}
+
+async fn load_transcript_metadata(
+    state: &WebState,
+    meeting_id: &str,
+) -> Result<TranscriptMetadata, StatusCode> {
+    let row = state
+        .db
+        .query_opt(
+            "SELECT m.status, \
+                    EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id=m.id AND t.transcript_stage='final' AND NOT t.is_deleted) as has_final_rows, \
+                    EXISTS (SELECT 1 FROM transcripts t JOIN live_transcription_chunks c ON c.id=t.live_chunk_id AND c.status='done' WHERE t.meeting_id=m.id AND t.transcript_stage='live' AND NOT t.is_deleted) as has_live_rows, \
+                    to_char((SELECT MAX(created_at) FROM transcripts WHERE meeting_id=m.id AND NOT is_deleted) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as updated_at \
+             FROM meetings m WHERE m.id=$1",
+            &[&meeting_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(TranscriptMetadata {
+        status: row.get("status"),
+        has_final_rows: row.get("has_final_rows"),
+        has_live_rows: row.get("has_live_rows"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+async fn load_transcript_segments_after(
+    state: &WebState,
+    meeting_id: &str,
+    cursor: Option<&TranscriptStreamCursor>,
+) -> Result<
+    (
+        Vec<TranscriptSegmentResponse>,
+        Option<TranscriptStreamCursor>,
+    ),
+    StatusCode,
+> {
+    let cursor_created_at = cursor.map(|value| value.created_at.as_str());
+    let cursor_id = cursor.map(|value| value.id.as_str()).unwrap_or("");
 
     let rows = state
         .db
-        .query(api_transcript_sql(), &[&meeting_id])
+        .query(
+            api_transcript_sql(),
+            &[&meeting_id, &cursor_created_at, &cursor_id],
+        )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut segments = Vec::with_capacity(rows.len());
+    let mut next_cursor = cursor.cloned();
     for row in &rows {
+        let id: String = row.get("id");
         let speaker_id: String = row.get("speaker_id");
         let profile = SpeakerProfile {
             speaker_id: speaker_id.clone(),
@@ -2052,6 +2250,7 @@ async fn api_transcript(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         segments.push(TranscriptSegmentResponse {
+            id: id.clone(),
             speaker_id,
             speaker: SpeakerResponse {
                 id: profile.speaker_id.clone(),
@@ -2067,9 +2266,21 @@ async fn api_transcript(
             is_noisy: row.get("is_noisy"),
             source,
         });
+        next_cursor = Some(TranscriptStreamCursor {
+            created_at: row.get("created_at"),
+            id,
+        });
     }
 
-    Ok(Json(segments))
+    segments.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(a.speaker_id.cmp(&b.speaker_id))
+            .then(a.id.cmp(&b.id))
+    });
+
+    Ok((segments, next_cursor))
 }
 
 async fn api_transcript_state(
@@ -2079,30 +2290,13 @@ async fn api_transcript_state(
 ) -> Result<Json<TranscriptStateResponse>, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
 
-    let row = state
-        .db
-        .query_opt(
-            "SELECT m.status, \
-                    EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id=m.id AND t.transcript_stage='final' AND NOT t.is_deleted) as has_final_rows, \
-                    EXISTS (SELECT 1 FROM transcripts t JOIN live_transcription_chunks c ON c.id=t.live_chunk_id AND c.status='done' WHERE t.meeting_id=m.id AND t.transcript_stage='live' AND NOT t.is_deleted) as has_live_rows, \
-                    to_char((SELECT MAX(created_at) FROM transcripts WHERE meeting_id=m.id AND NOT is_deleted) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as updated_at \
-             FROM meetings m WHERE m.id=$1",
-            &[&meeting_id],
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let status: String = row.get("status");
-    let has_final_rows: bool = row.get("has_final_rows");
-    let has_live_rows: bool = row.get("has_live_rows");
-    let is_final = has_final_rows
-        || (!has_live_rows
-            && !matches!(status.as_str(), "recording" | "stopping" | "transcribing"));
+    let metadata = load_transcript_metadata(&state, &meeting_id).await?;
+    let is_final = transcript_metadata_is_final(&metadata);
 
     Ok(Json(TranscriptStateResponse {
-        status,
+        status: metadata.status,
         is_final,
-        updated_at: row.get("updated_at"),
+        updated_at: metadata.updated_at,
     }))
 }
 
@@ -3893,8 +4087,12 @@ mod transcript_source_api_tests {
             "live rows should not be exposed after final transcript rows exist"
         );
         assert!(
-            sql.contains("ORDER BY start_ms, end_ms"),
-            "API should order by adjusted aliases, not raw t.start_ms/t.end_ms"
+            sql.contains("(t.created_at, t.id)"),
+            "streaming cursor should advance over stable transcript row identity"
+        );
+        assert!(
+            sql.contains("ORDER BY t.created_at, t.id"),
+            "database order must match the streaming cursor"
         );
         assert!(
             !sql.contains("ORDER BY t.start_ms, t.end_ms"),

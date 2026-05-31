@@ -21,7 +21,9 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/0010_guild_settings.sql"),
     "\n",
-    include_str!("../../migrations/0011_add_transcript_stage.sql"),
+    include_str!("../../migrations/0011_transcript_cursor_index.sql"),
+    "\n",
+    include_str!("../../migrations/0012_add_transcript_stage.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"

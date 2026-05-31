@@ -40,6 +40,25 @@ CREATE TABLE IF NOT EXISTS transcripts (
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
 
+CREATE INDEX IF NOT EXISTS idx_transcripts_meeting_cursor
+    ON transcripts (meeting_id, created_at, id)
+    WHERE NOT is_deleted;
+
+DO $$
+BEGIN
+    ALTER TABLE transcripts
+    ADD CONSTRAINT transcripts_stage_check CHECK (transcript_stage IN ('live', 'final'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_transcripts_meeting_stage
+    ON transcripts (meeting_id, transcript_stage, start_ms);
+
+CREATE INDEX IF NOT EXISTS idx_transcripts_live_chunk
+    ON transcripts (live_chunk_id);
+
 CREATE TABLE IF NOT EXISTS live_transcription_chunks (
     id TEXT PRIMARY KEY,
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -57,6 +76,16 @@ CREATE TABLE IF NOT EXISTS live_transcription_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_live_transcription_chunks_meeting_status
     ON live_transcription_chunks (meeting_id, status, start_ms);
+
+DO $$
+BEGIN
+    ALTER TABLE live_transcription_chunks
+    ADD CONSTRAINT live_transcription_chunks_status_check
+    CHECK (status IN ('running', 'done', 'failed'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS summaries (
     id TEXT PRIMARY KEY,
