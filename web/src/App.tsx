@@ -12,11 +12,14 @@ export function App() {
   const [me, setMe] = useState<MeResponse | null>(null);
   const [loadingMe, setLoadingMe] = useState(true);
   const [sessionForbidden, setSessionForbidden] = useState(false);
+  const [sessionError, setSessionError] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
     setLoadingMe(true);
+    setMe(null);
     setSessionForbidden(false);
+    setSessionError(false);
 
     fetchMe(controller.signal)
       .then((response) => {
@@ -30,6 +33,8 @@ export function App() {
         }
         if (err instanceof Error && err.message === "forbidden") {
           setSessionForbidden(true);
+        } else {
+          setSessionError(true);
         }
       })
       .finally(() => {
@@ -55,6 +60,7 @@ export function App() {
               isAdmin={isAdmin}
               loading={loadingMe}
               forbidden={sessionForbidden}
+              error={sessionError}
             />
           }
         />
@@ -78,9 +84,15 @@ interface SettingsRouteProps {
   isAdmin: boolean;
   loading: boolean;
   forbidden: boolean;
+  error: boolean;
 }
 
-function SettingsRoute({ isAdmin, loading, forbidden }: SettingsRouteProps) {
+function SettingsRoute({
+  isAdmin,
+  loading,
+  forbidden,
+  error,
+}: SettingsRouteProps) {
   if (loading) {
     return (
       <main className="settings-page">
@@ -88,6 +100,18 @@ function SettingsRoute({ isAdmin, loading, forbidden }: SettingsRouteProps) {
           <span className="loading-spinner" />
           {"\u8aad\u307f\u8fbc\u307f\u4e2d"}
         </output>
+      </main>
+    );
+  }
+
+  if (error) {
+    return (
+      <main className="settings-page">
+        <div className="panel-error settings-panel-message" role="alert">
+          {
+            "\u6a29\u9650\u60c5\u5831\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f"
+          }
+        </div>
       </main>
     );
   }

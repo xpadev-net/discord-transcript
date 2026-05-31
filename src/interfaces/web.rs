@@ -1384,18 +1384,26 @@ async fn check_guild_admin_permission(
 
     let resp_status = member_resp.as_ref().unwrap().status();
 
-    // Handle rate limiting as error (don't cache), treat 404/403 as not admin
-    if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        warn!(status = %resp_status, "discord member API rate limited");
-        return Err(StatusCode::BAD_GATEWAY);
-    }
-
-    if resp_status == reqwest::StatusCode::NOT_FOUND
-        || resp_status == reqwest::StatusCode::FORBIDDEN
-        || resp_status == reqwest::StatusCode::UNAUTHORIZED
-    {
-        cache_guild_admin_permission(state, user_id, false).await;
-        return Ok(false);
+    if let Some(decision) = guild_admin_member_status_decision(resp_status) {
+        match decision {
+            Ok(false) => {
+                cache_guild_admin_permission(state, user_id, false).await;
+                return Ok(false);
+            }
+            Err(status) => {
+                if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    warn!(status = %resp_status, "discord member API rate limited");
+                } else {
+                    warn!(
+                        status = %resp_status,
+                        user_id = %user_id,
+                        "discord member API forbidden during guild admin check; check bot token and GUILD_MEMBERS intent"
+                    );
+                }
+                return Err(status);
+            }
+            Ok(true) => {}
+        }
     }
 
     if !resp_status.is_success() {
@@ -1423,6 +1431,18 @@ async fn check_guild_admin_permission(
 
     cache_guild_admin_permission(state, user_id, is_admin).await;
     Ok(is_admin)
+}
+
+fn guild_admin_member_status_decision(
+    status: reqwest::StatusCode,
+) -> Option<Result<bool, StatusCode>> {
+    match status {
+        reqwest::StatusCode::NOT_FOUND => Some(Ok(false)),
+        reqwest::StatusCode::FORBIDDEN
+        | reqwest::StatusCode::UNAUTHORIZED
+        | reqwest::StatusCode::TOO_MANY_REQUESTS => Some(Err(StatusCode::BAD_GATEWAY)),
+        _ => None,
+    }
 }
 
 async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
@@ -3485,8 +3505,9 @@ async fn stream_file_range(
 mod guild_api_tests {
     use super::{
         GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
-        guild_admin_required_result, guild_settings_response, normalize_guild_meetings_pagination,
-        validate_authorized_guild_settings_update, validate_guild_settings_update,
+        guild_admin_member_status_decision, guild_admin_required_result, guild_settings_response,
+        normalize_guild_meetings_pagination, validate_authorized_guild_settings_update,
+        validate_guild_settings_update,
     };
     use axum::http::StatusCode;
 
@@ -3633,6 +3654,30 @@ mod guild_api_tests {
         assert_eq!(
             validate_authorized_guild_settings_update(true, &request),
             Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_admin_member_status_treats_bot_auth_failures_as_upstream_errors() {
+        assert_eq!(
+            guild_admin_member_status_decision(reqwest::StatusCode::NOT_FOUND),
+            Some(Ok(false))
+        );
+        assert_eq!(
+            guild_admin_member_status_decision(reqwest::StatusCode::FORBIDDEN),
+            Some(Err(StatusCode::BAD_GATEWAY))
+        );
+        assert_eq!(
+            guild_admin_member_status_decision(reqwest::StatusCode::UNAUTHORIZED),
+            Some(Err(StatusCode::BAD_GATEWAY))
+        );
+        assert_eq!(
+            guild_admin_member_status_decision(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some(Err(StatusCode::BAD_GATEWAY))
+        );
+        assert_eq!(
+            guild_admin_member_status_decision(reqwest::StatusCode::OK),
+            None
         );
     }
 

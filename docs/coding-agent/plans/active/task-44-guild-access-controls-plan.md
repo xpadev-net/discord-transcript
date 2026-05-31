@@ -226,6 +226,10 @@
   - Summary: `gh-review-hook 66` requested replacing dashboard string-prefix 403 detection with a canonical `forbidden` error. Added a dedicated guild meetings response handler and updated dashboard error handling.
   - Validation evidence: `rtk pnpm --dir web run format` pass; `rtk pnpm --dir web run test` pass (5 passed); `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass.
   - Notes: Hook rerun pending.
+- 2026-05-31 00:00 PR hook admin diagnostics/session error follow-up completed.
+  - Summary: `gh-review-hook 66` requested logging/failing closed for Discord 401/403 during guild admin checks and distinguishing `/api/me` transient failures from forbidden state. Guild admin member 401/403 now warns and returns `BAD_GATEWAY` without caching false; Settings route shows a distinct permission-state load error for non-forbidden `/api/me` failures.
+  - Validation evidence: `rtk cargo test guild_api_tests` pass (9 passed); `rtk pnpm --dir web run test` pass (6 passed); `rtk cargo fmt --all -- --check` pass; `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass; `rtk cargo check --workspace --all-targets --all-features` pass; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `rtk cargo test --workspace --all-targets --all-features` pass (276 passed).
+  - Notes: Hook rerun pending.
 
 ## Decision Log
 - 2026-05-31 00:00 Decision: Proceed without separate plan approval.

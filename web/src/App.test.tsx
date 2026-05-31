@@ -7,6 +7,8 @@ import { buildLoginRedirectUrl } from "./lib/api";
 const settingsLinkName = "\u8a2d\u5b9a";
 const saveButtonName = "\u4fdd\u5b58";
 const forbiddenTitle = "\u8868\u793a\u3067\u304d\u307e\u305b\u3093";
+const sessionErrorText =
+  "\u6a29\u9650\u60c5\u5831\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f";
 const emptyMeetingsText =
   "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
 const dashboardForbiddenText =
@@ -113,6 +115,25 @@ describe("App access controls", () => {
     expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
     expect(screen.queryByRole("link", { name: settingsLinkName })).toBeNull();
     expect(screen.queryByRole("button", { name: saveButtonName })).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/settings",
+      expect.anything(),
+    );
+  });
+
+  it("shows a session error instead of forbidden when admin status cannot be determined", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(emptyResponse(500));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    expect(await screen.findByText(sessionErrorText)).toBeTruthy();
+    expect(screen.queryByText(forbiddenTitle)).toBeNull();
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/guild/settings",
       expect.anything(),
