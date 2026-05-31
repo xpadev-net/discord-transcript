@@ -1,6 +1,6 @@
 # Plan: Task 44 Guild Access Controls
 
-- status: in_progress
+- status: done
 - generated: 2026-05-31
 - last_updated: 2026-05-31
 - work_type: code
@@ -243,6 +243,10 @@
   - Summary: `gh-review-hook 66` requested logging/failing closed for Discord 401/403 during guild admin checks and distinguishing `/api/me` transient failures from forbidden state. Guild admin member 401/403 now warns and returns `BAD_GATEWAY` without caching false; Settings route shows a distinct permission-state load error for non-forbidden `/api/me` failures.
   - Validation evidence: `rtk cargo test guild_api_tests` pass (9 passed); `rtk pnpm --dir web run test` pass (6 passed); `rtk cargo fmt --all -- --check` pass; `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass; `rtk cargo check --workspace --all-targets --all-features` pass; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `rtk cargo test --workspace --all-targets --all-features` pass (276 passed).
   - Notes: Hook rerun pending.
+- 2026-05-31 00:00 PR hook completed.
+  - Summary: `gh-review-hook 66` exited 0 after CI and AI review checks completed successfully.
+  - Validation evidence: frontend checks pass; rust checks pass; CodeRabbit success; Greptile success.
+  - Notes: Plan marked done and moved to completed before merge.
 
 ## Decision Log
 
