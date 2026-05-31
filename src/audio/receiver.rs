@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverConfig {
     pub chunk_duration: Duration,
+    pub silence_flush_duration: Duration,
 }
 
 impl Default for ReceiverConfig {
     fn default() -> Self {
         Self {
-            chunk_duration: Duration::from_secs(20),
+            chunk_duration: Duration::from_secs(60),
+            silence_flush_duration: Duration::from_secs(30),
         }
     }
 }
@@ -28,6 +30,7 @@ pub struct UserAudioBuffer {
     pub first_frame_ms: Option<u64>,
     /// Monotonic instant when the first frame arrived (for flush timing).
     first_frame_instant: Option<Instant>,
+    last_frame_instant: Option<Instant>,
 }
 
 impl UserAudioBuffer {
@@ -37,14 +40,17 @@ impl UserAudioBuffer {
             frames: Vec::new(),
             first_frame_ms: None,
             first_frame_instant: None,
+            last_frame_instant: None,
         }
     }
 
     pub fn push_frame(&mut self, frame: BufferedFrame) {
+        let now = Instant::now();
         if self.first_frame_ms.is_none() {
             self.first_frame_ms = Some(frame.timestamp_ms);
-            self.first_frame_instant = Some(Instant::now());
+            self.first_frame_instant = Some(now);
         }
+        self.last_frame_instant = Some(now);
         self.frames.push(frame);
     }
 
@@ -54,13 +60,19 @@ impl UserAudioBuffer {
         let Some(start) = self.first_frame_instant else {
             return false;
         };
-        now.saturating_duration_since(start) >= config.chunk_duration
+        if now.saturating_duration_since(start) >= config.chunk_duration {
+            return true;
+        }
+        self.last_frame_instant.is_some_and(|last| {
+            now.saturating_duration_since(last) >= config.silence_flush_duration
+        })
     }
 
     pub fn take_frames(&mut self) -> (u64, Vec<BufferedFrame>) {
         let start_ms = self.first_frame_ms.unwrap_or(0);
         self.first_frame_ms = None;
         self.first_frame_instant = None;
+        self.last_frame_instant = None;
         (start_ms, std::mem::take(&mut self.frames))
     }
 
@@ -75,6 +87,10 @@ impl UserAudioBuffer {
         };
         self.first_frame_instant = match (self.first_frame_instant, other.first_frame_instant) {
             (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.last_frame_instant = match (self.last_frame_instant, other.last_frame_instant) {
+            (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
     }

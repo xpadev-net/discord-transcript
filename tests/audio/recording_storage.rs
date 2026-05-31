@@ -103,7 +103,8 @@ fn recording_session_flushes_and_persists_wav_chunks() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(20),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 
@@ -157,7 +158,8 @@ fn recording_session_retries_failed_flush_chunks() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(20),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 
@@ -206,7 +208,8 @@ fn recording_session_rekeys_pending_failed_chunks_before_retry() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(20),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 
@@ -251,7 +254,8 @@ fn recording_session_increments_sequence_per_user() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(5),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 
@@ -295,7 +299,8 @@ fn recording_session_rekey_user_transfers_sequence_counter() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(5),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 
@@ -352,7 +357,8 @@ fn recording_session_rekey_user_keeps_higher_sequence() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(5),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 
@@ -425,7 +431,8 @@ fn recording_session_persists_ssrc_mapping_for_rekeyed_pending_failed_chunks() {
         storage,
         ReceiverConfig {
             chunk_duration: Duration::from_secs(20),
-        },
+            silence_flush_duration: Duration::from_secs(30),
+            },
         48_000,
     );
 

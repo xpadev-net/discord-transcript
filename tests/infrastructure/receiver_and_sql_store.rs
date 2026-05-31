@@ -20,7 +20,8 @@ fn receiver_state_flushes_by_chunk_duration() {
     let mut state = ReceiverState::default();
     let config = ReceiverConfig {
         chunk_duration: Duration::from_secs(20),
-    };
+        silence_flush_duration: Duration::from_secs(30),
+        };
 
     let start = Instant::now();
     state.track_frame(

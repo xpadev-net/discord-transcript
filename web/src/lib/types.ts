@@ -70,6 +70,12 @@ export interface TranscriptSegment {
   source: "voice" | "vc_text";
 }
 
+export interface TranscriptStateResponse {
+  status: string;
+  is_final: boolean;
+  updated_at: string | null;
+}
+
 export interface SummaryResponse {
   markdown: string | null;
 }

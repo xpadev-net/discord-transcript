@@ -1,14 +1,21 @@
 import { useEffect, useState } from "react";
-import { fetchMeeting, fetchSummary, fetchTranscript } from "../lib/api";
+import {
+  fetchMeeting,
+  fetchSummary,
+  fetchTranscript,
+  fetchTranscriptState,
+} from "../lib/api";
 import type {
   MeetingResponse,
   SummaryResponse,
   TranscriptSegment,
+  TranscriptStateResponse,
 } from "../lib/types";
 
 interface MeetingData {
   meeting: MeetingResponse | null;
   transcript: TranscriptSegment[] | null;
+  transcriptState: TranscriptStateResponse | null;
   summary: SummaryResponse | null;
   loading: boolean;
   error: string | null;
@@ -18,11 +25,23 @@ interface MeetingData {
   retrySummary: () => void;
 }
 
+function shouldPollTranscript(state: TranscriptStateResponse | null): boolean {
+  if (!state) return false;
+  return (
+    !state.is_final ||
+    state.status === "recording" ||
+    state.status === "stopping" ||
+    state.status === "transcribing"
+  );
+}
+
 export function useMeetingData(meetingId: string | undefined): MeetingData {
   const [meeting, setMeeting] = useState<MeetingResponse | null>(null);
   const [transcript, setTranscript] = useState<TranscriptSegment[] | null>(
     null,
   );
+  const [transcriptState, setTranscriptState] =
+    useState<TranscriptStateResponse | null>(null);
   const [summary, setSummary] = useState<SummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -65,25 +84,49 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     const retryAttempt = transcriptRetryCount;
     if (!meetingId) {
       setTranscript(null);
+      setTranscriptState(null);
       setTranscriptError(null);
       return;
     }
 
     const controller = new AbortController();
+    let intervalId: number | undefined;
     setTranscript(null);
+    setTranscriptState(null);
     setTranscriptError(null);
-    fetchTranscript(meetingId, controller.signal)
-      .then(setTranscript)
-      .catch(() => {
-        if (!controller.signal.aborted) {
-          setTranscriptError(
-            retryAttempt > 0
-              ? "\u6587\u5b57\u8d77\u3053\u3057\u306e\u518d\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
-              : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
-          );
-        }
-      });
-    return () => controller.abort();
+    const loadTranscript = () => {
+      Promise.all([
+        fetchTranscript(meetingId, controller.signal),
+        fetchTranscriptState(meetingId, controller.signal),
+      ])
+        .then(([segments, state]) => {
+          setTranscript(segments);
+          setTranscriptState(state);
+          if (shouldPollTranscript(state) && intervalId === undefined) {
+            intervalId = window.setInterval(loadTranscript, 5_000);
+          }
+          if (!shouldPollTranscript(state) && intervalId !== undefined) {
+            window.clearInterval(intervalId);
+            intervalId = undefined;
+          }
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) {
+            setTranscriptError(
+              retryAttempt > 0
+                ? "\u6587\u5b57\u8d77\u3053\u3057\u306e\u518d\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+                : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+            );
+          }
+        });
+    };
+    loadTranscript();
+    return () => {
+      controller.abort();
+      if (intervalId !== undefined) {
+        window.clearInterval(intervalId);
+      }
+    };
   }, [meetingId, transcriptRetryCount]);
 
   useEffect(() => {
@@ -114,6 +157,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   return {
     meeting,
     transcript,
+    transcriptState,
     summary,
     loading,
     error,

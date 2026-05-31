@@ -358,7 +358,7 @@ Instructions:\n\
     )
 }
 
-fn build_transcription_output(
+pub fn build_transcription_output(
     segments: Vec<crate::domain::transcript::TranscriptSegment>,
 ) -> Result<TranscriptionOutput, SummaryError> {
     let normalized = normalize_segments(&segments, NormalizationConfig::default());

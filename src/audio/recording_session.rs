@@ -13,6 +13,7 @@ const MAX_PENDING_FAILED_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedChunk {
+    pub meeting_id: String,
     pub user_id: String,
     pub sequence: u64,
     pub start_ms: u64,
@@ -219,6 +220,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
                     self.commit_sequence(&chunk.user_id);
                     let seq = self.current_sequence(&chunk.user_id);
                     persisted.push(PersistedChunk {
+                        meeting_id: self.meeting_id.clone(),
                         user_id: chunk.user_id,
                         sequence: seq,
                         start_ms: chunk.start_ms,

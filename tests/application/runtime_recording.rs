@@ -27,6 +27,7 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
         discord_transcript::audio::receiver::ReceiverConfig {
             // Use zero duration so the chunk flushes immediately upon ingest.
             chunk_duration: Duration::ZERO,
+            silence_flush_duration: Duration::from_secs(30),
         },
         48_000,
     );
@@ -40,9 +41,9 @@ fn ingest_voice_frames_into_session_persists_due_chunks() {
         },
     );
 
-    let count = ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user })
+    let persisted = ingest_voice_frames_into_session(&mut session, &AdaptedVoiceFrames { per_user })
         .expect("ingest should succeed");
-    assert_eq!(count, 1);
+    assert_eq!(persisted.len(), 1);
     let persisted_wavs: Vec<_> = std::fs::read_dir(workspace.audio_dir())
         .expect("audio dir should exist")
         .filter_map(Result::ok)

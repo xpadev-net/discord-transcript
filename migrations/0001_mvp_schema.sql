@@ -31,12 +31,32 @@ CREATE TABLE IF NOT EXISTS transcripts (
     confidence DOUBLE PRECISION,
     is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
     source TEXT NOT NULL DEFAULT 'voice',
+    transcript_stage TEXT NOT NULL DEFAULT 'final',
+    live_chunk_id TEXT,
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
+
+CREATE TABLE IF NOT EXISTS live_transcription_chunks (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    speaker_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL,
+    start_ms BIGINT NOT NULL,
+    timeline_base_ms BIGINT,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (meeting_id, speaker_id, sequence, start_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_transcription_chunks_meeting_status
+    ON live_transcription_chunks (meeting_id, status, start_ms);
 
 CREATE TABLE IF NOT EXISTS summaries (
     id TEXT PRIMARY KEY,
