@@ -306,7 +306,8 @@ button {
 }
 
 .settings-field input[type="text"],
-.settings-field input[type="number"] {
+.settings-field input[type="number"],
+.settings-field input[type="password"] {
   width: min(100%, 320px);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -330,6 +331,47 @@ button {
 .settings-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+.settings-token-status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.settings-token-status {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.settings-token-status.is-set {
+  border-color: rgba(152, 195, 121, 0.45);
+  color: #b7d99a;
+}
+
+.settings-token-status.is-empty {
+  color: var(--text-secondary);
+}
+
+.settings-token-meta {
+  color: var(--text-muted);
+}
+
+.settings-token-form {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-token-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .secondary-button {

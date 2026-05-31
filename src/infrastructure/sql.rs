@@ -24,6 +24,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0011_transcript_cursor_index.sql"),
     "\n",
     include_str!("../../migrations/0012_add_transcript_stage.sql"),
+    "\n",
+    include_str!("../../migrations/0013_guild_bot_tokens.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -251,8 +253,62 @@ ON CONFLICT (guild_id) DO UPDATE SET
 pub const GET_GUILD_SETTINGS_SQL: &str = r#"
 SELECT whisper_language, whisper_language_explicit, whisper_vad,
        auto_stop_grace_seconds, retention_raw_audio_ttl_days,
-       retention_transcript_ttl_days, summary_enabled
+       retention_transcript_ttl_days, summary_enabled,
+       (
+         bot_token_ciphertext IS NOT NULL
+         AND bot_token_nonce IS NOT NULL
+         AND bot_token_key_version IS NOT NULL
+       ) AS discord_bot_token_registered,
+       to_char(bot_token_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS bot_token_updated_at,
+       to_char(bot_token_last_validated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS bot_token_last_validated_at,
+       bot_user_id, bot_username
 FROM guild_settings
+WHERE guild_id = $1
+"#;
+
+pub const GET_GUILD_BOT_TOKEN_SQL: &str = r#"
+SELECT COALESCE(bot_token_ciphertext, '') AS bot_token_ciphertext,
+       COALESCE(bot_token_nonce, '') AS bot_token_nonce,
+       COALESCE(bot_token_key_version, '') AS bot_token_key_version,
+       to_char(bot_token_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS bot_token_updated_at,
+       to_char(bot_token_last_validated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS bot_token_last_validated_at,
+       bot_user_id, bot_username
+FROM guild_settings
+WHERE guild_id = $1
+  AND (
+    bot_token_ciphertext IS NOT NULL
+    OR bot_token_nonce IS NOT NULL
+    OR bot_token_key_version IS NOT NULL
+  )
+"#;
+
+pub const UPSERT_GUILD_BOT_TOKEN_SQL: &str = r#"
+INSERT INTO guild_settings (
+    guild_id, bot_token_ciphertext, bot_token_nonce, bot_token_key_version,
+    bot_token_updated_at, bot_token_last_validated_at, bot_user_id, bot_username, updated_at
+) VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, NOW())
+ON CONFLICT (guild_id) DO UPDATE SET
+    bot_token_ciphertext = EXCLUDED.bot_token_ciphertext,
+    bot_token_nonce = EXCLUDED.bot_token_nonce,
+    bot_token_key_version = EXCLUDED.bot_token_key_version,
+    bot_token_updated_at = NOW(),
+    bot_token_last_validated_at = NOW(),
+    bot_user_id = EXCLUDED.bot_user_id,
+    bot_username = EXCLUDED.bot_username,
+    updated_at = NOW()
+"#;
+
+pub const CLEAR_GUILD_BOT_TOKEN_SQL: &str = r#"
+UPDATE guild_settings
+SET
+    bot_token_ciphertext = NULL,
+    bot_token_nonce = NULL,
+    bot_token_key_version = NULL,
+    bot_token_updated_at = NULL,
+    bot_token_last_validated_at = NULL,
+    bot_user_id = NULL,
+    bot_username = NULL,
+    updated_at = NOW()
 WHERE guild_id = $1
 "#;
 

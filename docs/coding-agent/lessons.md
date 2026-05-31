@@ -23,6 +23,38 @@ Purpose:
 
 ## Entries
 
+## 2026-05-31 - Token Recovery Must Not Depend On Broken Token  [tags: review, validation]
+
+Context:
+
+- Plan: docs/coding-agent/plans/active/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: Reviewer pass after implementation
+- Roles involved: Orchestrator | Reviewer
+
+Symptom:
+
+- Reviewer found that admins could be locked out of replacing or deleting a stored guild bot token if that token was revoked, lost guild access, had corrupt ciphertext, or the encryption key was missing.
+
+Root cause:
+
+- Token-management endpoints reused the normal guild admin check, which resolved Discord REST auth through the currently stored guild token before allowing the operation that would repair that token.
+
+Fix applied:
+
+- Settings and token-management endpoints now retry the admin check with the global bot token for recovery when the guild-scoped token path fails or reports non-admin, while ordinary Discord calls still prefer the guild token.
+- Added regression coverage for the recovery retry decision.
+
+Prevention:
+
+- Review guardrail:
+  - Any credential-rotation or credential-delete endpoint must be reviewed for recovery paths that do not require the broken credential being replaced or deleted.
+- Residual risk / waiver:
+  - Full endpoint-level HTTP recovery testing remains limited by the current lack of mocked Discord/web integration tests.
+
+Evidence:
+
+- Reviewer reported CHANGES_REQUESTED; fixes were applied and Rust fmt/check/test/clippy plus frontend lint/typecheck/build passed afterward.
+
 ## 2026-05-31 - Avoid Snapshot Overwrites During Live Merge  [tags: review, ui-e2e]
 
 Context:

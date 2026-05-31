@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.10"
 axum = "0.8"
+base64 = "0.22"
 hmac = "0.12"
 libc = "0.2"
 regex = "1.12.2"

@@ -9,6 +9,7 @@ import type {
   TranscriptResponse,
   TranscriptSegment,
   TranscriptStateResponse,
+  UpdateGuildBotTokenRequest,
   UpdateGuildSettingsRequest,
 } from "./types";
 
@@ -32,8 +33,27 @@ function handleResponse<T>(response: Response): Promise<T> {
 function handleGuildSettingsResponse(
   response: Response,
 ): Promise<GuildSettingsResponse> {
-  if (response.status === 403) {
-    throw new Error("forbidden");
+  if (response.status === 401) {
+    return handleResponse<GuildSettingsResponse>(response);
+  }
+  if (!response.ok) {
+    return response
+      .clone()
+      .json()
+      .catch(() => null)
+      .then((payload: unknown) => {
+        const code =
+          payload &&
+          typeof payload === "object" &&
+          "code" in payload &&
+          typeof payload.code === "string"
+            ? payload.code
+            : null;
+        if (response.status === 403 && (!code || code === "forbidden")) {
+          throw new Error("forbidden");
+        }
+        throw new Error(code ?? `${response.status} ${response.statusText}`);
+      });
   }
   return handleResponse<GuildSettingsResponse>(response);
 }
@@ -75,6 +95,29 @@ export function updateGuildSettings(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(request),
+    signal,
+  }).then(handleGuildSettingsResponse);
+}
+
+export function updateGuildBotToken(
+  request: UpdateGuildBotTokenRequest,
+  signal?: AbortSignal,
+): Promise<GuildSettingsResponse> {
+  return fetch("/api/guild/settings/bot-token", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleGuildSettingsResponse);
+}
+
+export function deleteGuildBotToken(
+  signal?: AbortSignal,
+): Promise<GuildSettingsResponse> {
+  return fetch("/api/guild/settings/bot-token", {
+    method: "DELETE",
     signal,
   }).then(handleGuildSettingsResponse);
 }

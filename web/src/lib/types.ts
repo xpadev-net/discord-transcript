@@ -39,6 +39,11 @@ export interface GuildSettingsResponse {
   retention_raw_audio_ttl_days: number;
   retention_transcript_ttl_days: number;
   summary_enabled: boolean;
+  discord_bot_token_registered: boolean;
+  discord_bot_token_updated_at: string | null;
+  discord_bot_token_last_validated_at: string | null;
+  discord_bot_user_id: string | null;
+  discord_bot_username: string | null;
   is_admin: boolean;
 }
 
@@ -49,6 +54,10 @@ export interface UpdateGuildSettingsRequest {
   retention_raw_audio_ttl_days: number;
   retention_transcript_ttl_days: number;
   summary_enabled: boolean;
+}
+
+export interface UpdateGuildBotTokenRequest {
+  bot_token: string;
 }
 
 export interface SpeakerResponse {

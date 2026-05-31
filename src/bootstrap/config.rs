@@ -73,6 +73,7 @@ pub struct AppConfig {
     pub discord_client_id: Option<String>,
     pub discord_client_secret: Option<String>,
     pub web_session_secret: Option<String>,
+    pub guild_bot_token_encryption_key: Option<String>,
     pub static_files_dir: String,
     pub discord_bot_admin_user_ids: Vec<String>,
     pub retention_policy: RetentionPolicy,
@@ -167,6 +168,7 @@ impl AppConfig {
             discord_client_id: optional_env("DISCORD_CLIENT_ID"),
             discord_client_secret: optional_env("DISCORD_CLIENT_SECRET"),
             web_session_secret: optional_env("WEB_SESSION_SECRET"),
+            guild_bot_token_encryption_key: optional_env("GUILD_BOT_TOKEN_ENCRYPTION_KEY"),
             static_files_dir: optional_env("STATIC_FILES_DIR")
                 .unwrap_or_else(|| "web/dist".to_owned()),
             discord_bot_admin_user_ids: parse_csv_list(optional_env("DISCORD_BOT_ADMIN_USER_IDS")),
@@ -266,6 +268,10 @@ impl AppConfig {
             discord_client_id: optional_from_map(values, "DISCORD_CLIENT_ID"),
             discord_client_secret: optional_from_map(values, "DISCORD_CLIENT_SECRET"),
             web_session_secret: optional_from_map(values, "WEB_SESSION_SECRET"),
+            guild_bot_token_encryption_key: optional_from_map(
+                values,
+                "GUILD_BOT_TOKEN_ENCRYPTION_KEY",
+            ),
             static_files_dir: optional_from_map(values, "STATIC_FILES_DIR")
                 .unwrap_or_else(|| "web/dist".to_owned()),
             discord_bot_admin_user_ids: parse_csv_list(optional_from_map(

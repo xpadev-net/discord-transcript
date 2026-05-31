@@ -3,7 +3,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
@@ -23,9 +23,12 @@ use uuid::Uuid;
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
+use crate::infrastructure::bot_token::{
+    BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
+};
 use crate::infrastructure::sql::{
-    COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL, LIST_GUILD_MEETINGS_SQL,
-    UPSERT_GUILD_SETTINGS_SQL,
+    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL,
+    LIST_GUILD_MEETINGS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
@@ -112,6 +115,7 @@ pub struct WebState {
     pub chunk_storage_dir: String,
     pub auth: Option<Arc<AuthConfig>>,
     pub http_client: reqwest::Client,
+    pub guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
     /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
@@ -130,6 +134,7 @@ impl WebState {
         chunk_storage_dir: String,
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
+        guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
         static_files_dir: String,
         guild_settings_defaults: GuildSettingsDefaults,
     ) -> Self {
@@ -138,6 +143,7 @@ impl WebState {
             chunk_storage_dir,
             auth,
             http_client,
+            guild_bot_token_cipher,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -196,6 +202,10 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/guild/settings",
             get(api_guild_settings).put(api_update_guild_settings),
+        )
+        .route(
+            "/api/guild/settings/bot-token",
+            put(api_update_guild_bot_token).delete(api_delete_guild_bot_token),
         )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
@@ -407,12 +417,44 @@ fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool
     status == reqwest::StatusCode::OK
 }
 
+fn bot_token_resolve_status(err: &BotTokenResolveError) -> StatusCode {
+    match err {
+        BotTokenResolveError::MissingCipher => StatusCode::SERVICE_UNAVAILABLE,
+        BotTokenResolveError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BotTokenResolveError::Crypto(_) => StatusCode::BAD_GATEWAY,
+    }
+}
+
+async fn bot_auth_header_for_guild(
+    state: &WebState,
+    auth: &AuthConfig,
+) -> Result<String, StatusCode> {
+    let token = resolve_effective_bot_token(
+        &state.db,
+        &auth.guild_id,
+        &auth.bot_token,
+        state.guild_bot_token_cipher.as_deref(),
+    )
+    .await
+    .map_err(|err| {
+        let status = bot_token_resolve_status(&err);
+        warn!(
+            error = %err,
+            guild_id = %auth.guild_id,
+            status = %status,
+            "failed to resolve guild bot token"
+        );
+        status
+    })?;
+    Ok(format!("Bot {token}"))
+}
+
 async fn is_guild_member(
     state: &WebState,
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
-    let bot_auth = format!("Bot {}", auth.bot_token);
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
     let response = state
         .http_client
         .get(format!(
@@ -1019,6 +1061,15 @@ async fn get_guild_info(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<DiscordGuildFull, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+    get_guild_info_with_bot_auth(state, auth, &bot_auth).await
+}
+
+async fn get_guild_info_with_bot_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    bot_auth: &str,
+) -> Result<DiscordGuildFull, StatusCode> {
     // Fast path: read lock
     {
         let cache = state.guild_cache.read().await;
@@ -1037,11 +1088,10 @@ async fn get_guild_info(
         return Ok(guild.clone());
     }
 
-    let bot_auth = format!("Bot {}", auth.bot_token);
     let guild_resp = state
         .http_client
         .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
-        .header("Authorization", &bot_auth)
+        .header("Authorization", bot_auth)
         .send()
         .await
         .map_err(|err| {
@@ -1083,7 +1133,7 @@ async fn resolve_channel_permissions(
     channel_id: &str,
     user_id: &str,
 ) -> Result<Option<u64>, StatusCode> {
-    let bot_auth = format!("Bot {}", auth.bot_token);
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
 
     // Fetch guild from cache, channel and member from API in parallel
     let (guild_result, channel_res, member_res) = tokio::join!(
@@ -1213,10 +1263,21 @@ async fn check_guild_admin_permission(
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true).await
+}
+
+async fn check_guild_admin_permission_with_bot_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    bot_auth: &str,
+    use_cache: bool,
+) -> Result<bool, StatusCode> {
     let cache_key = (user_id.to_owned(), "__guild__".to_owned());
 
     // Check cache first
-    {
+    if use_cache {
         let cache = state.permission_cache.read().await;
         if let Some(&(permission, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
@@ -1226,21 +1287,22 @@ async fn check_guild_admin_permission(
     }
 
     // Fast path: check if user is guild owner
-    let guild = get_guild_info(state, auth).await?;
+    let guild = get_guild_info_with_bot_auth(state, auth, bot_auth).await?;
     if user_id == guild.owner_id {
-        cache_guild_admin_permission(state, user_id, true).await;
+        if use_cache {
+            cache_guild_admin_permission(state, user_id, true).await;
+        }
         return Ok(true);
     }
 
     // Slow path: fetch member roles and check ADMINISTRATOR bit
-    let bot_auth = format!("Bot {}", auth.bot_token);
     let member_resp = state
         .http_client
         .get(format!(
             "https://discord.com/api/guilds/{}/members/{user_id}",
             auth.guild_id
         ))
-        .header("Authorization", &bot_auth)
+        .header("Authorization", bot_auth)
         .send()
         .await;
 
@@ -1262,7 +1324,9 @@ async fn check_guild_admin_permission(
         || resp_status == reqwest::StatusCode::FORBIDDEN
         || resp_status == reqwest::StatusCode::UNAUTHORIZED
     {
-        cache_guild_admin_permission(state, user_id, false).await;
+        if use_cache {
+            cache_guild_admin_permission(state, user_id, false).await;
+        }
         return Ok(false);
     }
 
@@ -1289,8 +1353,43 @@ async fn check_guild_admin_permission(
     );
     let is_admin = permissions & ADMINISTRATOR != 0;
 
-    cache_guild_admin_permission(state, user_id, is_admin).await;
+    if use_cache {
+        cache_guild_admin_permission(state, user_id, is_admin).await;
+    }
     Ok(is_admin)
+}
+
+async fn check_guild_admin_permission_for_settings(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let effective_result = check_guild_admin_permission(state, auth, user_id).await;
+    if !should_retry_settings_admin_check_with_global(&effective_result) {
+        return effective_result;
+    }
+    if let Err(status) = &effective_result {
+        warn!(
+            status = %status,
+            user_id = %user_id,
+            guild_id = %auth.guild_id,
+            "guild-scoped bot token admin check failed; trying global token for settings recovery"
+        );
+    }
+
+    let global_bot_auth = format!("Bot {}", auth.bot_token);
+    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false).await
+}
+
+fn should_retry_settings_admin_check_with_global(result: &Result<bool, StatusCode>) -> bool {
+    match result {
+        Ok(true) => false,
+        Ok(false) => true,
+        Err(status) => matches!(
+            *status,
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY
+        ),
+    }
 }
 
 async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
@@ -1676,6 +1775,11 @@ struct GuildSettingsResponse {
     retention_raw_audio_ttl_days: i32,
     retention_transcript_ttl_days: i32,
     summary_enabled: bool,
+    discord_bot_token_registered: bool,
+    discord_bot_token_updated_at: Option<String>,
+    discord_bot_token_last_validated_at: Option<String>,
+    discord_bot_user_id: Option<String>,
+    discord_bot_username: Option<String>,
     is_admin: bool,
 }
 
@@ -1689,6 +1793,17 @@ struct GuildSettingsUpdateRequest {
     summary_enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct GuildBotTokenUpdateRequest {
+    bot_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorResponse {
+    code: &'static str,
+    message: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredGuildSettings {
     whisper_language: Option<String>,
@@ -1698,6 +1813,11 @@ struct StoredGuildSettings {
     retention_raw_audio_ttl_days: Option<i32>,
     retention_transcript_ttl_days: Option<i32>,
     summary_enabled: Option<bool>,
+    discord_bot_token_registered: bool,
+    discord_bot_token_updated_at: Option<String>,
+    discord_bot_token_last_validated_at: Option<String>,
+    discord_bot_user_id: Option<String>,
+    discord_bot_username: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1794,6 +1914,159 @@ fn validate_guild_settings_update(request: &GuildSettingsUpdateRequest) -> Resul
     Ok(())
 }
 
+fn normalize_guild_bot_token_update(
+    request: &GuildBotTokenUpdateRequest,
+) -> Result<String, StatusCode> {
+    let token = request.bot_token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(token.to_owned())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordBotTokenValidationStage {
+    User,
+    Guild,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiscordBotTokenValidationError {
+    InvalidToken,
+    NotBotToken,
+    GuildAccessDenied,
+    Upstream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedDiscordBotToken {
+    bot_user_id: String,
+    bot_username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordBotSelfResponse {
+    id: String,
+    username: String,
+    bot: Option<bool>,
+}
+
+fn classify_discord_bot_token_validation_status(
+    stage: DiscordBotTokenValidationStage,
+    status: reqwest::StatusCode,
+) -> Option<DiscordBotTokenValidationError> {
+    if status.is_success() {
+        return None;
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Some(DiscordBotTokenValidationError::InvalidToken);
+    }
+    match stage {
+        DiscordBotTokenValidationStage::User => Some(DiscordBotTokenValidationError::Upstream),
+        DiscordBotTokenValidationStage::Guild => {
+            if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND
+            {
+                Some(DiscordBotTokenValidationError::GuildAccessDenied)
+            } else {
+                Some(DiscordBotTokenValidationError::Upstream)
+            }
+        }
+    }
+}
+
+fn bot_token_validation_error_response(error: DiscordBotTokenValidationError) -> Response {
+    match error {
+        DiscordBotTokenValidationError::InvalidToken => api_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_bot_token",
+            "Discord bot token is invalid.",
+        ),
+        DiscordBotTokenValidationError::NotBotToken => api_error_response(
+            StatusCode::BAD_REQUEST,
+            "not_bot_token",
+            "Discord token must belong to a bot user.",
+        ),
+        DiscordBotTokenValidationError::GuildAccessDenied => api_error_response(
+            StatusCode::FORBIDDEN,
+            "bot_token_guild_access_denied",
+            "Discord bot token cannot access this guild.",
+        ),
+        DiscordBotTokenValidationError::Upstream => api_error_response(
+            StatusCode::BAD_GATEWAY,
+            "discord_validation_failed",
+            "Discord bot token validation failed.",
+        ),
+    }
+}
+
+fn api_error_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    (status, Json(ApiErrorResponse { code, message })).into_response()
+}
+
+async fn validate_discord_bot_token_for_guild(
+    state: &WebState,
+    guild_id: &str,
+    token: &str,
+) -> Result<ValidatedDiscordBotToken, DiscordBotTokenValidationError> {
+    let bot_auth = format!("Bot {token}");
+    let user_response = state
+        .http_client
+        .get("https://discord.com/api/users/@me")
+        .header("Authorization", &bot_auth)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "discord bot token validation user request failed");
+            DiscordBotTokenValidationError::Upstream
+        })?;
+    let user_status = user_response.status();
+    if let Some(error) = classify_discord_bot_token_validation_status(
+        DiscordBotTokenValidationStage::User,
+        user_status,
+    ) {
+        warn!(
+            status = %user_status,
+            "discord bot token validation user request returned non-success"
+        );
+        return Err(error);
+    }
+    let bot_user: DiscordBotSelfResponse = user_response.json().await.map_err(|err| {
+        warn!(error = %err, "discord bot token validation user response parse failed");
+        DiscordBotTokenValidationError::Upstream
+    })?;
+    if bot_user.bot != Some(true) {
+        return Err(DiscordBotTokenValidationError::NotBotToken);
+    }
+
+    let guild_response = state
+        .http_client
+        .get(format!("https://discord.com/api/guilds/{guild_id}"))
+        .header("Authorization", &bot_auth)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, guild_id = %guild_id, "discord bot token validation guild request failed");
+            DiscordBotTokenValidationError::Upstream
+        })?;
+    let guild_status = guild_response.status();
+    if let Some(error) = classify_discord_bot_token_validation_status(
+        DiscordBotTokenValidationStage::Guild,
+        guild_status,
+    ) {
+        warn!(
+            status = %guild_status,
+            guild_id = %guild_id,
+            "discord bot token validation guild request returned non-success"
+        );
+        return Err(error);
+    }
+
+    Ok(ValidatedDiscordBotToken {
+        bot_user_id: bot_user.id,
+        bot_username: bot_user.username,
+    })
+}
+
 fn guild_settings_response(
     defaults: &GuildSettingsDefaults,
     stored: Option<StoredGuildSettings>,
@@ -1807,6 +2080,11 @@ fn guild_settings_response(
         retention_raw_audio_ttl_days: None,
         retention_transcript_ttl_days: None,
         summary_enabled: None,
+        discord_bot_token_registered: false,
+        discord_bot_token_updated_at: None,
+        discord_bot_token_last_validated_at: None,
+        discord_bot_user_id: None,
+        discord_bot_username: None,
     });
     let whisper_language = if stored.whisper_language_explicit {
         stored.whisper_language
@@ -1827,13 +2105,18 @@ fn guild_settings_response(
             .retention_transcript_ttl_days
             .unwrap_or(defaults.retention_transcript_ttl_days),
         summary_enabled: stored.summary_enabled.unwrap_or(defaults.summary_enabled),
+        discord_bot_token_registered: stored.discord_bot_token_registered,
+        discord_bot_token_updated_at: stored.discord_bot_token_updated_at,
+        discord_bot_token_last_validated_at: stored.discord_bot_token_last_validated_at,
+        discord_bot_user_id: stored.discord_bot_user_id,
+        discord_bot_username: stored.discord_bot_username,
         is_admin,
     }
 }
 
 async fn current_user_is_guild_admin(state: &WebState, user_id: &str) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    check_guild_admin_permission(state, auth, user_id).await
+    check_guild_admin_permission_for_settings(state, auth, user_id).await
 }
 
 async fn api_me(
@@ -1912,6 +2195,11 @@ async fn load_guild_settings(
         retention_raw_audio_ttl_days: row.get("retention_raw_audio_ttl_days"),
         retention_transcript_ttl_days: row.get("retention_transcript_ttl_days"),
         summary_enabled: row.get("summary_enabled"),
+        discord_bot_token_registered: row.get("discord_bot_token_registered"),
+        discord_bot_token_updated_at: row.get("bot_token_updated_at"),
+        discord_bot_token_last_validated_at: row.get("bot_token_last_validated_at"),
+        discord_bot_user_id: row.get("bot_user_id"),
+        discord_bot_username: row.get("bot_username"),
     }))
 }
 
@@ -1937,7 +2225,7 @@ async fn api_update_guild_settings(
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     validate_guild_settings_update(&request)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    if !check_guild_admin_permission(&state, auth, &user_id).await? {
+    if !check_guild_admin_permission_for_settings(&state, auth, &user_id).await? {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1960,19 +2248,146 @@ async fn api_update_guild_settings(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let stored = load_guild_settings(&state, &auth.guild_id).await?;
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
-        Some(StoredGuildSettings {
-            whisper_language: request.whisper_language,
-            whisper_language_explicit,
-            whisper_vad: Some(request.whisper_vad),
-            auto_stop_grace_seconds: Some(request.auto_stop_grace_seconds),
-            retention_raw_audio_ttl_days: Some(request.retention_raw_audio_ttl_days),
-            retention_transcript_ttl_days: Some(request.retention_transcript_ttl_days),
-            summary_enabled: Some(request.summary_enabled),
-        }),
+        stored,
         true,
     )))
+}
+
+async fn api_update_guild_bot_token(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Json(request): Json<GuildBotTokenUpdateRequest>,
+) -> Result<Json<GuildSettingsResponse>, Response> {
+    let token = normalize_guild_bot_token_update(&request).map_err(|status| {
+        api_error_response(
+            status,
+            "invalid_bot_token_request",
+            "Discord bot token is required.",
+        )
+    })?;
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    if !check_guild_admin_permission_for_settings(&state, auth, &user_id)
+        .await
+        .map_err(|status| status.into_response())?
+    {
+        return Err(api_error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Guild administrator permission is required.",
+        ));
+    }
+
+    let cipher = state.guild_bot_token_cipher.as_ref().ok_or_else(|| {
+        api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing_guild_bot_token_encryption_key",
+            "Guild bot token encryption key is not configured.",
+        )
+    })?;
+    let validated = validate_discord_bot_token_for_guild(&state, &auth.guild_id, &token)
+        .await
+        .map_err(bot_token_validation_error_response)?;
+    let encrypted = cipher
+        .encrypt_for_guild(&auth.guild_id, &token)
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %auth.guild_id,
+                "failed to encrypt guild bot token"
+            );
+            api_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "guild_bot_token_encrypt_failed",
+                "Failed to store Discord bot token.",
+            )
+        })?;
+
+    state
+        .db
+        .execute(
+            UPSERT_GUILD_BOT_TOKEN_SQL,
+            &[
+                &auth.guild_id,
+                &encrypted.ciphertext,
+                &encrypted.nonce,
+                &encrypted.key_version,
+                &validated.bot_user_id,
+                &validated.bot_username,
+            ],
+        )
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %auth.guild_id,
+                "failed to store guild bot token"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+    invalidate_discord_caches(&state).await;
+
+    let stored = load_guild_settings(&state, &auth.guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        true,
+    )))
+}
+
+async fn api_delete_guild_bot_token(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<GuildSettingsResponse>, Response> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    if !check_guild_admin_permission_for_settings(&state, auth, &user_id)
+        .await
+        .map_err(|status| status.into_response())?
+    {
+        return Err(api_error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Guild administrator permission is required.",
+        ));
+    }
+
+    state
+        .db
+        .execute(CLEAR_GUILD_BOT_TOKEN_SQL, &[&auth.guild_id])
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %auth.guild_id,
+                "failed to delete guild bot token"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+    invalidate_discord_caches(&state).await;
+
+    let stored = load_guild_settings(&state, &auth.guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        true,
+    )))
+}
+
+async fn invalidate_discord_caches(state: &WebState) {
+    state.guild_cache.write().await.take();
+    state.permission_cache.write().await.clear();
 }
 
 async fn api_meeting(
@@ -3331,8 +3746,10 @@ async fn stream_file_range(
 #[cfg(test)]
 mod guild_api_tests {
     use super::{
+        DiscordBotTokenValidationError, DiscordBotTokenValidationStage, GuildBotTokenUpdateRequest,
         GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
-        guild_settings_response, normalize_guild_meetings_pagination,
+        classify_discord_bot_token_validation_status, guild_settings_response,
+        normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
         validate_guild_settings_update,
     };
     use axum::http::StatusCode;
@@ -3356,6 +3773,24 @@ mod guild_api_tests {
             retention_raw_audio_ttl_days: 14,
             retention_transcript_ttl_days: 60,
             summary_enabled: true,
+        }
+    }
+
+    fn stored_settings_with_token(registered: bool) -> StoredGuildSettings {
+        StoredGuildSettings {
+            whisper_language: Some("fr".to_owned()),
+            whisper_language_explicit: true,
+            whisper_vad: Some(true),
+            auto_stop_grace_seconds: Some(300),
+            retention_raw_audio_ttl_days: Some(21),
+            retention_transcript_ttl_days: Some(90),
+            summary_enabled: Some(false),
+            discord_bot_token_registered: registered,
+            discord_bot_token_updated_at: registered.then(|| "2026-05-31T00:00:00Z".to_owned()),
+            discord_bot_token_last_validated_at: registered
+                .then(|| "2026-05-31T00:01:00Z".to_owned()),
+            discord_bot_user_id: registered.then(|| "bot-1".to_owned()),
+            discord_bot_username: registered.then(|| "GuildBot".to_owned()),
         }
     }
 
@@ -3430,6 +3865,11 @@ mod guild_api_tests {
         assert_eq!(response.retention_raw_audio_ttl_days, 14);
         assert_eq!(response.retention_transcript_ttl_days, 60);
         assert!(response.summary_enabled);
+        assert!(!response.discord_bot_token_registered);
+        assert_eq!(response.discord_bot_token_updated_at, None);
+        assert_eq!(response.discord_bot_token_last_validated_at, None);
+        assert_eq!(response.discord_bot_user_id, None);
+        assert_eq!(response.discord_bot_username, None);
         assert!(!response.is_admin);
     }
 
@@ -3437,15 +3877,7 @@ mod guild_api_tests {
     fn guild_settings_response_honors_stored_values() {
         let response = guild_settings_response(
             &default_settings(),
-            Some(StoredGuildSettings {
-                whisper_language: Some("fr".to_owned()),
-                whisper_language_explicit: true,
-                whisper_vad: Some(true),
-                auto_stop_grace_seconds: Some(300),
-                retention_raw_audio_ttl_days: Some(21),
-                retention_transcript_ttl_days: Some(90),
-                summary_enabled: Some(false),
-            }),
+            Some(stored_settings_with_token(true)),
             true,
         );
 
@@ -3456,7 +3888,95 @@ mod guild_api_tests {
         assert_eq!(response.retention_raw_audio_ttl_days, 21);
         assert_eq!(response.retention_transcript_ttl_days, 90);
         assert!(!response.summary_enabled);
+        assert!(response.discord_bot_token_registered);
+        assert_eq!(
+            response.discord_bot_token_updated_at.as_deref(),
+            Some("2026-05-31T00:00:00Z")
+        );
+        assert_eq!(
+            response.discord_bot_token_last_validated_at.as_deref(),
+            Some("2026-05-31T00:01:00Z")
+        );
+        assert_eq!(response.discord_bot_user_id.as_deref(), Some("bot-1"));
+        assert_eq!(response.discord_bot_username.as_deref(), Some("GuildBot"));
         assert!(response.is_admin);
+    }
+
+    #[test]
+    fn guild_bot_token_update_validation_rejects_blank_or_oversized_token() {
+        assert_eq!(
+            normalize_guild_bot_token_update(&GuildBotTokenUpdateRequest {
+                bot_token: "   ".to_owned()
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_guild_bot_token_update(&GuildBotTokenUpdateRequest {
+                bot_token: "x".repeat(4097)
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_bot_token_update_validation_trims_token() {
+        assert_eq!(
+            normalize_guild_bot_token_update(&GuildBotTokenUpdateRequest {
+                bot_token: "  token-value  ".to_owned()
+            }),
+            Ok("token-value".to_owned())
+        );
+    }
+
+    #[test]
+    fn discord_bot_token_validation_status_maps_invalid_and_access_denied() {
+        assert_eq!(
+            classify_discord_bot_token_validation_status(
+                DiscordBotTokenValidationStage::User,
+                reqwest::StatusCode::UNAUTHORIZED,
+            ),
+            Some(DiscordBotTokenValidationError::InvalidToken)
+        );
+        assert_eq!(
+            classify_discord_bot_token_validation_status(
+                DiscordBotTokenValidationStage::Guild,
+                reqwest::StatusCode::FORBIDDEN,
+            ),
+            Some(DiscordBotTokenValidationError::GuildAccessDenied)
+        );
+        assert_eq!(
+            classify_discord_bot_token_validation_status(
+                DiscordBotTokenValidationStage::Guild,
+                reqwest::StatusCode::NOT_FOUND,
+            ),
+            Some(DiscordBotTokenValidationError::GuildAccessDenied)
+        );
+        assert_eq!(
+            classify_discord_bot_token_validation_status(
+                DiscordBotTokenValidationStage::Guild,
+                reqwest::StatusCode::OK,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn settings_admin_check_retries_global_for_token_recovery_failures() {
+        assert!(!super::should_retry_settings_admin_check_with_global(&Ok(
+            true
+        )));
+        assert!(super::should_retry_settings_admin_check_with_global(&Ok(
+            false
+        )));
+        assert!(super::should_retry_settings_admin_check_with_global(&Err(
+            StatusCode::BAD_GATEWAY
+        )));
+        assert!(super::should_retry_settings_admin_check_with_global(&Err(
+            StatusCode::SERVICE_UNAVAILABLE
+        )));
+        assert!(!super::should_retry_settings_admin_check_with_global(&Err(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use discord_transcript::application::runtime::run_bot;
 use discord_transcript::bootstrap::config::AppConfig;
+use discord_transcript::infrastructure::bot_token::{BotTokenCipher, resolve_effective_bot_token};
 use discord_transcript::interfaces::web;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
@@ -60,6 +61,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .batch_execute(discord_transcript::infrastructure::sql::INCREMENTAL_MIGRATIONS_SQL)
         .await?;
 
+    let guild_bot_token_cipher = config
+        .guild_bot_token_encryption_key
+        .as_deref()
+        .map(BotTokenCipher::new)
+        .transpose()?
+        .map(Arc::new);
+    let effective_discord_token = resolve_effective_bot_token(
+        &db_client,
+        &config.discord_guild_id,
+        &config.discord_token,
+        guild_bot_token_cipher.as_deref(),
+    )
+    .await?;
+    let mut runtime_config = config.clone();
+    runtime_config.discord_token = effective_discord_token;
+
     // Build OAuth config if all required fields are present
     let auth = match (
         &config.discord_client_id,
@@ -98,6 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
+        guild_bot_token_cipher,
         config.static_files_dir.clone(),
         web::GuildSettingsDefaults {
             whisper_language: config.whisper_language.clone(),
@@ -128,6 +146,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    run_bot(&config).await?;
+    run_bot(&runtime_config).await?;
     Ok(())
 }
