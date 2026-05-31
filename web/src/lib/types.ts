@@ -39,15 +39,7 @@ export interface GuildSettingsResponse {
   summary_enabled: boolean | null;
 }
 
-export interface UpdateGuildSettingsRequest {
-  whisper_language: string | null;
-  whisper_language_explicit: boolean;
-  whisper_vad: boolean | null;
-  auto_stop_grace_seconds: number | null;
-  retention_raw_audio_ttl_days: number | null;
-  retention_transcript_ttl_days: number | null;
-  summary_enabled: boolean | null;
-}
+export type UpdateGuildSettingsRequest = GuildSettingsResponse;
 
 export interface SpeakerResponse {
   id: string;

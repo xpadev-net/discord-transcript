@@ -1,9 +1,9 @@
 import type {
   DebugArtifact,
   GuildSettingsResponse,
+  MeetingListResponse,
   MeetingResponse,
   MeResponse,
-  MeetingListResponse,
   SpeakerAudioInfo,
   SummaryResponse,
   TranscriptSegment,
