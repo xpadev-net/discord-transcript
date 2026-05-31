@@ -2549,6 +2549,10 @@ fn guild_settings_response(
     }
 }
 
+fn guild_bot_token_delete_is_noop(stored: Option<&StoredGuildSettings>) -> bool {
+    stored.is_none_or(|settings| !settings.discord_bot_token_registered)
+}
+
 async fn current_user_is_guild_admin(state: &WebState, user_id: &str) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     check_guild_admin_permission_for_settings(state, auth, user_id).await
@@ -2816,6 +2820,17 @@ async fn api_delete_guild_bot_token(
             "forbidden",
             "Guild administrator permission is required.",
         ));
+    }
+
+    let current = load_guild_settings(&state, &auth.guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    if guild_bot_token_delete_is_noop(current.as_ref()) {
+        return Ok(Json(guild_settings_response(
+            &state.guild_settings_defaults,
+            current,
+            true,
+        )));
     }
 
     state
@@ -4230,9 +4245,9 @@ mod guild_api_tests {
         GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
         advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
         classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
-        guild_admin_required_result, guild_settings_response, normalize_guild_bot_token_update,
-        normalize_guild_meetings_pagination, validate_authorized_guild_settings_update,
-        validate_guild_settings_update,
+        guild_admin_required_result, guild_bot_token_delete_is_noop, guild_settings_response,
+        normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
+        validate_authorized_guild_settings_update, validate_guild_settings_update,
     };
     use axum::http::StatusCode;
     use std::sync::{
@@ -4280,6 +4295,16 @@ mod guild_api_tests {
             discord_bot_user_id: registered.then(|| "bot-1".to_owned()),
             discord_bot_username: registered.then(|| "GuildBot".to_owned()),
         }
+    }
+
+    #[test]
+    fn guild_bot_token_delete_noops_without_registered_token() {
+        let registered = stored_settings_with_token(true);
+        let unregistered = stored_settings_with_token(false);
+
+        assert!(guild_bot_token_delete_is_noop(None));
+        assert!(guild_bot_token_delete_is_noop(Some(&unregistered)));
+        assert!(!guild_bot_token_delete_is_noop(Some(&registered)));
     }
 
     #[test]
