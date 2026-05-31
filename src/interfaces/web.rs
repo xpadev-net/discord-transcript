@@ -439,7 +439,10 @@ fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool
 }
 
 fn allows_settings_token_recovery(path: &str) -> bool {
-    path == "/api/me" || path.starts_with("/api/guild/settings")
+    matches!(
+        path,
+        "/api/me" | "/api/guild/settings" | "/api/guild/settings/bot-token"
+    )
 }
 
 fn bot_token_resolve_status(err: &BotTokenResolveError) -> StatusCode {
@@ -4844,6 +4847,9 @@ mod session_reverify_tests {
         assert!(allows_settings_token_recovery("/api/guild/settings"));
         assert!(allows_settings_token_recovery(
             "/api/guild/settings/bot-token"
+        ));
+        assert!(!allows_settings_token_recovery(
+            "/api/guild/settings/notifications"
         ));
         assert!(!allows_settings_token_recovery("/api/meetings/meeting-1"));
         assert!(!allows_settings_token_recovery("/"));

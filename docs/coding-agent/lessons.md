@@ -331,3 +331,33 @@ Prevention:
 
 Evidence:
 - The combined Task 43/44 worktree reran Rust fmt/check/test/clippy and frontend install/lint/typecheck/build/test after conflict resolution.
+
+## 2026-05-31 - Sensitive Recovery Routes Must Be Explicit  [tags: review, security, routing]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: gh-review-hook 65
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+- `gh-review-hook` found that settings token recovery used `starts_with("/api/guild/settings")`, which would silently extend global-token recovery to future settings subroutes.
+- It also found a redundant `COALESCE` in the guild bot token lookup query that obscured the `NOT NULL` invariant enforced by the `WHERE` clause.
+
+Root cause:
+- The implementation optimized for current route grouping and defensive SQL defaults without making the security boundary and data invariant self-documenting.
+
+Fix applied:
+- Replaced the prefix route check with an explicit allowlist for `/api/me`, `/api/guild/settings`, and `/api/guild/settings/bot-token`.
+- Removed unreachable `COALESCE` fallback from `GET_GUILD_BOT_TOKEN_SQL`.
+
+Prevention:
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: Security-sensitive fallback/recovery helpers should use explicit route/resource allowlists instead of broad prefix matching.
+- Dispatch/plan guardrail:
+  - When SQL `WHERE` clauses establish non-null invariants, keep SELECT projections aligned with that invariant unless a fallback is actually reachable.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- `gh-review-hook 65` exited 2 with these findings; fixes were applied before the next validation/review cycle.

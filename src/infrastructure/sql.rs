@@ -267,9 +267,9 @@ WHERE guild_id = $1
 "#;
 
 pub const GET_GUILD_BOT_TOKEN_SQL: &str = r#"
-SELECT COALESCE(bot_token_ciphertext, '') AS bot_token_ciphertext,
-       COALESCE(bot_token_nonce, '') AS bot_token_nonce,
-       COALESCE(bot_token_key_version, '') AS bot_token_key_version,
+SELECT bot_token_ciphertext,
+       bot_token_nonce,
+       bot_token_key_version,
        to_char(bot_token_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS bot_token_updated_at,
        to_char(bot_token_last_validated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS bot_token_last_validated_at,
        bot_user_id, bot_username
