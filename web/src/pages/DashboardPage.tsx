@@ -27,6 +27,15 @@ function meetingPath(meetingId: string): string {
   return `/meetings/${meetingId}`;
 }
 
+function dashboardErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message === "forbidden") {
+    return "\u3053\u306e\u30ae\u30eb\u30c9\u306e\u4f1a\u8b70\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093";
+  }
+  return error instanceof Error
+    ? error.message
+    : "\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
+}
+
 export function DashboardPage() {
   const [request, setRequest] = useState({ page: 1, reloadKey: 0 });
   const [data, setData] = useState<MeetingListResponse | null>(null);
@@ -51,11 +60,7 @@ export function DashboardPage() {
       })
       .catch((err: unknown) => {
         if (!controller.signal.aborted) {
-          setError(
-            err instanceof Error
-              ? err.message
-              : "\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
-          );
+          setError(dashboardErrorMessage(err));
         }
       })
       .finally(() => {

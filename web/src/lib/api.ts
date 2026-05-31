@@ -16,9 +16,15 @@ function basePath(meetingId: string): string {
   return `/api/meetings/${encodeURIComponent(meetingId)}`;
 }
 
+export function buildLoginRedirectUrl(path: string): string {
+  return `/auth/login?redirect=${encodeURIComponent(path)}`;
+}
+
 function handleResponse<T>(response: Response): Promise<T> {
   if (response.status === 401) {
-    window.location.href = `/auth/login?redirect=${encodeURIComponent(window.location.pathname + window.location.search + window.location.hash)}`;
+    window.location.href = buildLoginRedirectUrl(
+      window.location.pathname + window.location.search + window.location.hash,
+    );
     return new Promise(() => {});
   }
   if (!response.ok) {
@@ -38,8 +44,24 @@ function handleGuildSettingsResponse(
   return handleResponse<GuildSettingsResponse>(response);
 }
 
+function handleMeResponse(response: Response): Promise<MeResponse> {
+  if (response.status === 403) {
+    throw new Error("forbidden");
+  }
+  return handleResponse<MeResponse>(response);
+}
+
+function handleGuildMeetingsResponse(
+  response: Response,
+): Promise<MeetingListResponse> {
+  if (response.status === 403) {
+    throw new Error("forbidden");
+  }
+  return handleResponse<MeetingListResponse>(response);
+}
+
 export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
-  return fetch("/api/me", { signal }).then(handleResponse<MeResponse>);
+  return fetch("/api/me", { signal }).then(handleMeResponse);
 }
 
 export function fetchGuildMeetings(
@@ -53,7 +75,7 @@ export function fetchGuildMeetings(
   });
 
   return fetch(`/api/guild/meetings?${params.toString()}`, { signal }).then(
-    handleResponse<MeetingListResponse>,
+    handleGuildMeetingsResponse,
   );
 }
 
