@@ -49,6 +49,8 @@ const MEMBERSHIP_CACHE_TTL_SECS: u64 = 5;
 const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 5;
 const GUILD_CACHE_TTL_SECS: u64 = 300;
 const BOT_TOKEN_CACHE_TTL_SECS: u64 = 300;
+const BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS: u64 = 5;
+const BOT_TOKEN_CACHE_FAILURE_TTL_SECS: u64 = 5;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
 const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
@@ -64,7 +66,15 @@ type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Members
 #[derive(Debug, Default)]
 struct BotTokenCacheState {
     entry: Option<(String, Instant)>,
+    failure: Option<(StatusCode, Instant)>,
     revision: u64,
+    refresh: Option<BotTokenRefreshEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct BotTokenRefreshEntry {
+    notify: Arc<Notify>,
+    started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -467,31 +477,37 @@ fn bot_token_resolve_status(err: &BotTokenResolveError) -> StatusCode {
     }
 }
 
+fn cached_bot_token_result(cache: &BotTokenCacheState) -> Option<Result<String, StatusCode>> {
+    let now = Instant::now();
+    if let Some((token, expires_at)) = cache.entry.as_ref()
+        && now < *expires_at
+    {
+        return Some(Ok(format!("Bot {token}")));
+    }
+    if let Some((status, expires_at)) = cache.failure.as_ref()
+        && now < *expires_at
+    {
+        return Some(Err(*status));
+    }
+    None
+}
+
+fn fresh_bot_token_refresh_notify(cache: &BotTokenCacheState) -> Option<Arc<Notify>> {
+    let refresh = cache.refresh.as_ref()?;
+    if Instant::now().duration_since(refresh.started_at).as_secs()
+        < BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS
+    {
+        return Some(refresh.notify.clone());
+    }
+    None
+}
+
 async fn bot_auth_header_for_guild(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<String, StatusCode> {
-    loop {
-        {
-            let cache = state.bot_token_cache.read().await;
-            if let Some((token, expires_at)) = cache.entry.as_ref()
-                && Instant::now() < *expires_at
-            {
-                return Ok(format!("Bot {token}"));
-            }
-        }
-
-        let observed_revision = {
-            let cache = state.bot_token_cache.write().await;
-            if let Some((token, expires_at)) = cache.entry.as_ref()
-                && Instant::now() < *expires_at
-            {
-                return Ok(format!("Bot {token}"));
-            }
-            cache.revision
-        };
-
-        let token = resolve_effective_bot_token(
+    bot_auth_header_from_cache_with_resolver(&state.bot_token_cache, || async {
+        resolve_effective_bot_token(
             &state.db,
             &auth.guild_id,
             &auth.bot_token,
@@ -507,20 +523,104 @@ async fn bot_auth_header_for_guild(
                 "failed to resolve guild bot token"
             );
             status
-        })?;
+        })
+    })
+    .await
+}
 
-        let mut cache = state.bot_token_cache.write().await;
-        if let Some((cached_token, expires_at)) = cache.entry.as_ref()
-            && Instant::now() < *expires_at
+async fn bot_auth_header_from_cache_with_resolver<F, Fut>(
+    bot_token_cache: &BotTokenCache,
+    resolve: F,
+) -> Result<String, StatusCode>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<String, StatusCode>>,
+{
+    loop {
         {
-            return Ok(format!("Bot {cached_token}"));
+            let cache = bot_token_cache.read().await;
+            if let Some(result) = cached_bot_token_result(&cache) {
+                return result;
+            }
+            if let Some(notify) = fresh_bot_token_refresh_notify(&cache) {
+                drop(cache);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS),
+                    notify.notified(),
+                )
+                .await;
+                continue;
+            }
         }
-        if cache.revision != observed_revision {
+
+        let (observed_revision, leader_notify) = {
+            let mut cache = bot_token_cache.write().await;
+            if let Some(result) = cached_bot_token_result(&cache) {
+                return result;
+            }
+            if let Some(notify) = fresh_bot_token_refresh_notify(&cache) {
+                drop(cache);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS),
+                    notify.notified(),
+                )
+                .await;
+                continue;
+            }
+            if let Some(stale_refresh) = cache.refresh.take() {
+                stale_refresh.notify.notify_waiters();
+            }
+            let notify = Arc::new(Notify::new());
+            cache.refresh = Some(BotTokenRefreshEntry {
+                notify: notify.clone(),
+                started_at: Instant::now(),
+            });
+            (cache.revision, notify)
+        };
+
+        let resolved = resolve().await;
+
+        let mut cache = bot_token_cache.write().await;
+        let is_current_refresh = cache
+            .refresh
+            .as_ref()
+            .is_some_and(|refresh| Arc::ptr_eq(&refresh.notify, &leader_notify));
+        if !is_current_refresh {
             continue;
         }
-        let expires_at = Instant::now() + Duration::from_secs(BOT_TOKEN_CACHE_TTL_SECS);
-        cache.entry = Some((token.clone(), expires_at));
-        return Ok(format!("Bot {token}"));
+        let mut refresh_notify = cache.refresh.take();
+        if let Some(result) = cached_bot_token_result(&cache) {
+            if let Some(notify) = refresh_notify.take() {
+                notify.notify.notify_waiters();
+            }
+            return result;
+        }
+        if cache.revision != observed_revision {
+            if let Some(notify) = refresh_notify.take() {
+                notify.notify.notify_waiters();
+            }
+            continue;
+        }
+        match resolved {
+            Ok(token) => {
+                let expires_at = Instant::now() + Duration::from_secs(BOT_TOKEN_CACHE_TTL_SECS);
+                cache.entry = Some((token.clone(), expires_at));
+                cache.failure = None;
+                if let Some(notify) = refresh_notify.take() {
+                    notify.notify.notify_waiters();
+                }
+                return Ok(format!("Bot {token}"));
+            }
+            Err(status) => {
+                let expires_at =
+                    Instant::now() + Duration::from_secs(BOT_TOKEN_CACHE_FAILURE_TTL_SECS);
+                cache.failure = Some((status, expires_at));
+                if let Some(notify) = refresh_notify.take() {
+                    notify.notify.notify_waiters();
+                }
+                return Err(status);
+            }
+        }
     }
 }
 
@@ -2744,10 +2844,15 @@ async fn api_delete_guild_bot_token(
 }
 
 async fn invalidate_discord_caches(state: &WebState) {
-    {
+    let bot_token_refresh = {
         let mut cache = state.bot_token_cache.write().await;
         cache.entry = None;
+        cache.failure = None;
         cache.revision = cache.revision.wrapping_add(1);
+        cache.refresh.take()
+    };
+    if let Some(refresh) = bot_token_refresh {
+        refresh.notify.notify_waiters();
     }
     state.guild_cache.write().await.take();
     state.membership_cache.write().await.clear();
@@ -4120,16 +4225,22 @@ async fn stream_file_range(
 #[cfg(test)]
 mod guild_api_tests {
     use super::{
-        DiscordBotTokenValidationError, DiscordBotTokenValidationStage, GuildAdminCheck,
-        GuildBotTokenUpdateRequest, GuildMeetingsQuery, GuildSettingsDefaults,
-        GuildSettingsUpdateRequest, StoredGuildSettings, advance_bot_token_revision,
+        BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, DiscordBotTokenValidationError,
+        DiscordBotTokenValidationStage, GuildAdminCheck, GuildBotTokenUpdateRequest,
+        GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
+        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
         classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
         guild_admin_required_result, guild_settings_response, normalize_guild_bot_token_update,
         normalize_guild_meetings_pagination, validate_authorized_guild_settings_update,
         validate_guild_settings_update,
     };
     use axum::http::StatusCode;
-    use tokio::sync::watch;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    use tokio::sync::{Barrier, Notify, RwLock, watch};
 
     fn valid_settings_request() -> GuildSettingsUpdateRequest {
         GuildSettingsUpdateRequest {
@@ -4368,6 +4479,113 @@ mod guild_api_tests {
         advance_bot_token_revision(&sender);
 
         assert_eq!(*receiver.borrow(), 0);
+    }
+
+    #[tokio::test]
+    async fn bot_token_cache_refresh_failure_is_shared_with_followers() {
+        let cache = Arc::new(RwLock::new(BotTokenCacheState::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(6));
+        let release = Arc::new(Notify::new());
+        let tasks = (0..5)
+            .map(|_| {
+                let cache = cache.clone();
+                let calls = calls.clone();
+                let start = start.clone();
+                let release = release.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    bot_auth_header_from_cache_with_resolver(&cache, || {
+                        let calls = calls.clone();
+                        let release = release.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            release.notified().await;
+                            Err(StatusCode::BAD_GATEWAY)
+                        }
+                    })
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if calls.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one refresh leader should start");
+        release.notify_waiters();
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), Err(StatusCode::BAD_GATEWAY));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_bot_token_cache_refresh_can_be_replaced() {
+        let cache = Arc::new(RwLock::new(BotTokenCacheState::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let leader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                bot_auth_header_from_cache_with_resolver(&cache, || {
+                    let calls = calls.clone();
+                    let release = release.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        release.notified().await;
+                        Ok("stale-token".to_owned())
+                    }
+                })
+                .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_refresh = cache.read().await.refresh.is_some();
+                if calls.load(Ordering::SeqCst) == 1 && has_refresh {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first refresh leader should install sentinel");
+        leader.abort();
+        let _ = leader.await;
+        {
+            let mut cache_state = cache.write().await;
+            cache_state
+                .refresh
+                .as_mut()
+                .expect("aborted leader leaves refresh sentinel")
+                .started_at =
+                Instant::now() - Duration::from_secs(BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS + 1);
+        }
+
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let result = bot_auth_header_from_cache_with_resolver(&cache, || {
+            let replacement_calls = replacement_calls.clone();
+            async move {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("fresh-token".to_owned())
+            }
+        })
+        .await;
+
+        assert_eq!(result, Ok("Bot fresh-token".to_owned()));
+        assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
