@@ -228,6 +228,10 @@
   - Summary: Hook found settings recovery retried global auth on Discord member API rate limits.
   - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`.
   - Notes: Added a distinct rate-limited admin-check outcome so global-token recovery does not double-call a saturated Discord endpoint.
+- 2026-05-31 gh-review-hook pass 6 completed: exit 2
+  - Summary: Hook found AES-GCM nonce generation used UUID-derived bytes and token update request `Debug` could expose raw tokens.
+  - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
+  - Notes: Switched nonce generation to `Aes256Gcm::generate_nonce(&mut OsRng)` and added a redacted `Debug` implementation for `GuildBotTokenUpdateRequest`.
 
 ## Decision Log
 - 2026-05-31 Decision:

@@ -1855,9 +1855,17 @@ struct GuildSettingsUpdateRequest {
     summary_enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct GuildBotTokenUpdateRequest {
     bot_token: String,
+}
+
+impl std::fmt::Debug for GuildBotTokenUpdateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuildBotTokenUpdateRequest")
+            .field("bot_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -1,4 +1,4 @@
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -6,7 +6,6 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use std::fmt::{Display, Formatter};
 use tokio_postgres::Client as PgClient;
-use uuid::Uuid;
 
 use crate::infrastructure::sql::GET_GUILD_BOT_TOKEN_SQL;
 
@@ -114,8 +113,8 @@ impl BotTokenCipher {
         if token.trim().is_empty() {
             return Err(BotTokenCryptoError::InvalidPlaintext);
         }
-        let nonce_uuid = Uuid::new_v4();
-        let nonce_bytes = &nonce_uuid.as_bytes()[..12];
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce_bytes = nonce.as_slice();
         let ciphertext = self
             .cipher
             .encrypt(
