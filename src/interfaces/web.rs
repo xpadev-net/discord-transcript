@@ -17,8 +17,13 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
+use crate::infrastructure::sql::{
+    COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL, LIST_GUILD_MEETINGS_SQL,
+    UPSERT_GUILD_SETTINGS_SQL,
+};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -95,6 +100,7 @@ pub struct GuildSettingsDefaults {
     pub auto_stop_grace_seconds: i64,
     pub retention_raw_audio_ttl_days: i32,
     pub retention_transcript_ttl_days: i32,
+    pub summary_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -182,6 +188,12 @@ pub fn create_router(state: WebState) -> Router {
         );
 
     let protected = Router::new()
+        .route("/api/me", get(api_me))
+        .route("/api/guild/meetings", get(api_guild_meetings))
+        .route(
+            "/api/guild/settings",
+            get(api_guild_settings).put(api_update_guild_settings),
+        )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route("/api/meetings/{meeting_id}/summary", get(api_summary))
@@ -1613,6 +1625,71 @@ struct MeetingResponse {
 }
 
 #[derive(Serialize)]
+struct CurrentUserResponse {
+    user_id: String,
+    guild_id: String,
+    is_admin: bool,
+}
+
+#[derive(Deserialize)]
+struct GuildMeetingsQuery {
+    page: Option<u32>,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct GuildMeetingEntryResponse {
+    id: String,
+    title: Option<String>,
+    status: String,
+    started_at: Option<String>,
+    stopped_at: Option<String>,
+    duration_seconds: Option<i32>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GuildMeetingsResponse {
+    meetings: Vec<GuildMeetingEntryResponse>,
+    page: u32,
+    limit: u32,
+    total: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildSettingsResponse {
+    whisper_language: Option<String>,
+    whisper_language_explicit: bool,
+    whisper_vad: bool,
+    auto_stop_grace_seconds: i64,
+    retention_raw_audio_ttl_days: i32,
+    retention_transcript_ttl_days: i32,
+    summary_enabled: bool,
+    is_admin: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildSettingsUpdateRequest {
+    whisper_language: Option<String>,
+    whisper_vad: bool,
+    auto_stop_grace_seconds: i64,
+    retention_raw_audio_ttl_days: i32,
+    retention_transcript_ttl_days: i32,
+    summary_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredGuildSettings {
+    whisper_language: Option<String>,
+    whisper_language_explicit: bool,
+    whisper_vad: Option<bool>,
+    auto_stop_grace_seconds: Option<i64>,
+    retention_raw_audio_ttl_days: Option<i32>,
+    retention_transcript_ttl_days: Option<i32>,
+    summary_enabled: Option<bool>,
+}
+
+#[derive(Serialize)]
 struct SpeakerResponse {
     id: String,
     username: Option<String>,
@@ -1660,6 +1737,210 @@ struct DebugArtifactEntry {
 }
 
 // ---------- Handlers ----------
+
+fn normalize_guild_meetings_pagination(query: GuildMeetingsQuery) -> (u32, u32) {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    (page, limit)
+}
+
+fn validate_guild_settings_update(request: &GuildSettingsUpdateRequest) -> Result<(), StatusCode> {
+    if let Some(language) = request.whisper_language.as_deref()
+        && !is_iso639_1_format(language)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !(10..=3600).contains(&request.auto_stop_grace_seconds) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !(1..=365).contains(&request.retention_raw_audio_ttl_days)
+        || !(1..=365).contains(&request.retention_transcript_ttl_days)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn guild_settings_response(
+    defaults: &GuildSettingsDefaults,
+    stored: Option<StoredGuildSettings>,
+    is_admin: bool,
+) -> GuildSettingsResponse {
+    let stored = stored.unwrap_or(StoredGuildSettings {
+        whisper_language: None,
+        whisper_language_explicit: false,
+        whisper_vad: None,
+        auto_stop_grace_seconds: None,
+        retention_raw_audio_ttl_days: None,
+        retention_transcript_ttl_days: None,
+        summary_enabled: None,
+    });
+    let whisper_language = if stored.whisper_language_explicit {
+        stored.whisper_language
+    } else {
+        defaults.whisper_language.clone()
+    };
+    GuildSettingsResponse {
+        whisper_language,
+        whisper_language_explicit: stored.whisper_language_explicit,
+        whisper_vad: stored.whisper_vad.unwrap_or(defaults.whisper_vad),
+        auto_stop_grace_seconds: stored
+            .auto_stop_grace_seconds
+            .unwrap_or(defaults.auto_stop_grace_seconds),
+        retention_raw_audio_ttl_days: stored
+            .retention_raw_audio_ttl_days
+            .unwrap_or(defaults.retention_raw_audio_ttl_days),
+        retention_transcript_ttl_days: stored
+            .retention_transcript_ttl_days
+            .unwrap_or(defaults.retention_transcript_ttl_days),
+        summary_enabled: stored.summary_enabled.unwrap_or(defaults.summary_enabled),
+        is_admin,
+    }
+}
+
+async fn current_user_is_guild_admin(state: &WebState, user_id: &str) -> Result<bool, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    check_guild_admin_permission(state, auth, user_id).await
+}
+
+async fn api_me(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<CurrentUserResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let is_admin = check_guild_admin_permission(&state, auth, &user_id).await?;
+    Ok(Json(CurrentUserResponse {
+        user_id,
+        guild_id: auth.guild_id.clone(),
+        is_admin,
+    }))
+}
+
+async fn api_guild_meetings(
+    State(state): State<WebState>,
+    Query(query): Query<GuildMeetingsQuery>,
+) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let (page, limit) = normalize_guild_meetings_pagination(query);
+    let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
+    let limit_i64 = i64::from(limit);
+
+    let count_row = state
+        .db
+        .query_one(COUNT_GUILD_MEETINGS_SQL, &[&auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total: i64 = count_row.get(0);
+
+    let rows = state
+        .db
+        .query(
+            LIST_GUILD_MEETINGS_SQL,
+            &[&auth.guild_id, &limit_i64, &offset],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let meetings = rows
+        .iter()
+        .map(|row| GuildMeetingEntryResponse {
+            id: row.get("id"),
+            title: row.get("title"),
+            status: row.get("status"),
+            started_at: row.get("started_at"),
+            stopped_at: row.get("stopped_at"),
+            duration_seconds: row.get("meeting_duration_seconds"),
+            stop_reason: row.get("stop_reason"),
+        })
+        .collect();
+
+    Ok(Json(GuildMeetingsResponse {
+        meetings,
+        page,
+        limit,
+        total,
+    }))
+}
+
+async fn load_guild_settings(
+    state: &WebState,
+    guild_id: &str,
+) -> Result<Option<StoredGuildSettings>, StatusCode> {
+    let row = state
+        .db
+        .query_opt(GET_GUILD_SETTINGS_SQL, &[&guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(row.map(|row| StoredGuildSettings {
+        whisper_language: row.get("whisper_language"),
+        whisper_language_explicit: row.get("whisper_language_explicit"),
+        whisper_vad: row.get("whisper_vad"),
+        auto_stop_grace_seconds: row.get("auto_stop_grace_seconds"),
+        retention_raw_audio_ttl_days: row.get("retention_raw_audio_ttl_days"),
+        retention_transcript_ttl_days: row.get("retention_transcript_ttl_days"),
+        summary_enabled: row.get("summary_enabled"),
+    }))
+}
+
+async fn api_guild_settings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<GuildSettingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
+    let stored = load_guild_settings(&state, &auth.guild_id).await?;
+
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        is_admin,
+    )))
+}
+
+async fn api_update_guild_settings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Json(request): Json<GuildSettingsUpdateRequest>,
+) -> Result<Json<GuildSettingsResponse>, StatusCode> {
+    validate_guild_settings_update(&request)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if !check_guild_admin_permission(&state, auth, &user_id).await? {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let whisper_language_explicit = request.whisper_language.is_some();
+    state
+        .db
+        .execute(
+            UPSERT_GUILD_SETTINGS_SQL,
+            &[
+                &auth.guild_id,
+                &request.whisper_language,
+                &whisper_language_explicit,
+                &request.whisper_vad,
+                &request.auto_stop_grace_seconds,
+                &request.retention_raw_audio_ttl_days,
+                &request.retention_transcript_ttl_days,
+                &request.summary_enabled,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        Some(StoredGuildSettings {
+            whisper_language: request.whisper_language,
+            whisper_language_explicit,
+            whisper_vad: Some(request.whisper_vad),
+            auto_stop_grace_seconds: Some(request.auto_stop_grace_seconds),
+            retention_raw_audio_ttl_days: Some(request.retention_raw_audio_ttl_days),
+            retention_transcript_ttl_days: Some(request.retention_transcript_ttl_days),
+            summary_enabled: Some(request.summary_enabled),
+        }),
+        true,
+    )))
+}
 
 async fn api_meeting(
     State(state): State<WebState>,
@@ -2785,6 +3066,163 @@ async fn stream_file_range(
     let limited = file.take(length);
     let stream = tokio_util::io::ReaderStream::new(limited);
     Ok(axum::body::Body::from_stream(stream))
+}
+
+#[cfg(test)]
+mod guild_api_tests {
+    use super::{
+        GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
+        guild_settings_response, normalize_guild_meetings_pagination,
+        validate_guild_settings_update,
+    };
+    use axum::http::StatusCode;
+
+    fn valid_settings_request() -> GuildSettingsUpdateRequest {
+        GuildSettingsUpdateRequest {
+            whisper_language: Some("en".to_owned()),
+            whisper_vad: true,
+            auto_stop_grace_seconds: 60,
+            retention_raw_audio_ttl_days: 7,
+            retention_transcript_ttl_days: 30,
+            summary_enabled: true,
+        }
+    }
+
+    fn default_settings() -> GuildSettingsDefaults {
+        GuildSettingsDefaults {
+            whisper_language: Some("ja".to_owned()),
+            whisper_vad: false,
+            auto_stop_grace_seconds: 120,
+            retention_raw_audio_ttl_days: 14,
+            retention_transcript_ttl_days: 60,
+            summary_enabled: true,
+        }
+    }
+
+    #[test]
+    fn guild_settings_validation_accepts_boundary_values() {
+        let mut request = valid_settings_request();
+        request.auto_stop_grace_seconds = 10;
+        request.retention_raw_audio_ttl_days = 1;
+        request.retention_transcript_ttl_days = 365;
+
+        assert_eq!(validate_guild_settings_update(&request), Ok(()));
+
+        request.auto_stop_grace_seconds = 3600;
+        request.retention_raw_audio_ttl_days = 365;
+        request.retention_transcript_ttl_days = 1;
+
+        assert_eq!(validate_guild_settings_update(&request), Ok(()));
+    }
+
+    #[test]
+    fn guild_settings_validation_rejects_invalid_language() {
+        for language in ["EN", "eng", "e1", ""] {
+            let mut request = valid_settings_request();
+            request.whisper_language = Some(language.to_owned());
+
+            assert_eq!(
+                validate_guild_settings_update(&request),
+                Err(StatusCode::BAD_REQUEST)
+            );
+        }
+    }
+
+    #[test]
+    fn guild_settings_validation_rejects_out_of_range_values() {
+        let mut request = valid_settings_request();
+        request.auto_stop_grace_seconds = 9;
+        assert_eq!(
+            validate_guild_settings_update(&request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        request = valid_settings_request();
+        request.auto_stop_grace_seconds = 3601;
+        assert_eq!(
+            validate_guild_settings_update(&request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        request = valid_settings_request();
+        request.retention_raw_audio_ttl_days = 0;
+        assert_eq!(
+            validate_guild_settings_update(&request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        request = valid_settings_request();
+        request.retention_transcript_ttl_days = 366;
+        assert_eq!(
+            validate_guild_settings_update(&request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_settings_response_falls_back_to_defaults() {
+        let response = guild_settings_response(&default_settings(), None, false);
+
+        assert_eq!(response.whisper_language.as_deref(), Some("ja"));
+        assert!(!response.whisper_language_explicit);
+        assert!(!response.whisper_vad);
+        assert_eq!(response.auto_stop_grace_seconds, 120);
+        assert_eq!(response.retention_raw_audio_ttl_days, 14);
+        assert_eq!(response.retention_transcript_ttl_days, 60);
+        assert!(response.summary_enabled);
+        assert!(!response.is_admin);
+    }
+
+    #[test]
+    fn guild_settings_response_honors_stored_values() {
+        let response = guild_settings_response(
+            &default_settings(),
+            Some(StoredGuildSettings {
+                whisper_language: Some("fr".to_owned()),
+                whisper_language_explicit: true,
+                whisper_vad: Some(true),
+                auto_stop_grace_seconds: Some(300),
+                retention_raw_audio_ttl_days: Some(21),
+                retention_transcript_ttl_days: Some(90),
+                summary_enabled: Some(false),
+            }),
+            true,
+        );
+
+        assert_eq!(response.whisper_language.as_deref(), Some("fr"));
+        assert!(response.whisper_language_explicit);
+        assert!(response.whisper_vad);
+        assert_eq!(response.auto_stop_grace_seconds, 300);
+        assert_eq!(response.retention_raw_audio_ttl_days, 21);
+        assert_eq!(response.retention_transcript_ttl_days, 90);
+        assert!(!response.summary_enabled);
+        assert!(response.is_admin);
+    }
+
+    #[test]
+    fn guild_meetings_pagination_is_bounded() {
+        assert_eq!(
+            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+                page: None,
+                limit: None
+            }),
+            (1, 20)
+        );
+        assert_eq!(
+            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+                page: Some(0),
+                limit: Some(0)
+            }),
+            (1, 1)
+        );
+        assert_eq!(
+            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+                page: Some(2),
+                limit: Some(250)
+            }),
+            (2, 100)
+        );
+    }
 }
 
 #[cfg(test)]

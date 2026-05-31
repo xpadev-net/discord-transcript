@@ -50,6 +50,7 @@ pub struct AppConfig {
     pub summary_harness: SummaryHarness,
     pub summary_command: String,
     pub summary_model: String,
+    pub summary_enabled: bool,
     pub database_url: String,
     pub database_ssl_mode: String,
     pub chunk_storage_dir: String,
@@ -124,6 +125,7 @@ impl AppConfig {
             summary_harness,
             summary_command,
             summary_model,
+            summary_enabled: optional_env_parse_bool("SUMMARY_ENABLED", true)?,
             database_url,
             database_ssl_mode: optional_env("DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
@@ -207,6 +209,7 @@ impl AppConfig {
             summary_harness,
             summary_command,
             summary_model,
+            summary_enabled: optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?,
             database_url,
             database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
@@ -562,7 +565,7 @@ fn optional_from_map_parse_bool(
     parse_bool(&value).ok_or(ConfigError::InvalidEnv { key, value })
 }
 
-fn is_iso639_1_format(s: &str) -> bool {
+pub(crate) fn is_iso639_1_format(s: &str) -> bool {
     s.len() == 2 && s.bytes().all(|b| b.is_ascii_lowercase())
 }
 
