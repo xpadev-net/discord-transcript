@@ -591,16 +591,31 @@ fn mark_live_transcription_chunk_failed<E: SqlExecutor>(
     error_message: &str,
 ) -> Result<(), String> {
     let chunk_id = live_chunk_id(chunk);
-    executor.execute(
-        "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live' AND live_chunk_id=$2",
-        &[chunk.meeting_id.clone(), chunk_id.clone()],
-    )?;
     executor
-        .execute(
-            "UPDATE live_transcription_chunks SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
-            &[chunk_id, error_message.to_owned()],
-        )
-        .map(|_| ())
+        .execute("BEGIN", &[])
+        .map_err(|err| format!("failed to begin live failure transaction: {err}"))?;
+    let result = (|| {
+        executor.execute(
+            "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live' AND live_chunk_id=$2",
+            &[chunk.meeting_id.clone(), chunk_id.clone()],
+        )?;
+        executor
+            .execute(
+                "UPDATE live_transcription_chunks SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
+                &[chunk_id, error_message.to_owned()],
+            )
+            .map(|_| ())
+    })();
+    match result {
+        Ok(()) => executor
+            .execute("COMMIT", &[])
+            .map(|_| ())
+            .map_err(|err| format!("failed to commit live failure transaction: {err}")),
+        Err(err) => {
+            let _ = executor.execute("ROLLBACK", &[]);
+            Err(err)
+        }
+    }
 }
 
 fn parse_transcript_row(row: &[Option<String>]) -> Result<TranscriptSegment, String> {
