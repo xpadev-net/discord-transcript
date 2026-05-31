@@ -237,7 +237,6 @@ export function SettingsPage() {
     try {
       const updated = await updateGuildBotToken({ bot_token: token });
       setSettings(updated);
-      setForm(formFromSettings(updated));
       setBotTokenValue("");
       setMessage(
         "Discord Bot token \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f",
@@ -273,7 +272,6 @@ export function SettingsPage() {
     try {
       const updated = await deleteGuildBotToken();
       setSettings(updated);
-      setForm(formFromSettings(updated));
       setBotTokenValue("");
       setMessage(
         "Discord Bot token \u306e\u30ae\u30eb\u30c9\u500b\u5225\u8a2d\u5b9a\u3092\u524a\u9664\u3057\u307e\u3057\u305f",
@@ -491,8 +489,15 @@ export function SettingsPage() {
                 {settings.discord_bot_username}
               </span>
             ) : null}
+            {settings.discord_bot_token_last_validated_at ? (
+              <span className="settings-token-meta">
+                {"\u691c\u8a3c: "}
+                {settings.discord_bot_token_last_validated_at}
+              </span>
+            ) : null}
             {settings.discord_bot_token_updated_at ? (
               <span className="settings-token-meta">
+                {"\u66f4\u65b0: "}
                 {settings.discord_bot_token_updated_at}
               </span>
             ) : null}

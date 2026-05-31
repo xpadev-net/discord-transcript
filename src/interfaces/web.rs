@@ -2699,6 +2699,7 @@ async fn api_delete_guild_bot_token(
 async fn invalidate_discord_caches(state: &WebState) {
     state.bot_token_cache.write().await.take();
     state.guild_cache.write().await.take();
+    state.membership_cache.write().await.clear();
     state.permission_cache.write().await.clear();
 }
 

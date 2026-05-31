@@ -371,22 +371,22 @@ Context:
 
 Symptom:
 - `gh-review-hook` found that web-layer Discord REST calls picked up per-guild token changes dynamically, but the Serenity gateway client kept the startup-resolved token indefinitely.
-- It also found that `bot_token_last_validated_at` was always identical to `bot_token_updated_at` because no independent background validation job exists.
+- It also found that token metadata could confuse save time and validation time if the UI displayed an unlabeled timestamp.
 
 Root cause:
 - The implementation treated the gateway token and web REST token as equivalent after startup, but only the web layer had a runtime refresh path.
-- Token metadata was modeled for future validation jobs before such a job existed.
+- Token metadata was displayed without labels, even though the current save path validates immediately before writing.
 
 Fix applied:
 - Token update/delete now advances an in-process watch revision, and `run_bot` gracefully drains and restarts the Discord gateway client so it resolves the current effective token.
-- Token writes now update `bot_token_updated_at` and leave `bot_token_last_validated_at` null until a future independent validation job exists; the UI shows updated-at metadata instead.
+- Token writes set both `bot_token_updated_at` and `bot_token_last_validated_at` because validation happens before persistence; the UI labels both values when present.
 
 Prevention:
 - Repo rule candidate:
   - audience: reviewer
   - proposed rule: When credentials are mutable at runtime, review every long-lived client/session separately from per-request REST helpers.
 - Dispatch/plan guardrail:
-  - Do not expose future metadata fields in UI unless the current implementation can make them semantically distinct.
+- Label token metadata values in UI when updated and validated timestamps are both present.
 - Residual risk / waiver:
   - none
 

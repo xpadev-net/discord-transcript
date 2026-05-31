@@ -221,9 +221,9 @@
   - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
   - Notes: `/api/me` now uses the same recovery-aware admin check and the token cache expires after 300 seconds.
 - 2026-05-31 gh-review-hook pass 4 completed: exit 0
-  - Summary: CI and AI review checks passed after the token cache TTL and `/api/me` recovery fixes.
-  - Validation evidence: `rtk gh-review-hook 65` exited 0.
-  - Notes: Ready to merge after plan lifecycle move.
+  - Summary: Token cache TTL and `/api/me` recovery fixes passed that hook cycle.
+  - Validation evidence: `rtk gh-review-hook 65` exited 0 for this scoped pass.
+  - Notes: Not final merge readiness; subsequent hook passes 5 and later reported additional issues.
 - 2026-05-31 gh-review-hook pass 5 completed: exit 2
   - Summary: Hook found settings recovery retried global auth on Discord member API rate limits.
   - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`.

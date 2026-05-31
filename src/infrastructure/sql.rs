@@ -283,14 +283,14 @@ WHERE guild_id = $1
 pub const UPSERT_GUILD_BOT_TOKEN_SQL: &str = r#"
 INSERT INTO guild_settings (
     guild_id, bot_token_ciphertext, bot_token_nonce, bot_token_key_version,
-    bot_token_updated_at, bot_user_id, bot_username, updated_at
-) VALUES ($1, $2, $3, $4, NOW(), $5, $6, NOW())
+    bot_token_updated_at, bot_token_last_validated_at, bot_user_id, bot_username, updated_at
+) VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, NOW())
 ON CONFLICT (guild_id) DO UPDATE SET
     bot_token_ciphertext = EXCLUDED.bot_token_ciphertext,
     bot_token_nonce = EXCLUDED.bot_token_nonce,
     bot_token_key_version = EXCLUDED.bot_token_key_version,
     bot_token_updated_at = NOW(),
-    bot_token_last_validated_at = NULL,
+    bot_token_last_validated_at = NOW(),
     bot_user_id = EXCLUDED.bot_user_id,
     bot_username = EXCLUDED.bot_username,
     updated_at = NOW()
