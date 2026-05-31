@@ -59,7 +59,7 @@ export function fetchGuildSettings(
   signal?: AbortSignal,
 ): Promise<GuildSettingsResponse> {
   return fetch("/api/guild/settings", { signal }).then(
-    handleResponse<GuildSettingsResponse>,
+    handleUpdateGuildSettingsResponse,
   );
 }
 
