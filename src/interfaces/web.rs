@@ -47,6 +47,7 @@ const ADMINISTRATOR: u64 = 1 << 3;
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
 const GUILD_CACHE_TTL_SECS: u64 = 300;
+const BOT_TOKEN_CACHE_TTL_SECS: u64 = 300;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
 const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
@@ -54,7 +55,7 @@ const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
-type BotTokenCache = Arc<tokio::sync::RwLock<Option<String>>>;
+type BotTokenCache = Arc<tokio::sync::RwLock<Option<(String, Instant)>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
 
 #[derive(Debug, Default)]
@@ -446,7 +447,9 @@ async fn bot_auth_header_for_guild(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<String, StatusCode> {
-    if let Some(token) = state.bot_token_cache.read().await.clone() {
+    if let Some((token, expires_at)) = state.bot_token_cache.read().await.clone()
+        && Instant::now() < expires_at
+    {
         return Ok(format!("Bot {token}"));
     }
 
@@ -467,7 +470,8 @@ async fn bot_auth_header_for_guild(
         );
         status
     })?;
-    *state.bot_token_cache.write().await = Some(token.clone());
+    let expires_at = Instant::now() + Duration::from_secs(BOT_TOKEN_CACHE_TTL_SECS);
+    *state.bot_token_cache.write().await = Some((token.clone(), expires_at));
     Ok(format!("Bot {token}"))
 }
 
@@ -2178,7 +2182,7 @@ async fn api_me(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<CurrentUserResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let is_admin = check_guild_admin_permission(&state, auth, &user_id).await?;
+    let is_admin = check_guild_admin_permission_for_settings(&state, auth, &user_id).await?;
     Ok(Json(CurrentUserResponse {
         user_id,
         guild_id: auth.guild_id.clone(),
