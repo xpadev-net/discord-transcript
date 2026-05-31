@@ -136,6 +136,7 @@ export function DashboardPage() {
                 reloadKey: current.reloadKey + 1,
               }))
             }
+            disabled={loading}
           >
             {"\u518d\u8a66\u884c"}
           </button>
@@ -212,37 +213,39 @@ export function DashboardPage() {
         </section>
       )}
 
-      <div className="pagination">
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() =>
-            setRequest((current) => ({
-              ...current,
-              page: Math.max(1, current.page - 1),
-            }))
-          }
-          disabled={loading || page <= 1}
-        >
-          {"\u524d\u3078"}
-        </button>
-        <span>
-          {page} / {totalPages}
-        </span>
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() =>
-            setRequest((current) => ({
-              ...current,
-              page: Math.min(totalPages, current.page + 1),
-            }))
-          }
-          disabled={loading || page >= totalPages}
-        >
-          {"\u6b21\u3078"}
-        </button>
-      </div>
+      {!error && data ? (
+        <div className="pagination">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() =>
+              setRequest((current) => ({
+                ...current,
+                page: Math.max(1, current.page - 1),
+              }))
+            }
+            disabled={loading || page <= 1}
+          >
+            {"\u524d\u3078"}
+          </button>
+          <span>
+            {page} / {totalPages}
+          </span>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() =>
+              setRequest((current) => ({
+                ...current,
+                page: Math.min(totalPages, current.page + 1),
+              }))
+            }
+            disabled={loading || page >= totalPages}
+          >
+            {"\u6b21\u3078"}
+          </button>
+        </div>
+      ) : null}
     </main>
   );
 }
