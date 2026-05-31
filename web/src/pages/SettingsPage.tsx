@@ -1,8 +1,7 @@
 import { type FormEvent, useEffect, useState } from "react";
-import { fetchGuildSettings, fetchMe, updateGuildSettings } from "../lib/api";
+import { fetchGuildSettings, updateGuildSettings } from "../lib/api";
 import type {
   GuildSettingsResponse,
-  MeResponse,
   UpdateGuildSettingsRequest,
 } from "../lib/types";
 
@@ -88,7 +87,6 @@ function validateForm(form: SettingsForm): string | null {
 }
 
 export function SettingsPage() {
-  const [me, setMe] = useState<MeResponse | null>(null);
   const [settings, setSettings] = useState<GuildSettingsResponse | null>(null);
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [loading, setLoading] = useState(true);
@@ -105,18 +103,6 @@ export function SettingsPage() {
     setLoading(true);
     setError(null);
     setMessage(null);
-
-    fetchMe(controller.signal)
-      .then((meResponse) => {
-        if (!controller.signal.aborted) {
-          setMe(meResponse);
-        }
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) {
-          setMe(null);
-        }
-      });
 
     fetchGuildSettings(controller.signal)
       .then((settingsResponse) => {
@@ -146,9 +132,8 @@ export function SettingsPage() {
     return () => controller.abort();
   }, []);
 
-  const canEdit = settings?.is_admin ?? me?.is_admin ?? false;
+  const canEdit = settings?.is_admin ?? false;
   const controlsDisabled = !canEdit || loading || saving || form == null;
-  const hasWhisperVad = settings?.whisper_vad != null;
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
@@ -169,16 +154,12 @@ export function SettingsPage() {
       return;
     }
 
-    const controller = new AbortController();
     setSaving(true);
     setError(null);
     setMessage(null);
 
     try {
-      const updated = await updateGuildSettings(
-        requestFromForm(form),
-        controller.signal,
-      );
+      const updated = await updateGuildSettings(requestFromForm(form));
       setSettings(updated);
       setForm(formFromSettings(updated));
       setMessage("\u8a2d\u5b9a\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f");
@@ -276,19 +257,17 @@ export function SettingsPage() {
                 }
               />
             </label>
-            {hasWhisperVad ? (
-              <label className="settings-checkbox">
-                <input
-                  type="checkbox"
-                  checked={form.whisper_vad}
-                  disabled={controlsDisabled}
-                  onChange={(event) =>
-                    updateForm({ whisper_vad: event.target.checked })
-                  }
-                />
-                <span>{"Whisper VAD \u3092\u4f7f\u7528\u3059\u308b"}</span>
-              </label>
-            ) : null}
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={form.whisper_vad}
+                disabled={controlsDisabled}
+                onChange={(event) =>
+                  updateForm({ whisper_vad: event.target.checked })
+                }
+              />
+              <span>{"Whisper VAD \u3092\u4f7f\u7528\u3059\u308b"}</span>
+            </label>
           </section>
 
           <section className="settings-section">
