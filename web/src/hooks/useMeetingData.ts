@@ -100,6 +100,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         fetchTranscriptState(meetingId, controller.signal),
       ])
         .then(([segments, state]) => {
+          if (controller.signal.aborted) return;
           setTranscript(segments);
           setTranscriptState(state);
           if (shouldPollTranscript(state) && intervalId === undefined) {

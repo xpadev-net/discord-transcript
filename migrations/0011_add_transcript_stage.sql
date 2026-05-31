@@ -34,9 +34,6 @@ CREATE TABLE IF NOT EXISTS live_transcription_chunks (
     UNIQUE (meeting_id, speaker_id, sequence, start_ms)
 );
 
-ALTER TABLE live_transcription_chunks
-ADD COLUMN IF NOT EXISTS timeline_base_ms BIGINT;
-
 DO $$
 BEGIN
     ALTER TABLE live_transcription_chunks

@@ -2014,7 +2014,7 @@ fn api_transcript_sql() -> &'static str {
      LEFT JOIN LATERAL ( \
        SELECT MIN(timeline_base_ms) AS min_base_ms \
        FROM live_transcription_chunks \
-       WHERE meeting_id=$1 AND status='done' AND timeline_base_ms IS NOT NULL \
+       WHERE meeting_id=$1 AND timeline_base_ms IS NOT NULL \
      ) lb ON true \
      LEFT JOIN LATERAL ( \
        SELECT EXISTS (SELECT 1 FROM transcripts ft WHERE ft.meeting_id=$1 AND ft.transcript_stage='final' AND NOT ft.is_deleted) AS has_final_rows \
