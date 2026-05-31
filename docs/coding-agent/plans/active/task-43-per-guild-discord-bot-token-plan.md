@@ -212,6 +212,10 @@
   - Summary: Hook found startup could fail before online recovery, settings recovery retried global auth for clean non-admins, SQL token-load semantics diverged from status semantics, key derivation needed purpose-bound KDF/normalization, and settings/token UI operations could race.
   - Validation evidence after fixes: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
   - Notes: Fixes were kept additive because PR #65 is open.
+- 2026-05-31 gh-review-hook pass 2 completed: exit 2
+  - Summary: Hook found effective bot-token resolution caused a DB query on every Discord REST call.
+  - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
+  - Notes: Added a WebState effective-token cache invalidated by the existing Discord cache invalidation path.
 
 ## Decision Log
 - 2026-05-31 Decision:

@@ -54,6 +54,7 @@ const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
+type BotTokenCache = Arc<tokio::sync::RwLock<Option<String>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
 
 #[derive(Debug, Default)]
@@ -129,6 +130,8 @@ pub struct WebState {
     pub auth: Option<Arc<AuthConfig>>,
     pub http_client: reqwest::Client,
     pub guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
+    /// Cache: resolved effective bot token for the configured guild.
+    bot_token_cache: BotTokenCache,
     /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
@@ -157,6 +160,7 @@ impl WebState {
             auth,
             http_client,
             guild_bot_token_cipher,
+            bot_token_cache: Arc::new(tokio::sync::RwLock::new(None)),
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -442,6 +446,10 @@ async fn bot_auth_header_for_guild(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<String, StatusCode> {
+    if let Some(token) = state.bot_token_cache.read().await.clone() {
+        return Ok(format!("Bot {token}"));
+    }
+
     let token = resolve_effective_bot_token(
         &state.db,
         &auth.guild_id,
@@ -459,6 +467,7 @@ async fn bot_auth_header_for_guild(
         );
         status
     })?;
+    *state.bot_token_cache.write().await = Some(token.clone());
     Ok(format!("Bot {token}"))
 }
 
@@ -2431,6 +2440,7 @@ async fn api_delete_guild_bot_token(
 }
 
 async fn invalidate_discord_caches(state: &WebState) {
+    state.bot_token_cache.write().await.take();
     state.guild_cache.write().await.take();
     state.permission_cache.write().await.clear();
 }
