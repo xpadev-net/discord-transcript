@@ -51,6 +51,15 @@ function handleMeResponse(response: Response): Promise<MeResponse> {
   return handleResponse<MeResponse>(response);
 }
 
+function handleGuildMeetingsResponse(
+  response: Response,
+): Promise<MeetingListResponse> {
+  if (response.status === 403) {
+    throw new Error("forbidden");
+  }
+  return handleResponse<MeetingListResponse>(response);
+}
+
 export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
   return fetch("/api/me", { signal }).then(handleMeResponse);
 }
@@ -66,7 +75,7 @@ export function fetchGuildMeetings(
   });
 
   return fetch(`/api/guild/meetings?${params.toString()}`, { signal }).then(
-    handleResponse<MeetingListResponse>,
+    handleGuildMeetingsResponse,
   );
 }
 

@@ -222,6 +222,10 @@
   - Summary: Reviewer status APPROVED with no findings for membership cache/in-flight ownership.
   - Validation evidence: Reviewer reran `rtk cargo test session_reverify_tests` pass (19 passed) and inspected full-suite evidence.
   - Notes: Proceeding to commit/push and hook rerun.
+- 2026-05-31 00:00 PR hook dashboard 403 follow-up completed.
+  - Summary: `gh-review-hook 66` requested replacing dashboard string-prefix 403 detection with a canonical `forbidden` error. Added a dedicated guild meetings response handler and updated dashboard error handling.
+  - Validation evidence: `rtk pnpm --dir web run format` pass; `rtk pnpm --dir web run test` pass (5 passed); `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass.
+  - Notes: Hook rerun pending.
 
 ## Decision Log
 - 2026-05-31 00:00 Decision: Proceed without separate plan approval.
