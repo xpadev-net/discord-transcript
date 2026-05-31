@@ -1204,7 +1204,7 @@ async fn check_guild_admin_permission(
 
     // Fast path: check if user is guild owner
     let guild = get_guild_info(state, auth).await?;
-    if user_id == &guild.owner_id {
+    if user_id == guild.owner_id {
         cache_guild_admin_permission(state, user_id, true).await;
         return Ok(true);
     }
@@ -1252,8 +1252,7 @@ async fn check_guild_admin_permission(
         Ok(m) => m,
         Err(err) => {
             warn!(error = %err, "discord member API response parse failed");
-            cache_guild_admin_permission(state, user_id, false).await;
-            return Ok(false);
+            return Err(StatusCode::BAD_GATEWAY);
         }
     };
 
@@ -2417,6 +2416,9 @@ async fn verify_raw_debug_artifact_access(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if check_guild_admin_permission(state, auth, user_id).await? {
+        return Ok(true);
+    }
     check_channel_admin_permission(state, auth, &access.voice_channel_id, user_id).await
 }
 
