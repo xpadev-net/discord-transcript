@@ -914,31 +914,44 @@ impl StatusMessenger for DiscordStatusMessenger<'_> {
     }
 }
 
-fn format_status_message_content(meeting_id: &str, update: &StatusMessageUpdate<'_>) -> String {
+fn format_status_message_content(
+    meeting_id: &str,
+    update: &StatusMessageUpdate<'_>,
+    meeting_url: Option<&str>,
+) -> String {
+    let with_meeting_url = |base: String| match meeting_url {
+        Some(url) if !base.contains(url) => format!("{base}\n会議ページ: {url}"),
+        None => base,
+        _ => base,
+    };
+
     match update {
         StatusMessageUpdate::RecordingStarted {
             voice_channel_id,
             report_channel_id,
-        } => format!(
+        } => with_meeting_url(format!(
             "🎙️ 録音を開始しました\nmeeting_id={meeting_id}\nVC: <#{}>\nレポート: <#{}>",
             voice_channel_id, report_channel_id
-        ),
-        StatusMessageUpdate::RecordingStopped => {
-            format!("⏹️ 録音を終了しました。要約を準備しています。\nmeeting_id={meeting_id}")
-        }
-        StatusMessageUpdate::SummaryStarted => {
-            format!("📝 要約を開始しました (文字起こし/要約を実行中)\nmeeting_id={meeting_id}")
-        }
+        )),
+        StatusMessageUpdate::RecordingStopped => with_meeting_url(format!(
+            "⏹️ 録音を終了しました。要約を準備しています。\nmeeting_id={meeting_id}"
+        )),
+        StatusMessageUpdate::SummaryStarted => with_meeting_url(format!(
+            "📝 要約を開始しました (文字起こし/要約を実行中)\nmeeting_id={meeting_id}"
+        )),
         StatusMessageUpdate::SummaryCompleted { summary_url } => {
             let base = format!("✅ 要約が完了しました\nmeeting_id={meeting_id}");
-            match summary_url {
-                Some(url) => format!("{base}\n要約ページ: {url}"),
-                None => base,
-            }
+            with_meeting_url(
+                summary_url
+                    .as_deref()
+                    .map_or(base.clone(), |url| format!("{base}\n要約ページ: {url}")),
+            )
         }
         StatusMessageUpdate::Failed { phase, error } => {
             let trimmed = truncate_error_for_status(error);
-            format!("⚠️ 処理に失敗しました ({phase})\nmeeting_id={meeting_id}\nerror={trimmed}")
+            with_meeting_url(format!(
+                "⚠️ 処理に失敗しました ({phase})\nmeeting_id={meeting_id}\nerror={trimmed}"
+            ))
         }
     }
 }
@@ -1915,7 +1928,8 @@ impl ScaffoldHandler {
                 "invalid status message channel id: meeting_id={meeting_id}, value={channel_id_str}, error={err}"
             )
         })?;
-        let content = format_status_message_content(meeting_id, &update);
+        let meeting_url = self.meeting_url(meeting_id);
+        let content = format_status_message_content(meeting_id, &update, meeting_url.as_deref());
 
         let existing_message_id = match metadata.status_message_id {
             Some(ref message_id_str) => match message_id_str.parse::<u64>() {
@@ -1950,6 +1964,12 @@ impl ScaffoldHandler {
                 .map_err(|err| err.to_string())?;
         }
         Ok(())
+    }
+
+    fn meeting_url(&self, meeting_id: &str) -> Option<String> {
+        self.public_base_url
+            .as_ref()
+            .map(|base_url| format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id))
     }
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
@@ -2355,9 +2375,7 @@ impl ScaffoldHandler {
         };
         match self.process_enqueued_summary_job(http, meeting_id).await {
             Ok(output) => {
-                let summary_url = self.public_base_url.as_ref().map(|base_url| {
-                    format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id)
-                });
+                let summary_url = self.meeting_url(meeting_id);
                 let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
                 } else {
@@ -5021,8 +5039,35 @@ mod status_message_tests {
             &StatusMessageUpdate::SummaryCompleted {
                 summary_url: Some("https://example.test/meetings/meeting-1".to_owned()),
             },
+            None,
         );
         assert!(message.contains("https://example.test/meetings/meeting-1"));
         assert!(message.contains("✅"));
+    }
+
+    #[test]
+    fn live_status_messages_include_meeting_url() {
+        let updates = [
+            StatusMessageUpdate::RecordingStarted {
+                voice_channel_id: 10,
+                report_channel_id: 20,
+            },
+            StatusMessageUpdate::RecordingStopped,
+            StatusMessageUpdate::SummaryStarted,
+            StatusMessageUpdate::Failed {
+                phase: "transcription",
+                error: "failed",
+            },
+        ];
+
+        for update in updates {
+            let message = format_status_message_content(
+                "meeting-1",
+                &update,
+                Some("https://example.test/meetings/meeting-1"),
+            );
+            assert!(message.contains("https://example.test/meetings/meeting-1"));
+            assert!(message.contains("meeting_id=meeting-1"));
+        }
     }
 }

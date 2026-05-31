@@ -465,6 +465,32 @@ button {
   border-radius: 8px;
 }
 
+.audio-placeholder {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.meeting-progress-notice,
+.transcript-live-status {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  padding: 10px 24px;
+  font-size: 0.9rem;
+}
+
+.meeting-progress-notice {
+  color: var(--text-primary);
+}
+
+.transcript-live-status {
+  margin: -16px -24px 12px;
+}
+
+.transcript-live-status.is-error {
+  color: var(--speaker-2);
+}
+
 audio::-webkit-media-controls-panel {
   background: var(--bg-panel);
 }

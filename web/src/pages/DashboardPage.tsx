@@ -5,6 +5,13 @@ import { formatDate, formatDuration } from "../lib/formatters";
 import type { MeetingListItem, MeetingListResponse } from "../lib/types";
 
 const PAGE_SIZE = 20;
+const LIVE_MEETING_STATUSES = new Set([
+  "recording",
+  "stopping",
+  "transcribing",
+  "summarizing",
+  "processing",
+]);
 
 const STATUS_LABELS: Record<string, string> = {
   scheduled: "\u4e88\u5b9a",
@@ -97,6 +104,23 @@ export function DashboardPage() {
     data && data.total > 0
       ? `${showingFrom}-${showingTo} / ${data.total}`
       : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
+
+  useEffect(() => {
+    if (
+      !data?.meetings.some((meeting) =>
+        LIVE_MEETING_STATUSES.has(meeting.status),
+      )
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setRequest((current) => ({
+        ...current,
+        reloadKey: current.reloadKey + 1,
+      }));
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [data?.meetings]);
 
   return (
     <main className="dashboard-page">
