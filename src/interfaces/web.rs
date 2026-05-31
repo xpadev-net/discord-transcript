@@ -1221,10 +1221,10 @@ async fn check_guild_admin_permission(
         .send()
         .await;
 
-    // Handle request errors - don't cache failures, return false but allow retry
+    // Handle request errors as retryable upstream failures.
     if let Err(err) = member_resp {
         warn!(error = %err, "discord member API request failed");
-        return Ok(false);
+        return Err(StatusCode::BAD_GATEWAY);
     }
 
     let resp_status = member_resp.as_ref().unwrap().status();
