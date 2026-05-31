@@ -7,6 +7,40 @@ export interface MeetingResponse {
   duration_seconds: number | null;
 }
 
+export interface MeResponse {
+  user_id: string;
+  is_guild_admin: boolean;
+}
+
+export interface MeetingListItem {
+  id: string;
+  title: string | null;
+  status: string;
+  started_at: string | null;
+  stopped_at: string | null;
+  duration_seconds: number | null;
+  stop_reason: string | null;
+}
+
+export interface MeetingListResponse {
+  meetings: MeetingListItem[];
+  page: number;
+  limit: number;
+  total: number;
+}
+
+export interface GuildSettingsResponse {
+  whisper_language: string | null;
+  whisper_language_explicit: boolean;
+  whisper_vad: boolean | null;
+  auto_stop_grace_seconds: number | null;
+  retention_raw_audio_ttl_days: number | null;
+  retention_transcript_ttl_days: number | null;
+  summary_enabled: boolean | null;
+}
+
+export type UpdateGuildSettingsRequest = GuildSettingsResponse;
+
 export interface SpeakerResponse {
   id: string;
   username: string | null;
