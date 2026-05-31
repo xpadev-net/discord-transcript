@@ -41,9 +41,7 @@ function requestFromForm(form: SettingsForm): UpdateGuildSettingsRequest {
     whisper_language: language === "" ? null : language,
     whisper_vad: form.whisper_vad,
     auto_stop_grace_seconds: readNumber(form.auto_stop_grace_seconds),
-    retention_raw_audio_ttl_days: readNumber(
-      form.retention_raw_audio_ttl_days,
-    ),
+    retention_raw_audio_ttl_days: readNumber(form.retention_raw_audio_ttl_days),
     retention_transcript_ttl_days: readNumber(
       form.retention_transcript_ttl_days,
     ),
