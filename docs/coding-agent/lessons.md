@@ -23,6 +23,40 @@ Purpose:
 
 ## Entries
 
+## 2026-05-31 - Token Recovery Must Not Depend On Broken Token  [tags: review, validation]
+
+Context:
+
+- Plan: docs/coding-agent/plans/active/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: Reviewer pass after implementation
+- Roles involved: Orchestrator | Reviewer
+
+Symptom:
+
+- Reviewer found that admins could be locked out of replacing or deleting a stored guild bot token if that token was revoked, lost guild access, had corrupt ciphertext, or the encryption key was missing.
+
+Root cause:
+
+- Token-management endpoints reused the normal guild admin check, which resolved Discord REST auth through the currently stored guild token before allowing the operation that would repair that token.
+
+Fix applied:
+
+- Settings and token-management endpoints now retry the admin check with the global bot token for recovery when the guild-scoped token path fails or reports non-admin, while ordinary Discord calls still prefer the guild token.
+- Startup now falls back to the global token for runtime startup if stored-token decryption/key resolution fails, keeping the settings UI online for recovery.
+- Added regression coverage for the recovery retry decision.
+
+Prevention:
+
+- Review guardrail:
+  - Any credential-rotation or credential-delete endpoint must be reviewed for recovery paths that do not require the broken credential being replaced or deleted.
+  - Any service startup path that reads a mutable stored credential must preserve an online recovery path when that stored credential cannot be decrypted or used.
+- Residual risk / waiver:
+  - Full endpoint-level HTTP recovery testing remains limited by the current lack of mocked Discord/web integration tests.
+
+Evidence:
+
+- Reviewer reported CHANGES_REQUESTED; fixes were applied and Rust fmt/check/test/clippy plus frontend lint/typecheck/build passed afterward.
+
 ## 2026-05-31 - Avoid Snapshot Overwrites During Live Merge  [tags: review, ui-e2e]
 
 Context:
@@ -267,3 +301,94 @@ Prevention:
 
 Evidence:
 - User correction received on 2026-05-31 in the Task 42 delegated thread.
+
+## 2026-05-31 - Integrate Parallel Task Merges Before PR Closeout  [tags: workflow, validation, merge]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: Task 43 PR merge recovery
+- Roles involved: Orchestrator
+
+Symptom:
+- Task 43 was left in a concrete conflict state after Task 44 merged, with `src/interfaces/web.rs` and `web/src/pages/SettingsPage.tsx` unresolved and Task 44 frontend/test files staged in the merge.
+- The parent Orchestrator had to restate that Task 43 token behavior and Task 44 guild access control behavior must both be preserved before PR closeout.
+
+Root cause:
+- The Task 43 closeout path focused on the latest hook findings and did not first complete a combined-behavior review of the sibling Task 44 merge.
+
+Fix applied:
+- Resolve the merge by preserving Task 44 `/api/me`, settings admin gating, forbidden UI, membership reverify cache, and frontend tests while integrating Task 43 token settings UI/API and token-recovery behavior.
+- Add validation coverage for the combined path, including settings-only recovery routing, no global fallback on rate limits, and no raw token redisplay in the settings UI.
+
+Prevention:
+- Repo rule candidate:
+  - audience: orchestrator
+  - proposed rule: After a parallel task branch merges into the base branch, resolve conflicts by reviewing the combined behavior before rerunning review hooks or claiming readiness.
+- Dispatch/plan guardrail:
+  - During PR closeout, treat unmerged files and sibling-task staged changes as blockers until the merged behavior is explicitly validated and independently reviewed.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- The combined Task 43/44 worktree reran Rust fmt/check/test/clippy and frontend install/lint/typecheck/build/test after conflict resolution.
+
+## 2026-05-31 - Sensitive Recovery Routes Must Be Explicit  [tags: review, security, routing]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: gh-review-hook 65
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+- `gh-review-hook` found that settings token recovery used `starts_with("/api/guild/settings")`, which would silently extend global-token recovery to future settings subroutes.
+- It also found a redundant `COALESCE` in the guild bot token lookup query that obscured the `NOT NULL` invariant enforced by the `WHERE` clause.
+
+Root cause:
+- The implementation optimized for current route grouping and defensive SQL defaults without making the security boundary and data invariant self-documenting.
+
+Fix applied:
+- Replaced the prefix route check with an explicit allowlist for `/api/me`, `/api/guild/settings`, and `/api/guild/settings/bot-token`.
+- Removed unreachable `COALESCE` fallback from `GET_GUILD_BOT_TOKEN_SQL`.
+
+Prevention:
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: Security-sensitive fallback/recovery helpers should use explicit route/resource allowlists instead of broad prefix matching.
+- Dispatch/plan guardrail:
+  - When SQL `WHERE` clauses establish non-null invariants, keep SELECT projections aligned with that invariant unless a fallback is actually reachable.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- `gh-review-hook 65` exited 2 with these findings; fixes were applied before the next validation/review cycle.
+
+## 2026-05-31 - Runtime Token Rotation Needs A Gateway Signal  [tags: review, integration, runtime]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: gh-review-hook 65
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+- `gh-review-hook` found that web-layer Discord REST calls picked up per-guild token changes dynamically, but the Serenity gateway client kept the startup-resolved token indefinitely.
+- It also found that token metadata could confuse save time and validation time if the UI displayed an unlabeled timestamp.
+
+Root cause:
+- The implementation treated the gateway token and web REST token as equivalent after startup, but only the web layer had a runtime refresh path.
+- Token metadata was displayed without labels, even though the current save path validates immediately before writing.
+
+Fix applied:
+- Token update/delete now advances an in-process watch revision, and `run_bot` gracefully drains and restarts the Discord gateway client so it resolves the current effective token.
+- Token writes set both `bot_token_updated_at` and `bot_token_last_validated_at` because validation happens before persistence; the UI labels both values when present.
+
+Prevention:
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: When credentials are mutable at runtime, review every long-lived client/session separately from per-request REST helpers.
+- Dispatch/plan guardrail:
+- Label token metadata values in UI when updated and validated timestamps are both present.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- `gh-review-hook 65` exited 2 with runtime-token staleness and redundant validation timestamp findings; fixes were applied before the next validation/review cycle.

@@ -674,9 +674,12 @@ dependencies = [
 name = "discord-transcript"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "axum",
+ "base64",
  "chrono",
  "futures-util",
+ "hkdf",
  "hmac",
  "libc",
  "regex",

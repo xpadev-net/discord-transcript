@@ -1,6 +1,11 @@
 import { type FormEvent, useEffect, useState } from "react";
 import { ForbiddenState } from "../components/ForbiddenState";
-import { fetchGuildSettings, updateGuildSettings } from "../lib/api";
+import {
+  deleteGuildBotToken,
+  fetchGuildSettings,
+  updateGuildBotToken,
+  updateGuildSettings,
+} from "../lib/api";
 import type {
   GuildSettingsResponse,
   UpdateGuildSettingsRequest,
@@ -87,11 +92,36 @@ function validateForm(form: SettingsForm): string | null {
   return null;
 }
 
+function guildSettingsErrorMessage(err: unknown, fallback: string): string {
+  if (!(err instanceof Error)) {
+    return fallback;
+  }
+  switch (err.message) {
+    case "forbidden":
+      return "\u30ae\u30eb\u30c9\u7ba1\u7406\u6a29\u9650\u304c\u5fc5\u8981\u3067\u3059";
+    case "invalid_bot_token":
+      return "Discord Bot token \u304c\u7121\u52b9\u3067\u3059";
+    case "not_bot_token":
+      return "\u767b\u9332\u3067\u304d\u308b\u306e\u306f Bot token \u306e\u307f\u3067\u3059";
+    case "bot_token_guild_access_denied":
+      return "\u3053\u306e Bot token \u306f\u3053\u306e\u30ae\u30eb\u30c9\u306b\u30a2\u30af\u30bb\u30b9\u3067\u304d\u307e\u305b\u3093";
+    case "missing_guild_bot_token_encryption_key":
+      return "\u30b5\u30fc\u30d0\u30fc\u306b token \u6697\u53f7\u5316\u30ad\u30fc\u304c\u8a2d\u5b9a\u3055\u308c\u3066\u3044\u307e\u305b\u3093";
+    default:
+      return fallback;
+  }
+}
+
 export function SettingsPage() {
   const [settings, setSettings] = useState<GuildSettingsResponse | null>(null);
   const [form, setForm] = useState<SettingsForm | null>(null);
+  const [botTokenValue, setBotTokenValue] = useState("");
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [activeOperation, setActiveOperation] = useState<
+    "settings" | "token-save" | "token-delete" | null
+  >(null);
+  const [tokenDeleteConfirmPending, setTokenDeleteConfirmPending] =
+    useState(false);
   const [error, setError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -138,20 +168,32 @@ export function SettingsPage() {
   }, []);
 
   const canEdit = settings?.is_admin ?? false;
-  const controlsDisabled = !canEdit || loading || saving || form == null;
+  const isSavingAny = activeOperation !== null;
+  const controlsDisabled = !canEdit || loading || isSavingAny || form == null;
+  const tokenControlsDisabled =
+    !canEdit || loading || isSavingAny || settings == null;
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
+    setTokenDeleteConfirmPending(false);
+    setError(null);
+    setMessage(null);
+  }
+
+  function updateBotTokenValue(value: string) {
+    setBotTokenValue(value);
+    setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!form || !canEdit) {
+    if (!form || !canEdit || isSavingAny) {
       return;
     }
 
+    setTokenDeleteConfirmPending(false);
     const validationError = validateForm(form);
     if (validationError) {
       setError(validationError);
@@ -159,7 +201,7 @@ export function SettingsPage() {
       return;
     }
 
-    setSaving(true);
+    setActiveOperation("settings");
     setError(null);
     setMessage(null);
 
@@ -175,7 +217,83 @@ export function SettingsPage() {
           : "\u8a2d\u5b9a\u306e\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
       setError(text);
     } finally {
-      setSaving(false);
+      setActiveOperation(null);
+    }
+  }
+
+  async function handleBotTokenSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!canEdit || isSavingAny) {
+      return;
+    }
+    const token = botTokenValue.trim();
+    if (!token) {
+      setError(
+        "Discord Bot token \u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044",
+      );
+      setMessage(null);
+      return;
+    }
+
+    setActiveOperation("token-save");
+    setTokenDeleteConfirmPending(false);
+    setError(null);
+    setMessage(null);
+
+    try {
+      const updated = await updateGuildBotToken({ bot_token: token });
+      setSettings(updated);
+      setBotTokenValue("");
+      setMessage(
+        "Discord Bot token \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f",
+      );
+    } catch (err) {
+      setError(
+        guildSettingsErrorMessage(
+          err,
+          "Discord Bot token \u306e\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+        ),
+      );
+    } finally {
+      setActiveOperation(null);
+    }
+  }
+
+  async function handleBotTokenDelete() {
+    if (!canEdit || !settings?.discord_bot_token_registered || isSavingAny) {
+      return;
+    }
+    if (!tokenDeleteConfirmPending) {
+      setTokenDeleteConfirmPending(true);
+      setError(null);
+      setMessage(
+        "Discord Bot token \u306e\u524a\u9664\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044",
+      );
+      return;
+    }
+
+    setActiveOperation("token-delete");
+    setTokenDeleteConfirmPending(false);
+    setError(null);
+    setMessage(null);
+
+    try {
+      const updated = await deleteGuildBotToken();
+      setSettings(updated);
+      setBotTokenValue("");
+      setMessage(
+        "Discord Bot token \u306e\u30ae\u30eb\u30c9\u500b\u5225\u8a2d\u5b9a\u3092\u524a\u9664\u3057\u307e\u3057\u305f",
+      );
+    } catch (err) {
+      setError(
+        guildSettingsErrorMessage(
+          err,
+          "Discord Bot token \u306e\u524a\u9664\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+        ),
+      );
+    } finally {
+      setTokenDeleteConfirmPending(false);
+      setActiveOperation(null);
     }
   }
 
@@ -352,10 +470,87 @@ export function SettingsPage() {
               className="primary-button"
               disabled={controlsDisabled}
             >
-              {saving ? "\u4fdd\u5b58\u4e2d" : "\u4fdd\u5b58"}
+              {activeOperation === "settings"
+                ? "\u4fdd\u5b58\u4e2d"
+                : "\u4fdd\u5b58"}
             </button>
           </div>
         </form>
+      ) : null}
+
+      {settings ? (
+        <section className="settings-section">
+          <h2>{"Discord Bot"}</h2>
+          <div className="settings-token-status-row">
+            <span
+              className={
+                settings.discord_bot_token_registered
+                  ? "settings-token-status is-set"
+                  : "settings-token-status is-empty"
+              }
+            >
+              {settings.discord_bot_token_registered
+                ? "\u767b\u9332\u6e08\u307f"
+                : "\u672a\u767b\u9332"}
+            </span>
+            {settings.discord_bot_username ? (
+              <span className="settings-token-meta">
+                {settings.discord_bot_username}
+              </span>
+            ) : null}
+            {settings.discord_bot_token_last_validated_at ? (
+              <span className="settings-token-meta">
+                {"\u691c\u8a3c: "}
+                {settings.discord_bot_token_last_validated_at}
+              </span>
+            ) : null}
+            {settings.discord_bot_token_updated_at ? (
+              <span className="settings-token-meta">
+                {"\u66f4\u65b0: "}
+                {settings.discord_bot_token_updated_at}
+              </span>
+            ) : null}
+          </div>
+
+          <form className="settings-token-form" onSubmit={handleBotTokenSubmit}>
+            <label className="settings-field">
+              <span>{"Bot token"}</span>
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={botTokenValue}
+                disabled={tokenControlsDisabled}
+                onChange={(event) => updateBotTokenValue(event.target.value)}
+              />
+            </label>
+            <div className="settings-token-actions">
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={tokenControlsDisabled || botTokenValue.trim() === ""}
+              >
+                {activeOperation === "token-save"
+                  ? "\u4fdd\u5b58\u4e2d"
+                  : "\u66f4\u65b0"}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={
+                  tokenControlsDisabled ||
+                  !settings.discord_bot_token_registered
+                }
+                onClick={handleBotTokenDelete}
+              >
+                {activeOperation === "token-delete"
+                  ? "\u524a\u9664\u4e2d"
+                  : tokenDeleteConfirmPending
+                    ? "\u524a\u9664\u3092\u78ba\u5b9a"
+                    : "\u524a\u9664"}
+              </button>
+            </div>
+          </form>
+        </section>
       ) : null}
     </main>
   );

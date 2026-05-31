@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod asr;
+pub mod bot_token;
 pub mod integrations;
 pub mod queue;
 pub mod retry;
