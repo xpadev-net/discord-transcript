@@ -185,7 +185,10 @@ describe("App access controls", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "\u66f4\u65b0" }));
 
-    await waitFor(() => expect(autoStopInput.value).toBe("999"));
+    await screen.findByText(
+      "Discord Bot token \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f",
+    );
+    expect(autoStopInput.value).toBe("999");
   });
 
   it("requires an in-page confirmation before deleting a bot token", async () => {

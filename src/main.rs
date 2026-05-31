@@ -147,6 +147,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut runtime_bot_token_revision_rx = bot_token_revision_rx.clone();
         runtime_bot_token_revision_rx.borrow_and_update();
+        // If a token update lands between this mark and the DB resolve below,
+        // this run may start once with the token read by this iteration, then
+        // observes the revision change and restarts on the next loop.
         let effective_discord_token = match resolve_effective_bot_token(
             &db_client,
             &config.discord_guild_id,

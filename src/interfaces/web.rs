@@ -56,10 +56,16 @@ const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
-type BotTokenCache = Arc<tokio::sync::RwLock<Option<(String, Instant)>>>;
+type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
 type MembershipCache =
     Arc<tokio::sync::RwLock<HashMap<String, (Result<bool, StatusCode>, Instant)>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, MembershipInflightEntry>>>;
+
+#[derive(Debug, Default)]
+struct BotTokenCacheState {
+    entry: Option<(String, Instant)>,
+    revision: u64,
+}
 
 #[derive(Clone)]
 struct MembershipInflightEntry {
@@ -189,7 +195,7 @@ impl WebState {
             auth,
             http_client,
             guild_bot_token_cipher: guild_bot_token.cipher,
-            bot_token_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            bot_token_cache: Arc::new(tokio::sync::RwLock::new(BotTokenCacheState::default())),
             bot_token_revision_tx: guild_bot_token.revision_tx,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
@@ -465,42 +471,57 @@ async fn bot_auth_header_for_guild(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<String, StatusCode> {
-    {
-        let cache = state.bot_token_cache.read().await;
-        if let Some((token, expires_at)) = cache.as_ref()
+    loop {
+        {
+            let cache = state.bot_token_cache.read().await;
+            if let Some((token, expires_at)) = cache.entry.as_ref()
+                && Instant::now() < *expires_at
+            {
+                return Ok(format!("Bot {token}"));
+            }
+        }
+
+        let observed_revision = {
+            let cache = state.bot_token_cache.write().await;
+            if let Some((token, expires_at)) = cache.entry.as_ref()
+                && Instant::now() < *expires_at
+            {
+                return Ok(format!("Bot {token}"));
+            }
+            cache.revision
+        };
+
+        let token = resolve_effective_bot_token(
+            &state.db,
+            &auth.guild_id,
+            &auth.bot_token,
+            state.guild_bot_token_cipher.as_deref(),
+        )
+        .await
+        .map_err(|err| {
+            let status = bot_token_resolve_status(&err);
+            warn!(
+                error = %err,
+                guild_id = %auth.guild_id,
+                status = %status,
+                "failed to resolve guild bot token"
+            );
+            status
+        })?;
+
+        let mut cache = state.bot_token_cache.write().await;
+        if let Some((cached_token, expires_at)) = cache.entry.as_ref()
             && Instant::now() < *expires_at
         {
-            return Ok(format!("Bot {token}"));
+            return Ok(format!("Bot {cached_token}"));
         }
-    }
-
-    let mut cache = state.bot_token_cache.write().await;
-    if let Some((token, expires_at)) = cache.as_ref()
-        && Instant::now() < *expires_at
-    {
+        if cache.revision != observed_revision {
+            continue;
+        }
+        let expires_at = Instant::now() + Duration::from_secs(BOT_TOKEN_CACHE_TTL_SECS);
+        cache.entry = Some((token.clone(), expires_at));
         return Ok(format!("Bot {token}"));
     }
-
-    let token = resolve_effective_bot_token(
-        &state.db,
-        &auth.guild_id,
-        &auth.bot_token,
-        state.guild_bot_token_cipher.as_deref(),
-    )
-    .await
-    .map_err(|err| {
-        let status = bot_token_resolve_status(&err);
-        warn!(
-            error = %err,
-            guild_id = %auth.guild_id,
-            status = %status,
-            "failed to resolve guild bot token"
-        );
-        status
-    })?;
-    let expires_at = Instant::now() + Duration::from_secs(BOT_TOKEN_CACHE_TTL_SECS);
-    *cache = Some((token.clone(), expires_at));
-    Ok(format!("Bot {token}"))
 }
 
 async fn cached_guild_membership(
@@ -2723,7 +2744,11 @@ async fn api_delete_guild_bot_token(
 }
 
 async fn invalidate_discord_caches(state: &WebState) {
-    state.bot_token_cache.write().await.take();
+    {
+        let mut cache = state.bot_token_cache.write().await;
+        cache.entry = None;
+        cache.revision = cache.revision.wrapping_add(1);
+    }
     state.guild_cache.write().await.take();
     state.membership_cache.write().await.clear();
     state.permission_cache.write().await.clear();
