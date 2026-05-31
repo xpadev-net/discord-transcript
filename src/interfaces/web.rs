@@ -21,7 +21,8 @@ use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
 use crate::infrastructure::sql::{
-    COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL, LIST_GUILD_MEETINGS_SQL,
+    UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
@@ -99,6 +100,7 @@ pub struct GuildSettingsDefaults {
     pub auto_stop_grace_seconds: i64,
     pub retention_raw_audio_ttl_days: i32,
     pub retention_transcript_ttl_days: i32,
+    pub summary_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -1791,7 +1793,7 @@ fn guild_settings_response(
         retention_transcript_ttl_days: stored
             .retention_transcript_ttl_days
             .unwrap_or(defaults.retention_transcript_ttl_days),
-        summary_enabled: stored.summary_enabled.unwrap_or(true),
+        summary_enabled: stored.summary_enabled.unwrap_or(defaults.summary_enabled),
         is_admin,
     }
 }
@@ -1833,14 +1835,7 @@ async fn api_guild_meetings(
     let rows = state
         .db
         .query(
-            "SELECT id, status, \
-                    to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as started_at, \
-                    to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as stopped_at, \
-                    meeting_duration_seconds, title, stop_reason \
-             FROM meetings \
-             WHERE guild_id = $1 \
-             ORDER BY started_at DESC \
-             LIMIT $2 OFFSET $3",
+            LIST_GUILD_MEETINGS_SQL,
             &[&auth.guild_id, &limit_i64, &offset],
         )
         .await
@@ -3100,6 +3095,7 @@ mod guild_api_tests {
             auto_stop_grace_seconds: 120,
             retention_raw_audio_ttl_days: 14,
             retention_transcript_ttl_days: 60,
+            summary_enabled: true,
         }
     }
 
