@@ -1228,7 +1228,7 @@ async fn check_guild_admin_permission(
     }
 
     let resp_status = member_resp.as_ref().unwrap().status();
-    
+
     // Handle rate limiting as error (don't cache), treat 404/403 as not admin
     if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         warn!(status = %resp_status, "discord member API rate limited");
@@ -1276,7 +1276,13 @@ async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin:
     let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
     cache.insert(
         (user_id.to_owned(), "__guild__".to_owned()),
-        (CachedChannelPermission { can_view: is_admin, is_admin }, expires_at),
+        (
+            CachedChannelPermission {
+                can_view: is_admin,
+                is_admin,
+            },
+            expires_at,
+        ),
     );
 
     // Evict old entries if cache is too large (same pattern as check_channel_admin_permission)
