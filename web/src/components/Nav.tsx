@@ -13,9 +13,14 @@ export function Nav() {
         >
           {"\u4f1a\u8b70\u4e00\u89a7"}
         </NavLink>
-        <span className="app-nav-link disabled" aria-disabled="true">
+        <NavLink
+          to="/settings"
+          className={({ isActive }) =>
+            `app-nav-link${isActive ? " active" : ""}`
+          }
+        >
           {"\u8a2d\u5b9a"}
-        </span>
+        </NavLink>
       </div>
     </nav>
   );

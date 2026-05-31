@@ -9,7 +9,8 @@ export interface MeetingResponse {
 
 export interface MeResponse {
   user_id: string;
-  is_guild_admin: boolean;
+  guild_id: string;
+  is_admin: boolean;
 }
 
 export interface MeetingListItem {
@@ -32,14 +33,22 @@ export interface MeetingListResponse {
 export interface GuildSettingsResponse {
   whisper_language: string | null;
   whisper_language_explicit: boolean;
-  whisper_vad: boolean | null;
-  auto_stop_grace_seconds: number | null;
-  retention_raw_audio_ttl_days: number | null;
-  retention_transcript_ttl_days: number | null;
-  summary_enabled: boolean | null;
+  whisper_vad: boolean;
+  auto_stop_grace_seconds: number;
+  retention_raw_audio_ttl_days: number;
+  retention_transcript_ttl_days: number;
+  summary_enabled: boolean;
+  is_admin: boolean;
 }
 
-export type UpdateGuildSettingsRequest = GuildSettingsResponse;
+export interface UpdateGuildSettingsRequest {
+  whisper_language: string | null;
+  whisper_vad: boolean;
+  auto_stop_grace_seconds: number;
+  retention_raw_audio_ttl_days: number;
+  retention_transcript_ttl_days: number;
+  summary_enabled: boolean;
+}
 
 export interface SpeakerResponse {
   id: string;
