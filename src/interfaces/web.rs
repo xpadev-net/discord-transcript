@@ -1231,10 +1231,10 @@ async fn check_guild_admin_permission(
         .send()
         .await;
 
-    // Handle request errors - don't cache failures, return false but allow retry
+    // Handle request errors as retryable upstream failures.
     if let Err(err) = member_resp {
         warn!(error = %err, "discord member API request failed");
-        return Ok(false);
+        return Err(StatusCode::BAD_GATEWAY);
     }
 
     let resp_status = member_resp.as_ref().unwrap().status();
@@ -1262,20 +1262,19 @@ async fn check_guild_admin_permission(
         Ok(m) => m,
         Err(err) => {
             warn!(error = %err, "discord member API response parse failed");
-            cache_guild_admin_permission(state, user_id, false).await;
-            return Ok(false);
+            return Err(StatusCode::BAD_GATEWAY);
         }
     };
 
-    // Check if any role has ADMINISTRATOR bit
-    let is_admin = member.roles.iter().any(|role_id| {
-        guild
-            .roles
-            .iter()
-            .find(|r| r.id == *role_id)
-            .map(|r| r.permissions & ADMINISTRATOR != 0)
-            .unwrap_or(false)
-    });
+    let permissions = compute_channel_permissions(
+        user_id,
+        &guild.owner_id,
+        &auth.guild_id,
+        &member.roles,
+        &guild.roles,
+        &[],
+    );
+    let is_admin = permissions & ADMINISTRATOR != 0;
 
     cache_guild_admin_permission(state, user_id, is_admin).await;
     Ok(is_admin)
@@ -2703,6 +2702,9 @@ async fn verify_raw_debug_artifact_access(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if check_guild_admin_permission(state, auth, user_id).await? {
+        return Ok(true);
+    }
     check_channel_admin_permission(state, auth, &access.voice_channel_id, user_id).await
 }
 
