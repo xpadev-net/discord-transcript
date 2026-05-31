@@ -23,6 +23,38 @@ Purpose:
 
 ## Entries
 
+## 2026-05-31 - Index Polling Cursors  [tags: review, performance]
+
+Context:
+
+- Plan: docs/coding-agent/plans/active/task-42-live-meeting-page-plan.md
+- Task/Wave: gh-review-hook final finding
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+
+- `gh-review-hook` found that the SSE transcript polling query ordered by `(created_at, id)` without a matching index.
+
+Root cause:
+
+- The implementation added a polling cursor query but did not add a persistence-level performance check for the new ordering path.
+
+Fix applied:
+
+- Added an idempotent partial index on `(meeting_id, created_at, id) WHERE NOT is_deleted` and included it in runtime migrations.
+
+Prevention:
+
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: Any polling query introduced for live UI must be checked for an index that matches its filter and ordering keys.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+
+- Pending final validation and hook rerun after the migration/index commit.
+
 ## 2026-05-31 - Keep Hook Fixes Minimal But Complete  [tags: review, validation]
 
 Context:

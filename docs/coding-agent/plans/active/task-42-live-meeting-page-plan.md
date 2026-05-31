@@ -249,6 +249,11 @@
   - Validation evidence: `cargo fmt --all -- --check` pass; `cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `cargo test --workspace --all-targets --all-features` pass; `pnpm run lint` pass; `pnpm exec tsc --noEmit` pass; `pnpm run build` pass.
   - Notes: Hook rerun pending after additive commit and push.
 
+- 2026-05-31 Third gh-review-hook fix in progress: [Task_4]
+  - Summary: Added an idempotent partial index for the SSE cursor query: `(meeting_id, created_at, id) WHERE NOT is_deleted`.
+  - Validation evidence: `cargo fmt --all -- --check` pass; `cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `cargo test --workspace --all-targets --all-features` pass.
+  - Notes: Hook rerun pending after validation, additive commit, and push.
+
 ## Decision Log (append-only; re-plans and major discoveries)
 
 - 2026-05-31 Decision:

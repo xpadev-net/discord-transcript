@@ -20,6 +20,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0009_add_stop_reason_check.sql"),
     "\n",
     include_str!("../../migrations/0010_guild_settings.sql"),
+    "\n",
+    include_str!("../../migrations/0011_transcript_cursor_index.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
