@@ -179,7 +179,7 @@ export function SettingsPage() {
     }
   }
 
-  if (!loading && (forbidden || settings?.is_admin === false)) {
+  if (!loading && forbidden) {
     return (
       <main className="settings-page">
         <div className="settings-header">

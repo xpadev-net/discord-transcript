@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
@@ -42,6 +42,8 @@ const ADMINISTRATOR: u64 = 1 << 3;
 // ---------- State ----------
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
+const MEMBERSHIP_CACHE_TTL_SECS: u64 = 5;
+const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 5;
 const GUILD_CACHE_TTL_SECS: u64 = 300;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
@@ -50,6 +52,20 @@ const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
+type MembershipCache =
+    Arc<tokio::sync::RwLock<HashMap<String, (Result<bool, StatusCode>, Instant)>>>;
+type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, MembershipInflightEntry>>>;
+
+#[derive(Clone)]
+struct MembershipInflightEntry {
+    notify: Arc<Notify>,
+    started_at: Instant,
+}
+
+enum MembershipReverifyStart {
+    Leader(Arc<Notify>),
+    Follower(Arc<Notify>),
+}
 
 #[derive(Debug, Default)]
 struct AudioRangeRateLimiter {
@@ -114,6 +130,10 @@ pub struct WebState {
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
+    /// Short-lived guild membership cache to bound Discord lookups during API bursts.
+    membership_cache: MembershipCache,
+    /// In-flight guild membership verification per user id
+    membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
@@ -136,6 +156,8 @@ impl WebState {
             http_client,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
@@ -269,10 +291,10 @@ async fn require_auth(
         }
     }
 
-    let membership = is_guild_member(&state, auth, &session.uid).await;
+    let membership = verify_current_guild_member(&state, auth, &session.uid).await;
     let refreshed_session_cookie = match membership {
         Ok(true) => {
-            if session_needs_membership_reverify(&session) {
+            if session_needs_cookie_refresh(&session) {
                 Some(session_cookie_with_membership(
                     &session.uid,
                     &auth.guild_id,
@@ -365,7 +387,7 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-fn session_needs_membership_reverify(session: &SessionPayload) -> bool {
+fn session_needs_cookie_refresh(session: &SessionPayload) -> bool {
     let now = unix_now_secs();
     if now.saturating_sub(session.verified_at) < SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS {
         return false;
@@ -377,6 +399,144 @@ fn session_needs_membership_reverify(session: &SessionPayload) -> bool {
 
 fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::OK
+}
+
+async fn cached_guild_membership(
+    cache: &MembershipCache,
+    user_id: &str,
+) -> Option<Result<bool, StatusCode>> {
+    let now = Instant::now();
+    {
+        let cache = cache.read().await;
+        if let Some(&(membership, expires_at)) = cache.get(user_id)
+            && now < expires_at
+        {
+            return Some(membership);
+        }
+    }
+
+    let mut cache = cache.write().await;
+    if let Some(&(_, expires_at)) = cache.get(user_id)
+        && now >= expires_at
+    {
+        cache.remove(user_id);
+    }
+    None
+}
+
+async fn cache_guild_membership(
+    cache: &MembershipCache,
+    user_id: &str,
+    membership: Result<bool, StatusCode>,
+) {
+    let mut cache = cache.write().await;
+    let expires_at = Instant::now() + Duration::from_secs(MEMBERSHIP_CACHE_TTL_SECS);
+    cache.insert(user_id.to_owned(), (membership, expires_at));
+    if cache.len() > 5000 {
+        let now = Instant::now();
+        cache.retain(|_, (_, expires_at)| *expires_at > now);
+    }
+}
+
+async fn begin_membership_reverify(
+    inflight: &MembershipReverifyInflight,
+    user_id: &str,
+) -> MembershipReverifyStart {
+    let mut map = inflight.lock().await;
+    let now = Instant::now();
+    let stale_user_ids = map
+        .iter()
+        .filter(|(_, entry)| {
+            now.duration_since(entry.started_at).as_secs() >= MEMBERSHIP_REVERIFY_INFLIGHT_SECS
+        })
+        .map(|(stale_user_id, _)| stale_user_id.clone())
+        .collect::<Vec<_>>();
+    for stale_user_id in stale_user_ids {
+        if let Some(entry) = map.remove(&stale_user_id) {
+            entry.notify.notify_waiters();
+        }
+    }
+
+    if let Some(entry) = map.get(user_id) {
+        return MembershipReverifyStart::Follower(entry.notify.clone());
+    }
+    let notify = Arc::new(Notify::new());
+    map.insert(
+        user_id.to_owned(),
+        MembershipInflightEntry {
+            notify: notify.clone(),
+            started_at: now,
+        },
+    );
+    MembershipReverifyStart::Leader(notify)
+}
+
+async fn publish_membership_reverify_result(
+    inflight: &MembershipReverifyInflight,
+    cache: &MembershipCache,
+    user_id: &str,
+    leader_notify: &Arc<Notify>,
+    membership: Result<bool, StatusCode>,
+) -> bool {
+    let notify = {
+        let mut map = inflight.lock().await;
+        let Some(entry) = map.get(user_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&entry.notify, leader_notify) {
+            return false;
+        }
+        map.remove(user_id).map(|entry| entry.notify)
+    };
+    cache_guild_membership(cache, user_id, membership).await;
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+    true
+}
+
+async fn verify_current_guild_member(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    if let Some(membership) = cached_guild_membership(&state.membership_cache, user_id).await {
+        return membership;
+    }
+
+    loop {
+        if let Some(membership) = cached_guild_membership(&state.membership_cache, user_id).await {
+            return membership;
+        }
+        match begin_membership_reverify(&state.membership_reverify_inflight, user_id).await {
+            MembershipReverifyStart::Follower(notify) => {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(MEMBERSHIP_REVERIFY_INFLIGHT_SECS),
+                    notify.notified(),
+                )
+                .await;
+                if let Some(membership) =
+                    cached_guild_membership(&state.membership_cache, user_id).await
+                {
+                    return membership;
+                }
+            }
+            MembershipReverifyStart::Leader(leader_notify) => {
+                let membership = is_guild_member(state, auth, user_id).await;
+                if publish_membership_reverify_result(
+                    &state.membership_reverify_inflight,
+                    &state.membership_cache,
+                    user_id,
+                    &leader_notify,
+                    membership,
+                )
+                .await
+                {
+                    return membership;
+                }
+            }
+        }
+    }
 }
 
 async fn is_guild_member(
@@ -3954,13 +4114,29 @@ mod oauth_state_tests {
 #[cfg(test)]
 mod session_reverify_tests {
     use super::{
+        MEMBERSHIP_REVERIFY_INFLIGHT_SECS, MembershipCache, MembershipInflightEntry,
+        MembershipReverifyInflight, MembershipReverifyStart,
         SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS, SESSION_TTL_SECS, SessionPayload,
+        begin_membership_reverify, cache_guild_membership, cached_guild_membership,
         guild_member_status_indicates_membership, guild_membership_forbidden_response,
-        session_matches_guild, session_needs_membership_reverify, sign_session, verify_session,
+        publish_membership_reverify_result, session_matches_guild, session_needs_cookie_refresh,
+        sign_session, verify_session,
     };
     use reqwest::StatusCode as HttpStatus;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::{Mutex, Notify, RwLock};
 
     const SECRET: &str = "test-session-secret";
+
+    fn membership_cache() -> MembershipCache {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn membership_inflight() -> MembershipReverifyInflight {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[test]
     fn session_needs_reverify_after_interval() {
@@ -3973,7 +4149,7 @@ mod session_reverify_tests {
             reverify_attempt_at: 0,
             issued_at: now,
         };
-        assert!(session_needs_membership_reverify(&session));
+        assert!(session_needs_cookie_refresh(&session));
     }
 
     #[test]
@@ -3987,7 +4163,7 @@ mod session_reverify_tests {
             reverify_attempt_at: 0,
             issued_at: now,
         };
-        assert!(!session_needs_membership_reverify(&session));
+        assert!(!session_needs_cookie_refresh(&session));
     }
 
     #[test]
@@ -4001,7 +4177,7 @@ mod session_reverify_tests {
             reverify_attempt_at: now.saturating_sub(60),
             issued_at: now,
         };
-        assert!(!session_needs_membership_reverify(&session));
+        assert!(!session_needs_cookie_refresh(&session));
     }
 
     #[test]
@@ -4013,7 +4189,7 @@ mod session_reverify_tests {
             session.verified_at,
             session.exp.saturating_sub(SESSION_TTL_SECS)
         );
-        assert!(!session_needs_membership_reverify(&session));
+        assert!(!session_needs_cookie_refresh(&session));
     }
 
     #[test]
@@ -4029,6 +4205,189 @@ mod session_reverify_tests {
     #[test]
     fn active_member_status_is_membership() {
         assert!(guild_member_status_indicates_membership(HttpStatus::OK));
+    }
+
+    #[tokio::test]
+    async fn fresh_membership_cache_entry_is_reused() {
+        let cache = membership_cache();
+
+        cache_guild_membership(&cache, "user-1", Ok(true)).await;
+
+        assert_eq!(
+            cached_guild_membership(&cache, "user-1").await,
+            Some(Ok(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_membership_cache_entry_is_ignored() {
+        let cache = membership_cache();
+        cache.write().await.insert(
+            "user-1".to_owned(),
+            (Ok(true), Instant::now() - Duration::from_secs(1)),
+        );
+
+        assert_eq!(cached_guild_membership(&cache, "user-1").await, None);
+    }
+
+    #[tokio::test]
+    async fn same_user_membership_reverify_is_deduplicated_until_finished() {
+        let inflight = membership_inflight();
+        let cache = membership_cache();
+
+        let leader_notify = match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(notify) => notify,
+            MembershipReverifyStart::Follower(_) => panic!("first caller must lead"),
+        };
+        match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(_) => panic!("second caller must follow"),
+            MembershipReverifyStart::Follower(_) => {}
+        }
+
+        assert!(
+            publish_membership_reverify_result(
+                &inflight,
+                &cache,
+                "user-1",
+                &leader_notify,
+                Ok(true)
+            )
+            .await
+        );
+
+        match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(_) => {}
+            MembershipReverifyStart::Follower(_) => panic!("new caller must lead after cleanup"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_membership_reverify_inflight_entry_is_replaced() {
+        let inflight = membership_inflight();
+        let stale_started_at =
+            Instant::now() - Duration::from_secs(MEMBERSHIP_REVERIFY_INFLIGHT_SECS + 1);
+        inflight.lock().await.insert(
+            "user-1".to_owned(),
+            MembershipInflightEntry {
+                notify: Arc::new(Notify::new()),
+                started_at: stale_started_at,
+            },
+        );
+
+        match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(_) => {}
+            MembershipReverifyStart::Follower(_) => panic!("stale entry must be replaced"),
+        }
+
+        let map = inflight.lock().await;
+        let entry = map.get("user-1").expect("fresh entry exists");
+        assert!(entry.started_at > stale_started_at);
+    }
+
+    #[tokio::test]
+    async fn stale_leader_cannot_remove_replacement_inflight_entry() {
+        let inflight = membership_inflight();
+        let cache = membership_cache();
+        let stale_leader_notify = match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(notify) => notify,
+            MembershipReverifyStart::Follower(_) => panic!("first caller must lead"),
+        };
+        {
+            let mut map = inflight.lock().await;
+            map.get_mut("user-1")
+                .expect("leader entry exists")
+                .started_at =
+                Instant::now() - Duration::from_secs(MEMBERSHIP_REVERIFY_INFLIGHT_SECS + 1);
+        }
+        let replacement_notify = match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(notify) => notify,
+            MembershipReverifyStart::Follower(_) => panic!("stale entry must be replaced"),
+        };
+
+        assert!(
+            !publish_membership_reverify_result(
+                &inflight,
+                &cache,
+                "user-1",
+                &stale_leader_notify,
+                Ok(true),
+            )
+            .await
+        );
+
+        let map = inflight.lock().await;
+        let entry = map.get("user-1").expect("replacement must remain");
+        assert!(Arc::ptr_eq(&entry.notify, &replacement_notify));
+    }
+
+    #[tokio::test]
+    async fn stale_leader_cannot_overwrite_replacement_membership_cache() {
+        let inflight = membership_inflight();
+        let cache = membership_cache();
+        let stale_leader_notify = match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(notify) => notify,
+            MembershipReverifyStart::Follower(_) => panic!("first caller must lead"),
+        };
+        {
+            let mut map = inflight.lock().await;
+            map.get_mut("user-1")
+                .expect("leader entry exists")
+                .started_at =
+                Instant::now() - Duration::from_secs(MEMBERSHIP_REVERIFY_INFLIGHT_SECS + 1);
+        }
+        let replacement_notify = match begin_membership_reverify(&inflight, "user-1").await {
+            MembershipReverifyStart::Leader(notify) => notify,
+            MembershipReverifyStart::Follower(_) => panic!("stale entry must be replaced"),
+        };
+
+        assert!(
+            publish_membership_reverify_result(
+                &inflight,
+                &cache,
+                "user-1",
+                &replacement_notify,
+                Ok(false),
+            )
+            .await
+        );
+        assert!(
+            !publish_membership_reverify_result(
+                &inflight,
+                &cache,
+                "user-1",
+                &stale_leader_notify,
+                Ok(true),
+            )
+            .await
+        );
+
+        assert_eq!(
+            cached_guild_membership(&cache, "user-1").await,
+            Some(Ok(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_membership_reverify_sweep_reclaims_other_users() {
+        let inflight = membership_inflight();
+        let stale_started_at =
+            Instant::now() - Duration::from_secs(MEMBERSHIP_REVERIFY_INFLIGHT_SECS + 1);
+        inflight.lock().await.insert(
+            "stale-user".to_owned(),
+            MembershipInflightEntry {
+                notify: Arc::new(Notify::new()),
+                started_at: stale_started_at,
+            },
+        );
+
+        match begin_membership_reverify(&inflight, "fresh-user").await {
+            MembershipReverifyStart::Leader(_) => {}
+            MembershipReverifyStart::Follower(_) => panic!("fresh user must lead"),
+        }
+
+        let map = inflight.lock().await;
+        assert!(!map.contains_key("stale-user"));
+        assert!(map.contains_key("fresh-user"));
     }
 
     #[test]
@@ -4100,7 +4459,7 @@ mod session_reverify_tests {
         let cookie = sign_session("user-1", "guild-1", SECRET, stale, stale);
         // issued_at preserved separately from verified_at in production cookies
         let session = verify_session(&cookie, SECRET).expect("session should verify");
-        assert!(session_needs_membership_reverify(&session));
+        assert!(session_needs_cookie_refresh(&session));
     }
 }
 

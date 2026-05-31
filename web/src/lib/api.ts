@@ -44,8 +44,15 @@ function handleGuildSettingsResponse(
   return handleResponse<GuildSettingsResponse>(response);
 }
 
+function handleMeResponse(response: Response): Promise<MeResponse> {
+  if (response.status === 403) {
+    throw new Error("forbidden");
+  }
+  return handleResponse<MeResponse>(response);
+}
+
 export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
-  return fetch("/api/me", { signal }).then(handleResponse<MeResponse>);
+  return fetch("/api/me", { signal }).then(handleMeResponse);
 }
 
 export function fetchGuildMeetings(

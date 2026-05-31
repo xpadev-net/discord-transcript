@@ -28,7 +28,7 @@ export function App() {
         if (controller.signal.aborted) {
           return;
         }
-        if (err instanceof Error && err.message.startsWith("403")) {
+        if (err instanceof Error && err.message === "forbidden") {
           setSessionForbidden(true);
         }
       })

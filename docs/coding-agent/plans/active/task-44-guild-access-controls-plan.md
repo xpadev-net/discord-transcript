@@ -202,6 +202,26 @@
   - Summary: Reviewer status APPROVED with no findings.
   - Validation evidence: Reviewer reran `rtk cargo test guild_settings_update_checks_admin_before_domain_validation` and inspected recorded full validation.
   - Notes: Residual route-level backend test gap accepted because existing backend has no route-level DB/http mock fixture; helper-level regression coverage is in place.
+- 2026-05-31 00:00 PR hook follow-up completed.
+  - Summary: `gh-review-hook 66` found four issues: unbounded Discord membership calls, misleading cookie-refresh helper name, unreachable settings branch, and fragile `/api/me` 403 detection. Added a 5-second membership result cache plus same-user in-flight de-duplication, renamed the cookie-refresh helper, removed the unreachable settings branch, and made `/api/me` map 403 to canonical `forbidden`.
+  - Validation evidence: `rtk cargo test session_reverify_tests` pass (14 passed); `rtk cargo test guild_api_tests` pass (8 passed); `rtk pnpm --dir web run test` pass (5 passed); `rtk cargo fmt --all -- --check` pass; `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass; `rtk cargo check --workspace --all-targets --all-features` pass; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `rtk cargo test --workspace --all-targets --all-features` pass (270 passed).
+  - Notes: Re-review of hook fixes pending.
+- 2026-05-31 00:00 Reviewer follow-up for inflight cancellation completed.
+  - Summary: Reviewer found same-user membership in-flight de-duplication could wedge if a leader request was cancelled. Replaced permanent waiting with bounded waits and stale in-flight entry replacement; added targeted tests for active de-duplication and stale-entry recovery.
+  - Validation evidence: `rtk cargo test session_reverify_tests` pass (16 passed); `rtk pnpm --dir web run test` pass (5 passed); `rtk cargo fmt --all -- --check` pass; `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass; `rtk cargo check --workspace --all-targets --all-features` pass; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `rtk cargo test --workspace --all-targets --all-features` pass (272 passed).
+  - Notes: Re-review pending.
+- 2026-05-31 00:00 Reviewer follow-up for stale leader ownership completed.
+  - Summary: Reviewer found stale leaders could remove replacement entries and cancelled unique-user leaders could remain until same-user retry. Made in-flight cleanup ownership-aware and added global stale-entry sweeping on verification begin.
+  - Validation evidence: `rtk cargo test session_reverify_tests` pass (18 passed); `rtk cargo fmt --all -- --check` pass; `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass; `rtk pnpm --dir web run test` pass (5 passed); `rtk cargo check --workspace --all-targets --all-features` pass; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `rtk cargo test --workspace --all-targets --all-features` pass (274 passed).
+  - Notes: Re-review pending.
+- 2026-05-31 00:00 Reviewer follow-up for stale cache publishing completed.
+  - Summary: Reviewer found stale leaders could still publish stale membership cache results. Added token-aware membership result publishing so stale leaders discard their result and loop through current cache/inflight state; added a regression test that stale positive results cannot overwrite a newer denial.
+  - Validation evidence: `rtk cargo test session_reverify_tests` pass (19 passed); `rtk cargo fmt --all -- --check` pass; `rtk pnpm --dir web run lint` pass; `rtk pnpm --dir web exec tsc --noEmit` pass; `rtk pnpm --dir web run build` pass; `rtk pnpm --dir web run test` pass (5 passed); `rtk cargo check --workspace --all-targets --all-features` pass; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` pass; `rtk cargo test whisper_parse_errors_do_not_retry_command` pass after an unrelated one-off full-suite failure; `rtk cargo test --workspace --all-targets --all-features` pass on rerun (275 passed).
+  - Notes: Re-review pending.
+- 2026-05-31 00:00 Final review completed.
+  - Summary: Reviewer status APPROVED with no findings for membership cache/in-flight ownership.
+  - Validation evidence: Reviewer reran `rtk cargo test session_reverify_tests` pass (19 passed) and inspected full-suite evidence.
+  - Notes: Proceeding to commit/push and hook rerun.
 
 ## Decision Log
 - 2026-05-31 00:00 Decision: Proceed without separate plan approval.
@@ -219,6 +239,26 @@
   - Plan delta: `PUT /api/guild/settings` now checks guild admin before validating update values.
   - Tradeoffs considered: Fail-closed API behavior over early input validation diagnostics for unauthorized callers.
   - User approval: implicit in settings admin-only API requirement.
+- 2026-05-31 00:00 Decision: Add bounded membership result cache.
+  - Trigger / new insight: `gh-review-hook` found that unconditionally checking Discord on every protected request can exhaust Discord bot rate limits during ordinary multi-request page loads.
+  - Plan delta: Protected requests still pass through membership validation, but Discord membership results are shared through a 5-second cache and same-user in-flight de-duplication.
+  - Tradeoffs considered: A bounded 5-second freshness window over duplicate live Discord calls for every concurrent API request.
+  - User approval: implicit in hook-required fix.
+- 2026-05-31 00:00 Decision: Bound membership in-flight waits.
+  - Trigger / new insight: Reviewer found cancellation of the in-flight leader could leave future same-user requests waiting forever.
+  - Plan delta: Waiting requests use a bounded timeout and stale in-flight entries are replaced.
+  - Tradeoffs considered: Recovery from cancelled/stalled leaders over perfect single-flight behavior for unusually slow Discord requests.
+  - User approval: implicit in required review fix.
+- 2026-05-31 00:00 Decision: Make in-flight membership cleanup ownership-aware.
+  - Trigger / new insight: Reviewer found stale leaders could remove newer replacement leaders and stale entries for other users were not swept.
+  - Plan delta: Leader cleanup now removes only matching leader tokens; each begin sweeps stale entries across users.
+  - Tradeoffs considered: Slightly more state in the in-flight map over race-prone key-only cleanup.
+  - User approval: implicit in required review fix.
+- 2026-05-31 00:00 Decision: Make membership cache publishing ownership-aware.
+  - Trigger / new insight: Reviewer found stale leaders could still overwrite newer membership cache results after losing in-flight ownership.
+  - Plan delta: A leader publishes membership results only if its leader token still owns the current in-flight entry; stale leaders ignore their result and re-enter the current validation path.
+  - Tradeoffs considered: More loops on stale/raced requests over any fail-open cache overwrite window.
+  - User approval: implicit in required review fix.
 
 ## Notes
 - Risks:
