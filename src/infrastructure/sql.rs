@@ -253,7 +253,13 @@ WHERE guild_id = $1
 "#;
 
 pub const LIST_GUILD_MEETINGS_SQL: &str = r#"
-SELECT id, status, started_at, stopped_at, meeting_duration_seconds, title, stop_reason
+SELECT id,
+       status,
+       to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as started_at,
+       to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as stopped_at,
+       meeting_duration_seconds,
+       title,
+       stop_reason
 FROM meetings
 WHERE guild_id = $1
 ORDER BY started_at DESC

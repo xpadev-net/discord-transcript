@@ -112,6 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 config.retention_policy.transcript_ttl_days.get(),
             )
             .expect("retention_transcript_ttl_days exceeds i32::MAX"),
+            summary_enabled: config.summary_enabled,
         },
     );
     let router = web::create_router(web_state);
