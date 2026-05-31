@@ -1256,15 +1256,15 @@ async fn check_guild_admin_permission(
         }
     };
 
-    // Check if any role has ADMINISTRATOR bit
-    let is_admin = member.roles.iter().any(|role_id| {
-        guild
-            .roles
-            .iter()
-            .find(|r| r.id == *role_id)
-            .map(|r| r.permissions & ADMINISTRATOR != 0)
-            .unwrap_or(false)
-    });
+    let permissions = compute_channel_permissions(
+        user_id,
+        &guild.owner_id,
+        &auth.guild_id,
+        &member.roles,
+        &guild.roles,
+        &[],
+    );
+    let is_admin = permissions & ADMINISTRATOR != 0;
 
     cache_guild_admin_permission(state, user_id, is_admin).await;
     Ok(is_admin)
