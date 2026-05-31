@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio_postgres::Client as PgClient;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
@@ -143,6 +143,12 @@ pub struct GuildSettingsDefaults {
     pub summary_enabled: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct GuildBotTokenRuntimeConfig {
+    pub cipher: Option<Arc<BotTokenCipher>>,
+    pub revision_tx: Option<watch::Sender<u64>>,
+}
+
 #[derive(Clone)]
 pub struct WebState {
     pub db: Arc<PgClient>,
@@ -152,6 +158,7 @@ pub struct WebState {
     pub guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
     /// Cache: resolved effective bot token for the configured guild.
     bot_token_cache: BotTokenCache,
+    bot_token_revision_tx: Option<watch::Sender<u64>>,
     /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
@@ -172,7 +179,7 @@ impl WebState {
         chunk_storage_dir: String,
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
-        guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
+        guild_bot_token: GuildBotTokenRuntimeConfig,
         static_files_dir: String,
         guild_settings_defaults: GuildSettingsDefaults,
     ) -> Self {
@@ -181,8 +188,9 @@ impl WebState {
             chunk_storage_dir,
             auth,
             http_client,
-            guild_bot_token_cipher,
+            guild_bot_token_cipher: guild_bot_token.cipher,
             bot_token_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            bot_token_revision_tx: guild_bot_token.revision_tx,
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -2632,6 +2640,7 @@ async fn api_update_guild_bot_token(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
     invalidate_discord_caches(&state).await;
+    notify_bot_token_changed(&state);
 
     let stored = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -2675,6 +2684,7 @@ async fn api_delete_guild_bot_token(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
     invalidate_discord_caches(&state).await;
+    notify_bot_token_changed(&state);
 
     let stored = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -2690,6 +2700,16 @@ async fn invalidate_discord_caches(state: &WebState) {
     state.bot_token_cache.write().await.take();
     state.guild_cache.write().await.take();
     state.permission_cache.write().await.clear();
+}
+
+fn advance_bot_token_revision(sender: &watch::Sender<u64>) {
+    sender.send_modify(|revision| *revision = revision.wrapping_add(1));
+}
+
+fn notify_bot_token_changed(state: &WebState) {
+    if let Some(sender) = &state.bot_token_revision_tx {
+        advance_bot_token_revision(sender);
+    }
 }
 
 async fn api_meeting(
@@ -4050,13 +4070,14 @@ mod guild_api_tests {
     use super::{
         DiscordBotTokenValidationError, DiscordBotTokenValidationStage, GuildAdminCheck,
         GuildBotTokenUpdateRequest, GuildMeetingsQuery, GuildSettingsDefaults,
-        GuildSettingsUpdateRequest, StoredGuildSettings,
+        GuildSettingsUpdateRequest, StoredGuildSettings, advance_bot_token_revision,
         classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
         guild_admin_required_result, guild_settings_response, normalize_guild_bot_token_update,
         normalize_guild_meetings_pagination, validate_authorized_guild_settings_update,
         validate_guild_settings_update,
     };
     use axum::http::StatusCode;
+    use tokio::sync::watch;
 
     fn valid_settings_request() -> GuildSettingsUpdateRequest {
         GuildSettingsUpdateRequest {
@@ -4286,6 +4307,15 @@ mod guild_api_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn bot_token_revision_advances_on_update_notification() {
+        let (sender, receiver) = watch::channel(u64::MAX);
+
+        advance_bot_token_revision(&sender);
+
+        assert_eq!(*receiver.borrow(), 0);
     }
 
     #[test]

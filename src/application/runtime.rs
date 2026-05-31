@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -1174,6 +1174,12 @@ pub enum RuntimeError {
     ClientRun(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotRunExit {
+    Shutdown,
+    TokenChanged,
+}
+
 impl Display for RuntimeError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1345,7 +1351,10 @@ async fn upsert_status_message_via_messenger<M: StatusMessenger + Sync>(
 
 impl std::error::Error for RuntimeError {}
 
-pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
+pub async fn run_bot(
+    config: &AppConfig,
+    mut bot_token_revision: watch::Receiver<u64>,
+) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
         .parse::<u64>()
@@ -1430,15 +1439,30 @@ pub async fn run_bot(config: &AppConfig) -> Result<(), RuntimeError> {
     tokio::select! {
         result = client.start() => {
             handler.shutdown(Arc::clone(&voice_manager), SHUTDOWN_GRACE_TIMEOUT).await;
-            result.map_err(|err| RuntimeError::ClientRun(err.to_string()))
+            result
+                .map(|_| BotRunExit::Shutdown)
+                .map_err(|err| RuntimeError::ClientRun(err.to_string()))
         }
         () = shutdown_signal() => {
             info!("shutdown signal received");
             handler.shutting_down.store(true, Ordering::Release);
             shard_manager.shutdown_all().await;
             handler.shutdown(voice_manager, SHUTDOWN_GRACE_TIMEOUT).await;
-            Ok(())
+            Ok(BotRunExit::Shutdown)
         }
+        () = wait_for_bot_token_revision_change(&mut bot_token_revision) => {
+            info!("guild bot token changed; restarting Discord gateway client");
+            handler.shutting_down.store(true, Ordering::Release);
+            shard_manager.shutdown_all().await;
+            handler.shutdown(voice_manager, SHUTDOWN_GRACE_TIMEOUT).await;
+            Ok(BotRunExit::TokenChanged)
+        }
+    }
+}
+
+async fn wait_for_bot_token_revision_change(revision: &mut watch::Receiver<u64>) {
+    if revision.changed().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 

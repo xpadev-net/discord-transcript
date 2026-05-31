@@ -1,4 +1,4 @@
-use discord_transcript::application::runtime::run_bot;
+use discord_transcript::application::runtime::{BotRunExit, run_bot};
 use discord_transcript::bootstrap::config::AppConfig;
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
@@ -63,35 +63,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .batch_execute(discord_transcript::infrastructure::sql::INCREMENTAL_MIGRATIONS_SQL)
         .await?;
 
+    let db_client = Arc::new(db_client);
     let guild_bot_token_cipher = config
         .guild_bot_token_encryption_key
         .as_deref()
         .map(BotTokenCipher::new)
         .transpose()?
         .map(Arc::new);
-    let effective_discord_token = match resolve_effective_bot_token(
-        &db_client,
-        &config.discord_guild_id,
-        &config.discord_token,
-        guild_bot_token_cipher.as_deref(),
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(BotTokenResolveError::Database(err)) => {
-            return Err(BotTokenResolveError::Database(err).into());
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                guild_id = %config.discord_guild_id,
-                "failed to resolve stored guild bot token at startup; using global token so settings recovery stays online"
-            );
-            config.discord_token.clone()
-        }
-    };
-    let mut runtime_config = config.clone();
-    runtime_config.discord_token = effective_discord_token;
+    let (bot_token_revision_tx, bot_token_revision_rx) = tokio::sync::watch::channel(0u64);
 
     // Build OAuth config if all required fields are present
     let auth = match (
@@ -124,14 +103,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let web_state = web::WebState::new(
-        Arc::new(db_client),
+        Arc::clone(&db_client),
         config.chunk_storage_dir.clone(),
         auth,
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
-        guild_bot_token_cipher,
+        web::GuildBotTokenRuntimeConfig {
+            cipher: guild_bot_token_cipher.clone(),
+            revision_tx: Some(bot_token_revision_tx),
+        },
         config.static_files_dir.clone(),
         web::GuildSettingsDefaults {
             whisper_language: config.whisper_language.clone(),
@@ -162,6 +144,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    run_bot(&runtime_config).await?;
+    loop {
+        let mut runtime_bot_token_revision_rx = bot_token_revision_rx.clone();
+        runtime_bot_token_revision_rx.borrow_and_update();
+        let effective_discord_token = match resolve_effective_bot_token(
+            &db_client,
+            &config.discord_guild_id,
+            &config.discord_token,
+            guild_bot_token_cipher.as_deref(),
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(BotTokenResolveError::Database(err)) => {
+                return Err(BotTokenResolveError::Database(err).into());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    guild_id = %config.discord_guild_id,
+                    "failed to resolve stored guild bot token for gateway; using global token so settings recovery stays online"
+                );
+                config.discord_token.clone()
+            }
+        };
+        let mut runtime_config = config.clone();
+        runtime_config.discord_token = effective_discord_token;
+
+        match run_bot(&runtime_config, runtime_bot_token_revision_rx).await? {
+            BotRunExit::Shutdown => break,
+            BotRunExit::TokenChanged => {
+                tracing::info!("restarting Discord gateway after guild bot token update");
+            }
+        }
+    }
     Ok(())
 }

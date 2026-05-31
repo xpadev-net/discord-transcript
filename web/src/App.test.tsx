@@ -117,7 +117,7 @@ describe("App access controls", () => {
           jsonResponse({
             ...settingsResponse(),
             discord_bot_token_registered: true,
-            discord_bot_token_last_validated_at: "2026-05-31T00:01:00Z",
+            discord_bot_token_updated_at: "2026-05-31T00:01:00Z",
             discord_bot_user_id: "bot-1",
             discord_bot_username: "GuildBot",
           }),
@@ -130,6 +130,7 @@ describe("App access controls", () => {
 
     expect(await screen.findByText("\u767b\u9332\u6e08\u307f")).toBeTruthy();
     expect(screen.getByText("GuildBot")).toBeTruthy();
+    expect(screen.getByText("2026-05-31T00:01:00Z")).toBeTruthy();
     const tokenInput = screen.getByLabelText("Bot token") as HTMLInputElement;
     expect(tokenInput.value).toBe("");
     expect(screen.queryByDisplayValue("bot-secret")).toBeNull();

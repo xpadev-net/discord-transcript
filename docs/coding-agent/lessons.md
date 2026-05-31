@@ -361,3 +361,34 @@ Prevention:
 
 Evidence:
 - `gh-review-hook 65` exited 2 with these findings; fixes were applied before the next validation/review cycle.
+
+## 2026-05-31 - Runtime Token Rotation Needs A Gateway Signal  [tags: review, integration, runtime]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/task-43-per-guild-discord-bot-token-plan.md
+- Task/Wave: gh-review-hook 65
+- Roles involved: Orchestrator | AI reviewer
+
+Symptom:
+- `gh-review-hook` found that web-layer Discord REST calls picked up per-guild token changes dynamically, but the Serenity gateway client kept the startup-resolved token indefinitely.
+- It also found that `bot_token_last_validated_at` was always identical to `bot_token_updated_at` because no independent background validation job exists.
+
+Root cause:
+- The implementation treated the gateway token and web REST token as equivalent after startup, but only the web layer had a runtime refresh path.
+- Token metadata was modeled for future validation jobs before such a job existed.
+
+Fix applied:
+- Token update/delete now advances an in-process watch revision, and `run_bot` gracefully drains and restarts the Discord gateway client so it resolves the current effective token.
+- Token writes now update `bot_token_updated_at` and leave `bot_token_last_validated_at` null until a future independent validation job exists; the UI shows updated-at metadata instead.
+
+Prevention:
+- Repo rule candidate:
+  - audience: reviewer
+  - proposed rule: When credentials are mutable at runtime, review every long-lived client/session separately from per-request REST helpers.
+- Dispatch/plan guardrail:
+  - Do not expose future metadata fields in UI unless the current implementation can make them semantically distinct.
+- Residual risk / waiver:
+  - none
+
+Evidence:
+- `gh-review-hook 65` exited 2 with runtime-token staleness and redundant validation timestamp findings; fixes were applied before the next validation/review cycle.

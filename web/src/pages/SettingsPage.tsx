@@ -491,9 +491,9 @@ export function SettingsPage() {
                 {settings.discord_bot_username}
               </span>
             ) : null}
-            {settings.discord_bot_token_last_validated_at ? (
+            {settings.discord_bot_token_updated_at ? (
               <span className="settings-token-meta">
-                {settings.discord_bot_token_last_validated_at}
+                {settings.discord_bot_token_updated_at}
               </span>
             ) : null}
           </div>
