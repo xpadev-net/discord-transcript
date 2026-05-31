@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { fetchGuildMeetings } from "../lib/api";
 import { formatDate, formatDuration } from "../lib/formatters";
 import type { MeetingListItem, MeetingListResponse } from "../lib/types";
@@ -38,8 +38,11 @@ function displayDuration(value: number | null): string {
   return value != null ? formatDuration(value) : "--";
 }
 
+function meetingPath(meetingId: string): string {
+  return `/meetings/${meetingId}`;
+}
+
 export function DashboardPage() {
-  const navigate = useNavigate();
   const [request, setRequest] = useState({ page: 1, reloadKey: 0 });
   const [data, setData] = useState<MeetingListResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -88,7 +91,12 @@ export function DashboardPage() {
 
   const showingFrom =
     data && data.total > 0 ? (request.page - 1) * PAGE_SIZE + 1 : 0;
-  const showingTo = data ? Math.min(request.page * PAGE_SIZE, data.total) : 0;
+  const showingTo =
+    data && data.total > 0 ? Math.min(request.page * PAGE_SIZE, data.total) : 0;
+  const meetingCountText =
+    data && data.total > 0
+      ? `${showingFrom}-${showingTo} / ${data.total}`
+      : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
 
   return (
     <main className="dashboard-page">
@@ -97,7 +105,7 @@ export function DashboardPage() {
           <h1>{"\u4f1a\u8b70\u4e00\u89a7"}</h1>
           <p>
             {data
-              ? `${showingFrom}-${showingTo} / ${data.total}`
+              ? meetingCountText
               : "\u6700\u65b0\u306e\u4f1a\u8b70\u3092\u8aad\u307f\u8fbc\u3093\u3067\u3044\u307e\u3059"}
           </p>
         </div>
@@ -121,6 +129,7 @@ export function DashboardPage() {
           <span>{error}</span>
           <button
             type="button"
+            className="secondary-button"
             onClick={() =>
               setRequest((current) => ({
                 ...current,
@@ -144,37 +153,47 @@ export function DashboardPage() {
               </tr>
             </thead>
             <tbody>
-              {data?.meetings.map((meeting) => (
-                <tr
-                  key={meeting.id}
-                  className="meeting-table-row"
-                  onClick={() => navigate(`/meetings/${meeting.id}`)}
-                >
-                  <td>
-                    <Link
-                      className="meeting-title-link"
-                      to={`/meetings/${meeting.id}`}
-                      onClick={(event) => event.stopPropagation()}
-                    >
-                      {displayTitle(meeting)}
-                    </Link>
-                  </td>
-                  <td>
-                    <span
-                      className={`status-badge status-${statusClassName(
-                        meeting.status,
-                      )}`}
-                    >
-                      {statusLabel(meeting.status)}
-                    </span>
-                  </td>
-                  <td>{displayDate(meeting.started_at)}</td>
-                  <td>{displayDate(meeting.stopped_at)}</td>
-                  <td className="meeting-duration">
-                    {displayDuration(meeting.duration_seconds)}
-                  </td>
-                </tr>
-              ))}
+              {data?.meetings.map((meeting) => {
+                const path = meetingPath(meeting.id);
+                return (
+                  <tr key={meeting.id} className="meeting-table-row">
+                    <td>
+                      <Link
+                        className="meeting-title-link meeting-table-cell-link"
+                        to={path}
+                      >
+                        {displayTitle(meeting)}
+                      </Link>
+                    </td>
+                    <td>
+                      <Link className="meeting-table-cell-link" to={path}>
+                        <span
+                          className={`status-badge status-${statusClassName(
+                            meeting.status,
+                          )}`}
+                        >
+                          {statusLabel(meeting.status)}
+                        </span>
+                      </Link>
+                    </td>
+                    <td>
+                      <Link className="meeting-table-cell-link" to={path}>
+                        {displayDate(meeting.started_at)}
+                      </Link>
+                    </td>
+                    <td>
+                      <Link className="meeting-table-cell-link" to={path}>
+                        {displayDate(meeting.stopped_at)}
+                      </Link>
+                    </td>
+                    <td className="meeting-duration">
+                      <Link className="meeting-table-cell-link" to={path}>
+                        {displayDuration(meeting.duration_seconds)}
+                      </Link>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
 
