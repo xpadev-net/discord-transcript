@@ -48,7 +48,8 @@ function requestFromForm(form: SettingsForm): UpdateGuildSettingsRequest {
 }
 
 function readNumber(value: string): number {
-  return Number.parseInt(value, 10);
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : Number.NaN;
 }
 
 function validateForm(form: SettingsForm): string | null {
@@ -121,9 +122,11 @@ export function SettingsPage() {
           return;
         }
         setError(
-          err instanceof Error
-            ? err.message
-            : "\u8a2d\u5b9a\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+          err instanceof Error && err.message === "forbidden"
+            ? "\u3053\u306e\u30ae\u30eb\u30c9\u8a2d\u5b9a\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093"
+            : err instanceof Error
+              ? err.message
+              : "\u8a2d\u5b9a\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
         );
       })
       .finally(() => {
@@ -290,6 +293,7 @@ export function SettingsPage() {
                 required
                 min={10}
                 max={3600}
+                step={1}
                 value={form.auto_stop_grace_seconds}
                 disabled={controlsDisabled}
                 onChange={(event) =>
@@ -308,6 +312,7 @@ export function SettingsPage() {
                 required
                 min={1}
                 max={365}
+                step={1}
                 value={form.retention_raw_audio_ttl_days}
                 disabled={controlsDisabled}
                 onChange={(event) =>
@@ -326,6 +331,7 @@ export function SettingsPage() {
                 required
                 min={1}
                 max={365}
+                step={1}
                 value={form.retention_transcript_ttl_days}
                 disabled={controlsDisabled}
                 onChange={(event) =>
