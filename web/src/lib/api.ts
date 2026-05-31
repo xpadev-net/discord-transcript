@@ -27,7 +27,7 @@ function handleResponse<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function handleUpdateGuildSettingsResponse(
+function handleGuildSettingsResponse(
   response: Response,
 ): Promise<GuildSettingsResponse> {
   if (response.status === 403) {
@@ -59,7 +59,7 @@ export function fetchGuildSettings(
   signal?: AbortSignal,
 ): Promise<GuildSettingsResponse> {
   return fetch("/api/guild/settings", { signal }).then(
-    handleUpdateGuildSettingsResponse,
+    handleGuildSettingsResponse,
   );
 }
 
@@ -74,7 +74,7 @@ export function updateGuildSettings(
     },
     body: JSON.stringify(request),
     signal,
-  }).then(handleUpdateGuildSettingsResponse);
+  }).then(handleGuildSettingsResponse);
 }
 
 export function fetchMeeting(
