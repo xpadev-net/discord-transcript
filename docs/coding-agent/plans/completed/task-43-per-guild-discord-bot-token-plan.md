@@ -224,6 +224,10 @@
   - Summary: CI and AI review checks passed after the token cache TTL and `/api/me` recovery fixes.
   - Validation evidence: `rtk gh-review-hook 65` exited 0.
   - Notes: Ready to merge after plan lifecycle move.
+- 2026-05-31 gh-review-hook pass 5 completed: exit 2
+  - Summary: Hook found settings recovery retried global auth on Discord member API rate limits.
+  - Validation evidence after fix: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`.
+  - Notes: Added a distinct rate-limited admin-check outcome so global-token recovery does not double-call a saturated Discord endpoint.
 
 ## Decision Log
 - 2026-05-31 Decision:

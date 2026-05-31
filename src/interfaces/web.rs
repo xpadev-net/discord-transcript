@@ -106,11 +106,16 @@ enum GuildAdminCheck {
     Admin,
     NotAdmin,
     BotAccessDenied,
+    RateLimited,
 }
 
 impl GuildAdminCheck {
-    fn is_admin(self) -> bool {
-        self == Self::Admin
+    fn into_status_result(self) -> Result<bool, StatusCode> {
+        match self {
+            Self::Admin => Ok(true),
+            Self::NotAdmin | Self::BotAccessDenied => Ok(false),
+            Self::RateLimited => Err(StatusCode::BAD_GATEWAY),
+        }
     }
 }
 
@@ -1290,11 +1295,9 @@ async fn check_guild_admin_permission(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let bot_auth = bot_auth_header_for_guild(state, auth).await?;
-    Ok(
-        check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true)
-            .await?
-            .is_admin(),
-    )
+    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true)
+        .await?
+        .into_status_result()
 }
 
 async fn check_guild_admin_permission_with_bot_auth(
@@ -1353,7 +1356,7 @@ async fn check_guild_admin_permission_with_bot_auth(
     // settings recovery with the global bot token.
     if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         warn!(status = %resp_status, "discord member API rate limited");
-        return Err(StatusCode::BAD_GATEWAY);
+        return Ok(GuildAdminCheck::RateLimited);
     }
 
     if resp_status == reqwest::StatusCode::UNAUTHORIZED
@@ -1415,7 +1418,7 @@ async fn check_guild_admin_permission_for_settings(
         Err(status) => Err(status),
     };
     if !should_retry_settings_admin_check_with_global(&effective_result) {
-        return effective_result.map(GuildAdminCheck::is_admin);
+        return effective_result.and_then(GuildAdminCheck::into_status_result);
     }
     match &effective_result {
         Ok(GuildAdminCheck::BotAccessDenied) => warn!(
@@ -1429,13 +1432,13 @@ async fn check_guild_admin_permission_for_settings(
             guild_id = %auth.guild_id,
             "guild-scoped bot token admin check failed; trying global token for settings recovery"
         ),
-        Ok(GuildAdminCheck::Admin | GuildAdminCheck::NotAdmin) => {}
+        Ok(GuildAdminCheck::Admin | GuildAdminCheck::NotAdmin | GuildAdminCheck::RateLimited) => {}
     }
 
     let global_bot_auth = format!("Bot {}", auth.bot_token);
     check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false)
         .await
-        .map(GuildAdminCheck::is_admin)
+        .and_then(GuildAdminCheck::into_status_result)
 }
 
 fn should_retry_settings_admin_check_with_global(
@@ -1444,6 +1447,7 @@ fn should_retry_settings_admin_check_with_global(
     match result {
         Ok(GuildAdminCheck::Admin | GuildAdminCheck::NotAdmin) => false,
         Ok(GuildAdminCheck::BotAccessDenied) => true,
+        Ok(GuildAdminCheck::RateLimited) => false,
         Err(status) => matches!(
             *status,
             StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY
@@ -4029,6 +4033,9 @@ mod guild_api_tests {
         )));
         assert!(super::should_retry_settings_admin_check_with_global(&Ok(
             super::GuildAdminCheck::BotAccessDenied
+        )));
+        assert!(!super::should_retry_settings_admin_check_with_global(&Ok(
+            super::GuildAdminCheck::RateLimited
         )));
         assert!(super::should_retry_settings_admin_check_with_global(&Err(
             StatusCode::BAD_GATEWAY
