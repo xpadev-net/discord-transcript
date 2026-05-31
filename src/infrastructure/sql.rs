@@ -275,11 +275,9 @@ SELECT COALESCE(bot_token_ciphertext, '') AS bot_token_ciphertext,
        bot_user_id, bot_username
 FROM guild_settings
 WHERE guild_id = $1
-  AND (
-    bot_token_ciphertext IS NOT NULL
-    OR bot_token_nonce IS NOT NULL
-    OR bot_token_key_version IS NOT NULL
-  )
+  AND bot_token_ciphertext IS NOT NULL
+  AND bot_token_nonce IS NOT NULL
+  AND bot_token_key_version IS NOT NULL
 "#;
 
 pub const UPSERT_GUILD_BOT_TOKEN_SQL: &str = r#"

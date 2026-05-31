@@ -42,12 +42,14 @@ Root cause:
 Fix applied:
 
 - Settings and token-management endpoints now retry the admin check with the global bot token for recovery when the guild-scoped token path fails or reports non-admin, while ordinary Discord calls still prefer the guild token.
+- Startup now falls back to the global token for runtime startup if stored-token decryption/key resolution fails, keeping the settings UI online for recovery.
 - Added regression coverage for the recovery retry decision.
 
 Prevention:
 
 - Review guardrail:
   - Any credential-rotation or credential-delete endpoint must be reviewed for recovery paths that do not require the broken credential being replaced or deleted.
+  - Any service startup path that reads a mutable stored credential must preserve an online recovery path when that stored credential cannot be decrypted or used.
 - Residual risk / waiver:
   - Full endpoint-level HTTP recovery testing remains limited by the current lack of mocked Discord/web integration tests.
 

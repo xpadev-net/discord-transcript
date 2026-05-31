@@ -168,7 +168,8 @@ impl AppConfig {
             discord_client_id: optional_env("DISCORD_CLIENT_ID"),
             discord_client_secret: optional_env("DISCORD_CLIENT_SECRET"),
             web_session_secret: optional_env("WEB_SESSION_SECRET"),
-            guild_bot_token_encryption_key: optional_env("GUILD_BOT_TOKEN_ENCRYPTION_KEY"),
+            guild_bot_token_encryption_key: optional_env("GUILD_BOT_TOKEN_ENCRYPTION_KEY")
+                .map(|value| value.trim().to_owned()),
             static_files_dir: optional_env("STATIC_FILES_DIR")
                 .unwrap_or_else(|| "web/dist".to_owned()),
             discord_bot_admin_user_ids: parse_csv_list(optional_env("DISCORD_BOT_ADMIN_USER_IDS")),

@@ -1,6 +1,8 @@
 use discord_transcript::application::runtime::run_bot;
 use discord_transcript::bootstrap::config::AppConfig;
-use discord_transcript::infrastructure::bot_token::{BotTokenCipher, resolve_effective_bot_token};
+use discord_transcript::infrastructure::bot_token::{
+    BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
+};
 use discord_transcript::interfaces::web;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
@@ -67,13 +69,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(BotTokenCipher::new)
         .transpose()?
         .map(Arc::new);
-    let effective_discord_token = resolve_effective_bot_token(
+    let effective_discord_token = match resolve_effective_bot_token(
         &db_client,
         &config.discord_guild_id,
         &config.discord_token,
         guild_bot_token_cipher.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(token) => token,
+        Err(BotTokenResolveError::Database(err)) => {
+            return Err(BotTokenResolveError::Database(err).into());
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                guild_id = %config.discord_guild_id,
+                "failed to resolve stored guild bot token at startup; using global token so settings recovery stays online"
+            );
+            config.discord_token.clone()
+        }
+    };
     let mut runtime_config = config.clone();
     runtime_config.discord_token = effective_discord_token;
 

@@ -2,7 +2,8 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use sha2::{Digest, Sha256};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use std::fmt::{Display, Formatter};
 use tokio_postgres::Client as PgClient;
 use uuid::Uuid;
@@ -44,6 +45,7 @@ pub enum BotTokenCryptoError {
     InvalidEncoding,
     EncryptFailed,
     DecryptFailed,
+    KeyDerivationFailed,
     InvalidPlaintext,
 }
 
@@ -57,6 +59,7 @@ impl Display for BotTokenCryptoError {
             Self::InvalidEncoding => f.write_str("invalid encrypted guild bot token encoding"),
             Self::EncryptFailed => f.write_str("failed to encrypt guild bot token"),
             Self::DecryptFailed => f.write_str("failed to decrypt guild bot token"),
+            Self::KeyDerivationFailed => f.write_str("failed to derive guild bot token key"),
             Self::InvalidPlaintext => f.write_str("invalid guild bot token plaintext"),
         }
     }
@@ -87,10 +90,17 @@ impl std::error::Error for BotTokenResolveError {}
 
 impl BotTokenCipher {
     pub fn new(key_material: &str) -> Result<Self, BotTokenCryptoError> {
-        if key_material.trim().is_empty() {
+        let key_material = key_material.trim();
+        if key_material.is_empty() {
             return Err(BotTokenCryptoError::MissingKey);
         }
-        let key = Sha256::digest(key_material.as_bytes());
+        let hk = Hkdf::<Sha256>::new(
+            Some(b"discord-transcript:guild-bot-token-key:v1"),
+            key_material.as_bytes(),
+        );
+        let mut key = [0u8; 32];
+        hk.expand(b"guild-bot-token-aes-256-gcm", &mut key)
+            .map_err(|_| BotTokenCryptoError::KeyDerivationFailed)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| BotTokenCryptoError::MissingKey)?;
         Ok(Self { cipher })

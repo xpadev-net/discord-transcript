@@ -208,6 +208,10 @@
   - Summary: Re-ran full Rust and frontend checks after the recovery fix.
   - Validation evidence: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
   - Notes: Rust test count increased to 274 passed after adding the recovery regression.
+- 2026-05-31 gh-review-hook pass 1 completed: exit 2
+  - Summary: Hook found startup could fail before online recovery, settings recovery retried global auth for clean non-admins, SQL token-load semantics diverged from status semantics, key derivation needed purpose-bound KDF/normalization, and settings/token UI operations could race.
+  - Validation evidence after fixes: `rtk cargo fmt --all -- --check`; `rtk cargo check --workspace --all-targets --all-features`; `rtk cargo test --workspace --all-targets --all-features`; `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`; `rtk pnpm run lint`; `rtk pnpm exec tsc --noEmit`; `rtk pnpm run build`; `rtk git diff --check`.
+  - Notes: Fixes were kept additive because PR #65 is open.
 
 ## Decision Log
 - 2026-05-31 Decision:
@@ -220,6 +224,11 @@
   - Plan delta: Token settings GET/update/delete and ordinary guild settings update now retry admin authorization with the global bot token when the guild-scoped token path cannot authorize recovery.
   - Tradeoffs considered: Keeping recovery only on settings endpoints preserves normal guild-token preference for Discord calls while avoiding lockout from a bad override.
   - User approval: not requested; change is required to satisfy Task 43 delete-after-failure fallback acceptance.
+- 2026-05-31 Decision:
+  - Trigger / new insight: gh-review-hook found startup could block all online recovery when stored-token decryption fails.
+  - Plan delta: Startup now logs stored-token resolution failures and uses the global token for runtime startup unless the failure is database-level.
+  - Tradeoffs considered: Falling back at startup keeps the settings UI online; normal web Discord calls still fail closed on unusable stored tokens except for explicit settings recovery auth.
+  - User approval: not requested; change is required to keep recovery paths operable.
 
 ## Notes
 - Risks:

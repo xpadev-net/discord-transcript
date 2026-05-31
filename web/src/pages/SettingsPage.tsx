@@ -116,9 +116,9 @@ export function SettingsPage() {
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [botTokenValue, setBotTokenValue] = useState("");
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [tokenSaving, setTokenSaving] = useState(false);
-  const [tokenDeleting, setTokenDeleting] = useState(false);
+  const [activeOperation, setActiveOperation] = useState<
+    "settings" | "token-save" | "token-delete" | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -161,9 +161,10 @@ export function SettingsPage() {
   }, []);
 
   const canEdit = settings?.is_admin ?? false;
-  const controlsDisabled = !canEdit || loading || saving || form == null;
+  const isSavingAny = activeOperation !== null;
+  const controlsDisabled = !canEdit || loading || isSavingAny || form == null;
   const tokenControlsDisabled =
-    !canEdit || loading || tokenSaving || tokenDeleting || settings == null;
+    !canEdit || loading || isSavingAny || settings == null;
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
@@ -179,7 +180,7 @@ export function SettingsPage() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!form || !canEdit) {
+    if (!form || !canEdit || isSavingAny) {
       return;
     }
 
@@ -190,7 +191,7 @@ export function SettingsPage() {
       return;
     }
 
-    setSaving(true);
+    setActiveOperation("settings");
     setError(null);
     setMessage(null);
 
@@ -206,13 +207,13 @@ export function SettingsPage() {
           : "\u8a2d\u5b9a\u306e\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
       setError(text);
     } finally {
-      setSaving(false);
+      setActiveOperation(null);
     }
   }
 
   async function handleBotTokenSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!canEdit) {
+    if (!canEdit || isSavingAny) {
       return;
     }
     const token = botTokenValue.trim();
@@ -224,7 +225,7 @@ export function SettingsPage() {
       return;
     }
 
-    setTokenSaving(true);
+    setActiveOperation("token-save");
     setError(null);
     setMessage(null);
 
@@ -244,12 +245,12 @@ export function SettingsPage() {
         ),
       );
     } finally {
-      setTokenSaving(false);
+      setActiveOperation(null);
     }
   }
 
   async function handleBotTokenDelete() {
-    if (!canEdit || !settings?.discord_bot_token_registered) {
+    if (!canEdit || !settings?.discord_bot_token_registered || isSavingAny) {
       return;
     }
     if (
@@ -260,7 +261,7 @@ export function SettingsPage() {
       return;
     }
 
-    setTokenDeleting(true);
+    setActiveOperation("token-delete");
     setError(null);
     setMessage(null);
 
@@ -280,7 +281,7 @@ export function SettingsPage() {
         ),
       );
     } finally {
-      setTokenDeleting(false);
+      setActiveOperation(null);
     }
   }
 
@@ -447,7 +448,9 @@ export function SettingsPage() {
               className="primary-button"
               disabled={controlsDisabled}
             >
-              {saving ? "\u4fdd\u5b58\u4e2d" : "\u4fdd\u5b58"}
+              {activeOperation === "settings"
+                ? "\u4fdd\u5b58\u4e2d"
+                : "\u4fdd\u5b58"}
             </button>
           </div>
         </form>
@@ -497,7 +500,9 @@ export function SettingsPage() {
                 className="primary-button"
                 disabled={tokenControlsDisabled || botTokenValue.trim() === ""}
               >
-                {tokenSaving ? "\u4fdd\u5b58\u4e2d" : "\u66f4\u65b0"}
+                {activeOperation === "token-save"
+                  ? "\u4fdd\u5b58\u4e2d"
+                  : "\u66f4\u65b0"}
               </button>
               <button
                 type="button"
@@ -508,7 +513,9 @@ export function SettingsPage() {
                 }
                 onClick={handleBotTokenDelete}
               >
-                {tokenDeleting ? "\u524a\u9664\u4e2d" : "\u524a\u9664"}
+                {activeOperation === "token-delete"
+                  ? "\u524a\u9664\u4e2d"
+                  : "\u524a\u9664"}
               </button>
             </div>
           </form>

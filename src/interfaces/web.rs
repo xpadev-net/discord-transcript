@@ -99,6 +99,19 @@ pub struct CachedChannelPermission {
     pub is_admin: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildAdminCheck {
+    Admin,
+    NotAdmin,
+    BotAccessDenied,
+}
+
+impl GuildAdminCheck {
+    fn is_admin(self) -> bool {
+        self == Self::Admin
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GuildSettingsDefaults {
     pub whisper_language: Option<String>,
@@ -1264,7 +1277,11 @@ async fn check_guild_admin_permission(
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let bot_auth = bot_auth_header_for_guild(state, auth).await?;
-    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true).await
+    Ok(
+        check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true)
+            .await?
+            .is_admin(),
+    )
 }
 
 async fn check_guild_admin_permission_with_bot_auth(
@@ -1273,7 +1290,7 @@ async fn check_guild_admin_permission_with_bot_auth(
     user_id: &str,
     bot_auth: &str,
     use_cache: bool,
-) -> Result<bool, StatusCode> {
+) -> Result<GuildAdminCheck, StatusCode> {
     let cache_key = (user_id.to_owned(), "__guild__".to_owned());
 
     // Check cache first
@@ -1282,7 +1299,11 @@ async fn check_guild_admin_permission_with_bot_auth(
         if let Some(&(permission, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
         {
-            return Ok(permission.is_admin);
+            return Ok(if permission.is_admin {
+                GuildAdminCheck::Admin
+            } else {
+                GuildAdminCheck::NotAdmin
+            });
         }
     }
 
@@ -1292,7 +1313,7 @@ async fn check_guild_admin_permission_with_bot_auth(
         if use_cache {
             cache_guild_admin_permission(state, user_id, true).await;
         }
-        return Ok(true);
+        return Ok(GuildAdminCheck::Admin);
     }
 
     // Slow path: fetch member roles and check ADMINISTRATOR bit
@@ -1314,20 +1335,26 @@ async fn check_guild_admin_permission_with_bot_auth(
 
     let resp_status = member_resp.as_ref().unwrap().status();
 
-    // Handle rate limiting as error (don't cache), treat 404/403 as not admin
+    // Handle rate limiting as error (don't cache), treat 404 as not admin.
+    // 401/403 mean the bot credential cannot prove permissions and may need
+    // settings recovery with the global bot token.
     if resp_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         warn!(status = %resp_status, "discord member API rate limited");
         return Err(StatusCode::BAD_GATEWAY);
     }
 
-    if resp_status == reqwest::StatusCode::NOT_FOUND
+    if resp_status == reqwest::StatusCode::UNAUTHORIZED
         || resp_status == reqwest::StatusCode::FORBIDDEN
-        || resp_status == reqwest::StatusCode::UNAUTHORIZED
     {
+        warn!(status = %resp_status, "discord member API denied bot token during admin check");
+        return Ok(GuildAdminCheck::BotAccessDenied);
+    }
+
+    if resp_status == reqwest::StatusCode::NOT_FOUND {
         if use_cache {
             cache_guild_admin_permission(state, user_id, false).await;
         }
-        return Ok(false);
+        return Ok(GuildAdminCheck::NotAdmin);
     }
 
     if !resp_status.is_success() {
@@ -1356,7 +1383,11 @@ async fn check_guild_admin_permission_with_bot_auth(
     if use_cache {
         cache_guild_admin_permission(state, user_id, is_admin).await;
     }
-    Ok(is_admin)
+    Ok(if is_admin {
+        GuildAdminCheck::Admin
+    } else {
+        GuildAdminCheck::NotAdmin
+    })
 }
 
 async fn check_guild_admin_permission_for_settings(
@@ -1364,34 +1395,48 @@ async fn check_guild_admin_permission_for_settings(
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
-    let effective_result = check_guild_admin_permission(state, auth, user_id).await;
+    let effective_result = match bot_auth_header_for_guild(state, auth).await {
+        Ok(bot_auth) => {
+            check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true).await
+        }
+        Err(status) => Err(status),
+    };
     if !should_retry_settings_admin_check_with_global(&effective_result) {
-        return effective_result;
+        return effective_result.map(GuildAdminCheck::is_admin);
     }
-    if let Err(status) = &effective_result {
-        warn!(
+    match &effective_result {
+        Ok(GuildAdminCheck::BotAccessDenied) => warn!(
+            user_id = %user_id,
+            guild_id = %auth.guild_id,
+            "guild-scoped bot token was denied during settings admin check; trying global token for settings recovery"
+        ),
+        Err(status) => warn!(
             status = %status,
             user_id = %user_id,
             guild_id = %auth.guild_id,
             "guild-scoped bot token admin check failed; trying global token for settings recovery"
-        );
+        ),
+        Ok(GuildAdminCheck::Admin | GuildAdminCheck::NotAdmin) => {}
     }
 
     let global_bot_auth = format!("Bot {}", auth.bot_token);
-    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false).await
+    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false)
+        .await
+        .map(GuildAdminCheck::is_admin)
 }
 
-fn should_retry_settings_admin_check_with_global(result: &Result<bool, StatusCode>) -> bool {
+fn should_retry_settings_admin_check_with_global(
+    result: &Result<GuildAdminCheck, StatusCode>,
+) -> bool {
     match result {
-        Ok(true) => false,
-        Ok(false) => true,
+        Ok(GuildAdminCheck::Admin | GuildAdminCheck::NotAdmin) => false,
+        Ok(GuildAdminCheck::BotAccessDenied) => true,
         Err(status) => matches!(
             *status,
             StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY
         ),
     }
 }
-
 async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
     let mut cache = state.permission_cache.write().await;
     let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
@@ -3963,10 +4008,13 @@ mod guild_api_tests {
     #[test]
     fn settings_admin_check_retries_global_for_token_recovery_failures() {
         assert!(!super::should_retry_settings_admin_check_with_global(&Ok(
-            true
+            super::GuildAdminCheck::Admin
+        )));
+        assert!(!super::should_retry_settings_admin_check_with_global(&Ok(
+            super::GuildAdminCheck::NotAdmin
         )));
         assert!(super::should_retry_settings_admin_check_with_global(&Ok(
-            false
+            super::GuildAdminCheck::BotAccessDenied
         )));
         assert!(super::should_retry_settings_admin_check_with_global(&Err(
             StatusCode::BAD_GATEWAY
