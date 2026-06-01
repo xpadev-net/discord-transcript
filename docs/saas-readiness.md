@@ -221,6 +221,7 @@ Fields:
 - `status`: `active` or `revoked`.
 - `effective_at`
 - `revoked_at`
+- `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
 
@@ -278,7 +279,7 @@ Fields:
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
-  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings such as `whisper_temperature` captured from raw environment strings and serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
+  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings such as `whisper_temperature` must be captured from raw environment strings before typed parsing (for example `process.env`, `os.environ`, or the injected config map string value) and serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer. If the raw string is unavailable, snapshot hash generation fails.
   The env layer is always present; `"env": null` is invalid. An absent tenant or guild layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
 - `settings`: structured values for the effective settings fields listed above.
 
