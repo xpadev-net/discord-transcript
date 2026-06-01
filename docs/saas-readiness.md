@@ -126,7 +126,8 @@ Usage timing differs by unit:
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
-- When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage.
+- Treat the `storage_bytes` gauge as stale for hard enforcement when `measured_at` is more than 5 minutes old or when `source_watermark` is behind the latest known artifact mutation watermark.
+- When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
 
 ## Data Contracts
 
@@ -151,6 +152,7 @@ Rules:
 - Only `active` plans may be newly assigned.
 - `draft` plans may be edited and validated but cannot be assigned.
 - `archived` plans cannot be newly assigned but remain valid for historical assignments.
+- Existing active and scheduled assignments on an archived plan continue to be honored until they end normally or are replaced by an explicit plan change.
 - Pricing fields are out of scope for this initial contract unless a later task explicitly adds billing integration.
 
 ### Plan Quota
