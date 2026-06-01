@@ -113,6 +113,7 @@ Usage timing differs by unit:
 - Measures authorized debug artifact downloads.
 - Count each successful authorized file response start, including prompt, transcript, summary, whisper debug, raw audio, speaker audio, and mixdown debug artifacts.
 - The unit is per artifact download intent, not per byte-range chunk. HTTP 206 responses count only for the first successful response for the same `(tenant_id, meeting_id, artifact_id, download_session_id)`; later range responses in that session do not increment usage.
+- `download_session_id` is a server-assigned opaque id created when a user is authorized for a debug artifact download. It is scoped to one `(tenant_id, meeting_id, artifact_id, user_id)` logical access, is embedded in the generated download URL or token, and expires no later than the download authorization.
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
 
@@ -191,7 +192,7 @@ Fields:
 - `effective_at`
 - `ended_at`
 - `period_anchor`: UTC timestamp used to compute monthly period boundaries; set from the billing provider subscription anchor when present, otherwise from `effective_at`.
-- `assigned_by_user_id`: nullable Discord user id; required for `source = admin`, null for `system`, `billing_provider`, and `migration` unless a real initiating user is known.
+- `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
 
@@ -201,7 +202,7 @@ Rules:
 - The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
 - The intended scheduled-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'scheduled'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
-- Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, or both replace the existing scheduled row.
+- Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, `period_anchor`, or any combination of those fields replace the existing scheduled row.
 - Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, then set the scheduled row to `active`.
 - Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
 - Monthly periods for period-counter units are derived from `period_anchor` in UTC. If the anchor day does not exist in a later month, use that month's last day.
