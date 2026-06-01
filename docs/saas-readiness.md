@@ -191,6 +191,28 @@ Rules:
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
 - Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. Keep events for at least 13 monthly periods.
 
+### Tenant Guild Binding
+
+Purpose: resolve Discord guild ownership to the active SaaS tenant.
+
+Fields:
+
+- `tenant_id`
+- `guild_id`
+- `status`: `active` or `revoked`.
+- `effective_at`
+- `revoked_at`
+- `source`: `system`, `admin`, `billing_provider`, or `migration`.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
+- A `(tenant_id, guild_id)` pair may have only one active row.
+- Revoked rows remain for history and audit but must not be used for SaaS query scoping.
+- Moving a guild to another tenant is a single transaction: revoke the current active row with `revoked_at`, then insert or activate the new tenant binding.
+- SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
+
 ### Guild Plan Assignment
 
 Purpose: assign a SaaS plan to a tenant-guild boundary.
