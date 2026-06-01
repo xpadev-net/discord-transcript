@@ -210,7 +210,7 @@ Rules:
 - The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
 - A `(tenant_id, guild_id)` pair may have only one active row.
 - Revoked rows remain for history and audit but must not be used for SaaS query scoping.
-- Moving a guild to another tenant is a single transaction: revoke the current active row with `revoked_at`, then insert or activate the new tenant binding.
+- Moving a guild to another tenant is a single transaction: revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and create or activate the new tenant's plan assignment for that guild. If the new assignment cannot be created in the same transaction, the move fails.
 - SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
 
 ### Guild Plan Assignment
