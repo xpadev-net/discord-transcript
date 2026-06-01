@@ -216,7 +216,7 @@ Rules:
 - Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, `period_anchor`, or any combination of those fields replace the existing scheduled row.
 - Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, then set the scheduled row to `active`.
 - Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
-- Monthly periods for period-counter units are derived from `period_anchor` in UTC. If the anchor day does not exist in a later month, use that month's last day.
+- Monthly periods for period-counter units are derived from the original `period_anchor` day in UTC. If the anchor day does not exist in a later month, use that month's last day for that boundary only; subsequent boundaries still derive from the original anchor day.
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
 - Plan changes do not rewrite past usage or meeting snapshots.
 
