@@ -133,6 +133,7 @@ Usage timing differs by unit:
 - Period counter usage keys are scoped by `tenant_id`, `unit`, `period_start`, and `period_end`.
 - `period_start` is inclusive and `period_end` is exclusive.
 - The initial billing period is monthly in UTC and is computed from the authoritative tenant-scoped `period_anchor`. In the initial guild-assignment model, `guild_plan_assignments.period_anchor` stores a copy of that tenant anchor and every active guild assignment for the same tenant must use the same value.
+- After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
@@ -207,9 +208,11 @@ Fields:
 Rules:
 
 - `period_anchor` is initialized in the same transaction as the first guild plan assignment, from the billing provider subscription anchor when present, otherwise from the first assignment's `effective_at`.
-- Changing `period_anchor` requires updating the tenant row and all active and scheduled guild plan assignment copies in one serializable transaction or equivalent tenant-scoped lock.
+- After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
 - A `suspended` tenant keeps data ownership but fails hard entitlement checks for new resource-consuming operations.
-- A `closed` tenant cannot receive new guild bindings or plan assignments.
+- Closing a tenant requires no non-terminal meetings and no in-flight ASR or summary jobs.
+- Closing a tenant is a single transaction: set tenant status to `closed`, revoke all active tenant-guild bindings, end all active guild plan assignments, and cancel all scheduled guild plan assignments.
+- A `closed` tenant keeps historical data ownership for retention, audit, and read-only access, but cannot receive new guild bindings or plan assignments and must fail all new resource-consuming operations.
 
 ### Tenant Guild Binding
 
@@ -247,7 +250,7 @@ Fields:
 - `status`: `active`, `scheduled`, `ended`.
 - `effective_at`
 - `ended_at`
-- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. The tenant record is the authoritative source. Set it from the billing provider subscription anchor when present; otherwise, inherit the existing tenant `period_anchor` when the tenant already has one; otherwise default to `effective_at` for the tenant's first assignment. Initializing or changing the tenant `period_anchor` and writing the guild assignment must happen in one serializable transaction or under an equivalent tenant-scoped lock. Every active guild assignment for the same tenant must share the same `period_anchor`.
+- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. The tenant record is the authoritative source. Set it from the billing provider subscription anchor when present; otherwise, inherit the existing tenant `period_anchor` when the tenant already has one; otherwise default to `effective_at` for the tenant's first assignment. Initializing the tenant `period_anchor` and writing the guild assignment must happen in one serializable transaction or under an equivalent tenant-scoped lock. After initialization, `period_anchor` is immutable in this contract; billing anchor corrections require a future explicit re-bucketing or migration task. Every active guild assignment for the same tenant must share the same `period_anchor`.
 - `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
@@ -258,7 +261,7 @@ Rules:
 - The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
 - The intended scheduled-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'scheduled'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
-- Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, `period_anchor`, or any combination of those fields replace the existing scheduled row.
+- Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, or both replace the existing scheduled row. Scheduled changes must use the authoritative tenant `period_anchor`; they must not introduce a different period anchor.
 - Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, copy the authoritative tenant `period_anchor` onto the scheduled row, then set the scheduled row to `active`.
 - Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time, and cancels any scheduled row for the same `(tenant_id, guild_id)` in the same transaction.
 - Monthly periods for period-counter units are derived from the original `period_anchor` day in UTC; period boundaries fall at midnight UTC (`00:00:00 UTC`) on that calendar day. If the anchor day does not exist in a later month, use that month's last day for that boundary only; subsequent boundaries still derive from the original anchor day.
