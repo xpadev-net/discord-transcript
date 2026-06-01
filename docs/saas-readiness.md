@@ -91,7 +91,8 @@ Usage timing differs by unit:
 `recording_minutes`
 
 - Measures wall-clock meeting recording time.
-- Per meeting value is `max(1, ceil(recording_duration_seconds / 60))` if the meeting status ever transitioned to `recording`; otherwise `ceil(recording_duration_seconds / 60)`.
+- `recording_duration_seconds` is the elapsed wall-clock time the meeting spent in the `recording` state; it is zero when the meeting never transitioned to `recording`.
+- Per meeting value is `max(1, ceil(recording_duration_seconds / 60))` if the meeting status ever transitioned to `recording`; otherwise `0`.
 - A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
@@ -259,7 +260,7 @@ Rules:
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
 - Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, `period_anchor`, or any combination of those fields replace the existing scheduled row.
 - Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, copy the authoritative tenant `period_anchor` onto the scheduled row, then set the scheduled row to `active`.
-- Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
+- Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time, and cancels any scheduled row for the same `(tenant_id, guild_id)` in the same transaction.
 - Monthly periods for period-counter units are derived from the original `period_anchor` day in UTC; period boundaries fall at midnight UTC (`00:00:00 UTC`) on that calendar day. If the anchor day does not exist in a later month, use that month's last day for that boundary only; subsequent boundaries still derive from the original anchor day.
 - Example: with `period_anchor = 2026-01-31 00:00:00 UTC`, monthly periods use boundaries Jan 31 -> Feb 28, Feb 28 -> Mar 31, Mar 31 -> Apr 30, and Apr 30 -> May 31.
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
