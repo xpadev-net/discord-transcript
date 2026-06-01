@@ -227,7 +227,7 @@ Fields:
 - `status`: `active`, `scheduled`, `ended`.
 - `effective_at`
 - `ended_at`
-- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries; set from the billing provider subscription anchor when present, otherwise from `effective_at`. Every active guild assignment for the same tenant must share the same `period_anchor`.
+- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. Set it from the billing provider subscription anchor when present; otherwise, inherit the existing tenant `period_anchor` when the tenant already has an active assignment; otherwise default to `effective_at` for the tenant's first assignment. Every active guild assignment for the same tenant must share the same `period_anchor`.
 - `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
