@@ -54,6 +54,20 @@ FROM meetings
 WHERE guild_id = $1
 ORDER BY started_at DESC
 "#;
+const OPERATIONAL_SCHEMA_READY_SQL: &str = r#"
+SELECT
+  to_regclass('public.meetings') IS NOT NULL AS meetings_ready,
+  to_regclass('public.jobs') IS NOT NULL AS jobs_ready,
+  to_regclass('public.live_transcription_chunks') IS NOT NULL AS live_chunks_ready
+"#;
+const OPERATIONAL_COUNTERS_SQL: &str = r#"
+SELECT
+  (SELECT COUNT(*) FROM jobs WHERE status = 'failed') AS failed_jobs,
+  (SELECT COUNT(*) FROM jobs WHERE status = 'running') AS running_jobs,
+  (SELECT COUNT(*) FROM jobs WHERE status = 'queued') AS queued_jobs,
+  (SELECT COUNT(*) FROM meetings WHERE status IN ('recording', 'stopping', 'transcribing', 'summarizing')) AS running_meetings,
+  (SELECT COUNT(*) FROM live_transcription_chunks WHERE status = 'failed') AS failed_live_transcription_chunks
+"#;
 
 // ---------- State ----------
 
@@ -318,6 +332,9 @@ pub fn create_router(state: WebState) -> Router {
     let spa = ServeDir::new(&state.static_files_dir).not_found_service(ServeFile::new(index_html));
 
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metricsz", get(metricsz))
         .merge(auth_routes)
         .merge(protected)
         .fallback_service(spa)
@@ -2279,6 +2296,77 @@ struct ApiErrorResponse {
     message: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct OperationalCheck {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+impl OperationalCheck {
+    fn ok() -> Self {
+        Self {
+            status: "ok",
+            reason: None,
+        }
+    }
+
+    fn unavailable(reason: &'static str) -> Self {
+        Self {
+            status: "unavailable",
+            reason: Some(reason),
+        }
+    }
+
+    fn not_checked(reason: &'static str) -> Self {
+        Self {
+            status: "not_checked",
+            reason: Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct OperationalReadinessChecks {
+    database: OperationalCheck,
+    migrations: OperationalCheck,
+    queue: OperationalCheck,
+    integrations: OperationalCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct OperationalReadinessResponse {
+    status: &'static str,
+    checks: OperationalReadinessChecks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+struct OperationalCounters {
+    failed_jobs: Option<i64>,
+    running_jobs: Option<i64>,
+    queued_jobs: Option<i64>,
+    running_meetings: Option<i64>,
+    failed_live_transcription_chunks: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct OperationalMetricsResponse {
+    status: &'static str,
+    counters: OperationalCounters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperationalSchemaStatus {
+    meetings_ready: bool,
+    jobs_ready: bool,
+    live_chunks_ready: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredGuildSettings {
     whisper_language: Option<String>,
@@ -2365,6 +2453,131 @@ struct DebugArtifactEntry {
 }
 
 // ---------- Handlers ----------
+
+async fn healthz() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+async fn readyz(State(state): State<WebState>) -> Response {
+    let checks = operational_readiness_checks(&state.db).await;
+    let (status, response) = operational_readiness_response(checks);
+    (status, Json(response)).into_response()
+}
+
+async fn metricsz(State(state): State<WebState>) -> Response {
+    match load_operational_counters(&state.db).await {
+        Ok(counters) => (
+            StatusCode::OK,
+            Json(OperationalMetricsResponse {
+                status: "ok",
+                counters,
+            }),
+        )
+            .into_response(),
+        Err(err) => {
+            warn!(error = %err, "failed to load operational counters");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(OperationalMetricsResponse {
+                    status: "unavailable",
+                    counters: OperationalCounters::default(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn operational_readiness_checks(db: &PgClient) -> OperationalReadinessChecks {
+    let database = match db.query_one("SELECT 1", &[]).await {
+        Ok(_) => OperationalCheck::ok(),
+        Err(err) => {
+            warn!(error = %err, "database readiness check failed");
+            return OperationalReadinessChecks {
+                database: OperationalCheck::unavailable("database query failed"),
+                migrations: OperationalCheck::unavailable("database unavailable"),
+                queue: OperationalCheck::unavailable("database unavailable"),
+                integrations: integration_readiness_not_checked(),
+            };
+        }
+    };
+
+    let schema = match load_operational_schema_status(db).await {
+        Ok(schema) => schema,
+        Err(err) => {
+            warn!(error = %err, "schema readiness check failed");
+            return OperationalReadinessChecks {
+                database,
+                migrations: OperationalCheck::unavailable("schema readiness query failed"),
+                queue: OperationalCheck::unavailable("schema readiness query failed"),
+                integrations: integration_readiness_not_checked(),
+            };
+        }
+    };
+
+    let migrations = if schema.meetings_ready && schema.jobs_ready && schema.live_chunks_ready {
+        OperationalCheck::ok()
+    } else {
+        OperationalCheck::unavailable("required database tables are missing")
+    };
+    let queue = if schema.jobs_ready {
+        OperationalCheck::ok()
+    } else {
+        OperationalCheck::unavailable("jobs table is missing")
+    };
+
+    OperationalReadinessChecks {
+        database,
+        migrations,
+        queue,
+        integrations: integration_readiness_not_checked(),
+    }
+}
+
+fn operational_readiness_response(
+    checks: OperationalReadinessChecks,
+) -> (StatusCode, OperationalReadinessResponse) {
+    let ready = checks.database.status == "ok"
+        && checks.migrations.status == "ok"
+        && checks.queue.status == "ok";
+    let status = if ready { "ready" } else { "not_ready" };
+    let http_status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (http_status, OperationalReadinessResponse { status, checks })
+}
+
+fn integration_readiness_not_checked() -> OperationalCheck {
+    OperationalCheck::not_checked(
+        "runtime integration state is not shared with the web server in this operational slice",
+    )
+}
+
+async fn load_operational_schema_status(
+    db: &PgClient,
+) -> Result<OperationalSchemaStatus, tokio_postgres::Error> {
+    let row = db.query_one(OPERATIONAL_SCHEMA_READY_SQL, &[]).await?;
+    Ok(OperationalSchemaStatus {
+        meetings_ready: row.get("meetings_ready"),
+        jobs_ready: row.get("jobs_ready"),
+        live_chunks_ready: row.get("live_chunks_ready"),
+    })
+}
+
+async fn load_operational_counters(
+    db: &PgClient,
+) -> Result<OperationalCounters, tokio_postgres::Error> {
+    let row = db.query_one(OPERATIONAL_COUNTERS_SQL, &[]).await?;
+    Ok(OperationalCounters {
+        failed_jobs: Some(row.get("failed_jobs")),
+        running_jobs: Some(row.get("running_jobs")),
+        queued_jobs: Some(row.get("queued_jobs")),
+        running_meetings: Some(row.get("running_meetings")),
+        failed_live_transcription_chunks: Some(row.get("failed_live_transcription_chunks")),
+    })
+}
 
 fn normalize_guild_meetings_pagination(query: GuildMeetingsQuery) -> (u32, u32) {
     let page = query.page.unwrap_or(1).max(1);
@@ -4329,6 +4542,109 @@ async fn stream_file_range(
     let limited = file.take(length);
     let stream = tokio_util::io::ReaderStream::new(limited);
     Ok(axum::body::Body::from_stream(stream))
+}
+
+#[cfg(test)]
+mod operational_endpoint_tests {
+    use super::{
+        OperationalCheck, OperationalCounters, OperationalMetricsResponse,
+        OperationalReadinessChecks, healthz, integration_readiness_not_checked,
+        operational_readiness_response,
+    };
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn healthz_returns_liveness_without_state_or_auth() {
+        let response = healthz().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("health response body should be readable");
+        let json: Value =
+            serde_json::from_slice(&body).expect("health response should be valid JSON");
+
+        assert_eq!(json, serde_json::json!({ "status": "ok" }));
+    }
+
+    #[test]
+    fn readiness_is_ready_when_required_checks_are_ok() {
+        let checks = OperationalReadinessChecks {
+            database: OperationalCheck::ok(),
+            migrations: OperationalCheck::ok(),
+            queue: OperationalCheck::ok(),
+            integrations: integration_readiness_not_checked(),
+        };
+
+        let (status, response) = operational_readiness_response(checks);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.checks.integrations.status, "not_checked");
+        assert_eq!(
+            response.checks.integrations.reason,
+            Some(
+                "runtime integration state is not shared with the web server in this operational slice"
+            )
+        );
+    }
+
+    #[test]
+    fn readiness_is_unready_when_database_is_unavailable() {
+        let checks = OperationalReadinessChecks {
+            database: OperationalCheck::unavailable("database query failed"),
+            migrations: OperationalCheck::unavailable("database unavailable"),
+            queue: OperationalCheck::unavailable("database unavailable"),
+            integrations: integration_readiness_not_checked(),
+        };
+
+        let (status, response) = operational_readiness_response(checks);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "not_ready");
+        assert_eq!(response.checks.database.status, "unavailable");
+        assert_eq!(
+            response.checks.database.reason,
+            Some("database query failed")
+        );
+    }
+
+    #[test]
+    fn metrics_response_exposes_only_aggregate_counters() {
+        let response = OperationalMetricsResponse {
+            status: "ok",
+            counters: OperationalCounters {
+                failed_jobs: Some(2),
+                running_jobs: Some(1),
+                queued_jobs: Some(3),
+                running_meetings: Some(4),
+                failed_live_transcription_chunks: Some(5),
+            },
+        };
+
+        let json = serde_json::to_value(response).expect("metrics response should serialize");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "status": "ok",
+                "counters": {
+                    "failed_jobs": 2,
+                    "running_jobs": 1,
+                    "queued_jobs": 3,
+                    "running_meetings": 4,
+                    "failed_live_transcription_chunks": 5
+                }
+            })
+        );
+        let serialized = json.to_string();
+        assert!(!serialized.contains("token"));
+        assert!(!serialized.contains("user_id"));
+        assert!(!serialized.contains("guild_id"));
+    }
 }
 
 #[cfg(test)]
