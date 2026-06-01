@@ -2368,7 +2368,7 @@ struct OperationalCounters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct OperationalMetricsResponse {
-    status: &'static str,
+    status: OperationalStatus,
     counters: OperationalCounters,
 }
 
@@ -2484,10 +2484,11 @@ async fn readyz(State(state): State<WebState>) -> Response {
 
 async fn metricsz(State(state): State<WebState>) -> Response {
     let snapshot = load_cached_operational_metrics(&state).await;
-    let status = if snapshot.status == "ok" {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+    let status = match snapshot.status {
+        OperationalStatus::Ok => StatusCode::OK,
+        OperationalStatus::Unavailable | OperationalStatus::NotChecked => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
     };
     (status, Json(snapshot)).into_response()
 }
@@ -2512,13 +2513,13 @@ async fn load_cached_operational_metrics(state: &WebState) -> OperationalMetrics
 async fn load_operational_metrics(db: &PgClient) -> OperationalMetricsResponse {
     match load_operational_counters(db).await {
         Ok(counters) => OperationalMetricsResponse {
-            status: "ok",
+            status: OperationalStatus::Ok,
             counters,
         },
         Err(err) => {
             warn!(error = %err, "failed to load operational counters");
             OperationalMetricsResponse {
-                status: "unavailable",
+                status: OperationalStatus::Unavailable,
                 counters: OperationalCounters::default(),
             }
         }
@@ -4660,7 +4661,7 @@ mod operational_endpoint_tests {
     #[test]
     fn metrics_response_exposes_only_aggregate_counters() {
         let response = OperationalMetricsResponse {
-            status: "ok",
+            status: OperationalStatus::Ok,
             counters: OperationalCounters {
                 failed_jobs: Some(2),
                 running_jobs: Some(1),
