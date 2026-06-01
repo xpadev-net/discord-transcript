@@ -139,10 +139,10 @@ Usage timing differs by unit:
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
-- `source_watermark` is the latest tenant-scoped `artifact_mutation_sequence` included in the gauge. `artifact_mutation_sequence` is a monotonically increasing integer assigned transactionally whenever retained artifact inventory changes.
+- `source_watermark` is the latest tenant-scoped artifact inventory watermark included in the gauge.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
-- Treat the `storage_bytes` gauge as stale for hard enforcement when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind the latest known artifact mutation watermark. The latest known artifact mutation watermark is `MAX(artifact_mutation_sequence)` across retained artifact inventory rows for that tenant, or `0` when none exist. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
-- When a finite `storage_bytes` hard quota is enforced and the gauge is stale, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured from retained artifact inventory rows when the rebuild started.
+- Treat the `storage_bytes` gauge as stale when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind `artifact_inventory_watermarks.current_sequence` for that tenant. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
+- When a finite `storage_bytes` hard quota is enforced and the gauge is stale, fail closed for operations that increase storage and enqueue or trigger a gauge rebuild. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the tenant artifact inventory watermark captured when the rebuild started.
 - When a finite `storage_bytes` soft quota is enforced and the gauge is stale, allow the operation, enqueue or trigger a gauge rebuild, and record an observable stale-gauge quota event using the last known `current_value` when present or `0` when no row exists. For that event, `amount_over = max(0, observed_value - limit_value)`.
 
 ## Data Contracts
@@ -195,6 +195,24 @@ Rules:
 - `hard` enforcement rejects the operation when the applicable finite quota is exhausted, subject to the `recording_minutes` post-hoc overrun rule above.
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
 - Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`. Keep events for at least 13 monthly periods.
+
+### Artifact Inventory Watermark
+
+Purpose: tenant-scoped storage inventory version used to decide whether the `storage_bytes` gauge is fresh.
+
+Fields:
+
+- `tenant_id`
+- `current_sequence`: monotonically increasing integer, initialized to `0` for a new tenant.
+- `updated_at`
+
+Rules:
+
+- `current_sequence` is tenant-scoped, not global.
+- Every retained artifact inventory row that contributes to `storage_bytes` carries the tenant's latest `artifact_mutation_sequence` at the time that row last changed.
+- A retained artifact inventory change is any create, byte-size change, tenant attribution change, retention-state change, TTL cleanup, explicit deletion, or soft-delete/tombstone transition that changes whether bytes are counted for a tenant.
+- Each retained artifact inventory change increments `artifact_inventory_watermarks.current_sequence` in the same transaction and assigns that value as the affected row's `artifact_mutation_sequence` when a counted row remains. If the change removes the row from retained inventory, the tenant watermark still advances even though no retained row carries that new sequence afterward.
+- A storage gauge rebuild captures the tenant `current_sequence` at rebuild start and writes that value to `storage_bytes.source_watermark` when the rebuilt byte total reflects all retained artifact inventory changes through that captured sequence.
 
 ### Tenant
 
