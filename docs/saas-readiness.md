@@ -122,7 +122,7 @@ Usage timing differs by unit:
 
 - Measures authorized debug artifact downloads.
 - Count each successful authorized file response start, including prompt, transcript, summary, whisper debug, raw audio, speaker audio, and mixdown debug artifacts.
-- The unit is per artifact download intent, not per byte-range chunk. HTTP 206 responses count only for the first successful response for the same `(tenant_id, meeting_id, artifact_id, download_session_id)`; later range responses in that session do not increment usage.
+- The unit is per artifact download intent, not per HTTP response. Count only the first successful 200 or 206 response for the same `(tenant_id, meeting_id, artifact_id, download_session_id)`; later full or range responses in that session do not increment usage.
 - `download_session_id` is a server-assigned opaque id created when a user is authorized for a debug artifact download. It is scoped to one `(tenant_id, meeting_id, artifact_id, user_id)` logical access, is embedded in the generated download URL or token, and expires no later than the download authorization.
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
@@ -139,6 +139,7 @@ Usage timing differs by unit:
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
 - Treat the `storage_bytes` gauge as stale for hard enforcement when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind the latest known artifact mutation watermark. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
 - When a finite `storage_bytes` hard quota is enforced and the gauge is stale, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
+- When a finite `storage_bytes` soft quota is enforced and the gauge is stale, allow the operation, enqueue or trigger a gauge rebuild, and record an observable stale-gauge quota event using the last known `current_value` when present or `0` when no row exists.
 
 ## Data Contracts
 
@@ -189,7 +190,7 @@ Rules:
 - A migration that introduces a new unit must add quota rows for every affected existing plan in the same migration step, or explicitly accept that tenants on plans without that row are denied for the new unit.
 - `hard` enforcement rejects the operation when the applicable finite quota is exhausted, subject to the `recording_minutes` post-hoc overrun rule above.
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
-- Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. Keep events for at least 13 monthly periods.
+- Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`. Keep events for at least 13 monthly periods.
 
 ### Tenant Guild Binding
 
