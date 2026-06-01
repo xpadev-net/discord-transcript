@@ -61,12 +61,30 @@ SELECT
   to_regclass('public.live_transcription_chunks') IS NOT NULL AS live_chunks_ready
 "#;
 const OPERATIONAL_COUNTERS_SQL: &str = r#"
+WITH job_counts AS (
+  SELECT
+    COUNT(*) FILTER (WHERE status = 'failed') AS failed_jobs,
+    COUNT(*) FILTER (WHERE status = 'running') AS running_jobs,
+    COUNT(*) FILTER (WHERE status = 'queued') AS queued_jobs
+  FROM jobs
+),
+meeting_counts AS (
+  SELECT
+    COUNT(*) FILTER (WHERE status IN ('recording', 'stopping', 'transcribing', 'summarizing')) AS running_meetings
+  FROM meetings
+),
+live_chunk_counts AS (
+  SELECT
+    COUNT(*) FILTER (WHERE status = 'failed') AS failed_live_transcription_chunks
+  FROM live_transcription_chunks
+)
 SELECT
-  (SELECT COUNT(*) FROM jobs WHERE status = 'failed') AS failed_jobs,
-  (SELECT COUNT(*) FROM jobs WHERE status = 'running') AS running_jobs,
-  (SELECT COUNT(*) FROM jobs WHERE status = 'queued') AS queued_jobs,
-  (SELECT COUNT(*) FROM meetings WHERE status IN ('recording', 'stopping', 'transcribing', 'summarizing')) AS running_meetings,
-  (SELECT COUNT(*) FROM live_transcription_chunks WHERE status = 'failed') AS failed_live_transcription_chunks
+  job_counts.failed_jobs,
+  job_counts.running_jobs,
+  job_counts.queued_jobs,
+  meeting_counts.running_meetings,
+  live_chunk_counts.failed_live_transcription_chunks
+FROM job_counts, meeting_counts, live_chunk_counts
 "#;
 
 // ---------- State ----------
@@ -293,6 +311,7 @@ pub fn create_router(state: WebState) -> Router {
 
     let protected = Router::new()
         .route("/api/me", get(api_me))
+        .route("/api/metricsz", get(metricsz))
         .route("/api/guild/meetings", get(api_guild_meetings))
         .route(
             "/api/guild/settings",
@@ -338,7 +357,6 @@ pub fn create_router(state: WebState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metricsz", get(metricsz))
         .merge(auth_routes)
         .merge(protected)
         .fallback_service(spa)
@@ -2309,6 +2327,13 @@ enum OperationalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationalMetricsStatus {
+    Ok,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct HealthResponse {
     status: &'static str,
 }
@@ -2359,16 +2384,16 @@ struct OperationalReadinessResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 struct OperationalCounters {
-    failed_jobs: Option<i64>,
-    running_jobs: Option<i64>,
-    queued_jobs: Option<i64>,
-    running_meetings: Option<i64>,
-    failed_live_transcription_chunks: Option<i64>,
+    failed_jobs: i64,
+    running_jobs: i64,
+    queued_jobs: i64,
+    running_meetings: i64,
+    failed_live_transcription_chunks: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct OperationalMetricsResponse {
-    status: OperationalStatus,
+    status: OperationalMetricsStatus,
     counters: OperationalCounters,
 }
 
@@ -2485,10 +2510,8 @@ async fn readyz(State(state): State<WebState>) -> Response {
 async fn metricsz(State(state): State<WebState>) -> Response {
     let snapshot = load_cached_operational_metrics(&state).await;
     let status = match snapshot.status {
-        OperationalStatus::Ok => StatusCode::OK,
-        OperationalStatus::Unavailable | OperationalStatus::NotChecked => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        OperationalMetricsStatus::Ok => StatusCode::OK,
+        OperationalMetricsStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
     };
     (status, Json(snapshot)).into_response()
 }
@@ -2513,13 +2536,13 @@ async fn load_cached_operational_metrics(state: &WebState) -> OperationalMetrics
 async fn load_operational_metrics(db: &PgClient) -> OperationalMetricsResponse {
     match load_operational_counters(db).await {
         Ok(counters) => OperationalMetricsResponse {
-            status: OperationalStatus::Ok,
+            status: OperationalMetricsStatus::Ok,
             counters,
         },
         Err(err) => {
             warn!(error = %err, "failed to load operational counters");
             OperationalMetricsResponse {
-                status: OperationalStatus::Unavailable,
+                status: OperationalMetricsStatus::Unavailable,
                 counters: OperationalCounters::default(),
             }
         }
@@ -2609,11 +2632,11 @@ async fn load_operational_counters(
 ) -> Result<OperationalCounters, tokio_postgres::Error> {
     let row = db.query_one(OPERATIONAL_COUNTERS_SQL, &[]).await?;
     Ok(OperationalCounters {
-        failed_jobs: Some(row.get("failed_jobs")),
-        running_jobs: Some(row.get("running_jobs")),
-        queued_jobs: Some(row.get("queued_jobs")),
-        running_meetings: Some(row.get("running_meetings")),
-        failed_live_transcription_chunks: Some(row.get("failed_live_transcription_chunks")),
+        failed_jobs: row.get("failed_jobs"),
+        running_jobs: row.get("running_jobs"),
+        queued_jobs: row.get("queued_jobs"),
+        running_meetings: row.get("running_meetings"),
+        failed_live_transcription_chunks: row.get("failed_live_transcription_chunks"),
     })
 }
 
@@ -4586,8 +4609,8 @@ async fn stream_file_range(
 mod operational_endpoint_tests {
     use super::{
         OperationalCheck, OperationalCounters, OperationalMetricsResponse,
-        OperationalReadinessChecks, OperationalStatus, healthz, integration_readiness_not_checked,
-        operational_readiness_response,
+        OperationalMetricsStatus, OperationalReadinessChecks, OperationalStatus, healthz,
+        integration_readiness_not_checked, operational_readiness_response,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
@@ -4659,15 +4682,35 @@ mod operational_endpoint_tests {
     }
 
     #[test]
+    fn readiness_is_unready_when_migrations_are_unavailable() {
+        let checks = OperationalReadinessChecks {
+            database: OperationalCheck::ok(),
+            migrations: OperationalCheck::unavailable("required database tables are missing"),
+            queue: OperationalCheck::ok(),
+            integrations: integration_readiness_not_checked(),
+        };
+
+        let (status, response) = operational_readiness_response(checks);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "not_ready");
+        assert_eq!(response.checks.database.status, OperationalStatus::Ok);
+        assert_eq!(
+            response.checks.migrations.status,
+            OperationalStatus::Unavailable
+        );
+    }
+
+    #[test]
     fn metrics_response_exposes_only_aggregate_counters() {
         let response = OperationalMetricsResponse {
-            status: OperationalStatus::Ok,
+            status: OperationalMetricsStatus::Ok,
             counters: OperationalCounters {
-                failed_jobs: Some(2),
-                running_jobs: Some(1),
-                queued_jobs: Some(3),
-                running_meetings: Some(4),
-                failed_live_transcription_chunks: Some(5),
+                failed_jobs: 2,
+                running_jobs: 1,
+                queued_jobs: 3,
+                running_meetings: 4,
+                failed_live_transcription_chunks: 5,
             },
         };
 
