@@ -71,6 +71,12 @@ Fields that are not yet tenant- or guild-editable still belong in the snapshot w
 
 Usage must be recorded as append-only events for period units and as current-state measurements for storage. Entitlement checks should be done before starting work when the needed amount is knowable, and usage should still be recorded for work that started and consumed external resources.
 
+Usage timing differs by unit:
+
+- Pre-flight units with known amounts should use a check-then-record or check-then-reserve pattern before the resource is consumed.
+- `recording_minutes` is post-hoc because final duration is unknown at meeting start. A hard quota check at meeting start blocks when current period `recording_minutes >= limit`; a single active meeting may overrun the remaining balance and is recorded after the duration is known.
+- If later product requirements need strict no-overrun recording limits, that task must add a maximum session duration or reservation model before changing the enforcement semantics.
+
 ### Units
 
 `recording_minutes`
@@ -79,6 +85,7 @@ Usage must be recorded as append-only events for period units and as current-sta
 - Per meeting value is `ceil(recording_duration_seconds / 60)`.
 - A meeting shorter than one second records zero minutes if it never reaches `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
+- Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
 
 `storage_bytes`
 
@@ -159,6 +166,7 @@ Rules:
 - `storage_bytes` uses `period = current`.
 - `recording_minutes`, `asr_seconds`, `summary_runs`, and `debug_downloads` use `period = monthly` initially.
 - Missing quota rows mean the unit is not entitled unless a later migration explicitly defines default quota inheritance.
+- A migration that introduces a new unit must add quota rows for every affected existing plan in the same migration step, or explicitly accept that tenants on plans without that row are denied for the new unit.
 
 ### Guild Plan Assignment
 
@@ -180,7 +188,9 @@ Fields:
 
 Rules:
 
-- Initially there is one active assignment per guild/tenant.
+- Initially there is one active assignment per `(tenant_id, guild_id)`.
+- The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
+- Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
 - Plan changes do not rewrite past usage or meeting snapshots.
 
@@ -194,7 +204,7 @@ Fields:
 - `tenant_id`
 - `guild_id`
 - `resolved_at`
-- `precedence_version`
+- `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot.
 - `settings`: structured values for the effective settings fields listed above.
 
