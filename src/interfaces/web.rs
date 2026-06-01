@@ -28,7 +28,7 @@ use crate::infrastructure::bot_token::{
 };
 use crate::infrastructure::sql::{
     CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL,
-    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    LIST_GUILD_MEETINGS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
@@ -41,20 +41,6 @@ const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
 const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
 const VIEW_CHANNEL: u64 = 1 << 10;
 const ADMINISTRATOR: u64 = 1 << 3;
-const LIST_GUILD_MEETINGS_PAGE_WITH_CHANNEL_SQL: &str = r#"
-SELECT id,
-       status,
-       to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as started_at,
-       to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as stopped_at,
-       meeting_duration_seconds,
-       title,
-       stop_reason,
-       voice_channel_id
-FROM meetings
-WHERE guild_id = $1
-ORDER BY started_at DESC
-LIMIT $2 OFFSET $3
-"#;
 const LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL: &str = r#"
 SELECT id,
        status,
@@ -2690,7 +2676,7 @@ async fn api_guild_meetings(
         let rows = state
             .db
             .query(
-                LIST_GUILD_MEETINGS_PAGE_WITH_CHANNEL_SQL,
+                LIST_GUILD_MEETINGS_SQL,
                 &[&auth.guild_id, &limit_i64, &offset],
             )
             .await
