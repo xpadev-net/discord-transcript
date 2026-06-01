@@ -112,6 +112,7 @@ Usage timing differs by unit:
 
 - Measures authorized debug artifact downloads.
 - Count each successful authorized file response start, including prompt, transcript, summary, whisper debug, raw audio, speaker audio, and mixdown debug artifacts.
+- The unit is per artifact download intent, not per byte-range chunk. HTTP 206 responses count only for the first successful response for the same `(tenant_id, meeting_id, artifact_id, download_session_id)`; later range responses in that session do not increment usage.
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
 
@@ -218,7 +219,7 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is the lowercase hex SHA-256 of the JSON-serialized non-secret environment defaults that participate in the snapshot, with keys sorted lexicographically and absent optional values omitted. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is the lowercase hex SHA-256 of the JSON-serialized non-secret environment defaults that participate in the snapshot, with keys sorted lexicographically and absent optional values omitted. Numeric values use canonical JSON form: integers without a decimal point, decimals in standard decimal notation without trailing zeros. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
