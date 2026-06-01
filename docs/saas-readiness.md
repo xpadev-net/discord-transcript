@@ -15,8 +15,8 @@ Initial SaaS tenant:
 
 - A tenant is the billable, isolated customer boundary.
 - For the first SaaS phase, a tenant maps one-to-one to a Discord guild.
-- The initial tenant identifier may be derived from `guild_id`, but new SaaS tables should use a dedicated `tenant_id` so a later organization model does not require rewriting historical rows.
-- All SaaS-owned data must be tenant-scoped. A query that lists or mutates meetings, settings, usage, plan assignments, artifacts, or debug downloads must include `tenant_id` directly or derive it through a tenant-owned `guild_id`.
+- In the initial phase, create `tenant_id` by copying the Discord `guild_id` value into the tenant record. Future identifier changes must preserve a stable mapping through `tenant_guilds(tenant_id, guild_id)` rather than rewriting historical SaaS rows.
+- All SaaS-owned data must be tenant-scoped. A query that lists or mutates meetings, settings, usage, plan assignments, artifacts, or debug downloads must include `tenant_id` directly or resolve it explicitly from `tenant_guilds.guild_id` to `tenant_guilds.tenant_id`.
 - Existing `meetings.guild_id` remains the source for legacy meeting ownership until tenant columns/tables are introduced.
 
 Future organization relationship:
@@ -47,7 +47,7 @@ Rules:
 - Existing `guild_settings` rows map to the guild override layer.
 - A meeting snapshot is captured when recording starts and is immutable for that meeting. Recording, ASR, summary, retention, and debug availability decisions for that meeting use the snapshot, not later settings edits.
 - A meeting snapshot must not contain secrets. For credentials, store only a non-secret source marker such as `global_bot_token`, `guild_bot_token`, or future `tenant_bot_token`.
-- Tenant default rows and guild override rows should carry an integer `settings_version` that increments on every settings change. Snapshot `source_versions.tenant.version` and `source_versions.guild.version` refer to those values.
+- Tenant default rows and guild override rows must carry `settings_version`: a required integer that increments on every settings change. Snapshot `source_versions.tenant.version` and `source_versions.guild.version` refer to those required values; a row without `settings_version` is invalid for snapshot resolution.
 
 Initial effective settings fields:
 
@@ -90,7 +90,7 @@ Usage timing differs by unit:
 
 - Measures wall-clock meeting recording time.
 - Per meeting value is `ceil(recording_duration_seconds / 60)`.
-- A meeting shorter than one second records zero minutes if it never reaches `recording`; otherwise it records at least one minute.
+- A meeting shorter than one second records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
 
@@ -135,7 +135,7 @@ Usage timing differs by unit:
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - `source_watermark` is the latest tenant-scoped `artifact_mutation_sequence` included in the gauge. `artifact_mutation_sequence` is a monotonically increasing integer assigned transactionally whenever retained artifact inventory changes.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
-- Treat the `storage_bytes` gauge as stale for hard enforcement when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind the latest known artifact mutation watermark. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
+- Treat the `storage_bytes` gauge as stale for hard enforcement when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind the latest known artifact mutation watermark. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
 - When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
 
 ## Data Contracts
@@ -216,7 +216,8 @@ Rules:
 - Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, `period_anchor`, or any combination of those fields replace the existing scheduled row.
 - Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, then set the scheduled row to `active`.
 - Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
-- Monthly periods for period-counter units are derived from the original `period_anchor` day in UTC. If the anchor day does not exist in a later month, use that month's last day for that boundary only; subsequent boundaries still derive from the original anchor day.
+- Monthly periods for period-counter units are derived from the original `period_anchor` day in UTC; period boundaries fall at midnight UTC (`00:00:00 UTC`) on that calendar day. If the anchor day does not exist in a later month, use that month's last day for that boundary only; subsequent boundaries still derive from the original anchor day.
+- Example: with `period_anchor = 2026-01-31 00:00:00 UTC`, monthly periods use boundaries Jan 31 -> Feb 28, Feb 28 -> Mar 31, Mar 31 -> Apr 30, and Apr 30 -> May 31.
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
 - Plan changes do not rewrite past usage or meeting snapshots.
 
@@ -231,7 +232,11 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is the lowercase hex SHA-256 of the JSON-serialized non-secret environment defaults that participate in the snapshot, with keys sorted lexicographically and absent optional values omitted. Numeric values use canonical JSON form: integers without a decimal point, decimals in standard decimal notation without trailing zeros. An absent layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`. `env.hash` is calculated as:
+  - Algorithm: lowercase hex SHA-256.
+  - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
+  - JSON serialization: keys sorted lexicographically; absent optional values omitted; integers serialized without a decimal point; decimals serialized in standard decimal notation with no trailing zeros.
+  An absent layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
