@@ -174,6 +174,7 @@ Rules:
 - A migration that introduces a new unit must add quota rows for every affected existing plan in the same migration step, or explicitly accept that tenants on plans without that row are denied for the new unit.
 - `hard` enforcement rejects the operation when the applicable finite quota is exhausted, subject to the `recording_minutes` post-hoc overrun rule above.
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
+- Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. Keep events for at least 13 monthly periods.
 
 ### Guild Plan Assignment
 
@@ -197,7 +198,11 @@ Rules:
 
 - Initially there is one active assignment per `(tenant_id, guild_id)`.
 - The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
+- The intended scheduled-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'scheduled'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
+- Repeated billing or admin requests for the same scheduled change update the existing scheduled row idempotently instead of inserting another scheduled row.
+- Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, then set the scheduled row to `active`.
+- Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
 - Monthly periods for period-counter units are derived from `period_anchor` in UTC. If the anchor day does not exist in a later month, use that month's last day.
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
 - Plan changes do not rewrite past usage or meeting snapshots.
@@ -213,7 +218,7 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is a canonical hash of the non-secret environment defaults that participate in the snapshot. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
