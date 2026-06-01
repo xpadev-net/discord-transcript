@@ -32,7 +32,7 @@ services:
       - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://${WEB_BIND_HOST:-127.0.0.1}:${WEB_PORT:-3000}/healthz >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${WEB_PORT:-3000}/healthz >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
