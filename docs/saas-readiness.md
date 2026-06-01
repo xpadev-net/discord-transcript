@@ -92,7 +92,7 @@ Usage timing differs by unit:
 
 - Measures wall-clock meeting recording time.
 - Per meeting value is `max(1, ceil(recording_duration_seconds / 60))` if the meeting status ever transitioned to `recording`; otherwise `ceil(recording_duration_seconds / 60)`.
-- A meeting shorter than one second records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
+- A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
 
