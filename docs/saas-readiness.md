@@ -138,7 +138,7 @@ Usage timing differs by unit:
 - `source_watermark` is the latest tenant-scoped `artifact_mutation_sequence` included in the gauge. `artifact_mutation_sequence` is a monotonically increasing integer assigned transactionally whenever retained artifact inventory changes.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
 - Treat the `storage_bytes` gauge as stale for hard enforcement when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind the latest known artifact mutation watermark. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
-- When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
+- When a finite `storage_bytes` hard quota is enforced and the gauge is stale, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
 
 ## Data Contracts
 
@@ -260,7 +260,7 @@ Fields:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
   - JSON serialization: keys sorted lexicographically; absent optional values and null optional values both omitted; integers serialized without a decimal point; decimals serialized in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
-  An absent layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
+  The env layer is always present; `"env": null` is invalid. An absent tenant or guild layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
