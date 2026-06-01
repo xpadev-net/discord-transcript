@@ -200,13 +200,13 @@ Fields:
 
 - `id`
 - `status`: `active`, `suspended`, or `closed`.
-- `period_anchor`: tenant-scoped UTC timestamp used for period-counter quota windows.
+- `period_anchor`: nullable tenant-scoped UTC timestamp used for period-counter quota windows; null only before the first guild plan assignment initializes it.
 - `created_at`, `updated_at`.
 
 Rules:
 
-- `period_anchor` is initialized from the billing provider subscription anchor when present, otherwise from the first guild plan assignment's `effective_at`.
-- Changing `period_anchor` requires updating the tenant row and all active guild plan assignment copies in one serializable transaction or equivalent tenant-scoped lock.
+- `period_anchor` is initialized in the same transaction as the first guild plan assignment, from the billing provider subscription anchor when present, otherwise from the first assignment's `effective_at`.
+- Changing `period_anchor` requires updating the tenant row and all active and scheduled guild plan assignment copies in one serializable transaction or equivalent tenant-scoped lock.
 - A `suspended` tenant keeps data ownership but fails hard entitlement checks for new resource-consuming operations.
 - A `closed` tenant cannot receive new guild bindings or plan assignments.
 
@@ -258,7 +258,7 @@ Rules:
 - The intended scheduled-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'scheduled'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
 - Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, `period_anchor`, or any combination of those fields replace the existing scheduled row.
-- Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, then set the scheduled row to `active`.
+- Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, copy the authoritative tenant `period_anchor` onto the scheduled row, then set the scheduled row to `active`.
 - Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
 - Monthly periods for period-counter units are derived from the original `period_anchor` day in UTC; period boundaries fall at midnight UTC (`00:00:00 UTC`) on that calendar day. If the anchor day does not exist in a later month, use that month's last day for that boundary only; subsequent boundaries still derive from the original anchor day.
 - Example: with `period_anchor = 2026-01-31 00:00:00 UTC`, monthly periods use boundaries Jan 31 -> Feb 28, Feb 28 -> Mar 31, Mar 31 -> Apr 30, and Apr 30 -> May 31.
