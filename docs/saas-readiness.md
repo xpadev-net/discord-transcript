@@ -200,7 +200,7 @@ Rules:
 - The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
 - The intended scheduled-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'scheduled'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
-- Repeated billing or admin requests for the same scheduled change update the existing scheduled row idempotently instead of inserting another scheduled row.
+- Any billing or admin request for a scheduled change upserts the single scheduled row for `(tenant_id, guild_id)`. Exact duplicates are idempotent; corrections with a different `plan_id`, `effective_at`, or both replace the existing scheduled row.
 - Activating a scheduled assignment is a single transaction: set the current active row to `ended` with `ended_at = scheduled.effective_at`, then set the scheduled row to `active`.
 - Direct cancellation or provider termination sets the active row to `ended` with the provider/admin termination time.
 - Monthly periods for period-counter units are derived from `period_anchor` in UTC. If the anchor day does not exist in a later month, use that month's last day.
@@ -218,7 +218,7 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is a canonical hash of the non-secret environment defaults that participate in the snapshot. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is the lowercase hex SHA-256 of the JSON-serialized non-secret environment defaults that participate in the snapshot, with keys sorted lexicographically and absent optional values omitted. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
