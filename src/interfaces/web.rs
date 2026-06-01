@@ -311,7 +311,6 @@ pub fn create_router(state: WebState) -> Router {
 
     let protected = Router::new()
         .route("/api/me", get(api_me))
-        .route("/api/metricsz", get(metricsz))
         .route("/api/guild/meetings", get(api_guild_meetings))
         .route(
             "/api/guild/settings",
@@ -357,6 +356,7 @@ pub fn create_router(state: WebState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metricsz", get(metricsz))
         .merge(auth_routes)
         .merge(protected)
         .fallback_service(spa)
