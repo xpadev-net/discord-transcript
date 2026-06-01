@@ -114,6 +114,7 @@ Usage timing differs by unit:
 - Count each invocation that starts sending a prompt to the summary harness, including retries and regeneration requests.
 - Do not count validation failures or jobs that fail before an LLM invocation begins.
 - Period usage increments at invocation start.
+- Idempotency keys for `summary_runs` must be per invocation attempt, not per meeting, so retries are counted exactly once each.
 
 `debug_downloads`
 
@@ -134,7 +135,7 @@ Usage timing differs by unit:
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - `source_watermark` is the latest tenant-scoped `artifact_mutation_sequence` included in the gauge. `artifact_mutation_sequence` is a monotonically increasing integer assigned transactionally whenever retained artifact inventory changes.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
-- Treat the `storage_bytes` gauge as stale for hard enforcement when `measured_at` is more than 5 minutes old or when `source_watermark` is behind the latest known artifact mutation watermark.
+- Treat the `storage_bytes` gauge as stale for hard enforcement when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind the latest known artifact mutation watermark. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
 - When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
 
 ## Data Contracts
@@ -230,7 +231,7 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is the lowercase hex SHA-256 of the JSON-serialized non-secret environment defaults that participate in the snapshot, with keys sorted lexicographically and absent optional values omitted. Numeric values use canonical JSON form: integers without a decimal point, decimals in standard decimal notation without trailing zeros. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. `env.version` is the environment-settings schema version, initially `1`; `env.hash` is the lowercase hex SHA-256 of the JSON-serialized non-secret environment defaults that participate in the snapshot, with keys sorted lexicographically and absent optional values omitted. Numeric values use canonical JSON form: integers without a decimal point, decimals in standard decimal notation without trailing zeros. An absent layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
@@ -246,6 +247,7 @@ Rules:
 - Keep current `guild_settings` behavior compatible by treating existing rows as guild overrides.
 - Prefer explicit null inheritance for defaults and overrides.
 - Keep usage accounting idempotent by using deterministic source identifiers, for example `meeting_id + unit` or `job_id + unit`.
+- For units where retries count as new usage, such as `asr_seconds` and `summary_runs`, the deterministic source identifier must include the attempt or invocation id.
 - Keep entitlement checks fail-closed for hard quotas and observable for soft quotas.
 - Record audit timestamps for plan assignments and settings changes.
 - Avoid backfilling historical tenant data beyond the current guild mapping unless a later task explicitly owns that migration.
