@@ -78,6 +78,7 @@ const GUILD_CACHE_TTL_SECS: u64 = 300;
 const BOT_TOKEN_CACHE_TTL_SECS: u64 = 300;
 const BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS: u64 = 5;
 const BOT_TOKEN_CACHE_FAILURE_TTL_SECS: u64 = 5;
+const OPERATIONAL_METRICS_CACHE_TTL_SECS: u64 = 15;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
 const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
@@ -86,6 +87,7 @@ type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
 type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
+type OperationalMetricsCache = Arc<Mutex<Option<OperationalMetricsCacheEntry>>>;
 type MembershipCache =
     Arc<tokio::sync::RwLock<HashMap<String, (Result<bool, StatusCode>, Instant)>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, MembershipInflightEntry>>>;
@@ -202,6 +204,7 @@ pub struct WebState {
     /// Cache: resolved effective bot token for the configured guild.
     bot_token_cache: BotTokenCache,
     bot_token_revision_tx: Option<watch::Sender<u64>>,
+    operational_metrics_cache: OperationalMetricsCache,
     /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
@@ -234,6 +237,7 @@ impl WebState {
             guild_bot_token_cipher: guild_bot_token.cipher,
             bot_token_cache: Arc::new(tokio::sync::RwLock::new(BotTokenCacheState::default())),
             bot_token_revision_tx: guild_bot_token.revision_tx,
+            operational_metrics_cache: Arc::new(Mutex::new(None)),
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -2297,13 +2301,21 @@ struct ApiErrorResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationalStatus {
+    Ok,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct HealthResponse {
     status: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct OperationalCheck {
-    status: &'static str,
+    status: OperationalStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
 }
@@ -2311,21 +2323,21 @@ struct OperationalCheck {
 impl OperationalCheck {
     fn ok() -> Self {
         Self {
-            status: "ok",
+            status: OperationalStatus::Ok,
             reason: None,
         }
     }
 
     fn unavailable(reason: &'static str) -> Self {
         Self {
-            status: "unavailable",
+            status: OperationalStatus::Unavailable,
             reason: Some(reason),
         }
     }
 
     fn not_checked(reason: &'static str) -> Self {
         Self {
-            status: "not_checked",
+            status: OperationalStatus::NotChecked,
             reason: Some(reason),
         }
     }
@@ -2358,6 +2370,12 @@ struct OperationalCounters {
 struct OperationalMetricsResponse {
     status: &'static str,
     counters: OperationalCounters,
+}
+
+#[derive(Debug, Clone)]
+struct OperationalMetricsCacheEntry {
+    snapshot: OperationalMetricsResponse,
+    cached_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2465,25 +2483,44 @@ async fn readyz(State(state): State<WebState>) -> Response {
 }
 
 async fn metricsz(State(state): State<WebState>) -> Response {
-    match load_operational_counters(&state.db).await {
-        Ok(counters) => (
-            StatusCode::OK,
-            Json(OperationalMetricsResponse {
-                status: "ok",
-                counters,
-            }),
-        )
-            .into_response(),
+    let snapshot = load_cached_operational_metrics(&state).await;
+    let status = if snapshot.status == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(snapshot)).into_response()
+}
+
+async fn load_cached_operational_metrics(state: &WebState) -> OperationalMetricsResponse {
+    let now = Instant::now();
+    let mut cache = state.operational_metrics_cache.lock().await;
+    if let Some(entry) = cache.as_ref()
+        && now.duration_since(entry.cached_at).as_secs() < OPERATIONAL_METRICS_CACHE_TTL_SECS
+    {
+        return entry.snapshot.clone();
+    }
+
+    let snapshot = load_operational_metrics(&state.db).await;
+    *cache = Some(OperationalMetricsCacheEntry {
+        snapshot: snapshot.clone(),
+        cached_at: now,
+    });
+    snapshot
+}
+
+async fn load_operational_metrics(db: &PgClient) -> OperationalMetricsResponse {
+    match load_operational_counters(db).await {
+        Ok(counters) => OperationalMetricsResponse {
+            status: "ok",
+            counters,
+        },
         Err(err) => {
             warn!(error = %err, "failed to load operational counters");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(OperationalMetricsResponse {
-                    status: "unavailable",
-                    counters: OperationalCounters::default(),
-                }),
-            )
-                .into_response()
+            OperationalMetricsResponse {
+                status: "unavailable",
+                counters: OperationalCounters::default(),
+            }
         }
     }
 }
@@ -2537,9 +2574,9 @@ async fn operational_readiness_checks(db: &PgClient) -> OperationalReadinessChec
 fn operational_readiness_response(
     checks: OperationalReadinessChecks,
 ) -> (StatusCode, OperationalReadinessResponse) {
-    let ready = checks.database.status == "ok"
-        && checks.migrations.status == "ok"
-        && checks.queue.status == "ok";
+    let ready = matches!(checks.database.status, OperationalStatus::Ok)
+        && matches!(checks.migrations.status, OperationalStatus::Ok)
+        && matches!(checks.queue.status, OperationalStatus::Ok);
     let status = if ready { "ready" } else { "not_ready" };
     let http_status = if ready {
         StatusCode::OK
@@ -4548,7 +4585,7 @@ async fn stream_file_range(
 mod operational_endpoint_tests {
     use super::{
         OperationalCheck, OperationalCounters, OperationalMetricsResponse,
-        OperationalReadinessChecks, healthz, integration_readiness_not_checked,
+        OperationalReadinessChecks, OperationalStatus, healthz, integration_readiness_not_checked,
         operational_readiness_response,
     };
     use axum::body::to_bytes;
@@ -4583,7 +4620,12 @@ mod operational_endpoint_tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ready");
-        assert_eq!(response.checks.integrations.status, "not_checked");
+        assert_eq!(
+            response.checks.integrations.status,
+            OperationalStatus::NotChecked
+        );
+        let json = serde_json::to_value(&response).expect("readiness response should serialize");
+        assert_eq!(json["checks"]["integrations"]["status"], "not_checked");
         assert_eq!(
             response.checks.integrations.reason,
             Some(
@@ -4605,7 +4647,10 @@ mod operational_endpoint_tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "not_ready");
-        assert_eq!(response.checks.database.status, "unavailable");
+        assert_eq!(
+            response.checks.database.status,
+            OperationalStatus::Unavailable
+        );
         assert_eq!(
             response.checks.database.reason,
             Some("database query failed")
