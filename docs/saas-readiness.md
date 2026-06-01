@@ -74,6 +74,8 @@ Fields that are not yet tenant- or guild-editable still belong in the snapshot w
 - `guild_bot_token`
 - `tenant_bot_token` (reserved until tenant-level bot tokens are implemented)
 
+`tenant_bot_token` must not be emitted until tenant-level bot tokens are implemented. If encountered before support exists, token resolution fails closed rather than falling back to another token source.
+
 ## Usage And Entitlement Units
 
 Usage must be recorded as append-only events for period units and as current-state measurements for storage. Entitlement checks should be done before starting work when the needed amount is knowable, and usage should still be recorded for work that started and consumed external resources.
@@ -232,10 +234,10 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`. `env.hash` is calculated as:
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
-  - JSON serialization: keys sorted lexicographically; absent optional values and null optional values both omitted; integers serialized without a decimal point; decimals serialized in standard decimal notation with no trailing zeros.
+  - JSON serialization: keys sorted lexicographically; absent optional values and null optional values both omitted; integers serialized without a decimal point; decimals serialized in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
   An absent layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
 - `settings`: structured values for the effective settings fields listed above.
 
