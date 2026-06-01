@@ -192,6 +192,24 @@ Rules:
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
 - Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`. Keep events for at least 13 monthly periods.
 
+### Tenant
+
+Purpose: authoritative SaaS isolation and entitlement record.
+
+Fields:
+
+- `id`
+- `status`: `active`, `suspended`, or `closed`.
+- `period_anchor`: tenant-scoped UTC timestamp used for period-counter quota windows.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- `period_anchor` is initialized from the billing provider subscription anchor when present, otherwise from the first guild plan assignment's `effective_at`.
+- Changing `period_anchor` requires updating the tenant row and all active guild plan assignment copies in one serializable transaction or equivalent tenant-scoped lock.
+- A `suspended` tenant keeps data ownership but fails hard entitlement checks for new resource-consuming operations.
+- A `closed` tenant cannot receive new guild bindings or plan assignments.
+
 ### Tenant Guild Binding
 
 Purpose: resolve Discord guild ownership to the active SaaS tenant.
@@ -211,7 +229,7 @@ Rules:
 - The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
 - A `(tenant_id, guild_id)` pair may have only one active row.
 - Revoked rows remain for history and audit but must not be used for SaaS query scoping.
-- Moving a guild to another tenant is a single transaction: revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and create or activate the new tenant's plan assignment for that guild. If the new assignment cannot be created in the same transaction, the move fails.
+- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings or in-flight ASR/summary jobs, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and create or activate the new tenant's plan assignment for that guild. If the new assignment cannot be created in the same transaction, the move fails.
 - SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
 
 ### Guild Plan Assignment
@@ -260,7 +278,7 @@ Fields:
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
-  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
+  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings such as `whisper_temperature` captured from raw environment strings and serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
   The env layer is always present; `"env": null` is invalid. An absent tenant or guild layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
 - `settings`: structured values for the effective settings fields listed above.
 
