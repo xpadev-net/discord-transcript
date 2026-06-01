@@ -110,6 +110,7 @@ Usage timing differs by unit:
 - Count the actual audio duration sent to the ASR engine. For per-speaker chunk ASR, sum submitted chunk durations; for mixdown ASR, use the mixdown duration.
 - Retries count again only after a retry submits audio to ASR.
 - Period usage increments when the ASR request is started or durably queued with a known input duration.
+- Idempotency keys for `asr_seconds` must be per ASR attempt, not per meeting or job, so retries are counted exactly once each.
 
 `summary_runs`
 
@@ -210,8 +211,7 @@ Rules:
 - `period_anchor` is initialized in the same transaction as the first guild plan assignment, from the billing provider subscription anchor when present, otherwise from the first assignment's `effective_at`.
 - After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
 - A `suspended` tenant keeps data ownership but fails hard entitlement checks for new resource-consuming operations.
-- Closing a tenant requires no non-terminal meetings and no in-flight ASR or summary jobs.
-- Closing a tenant is a single transaction: set tenant status to `closed`, revoke all active tenant-guild bindings, end all active guild plan assignments, and cancel all scheduled guild plan assignments.
+- Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs, then set tenant status to `closed`, revoke all active tenant-guild bindings, end all active guild plan assignments, and cancel all scheduled guild plan assignments. If any precondition fails while the lock is held, the close attempt fails without partial changes.
 - A `closed` tenant keeps historical data ownership for retention, audit, and read-only access, but cannot receive new guild bindings or plan assignments and must fail all new resource-consuming operations.
 
 ### Tenant Guild Binding
@@ -283,6 +283,7 @@ Fields:
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
+  - Initial `env.version = 1` field set: exactly `whisper_language`, `whisper_language_explicit`, `whisper_vad`, `whisper_beam_size`, `whisper_suppress_non_speech`, `whisper_prompt`, `whisper_temperature`, `whisper_resample_to_16k`, `auto_stop_grace_seconds`, `retention_raw_audio_ttl_days`, `retention_transcript_ttl_days`, `retention_summary_ttl_days`, `summary_enabled`, and `bot_token_source`. `bot_token_source` is included because it is a non-secret source marker. Credential values and any other environment defaults are excluded.
   - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings such as `whisper_temperature` must be captured from raw environment strings before typed parsing (for example `process.env`, `os.environ`, or the injected config map string value) and serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer. If the raw string is unavailable, snapshot hash generation fails. Every decimal setting that participates in the snapshot must therefore be supplied as an environment variable string in all deployment environments, including local development and CI; a typed code default is not sufficient for hash computation.
   The env layer is always present; `"env": null` is invalid. An absent tenant or guild layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
 - `settings`: structured values for the effective settings fields listed above.
