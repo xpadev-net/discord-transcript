@@ -47,6 +47,7 @@ Rules:
 - Existing `guild_settings` rows map to the guild override layer.
 - A meeting snapshot is captured when recording starts and is immutable for that meeting. Recording, ASR, summary, retention, and debug availability decisions for that meeting use the snapshot, not later settings edits.
 - A meeting snapshot must not contain secrets. For credentials, store only a non-secret source marker such as `global_bot_token`, `guild_bot_token`, or future `tenant_bot_token`.
+- Tenant default rows and guild override rows should carry an integer `settings_version` that increments on every settings change. Snapshot `source_versions.tenant.version` and `source_versions.guild.version` refer to those values.
 
 Initial effective settings fields:
 
@@ -66,6 +67,12 @@ Initial effective settings fields:
 - `bot_token_source`
 
 Fields that are not yet tenant- or guild-editable still belong in the snapshot when they affect recording, ASR, summary, retention, or artifact availability. Future settings may be added with the same precedence. New fields should define whether they are snapshotted at meeting start or read live.
+
+`bot_token_source` allowed values are:
+
+- `global_bot_token`
+- `guild_bot_token`
+- `tenant_bot_token` (reserved until tenant-level bot tokens are implemented)
 
 ## Usage And Entitlement Units
 
@@ -125,6 +132,7 @@ Usage timing differs by unit:
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
+- `source_watermark` is the latest tenant-scoped `artifact_mutation_sequence` included in the gauge. `artifact_mutation_sequence` is a monotonically increasing integer assigned transactionally whenever retained artifact inventory changes.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
 - Treat the `storage_bytes` gauge as stale for hard enforcement when `measured_at` is more than 5 minutes old or when `source_watermark` is behind the latest known artifact mutation watermark.
 - When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the latest artifact mutation watermark captured when the rebuild started.
