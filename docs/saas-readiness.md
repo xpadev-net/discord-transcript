@@ -124,6 +124,7 @@ Usage timing differs by unit:
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
+- When a finite `storage_bytes` hard quota is enforced and the gauge is stale or rebuilding, fail closed for operations that increase storage. Cleanup and delete operations may proceed because they reduce or preserve storage.
 
 ## Data Contracts
 
@@ -145,7 +146,9 @@ Fields:
 Rules:
 
 - `code` is unique across all plan rows, including archived plans. The initial lifecycle has no deleted state.
-- Archived plans cannot be newly assigned but remain valid for historical assignments.
+- Only `active` plans may be newly assigned.
+- `draft` plans may be edited and validated but cannot be assigned.
+- `archived` plans cannot be newly assigned but remain valid for historical assignments.
 - Pricing fields are out of scope for this initial contract unless a later task explicitly adds billing integration.
 
 ### Plan Quota
@@ -210,7 +213,7 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }` with null layer values when a layer is absent.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }`. An absent layer is represented by a null key value, for example `{ "env": { "version": "1", "hash": "..." }, "tenant": null, "guild": { "id": "123", "version": "7" } }`.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
