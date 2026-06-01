@@ -131,7 +131,7 @@ Usage timing differs by unit:
 
 - Period counter usage keys are scoped by `tenant_id`, `unit`, `period_start`, and `period_end`.
 - `period_start` is inclusive and `period_end` is exclusive.
-- The initial billing period is monthly in UTC and is computed from the active plan assignment's `period_anchor`.
+- The initial billing period is monthly in UTC and is computed from the tenant-scoped `period_anchor`. In the initial guild-assignment model, `guild_plan_assignments.period_anchor` stores that tenant anchor and every active guild assignment for the same tenant must use the same value.
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
@@ -227,7 +227,7 @@ Fields:
 - `status`: `active`, `scheduled`, `ended`.
 - `effective_at`
 - `ended_at`
-- `period_anchor`: UTC timestamp used to compute monthly period boundaries; set from the billing provider subscription anchor when present, otherwise from `effective_at`.
+- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries; set from the billing provider subscription anchor when present, otherwise from `effective_at`. Every active guild assignment for the same tenant must share the same `period_anchor`.
 - `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
