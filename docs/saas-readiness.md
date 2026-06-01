@@ -144,7 +144,7 @@ Fields:
 
 Rules:
 
-- `code` is unique among non-deleted plans.
+- `code` is unique across all plan rows, including archived plans. The initial lifecycle has no deleted state.
 - Archived plans cannot be newly assigned but remain valid for historical assignments.
 - Pricing fields are out of scope for this initial contract unless a later task explicitly adds billing integration.
 
@@ -169,6 +169,8 @@ Rules:
 - `recording_minutes`, `asr_seconds`, `summary_runs`, and `debug_downloads` use `period = monthly` initially.
 - Missing quota rows mean the unit is not entitled unless a later migration explicitly defines default quota inheritance.
 - A migration that introduces a new unit must add quota rows for every affected existing plan in the same migration step, or explicitly accept that tenants on plans without that row are denied for the new unit.
+- `hard` enforcement rejects the operation when the applicable finite quota is exhausted, subject to the `recording_minutes` post-hoc overrun rule above.
+- `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
 
 ### Guild Plan Assignment
 
@@ -184,7 +186,7 @@ Fields:
 - `effective_at`
 - `ended_at`
 - `period_anchor`: UTC timestamp used to compute monthly period boundaries; set from the billing provider subscription anchor when present, otherwise from `effective_at`.
-- `assigned_by_user_id`
+- `assigned_by_user_id`: nullable Discord user id; required for `source = admin`, null for `system`, `billing_provider`, and `migration` unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
 
@@ -208,7 +210,7 @@ Fields:
 - `guild_id`
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract; increment when the precedence order, snapshot field set, or inheritance semantics change.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot.
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": "...", "hash": "..." }, "tenant": { "id": "...", "version": "..." }, "guild": { "id": "...", "version": "..." } }` with null layer values when a layer is absent.
 - `settings`: structured values for the effective settings fields listed above.
 
 Rules:
