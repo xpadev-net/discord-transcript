@@ -128,6 +128,7 @@ Usage timing differs by unit:
 - `download_session_id` is a server-assigned opaque id created when a user is authorized for a debug artifact download. It is scoped to one `(tenant_id, meeting_id, artifact_id, user_id)` logical access, is embedded in the generated download URL or token, and expires no later than the download authorization.
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
+- Idempotency keys for `debug_downloads` must be per `download_session_id`, not per meeting or artifact, so each authorized logical download intent is counted at most once.
 
 ### Period And Gauge Semantics
 
@@ -234,7 +235,7 @@ Rules:
 - The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
 - A `(tenant_id, guild_id)` pair may have only one active row.
 - Revoked rows remain for history and audit but must not be used for SaaS query scoping.
-- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings or in-flight ASR/summary jobs, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and create or activate the new tenant's plan assignment for that guild. The move must invalidate or advance storage gauge watermarks for both the old and new tenants, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale. If the new assignment cannot be created in the same transaction, the move fails.
+- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings or in-flight ASR/summary jobs, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild. The move must invalidate or advance storage gauge watermarks for both the old and new tenants, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale. If the new assignment cannot be created in the same transaction, the move fails.
 - SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
 
 ### Guild Plan Assignment
