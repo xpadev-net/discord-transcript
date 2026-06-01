@@ -131,7 +131,7 @@ Usage timing differs by unit:
 
 - Period counter usage keys are scoped by `tenant_id`, `unit`, `period_start`, and `period_end`.
 - `period_start` is inclusive and `period_end` is exclusive.
-- The initial billing period is monthly in UTC and is computed from the tenant-scoped `period_anchor`. In the initial guild-assignment model, `guild_plan_assignments.period_anchor` stores that tenant anchor and every active guild assignment for the same tenant must use the same value.
+- The initial billing period is monthly in UTC and is computed from the authoritative tenant-scoped `period_anchor`. In the initial guild-assignment model, `guild_plan_assignments.period_anchor` stores a copy of that tenant anchor and every active guild assignment for the same tenant must use the same value.
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
@@ -227,7 +227,7 @@ Fields:
 - `status`: `active`, `scheduled`, `ended`.
 - `effective_at`
 - `ended_at`
-- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. Set it from the billing provider subscription anchor when present; otherwise, inherit the existing tenant `period_anchor` when the tenant already has an active assignment; otherwise default to `effective_at` for the tenant's first assignment. Every active guild assignment for the same tenant must share the same `period_anchor`.
+- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. The tenant record is the authoritative source. Set it from the billing provider subscription anchor when present; otherwise, inherit the existing tenant `period_anchor` when the tenant already has one; otherwise default to `effective_at` for the tenant's first assignment. Initializing or changing the tenant `period_anchor` and writing the guild assignment must happen in one serializable transaction or under an equivalent tenant-scoped lock. Every active guild assignment for the same tenant must share the same `period_anchor`.
 - `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
@@ -260,7 +260,7 @@ Fields:
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
-  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimals serialized in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
+  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer.
   The env layer is always present; `"env": null` is invalid. An absent tenant or guild layer is represented by a null key value. If the tenant exists but has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }` for the tenant layer. If the guild exists but has no guild override row, use `{ "id": "<guild_id>", "version": null }` for the guild layer.
 - `settings`: structured values for the effective settings fields listed above.
 
