@@ -31,6 +31,12 @@ services:
       - ${HOME}/.local/share/opencode:/home/app/.local/share/opencode
       - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${WEB_PORT:-3000}/healthz >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
 
   db:
