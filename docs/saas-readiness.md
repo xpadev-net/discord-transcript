@@ -115,12 +115,14 @@ Usage timing differs by unit:
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
 
-### Period Semantics
+### Period And Gauge Semantics
 
-- Period usage keys are scoped by `tenant_id`, `unit`, `period_start`, and `period_end`.
-- The initial billing period is monthly in UTC unless the plan assignment specifies otherwise.
+- Period counter usage keys are scoped by `tenant_id`, `unit`, `period_start`, and `period_end`.
+- `period_start` is inclusive and `period_end` is exclusive.
+- The initial billing period is monthly in UTC and is computed from the active plan assignment's `period_anchor`.
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
+- `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
 
 ## Data Contracts
@@ -137,7 +139,7 @@ Fields:
 - `code`: stable external code used by configuration, admin UI, and tests.
 - `name`: display name.
 - `status`: `draft`, `active`, `archived`.
-- `version`: integer or timestamp version for auditability.
+- `version`: integer version, incremented on each update, for optimistic locking and auditability.
 - `created_at`, `updated_at`.
 
 Rules:
@@ -181,7 +183,7 @@ Fields:
 - `status`: `active`, `scheduled`, `ended`.
 - `effective_at`
 - `ended_at`
-- `period_anchor`
+- `period_anchor`: UTC timestamp used to compute monthly period boundaries; set from the billing provider subscription anchor when present, otherwise from `effective_at`.
 - `assigned_by_user_id`
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
@@ -191,6 +193,7 @@ Rules:
 - Initially there is one active assignment per `(tenant_id, guild_id)`.
 - The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
+- Monthly periods for period-counter units are derived from `period_anchor` in UTC. If the anchor day does not exist in a later month, use that month's last day.
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
 - Plan changes do not rewrite past usage or meeting snapshots.
 
