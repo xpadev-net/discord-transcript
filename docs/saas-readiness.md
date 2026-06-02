@@ -120,7 +120,7 @@ Usage timing differs by unit:
 - Do not count validation failures or jobs that fail before an LLM invocation begins.
 - Period usage increments at invocation start.
 - Idempotency keys for `summary_runs` must be per invocation attempt, not per meeting, so retries are counted exactly once each.
-- `summary_invocation_id` is a server-assigned opaque id created before sending each summary prompt. It is scoped to one `(tenant_id, meeting_id, job_type, invocation_number)` and stored with the usage event or job-attempt metadata before the LLM request starts. Redelivery of the same queued invocation reuses the same `summary_invocation_id`; a retry or regeneration that sends a prompt creates a new `summary_invocation_id`.
+- `summary_invocation_id` is a server-assigned opaque id created before sending each summary prompt. It is scoped to one `(tenant_id, meeting_id, job_type, invocation_number)` where `invocation_number` is a monotonically increasing counter across all prompt sends for that meeting and job type, including retries and regenerations. It is stored with the usage event or job-attempt metadata before the LLM request starts. Redelivery of the same queued invocation reuses the same `summary_invocation_id`; a retry or regeneration that sends a prompt creates a new `summary_invocation_id` with an incremented `invocation_number`.
 
 `debug_downloads`
 
