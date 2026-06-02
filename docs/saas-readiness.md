@@ -537,6 +537,29 @@ Rules:
 - Future organization support may assign default plans at the organization level, but the effective guild assignment must still be resolvable without ambiguity.
 - Plan changes do not rewrite past usage or meeting snapshots.
 
+### Delayed Plan Activation Event
+
+Purpose: observable billing-timeline audit record for a scheduled guild plan assignment that activates after its scheduled `effective_at`.
+
+Fields:
+
+- `tenant_id`
+- `guild_id`
+- `previous_plan_id`
+- `scheduled_plan_id`
+- `scheduled_effective_at`
+- `actual_effective_at`
+- `delay_seconds`: non-negative integer.
+- `source`: copied from the activated scheduled assignment.
+- `created_at`
+
+Rules:
+
+- The intended uniqueness constraint is `(tenant_id, guild_id, scheduled_plan_id, scheduled_effective_at)`.
+- Emit the event in the same transaction that activates a delayed scheduled assignment. Do not emit it when activation runs on time and `actual_effective_at = scheduled_effective_at`.
+- `delay_seconds = max(0, actual_effective_at - scheduled_effective_at)` in whole seconds.
+- Keep events for at least 13 monthly periods.
+
 ### Effective Settings Snapshot
 
 Purpose: preserve the exact settings used for a meeting after later settings edits.
