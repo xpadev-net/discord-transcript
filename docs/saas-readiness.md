@@ -377,6 +377,7 @@ Fields:
 - `meeting_id`
 - `tenant_id`
 - `guild_id`
+- `plan_assignment_id`: guild plan assignment active when the snapshot is created; authoritative for post-hoc `recording_minutes` usage and quota violation attribution even if the guild changes plans before the meeting reaches a terminal state.
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract, initially `1`; increment when the precedence order or inheritance semantics change, or when non-env-default fields are added to or removed from the snapshot. Changes to which env-default fields are snapshotted increment `env.version` instead; do not increment `precedence_version` for that case alone.
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
