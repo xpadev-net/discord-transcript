@@ -118,6 +118,7 @@ Usage timing differs by unit:
 - Period usage increments when the ASR request is started or durably queued with a known input duration.
 - Idempotency keys for `asr_seconds` must be per ASR attempt, not per meeting or job, so retries are counted exactly once each.
 - `asr_attempt_id` is a server-assigned opaque id created before durably queueing or submitting each ASR attempt. It is scoped to one `(tenant_id, meeting_id, job_type, submission_sequence, attempt_number)` where `submission_sequence` is a monotonically increasing integer assigned per distinct audio submission to ASR within the meeting, for example one per speaker chunk or `1` for mixdown ASR. It is stored with the usage event or job-attempt metadata before the external ASR request starts. Redelivery of the same queued attempt reuses the same `asr_attempt_id`; a retry that submits audio creates a new `asr_attempt_id` with the same `submission_sequence` and an incremented `attempt_number`.
+- ASR attempt metadata must include the durable submitted duration, external submission started timestamp, and whether a matching usage event has been written. Reconciliation must convert any submitted ASR attempt without a usage event into the corresponding Period Counter Usage Event and release the matching reservation; attempts with no external submission started timestamp may release their reservation without usage.
 
 `summary_runs`
 
@@ -127,6 +128,7 @@ Usage timing differs by unit:
 - Period usage increments at invocation start.
 - Idempotency keys for `summary_runs` must be per invocation attempt, not per meeting, so retries are counted exactly once each.
 - `summary_invocation_id` is a server-assigned opaque id created before sending each summary prompt. It is scoped to one `(tenant_id, meeting_id, job_type, invocation_number)` where `invocation_number` is a monotonically increasing counter across all prompt sends for that meeting and job type, including retries and regenerations. It is stored with the usage event or job-attempt metadata before the LLM request starts. Redelivery of the same queued invocation reuses the same `summary_invocation_id`; a retry or regeneration that sends a prompt creates a new `summary_invocation_id` with an incremented `invocation_number`.
+- For finite hard `summary_runs` quotas, invocation authorization must atomically insert or reuse the usage event before the prompt starts sending, using the invocation idempotency key. A bare read-then-send check is invalid. Summary invocation metadata must record the prompt submission started timestamp so reconciliation can append the missing usage event after a crash.
 
 `debug_downloads`
 
@@ -140,14 +142,16 @@ Usage timing differs by unit:
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
 - Idempotency keys for `debug_downloads` must be per `download_session_id`, not per meeting or artifact, so each authorized logical download intent is counted at most once.
+- For finite hard `debug_downloads` quotas, response-start authorization must atomically insert or reuse the usage event before any bytes stream or inline artifact is returned, using `download_session_id` as the idempotency key. A bare read-then-stream check is invalid.
 
 ### Period And Gauge Semantics
 
-- Period counter usage keys are scoped by `tenant_id`, `unit`, `period_start`, and `period_end`.
+- Period counter entitlement windows are scoped by `tenant_id`, `plan_assignment_id`, `unit`, `period_start`, and `period_end`.
 - `period_start` is inclusive and `period_end` is exclusive.
 - The initial billing period is monthly in UTC and is computed from the authoritative tenant-scoped `period_anchor`. In the initial guild-assignment model, `guild_plan_assignments.period_anchor` stores a copy of that tenant anchor and every active guild assignment for the same tenant must use the same value.
 - After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
 - A plan change starts a new entitlement evaluation window at `effective_at`; historical usage events remain attached to their original period.
+- For period-counter quota evaluation, aggregate usage by `tenant_id`, `unit`, `period_start`, `period_end`, and `plan_assignment_id`. If a guild changes plans mid-period, the new assignment starts a fresh assignment-scoped entitlement window inside the same monthly period; usage attached to the old `plan_assignment_id` does not count against the new assignment.
 - Usage events should keep `source_type` and `source_id` so meeting, job, artifact, and debug download usage can be reconciled.
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - `source_watermark` is the latest tenant-scoped artifact inventory watermark included in the gauge.
@@ -199,6 +203,7 @@ Fields:
 
 Rules:
 
+- The intended uniqueness constraint is `(plan_id, unit)`.
 - Unlimited quota must be represented by `limit_type = unlimited` with `limit_value = null`; do not use sentinel values such as `-1`.
 - `storage_bytes` uses `period = current`.
 - `recording_minutes`, `asr_seconds`, `summary_runs`, and `debug_downloads` use `period = monthly` initially.
@@ -231,8 +236,10 @@ Rules:
 - The intended uniqueness constraint is `(tenant_id, unit, period_start, period_end, idempotency_key)`.
 - `period_start` and `period_end` are required and use the Period And Gauge Semantics boundaries.
 - `plan_assignment_id` is the assignment active when work was authorized or started for post-hoc units, and the assignment active at usage start for immediate units.
+- For post-hoc units such as `recording_minutes`, `guild_id` is sourced from the Effective Settings Snapshot captured at recording start, not from the active tenant-guild binding at terminal-state time.
 - `source_type` and `source_id` identify the meeting, ASR attempt, summary invocation, or download session that produced the usage.
 - Retrying the same durable attempt uses the same `idempotency_key`; a retry that intentionally counts as new usage must use a new idempotency key as defined by the unit contract.
+- Finite hard checks for known-amount period units must be serialized by row lock, advisory lock, conditional insert, or equivalent serializable transaction over the active `plan_assignment_id`, unit, and period before the counted side effect starts. This applies to `summary_runs` and `debug_downloads`; `asr_seconds` uses Period Counter Reservation because its final amount may require reservation and later reconciliation.
 
 ### Period Counter Reservation
 
@@ -241,6 +248,7 @@ Purpose: per-source tenant-period reservation used for hard pre-flight checks th
 Fields:
 
 - `tenant_id`
+- `plan_assignment_id`
 - `unit`: initially `asr_seconds`.
 - `period_start`
 - `period_end`
@@ -252,10 +260,10 @@ Fields:
 
 Rules:
 
-- The intended uniqueness constraint is `(tenant_id, unit, period_start, period_end, source_type, source_id)`.
+- The intended uniqueness constraint is `(tenant_id, plan_assignment_id, unit, period_start, period_end, source_type, source_id)`.
 - Hard `asr_seconds` pre-flight must lock or atomically upsert the source reservation row, compare `current_usage + active_reserved_value_excluding_this_source + requested_amount` against the finite quota, and set `reserved_value` only if the result fits.
-- `current_usage` is the committed sum of Period Counter Usage Event `amount` for the same tenant, unit, and period.
-- `active_reserved_value` is the sum of reservation `reserved_value` for the same tenant, unit, and period where `reserved_until` is greater than the transaction timestamp.
+- `current_usage` is the committed sum of Period Counter Usage Event `amount` for the same tenant, plan assignment, unit, and period.
+- `active_reserved_value` is the sum of reservation `reserved_value` for the same tenant, plan assignment, unit, and period where `reserved_until` is greater than the transaction timestamp.
 - The initial reservation TTL is 15 minutes. A worker that still needs the reservation must refresh `reserved_until` before it expires, and must stop before submitting additional audio if it cannot refresh the reservation.
 - When an ASR attempt records its usage event or is cancelled before submitting audio, delete the matching reservation in the same transaction or an equivalent idempotent reconciliation step.
 - Reconciliation must run at least every 5 minutes and delete expired reservation rows after confirming the source job is terminal or absent. Expired rows are ignored by quota enforcement even before reconciliation deletes them.
@@ -306,6 +314,7 @@ Rules:
 - The intended idempotency constraint for period-counter units is `(tenant_id, unit, period_start, period_end, source_type, source_id)`. The intended idempotency constraint for current-gauge units is `(tenant_id, unit, source_type, source_id)`, where `source_id` is a durable idempotency key for the gauge check that produced the event.
 - In the initial one-guild-per-tenant phase, `guild_id` is required for every quota violation event and is resolved from the active tenant-guild binding at `observed_at`, including tenant-level `storage_bytes` gauge events. `guild_id` may be null only for a future tenant-level or organization-level event that does not correspond to one active guild.
 - For post-hoc units such as `recording_minutes`, `plan_assignment_id` is the assignment active when the work was authorized or started, not the assignment active at `observed_at`. The meeting or usage-start metadata must retain that assignment id so terminal-state accounting does not misattribute usage after a plan change.
+- For immediate period-counter units, `plan_assignment_id` is the assignment active at usage start. For current-gauge units such as `storage_bytes`, `plan_assignment_id` is the assignment active at `observed_at` in the initial one-guild-per-tenant phase. It may be null only for a future tenant-level or organization-level gauge event that has no active guild assignment.
 - Keep events for at least 13 monthly periods.
 
 ### Download Session
@@ -328,7 +337,7 @@ Rules:
 
 - The intended active-row uniqueness constraint is `(tenant_id, meeting_id, artifact_id, user_id) WHERE status = 'active'`.
 - `expires_at` is the database source of truth for whether an active session is still reusable. The authorization handler must expire any active row whose `expires_at <= now` inside the same atomic upsert or lock used to create or reuse sessions; a background expiry job is optional but not sufficient by itself.
-- The download handler must also validate `expires_at > now` while authorizing the file response. If the session is expired, it must reject the download and atomically mark the row `expired` before any bytes stream or usage is counted.
+- The download handler must validate `status = active`, `revoked_at IS NULL`, and `expires_at > now` while authorizing the file response, and must re-resolve the meeting's current active tenant-guild binding before streaming or counting usage. If the session is expired, it must reject the download and atomically mark the row `expired` before any bytes stream or usage is counted. If the session is revoked or the tenant no longer owns the guild, reject without streaming or counting usage.
 - Revoking or replacing a session sets `status = revoked` and `revoked_at`.
 - Usage idempotency uses `download_session_id`, as defined in the `debug_downloads` unit.
 
@@ -349,7 +358,7 @@ Rules:
 - Every retained artifact inventory row that contributes to `storage_bytes` carries the tenant's latest `artifact_mutation_sequence` at the time that row last changed.
 - A retained artifact inventory change is any create, byte-size change, tenant attribution change, retention-state change, TTL cleanup, explicit deletion, or soft-delete/tombstone transition that changes whether bytes are counted for a tenant.
 - Each retained artifact inventory change increments `artifact_inventory_watermarks.current_sequence` in the same transaction and assigns that value as the affected row's `artifact_mutation_sequence` when a counted row remains. If the change removes the row from retained inventory, the tenant watermark still advances even though no retained row carries that new sequence afterward.
-- A storage gauge rebuild captures the tenant `artifact_inventory_watermarks.current_sequence` at rebuild start and may finalize only while holding the tenant gauge and watermark rows. If the artifact inventory watermark still equals the captured sequence, finalization writes the rebuilt byte total and sets `storage_bytes.source_watermark` to the captured sequence. If concurrent cleanup or deletion advanced the artifact inventory watermark beyond the captured sequence, finalization must either incorporate those later deltas before writing or leave the gauge stale and enqueue another rebuild. It must never lower `storage_bytes.source_watermark`.
+- A storage gauge rebuild captures the tenant `artifact_inventory_watermarks.current_sequence` at rebuild start and may finalize only while holding the tenant gauge and watermark rows. If the artifact inventory watermark still equals the captured sequence, finalization writes the rebuilt byte total and sets `storage_bytes.source_watermark` to the captured sequence. If any concurrent retained artifact inventory change advanced the artifact inventory watermark beyond the captured sequence, finalization must either incorporate those later deltas before writing or leave the gauge stale and enqueue another rebuild. It must never lower `storage_bytes.source_watermark`.
 
 ### Processing Job Status For Boundary Checks
 
@@ -488,7 +497,7 @@ Fields:
 - `recording_started_at`: copied from meeting metadata when the first transition into `recording` is authorized; authoritative for `recording_minutes` period allocation.
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract, initially `1`; increment when the precedence order or inheritance semantics change, or when non-env-default fields are added to or removed from the snapshot. Changes to which env-default fields are snapshotted increment `env.version` instead; do not increment `precedence_version` for that case alone.
-- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
+- `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `env.version` is a JSON integer, tenant and guild `version` fields are JSON integers when a settings row exists and JSON null when no row exists, and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
   - Algorithm: lowercase hex SHA-256 over UTF-8 encoded bytes.
   - Input: JSON-serialized non-secret environment defaults that participate in the snapshot.
   - Initial `env.version = 1` field set: exactly `whisper_language`, `whisper_language_explicit`, `whisper_vad`, `whisper_beam_size`, `whisper_suppress_non_speech`, `whisper_prompt`, `whisper_temperature`, `whisper_resample_to_16k`, `auto_stop_grace_seconds`, `retention_raw_audio_ttl_days`, `retention_transcript_ttl_days`, `retention_summary_ttl_days`, `summary_enabled`, and `bot_token_source`. `bot_token_source` is included because it is a non-secret source marker. Credential values and any other environment defaults are excluded.
@@ -501,7 +510,7 @@ Fields:
 
 Rules:
 
-- Create the snapshot in the same transaction that authorizes the first transition into `recording`, using the same transaction timestamp as `recording_started_at`. A meeting may be created earlier, but any pre-start settings preview is provisional and must not be used for usage attribution.
+- Create the snapshot in the same transaction that authorizes the first transition into `recording`, using the same transaction timestamp as `recording_started_at`. A meeting may be created earlier, but any pre-start settings preview is provisional and must not be used for usage attribution. This transaction must take the same tenant/guild/binding lock, or an equivalent serializable predicate, used by tenant close, guild move, and binding revocation, and must re-read the tenant status, active tenant-guild binding, and active plan assignment immediately before inserting the non-terminal meeting/job state.
 - Processing jobs must read settings from the snapshot for that meeting.
 - Stored snapshots remain valid for the lifetime of the meeting and retention period using their recorded `env.version` and `precedence_version`. Implementations must keep backward-compatible readers for every prior snapshot version that can still exist, or run an explicit migration that rewrites retained snapshots to a newer version.
 - Admin settings APIs may show current effective settings, but meeting detail APIs should expose snapshot-derived settings only if a user-facing need exists.
