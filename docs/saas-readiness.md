@@ -208,7 +208,7 @@ Fields:
 
 Rules:
 
-- `current_sequence` is tenant-scoped, not global.
+- `current_sequence` is tenant-scoped, not global. The intended uniqueness constraint is `tenant_id` with one row per tenant; concurrent inserts must be prevented by this constraint or by the tenant-provisioning transaction.
 - Every retained artifact inventory row that contributes to `storage_bytes` carries the tenant's latest `artifact_mutation_sequence` at the time that row last changed.
 - A retained artifact inventory change is any create, byte-size change, tenant attribution change, retention-state change, TTL cleanup, explicit deletion, or soft-delete/tombstone transition that changes whether bytes are counted for a tenant.
 - Each retained artifact inventory change increments `artifact_inventory_watermarks.current_sequence` in the same transaction and assigns that value as the affected row's `artifact_mutation_sequence` when a counted row remains. If the change removes the row from retained inventory, the tenant watermark still advances even though no retained row carries that new sequence afterward.
@@ -336,7 +336,7 @@ Rules:
 ## Implementation Guidance
 
 - Add tenant and quota schema in small, additive migrations.
-- Keep current `guild_settings` behavior compatible by treating existing rows as guild overrides.
+- Keep current `guild_settings` behavior compatible by treating existing rows as guild overrides. A migration must backfill `settings_version` on all existing `guild_settings` rows before enabling snapshot resolution for those guilds; until backfilled, snapshot creation fails for any meeting in a guild that has a legacy override row without `settings_version`.
 - Prefer explicit null inheritance for defaults and overrides.
 - Keep usage accounting idempotent by using deterministic source identifiers, for example `meeting_id + unit` or `job_id + unit`.
 - For units where retries count as new usage, such as `asr_seconds` and `summary_runs`, the deterministic source identifier must include the attempt or invocation id.
