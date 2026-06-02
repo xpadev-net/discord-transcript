@@ -110,6 +110,7 @@ Usage timing differs by unit:
 - Measures audio seconds submitted to ASR.
 - Count the actual audio duration sent to the ASR engine. For per-speaker chunk ASR, sum submitted chunk durations; for mixdown ASR, use the mixdown duration.
 - When the planned per-speaker chunk durations are known before submission, entitlement pre-flight must check or reserve the aggregate planned ASR seconds for the meeting before enqueueing any chunk. Do not rely on independent per-chunk checks that can pass concurrently and exceed the tenant quota in aggregate.
+- When per-speaker chunk durations are not knowable before submission, serialize chunk authorization under a meeting-scoped ASR accounting lock. Each chunk must check or reserve against the tenant's current period usage plus any already reserved/submitted chunks for that meeting; the prohibition above applies to independent concurrent per-chunk checks, not to this serialized unknowable-duration fallback.
 - Retries count again only after a retry submits audio to ASR.
 - Period usage increments when the ASR request is started or durably queued with a known input duration.
 - Idempotency keys for `asr_seconds` must be per ASR attempt, not per meeting or job, so retries are counted exactly once each.
@@ -251,6 +252,29 @@ Rules:
 - For post-hoc units such as `recording_minutes`, `plan_assignment_id` is the assignment active when the work was authorized or started, not the assignment active at `observed_at`. The meeting or usage-start metadata must retain that assignment id so terminal-state accounting does not misattribute usage after a plan change.
 - Keep events for at least 13 monthly periods.
 
+### Download Session
+
+Purpose: authorize one logical debug artifact download intent and provide the idempotency key for `debug_downloads`.
+
+Fields:
+
+- `download_session_id`: server-assigned opaque id.
+- `tenant_id`
+- `meeting_id`
+- `artifact_id`
+- `user_id`
+- `status`: `active`, `expired`, or `revoked`.
+- `expires_at`
+- `revoked_at`: nullable.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The intended active-row uniqueness constraint is `(tenant_id, meeting_id, artifact_id, user_id) WHERE status = 'active'`.
+- `expires_at` is the database source of truth for whether an active session is still reusable. The authorization handler must expire any active row whose `expires_at <= now` inside the same atomic upsert or lock used to create or reuse sessions; a background expiry job is optional but not sufficient by itself.
+- Revoking or replacing a session sets `status = revoked` and `revoked_at`.
+- Usage idempotency uses `download_session_id`, as defined in the `debug_downloads` unit.
+
 ### Artifact Inventory Watermark
 
 Purpose: tenant-scoped storage inventory version used to decide whether the `storage_bytes` gauge is fresh.
@@ -309,6 +333,24 @@ Rules:
 - A `suspended` tenant keeps data ownership but fails a tenant-status pre-gate for all new resource-consuming operations, regardless of whether the active plan's quota enforcement is `hard` or `soft`. Read-only access, cleanup, and delete operations may proceed when otherwise authorized.
 - Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, then set tenant status to `closed`, revoke all active tenant-guild bindings with `revoked_at` set to the close transaction timestamp, end all active guild plan assignments with `ended_at` set to the same close transaction timestamp, and cancel all scheduled guild plan assignments. If any precondition fails while the lock is held, the close attempt fails without partial changes.
 - A `closed` tenant keeps historical data ownership for retention, audit, and read-only access, but cannot receive new guild bindings or plan assignments and must fail all new resource-consuming operations.
+
+### Tenant Default Settings
+
+Purpose: tenant-level settings layer between environment defaults and guild overrides.
+
+Fields:
+
+- `tenant_id`
+- `settings_version`: required integer incremented on every settings change.
+- One nullable column or structured value per initial effective settings field: `whisper_language`, `whisper_language_explicit`, `whisper_vad`, `whisper_beam_size`, `whisper_suppress_non_speech`, `whisper_prompt`, `whisper_temperature`, `whisper_resample_to_16k`, `auto_stop_grace_seconds`, `retention_raw_audio_ttl_days`, `retention_transcript_ttl_days`, `retention_summary_ttl_days`, `summary_enabled`, and `bot_token_source`.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The intended uniqueness constraint is `tenant_id` with one default-settings row per tenant.
+- Null setting values inherit from the environment default layer.
+- The row must not store secrets. For credentials, store only non-secret source markers such as `global_bot_token`, `guild_bot_token`, or future `tenant_bot_token`.
+- Snapshot `source_versions.tenant.version` reads `settings_version`; a tenant-default settings row without `settings_version` is invalid for snapshot resolution.
 
 ### Tenant Guild Binding
 
