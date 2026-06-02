@@ -111,6 +111,7 @@ Usage timing differs by unit:
 - Count the actual audio duration sent to the ASR engine. For per-speaker chunk ASR, sum submitted chunk durations; for mixdown ASR, use the mixdown duration.
 - When the planned per-speaker chunk durations are known before submission, entitlement pre-flight must check or reserve the aggregate planned ASR seconds for the meeting before enqueueing any chunk. Do not rely on independent per-chunk checks that can pass concurrently and exceed the tenant quota in aggregate.
 - When per-speaker chunk durations are not knowable before submission, serialize chunk authorization under a meeting-scoped ASR accounting lock. Each chunk must check or reserve against the tenant's current period usage plus any already reserved/submitted chunks for that meeting; the prohibition above applies to independent concurrent per-chunk checks, not to this serialized unknowable-duration fallback.
+- For finite hard `asr_seconds` quotas, pre-flight must reserve or atomically increment-and-compare against a tenant-scoped period counter that is shared across concurrent meetings before any ASR submission is queued. A bare read-then-enqueue check is invalid for hard ASR enforcement.
 - Retries count again only after a retry submits audio to ASR.
 - Period usage increments when the ASR request is started or durably queued with a known input duration.
 - Idempotency keys for `asr_seconds` must be per ASR attempt, not per meeting or job, so retries are counted exactly once each.
@@ -272,6 +273,7 @@ Rules:
 
 - The intended active-row uniqueness constraint is `(tenant_id, meeting_id, artifact_id, user_id) WHERE status = 'active'`.
 - `expires_at` is the database source of truth for whether an active session is still reusable. The authorization handler must expire any active row whose `expires_at <= now` inside the same atomic upsert or lock used to create or reuse sessions; a background expiry job is optional but not sufficient by itself.
+- The download handler must also validate `expires_at > now` while authorizing the file response. If the session is expired, it must reject the download and atomically mark the row `expired` before any bytes stream or usage is counted.
 - Revoking or replacing a session sets `status = revoked` and `revoked_at`.
 - Usage idempotency uses `download_session_id`, as defined in the `debug_downloads` unit.
 
