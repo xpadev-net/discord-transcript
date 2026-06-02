@@ -141,7 +141,7 @@ Usage timing differs by unit:
 - `storage_bytes` is not keyed by period. Store it as a current gauge keyed by `tenant_id` and `unit`, with `current_value`, `measured_at`, and optional `source_watermark`.
 - `source_watermark` is the latest tenant-scoped artifact inventory watermark included in the gauge.
 - Current storage usage should be separately queryable by tenant and may be rebuilt from artifact/workspace inventories if a gauge update fails.
-- Treat the `storage_bytes` gauge as stale when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind `artifact_inventory_watermarks.current_sequence` for that tenant. New tenants should initialize the gauge with `current_value = 0` and `source_watermark = 0` before allowing storage-increasing operations.
+- Treat the `storage_bytes` gauge as stale when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind `artifact_inventory_watermarks.current_sequence` for that tenant. New tenants must initialize the gauge synchronously with tenant provisioning, using `current_value = 0` and `source_watermark = 0`, before allowing storage-increasing operations.
 - When a finite `storage_bytes` hard quota is enforced and the gauge is stale, fail closed for operations that increase storage and enqueue or trigger a gauge rebuild. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the tenant artifact inventory watermark captured when the rebuild started.
 - When a finite `storage_bytes` soft quota is enforced and the gauge is stale, allow the operation, enqueue or trigger a gauge rebuild, and record an observable stale-gauge quota event using the last known `current_value` when present or `0` when no row exists. For that event, `amount_over = max(0, observed_value - limit_value)`.
 
@@ -214,6 +214,25 @@ Rules:
 - Each retained artifact inventory change increments `artifact_inventory_watermarks.current_sequence` in the same transaction and assigns that value as the affected row's `artifact_mutation_sequence` when a counted row remains. If the change removes the row from retained inventory, the tenant watermark still advances even though no retained row carries that new sequence afterward.
 - A storage gauge rebuild captures the tenant `current_sequence` at rebuild start and writes that value to `storage_bytes.source_watermark` when the rebuilt byte total reflects all retained artifact inventory changes through that captured sequence.
 
+### Processing Job Status For Boundary Checks
+
+Purpose: authoritative record for tenant-close and guild-move checks that need to know whether ASR or summary work is still active.
+
+Fields:
+
+- `tenant_id`
+- `guild_id`
+- `meeting_id`
+- `job_type`: `asr` or `summary`.
+- `status`: `queued`, `running`, `succeeded`, `failed`, or `cancelled`.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The database job-status row is the system of record for boundary checks; external queue visibility is a delivery signal and is not authoritative for tenant close or guild move decisions.
+- A job is in flight until its database status is one of `succeeded`, `failed`, or `cancelled`.
+- Code that queues or starts ASR or summary work must create or update the database job-status row before enqueueing or executing the work.
+
 ### Tenant
 
 Purpose: authoritative SaaS isolation and entitlement record.
@@ -230,7 +249,7 @@ Rules:
 - `period_anchor` is initialized in the same transaction as the first guild plan assignment, from the billing provider subscription anchor when present, otherwise from the first assignment's `effective_at`.
 - After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
 - A `suspended` tenant keeps data ownership but fails hard entitlement checks for new resource-consuming operations.
-- Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs, then set tenant status to `closed`, revoke all active tenant-guild bindings, end all active guild plan assignments, and cancel all scheduled guild plan assignments. If any precondition fails while the lock is held, the close attempt fails without partial changes.
+- Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, then set tenant status to `closed`, revoke all active tenant-guild bindings, end all active guild plan assignments, and cancel all scheduled guild plan assignments. If any precondition fails while the lock is held, the close attempt fails without partial changes.
 - A `closed` tenant keeps historical data ownership for retention, audit, and read-only access, but cannot receive new guild bindings or plan assignments and must fail all new resource-consuming operations.
 
 ### Tenant Guild Binding
@@ -253,7 +272,7 @@ Rules:
 - The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
 - A `(tenant_id, guild_id)` pair may have only one active row.
 - Revoked rows remain for history and audit but must not be used for SaaS query scoping.
-- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings or in-flight ASR/summary jobs, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild. The move must invalidate or advance storage gauge watermarks for both the old and new tenants, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale. If the new assignment cannot be created in the same transaction, the move fails.
+- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild with `period_anchor` matching the authoritative tenant `period_anchor`. The move must invalidate or advance storage gauge watermarks for both the old and new tenants, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale. If the new assignment cannot be created in the same transaction, the move fails.
 - SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
 
 ### Guild Plan Assignment
