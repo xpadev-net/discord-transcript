@@ -91,11 +91,12 @@ Usage timing differs by unit:
 `recording_minutes`
 
 - Measures wall-clock meeting recording time.
+- `recording_started_at` is a meeting metadata field set exactly once in the same transaction as the first transition into the `recording` state, and remains null for meetings that never start recording.
 - `recording_duration_seconds` is the elapsed wall-clock time the meeting spent in the `recording` state; it is zero when the meeting never transitioned to `recording`.
 - Per meeting value is `max(1, ceil(recording_duration_seconds / 60))` if the meeting status ever transitioned to `recording`; otherwise `0`.
 - A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
-- `recording_minutes` usage is allocated to the quota period that contains the recording start time, even if the meeting reaches a terminal state in a later period. The meeting or snapshot metadata must retain that period so terminal-state accounting writes the event to the original period; the initial contract does not split one recording across periods.
+- `recording_minutes` usage is allocated to the quota period that contains `recording_started_at`, even if the meeting reaches a terminal state in a later period. The meeting or snapshot metadata must retain that period so terminal-state accounting writes the event to the original period; the initial contract does not split one recording across periods.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
 - Soft entitlement enforcement for `recording_minutes` does not emit the quota violation event at meeting start because the consumed amount is unknown. Record usage at the terminal state; if the resulting period usage exceeds the finite soft limit, record one quota violation event with `observed_value` equal to the period usage after adding the meeting, `source_type = meeting`, `source_id` equal to the meeting id, and `plan_assignment_id` equal to the assignment active when recording started.
 
@@ -302,6 +303,7 @@ Rules:
 
 - `amount_over = max(0, observed_value - limit_value)`.
 - `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`.
+- The intended idempotency constraint for period-counter units is `(tenant_id, unit, period_start, period_end, source_type, source_id)`. The intended idempotency constraint for current-gauge units is `(tenant_id, unit, source_type, source_id)`, where `source_id` is a durable idempotency key for the gauge check that produced the event.
 - In the initial one-guild-per-tenant phase, `guild_id` is required for every quota violation event and is resolved from the active tenant-guild binding at `observed_at`, including tenant-level `storage_bytes` gauge events. `guild_id` may be null only for a future tenant-level or organization-level event that does not correspond to one active guild.
 - For post-hoc units such as `recording_minutes`, `plan_assignment_id` is the assignment active when the work was authorized or started, not the assignment active at `observed_at`. The meeting or usage-start metadata must retain that assignment id so terminal-state accounting does not misattribute usage after a plan change.
 - Keep events for at least 13 monthly periods.
@@ -391,7 +393,7 @@ Rules:
 
 - `period_anchor` is initialized in the same transaction as the first guild plan assignment, from the billing provider subscription anchor when present, otherwise from the first assignment's `effective_at`. The stored value must be truncated to midnight UTC on the initializing value's UTC calendar day.
 - After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
-- A `suspended` tenant keeps data ownership but fails a tenant-status pre-gate for all new resource-consuming operations, regardless of whether the active plan's quota enforcement is `hard` or `soft`. Read-only access, cleanup, and delete operations may proceed when otherwise authorized.
+- A `suspended` tenant keeps data ownership but fails a tenant-status pre-gate for all new resource-consuming operations, regardless of whether the active plan's quota enforcement is `hard` or `soft`. Read-only access, cleanup, and delete operations may proceed when otherwise authorized. Automated pipeline work for a meeting that already transitioned to `recording` before suspension is treated as terminalization rather than new user-initiated consumption: it may continue through ASR, summary, usage recording, quota violation recording, and terminal failure handling under the meeting's stored snapshot and plan assignment, while still applying unit-level quota checks. New recordings, manual regenerations, debug downloads, and other newly requested consumption remain blocked while suspended.
 - Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, then set tenant status to `closed`, revoke all active tenant-guild bindings with `revoked_at` set to the close transaction timestamp, revoke all active download sessions for the tenant's guilds with `status = revoked` and `revoked_at` set to the same timestamp, end all active guild plan assignments with `ended_at` set to the same close transaction timestamp, and cancel all scheduled guild plan assignments. If any precondition fails while the lock is held, the close attempt fails without partial changes.
 - A `closed` tenant keeps historical data ownership for retention, audit, and read-only access, but cannot receive new guild bindings or plan assignments and must fail all new resource-consuming operations.
 
@@ -482,7 +484,8 @@ Fields:
 - `meeting_id`
 - `tenant_id`
 - `guild_id`
-- `plan_assignment_id`: guild plan assignment active when the snapshot is created; authoritative for post-hoc `recording_minutes` usage and quota violation attribution even if the guild changes plans before the meeting reaches a terminal state.
+- `plan_assignment_id`: guild plan assignment active at `recording_started_at`; authoritative for post-hoc `recording_minutes` usage and quota violation attribution even if the guild changes plans before the meeting reaches a terminal state.
+- `recording_started_at`: copied from meeting metadata when the first transition into `recording` is authorized; authoritative for `recording_minutes` period allocation.
 - `resolved_at`
 - `precedence_version`: integer version of the settings resolution contract, initially `1`; increment when the precedence order or inheritance semantics change, or when non-env-default fields are added to or removed from the snapshot. Changes to which env-default fields are snapshotted increment `env.version` instead; do not increment `precedence_version` for that case alone.
 - `source_versions`: metadata for the env, tenant, and guild layers used to resolve the snapshot, shaped as `{ "env": { "version": 1, "hash": "<lowercase-hex-sha256>" }, "tenant": { "id": "<tenant_id>", "version": 3 }, "guild": { "id": "<guild_id>", "version": 7 } }` where `version` fields are JSON integers and `id`/`hash` fields are JSON strings. `env.version` is the environment-settings schema version, initially `1`; increment it when snapshotted env-default fields are added, removed, or renamed, or when an existing snapshotted field's type or allowed values change. `env.hash` is calculated as:
@@ -498,7 +501,7 @@ Fields:
 
 Rules:
 
-- Create the snapshot in the same logical operation as meeting creation or before the recording can start.
+- Create the snapshot in the same transaction that authorizes the first transition into `recording`, using the same transaction timestamp as `recording_started_at`. A meeting may be created earlier, but any pre-start settings preview is provisional and must not be used for usage attribution.
 - Processing jobs must read settings from the snapshot for that meeting.
 - Stored snapshots remain valid for the lifetime of the meeting and retention period using their recorded `env.version` and `precedence_version`. Implementations must keep backward-compatible readers for every prior snapshot version that can still exist, or run an explicit migration that rewrites retained snapshots to a newer version.
 - Admin settings APIs may show current effective settings, but meeting detail APIs should expose snapshot-derived settings only if a user-facing need exists.
