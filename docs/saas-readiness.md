@@ -380,6 +380,7 @@ Fields:
 
 - `download_session_id`: server-assigned opaque id.
 - `tenant_id`
+- `guild_id`: copied from the meeting at authorization time for scoped revocation.
 - `meeting_id`
 - `artifact_id`
 - `user_id`
