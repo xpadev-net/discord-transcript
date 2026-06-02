@@ -3,8 +3,9 @@ use crate::domain::StopReason;
 use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
-    CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, ENQUEUE_JOB_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
-    MARK_STOPPING_IF_RECORDING_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
+    BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
+    ENQUEUE_JOB_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL,
+    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, MeetingStore, StatusMessageMetadata, StopTransition, StoreError,
@@ -80,6 +81,21 @@ pub struct SqlMeetingStore<E: SqlExecutor> {
     pub executor: E,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTenantInstallation {
+    pub tenant_id: String,
+    pub tenant_status: String,
+    pub period_anchor: Option<DateTime<Utc>>,
+    pub guild_id: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultTenantBackfill {
+    pub tenants_inserted: u64,
+    pub installations_inserted: u64,
+}
+
 impl<E: SqlExecutor> SqlMeetingStore<E> {
     pub fn new(executor: E) -> Self {
         Self { executor }
@@ -87,6 +103,35 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
 
     pub fn apply_initial_migration(&mut self, migration_sql: &str) -> Result<(), String> {
         self.executor.run_migration(migration_sql)
+    }
+
+    pub fn resolve_tenant_by_guild(
+        &mut self,
+        guild_id: &str,
+    ) -> Result<Option<ResolvedTenantInstallation>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(RESOLVE_TENANT_BY_GUILD_SQL, &[guild_id.to_owned()])
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_resolved_tenant_installation_row(&row).map(Some)
+    }
+
+    pub fn backfill_default_tenants_from_existing_guilds(
+        &mut self,
+    ) -> Result<DefaultTenantBackfill, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, &[])
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::Backend(
+                "default tenant backfill returned no counts".to_owned(),
+            ));
+        };
+        parse_default_tenant_backfill_row(&row)
     }
 }
 
@@ -236,6 +281,69 @@ fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
         retry_count,
         error_message: row.get(5).and_then(|v| v.clone()),
     })
+}
+
+fn require_store_column(
+    row: &[Option<String>],
+    idx: usize,
+    field: &str,
+) -> Result<String, StoreError> {
+    row.get(idx)
+        .and_then(|v| v.clone())
+        .ok_or_else(|| StoreError::Backend(format!("{field} is NULL")))
+}
+
+fn parse_resolved_tenant_installation_row(
+    row: &SqlRow,
+) -> Result<ResolvedTenantInstallation, StoreError> {
+    if row.len() < 5 {
+        return Err(StoreError::Backend(format!(
+            "invalid tenant installation row length: {}",
+            row.len()
+        )));
+    }
+    Ok(ResolvedTenantInstallation {
+        tenant_id: require_store_column(row, 0, "tenant_id")?,
+        tenant_status: require_store_column(row, 1, "tenant_status")?,
+        period_anchor: parse_optional_tenant_period_anchor(row.get(2).and_then(|v| v.clone()))?,
+        guild_id: require_store_column(row, 3, "guild_id")?,
+        source: require_store_column(row, 4, "source")?,
+    })
+}
+
+fn parse_default_tenant_backfill_row(row: &SqlRow) -> Result<DefaultTenantBackfill, StoreError> {
+    if row.len() < 2 {
+        return Err(StoreError::Backend(format!(
+            "invalid default tenant backfill row length: {}",
+            row.len()
+        )));
+    }
+    let tenants_inserted = require_store_column(row, 0, "tenants_inserted")?;
+    let installations_inserted = require_store_column(row, 1, "installations_inserted")?;
+
+    Ok(DefaultTenantBackfill {
+        tenants_inserted: tenants_inserted.parse::<u64>().map_err(|err| {
+            StoreError::Backend(format!(
+                "invalid tenants_inserted count '{tenants_inserted}': {err}"
+            ))
+        })?,
+        installations_inserted: installations_inserted.parse::<u64>().map_err(|err| {
+            StoreError::Backend(format!(
+                "invalid installations_inserted count '{installations_inserted}': {err}"
+            ))
+        })?,
+    })
+}
+
+fn parse_optional_tenant_period_anchor(
+    value: Option<String>,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|ts| Some(ts.with_timezone(&Utc)))
+        .map_err(|err| StoreError::Backend(format!("invalid tenant period_anchor '{raw}': {err}")))
 }
 
 impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {

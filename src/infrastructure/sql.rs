@@ -26,6 +26,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0012_add_transcript_stage.sql"),
     "\n",
     include_str!("../../migrations/0013_guild_bot_tokens.sql"),
+    "\n",
+    include_str!("../../migrations/0013_tenants_and_installations.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -326,4 +328,62 @@ LIMIT $2 OFFSET $3
 
 pub const COUNT_GUILD_MEETINGS_SQL: &str = r#"
 SELECT count(*) FROM meetings WHERE guild_id = $1
+"#;
+
+pub const RESOLVE_TENANT_BY_GUILD_SQL: &str = r#"
+SELECT t.id AS tenant_id,
+       t.status AS tenant_status,
+       to_char(t.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS period_anchor,
+       tg.guild_id,
+       tg.source
+FROM tenant_discord_guilds tg
+JOIN tenants t ON t.id = tg.tenant_id
+WHERE tg.guild_id = $1
+  AND tg.status = 'active'
+  AND tg.revoked_at IS NULL
+  AND t.status = 'active'
+LIMIT 1
+"#;
+
+pub const BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL: &str = r#"
+WITH existing_guilds AS (
+    SELECT DISTINCT guild_id
+    FROM meetings
+    WHERE guild_id IS NOT NULL
+    UNION
+    SELECT DISTINCT guild_id
+    FROM guild_settings
+    WHERE guild_id IS NOT NULL
+), inserted_tenants AS (
+    INSERT INTO tenants (id, status, created_at, updated_at)
+    SELECT guild_id, 'active', NOW(), NOW()
+    FROM existing_guilds
+    ON CONFLICT (id) DO NOTHING
+    RETURNING id
+), inserted_installations AS (
+    INSERT INTO tenant_discord_guilds (
+        id, tenant_id, guild_id, status, effective_at, source, created_at, updated_at
+    )
+    SELECT
+        'migration:default-tenant:' || guild_id,
+        guild_id,
+        guild_id,
+        'active',
+        NOW(),
+        'migration',
+        NOW(),
+        NOW()
+    FROM existing_guilds
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM tenant_discord_guilds existing
+        WHERE existing.guild_id = existing_guilds.guild_id
+          AND existing.status = 'active'
+    )
+    ON CONFLICT (id) DO NOTHING
+    RETURNING id
+)
+SELECT
+    (SELECT count(*) FROM inserted_tenants) AS tenants_inserted,
+    (SELECT count(*) FROM inserted_installations) AS installations_inserted
 "#;
