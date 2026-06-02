@@ -95,10 +95,11 @@ Usage timing differs by unit:
 - `recording_duration_seconds` is the elapsed wall-clock time the meeting spent in the `recording` state; it is zero when the meeting never transitioned to `recording`.
 - Per meeting value is `max(1, ceil(recording_duration_seconds / 60))` if the meeting status ever transitioned to `recording`; otherwise `0`.
 - A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
-- Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
+- Period usage increments when a meeting reaches any terminal state (`posted`, `failed`, or `aborted`) with a known recording duration. For `aborted` meetings, `recording_duration_seconds` must be computed and stored in the same abort transaction when the meeting had previously transitioned to `recording`; if the abort is an emergency path where duration is unavailable, record the last-known elapsed duration and note it as an estimate.
 - `recording_minutes` usage is allocated to the quota period that contains `recording_started_at`, even if the meeting reaches a terminal state in a later period. The meeting or snapshot metadata must retain that period so terminal-state accounting writes the event to the original period; the initial contract does not split one recording across periods.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
 - Soft entitlement enforcement for `recording_minutes` does not emit the quota violation event at meeting start because the consumed amount is unknown. Record usage at the terminal state; if the resulting period usage exceeds the finite soft limit, record one quota violation event with `observed_value` equal to the period usage after adding the meeting, `source_type = meeting`, `source_id` equal to the meeting id, and `plan_assignment_id` equal to the assignment active when recording started.
+- The `idempotency_key` for a `recording_minutes` usage event is the `meeting_id`. Retrying the terminal-state accounting write reuses the same `meeting_id` as the idempotency key; exactly one usage event is written per meeting.
 
 `storage_bytes`
 
