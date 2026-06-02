@@ -152,7 +152,7 @@ Usage timing differs by unit:
 - Normal retained artifact inventory changes must update `storage_bytes.current_value`, `measured_at`, and `source_watermark` to the new `artifact_inventory_watermarks.current_sequence` in the same transaction as the artifact mutation whenever the byte delta is known. If the gauge cannot be updated atomically, mark it stale by setting `source_watermark = null` and enqueue or trigger a rebuild.
 - Treat the `storage_bytes` gauge as stale when no gauge row exists, when `measured_at` is more than 5 minutes old, when `source_watermark` is null, or when `source_watermark` is behind `artifact_inventory_watermarks.current_sequence` for that tenant. New tenants must initialize the gauge synchronously with tenant provisioning, using `current_value = 0` and `source_watermark = 0`, before allowing storage-increasing operations.
 - When a finite `storage_bytes` hard quota is enforced and the gauge is stale, fail closed for operations that increase storage and enqueue or trigger a gauge rebuild. Cleanup and delete operations may proceed because they reduce or preserve storage. A rebuild is complete when the rebuilt gauge's `source_watermark` is at or beyond the tenant artifact inventory watermark captured when the rebuild started.
-- When a finite `storage_bytes` soft quota is enforced and the gauge is stale, allow the operation, enqueue or trigger a gauge rebuild, and record an observable stale-gauge quota event using the last known `current_value` when present or `0` when no row exists. For that event, `amount_over = max(0, observed_value - limit_value)`.
+- When a finite `storage_bytes` soft quota is enforced and the gauge is stale, allow the operation, enqueue or trigger a gauge rebuild, and record an observable stale-gauge quota event using the last known `current_value` when present or `0` when no row exists. For that event, use `source_type = stale_gauge`, set `source_id` to the storage-increasing operation id when available or the rebuild request id otherwise, and set `amount_over = max(0, observed_value - limit_value)`.
 
 ## Data Contracts
 
@@ -202,7 +202,7 @@ Rules:
 - Missing quota rows mean the unit is not entitled unless a later migration explicitly defines default quota inheritance.
 - A migration that introduces a new unit must add quota rows for every affected existing plan in the same migration step, or explicitly accept that tenants on plans without that row are denied for the new unit.
 - `hard` enforcement rejects the operation when the applicable finite quota is exhausted, subject to the `recording_minutes` post-hoc overrun rule above.
-- `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
+- `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI when the applicable finite quota is exceeded. It must not silently drop or skip usage.
 - Soft quota violation events use the Quota Violation Event contract below.
 
 ### Storage Bytes Gauge
