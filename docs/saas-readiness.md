@@ -293,7 +293,7 @@ Rules:
 
 - The intended uniqueness constraints are `asr_attempt_id` and `(tenant_id, meeting_id, job_type, submission_sequence, attempt_number)`.
 - Create the row before durably queueing or submitting the attempt. Redelivery of the same queued attempt reuses the same row; a retry that submits audio creates a new row with an incremented `attempt_number`.
-- Reconciliation must append the missing `asr_seconds` usage event with `idempotency_key = asr_attempt_id` and `amount = submitted_duration_seconds` for any row whose `external_submission_started_at` is non-null and `usage_recorded_at` is null, then set `usage_recorded_at` and release the matching reservation in the same transaction.
+- Reconciliation must append the missing `asr_seconds` usage event with `tenant_id`, `guild_id`, and `plan_assignment_id` copied from the ASR attempt row, `idempotency_key = asr_attempt_id`, and `amount = submitted_duration_seconds` for any row whose `external_submission_started_at` is non-null and `usage_recorded_at` is null, then set `usage_recorded_at` and release the matching reservation in the same transaction. Reconciliation must not re-query the active tenant-guild binding for attribution.
 - Rows whose `external_submission_started_at` is null may be cancelled and have their matching reservation released without recording usage.
 
 ### Summary Invocation Metadata
@@ -318,7 +318,7 @@ Rules:
 
 - The intended uniqueness constraints are `summary_invocation_id` and `(tenant_id, meeting_id, job_type, invocation_number)`.
 - Create the row before sending the prompt. Redelivery of the same queued invocation reuses the same row; a retry or regeneration that sends a prompt creates a new row with an incremented `invocation_number`.
-- Reconciliation must append the missing `summary_runs` usage event with `idempotency_key = summary_invocation_id` and `amount = 1` for any row whose `external_submission_started_at` is non-null and `usage_recorded_at` is null, then set `usage_recorded_at` in the same transaction.
+- Reconciliation must append the missing `summary_runs` usage event with `tenant_id`, `guild_id`, and `plan_assignment_id` copied from the summary invocation row, `idempotency_key = summary_invocation_id`, and `amount = 1` for any row whose `external_submission_started_at` is non-null and `usage_recorded_at` is null, then set `usage_recorded_at` in the same transaction. Reconciliation must not re-query the active tenant-guild binding for attribution.
 - Rows whose `external_submission_started_at` is null may be cancelled without recording usage.
 
 ### Storage Bytes Gauge
@@ -421,6 +421,7 @@ Meeting boundary checks:
 
 - Terminal meeting statuses are `posted`, `failed`, and `aborted`.
 - Non-terminal meeting statuses are `scheduled`, `recording`, `stopping`, `transcribing`, and `summarizing`.
+- Transitioning a meeting to `aborted` must cancel all associated non-terminal ASR and summary job-status rows in the same transaction by setting them to `cancelled`, unless an associated submitted ASR attempt or summary invocation still requires usage reconciliation; in that case reconciliation runs first and then the job row is cancelled in the same transaction.
 - Tenant close, guild move, and standalone binding revocation must use this terminal/non-terminal split when verifying that no non-terminal meetings remain.
 
 Fields:
