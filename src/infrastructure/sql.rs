@@ -27,7 +27,7 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/0013_guild_bot_tokens.sql"),
     "\n",
-    include_str!("../../migrations/0013_tenants_and_installations.sql"),
+    include_str!("../../migrations/0014_tenants_and_installations.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -333,7 +333,7 @@ SELECT count(*) FROM meetings WHERE guild_id = $1
 pub const RESOLVE_TENANT_BY_GUILD_SQL: &str = r#"
 SELECT t.id AS tenant_id,
        t.status AS tenant_status,
-       to_char(t.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS period_anchor,
+       to_char(t.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS period_anchor,
        tg.guild_id,
        tg.source
 FROM tenant_discord_guilds tg
