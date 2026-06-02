@@ -220,7 +220,7 @@ Fields:
 - `period_start`
 - `period_end`
 - `amount`: non-negative integer amount for the unit.
-- `source_type`
+- `source_type`: one of `meeting`, `asr_attempt`, `summary_invocation`, or `download_session`.
 - `source_id`
 - `idempotency_key`
 - `created_at`
@@ -287,7 +287,7 @@ Fields:
 - `amount_over`
 - `period_start`: nullable.
 - `period_end`: nullable.
-- `source_type`
+- `source_type`: one of `meeting`, `asr_attempt`, `summary_invocation`, `download_session`, or `stale_gauge`.
 - `source_id`
 - `observed_at`
 - `created_at`
