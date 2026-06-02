@@ -423,6 +423,7 @@ fn bot_command_service_start_and_stop_flow() {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
         })
         .expect("start should pass");
     assert!(start_message.contains("meeting_id=m1"));
@@ -455,6 +456,7 @@ fn bot_command_service_idempotent_stop() {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
         })
         .expect("start should pass");
 

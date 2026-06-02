@@ -10,7 +10,7 @@ use discord_transcript::domain::{JobStatus, JobType, MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, Job, JobQueue, QueueError};
 use discord_transcript::infrastructure::storage::{
-    CreateMeetingRequest, InMemoryMeetingStore, MeetingStore,
+    CreateMeetingRequest, EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore,
 };
 use serenity::all::GuildId;
 use std::sync::{
@@ -19,6 +19,25 @@ use std::sync::{
 };
 
 struct FailingEnqueueQueue;
+
+fn effective_settings_with_summary_enabled(summary_enabled: bool) -> EffectiveMeetingSettings {
+    EffectiveMeetingSettings {
+        whisper_language: Some("ja".to_owned()),
+        whisper_vad: true,
+        whisper_beam_size: 5,
+        whisper_suppress_non_speech: true,
+        whisper_prompt: None,
+        whisper_temperature: 0.0,
+        whisper_resample_to_16k: true,
+        auto_stop_grace_seconds: 60,
+        retention_raw_audio_ttl_days: 7,
+        retention_transcript_ttl_days: 30,
+        retention_summary_ttl_days: None,
+        summary_enabled,
+        summary_template_id: None,
+        domain_knowledge_version_id: None,
+    }
+}
 
 impl JobQueue for FailingEnqueueQueue {
     fn enqueue(&mut self, _job: Job) -> Result<(), QueueError> {
@@ -146,7 +165,7 @@ fn runtime_dispatch_routes_record_start() {
 
     let result = dispatch_runtime_command(
         &mut service,
-        RuntimeCommandInput::RecordStart(StartCommandInput {
+        RuntimeCommandInput::RecordStart(Box::new(StartCommandInput {
             meeting_id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             user_id: "u1".to_owned(),
@@ -157,7 +176,8 @@ fn runtime_dispatch_routes_record_start() {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
-        }),
+            effective_settings: None,
+        })),
     )
     .expect("dispatch should succeed");
 
@@ -181,7 +201,7 @@ fn stop_and_enqueue_summary_job_enqueues_on_owner_stop() {
 
     dispatch_runtime_command(
         &mut service,
-        RuntimeCommandInput::RecordStart(StartCommandInput {
+        RuntimeCommandInput::RecordStart(Box::new(StartCommandInput {
             meeting_id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             user_id: "u1".to_owned(),
@@ -192,7 +212,8 @@ fn stop_and_enqueue_summary_job_enqueues_on_owner_stop() {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
-        }),
+            effective_settings: None,
+        })),
     )
     .expect("start should succeed");
 
@@ -216,14 +237,14 @@ fn stop_and_enqueue_summary_job_enqueues_on_owner_stop() {
 }
 
 #[test]
-fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
+fn stop_and_enqueue_summary_job_uses_meeting_snapshot_when_summary_disabled() {
     let store = InMemoryMeetingStore::new();
     let mut service = BotCommandService::new(store);
     let mut queue = InMemoryJobQueue::new();
 
     dispatch_runtime_command(
         &mut service,
-        RuntimeCommandInput::RecordStart(StartCommandInput {
+        RuntimeCommandInput::RecordStart(Box::new(StartCommandInput {
             meeting_id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             user_id: "u1".to_owned(),
@@ -234,7 +255,50 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
-        }),
+            effective_settings: Some(effective_settings_with_summary_enabled(false)),
+        })),
+    )
+    .expect("start should succeed");
+
+    let stop = stop_and_enqueue_summary_job(
+        &mut service,
+        &mut queue,
+        "g1",
+        "u1",
+        UserRole::Member,
+        Some("m1"),
+        StopReason::Manual,
+    )
+    .expect("stop should succeed");
+
+    assert_eq!(stop.meeting_id, "m1");
+    let claimed = queue
+        .claim_next(JobType::Summarize)
+        .expect("claim should succeed");
+    assert!(claimed.is_none());
+}
+
+#[test]
+fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
+    let store = InMemoryMeetingStore::new();
+    let mut service = BotCommandService::new(store);
+    let mut queue = InMemoryJobQueue::new();
+
+    dispatch_runtime_command(
+        &mut service,
+        RuntimeCommandInput::RecordStart(Box::new(StartCommandInput {
+            meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            user_id: "u1".to_owned(),
+            command_channel_id: "c1".to_owned(),
+            user_voice_channel_id: Some("vc1".to_owned()),
+            permissions: PermissionSet {
+                can_connect_voice: true,
+                can_send_messages: true,
+            },
+            caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
+        })),
     )
     .expect("start should succeed");
 
@@ -285,7 +349,7 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
 
     dispatch_runtime_command(
         &mut service,
-        RuntimeCommandInput::RecordStart(StartCommandInput {
+        RuntimeCommandInput::RecordStart(Box::new(StartCommandInput {
             meeting_id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             user_id: "u1".to_owned(),
@@ -296,7 +360,8 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
-        }),
+            effective_settings: None,
+        })),
     )
     .expect("start should succeed");
 
@@ -351,6 +416,7 @@ fn stop_and_enqueue_summary_job_does_not_enqueue_for_scheduled_abort() {
             status_message_channel_id: None,
             status_message_id: None,
             started_by_user_id: "u1".to_owned(),
+            effective_settings: None,
         })
         .expect("scheduled meeting should be created");
     let mut service = BotCommandService::new(store);

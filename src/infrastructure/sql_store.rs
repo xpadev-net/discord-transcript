@@ -4,12 +4,16 @@ use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
     BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
-    ENQUEUE_JOB_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL,
-    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
+    ENQUEUE_JOB_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
+    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
+    INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
+    MARK_STOPPING_IF_RECORDING_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
+    SET_MEETING_STATUS_CAS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
 };
 use crate::infrastructure::storage::{
-    CreateMeetingRequest, MeetingStore, StatusMessageMetadata, StopTransition, StoreError,
-    StoredMeeting,
+    CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
+    StatusMessageMetadata, StopTransition, StoreError, StoredMeeting,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -132,6 +136,23 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             ));
         };
         parse_default_tenant_backfill_row(&row)
+    }
+
+    pub fn get_guild_settings_for_meeting_snapshot(
+        &mut self,
+        guild_id: &str,
+    ) -> Result<Option<GuildSettingsForSnapshot>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
+                &[guild_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_guild_settings_for_snapshot_row(&row).map(Some)
     }
 }
 
@@ -335,6 +356,119 @@ fn parse_default_tenant_backfill_row(row: &SqlRow) -> Result<DefaultTenantBackfi
     })
 }
 
+fn optional_u64_column(row: &SqlRow, idx: usize, field: &str) -> Result<Option<u64>, StoreError> {
+    let Some(raw) = row.get(idx).and_then(|v| v.clone()) else {
+        return Ok(None);
+    };
+    raw.parse::<u64>()
+        .map(Some)
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn optional_u32_column(row: &SqlRow, idx: usize, field: &str) -> Result<Option<u32>, StoreError> {
+    let Some(raw) = row.get(idx).and_then(|v| v.clone()) else {
+        return Ok(None);
+    };
+    raw.parse::<u32>()
+        .map(Some)
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn required_u64_column(row: &SqlRow, idx: usize, field: &str) -> Result<u64, StoreError> {
+    let raw = require_store_column(row, idx, field)?;
+    raw.parse::<u64>()
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn required_u32_column(row: &SqlRow, idx: usize, field: &str) -> Result<u32, StoreError> {
+    let raw = require_store_column(row, idx, field)?;
+    raw.parse::<u32>()
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn required_f32_column(row: &SqlRow, idx: usize, field: &str) -> Result<f32, StoreError> {
+    let raw = require_store_column(row, idx, field)?;
+    let parsed = raw
+        .parse::<f32>()
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))?;
+    if !parsed.is_finite() {
+        return Err(StoreError::Backend(format!(
+            "invalid {field} '{raw}': must be finite"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn optional_bool_column(row: &SqlRow, idx: usize, field: &str) -> Result<Option<bool>, StoreError> {
+    let Some(raw) = row.get(idx).and_then(|v| v.clone()) else {
+        return Ok(None);
+    };
+    raw.parse::<bool>()
+        .map(Some)
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn required_bool_column(row: &SqlRow, idx: usize, field: &str) -> Result<bool, StoreError> {
+    let raw = require_store_column(row, idx, field)?;
+    raw.parse::<bool>()
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn parse_guild_settings_for_snapshot_row(
+    row: &SqlRow,
+) -> Result<GuildSettingsForSnapshot, StoreError> {
+    if row.len() < 7 {
+        return Err(StoreError::Backend(format!(
+            "invalid guild settings snapshot row length: {}",
+            row.len()
+        )));
+    }
+    Ok(GuildSettingsForSnapshot {
+        whisper_language: row.first().and_then(|v| v.clone()),
+        whisper_language_explicit: required_bool_column(row, 1, "whisper_language_explicit")?,
+        whisper_vad: optional_bool_column(row, 2, "whisper_vad")?,
+        auto_stop_grace_seconds: optional_u64_column(row, 3, "auto_stop_grace_seconds")?,
+        retention_raw_audio_ttl_days: optional_u32_column(row, 4, "retention_raw_audio_ttl_days")?,
+        retention_transcript_ttl_days: optional_u32_column(
+            row,
+            5,
+            "retention_transcript_ttl_days",
+        )?,
+        summary_enabled: optional_bool_column(row, 6, "summary_enabled")?,
+    })
+}
+
+fn parse_effective_meeting_settings_row(
+    row: &SqlRow,
+) -> Result<EffectiveMeetingSettings, StoreError> {
+    if row.len() < 14 {
+        return Err(StoreError::Backend(format!(
+            "invalid effective meeting settings row length: {}",
+            row.len()
+        )));
+    }
+    Ok(EffectiveMeetingSettings {
+        whisper_language: row.first().and_then(|v| v.clone()),
+        whisper_vad: required_bool_column(row, 1, "whisper_vad")?,
+        whisper_beam_size: required_u32_column(row, 2, "whisper_beam_size")?,
+        whisper_suppress_non_speech: required_bool_column(row, 3, "whisper_suppress_non_speech")?,
+        whisper_prompt: row.get(4).and_then(|v| v.clone()),
+        whisper_temperature: required_f32_column(row, 5, "whisper_temperature")?,
+        whisper_resample_to_16k: required_bool_column(row, 6, "whisper_resample_to_16k")?,
+        auto_stop_grace_seconds: required_u64_column(row, 7, "auto_stop_grace_seconds")?,
+        retention_raw_audio_ttl_days: required_u32_column(row, 8, "retention_raw_audio_ttl_days")?,
+        retention_transcript_ttl_days: required_u32_column(
+            row,
+            9,
+            "retention_transcript_ttl_days",
+        )?,
+        retention_summary_ttl_days: optional_u32_column(row, 10, "retention_summary_ttl_days")?,
+        summary_enabled: required_bool_column(row, 11, "summary_enabled")?,
+        summary_template_id: row.get(12).and_then(|v| v.clone()),
+        domain_knowledge_version_id: row.get(13).and_then(|v| v.clone()),
+    })
+}
+
 fn parse_optional_tenant_period_anchor(
     value: Option<String>,
 ) -> Result<Option<DateTime<Utc>>, StoreError> {
@@ -430,28 +564,44 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
-        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')";
         let meeting_id = request.id.clone();
-        self.executor
-            .execute(
-                sql,
-                &[
-                    request.id,
-                    request.guild_id,
-                    request.voice_channel_id,
-                    request.report_channel_id,
-                    request.status_message_channel_id.unwrap_or_default(),
-                    request.status_message_id.unwrap_or_default(),
-                    request.started_by_user_id,
-                ],
-            )
-            .map_err(|err| {
-                if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
-                    StoreError::AlreadyExists { meeting_id }
-                } else {
-                    StoreError::Backend(err)
-                }
-            })?;
+        if let Some(settings) = request.effective_settings.clone() {
+            let params = create_meeting_with_settings_params(request, settings);
+            self.executor
+                .execute(
+                    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+                    &params,
+                )
+                .map_err(|err| {
+                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+                        StoreError::AlreadyExists { meeting_id }
+                    } else {
+                        StoreError::Backend(err)
+                    }
+                })?;
+        } else {
+            let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')";
+            self.executor
+                .execute(
+                    sql,
+                    &[
+                        request.id,
+                        request.guild_id,
+                        request.voice_channel_id,
+                        request.report_channel_id,
+                        request.status_message_channel_id.unwrap_or_default(),
+                        request.status_message_id.unwrap_or_default(),
+                        request.started_by_user_id,
+                    ],
+                )
+                .map_err(|err| {
+                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+                        StoreError::AlreadyExists { meeting_id }
+                    } else {
+                        StoreError::Backend(err)
+                    }
+                })?;
+        }
         Ok(())
     }
 
@@ -459,28 +609,44 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         &mut self,
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
-        let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')";
         let meeting_id = request.id.clone();
-        self.executor
-            .execute(
-                sql,
-                &[
-                    request.id,
-                    request.guild_id,
-                    request.voice_channel_id,
-                    request.report_channel_id,
-                    request.status_message_channel_id.unwrap_or_default(),
-                    request.status_message_id.unwrap_or_default(),
-                    request.started_by_user_id,
-                ],
-            )
-            .map_err(|err| {
-                if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
-                    StoreError::AlreadyExists { meeting_id }
-                } else {
-                    StoreError::Backend(err)
-                }
-            })?;
+        if let Some(settings) = request.effective_settings.clone() {
+            let params = create_meeting_with_settings_params(request, settings);
+            self.executor
+                .execute(
+                    INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+                    &params,
+                )
+                .map_err(|err| {
+                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+                        StoreError::AlreadyExists { meeting_id }
+                    } else {
+                        StoreError::Backend(err)
+                    }
+                })?;
+        } else {
+            let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')";
+            self.executor
+                .execute(
+                    sql,
+                    &[
+                        request.id,
+                        request.guild_id,
+                        request.voice_channel_id,
+                        request.report_channel_id,
+                        request.status_message_channel_id.unwrap_or_default(),
+                        request.status_message_id.unwrap_or_default(),
+                        request.started_by_user_id,
+                    ],
+                )
+                .map_err(|err| {
+                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+                        StoreError::AlreadyExists { meeting_id }
+                    } else {
+                        StoreError::Backend(err)
+                    }
+                })?;
+        }
         Ok(())
     }
 
@@ -616,6 +782,88 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         }
         Ok(())
     }
+
+    fn upsert_effective_meeting_settings(
+        &mut self,
+        meeting_id: &str,
+        settings: EffectiveMeetingSettings,
+    ) -> Result<(), StoreError> {
+        let affected = self
+            .executor
+            .execute(
+                UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+                &effective_settings_params(meeting_id, &settings),
+            )
+            .map_err(StoreError::Backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_effective_meeting_settings(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<Option<EffectiveMeetingSettings>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(GET_EFFECTIVE_MEETING_SETTINGS_SQL, &[meeting_id.to_owned()])
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_effective_meeting_settings_row(&row).map(Some)
+    }
+}
+
+fn create_meeting_with_settings_params(
+    request: CreateMeetingRequest,
+    settings: EffectiveMeetingSettings,
+) -> Vec<String> {
+    let mut params = vec![
+        request.id,
+        request.guild_id,
+        request.voice_channel_id,
+        request.report_channel_id,
+        request.status_message_channel_id.unwrap_or_default(),
+        request.status_message_id.unwrap_or_default(),
+        request.started_by_user_id,
+    ];
+    params.extend(effective_settings_values(&settings));
+    params
+}
+
+fn effective_settings_params(meeting_id: &str, settings: &EffectiveMeetingSettings) -> Vec<String> {
+    let mut params = vec![meeting_id.to_owned()];
+    params.extend(effective_settings_values(settings));
+    params
+}
+
+fn effective_settings_values(settings: &EffectiveMeetingSettings) -> Vec<String> {
+    vec![
+        settings.whisper_language.clone().unwrap_or_default(),
+        settings.whisper_vad.to_string(),
+        settings.whisper_beam_size.to_string(),
+        settings.whisper_suppress_non_speech.to_string(),
+        settings.whisper_prompt.clone().unwrap_or_default(),
+        settings.whisper_temperature.to_string(),
+        settings.whisper_resample_to_16k.to_string(),
+        settings.auto_stop_grace_seconds.to_string(),
+        settings.retention_raw_audio_ttl_days.to_string(),
+        settings.retention_transcript_ttl_days.to_string(),
+        settings
+            .retention_summary_ttl_days
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        settings.summary_enabled.to_string(),
+        settings.summary_template_id.clone().unwrap_or_default(),
+        settings
+            .domain_knowledge_version_id
+            .clone()
+            .unwrap_or_default(),
+    ]
 }
 
 pub struct PgSqlExecutor {

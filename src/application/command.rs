@@ -2,7 +2,7 @@ use crate::application::stop::{StopMeetingError, StopOutcome, stop_meeting};
 use crate::domain::StopReason;
 use crate::domain::authz::{Action, UserRole, is_allowed};
 use crate::infrastructure::storage::{
-    CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting,
+    CreateMeetingRequest, EffectiveMeetingSettings, MeetingStore, StoreError, StoredMeeting,
 };
 use std::fmt::{Display, Formatter};
 
@@ -12,7 +12,7 @@ pub struct PermissionSet {
     pub can_send_messages: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordStartRequest {
     pub meeting_id: String,
     pub guild_id: String,
@@ -21,6 +21,7 @@ pub struct RecordStartRequest {
     pub user_voice_channel_id: Option<String>,
     pub permissions: PermissionSet,
     pub caller_role: UserRole,
+    pub effective_settings: Option<EffectiveMeetingSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +140,7 @@ pub fn record_start<S: MeetingStore>(
         status_message_channel_id: None,
         status_message_id: None,
         started_by_user_id: request.started_by_user_id,
+        effective_settings: request.effective_settings,
     })?;
 
     Ok(RecordStartResult {

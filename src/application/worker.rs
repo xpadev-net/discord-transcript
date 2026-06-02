@@ -298,6 +298,9 @@ where
             .ok_or_else(|| {
                 WorkerError::Store(format!("meeting not found for summary: {}", job.meeting_id))
             })?;
+        let effective_settings = store
+            .get_effective_meeting_settings(&job.meeting_id)
+            .map_err(WorkerError::from)?;
         let layout = MeetingWorkspaceLayout::new(&options.audio_base_dir);
         let workspace = layout.for_meeting(
             &meeting.guild_id,
@@ -313,6 +316,10 @@ where
         let primary_dir = workspace.audio_dir();
         let primary_has_nonempty =
             has_nonempty_audio_chunk(&primary_dir).map_err(WorkerError::Summary)?;
+        let resample_to_16k = effective_settings
+            .as_ref()
+            .map(|settings| settings.whisper_resample_to_16k)
+            .unwrap_or(options.resample_to_16k);
         let meeting_dir = if primary_has_nonempty {
             primary_dir.clone()
         } else {
@@ -336,7 +343,7 @@ where
             }
         };
 
-        let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, options.resample_to_16k)
+        let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, resample_to_16k)
             .map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
@@ -344,9 +351,12 @@ where
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
             audio_path: mixdown_path,
-            speaker_audio: build_speaker_audio_inputs(&meeting_dir, options.resample_to_16k)
+            speaker_audio: build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
                 .map_err(WorkerError::Summary)?,
-            language: options.language.clone(),
+            language: effective_settings
+                .as_ref()
+                .and_then(|settings| settings.whisper_language.clone())
+                .or_else(|| options.language.clone()),
             workspace,
         };
         process_meeting_summary(store, whisper, claude, &input)

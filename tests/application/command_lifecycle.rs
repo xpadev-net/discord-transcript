@@ -27,6 +27,7 @@ fn record_start_persists_report_channel_and_moves_to_recording() {
         user_voice_channel_id: Some("vc-1".to_owned()),
         permissions: default_permissions(),
         caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
     };
 
     let result = record_start(&mut store, request).expect("start should succeed");
@@ -50,6 +51,7 @@ fn record_start_rejects_when_user_not_in_voice() {
         user_voice_channel_id: None,
         permissions: default_permissions(),
         caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
     };
 
     let error = record_start(&mut store, request).expect_err("must fail");
@@ -83,6 +85,7 @@ fn record_start_rejects_if_active_meeting_exists() {
         user_voice_channel_id: Some("vc-2".to_owned()),
         permissions: default_permissions(),
         caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
     };
 
     let error = record_start(&mut store, request).expect_err("must fail");
@@ -105,6 +108,7 @@ fn record_start_rejects_plain_member() {
         user_voice_channel_id: Some("vc-1".to_owned()),
         permissions: default_permissions(),
         caller_role: UserRole::Member,
+            effective_settings: None,
     };
 
     let error = record_start(&mut store, request).expect_err("member must not start");
@@ -140,6 +144,7 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
         user_voice_channel_id: Some("vc-2".to_owned()),
         permissions: default_permissions(),
         caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
     };
 
     let result = record_start(&mut store, request)
