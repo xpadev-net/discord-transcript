@@ -206,6 +206,52 @@ Rules:
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI when the applicable finite quota is exceeded. It must not silently drop or skip usage.
 - Soft quota violation events use the Quota Violation Event contract below.
 
+### Period Counter Usage Event
+
+Purpose: append-only metering record for period-counter units.
+
+Fields:
+
+- `tenant_id`
+- `guild_id`
+- `plan_assignment_id`
+- `unit`: one of `recording_minutes`, `asr_seconds`, `summary_runs`, or `debug_downloads`.
+- `period_start`
+- `period_end`
+- `amount`: non-negative integer amount for the unit.
+- `source_type`
+- `source_id`
+- `idempotency_key`
+- `created_at`
+
+Rules:
+
+- The intended uniqueness constraint is `(tenant_id, unit, period_start, period_end, idempotency_key)`.
+- `period_start` and `period_end` are required and use the Period And Gauge Semantics boundaries.
+- `plan_assignment_id` is the assignment active when work was authorized or started for post-hoc units, and the assignment active at usage start for immediate units.
+- `source_type` and `source_id` identify the meeting, ASR attempt, summary invocation, or download session that produced the usage.
+- Retrying the same durable attempt uses the same `idempotency_key`; a retry that intentionally counts as new usage must use a new idempotency key as defined by the unit contract.
+
+### Period Counter Reservation
+
+Purpose: mutable tenant-period counter used for hard pre-flight reservations that cannot rely on read-then-insert usage aggregation.
+
+Fields:
+
+- `tenant_id`
+- `unit`: initially `asr_seconds`.
+- `period_start`
+- `period_end`
+- `reserved_value`: non-negative integer amount reserved but not yet converted into usage events.
+- `updated_at`
+
+Rules:
+
+- The intended uniqueness constraint is `(tenant_id, unit, period_start, period_end)`.
+- Hard `asr_seconds` pre-flight must lock or atomically upsert this row, compare `current_usage + reserved_value + requested_amount` against the finite quota, and increment `reserved_value` only if the result fits.
+- `current_usage` is the committed sum of Period Counter Usage Event `amount` for the same tenant, unit, and period.
+- When an ASR attempt records its usage event or is cancelled before submitting audio, release the matching reservation in the same transaction or an equivalent idempotent reconciliation step.
+
 ### Storage Bytes Gauge
 
 Purpose: current retained-byte measurement used by `storage_bytes` entitlement checks.
