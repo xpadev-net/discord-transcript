@@ -262,6 +262,7 @@ Fields:
 Rules:
 
 - `current_sequence` is tenant-scoped, not global. The intended uniqueness constraint is `tenant_id` with one row per tenant; concurrent inserts must be prevented by this constraint or by the tenant-provisioning transaction.
+- New tenants must create the initial artifact inventory watermark row synchronously with tenant provisioning using `current_sequence = 0`.
 - Every retained artifact inventory row that contributes to `storage_bytes` carries the tenant's latest `artifact_mutation_sequence` at the time that row last changed.
 - A retained artifact inventory change is any create, byte-size change, tenant attribution change, retention-state change, TTL cleanup, explicit deletion, or soft-delete/tombstone transition that changes whether bytes are counted for a tenant.
 - Each retained artifact inventory change increments `artifact_inventory_watermarks.current_sequence` in the same transaction and assigns that value as the affected row's `artifact_mutation_sequence` when a counted row remains. If the change removes the row from retained inventory, the tenant watermark still advances even though no retained row carries that new sequence afterward.
@@ -345,7 +346,7 @@ Fields:
 - `status`: `active`, `scheduled`, `ended`.
 - `effective_at`
 - `ended_at`
-- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. The tenant record is the authoritative source. Set it from the billing provider subscription anchor when present; otherwise, inherit the existing tenant `period_anchor` when the tenant already has one; otherwise default to `effective_at` for the tenant's first active assignment. Initializing the tenant `period_anchor` and writing the guild assignment must happen in one serializable transaction or under an equivalent tenant-scoped lock. After initialization, `period_anchor` is immutable in this contract; billing anchor corrections require a future explicit re-bucketing or migration task. Every active guild assignment for the same tenant must share the same `period_anchor`.
+- `period_anchor`: tenant-scoped UTC timestamp used to compute monthly period boundaries. The tenant record is the authoritative source. When the tenant already has a `period_anchor`, every assignment copies that value regardless of any billing-provider anchor in the request. Only when the tenant has no `period_anchor`, initialize it from the billing provider subscription anchor when present, otherwise from `effective_at` for the tenant's first active assignment. Initializing the tenant `period_anchor` and writing the guild assignment must happen in one serializable transaction or under an equivalent tenant-scoped lock. After initialization, `period_anchor` is immutable in this contract; billing anchor corrections require a future explicit re-bucketing or migration task. Every active guild assignment for the same tenant must share the same `period_anchor`.
 - `assigned_by_user_id`: nullable Discord user id with a conditional requirement. `source = admin` requires a non-null user id via application validation and a database check constraint; `system`, `billing_provider`, and `migration` use null unless a real initiating user is known.
 - `source`: `system`, `admin`, `billing_provider`, or `migration`.
 - `created_at`, `updated_at`.
