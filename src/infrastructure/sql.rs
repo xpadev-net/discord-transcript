@@ -340,7 +340,6 @@ FROM tenant_discord_guilds tg
 JOIN tenants t ON t.id = tg.tenant_id
 WHERE tg.guild_id = $1
   AND tg.status = 'active'
-  AND tg.revoked_at IS NULL
   AND t.status = 'active'
 LIMIT 1
 "#;

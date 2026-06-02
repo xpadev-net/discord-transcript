@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS tenant_memberships (
     PRIMARY KEY (tenant_id, user_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_tenant_memberships_user_id
+    ON tenant_memberships (user_id);
+
 DO $$
 BEGIN
     ALTER TABLE tenant_memberships

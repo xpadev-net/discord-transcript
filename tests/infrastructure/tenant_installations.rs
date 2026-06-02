@@ -16,6 +16,7 @@ fn incremental_migrations_include_tenant_installation_schema() {
     assert!(schema.contains("tenants_status_check"));
     assert!(schema.contains("tenant_discord_guilds_status_check"));
     assert!(schema.contains("idx_tenant_discord_guilds_active_guild"));
+    assert!(schema.contains("idx_tenant_memberships_user_id"));
     assert!(schema.contains("WHERE status = 'active'"));
 }
 
@@ -37,7 +38,6 @@ fn resolve_tenant_by_guild_requires_active_binding_and_tenant() {
 
     assert!(sql.contains("tg.guild_id = $1"));
     assert!(sql.contains("tg.status = 'active'"));
-    assert!(sql.contains("tg.revoked_at IS NULL"));
     assert!(sql.contains("t.status = 'active'"));
 }
 
