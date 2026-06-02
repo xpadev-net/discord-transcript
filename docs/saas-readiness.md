@@ -96,6 +96,7 @@ Usage timing differs by unit:
 - A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
+- Soft entitlement enforcement for `recording_minutes` does not emit the quota violation event at meeting start because the consumed amount is unknown. Record usage at the terminal state; if the resulting period usage exceeds the finite soft limit, record one quota violation event with `observed_value` equal to the period usage after adding the meeting, `source_type = meeting`, and `source_id` equal to the meeting id.
 
 `storage_bytes`
 
@@ -196,7 +197,52 @@ Rules:
 - A migration that introduces a new unit must add quota rows for every affected existing plan in the same migration step, or explicitly accept that tenants on plans without that row are denied for the new unit.
 - `hard` enforcement rejects the operation when the applicable finite quota is exhausted, subject to the `recording_minutes` post-hoc overrun rule above.
 - `soft` enforcement allows the operation, records usage normally, and records an observable quota violation event for alerting/admin UI. It must not silently drop or skip usage.
-- Soft quota violation events are recorded as `quota_violation_events` with `tenant_id`, optional `guild_id`, `plan_assignment_id`, `unit`, `limit_value`, `observed_value`, `amount_over`, optional `period_start`, optional `period_end`, `source_type`, `source_id`, `observed_at`, and `created_at`. `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`. Keep events for at least 13 monthly periods.
+- Soft quota violation events use the Quota Violation Event contract below.
+
+### Storage Bytes Gauge
+
+Purpose: current retained-byte measurement used by `storage_bytes` entitlement checks.
+
+Fields:
+
+- `tenant_id`
+- `unit`: always `storage_bytes`.
+- `current_value`: non-negative byte count.
+- `measured_at`
+- `source_watermark`: nullable tenant artifact inventory watermark included in this measurement.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The intended uniqueness constraint is `(tenant_id, unit)`.
+- New tenants must create the initial row synchronously with tenant provisioning using `current_value = 0`, `source_watermark = 0`, and `unit = storage_bytes`.
+- Staleness, rebuild, and hard/soft enforcement behavior are defined in Period And Gauge Semantics.
+
+### Quota Violation Event
+
+Purpose: observable record for soft quota overages used by alerting and admin UI.
+
+Fields:
+
+- `tenant_id`
+- `guild_id`: nullable.
+- `plan_assignment_id`
+- `unit`
+- `limit_value`
+- `observed_value`
+- `amount_over`
+- `period_start`: nullable.
+- `period_end`: nullable.
+- `source_type`
+- `source_id`
+- `observed_at`
+- `created_at`
+
+Rules:
+
+- `amount_over = max(0, observed_value - limit_value)`.
+- `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`.
+- Keep events for at least 13 monthly periods.
 
 ### Artifact Inventory Watermark
 
