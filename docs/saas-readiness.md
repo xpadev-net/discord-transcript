@@ -95,6 +95,7 @@ Usage timing differs by unit:
 - Per meeting value is `max(1, ceil(recording_duration_seconds / 60))` if the meeting status ever transitioned to `recording`; otherwise `0`.
 - A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
+- `recording_minutes` usage is allocated to the quota period that contains the recording start time, even if the meeting reaches a terminal state in a later period. The meeting or snapshot metadata must retain that period so terminal-state accounting writes the event to the original period; the initial contract does not split one recording across periods.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
 - Soft entitlement enforcement for `recording_minutes` does not emit the quota violation event at meeting start because the consumed amount is unknown. Record usage at the terminal state; if the resulting period usage exceeds the finite soft limit, record one quota violation event with `observed_value` equal to the period usage after adding the meeting, `source_type = meeting`, `source_id` equal to the meeting id, and `plan_assignment_id` equal to the assignment active when recording started.
 
@@ -500,7 +501,7 @@ Rules:
 
 - Add tenant and quota schema in small, additive migrations.
 - Keep current `guild_settings` behavior compatible by treating existing rows as guild overrides. A migration must backfill `settings_version` on all existing `guild_settings` rows before enabling snapshot resolution for those guilds; until backfilled, snapshot creation fails for any meeting in a guild that has a legacy override row without `settings_version`.
-- Add every decimal snapshot environment variable, initially `WHISPER_TEMPERATURE`, to local development, CI, and deployment configuration before enabling startup validation for decimal env-string presence and format.
+- Add every decimal snapshot environment variable, initially `WHISPER_TEMPERATURE`, to local development, CI, and deployment configuration before enabling startup validation for decimal env-string presence and format. Ensure each decimal env value is already in standard decimal form before enabling validation: integer-valued temperatures must be written without a decimal point, for example `0` not `0.0`; values with trailing zeros or scientific notation must be reconfigured in the same deploy that enables startup validation.
 - Prefer explicit null inheritance for defaults and overrides.
 - Keep usage accounting idempotent by using deterministic source identifiers, for example `meeting_id + unit` or `job_id + unit`.
 - For units where retries count as new usage, such as `asr_seconds` and `summary_runs`, the deterministic source identifier must include the attempt or invocation id.
