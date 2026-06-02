@@ -263,7 +263,7 @@ Fields:
 Rules:
 
 - The intended uniqueness constraint is `(tenant_id, plan_assignment_id, unit, period_start, period_end, source_type, source_id)`.
-- Hard `asr_seconds` pre-flight must lock or atomically upsert the source reservation row, compare `current_usage + active_reserved_value_excluding_this_source + requested_amount` against the finite quota, and set `reserved_value` only if the result fits.
+- Hard `asr_seconds` pre-flight must lock or atomically upsert the source reservation row, compare `current_usage + active_reserved_value_excluding_this_source + requested_amount` against the finite quota, and set `reserved_value` only if the result fits. The aggregate read-compare-upsert sequence must run under a tenant, plan-assignment, unit, and period serialization boundary, such as a transaction-scoped advisory lock or a serializable transaction; locking only the per-source reservation row is not sufficient.
 - `current_usage` is the committed sum of Period Counter Usage Event `amount` for the same tenant, plan assignment, unit, and period.
 - `active_reserved_value` is the sum of reservation `reserved_value` for the same tenant, plan assignment, unit, and period where `reserved_until` is greater than the transaction timestamp.
 - The initial reservation TTL is 15 minutes. A worker that still needs the reservation must refresh `reserved_until` before it expires, and must stop before submitting additional audio if it cannot refresh the reservation.
