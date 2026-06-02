@@ -268,6 +268,58 @@ Rules:
 - When an ASR attempt records its usage event or is cancelled before submitting audio, delete the matching reservation in the same transaction or an equivalent idempotent reconciliation step.
 - Reconciliation must run at least every 5 minutes and delete expired reservation rows after confirming the source job is terminal or absent. Expired rows are ignored by quota enforcement even before reconciliation deletes them.
 
+### ASR Attempt Metadata
+
+Purpose: durable ASR submission record used to reconcile `asr_seconds` usage events and reservations after crashes or retries.
+
+Fields:
+
+- `asr_attempt_id`: server-assigned opaque id.
+- `tenant_id`
+- `guild_id`
+- `meeting_id`
+- `plan_assignment_id`
+- `job_type`: initially `asr`.
+- `submission_sequence`
+- `attempt_number`
+- `submitted_duration_seconds`: non-negative integer duration that will be metered if `external_submission_started_at` is set.
+- `external_submission_started_at`: nullable timestamp set before or atomically with handing audio to the ASR engine.
+- `usage_recorded_at`: nullable timestamp set when the matching Period Counter Usage Event exists.
+- `status`: `queued`, `submitted`, `succeeded`, `failed`, or `cancelled`.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The intended uniqueness constraints are `asr_attempt_id` and `(tenant_id, meeting_id, job_type, submission_sequence, attempt_number)`.
+- Create the row before durably queueing or submitting the attempt. Redelivery of the same queued attempt reuses the same row; a retry that submits audio creates a new row with an incremented `attempt_number`.
+- Reconciliation must append the missing `asr_seconds` usage event with `idempotency_key = asr_attempt_id` and `amount = submitted_duration_seconds` for any row whose `external_submission_started_at` is non-null and `usage_recorded_at` is null, then set `usage_recorded_at` and release the matching reservation in the same transaction.
+- Rows whose `external_submission_started_at` is null may be cancelled and have their matching reservation released without recording usage.
+
+### Summary Invocation Metadata
+
+Purpose: durable summary prompt submission record used to reconcile `summary_runs` usage events after crashes or retries.
+
+Fields:
+
+- `summary_invocation_id`: server-assigned opaque id.
+- `tenant_id`
+- `guild_id`
+- `meeting_id`
+- `plan_assignment_id`
+- `job_type`: initially `summary`.
+- `invocation_number`
+- `external_submission_started_at`: nullable timestamp set before or atomically with handing the prompt to the summary harness.
+- `usage_recorded_at`: nullable timestamp set when the matching Period Counter Usage Event exists.
+- `status`: `queued`, `submitted`, `succeeded`, `failed`, or `cancelled`.
+- `created_at`, `updated_at`.
+
+Rules:
+
+- The intended uniqueness constraints are `summary_invocation_id` and `(tenant_id, meeting_id, job_type, invocation_number)`.
+- Create the row before sending the prompt. Redelivery of the same queued invocation reuses the same row; a retry or regeneration that sends a prompt creates a new row with an incremented `invocation_number`.
+- Reconciliation must append the missing `summary_runs` usage event with `idempotency_key = summary_invocation_id` and `amount = 1` for any row whose `external_submission_started_at` is non-null and `usage_recorded_at` is null, then set `usage_recorded_at` in the same transaction.
+- Rows whose `external_submission_started_at` is null may be cancelled without recording usage.
+
 ### Storage Bytes Gauge
 
 Purpose: current retained-byte measurement used by `storage_bytes` entitlement checks.
@@ -403,7 +455,7 @@ Rules:
 - `period_anchor` is initialized in the same transaction as the first guild plan assignment, from the billing provider subscription anchor when present, otherwise from the first assignment's `effective_at`. The stored value must be truncated to midnight UTC on the initializing value's UTC calendar day.
 - After initialization, `period_anchor` is immutable in this initial contract. Billing-provider anchor corrections require a future migration or re-bucketing task that explicitly defines how historical usage events are treated.
 - A `suspended` tenant keeps data ownership but fails a tenant-status pre-gate for all new resource-consuming operations, regardless of whether the active plan's quota enforcement is `hard` or `soft`. Read-only access, cleanup, and delete operations may proceed when otherwise authorized. Automated pipeline work for a meeting that already transitioned to `recording` before suspension is treated as terminalization rather than new user-initiated consumption: it may continue through ASR, summary, usage recording, quota violation recording, and terminal failure handling under the meeting's stored snapshot and plan assignment, while still applying unit-level quota checks. New recordings, manual regenerations, debug downloads, and other newly requested consumption remain blocked while suspended.
-- Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, then set tenant status to `closed`, revoke all active tenant-guild bindings with `revoked_at` set to the close transaction timestamp, revoke all active download sessions for the tenant's guilds with `status = revoked` and `revoked_at` set to the same timestamp, end all active guild plan assignments with `ended_at` set to the same close transaction timestamp, and cancel all scheduled guild plan assignments. If any precondition fails while the lock is held, the close attempt fails without partial changes.
+- Closing a tenant is a single transaction under a tenant-scoped lock or equivalent serializable isolation: first verify and lock that the tenant has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, then set tenant status to `closed`, revoke all active tenant-guild bindings with `revoked_at` set to the close transaction timestamp, revoke all active download sessions for the tenant's guilds with `status = revoked` and `revoked_at` set to the same timestamp, end all active guild plan assignments with `ended_at` set to the same close transaction timestamp, and cancel all scheduled guild plan assignments with `ended_at` set to the same close transaction timestamp. If any precondition fails while the lock is held, the close attempt fails without partial changes.
 - A `closed` tenant keeps historical data ownership for retention, audit, and read-only access, but cannot receive new guild bindings or plan assignments and must fail all new resource-consuming operations.
 
 ### Tenant Default Settings
@@ -444,9 +496,9 @@ Rules:
 - The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
 - A `(tenant_id, guild_id)` pair may have only one active row.
 - Revoked rows remain for history and audit but must not be used for SaaS query scoping.
-- Moving a guild to another tenant is a single transaction under locks on the guild and both old and new tenants, or under equivalent serializable isolation: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the current active tenant-guild row with `revoked_at` set to the move transaction timestamp, revoke all active download sessions for the old `(tenant_id, guild_id)` scope with `status = revoked` and `revoked_at` set to the same timestamp, end the old `(tenant_id, guild_id)` active plan assignment with `ended_at` set to the same move transaction timestamp and cancel any scheduled plan assignment, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild with `effective_at` set to the move transaction timestamp and `period_anchor` matching the authoritative tenant `period_anchor` after any first-assignment initialization. The new assignment `plan_id` must be explicit from the move source: admin moves require a caller-supplied active plan, billing-provider moves use the provider-supplied plan mapping, and system or migration moves use the explicit system/migration plan. The old tenant's plan is never inherited implicitly. The move must invalidate or advance storage gauge watermarks for both the old and new tenants in the same transaction, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale in the transaction, for example by setting `storage_bytes.source_watermark = null` for both tenants. If any precondition fails while the locks are held or the new assignment cannot be created in the same transaction, the move fails.
+- Moving a guild to another tenant is a single transaction under locks on the guild and both old and new tenants, or under equivalent serializable isolation: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the current active tenant-guild row with `revoked_at` set to the move transaction timestamp, revoke all active download sessions for the old `(tenant_id, guild_id)` scope with `status = revoked` and `revoked_at` set to the same timestamp, end the old `(tenant_id, guild_id)` active plan assignment with `ended_at` set to the same move transaction timestamp and cancel any scheduled plan assignment with `ended_at` set to the same move transaction timestamp, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild with `effective_at` set to the move transaction timestamp and `period_anchor` matching the authoritative tenant `period_anchor` after any first-assignment initialization. The new assignment `plan_id` must be explicit from the move source: admin moves require a caller-supplied active plan, billing-provider moves use the provider-supplied plan mapping, and system or migration moves use the explicit system/migration plan. The old tenant's plan is never inherited implicitly. The move must invalidate or advance storage gauge watermarks for both the old and new tenants in the same transaction, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale in the transaction, for example by setting `storage_bytes.source_watermark = null` for both tenants. If any precondition fails while the locks are held or the new assignment cannot be created in the same transaction, the move fails.
 - If the receiving tenant's `period_anchor` is null during a guild move, the move transaction must initialize it using the same first-assignment rule as guild plan assignment creation: billing-provider subscription anchor when present, otherwise the new assignment's `effective_at`, truncated to midnight UTC on the initializing value's UTC calendar day. The new active assignment then copies that initialized tenant anchor.
-- Standalone binding revocation, such as bot removal or admin eviction without tenant close or guild move, is a single transaction under a tenant-scoped lock or equivalent serializable isolation: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the active tenant-guild binding with `revoked_at` set to the revocation transaction timestamp, revoke all active download sessions for that `(tenant_id, guild_id)` scope with `status = revoked` and `revoked_at` set to the same timestamp, end the active guild plan assignment with `ended_at` set to the same revocation transaction timestamp, cancel any scheduled assignment for that `(tenant_id, guild_id)`, and mark the tenant's storage gauge stale or advance the artifact inventory watermark in the same transaction. If any step cannot be completed, the revocation fails without partial changes.
+- Standalone binding revocation, such as bot removal or admin eviction without tenant close or guild move, is a single transaction under a tenant-scoped lock or equivalent serializable isolation: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the active tenant-guild binding with `revoked_at` set to the revocation transaction timestamp, revoke all active download sessions for that `(tenant_id, guild_id)` scope with `status = revoked` and `revoked_at` set to the same timestamp, end the active guild plan assignment with `ended_at` set to the same revocation transaction timestamp, cancel any scheduled assignment for that `(tenant_id, guild_id)` with `ended_at` set to the same revocation transaction timestamp, and mark the tenant's storage gauge stale or advance the artifact inventory watermark in the same transaction. If any step cannot be completed, the revocation fails without partial changes.
 - SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
 
 ### Guild Plan Assignment
