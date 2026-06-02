@@ -96,7 +96,7 @@ Usage timing differs by unit:
 - A meeting with zero recording duration records zero minutes if the meeting status never transitions to `recording`; otherwise it records at least one minute.
 - Period usage increments when a meeting reaches a terminal processed or failed state with a known recording duration.
 - Hard entitlement enforcement at meeting start only checks whether current period usage is already at or above the limit. It does not guarantee the meeting will fit inside the remaining balance.
-- Soft entitlement enforcement for `recording_minutes` does not emit the quota violation event at meeting start because the consumed amount is unknown. Record usage at the terminal state; if the resulting period usage exceeds the finite soft limit, record one quota violation event with `observed_value` equal to the period usage after adding the meeting, `source_type = meeting`, and `source_id` equal to the meeting id.
+- Soft entitlement enforcement for `recording_minutes` does not emit the quota violation event at meeting start because the consumed amount is unknown. Record usage at the terminal state; if the resulting period usage exceeds the finite soft limit, record one quota violation event with `observed_value` equal to the period usage after adding the meeting, `source_type = meeting`, `source_id` equal to the meeting id, and `plan_assignment_id` equal to the assignment active when recording started.
 
 `storage_bytes`
 
@@ -244,6 +244,7 @@ Rules:
 - `amount_over = max(0, observed_value - limit_value)`.
 - `period_start` and `period_end` are required for period-counter units and null only for current-gauge units such as `storage_bytes`.
 - In the initial one-guild-per-tenant phase, `guild_id` is required for every quota violation event and is resolved from the active tenant-guild binding at `observed_at`, including tenant-level `storage_bytes` gauge events. `guild_id` may be null only for a future tenant-level or organization-level event that does not correspond to one active guild.
+- For post-hoc units such as `recording_minutes`, `plan_assignment_id` is the assignment active when the work was authorized or started, not the assignment active at `observed_at`. The meeting or usage-start metadata must retain that assignment id so terminal-state accounting does not misattribute usage after a plan change.
 - Keep events for at least 13 monthly periods.
 
 ### Artifact Inventory Watermark
@@ -385,6 +386,7 @@ Rules:
 
 - Create the snapshot in the same logical operation as meeting creation or before the recording can start.
 - Processing jobs must read settings from the snapshot for that meeting.
+- Stored snapshots remain valid for the lifetime of the meeting and retention period using their recorded `env.version` and `precedence_version`. Implementations must keep backward-compatible readers for every prior snapshot version that can still exist, or run an explicit migration that rewrites retained snapshots to a newer version.
 - Admin settings APIs may show current effective settings, but meeting detail APIs should expose snapshot-derived settings only if a user-facing need exists.
 - If snapshot creation fails, recording start fails rather than falling back to live settings.
 
