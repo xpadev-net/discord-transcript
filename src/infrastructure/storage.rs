@@ -107,6 +107,17 @@ pub trait MeetingStore {
         channel_id: String,
         message_id: String,
     ) -> Result<(), StoreError>;
+
+    fn upsert_effective_meeting_settings(
+        &mut self,
+        meeting_id: &str,
+        settings: EffectiveMeetingSettings,
+    ) -> Result<(), StoreError>;
+
+    fn get_effective_meeting_settings(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<Option<EffectiveMeetingSettings>, StoreError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +137,7 @@ pub struct StoredMeeting {
     pub stopped_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateMeetingRequest {
     pub id: String,
     pub guild_id: String,
@@ -135,11 +146,106 @@ pub struct CreateMeetingRequest {
     pub status_message_channel_id: Option<String>,
     pub status_message_id: Option<String>,
     pub started_by_user_id: String,
+    pub effective_settings: Option<EffectiveMeetingSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeetingSettingsDefaults {
+    pub whisper_language: Option<String>,
+    pub whisper_vad: bool,
+    pub whisper_beam_size: u32,
+    pub whisper_suppress_non_speech: bool,
+    pub whisper_prompt: Option<String>,
+    pub whisper_temperature: f32,
+    pub whisper_resample_to_16k: bool,
+    pub auto_stop_grace_seconds: u64,
+    pub retention_raw_audio_ttl_days: u32,
+    pub retention_transcript_ttl_days: u32,
+    pub retention_summary_ttl_days: Option<u32>,
+    pub summary_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuildSettingsForSnapshot {
+    pub whisper_language: Option<String>,
+    pub whisper_language_explicit: bool,
+    pub whisper_vad: Option<bool>,
+    pub auto_stop_grace_seconds: Option<u64>,
+    pub retention_raw_audio_ttl_days: Option<u32>,
+    pub retention_transcript_ttl_days: Option<u32>,
+    pub summary_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveMeetingSettings {
+    pub whisper_language: Option<String>,
+    pub whisper_vad: bool,
+    pub whisper_beam_size: u32,
+    pub whisper_suppress_non_speech: bool,
+    pub whisper_prompt: Option<String>,
+    pub whisper_temperature: f32,
+    pub whisper_resample_to_16k: bool,
+    pub auto_stop_grace_seconds: u64,
+    pub retention_raw_audio_ttl_days: u32,
+    pub retention_transcript_ttl_days: u32,
+    pub retention_summary_ttl_days: Option<u32>,
+    pub summary_enabled: bool,
+    pub summary_template_id: Option<String>,
+    pub domain_knowledge_version_id: Option<String>,
+}
+
+impl EffectiveMeetingSettings {
+    pub fn from_defaults(defaults: &MeetingSettingsDefaults) -> Self {
+        Self {
+            whisper_language: defaults.whisper_language.clone(),
+            whisper_vad: defaults.whisper_vad,
+            whisper_beam_size: defaults.whisper_beam_size,
+            whisper_suppress_non_speech: defaults.whisper_suppress_non_speech,
+            whisper_prompt: defaults.whisper_prompt.clone(),
+            whisper_temperature: defaults.whisper_temperature,
+            whisper_resample_to_16k: defaults.whisper_resample_to_16k,
+            auto_stop_grace_seconds: defaults.auto_stop_grace_seconds,
+            retention_raw_audio_ttl_days: defaults.retention_raw_audio_ttl_days,
+            retention_transcript_ttl_days: defaults.retention_transcript_ttl_days,
+            retention_summary_ttl_days: defaults.retention_summary_ttl_days,
+            summary_enabled: defaults.summary_enabled,
+            summary_template_id: None,
+            domain_knowledge_version_id: None,
+        }
+    }
+
+    pub fn resolve(
+        defaults: &MeetingSettingsDefaults,
+        guild_settings: Option<&GuildSettingsForSnapshot>,
+    ) -> Self {
+        let mut resolved = Self::from_defaults(defaults);
+        let Some(guild_settings) = guild_settings else {
+            return resolved;
+        };
+        if guild_settings.whisper_language_explicit {
+            resolved.whisper_language = guild_settings.whisper_language.clone();
+        }
+        resolved.whisper_vad = guild_settings.whisper_vad.unwrap_or(resolved.whisper_vad);
+        resolved.auto_stop_grace_seconds = guild_settings
+            .auto_stop_grace_seconds
+            .unwrap_or(resolved.auto_stop_grace_seconds);
+        resolved.retention_raw_audio_ttl_days = guild_settings
+            .retention_raw_audio_ttl_days
+            .unwrap_or(resolved.retention_raw_audio_ttl_days);
+        resolved.retention_transcript_ttl_days = guild_settings
+            .retention_transcript_ttl_days
+            .unwrap_or(resolved.retention_transcript_ttl_days);
+        resolved.summary_enabled = guild_settings
+            .summary_enabled
+            .unwrap_or(resolved.summary_enabled);
+        resolved
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct InMemoryMeetingStore {
     meetings: HashMap<String, StoredMeeting>,
+    effective_settings: HashMap<String, EffectiveMeetingSettings>,
 }
 
 impl InMemoryMeetingStore {
@@ -153,6 +259,10 @@ impl InMemoryMeetingStore {
 
     pub fn get(&self, meeting_id: &str) -> Option<&StoredMeeting> {
         self.meetings.get(meeting_id)
+    }
+
+    pub fn get_effective_settings(&self, meeting_id: &str) -> Option<&EffectiveMeetingSettings> {
+        self.effective_settings.get(meeting_id)
     }
 
     fn is_active(status: MeetingStatus) -> bool {
@@ -210,6 +320,8 @@ impl MeetingStore for InMemoryMeetingStore {
             });
         }
 
+        let meeting_id = request.id.clone();
+        let effective_settings = request.effective_settings.clone();
         let meeting = StoredMeeting {
             id: request.id.clone(),
             guild_id: request.guild_id,
@@ -226,6 +338,9 @@ impl MeetingStore for InMemoryMeetingStore {
             stopped_at: None,
         };
         self.meetings.insert(request.id, meeting);
+        if let Some(settings) = effective_settings {
+            self.effective_settings.insert(meeting_id, settings);
+        }
         Ok(())
     }
 
@@ -239,6 +354,8 @@ impl MeetingStore for InMemoryMeetingStore {
             });
         }
 
+        let meeting_id = request.id.clone();
+        let effective_settings = request.effective_settings.clone();
         let meeting = StoredMeeting {
             id: request.id.clone(),
             guild_id: request.guild_id,
@@ -255,6 +372,9 @@ impl MeetingStore for InMemoryMeetingStore {
             stopped_at: None,
         };
         self.meetings.insert(request.id, meeting);
+        if let Some(settings) = effective_settings {
+            self.effective_settings.insert(meeting_id, settings);
+        }
         Ok(())
     }
 
@@ -325,5 +445,27 @@ impl MeetingStore for InMemoryMeetingStore {
         meeting.status_message_channel_id = Some(channel_id);
         meeting.status_message_id = Some(message_id);
         Ok(())
+    }
+
+    fn upsert_effective_meeting_settings(
+        &mut self,
+        meeting_id: &str,
+        settings: EffectiveMeetingSettings,
+    ) -> Result<(), StoreError> {
+        if !self.meetings.contains_key(meeting_id) {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        self.effective_settings
+            .insert(meeting_id.to_owned(), settings);
+        Ok(())
+    }
+
+    fn get_effective_meeting_settings(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<Option<EffectiveMeetingSettings>, StoreError> {
+        Ok(self.effective_settings.get(meeting_id).cloned())
     }
 }

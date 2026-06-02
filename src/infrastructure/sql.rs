@@ -28,6 +28,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0013_guild_bot_tokens.sql"),
     "\n",
     include_str!("../../migrations/0014_tenants_and_installations.sql"),
+    "\n",
+    include_str!("../../migrations/0015_effective_meeting_settings.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -266,6 +268,106 @@ SELECT whisper_language, whisper_language_explicit, whisper_vad,
        bot_user_id, bot_username
 FROM guild_settings
 WHERE guild_id = $1
+"#;
+
+pub const GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL: &str = r#"
+SELECT whisper_language, whisper_language_explicit, whisper_vad,
+       auto_stop_grace_seconds, retention_raw_audio_ttl_days,
+       retention_transcript_ttl_days, summary_enabled
+FROM guild_settings
+WHERE guild_id = $1
+"#;
+
+pub const INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL: &str = r#"
+WITH inserted_meeting AS (
+    INSERT INTO meetings(
+        id, guild_id, voice_channel_id, report_channel_id,
+        status_message_channel_id, status_message_id, started_by_user_id, status
+    )
+    VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')
+    RETURNING id
+)
+INSERT INTO meeting_effective_settings (
+    meeting_id, whisper_language, whisper_vad, whisper_beam_size,
+    whisper_suppress_non_speech, whisper_prompt, whisper_temperature,
+    whisper_resample_to_16k, auto_stop_grace_seconds, retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days, retention_summary_ttl_days, summary_enabled,
+    summary_template_id, domain_knowledge_version_id, updated_at
+)
+SELECT id, NULLIF($8,''), $9::TEXT::BOOLEAN, $10::TEXT::INTEGER,
+       $11::TEXT::BOOLEAN, NULLIF($12,''), $13::TEXT::DOUBLE PRECISION,
+       $14::TEXT::BOOLEAN, $15::TEXT::BIGINT, $16::TEXT::INTEGER,
+       $17::TEXT::INTEGER, NULLIF($18,'')::TEXT::INTEGER,
+       $19::TEXT::BOOLEAN, NULLIF($20,''), NULLIF($21,''), NOW()
+FROM inserted_meeting
+"#;
+
+pub const INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL: &str = r#"
+WITH inserted_meeting AS (
+    INSERT INTO meetings(
+        id, guild_id, voice_channel_id, report_channel_id,
+        status_message_channel_id, status_message_id, started_by_user_id, status
+    )
+    VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')
+    RETURNING id
+)
+INSERT INTO meeting_effective_settings (
+    meeting_id, whisper_language, whisper_vad, whisper_beam_size,
+    whisper_suppress_non_speech, whisper_prompt, whisper_temperature,
+    whisper_resample_to_16k, auto_stop_grace_seconds, retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days, retention_summary_ttl_days, summary_enabled,
+    summary_template_id, domain_knowledge_version_id, updated_at
+)
+SELECT id, NULLIF($8,''), $9::TEXT::BOOLEAN, $10::TEXT::INTEGER,
+       $11::TEXT::BOOLEAN, NULLIF($12,''), $13::TEXT::DOUBLE PRECISION,
+       $14::TEXT::BOOLEAN, $15::TEXT::BIGINT, $16::TEXT::INTEGER,
+       $17::TEXT::INTEGER, NULLIF($18,'')::TEXT::INTEGER,
+       $19::TEXT::BOOLEAN, NULLIF($20,''), NULLIF($21,''), NOW()
+FROM inserted_meeting
+"#;
+
+pub const UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL: &str = r#"
+INSERT INTO meeting_effective_settings (
+    meeting_id, whisper_language, whisper_vad, whisper_beam_size,
+    whisper_suppress_non_speech, whisper_prompt, whisper_temperature,
+    whisper_resample_to_16k, auto_stop_grace_seconds, retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days, retention_summary_ttl_days, summary_enabled,
+    summary_template_id, domain_knowledge_version_id, updated_at
+)
+SELECT m.id, NULLIF($2,''), $3::TEXT::BOOLEAN, $4::TEXT::INTEGER,
+       $5::TEXT::BOOLEAN, NULLIF($6,''), $7::TEXT::DOUBLE PRECISION,
+       $8::TEXT::BOOLEAN, $9::TEXT::BIGINT, $10::TEXT::INTEGER,
+       $11::TEXT::INTEGER, NULLIF($12,'')::TEXT::INTEGER,
+       $13::TEXT::BOOLEAN, NULLIF($14,''), NULLIF($15,''), NOW()
+FROM meetings m
+WHERE m.id = $1
+ON CONFLICT (meeting_id) DO UPDATE SET
+    whisper_language = EXCLUDED.whisper_language,
+    whisper_vad = EXCLUDED.whisper_vad,
+    whisper_beam_size = EXCLUDED.whisper_beam_size,
+    whisper_suppress_non_speech = EXCLUDED.whisper_suppress_non_speech,
+    whisper_prompt = EXCLUDED.whisper_prompt,
+    whisper_temperature = EXCLUDED.whisper_temperature,
+    whisper_resample_to_16k = EXCLUDED.whisper_resample_to_16k,
+    auto_stop_grace_seconds = EXCLUDED.auto_stop_grace_seconds,
+    retention_raw_audio_ttl_days = EXCLUDED.retention_raw_audio_ttl_days,
+    retention_transcript_ttl_days = EXCLUDED.retention_transcript_ttl_days,
+    retention_summary_ttl_days = EXCLUDED.retention_summary_ttl_days,
+    summary_enabled = EXCLUDED.summary_enabled,
+    summary_template_id = EXCLUDED.summary_template_id,
+    domain_knowledge_version_id = EXCLUDED.domain_knowledge_version_id,
+    updated_at = NOW()
+"#;
+
+pub const GET_EFFECTIVE_MEETING_SETTINGS_SQL: &str = r#"
+SELECT whisper_language, whisper_vad, whisper_beam_size,
+       whisper_suppress_non_speech, whisper_prompt, whisper_temperature,
+       whisper_resample_to_16k, auto_stop_grace_seconds,
+       retention_raw_audio_ttl_days, retention_transcript_ttl_days,
+       retention_summary_ttl_days, summary_enabled, summary_template_id,
+       domain_knowledge_version_id
+FROM meeting_effective_settings
+WHERE meeting_id = $1
 "#;
 
 pub const GET_GUILD_BOT_TOKEN_SQL: &str = r#"

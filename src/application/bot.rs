@@ -4,9 +4,10 @@ use crate::application::command::{
 use crate::application::stop::StopOutcome;
 use crate::domain::StopReason;
 use crate::domain::authz::UserRole;
+use crate::infrastructure::storage::EffectiveMeetingSettings;
 use crate::infrastructure::storage::MeetingStore;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StartCommandInput {
     pub meeting_id: String,
     pub guild_id: String,
@@ -15,6 +16,7 @@ pub struct StartCommandInput {
     pub user_voice_channel_id: Option<String>,
     pub permissions: PermissionSet,
     pub caller_role: UserRole,
+    pub effective_settings: Option<EffectiveMeetingSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,7 @@ impl<S: MeetingStore> BotCommandService<S> {
                 user_voice_channel_id: input.user_voice_channel_id,
                 permissions: input.permissions,
                 caller_role: input.caller_role,
+                effective_settings: input.effective_settings,
             },
         )?;
 

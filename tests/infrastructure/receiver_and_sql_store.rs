@@ -64,6 +64,7 @@ fn sql_store_applies_migration_and_writes_sql() {
             status_message_channel_id: None,
             status_message_id: None,
             started_by_user_id: "u1".to_owned(),
+            effective_settings: None,
         })
         .expect("insert should execute");
     store

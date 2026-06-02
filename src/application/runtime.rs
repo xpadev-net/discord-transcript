@@ -37,7 +37,10 @@ use crate::infrastructure::sql::{
     RECOVERY_SUMMARY_JOB_STATUS_SQL,
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
-use crate::infrastructure::storage::{MeetingStore, StatusMessageMetadata, StoredMeeting};
+use crate::infrastructure::storage::{
+    EffectiveMeetingSettings, MeetingSettingsDefaults, MeetingStore, StatusMessageMetadata,
+    StoredMeeting,
+};
 use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
@@ -136,9 +139,9 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeCommandInput {
-    RecordStart(StartCommandInput),
+    RecordStart(Box<StartCommandInput>),
     RecordStop {
         guild_id: String,
         user_id: String,
@@ -152,7 +155,7 @@ pub fn dispatch_runtime_command<S: MeetingStore>(
     input: RuntimeCommandInput,
 ) -> Result<String, CommandError> {
     match input {
-        RuntimeCommandInput::RecordStart(value) => service.handle_record_start(value),
+        RuntimeCommandInput::RecordStart(value) => service.handle_record_start(*value),
         RuntimeCommandInput::RecordStop {
             guild_id,
             user_id,
@@ -225,6 +228,18 @@ where
     };
 
     if should_enqueue {
+        if service
+            .store
+            .get_effective_meeting_settings(&stop_result.meeting_id)
+            .map_err(|err| err.to_string())?
+            .is_some_and(|settings| !settings.summary_enabled)
+        {
+            info!(
+                meeting_id = %stop_result.meeting_id,
+                "summary job not enqueued because meeting snapshot disabled summaries"
+            );
+            return Ok(stop_result);
+        }
         let job_id = format!("summary-{}", stop_result.meeting_id);
         match enqueue_summary_job(queue, &job_id, &stop_result.meeting_id) {
             Ok(()) => {
@@ -997,7 +1012,16 @@ fn recover_summary_job_for_startup<E: SqlExecutor>(
     queue: &mut SqlJobQueue<E>,
     job_id: &str,
     meeting_id: &str,
+    summary_enabled: bool,
 ) -> bool {
+    if !summary_enabled {
+        info!(
+            meeting_id,
+            job_id, "summary job not recovered because meeting snapshot disabled summaries"
+        );
+        return false;
+    }
+
     if let Err(err) = queue.executor.execute(
         RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL,
         &[job_id.to_owned()],
@@ -1408,6 +1432,7 @@ pub async fn run_bot(
         whisper_temperature: config.whisper_temperature,
         whisper_resample_to_16k: config.whisper_resample_to_16k,
         summary_max_retries: config.summary_max_retries,
+        summary_enabled: config.summary_enabled,
         retention_policy: config.retention_policy,
         integration_retry_policy: RetryPolicy {
             max_attempts: config.integration_retry_max_attempts,
@@ -1497,6 +1522,7 @@ struct ScaffoldHandler {
     whisper_temperature: f32,
     whisper_resample_to_16k: bool,
     summary_max_retries: u32,
+    summary_enabled: bool,
     retention_policy: crate::domain::retention::RetentionPolicy,
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
@@ -1504,6 +1530,70 @@ struct ScaffoldHandler {
 }
 
 impl ScaffoldHandler {
+    fn meeting_settings_defaults(&self) -> MeetingSettingsDefaults {
+        MeetingSettingsDefaults {
+            whisper_language: self.whisper_language.clone(),
+            whisper_vad: self.whisper_vad,
+            whisper_beam_size: self.whisper_beam_size,
+            whisper_suppress_non_speech: self.whisper_suppress_non_speech,
+            whisper_prompt: self.whisper_prompt.clone(),
+            whisper_temperature: self.whisper_temperature,
+            whisper_resample_to_16k: self.whisper_resample_to_16k,
+            auto_stop_grace_seconds: self.auto_stop_grace_seconds,
+            retention_raw_audio_ttl_days: self.retention_policy.raw_audio_ttl_days.get(),
+            retention_transcript_ttl_days: self.retention_policy.transcript_ttl_days.get(),
+            retention_summary_ttl_days: self
+                .retention_policy
+                .summary_ttl_days
+                .map(std::num::NonZeroU32::get),
+            summary_enabled: self.summary_enabled,
+        }
+    }
+
+    async fn resolve_effective_settings_for_guild(
+        &self,
+        guild_id: &str,
+    ) -> Result<EffectiveMeetingSettings, String> {
+        let defaults = self.meeting_settings_defaults();
+        let mut service = self.service.lock().await;
+        let guild_settings = service
+            .store
+            .get_guild_settings_for_meeting_snapshot(guild_id)
+            .map_err(|err| err.to_string())?;
+        Ok(EffectiveMeetingSettings::resolve(
+            &defaults,
+            guild_settings.as_ref(),
+        ))
+    }
+
+    async fn effective_settings_for_meeting(
+        &self,
+        meeting_id: &str,
+    ) -> Result<EffectiveMeetingSettings, String> {
+        let mut service = self.service.lock().await;
+        service
+            .store
+            .get_effective_meeting_settings(meeting_id)
+            .map_err(|err| err.to_string())
+            .map(|settings| {
+                settings.unwrap_or_else(|| {
+                    EffectiveMeetingSettings::from_defaults(&self.meeting_settings_defaults())
+                })
+            })
+    }
+
+    async fn auto_stop_grace_for_meeting(&self, meeting_id: Option<&str>) -> Duration {
+        let seconds = match meeting_id {
+            Some(meeting_id) => self
+                .effective_settings_for_meeting(meeting_id)
+                .await
+                .map(|settings| settings.auto_stop_grace_seconds)
+                .unwrap_or(self.auto_stop_grace_seconds),
+            None => self.auto_stop_grace_seconds,
+        };
+        Duration::from_secs(seconds)
+    }
+
     fn spawn_background<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -1574,20 +1664,31 @@ impl ScaffoldHandler {
             return;
         }
 
+        let effective_settings = self
+            .effective_settings_for_meeting(&chunk.meeting_id)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    meeting_id = %chunk.meeting_id,
+                    error = %err,
+                    "failed to load meeting settings snapshot for live transcription; using runtime defaults"
+                );
+                EffectiveMeetingSettings::from_defaults(&self.meeting_settings_defaults())
+            });
         let whisper = CommandWhisperClient {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
             retry_policy: self.integration_retry_policy,
-            beam_size: self.whisper_beam_size,
-            suppress_non_speech: self.whisper_suppress_non_speech,
-            prompt: self.whisper_prompt.clone(),
-            vad: self.whisper_vad,
-            temperature: self.whisper_temperature,
+            beam_size: effective_settings.whisper_beam_size,
+            suppress_non_speech: effective_settings.whisper_suppress_non_speech,
+            prompt: effective_settings.whisper_prompt.clone(),
+            vad: effective_settings.whisper_vad,
+            temperature: effective_settings.whisper_temperature,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
         let request = WhisperInferenceRequest {
             audio_path: chunk.saved.path.to_string_lossy().to_string(),
-            language: self.whisper_language.clone(),
+            language: effective_settings.whisper_language.clone(),
         };
         let transcription = tokio::task::block_in_place(|| whisper.infer(&request));
         let mut segments = match transcription {
@@ -1968,7 +2069,10 @@ impl EventHandler for ScaffoldHandler {
             );
             return;
         };
-        let grace = Duration::from_secs(self.auto_stop_grace_seconds);
+        let active_meeting_id = self.active_meeting_id().await;
+        let grace = self
+            .auto_stop_grace_for_meeting(active_meeting_id.as_deref())
+            .await;
         let (signal, timer_generation) = {
             let mut states = self.auto_stop_states.lock().await;
             let state = states
@@ -1984,7 +2088,7 @@ impl EventHandler for ScaffoldHandler {
             let handler = self.clone();
             let ctx_for_task = ctx.clone();
             let guild_for_task = guild_key;
-            let expected_meeting_id = self.active_meeting_id().await;
+            let expected_meeting_id = active_meeting_id;
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
             self.spawn_background(async move {
@@ -2384,10 +2488,20 @@ impl ScaffoldHandler {
             match effect {
                 RecoveryEffect::SummaryRequeued { .. }
                 | RecoveryEffect::StopConfirmedClientDisconnect { .. } => {
+                    let summary_enabled = self
+                        .effective_settings_for_meeting(&snapshot.meeting_id)
+                        .await
+                        .map(|settings| settings.summary_enabled)
+                        .unwrap_or(self.summary_enabled);
                     let job_id = format!("summary-{}", snapshot.meeting_id);
                     let job_available = {
                         let mut queue = self.queue.lock().await;
-                        recover_summary_job_for_startup(&mut queue, &job_id, &snapshot.meeting_id)
+                        recover_summary_job_for_startup(
+                            &mut queue,
+                            &job_id,
+                            &snapshot.meeting_id,
+                            summary_enabled,
+                        )
                     };
                     if !job_available {
                         // No claimable job — skip run_summary_and_notify for this meeting.
@@ -2610,6 +2724,9 @@ impl ScaffoldHandler {
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
         let _command_guard = self.command_gate.read().await;
         self.reject_if_shutting_down()?;
+        let effective_settings = self
+            .resolve_effective_settings_for_guild(&guild_id.get().to_string())
+            .await?;
 
         let mut service = self.service.lock().await;
         let response = complete_record_start_after_runtime_setup(
@@ -2622,6 +2739,7 @@ impl ScaffoldHandler {
                 user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
                 permissions,
                 caller_role,
+                effective_settings: Some(effective_settings),
             },
         )?;
         drop(service);
@@ -3140,15 +3258,16 @@ impl ScaffoldHandler {
         http: &Http,
         meeting_id: &str,
     ) -> Result<crate::application::worker::ProcessMeetingOutput, SummaryJobRunError> {
+        let effective_settings = self.effective_settings_for_meeting(meeting_id).await?;
         let whisper = CommandWhisperClient {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
             retry_policy: self.integration_retry_policy,
-            beam_size: self.whisper_beam_size,
-            suppress_non_speech: self.whisper_suppress_non_speech,
-            prompt: self.whisper_prompt.clone(),
-            vad: self.whisper_vad,
-            temperature: self.whisper_temperature,
+            beam_size: effective_settings.whisper_beam_size,
+            suppress_non_speech: effective_settings.whisper_suppress_non_speech,
+            prompt: effective_settings.whisper_prompt.clone(),
+            vad: effective_settings.whisper_vad,
+            temperature: effective_settings.whisper_temperature,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
         let summary_client = HarnessCliSummaryClient {
@@ -3253,34 +3372,36 @@ impl ScaffoldHandler {
         }
         let _heartbeat_guard = SummaryJobHeartbeatGuard(heartbeat_task);
 
-        let audio_path =
-            match merge_user_chunks_to_mixdown(&meeting_dir, self.whisper_resample_to_16k) {
-                Ok(path) => path,
-                Err(err) => {
-                    let err_string = format!("merge failed: {err}");
-                    let mut queue = self.queue.lock().await;
-                    let exhausted = retry_claimed_summary_job(
-                        &mut *queue,
-                        &claimed_job,
-                        err_string.clone(),
-                        self.summary_max_retries,
-                        "merge",
+        let audio_path = match merge_user_chunks_to_mixdown(
+            &meeting_dir,
+            effective_settings.whisper_resample_to_16k,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let err_string = format!("merge failed: {err}");
+                let mut queue = self.queue.lock().await;
+                let exhausted = retry_claimed_summary_job(
+                    &mut *queue,
+                    &claimed_job,
+                    err_string.clone(),
+                    self.summary_max_retries,
+                    "merge",
+                );
+                drop(queue);
+                if exhausted {
+                    let mut service = self.service.lock().await;
+                    let _ = service.store.set_meeting_status(
+                        &claimed_job.meeting_id,
+                        MeetingStatus::Failed,
+                        None,
                     );
-                    drop(queue);
-                    if exhausted {
-                        let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(
-                            &claimed_job.meeting_id,
-                            MeetingStatus::Failed,
-                            None,
-                        );
-                        let _ = service
-                            .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
-                    }
-                    return Err(SummaryJobRunError::Terminal(err_string));
+                    let _ = service
+                        .store
+                        .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
                 }
-            };
+                return Err(SummaryJobRunError::Terminal(err_string));
+            }
+        };
 
         let final_timeline_base_ms = match load_chunks(&meeting_dir) {
             Ok(chunks) => compute_meeting_start_ms(&chunks),
@@ -3329,11 +3450,11 @@ impl ScaffoldHandler {
         };
 
         let speaker_audio = match if completed_live_chunks.is_empty() {
-            build_speaker_audio_inputs(&meeting_dir, self.whisper_resample_to_16k)
+            build_speaker_audio_inputs(&meeting_dir, effective_settings.whisper_resample_to_16k)
         } else {
             build_speaker_audio_inputs_excluding_processed_chunks(
                 &meeting_dir,
-                self.whisper_resample_to_16k,
+                effective_settings.whisper_resample_to_16k,
                 &completed_live_chunks,
             )
         } {
@@ -3388,7 +3509,7 @@ impl ScaffoldHandler {
             title: meeting.title.clone(),
             speaker_audio,
             audio_path,
-            language: self.whisper_language.clone(),
+            language: effective_settings.whisper_language.clone(),
             workspace: workspace.clone(),
         };
 
@@ -3746,12 +3867,12 @@ impl ScaffoldHandler {
                 crate::application::summary::persist_correction_prompt_debug_artifact(
                     &request.workspace,
                     &summary_transcript,
-                    self.whisper_language.as_deref(),
+                    effective_settings.whisper_language.as_deref(),
                 )
                 .unwrap_or_else(|| {
                     crate::application::summary::build_correction_prompt(
                         &summary_transcript,
-                        self.whisper_language.as_deref(),
+                        effective_settings.whisper_language.as_deref(),
                     )
                 });
             match tokio::task::block_in_place(|| {
@@ -4214,7 +4335,9 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let http = Arc::clone(&self.http);
                     let ctx_for_task = self.ctx.clone();
                     let expected_meeting_id = runtime.active_meeting_id().await;
-                    let grace = Duration::from_secs(runtime.auto_stop_grace_seconds);
+                    let grace = runtime
+                        .auto_stop_grace_for_meeting(expected_meeting_id.as_deref())
+                        .await;
                     self.runtime.spawn_background(async move {
                         tokio::select! {
                             _ = sleep(grace) => {}
@@ -4906,7 +5029,8 @@ mod status_message_tests {
         assert!(recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
     }
 
@@ -4916,14 +5040,16 @@ mod status_message_tests {
         assert!(!recover_summary_job_for_startup(
             &mut running_queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
 
         let mut failed_queue = fake_recovery_queue_with_existing_summary_job_status("failed");
         assert!(!recover_summary_job_for_startup(
             &mut failed_queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
     }
 
@@ -4940,7 +5066,8 @@ mod status_message_tests {
         assert!(!recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
     }
 
@@ -4951,7 +5078,8 @@ mod status_message_tests {
         assert!(recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
         assert_eq!(queue.executor.job_status, "queued");
         assert!(queue.executor.inner.executed.iter().any(|(sql, params)| {
@@ -4967,7 +5095,8 @@ mod status_message_tests {
         assert!(!recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
         assert_eq!(queue.executor.job_status, "failed");
     }
@@ -4979,7 +5108,8 @@ mod status_message_tests {
         assert!(!recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
         assert_eq!(queue.executor.job_status, "running");
     }
@@ -4998,9 +5128,23 @@ mod status_message_tests {
         assert!(recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
-            "m1"
+            "m1",
+            true
         ));
         assert_eq!(queue.executor.job_status, "queued");
+    }
+
+    #[test]
+    fn recovery_does_not_recover_summary_job_when_snapshot_disables_summary() {
+        let mut queue = fake_recovery_queue_with_existing_summary_job_status("queued");
+
+        assert!(!recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1",
+            false
+        ));
+        assert!(queue.executor.inner.executed.is_empty());
     }
 
     fn running_summary_job() -> crate::infrastructure::queue::Job {
@@ -5670,6 +5814,7 @@ mod status_message_tests {
                 can_send_messages: true,
             },
             caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
         }
     }
 
