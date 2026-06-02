@@ -111,6 +111,7 @@ Usage timing differs by unit:
 - Retries count again only after a retry submits audio to ASR.
 - Period usage increments when the ASR request is started or durably queued with a known input duration.
 - Idempotency keys for `asr_seconds` must be per ASR attempt, not per meeting or job, so retries are counted exactly once each.
+- `asr_attempt_id` is a server-assigned opaque id created before durably queueing or submitting each ASR attempt. It is scoped to one `(tenant_id, meeting_id, job_type, attempt_number)` and stored with the usage event or job-attempt metadata before the external ASR request starts. Redelivery of the same queued attempt reuses the same `asr_attempt_id`; a retry that submits audio creates a new `asr_attempt_id`.
 
 `summary_runs`
 
@@ -119,6 +120,7 @@ Usage timing differs by unit:
 - Do not count validation failures or jobs that fail before an LLM invocation begins.
 - Period usage increments at invocation start.
 - Idempotency keys for `summary_runs` must be per invocation attempt, not per meeting, so retries are counted exactly once each.
+- `summary_invocation_id` is a server-assigned opaque id created before sending each summary prompt. It is scoped to one `(tenant_id, meeting_id, job_type, invocation_number)` and stored with the usage event or job-attempt metadata before the LLM request starts. Redelivery of the same queued invocation reuses the same `summary_invocation_id`; a retry or regeneration that sends a prompt creates a new `summary_invocation_id`.
 
 `debug_downloads`
 
@@ -273,7 +275,8 @@ Rules:
 - The intended active-row uniqueness constraint is `guild_id WHERE status = 'active'`.
 - A `(tenant_id, guild_id)` pair may have only one active row.
 - Revoked rows remain for history and audit but must not be used for SaaS query scoping.
-- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild with `period_anchor` matching the authoritative tenant `period_anchor`. The new assignment `plan_id` must be explicit from the move source: admin moves require a caller-supplied active plan, billing-provider moves use the provider-supplied plan mapping, and system or migration moves use the explicit system/migration plan. The old tenant's plan is never inherited implicitly. The move must invalidate or advance storage gauge watermarks for both the old and new tenants in the same transaction, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale in the transaction, for example by setting `storage_bytes.source_watermark = null` for both tenants. If the new assignment cannot be created in the same transaction, the move fails.
+- Moving a guild to another tenant is a single transaction: verify the guild has no non-terminal meetings and no in-flight ASR or summary jobs according to the database job-status records, revoke the current active tenant-guild row with `revoked_at`, end the old `(tenant_id, guild_id)` active plan assignment and any scheduled plan assignment, insert or activate the new tenant binding, and insert a new active plan assignment for the new tenant and guild with `period_anchor` matching the authoritative tenant `period_anchor` after any first-assignment initialization. The new assignment `plan_id` must be explicit from the move source: admin moves require a caller-supplied active plan, billing-provider moves use the provider-supplied plan mapping, and system or migration moves use the explicit system/migration plan. The old tenant's plan is never inherited implicitly. The move must invalidate or advance storage gauge watermarks for both the old and new tenants in the same transaction, either by generating tenant-scoped artifact mutation sequences for both de-attribution and attribution or by marking both gauges stale in the transaction, for example by setting `storage_bytes.source_watermark = null` for both tenants. If the new assignment cannot be created in the same transaction, the move fails.
+- If the receiving tenant's `period_anchor` is null during a guild move, the move transaction must initialize it using the same first-assignment rule as guild plan assignment creation: billing-provider subscription anchor when present, otherwise the new assignment's `effective_at`. The new active assignment then copies that initialized tenant anchor.
 - SaaS queries that start from `guild_id` must resolve through an active `tenant_guilds` row before reading or mutating tenant-owned data.
 
 ### Guild Plan Assignment
