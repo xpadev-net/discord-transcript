@@ -109,6 +109,7 @@ Usage timing differs by unit:
 
 - Measures audio seconds submitted to ASR.
 - Count the actual audio duration sent to the ASR engine. For per-speaker chunk ASR, sum submitted chunk durations; for mixdown ASR, use the mixdown duration.
+- When the planned per-speaker chunk durations are known before submission, entitlement pre-flight must check or reserve the aggregate planned ASR seconds for the meeting before enqueueing any chunk. Do not rely on independent per-chunk checks that can pass concurrently and exceed the tenant quota in aggregate.
 - Retries count again only after a retry submits audio to ASR.
 - Period usage increments when the ASR request is started or durably queued with a known input duration.
 - Idempotency keys for `asr_seconds` must be per ASR attempt, not per meeting or job, so retries are counted exactly once each.
@@ -130,6 +131,7 @@ Usage timing differs by unit:
 - The unit is per artifact download intent, not per HTTP response. Count only the first successful 200 or 206 response for the same `(tenant_id, meeting_id, artifact_id, download_session_id)`; later full or range responses in that session do not increment usage.
 - `download_session_id` is a server-assigned opaque id created when a user is authorized for a debug artifact download. It is scoped to one `(tenant_id, meeting_id, artifact_id, user_id)` logical access, is embedded in the generated download URL or token, and expires no later than the download authorization.
 - The intended active-session uniqueness constraint is `(tenant_id, meeting_id, artifact_id, user_id) WHERE status = 'active'`. Repeated authorization for the same tuple should reuse the active `download_session_id` or atomically revoke/expire it before creating a replacement; multiple concurrent active sessions for the same tuple are not valid in the initial contract.
+- Authorization must use an atomic upsert or a serialized lock on `(tenant_id, meeting_id, artifact_id, user_id)`. If concurrent insertion loses to the active-session uniqueness constraint, retry the active-session lookup in the same request and return the winning active `download_session_id`; do not surface the conflict as a user-visible failure.
 - Do not count denied, missing, or validation-failed requests.
 - Period usage increments when the response begins streaming or returns an inline artifact.
 - Idempotency keys for `debug_downloads` must be per `download_session_id`, not per meeting or artifact, so each authorized logical download intent is counted at most once.
