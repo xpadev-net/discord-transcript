@@ -298,6 +298,12 @@ Rules:
 
 Purpose: authoritative record for tenant-close and guild-move checks that need to know whether ASR or summary work is still active.
 
+Meeting boundary checks:
+
+- Terminal meeting statuses are `posted`, `failed`, and `aborted`.
+- Non-terminal meeting statuses are `scheduled`, `recording`, `stopping`, `transcribing`, and `summarizing`.
+- Tenant close, guild move, and standalone binding revocation must use this terminal/non-terminal split when verifying that no non-terminal meetings remain.
+
 Fields:
 
 - `tenant_id`
