@@ -235,7 +235,7 @@ Rules:
 
 ### Period Counter Reservation
 
-Purpose: mutable tenant-period counter used for hard pre-flight reservations that cannot rely on read-then-insert usage aggregation.
+Purpose: per-source tenant-period reservation used for hard pre-flight checks that cannot rely on read-then-insert usage aggregation.
 
 Fields:
 
@@ -243,15 +243,21 @@ Fields:
 - `unit`: initially `asr_seconds`.
 - `period_start`
 - `period_end`
+- `source_type`: initially `asr_attempt`.
+- `source_id`: durable identifier of the attempt that owns the reservation.
 - `reserved_value`: non-negative integer amount reserved but not yet converted into usage events.
+- `reserved_until`: instant after which the reservation no longer counts toward hard-quota enforcement.
 - `updated_at`
 
 Rules:
 
-- The intended uniqueness constraint is `(tenant_id, unit, period_start, period_end)`.
-- Hard `asr_seconds` pre-flight must lock or atomically upsert this row, compare `current_usage + reserved_value + requested_amount` against the finite quota, and increment `reserved_value` only if the result fits.
+- The intended uniqueness constraint is `(tenant_id, unit, period_start, period_end, source_type, source_id)`.
+- Hard `asr_seconds` pre-flight must lock or atomically upsert the source reservation row, compare `current_usage + active_reserved_value_excluding_this_source + requested_amount` against the finite quota, and set `reserved_value` only if the result fits.
 - `current_usage` is the committed sum of Period Counter Usage Event `amount` for the same tenant, unit, and period.
-- When an ASR attempt records its usage event or is cancelled before submitting audio, release the matching reservation in the same transaction or an equivalent idempotent reconciliation step.
+- `active_reserved_value` is the sum of reservation `reserved_value` for the same tenant, unit, and period where `reserved_until` is greater than the transaction timestamp.
+- The initial reservation TTL is 15 minutes. A worker that still needs the reservation must refresh `reserved_until` before it expires, and must stop before submitting additional audio if it cannot refresh the reservation.
+- When an ASR attempt records its usage event or is cancelled before submitting audio, delete the matching reservation in the same transaction or an equivalent idempotent reconciliation step.
+- Reconciliation must run at least every 5 minutes and delete expired reservation rows after confirming the source job is terminal or absent. Expired rows are ignored by quota enforcement even before reconciliation deletes them.
 
 ### Storage Bytes Gauge
 
@@ -485,7 +491,7 @@ Fields:
   - Initial `env.version = 1` field set: exactly `whisper_language`, `whisper_language_explicit`, `whisper_vad`, `whisper_beam_size`, `whisper_suppress_non_speech`, `whisper_prompt`, `whisper_temperature`, `whisper_resample_to_16k`, `auto_stop_grace_seconds`, `retention_raw_audio_ttl_days`, `retention_transcript_ttl_days`, `retention_summary_ttl_days`, `summary_enabled`, and `bot_token_source`. `bot_token_source` is included because it is a non-secret source marker. Credential values and any other environment defaults are excluded.
   - Initial `env.version = 1` field types: strings are `whisper_language`, `whisper_prompt`, and `bot_token_source`; booleans are `whisper_language_explicit`, `whisper_vad`, `whisper_suppress_non_speech`, `whisper_resample_to_16k`, and `summary_enabled`; integers are `whisper_beam_size`, `auto_stop_grace_seconds`, `retention_raw_audio_ttl_days`, `retention_transcript_ttl_days`, and `retention_summary_ttl_days`; the only decimal field is `whisper_temperature`.
   - Initial `env.version = 1` optional fields are `whisper_language` and `whisper_prompt`. Their canonical absent representation is omission from the hash input object; null and empty environment strings for those fields are normalized to absent before hashing. Every other initial field is required in the hash input.
-  - JSON serialization: keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings such as `whisper_temperature` must be captured from raw environment strings before typed parsing (for example `process.env`, `os.environ`, or the injected config map string value) and serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer. Raw decimal environment strings that are not already in standard decimal notation, including scientific notation such as `1.0e-2`, make snapshot hash generation fail. If the raw string is unavailable, snapshot hash generation fails. Every decimal setting that participates in the snapshot must therefore be supplied as an environment variable string in all deployment environments, including local development and CI; a typed code default is not sufficient for hash computation. Implementations must validate the presence and format of all participating decimal env strings at process startup and refuse to start if any participating decimal value is absent, is in scientific notation, has trailing zeros after a decimal point, or is otherwise not in standard decimal form. Integer-valued decimals must be configured without a decimal point, so `0` and `1` are valid but `0.0` and `1.0` are invalid. This makes the failure surface at deploy time rather than at recording start.
+  - JSON serialization: compact JSON with no whitespace between tokens; keys sorted lexicographically at every object level, recursively; absent optional values and null optional values both omitted; booleans serialized as JSON `true` or `false` literals; integers serialized without a decimal point; decimal settings such as `whisper_temperature` must be captured from raw environment strings before typed parsing (for example `process.env`, `os.environ`, or the injected config map string value) and serialized from normalized exact decimal source strings, not binary floating-point renderings, in standard decimal notation with no trailing zeros; a decimal whose fractional part is zero is serialized as an integer. Raw decimal environment strings that are not already in standard decimal notation, including scientific notation such as `1.0e-2`, make snapshot hash generation fail. If the raw string is unavailable, snapshot hash generation fails. Every decimal setting that participates in the snapshot must therefore be supplied as an environment variable string in all deployment environments, including local development and CI; a typed code default is not sufficient for hash computation. Implementations must validate the presence and format of all participating decimal env strings at process startup and refuse to start if any participating decimal value is absent, is in scientific notation, has trailing zeros after a decimal point, or is otherwise not in standard decimal form. Integer-valued decimals must be configured without a decimal point, so `0` and `1` are valid but `0.0` and `1.0` are invalid. This makes the failure surface at deploy time rather than at recording start.
   The env layer is always present; `"env": null` is invalid. For new SaaS snapshots, the tenant layer is also always present because `tenant_id` is required on the snapshot; if the tenant has no tenant-default settings row, use `{ "id": "<tenant_id>", "version": null }`. A null tenant layer is reserved only for an explicit future pre-SaaS legacy backfill path and must not be emitted by normal snapshot creation. For new SaaS snapshots, the guild layer is also always present because `guild_id` is required on the snapshot; if the guild has no guild override row, use `{ "id": "<guild_id>", "version": null }`. A null guild layer is reserved only for an explicit future pre-SaaS legacy backfill path and must not be emitted by normal snapshot creation.
 - `settings`: structured values for the effective settings fields listed above.
 
