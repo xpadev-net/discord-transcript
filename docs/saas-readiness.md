@@ -471,7 +471,7 @@ Rules:
 
 - Initially there is one active assignment per `(tenant_id, guild_id)`.
 - The first plan assignment for a tenant-guild must be created with `status = active`; scheduled assignments require an existing active assignment and an initialized tenant `period_anchor`.
-- Every transaction that writes a guild plan assignment must assert that the row's `period_anchor` equals the authoritative tenant `period_anchor`, using a trigger, deferred constraint, or explicit locked CTE assertion in that transaction. A mismatch fails the write.
+- Every transaction that writes a guild plan assignment must assert that the row's `period_anchor` equals the authoritative tenant `period_anchor`, using a trigger, deferred constraint, or explicit locked CTE assertion in that transaction. A mismatch fails the write. When using a non-deferred trigger, the tenant `period_anchor` must be written before the assignment row is inserted in the same transaction; for the first assignment this means updating the tenant's `period_anchor` first so the trigger reads the initialized value rather than null.
 - The intended active-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'active'`.
 - The intended scheduled-row uniqueness constraint is `(tenant_id, guild_id) WHERE status = 'scheduled'`.
 - Current guild ownership is resolved separately through the active tenant-guild binding, which must allow at most one active tenant for a Discord `guild_id`.
