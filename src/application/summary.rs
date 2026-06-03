@@ -168,11 +168,13 @@ pub fn build_whisper_context_prompt(
     if let Some(title) = title.map(str::trim)
         && !title.is_empty()
     {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
         lines.push(format!("Meeting title: {title}"));
     }
     if let Some(speaker_id) = speaker_id.map(str::trim)
         && !speaker_id.is_empty()
     {
+        let speaker_id = speaker_id.split_whitespace().collect::<Vec<_>>().join(" ");
         lines.push(format!("Speaker ID: {speaker_id}"));
     }
     if lines.is_empty() {

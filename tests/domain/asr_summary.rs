@@ -403,8 +403,9 @@ fn transcription_passes_meeting_prompt_to_mixdown_whisper_request() {
 fn whisper_context_prompt_omits_blank_context() {
     assert_eq!(build_whisper_context_prompt(Some("  "), Some("\t")), None);
     assert_eq!(
-        build_whisper_context_prompt(Some("定例会"), Some("  user-1  ")).as_deref(),
-        Some("Meeting title: 定例会\nSpeaker ID: user-1")
+        build_whisper_context_prompt(Some("定例会\n運用\t確認"), Some("  user-1\nalice  "))
+            .as_deref(),
+        Some("Meeting title: 定例会 運用 確認\nSpeaker ID: user-1 alice")
     );
 }
 

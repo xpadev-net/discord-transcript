@@ -206,8 +206,8 @@ fn render_whisper_command_for_log(
 }
 
 fn quote_log_arg(part: &str) -> String {
-    if part.contains(char::is_whitespace) || part.contains('"') {
-        format!("\"{}\"", part.replace('"', "\\\""))
+    if part.contains(char::is_whitespace) || part.contains('"') || part.contains('\\') {
+        format!("\"{}\"", part.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         part.to_owned()
     }
@@ -906,7 +906,7 @@ mod tests {
             command_timeout: Duration::from_secs(5),
         };
         let request = WhisperInferenceRequest {
-            audio_path: "audio file.wav".to_owned(),
+            audio_path: r#"audio file "quoted"\chunk.wav"#.to_owned(),
             language: None,
             prompt: Some(secret_request.to_owned()),
         };
@@ -922,7 +922,7 @@ mod tests {
         assert!(!message.contains(secret_request));
         assert!(!message.contains("customer secret"));
         assert!(!message.contains("still secret"));
-        assert!(message.contains("\"file=@audio file.wav\""));
+        assert!(message.contains(r#""file=@audio file \"quoted\"\\chunk.wav""#));
         assert!(message.contains("prompt=[REDACTED]"));
 
         let client_debug = format!("{client:?}");
