@@ -81,7 +81,6 @@ CREATE TABLE IF NOT EXISTS ai_memory_notes (
     CONSTRAINT ai_memory_notes_source_reference_check CHECK (
         (
             source_type = 'ai_meeting_extraction'
-            AND source_meeting_id IS NOT NULL
             AND source_feedback_id IS NULL
         )
         OR (
@@ -90,7 +89,6 @@ CREATE TABLE IF NOT EXISTS ai_memory_notes (
         )
         OR (
             source_type = 'vc_participant'
-            AND source_meeting_id IS NOT NULL
             AND source_feedback_id IS NULL
         )
         OR (
@@ -271,24 +269,6 @@ CREATE INDEX IF NOT EXISTS idx_transcript_feedback_target_ai_memory
     ON transcript_feedback (target_ai_memory_note_id)
     WHERE target_ai_memory_note_id IS NOT NULL;
 
-CREATE OR REPLACE FUNCTION clear_transcript_feedback_meeting_refs()
-RETURNS TRIGGER AS $$
-BEGIN
-    UPDATE transcript_feedback
-    SET meeting_id = NULL,
-        transcript_segment_id = NULL
-    WHERE meeting_id = OLD.id;
-    RETURN OLD;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_clear_transcript_feedback_meeting_refs ON meetings;
-
-CREATE TRIGGER trg_clear_transcript_feedback_meeting_refs
-BEFORE DELETE ON meetings
-FOR EACH ROW
-EXECUTE FUNCTION clear_transcript_feedback_meeting_refs();
-
 CREATE TABLE IF NOT EXISTS person_aliases (
     id TEXT PRIMARY KEY,
     tenant_discord_guild_id TEXT NOT NULL,
@@ -361,7 +341,6 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         )
         OR (
             source_type = 'vc_participant'
-            AND source_meeting_id IS NOT NULL
             AND source_feedback_id IS NULL
         )
         OR (
@@ -371,6 +350,34 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         )
     )
 );
+
+CREATE OR REPLACE FUNCTION clear_ai_feedback_meeting_refs()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE transcript_feedback
+    SET meeting_id = NULL,
+        transcript_segment_id = NULL
+    WHERE meeting_id = OLD.id;
+
+    UPDATE ai_memory_notes
+    SET source_meeting_id = NULL
+    WHERE source_meeting_id = OLD.id;
+
+    UPDATE person_aliases
+    SET source_meeting_id = NULL
+    WHERE source_meeting_id = OLD.id;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_clear_transcript_feedback_meeting_refs ON meetings;
+DROP TRIGGER IF EXISTS trg_clear_ai_feedback_meeting_refs ON meetings;
+
+CREATE TRIGGER trg_clear_ai_feedback_meeting_refs
+BEFORE DELETE ON meetings
+FOR EACH ROW
+EXECUTE FUNCTION clear_ai_feedback_meeting_refs();
 
 CREATE INDEX IF NOT EXISTS idx_person_aliases_tenant_guild_active
     ON person_aliases (tenant_id, guild_id, active, updated_at DESC, id);

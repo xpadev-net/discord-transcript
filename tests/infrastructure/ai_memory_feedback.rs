@@ -118,7 +118,6 @@ fn schema_constrains_source_confidence_active_archive_and_review_fields() {
     assert!(schema.contains("source_type = 'user_feedback'"));
     assert!(schema.contains("source_feedback_id IS NOT NULL"));
     assert!(schema.contains("source_type = 'vc_participant'"));
-    assert!(schema.contains("source_meeting_id IS NOT NULL"));
     assert!(schema.contains("source_meeting_id IS NULL"));
     assert!(schema.contains("source_feedback_id IS NULL"));
     assert!(schema.contains("archived_at IS NOT NULL"));
@@ -178,10 +177,13 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(segment_fk.contains("DEFERRABLE INITIALLY DEFERRED"));
     assert!(schema.contains("transcript_feedback_segment_delete_fk"));
     assert!(schema.contains("FOREIGN KEY (transcript_segment_id) REFERENCES transcripts(id) ON DELETE SET NULL"));
-    assert!(schema.contains("CREATE OR REPLACE FUNCTION clear_transcript_feedback_meeting_refs()"));
+    assert!(schema.contains("CREATE OR REPLACE FUNCTION clear_ai_feedback_meeting_refs()"));
     assert!(schema.contains("DROP TRIGGER IF EXISTS trg_clear_transcript_feedback_meeting_refs ON meetings"));
-    assert!(schema.contains("CREATE TRIGGER trg_clear_transcript_feedback_meeting_refs"));
+    assert!(schema.contains("DROP TRIGGER IF EXISTS trg_clear_ai_feedback_meeting_refs ON meetings"));
+    assert!(schema.contains("CREATE TRIGGER trg_clear_ai_feedback_meeting_refs"));
     assert!(schema.contains("SET meeting_id = NULL,\n        transcript_segment_id = NULL"));
+    assert!(schema.contains("UPDATE ai_memory_notes\n    SET source_meeting_id = NULL"));
+    assert!(schema.contains("UPDATE person_aliases\n    SET source_meeting_id = NULL"));
     assert!(
         schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL")
     );
@@ -214,6 +216,15 @@ fn source_feedback_delete_paths_keep_set_null_compatible_with_checks() {
         !ai_memory_user_feedback_check.contains("source_feedback_id IS NOT NULL"),
         "ai memory source feedback must be nullable after feedback deletion"
     );
+    let ai_memory_meeting_check = sql_between(
+        schema,
+        "source_type = 'ai_meeting_extraction'",
+        "source_type = 'user_feedback'",
+    );
+    assert!(
+        !ai_memory_meeting_check.contains("source_meeting_id IS NOT NULL"),
+        "ai memory meeting source must be nullable after meeting deletion"
+    );
 
     let alias_user_feedback_check = sql_between(
         schema,
@@ -225,6 +236,15 @@ fn source_feedback_delete_paths_keep_set_null_compatible_with_checks() {
     assert!(
         !alias_user_feedback_check.contains("source_feedback_id IS NOT NULL"),
         "person alias source feedback must be nullable after feedback deletion"
+    );
+    let alias_meeting_check = sql_between(
+        schema,
+        "CONSTRAINT person_aliases_source_reference_check",
+        "source_type IN ('manual', 'ai_inference')",
+    );
+    assert!(
+        !alias_meeting_check.contains("source_meeting_id IS NOT NULL"),
+        "person alias meeting source must be nullable after meeting deletion"
     );
 }
 
@@ -255,6 +275,7 @@ fn ai_memory_domain_types_match_schema_values() {
         ConfidencePermille::parse_sql_decimal("1.000").expect("valid full confidence"),
         ConfidencePermille::new(1000).unwrap()
     );
+    assert!(ConfidencePermille::new(900).unwrap() > ConfidencePermille::new(875).unwrap());
     assert!(ConfidencePermille::new(1001).is_err());
     assert!(ConfidencePermille::parse_sql_decimal("1").is_err());
     assert!(ConfidencePermille::parse_sql_decimal("1.").is_err());
