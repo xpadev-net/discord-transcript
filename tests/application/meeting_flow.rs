@@ -1,5 +1,7 @@
 use discord_transcript::application::meeting_flow::{MeetingFlowInput, run_meeting_flow};
-use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
+use discord_transcript::application::summary::{
+    SpeakerAudioInput, StubClaudeSummaryClient, SummaryContextInput,
+};
 use discord_transcript::application::worker::ProcessMeetingInput;
 use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig};
@@ -99,6 +101,7 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         }],
         language: Some("ja".to_owned()),
         workspace,
+        summary_context: SummaryContextInput::default(),
     };
     let retention_records = [ArtifactRecord {
         kind: RetentionKind::RawAudio,

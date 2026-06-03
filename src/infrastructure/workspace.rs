@@ -12,6 +12,10 @@ pub const DEBUG_MIXDOWN_WHISPER_FILENAME: &str = "mixdown.json";
 pub const DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME: &str = "transcript_pre_correction.md";
 pub const DEBUG_CORRECTION_PROMPT_FILENAME: &str = "correction_prompt.txt";
 pub const DEBUG_SUMMARY_PROMPT_FILENAME: &str = "summary_prompt.txt";
+pub const CONTEXT_MANIFEST_FILENAME: &str = "manifest.json";
+pub const CONTEXT_SPEAKERS_FILENAME: &str = "speakers.json";
+pub const CONTEXT_DOMAIN_KNOWLEDGE_FILENAME: &str = "domain_knowledge.md";
+pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspaceLayout {
@@ -139,6 +143,22 @@ impl MeetingWorkspacePaths {
 
     pub fn summary_prompt_path(&self) -> PathBuf {
         self.debug_dir().join(DEBUG_SUMMARY_PROMPT_FILENAME)
+    }
+
+    pub fn context_manifest_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_MANIFEST_FILENAME)
+    }
+
+    pub fn context_speakers_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_SPEAKERS_FILENAME)
+    }
+
+    pub fn context_domain_knowledge_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_DOMAIN_KNOWLEDGE_FILENAME)
+    }
+
+    pub fn context_summary_template_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_SUMMARY_TEMPLATE_FILENAME)
     }
 
     pub fn ensure_base_dirs(&self) -> std::io::Result<()> {
