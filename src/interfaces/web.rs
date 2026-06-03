@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_postgres::Client as PgClient;
+use tokio_postgres::error::SqlState;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 use uuid::Uuid;
@@ -26,15 +27,18 @@ use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::audit::AuditEvent;
 use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::speaker::SpeakerProfile;
+use crate::domain::summary_template::{summary_template_variables, validate_summary_template};
 use crate::domain::transcript::TranscriptSource;
 use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use crate::infrastructure::sql::{
-    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL,
-    COUNT_GUILD_MEETINGS_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
-    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
-    LIST_GUILD_MEETINGS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
+    ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL,
+    GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
+    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
     UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::audit_event_params;
@@ -397,6 +401,22 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/guild/domain-knowledge/{item_id}/archive",
             post(api_archive_domain_knowledge),
+        )
+        .route(
+            "/api/guild/summary-templates",
+            get(api_list_summary_templates).post(api_create_summary_template),
+        )
+        .route(
+            "/api/guild/summary-templates/{template_id}",
+            get(api_get_summary_template).put(api_update_summary_template),
+        )
+        .route(
+            "/api/guild/summary-templates/{template_id}/activate",
+            post(api_activate_summary_template),
+        )
+        .route(
+            "/api/guild/summary-templates/{template_id}/archive",
+            post(api_archive_summary_template),
         )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
@@ -2427,12 +2447,38 @@ struct DomainKnowledgeUpsertRequest {
     active: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SummaryTemplateListQuery {
+    include_archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryTemplateUpsertRequest {
+    name: String,
+    template: String,
+    active: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DomainKnowledgeItemResponse {
     id: String,
     content_type: String,
     title: String,
     body: String,
+    active: bool,
+    version: i32,
+    updated_actor_user_id: Option<String>,
+    archived_at: Option<String>,
+    archived_actor_user_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SummaryTemplateResponse {
+    id: String,
+    name: String,
+    template: String,
     active: bool,
     version: i32,
     updated_actor_user_id: Option<String>,
@@ -2812,7 +2858,22 @@ struct NormalizedDomainKnowledgeRequest {
     active: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedSummaryTemplateRequest {
+    name: String,
+    template: String,
+    active: Option<bool>,
+    variables: Vec<String>,
+}
+
 fn validate_domain_knowledge_item_id(id: &str) -> Result<(), StatusCode> {
+    if id.trim().is_empty() || id.len() > 128 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn validate_summary_template_id(id: &str) -> Result<(), StatusCode> {
     if id.trim().is_empty() || id.len() > 128 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -2855,6 +2916,32 @@ fn normalize_domain_knowledge_list_filter(
     Ok((query.include_archived.unwrap_or(false), content_type))
 }
 
+fn normalize_summary_template_request(
+    request: &SummaryTemplateUpsertRequest,
+) -> Result<NormalizedSummaryTemplateRequest, StatusCode> {
+    let name = request.name.trim();
+    let template = request.template.trim();
+    if name.is_empty() || name.len() > 200 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    validate_summary_template(template).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let variables = summary_template_variables(template).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(NormalizedSummaryTemplateRequest {
+        name: name.to_owned(),
+        template: template.to_owned(),
+        active: request.active,
+        variables,
+    })
+}
+
+fn validate_authorized_summary_template_request(
+    is_admin: bool,
+    request: &SummaryTemplateUpsertRequest,
+) -> Result<NormalizedSummaryTemplateRequest, StatusCode> {
+    guild_admin_required_result(is_admin)?;
+    normalize_summary_template_request(request)
+}
+
 fn domain_knowledge_response_from_row(row: &tokio_postgres::Row) -> DomainKnowledgeItemResponse {
     DomainKnowledgeItemResponse {
         id: row.get("id"),
@@ -2868,6 +2955,29 @@ fn domain_knowledge_response_from_row(row: &tokio_postgres::Row) -> DomainKnowle
         archived_actor_user_id: row.get("archived_actor_user_id"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    }
+}
+
+fn summary_template_response_from_row(row: &tokio_postgres::Row) -> SummaryTemplateResponse {
+    SummaryTemplateResponse {
+        id: row.get("id"),
+        name: row.get("name"),
+        template: row.get("template"),
+        active: row.get("active"),
+        version: row.get("version"),
+        updated_actor_user_id: row.get("updated_actor_user_id"),
+        archived_at: row.get("archived_at"),
+        archived_actor_user_id: row.get("archived_actor_user_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn summary_template_mutation_status(err: &tokio_postgres::Error) -> StatusCode {
+    if err.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
@@ -3533,6 +3643,236 @@ async fn api_archive_domain_knowledge(
                 &headers,
                 "POST",
                 &format!("/api/guild/domain-knowledge/{item_id}/archive"),
+            ),
+            json!({
+                "active": response.active,
+                "version": response.version,
+                "archived": response.archived_at.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_list_summary_templates(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Query(query): Query<SummaryTemplateListQuery>,
+) -> Result<Json<Vec<SummaryTemplateResponse>>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let include_archived = query.include_archived.unwrap_or(false).to_string();
+    let rows = state
+        .db
+        .query(
+            LIST_SUMMARY_TEMPLATES_SQL,
+            &[&auth.guild_id, &include_archived],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        rows.iter()
+            .map(summary_template_response_from_row)
+            .collect(),
+    ))
+}
+
+async fn api_get_summary_template(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(template_id): Path<String>,
+) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
+    validate_summary_template_id(&template_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let row = state
+        .db
+        .query_opt(GET_SUMMARY_TEMPLATE_SQL, &[&auth.guild_id, &template_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(summary_template_response_from_row(&row)))
+}
+
+async fn api_create_summary_template(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+    Json(request): Json<SummaryTemplateUpsertRequest>,
+) -> Result<(StatusCode, Json<SummaryTemplateResponse>), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
+    let normalized = validate_authorized_summary_template_request(is_admin, &request)?;
+    let id = Uuid::new_v4().to_string();
+    let active = normalized.active.unwrap_or(true).to_string();
+    let row = state
+        .db
+        .query_opt(
+            INSERT_SUMMARY_TEMPLATE_SQL,
+            &[
+                &id,
+                &auth.guild_id,
+                &normalized.name,
+                &normalized.template,
+                &active,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|err| summary_template_mutation_status(&err))?
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let response = summary_template_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "summary_template.create",
+            "summary_template",
+            Some(response.id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/guild/summary-templates"),
+            json!({
+                "active": response.active,
+                "version": response.version,
+                "variables": normalized.variables,
+            }),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn api_update_summary_template(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(template_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SummaryTemplateUpsertRequest>,
+) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
+    validate_summary_template_id(&template_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
+    let normalized = validate_authorized_summary_template_request(is_admin, &request)?;
+    let active = normalized
+        .active
+        .map(|active| active.to_string())
+        .unwrap_or_default();
+    let row = state
+        .db
+        .query_opt(
+            UPDATE_SUMMARY_TEMPLATE_SQL,
+            &[
+                &template_id,
+                &auth.guild_id,
+                &normalized.name,
+                &normalized.template,
+                &active,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|err| summary_template_mutation_status(&err))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = summary_template_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "summary_template.update",
+            "summary_template",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &format!("/api/guild/summary-templates/{template_id}"),
+            ),
+            json!({
+                "active": response.active,
+                "version": response.version,
+                "variables": normalized.variables,
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_activate_summary_template(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(template_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
+    validate_summary_template_id(&template_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let row = state
+        .db
+        .query_opt(
+            ACTIVATE_SUMMARY_TEMPLATE_SQL,
+            &[&template_id, &auth.guild_id, &user_id],
+        )
+        .await
+        .map_err(|err| summary_template_mutation_status(&err))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = summary_template_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "summary_template.activate",
+            "summary_template",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/summary-templates/{template_id}/activate"),
+            ),
+            json!({
+                "active": response.active,
+                "version": response.version,
+                "archived": response.archived_at.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_archive_summary_template(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(template_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
+    validate_summary_template_id(&template_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let row = state
+        .db
+        .query_opt(
+            ARCHIVE_SUMMARY_TEMPLATE_SQL,
+            &[&template_id, &auth.guild_id, &user_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = summary_template_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "summary_template.archive",
+            "summary_template",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/summary-templates/{template_id}/archive"),
             ),
             json!({
                 "active": response.active,
@@ -5278,14 +5618,15 @@ mod guild_api_tests {
         BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, DiscordBotTokenValidationError,
         DiscordBotTokenValidationStage, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
         GuildAdminCheck, GuildBotTokenUpdateRequest, GuildMeetingsQuery, GuildSettingsDefaults,
-        GuildSettingsUpdateRequest, StoredGuildSettings, advance_bot_token_revision,
-        bot_auth_header_from_cache_with_resolver, classify_discord_bot_token_validation_status,
-        guild_admin_member_status_decision, guild_admin_required_result,
-        guild_bot_token_delete_is_noop, guild_settings_response,
+        GuildSettingsUpdateRequest, StoredGuildSettings, SummaryTemplateUpsertRequest,
+        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
+        classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
+        guild_admin_required_result, guild_bot_token_delete_is_noop, guild_settings_response,
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
-        validate_authorized_guild_settings_update, validate_domain_knowledge_item_id,
-        validate_guild_settings_update,
+        normalize_summary_template_request, validate_authorized_guild_settings_update,
+        validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
+        validate_guild_settings_update, validate_summary_template_id,
     };
     use axum::http::StatusCode;
     use std::sync::{
@@ -5568,6 +5909,78 @@ mod guild_api_tests {
         );
         assert_eq!(
             validate_domain_knowledge_item_id(&"x".repeat(129)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn summary_template_validation_accepts_and_trims_valid_request() {
+        let normalized = normalize_summary_template_request(&SummaryTemplateUpsertRequest {
+            name: "  Default summary  ".to_owned(),
+            template: "  Read {{ transcript_path }} and {{manifest_path}}.  ".to_owned(),
+            active: None,
+        })
+        .expect("valid summary template request should normalize");
+
+        assert_eq!(normalized.name, "Default summary");
+        assert_eq!(
+            normalized.template,
+            "Read {{ transcript_path }} and {{manifest_path}}."
+        );
+        assert_eq!(
+            normalized.variables,
+            vec!["transcript_path".to_owned(), "manifest_path".to_owned()]
+        );
+        assert_eq!(normalized.active, None);
+    }
+
+    #[test]
+    fn summary_template_validation_rejects_unknown_variables_and_blank_name() {
+        assert_eq!(
+            normalize_summary_template_request(&SummaryTemplateUpsertRequest {
+                name: "Summary".to_owned(),
+                template: "Read {{secret_path}}.".to_owned(),
+                active: Some(true),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_summary_template_request(&SummaryTemplateUpsertRequest {
+                name: "   ".to_owned(),
+                template: "Read {{transcript_path}}.".to_owned(),
+                active: Some(true),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn summary_template_update_checks_admin_before_template_validation() {
+        let request = SummaryTemplateUpsertRequest {
+            name: "Summary".to_owned(),
+            template: "Read {{secret_path}}.".to_owned(),
+            active: Some(true),
+        };
+
+        assert_eq!(
+            validate_authorized_summary_template_request(false, &request),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_authorized_summary_template_request(true, &request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn summary_template_id_validation_rejects_blank_or_oversized_ids() {
+        assert_eq!(validate_summary_template_id("st-1"), Ok(()));
+        assert_eq!(
+            validate_summary_template_id("   "),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_summary_template_id(&"x".repeat(129)),
             Err(StatusCode::BAD_REQUEST)
         );
     }

@@ -88,6 +88,25 @@ export interface DomainKnowledgeUpsertRequest {
   active?: boolean;
 }
 
+export interface SummaryTemplate {
+  id: string;
+  name: string;
+  template: string;
+  active: boolean;
+  version: number;
+  updated_actor_user_id: string | null;
+  archived_at: string | null;
+  archived_actor_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SummaryTemplateUpsertRequest {
+  name: string;
+  template: string;
+  active?: boolean;
+}
+
 export interface SpeakerResponse {
   id: string;
   username: string | null;
