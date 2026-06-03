@@ -1,11 +1,24 @@
 use crate::domain::transcript::{MAX_DB_TIMESTAMP_MS, TranscriptSegment, TranscriptSource};
 use serde::Deserialize;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WhisperInferenceRequest {
     pub audio_path: String,
     pub language: Option<String>,
+    /// Meeting-specific prompt hints for this inference request. This may
+    /// contain sensitive meeting context and must not be emitted in logs.
+    pub prompt: Option<String>,
+}
+
+impl Debug for WhisperInferenceRequest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WhisperInferenceRequest")
+            .field("audio_path", &self.audio_path)
+            .field("language", &self.language)
+            .field("prompt", &self.prompt.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
