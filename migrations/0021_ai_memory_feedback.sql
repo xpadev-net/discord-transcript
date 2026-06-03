@@ -144,11 +144,13 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
         FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)
         REFERENCES tenant_discord_guilds(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT transcript_feedback_meeting_fk
-        FOREIGN KEY (meeting_id, guild_id)
-        REFERENCES meetings(id, guild_id) ON DELETE SET NULL (meeting_id),
+        FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id),
+    CONSTRAINT transcript_feedback_meeting_delete_fk
+        FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL,
     CONSTRAINT transcript_feedback_segment_fk
-        FOREIGN KEY (transcript_segment_id, meeting_id)
-        REFERENCES transcripts(id, meeting_id) ON DELETE SET NULL (transcript_segment_id),
+        FOREIGN KEY (transcript_segment_id, meeting_id) REFERENCES transcripts(id, meeting_id),
+    CONSTRAINT transcript_feedback_segment_delete_fk
+        FOREIGN KEY (transcript_segment_id) REFERENCES transcripts(id) ON DELETE SET NULL,
     CONSTRAINT transcript_feedback_target_domain_fk
         FOREIGN KEY (target_domain_knowledge_id, tenant_id, guild_id)
         REFERENCES domain_knowledge_items(id, tenant_id, guild_id) ON DELETE RESTRICT,
@@ -361,6 +363,10 @@ CREATE INDEX IF NOT EXISTS idx_person_aliases_guild_discord_user
 
 CREATE INDEX IF NOT EXISTS idx_person_aliases_guild_alias_active
     ON person_aliases (guild_id, lower(alias), active);
+
+CREATE INDEX IF NOT EXISTS idx_person_aliases_source_feedback
+    ON person_aliases (source_feedback_id)
+    WHERE source_feedback_id IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_person_aliases_active_identity
     ON person_aliases (tenant_id, guild_id, lower(canonical_name), lower(alias))
