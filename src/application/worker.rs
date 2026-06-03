@@ -511,10 +511,11 @@ fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
     if byte_rate == 0 {
         return None;
     }
-    let data_size = u32::from_le_bytes([header[40], header[41], header[42], header[43]]) as u128;
-    if data_size == 0 {
+    let data_size = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
+    if data_size == 0 || data_size == u32::MAX {
         return None;
     }
+    let data_size = data_size as u128;
     Some(data_size.saturating_mul(1_000).div_ceil(byte_rate) as u64)
 }
 
