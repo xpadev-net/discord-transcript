@@ -69,6 +69,8 @@ done
 
 Docker Compose では各要約 CLI の認証用ディレクトリ（ホストの `~/.claude`・`~/.local/share/opencode`・`~/.cursor`）をコンテナの `HOME` 配下にマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
 
+公開 GHCR イメージはネットワークインストーラの実行を避けるため Cursor Agent CLI を同梱しません。Docker で `cursor_agent` / `opencode` harness を使う場合は、検証済みの CLI を含む派生イメージを作るか、信頼できる方法でバイナリを配置し、`SUMMARY_COMMAND` に明示的なパスを設定してください。
+
 ### ワークスペース構造
 
 `CHUNK_STORAGE_DIR` 配下に会議ごとのワークスペースを作成します。
