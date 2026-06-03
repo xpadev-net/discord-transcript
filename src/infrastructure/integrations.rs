@@ -42,7 +42,7 @@ impl Display for IntegrationError {
 
 impl std::error::Error for IntegrationError {}
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CommandWhisperClient {
     pub endpoint: String,
     pub curl_bin: String,
@@ -55,6 +55,22 @@ pub struct CommandWhisperClient {
     pub command_timeout: Duration,
 }
 
+impl std::fmt::Debug for CommandWhisperClient {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandWhisperClient")
+            .field("endpoint", &self.endpoint)
+            .field("curl_bin", &self.curl_bin)
+            .field("retry_policy", &self.retry_policy)
+            .field("beam_size", &self.beam_size)
+            .field("suppress_non_speech", &self.suppress_non_speech)
+            .field("prompt", &self.prompt.as_ref().map(|_| "[REDACTED]"))
+            .field("vad", &self.vad)
+            .field("temperature", &self.temperature)
+            .field("command_timeout", &self.command_timeout)
+            .finish()
+    }
+}
+
 impl WhisperClient for CommandWhisperClient {
     fn infer(
         &self,
@@ -63,6 +79,10 @@ impl WhisperClient for CommandWhisperClient {
         let output = retry_with_backoff_if(
             self.retry_policy,
             |_| {
+                let effective_prompt =
+                    compose_whisper_prompt(self.prompt.as_deref(), request.prompt.as_deref());
+                let command_for_log =
+                    render_whisper_command_for_log(self, request, effective_prompt.as_deref());
                 let mut cmd = Command::new(&self.curl_bin);
                 cmd.arg("-sS")
                     .arg("-X")
@@ -79,7 +99,7 @@ impl WhisperClient for CommandWhisperClient {
                 cmd.arg("-F").arg(format!("beam_size={}", self.beam_size));
                 cmd.arg("-F")
                     .arg(format!("suppress_non_speech={}", self.suppress_non_speech));
-                if let Some(p) = &self.prompt {
+                if let Some(p) = &effective_prompt {
                     cmd.arg("--form-string").arg(format!("prompt={p}"));
                 }
                 cmd.arg("-F").arg(format!("vad={}", self.vad));
@@ -87,13 +107,17 @@ impl WhisperClient for CommandWhisperClient {
                     .arg(format!("temperature={}", self.temperature));
 
                 run_command_with_timeout(&mut cmd, None, self.command_timeout)
-                    .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))
+                    .map_err(|err| {
+                        WhisperParseError::InvalidJson(format!(
+                            "whisper command failed before execution: command={command_for_log}, error={err}"
+                        ))
+                    })
                     .and_then(|output| {
                         if output.status.success() {
                             Ok(output)
                         } else {
                             Err(WhisperParseError::InvalidJson(format!(
-                                "whisper command failed: status={:?}, stderr={}",
+                                "whisper command failed: command={command_for_log}, status={:?}, stderr={}",
                                 output.status.code(),
                                 sanitize_output(&output.stderr)
                             )))
@@ -113,6 +137,66 @@ impl WhisperClient for CommandWhisperClient {
             other => other,
         })
     }
+}
+
+fn compose_whisper_prompt(
+    configured_prompt: Option<&str>,
+    request_prompt: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(prompt) = configured_prompt.map(str::trim)
+        && !prompt.is_empty()
+    {
+        parts.push(prompt.to_owned());
+    }
+    if let Some(prompt) = request_prompt.map(str::trim)
+        && !prompt.is_empty()
+    {
+        parts.push(prompt.to_owned());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn render_whisper_command_for_log(
+    client: &CommandWhisperClient,
+    request: &WhisperInferenceRequest,
+    effective_prompt: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        client.curl_bin.clone(),
+        "-sS".to_owned(),
+        "-X".to_owned(),
+        "POST".to_owned(),
+        format!("{}/inference", client.endpoint.trim_end_matches('/')),
+        "-F".to_owned(),
+        format!("file=@{}", request.audio_path),
+        "-F".to_owned(),
+        "response_format=verbose_json".to_owned(),
+    ];
+    if let Some(language) = &request.language {
+        parts.push("-F".to_owned());
+        parts.push(format!("language={language}"));
+    }
+    parts.push("-F".to_owned());
+    parts.push(format!("beam_size={}", client.beam_size));
+    parts.push("-F".to_owned());
+    parts.push(format!(
+        "suppress_non_speech={}",
+        client.suppress_non_speech
+    ));
+    if effective_prompt.is_some() {
+        parts.push("--form-string".to_owned());
+        parts.push("prompt=[REDACTED]".to_owned());
+    }
+    parts.push("-F".to_owned());
+    parts.push(format!("vad={}", client.vad));
+    parts.push("-F".to_owned());
+    parts.push(format!("temperature={}", client.temperature));
+    parts.join(" ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +225,7 @@ fn sanitize_output(raw: &[u8]) -> String {
             .expect("hardcoded redaction regex is valid")
     });
     let redacted = re.replace_all(&collapsed, "[REDACTED]").into_owned();
+    let redacted = redact_prompt_values(&redacted);
 
     if redacted.len() <= SANITIZE_MAX_LEN {
         return redacted;
@@ -149,6 +234,16 @@ fn sanitize_output(raw: &[u8]) -> String {
     let omitted = redacted.len() - truncated.len();
     let _ = write!(truncated, "... ({omitted} bytes omitted)");
     truncated
+}
+
+fn redact_prompt_values(value: &str) -> String {
+    let Some(index) = value.to_ascii_lowercase().find("prompt=") else {
+        return value.to_owned();
+    };
+    let mut output = String::with_capacity(index + "prompt=[REDACTED]".len());
+    output.push_str(&value[..index]);
+    output.push_str("prompt=[REDACTED]");
+    output
 }
 
 impl HarnessCliSummaryClient {
@@ -638,6 +733,7 @@ mod tests {
         let request = WhisperInferenceRequest {
             audio_path: "audio.wav".to_owned(),
             language: None,
+            prompt: None,
         };
 
         let err = client.infer(&request).expect_err("command should fail");
@@ -648,6 +744,177 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         };
         assert!(!message.contains("sk-secret123456789"));
+    }
+
+    #[test]
+    fn whisper_command_combines_configured_and_request_prompt() {
+        let args_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_args_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_capture_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"text\":\"ok\",\"segments\":[{{\"speaker\":\"alice\",\"start\":0.0,\"end\":1.0,\"text\":\"hello\"}}]}}'\n",
+                args_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: Some("共通用語: Kubernetes".to_owned()),
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(5),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: Some("ja".to_owned()),
+            prompt: Some("Meeting title: 朝会\nSpeaker ID: 山田太郎".to_owned()),
+        };
+
+        client.infer(&request).expect("command should succeed");
+        let args = std::fs::read_to_string(&args_path).expect("args should be captured");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&args_path);
+
+        let expected = "prompt=共通用語: Kubernetes\nMeeting title: 朝会\nSpeaker ID: 山田太郎";
+        assert!(
+            args.contains(expected),
+            "combined prompt missing from argv: {args}"
+        );
+        assert!(
+            args.find("共通用語").unwrap() < args.find("Meeting title").unwrap(),
+            "configured prompt should be the prefix: {args}"
+        );
+    }
+
+    #[test]
+    fn whisper_command_uses_configured_prompt_as_fallback() {
+        let args_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_fallback_args_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_fallback_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"text\":\"ok\",\"segments\":[{{\"speaker\":\"alice\",\"start\":0.0,\"end\":1.0,\"text\":\"hello\"}}]}}'\n",
+                args_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: Some("legacy WHISPER_PROMPT".to_owned()),
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(5),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        client.infer(&request).expect("command should succeed");
+        let args = std::fs::read_to_string(&args_path).expect("args should be captured");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&args_path);
+
+        assert!(args.contains("prompt=legacy WHISPER_PROMPT"));
+    }
+
+    #[test]
+    fn whisper_prompt_is_redacted_from_errors_and_debug_output() {
+        let secret_configured = "configured prompt secret";
+        let secret_request = "会議固有プロンプト -- customer secret -F still secret";
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_prompt_leak_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >&2\nexit 7\n",
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: Some(secret_configured.to_owned()),
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(5),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: Some(secret_request.to_owned()),
+        };
+
+        let err = client.infer(&request).expect_err("command should fail");
+        let _ = std::fs::remove_file(&script_path);
+
+        let message = match err {
+            WhisperParseError::InvalidJson(message) => message,
+            other => panic!("unexpected error: {other}"),
+        };
+        assert!(!message.contains(secret_configured));
+        assert!(!message.contains(secret_request));
+        assert!(!message.contains("customer secret"));
+        assert!(!message.contains("still secret"));
+        assert!(message.contains("prompt=[REDACTED]"));
+
+        let client_debug = format!("{client:?}");
+        let request_debug = format!("{request:?}");
+        assert!(!client_debug.contains(secret_configured));
+        assert!(!request_debug.contains(secret_request));
+        assert!(client_debug.contains("[REDACTED]"));
+        assert!(request_debug.contains("[REDACTED]"));
     }
 
     #[test]
@@ -691,6 +958,7 @@ mod tests {
         let request = WhisperInferenceRequest {
             audio_path: "audio.wav".to_owned(),
             language: None,
+            prompt: None,
         };
 
         let err = client
@@ -747,6 +1015,7 @@ mod tests {
         let request = WhisperInferenceRequest {
             audio_path: "audio.wav".to_owned(),
             language: None,
+            prompt: None,
         };
 
         let err = client

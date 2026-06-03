@@ -1741,6 +1741,18 @@ impl ScaffoldHandler {
                 );
                 EffectiveMeetingSettings::from_defaults(&self.meeting_settings_defaults())
             });
+        let meeting_title = self
+            .load_meeting(&chunk.meeting_id)
+            .await
+            .map(|meeting| meeting.title)
+            .unwrap_or_else(|err| {
+                warn!(
+                    meeting_id = %chunk.meeting_id,
+                    error = %err,
+                    "failed to load meeting title for live transcription prompt"
+                );
+                None
+            });
         let whisper = CommandWhisperClient {
             endpoint: self.whisper_endpoint.clone(),
             curl_bin: "curl".to_owned(),
@@ -1755,6 +1767,10 @@ impl ScaffoldHandler {
         let request = WhisperInferenceRequest {
             audio_path: chunk.saved.path.to_string_lossy().to_string(),
             language: effective_settings.whisper_language.clone(),
+            prompt: crate::application::summary::build_whisper_context_prompt(
+                meeting_title.as_deref(),
+                Some(&chunk.user_id),
+            ),
         };
         let transcription = tokio::task::block_in_place(|| whisper.infer(&request));
         let mut segments = match transcription {
