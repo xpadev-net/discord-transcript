@@ -84,6 +84,7 @@ impl WhisperClient for CommandWhisperClient {
                 let command_for_log =
                     render_whisper_command_for_log(self, request, effective_prompt.as_deref());
                 let mut cmd = Command::new(&self.curl_bin);
+                // Keep this argument order in sync with `render_whisper_command_for_log`.
                 cmd.arg("-sS")
                     .arg("-X")
                     .arg("POST")
@@ -166,6 +167,7 @@ fn render_whisper_command_for_log(
     request: &WhisperInferenceRequest,
     effective_prompt: Option<&str>,
 ) -> String {
+    // Keep this redacted representation in sync with the curl arguments built in `infer`.
     let mut parts = vec![
         client.curl_bin.clone(),
         "-sS".to_owned(),
@@ -242,7 +244,7 @@ fn redact_prompt_values(value: &str) -> String {
     };
     let mut output = String::with_capacity(index + "prompt=[REDACTED]".len());
     output.push_str(&value[..index]);
-    output.push_str("prompt=[REDACTED]");
+    output.push_str("prompt=[REDACTED]... (truncated after prompt)");
     output
 }
 
