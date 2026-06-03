@@ -34,9 +34,12 @@ impl ConfidencePermille {
                 "confidence decimal whole part must be 0 or 1: {value}"
             ));
         }
-        if fractional.len() > 3 || !fractional.chars().all(|ch| ch.is_ascii_digit()) {
+        if fractional.is_empty()
+            || fractional.len() > 3
+            || !fractional.chars().all(|ch| ch.is_ascii_digit())
+        {
             return Err(format!(
-                "confidence decimal must have at most 3 fractional digits: {value}"
+                "confidence decimal must have 1-3 fractional digits containing only digits: {value}"
             ));
         }
         if whole == "1" && fractional.chars().any(|ch| ch != '0') {

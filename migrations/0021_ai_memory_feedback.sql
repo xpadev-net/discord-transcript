@@ -86,7 +86,6 @@ CREATE TABLE IF NOT EXISTS ai_memory_notes (
         )
         OR (
             source_type = 'user_feedback'
-            AND source_feedback_id IS NOT NULL
             AND source_meeting_id IS NULL
         )
         OR (
@@ -247,7 +246,7 @@ BEGIN
     ALTER TABLE ai_memory_notes
     ADD CONSTRAINT ai_memory_notes_source_feedback_fk
     FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT;
+    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL;
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END
@@ -297,7 +296,7 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT person_aliases_source_feedback_fk
         FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT,
+        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL,
     CONSTRAINT person_aliases_guild_id_nonempty_check CHECK (length(btrim(guild_id)) > 0),
     CONSTRAINT person_aliases_canonical_name_nonempty_check CHECK (length(btrim(canonical_name)) > 0),
     CONSTRAINT person_aliases_alias_nonempty_check CHECK (length(btrim(alias)) > 0),
@@ -338,7 +337,6 @@ CREATE TABLE IF NOT EXISTS person_aliases (
     CONSTRAINT person_aliases_source_reference_check CHECK (
         (
             source_type = 'user_feedback'
-            AND source_feedback_id IS NOT NULL
             AND source_meeting_id IS NULL
         )
         OR (

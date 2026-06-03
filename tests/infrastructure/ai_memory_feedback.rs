@@ -157,7 +157,9 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL"));
     assert!(schema.contains("transcript_feedback_segment_delete_fk"));
     assert!(schema.contains("FOREIGN KEY (transcript_segment_id) REFERENCES transcripts(id) ON DELETE SET NULL"));
-    assert!(schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT"));
+    assert!(
+        schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL")
+    );
     assert!(schema.contains("FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)"));
     assert!(schema.contains("FOREIGN KEY (source_feedback_id, tenant_id, guild_id)"));
     assert!(schema.contains("person_aliases_source_reference_check"));
@@ -194,6 +196,7 @@ fn ai_memory_domain_types_match_schema_values() {
     );
     assert!(ConfidencePermille::new(1001).is_err());
     assert!(ConfidencePermille::parse_sql_decimal("1").is_err());
+    assert!(ConfidencePermille::parse_sql_decimal("1.").is_err());
     assert!(ConfidencePermille::parse_sql_decimal("1.001").is_err());
 }
 
