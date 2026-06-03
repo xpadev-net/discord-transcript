@@ -204,7 +204,7 @@ INSERT INTO plans (id, code, name, kind, status, created_at, updated_at)
 VALUES
     ('plan:default', 'default', 'Default', 'default', 'active', NOW(), NOW()),
     ('plan:beta', 'beta', 'Beta', 'beta', 'active', NOW(), NOW())
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
 INSERT INTO plan_quotas (
     id, plan_id, dimension, period, limit_value, unlimited, enforcement_mode, created_at, updated_at
@@ -220,4 +220,4 @@ VALUES
     ('quota:beta:summary_runs:monthly', 'plan:beta', 'summary_runs', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:beta:storage_bytes:current', 'plan:beta', 'storage_bytes', 'current', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:beta:debug_downloads:daily', 'plan:beta', 'debug_downloads', 'daily', NULL, true, 'observe_only', NOW(), NOW())
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT DO NOTHING;

@@ -758,18 +758,22 @@ fn parse_resolved_tenant_installation_row(
 }
 
 fn parse_resolved_plan_rows(rows: Vec<SqlRow>) -> Result<Option<ResolvedPlan>, StoreError> {
-    let Some(first) = rows.first() else {
+    let mut rows = rows.iter();
+    let Some(first) = rows.next() else {
         return Ok(None);
     };
     let mut resolved = parse_resolved_plan_header(first)?;
+    if let Some(quota) = parse_resolved_plan_quota_row(first)? {
+        resolved.quotas.push(quota);
+    }
     for row in rows {
-        let row_header = parse_resolved_plan_header(&row)?;
+        let row_header = parse_resolved_plan_header(row)?;
         if !resolved_plan_headers_match(&resolved, &row_header) {
             return Err(StoreError::Backend(
                 "plan resolver returned rows for multiple plans or assignments".to_owned(),
             ));
         }
-        if let Some(quota) = parse_resolved_plan_quota_row(&row)? {
+        if let Some(quota) = parse_resolved_plan_quota_row(row)? {
             resolved.quotas.push(quota);
         }
     }

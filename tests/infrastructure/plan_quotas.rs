@@ -54,6 +54,7 @@ fn incremental_migrations_include_plan_quota_assignment_schema() {
     assert!(schema.contains("EXCLUDE USING gist"));
     assert!(schema.contains("'plan:default'"));
     assert!(schema.contains("'plan:beta'"));
+    assert!(schema.contains("ON CONFLICT DO NOTHING"));
 }
 
 #[test]
