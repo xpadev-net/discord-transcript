@@ -67,7 +67,17 @@ done
 >
 > **`cursor_agent`:** バックグラウンド要約は TTY がないため、Cursor Agent CLI に **`--trust`** を付与してワークスペース（`CHUNK_STORAGE_DIR` 配下の会議ディレクトリ）を信頼済みとして実行します。
 
-Docker Compose では各要約 CLI の認証用ディレクトリ（ホストの `~/.claude`・`~/.local/share/opencode`・`~/.cursor`）をコンテナの `HOME` 配下にマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
+Docker Compose の通常サービスは、ホストの LLM 認証ディレクトリをマウントしません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する `app-*-harness` サービスを明示的に起動してください。これらの unsafe harness サービスは認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
+
+```bash
+docker compose --profile unsafe-claude-harness up app-claude-harness
+docker compose --profile unsafe-opencode-harness up app-opencode-harness
+docker compose --profile unsafe-cursor-harness up app-cursor-harness
+```
+
+Unsafe profile を指定すると Compose は通常の `app` も対象に含めるため、必ず上記のように起動対象の `app-*-harness` サービス名まで指定してください。
+
+Compose の `app` は Discord voice (songbird) の UDP 通信のため host network を使います。Web UI は既定で `127.0.0.1` に bind します。外部公開する場合は、リバースプロキシなどの公開経路を決めた上で `WEB_BIND_HOST` を明示的に変更してください。`migrate` は compose network 上の `db:5432` に接続するため host network を使いません。
 
 ### ワークスペース構造
 

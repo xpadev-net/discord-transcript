@@ -1,7 +1,9 @@
 services:
   app:
-    image: ghcr.io/xpadev-net/discord-transcript:latest
-    # Host networking is required for Discord voice (songbird).
+    # Use an immutable release tag or digest for production. The mutable
+    # "latest" tag is only suitable for local smoke tests.
+    image: ${DISCORD_TRANSCRIPT_IMAGE:?Set DISCORD_TRANSCRIPT_IMAGE to ghcr.io/xpadev-net/discord-transcript:<release-tag> or ghcr.io/xpadev-net/discord-transcript@sha256:<digest>}
+    # Host networking is required only for the Discord voice runtime (songbird).
     # Docker's bridge network does not reliably NAT the UDP traffic
     # needed for voice gateway IP discovery and audio streaming.
     network_mode: host
@@ -21,15 +23,12 @@ services:
       WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-ja}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       WEB_PORT: ${WEB_PORT:-3000}
-      WEB_BIND_HOST: ${WEB_BIND_HOST:-0.0.0.0}
+      # Keep the web UI loopback-only by default because app uses host networking.
+      WEB_BIND_HOST: ${WEB_BIND_HOST:-127.0.0.1}
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
       DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
     volumes:
-      - ${HOME}/.claude:/home/app/.claude
-      # OpenCode (auth.json under ~/.local/share/opencode) and Cursor CLI (~/.cursor)
-      - ${HOME}/.local/share/opencode:/home/app/.local/share/opencode
-      - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${WEB_PORT:-3000}/healthz >/dev/null"]
@@ -38,6 +37,47 @@ services:
       retries: 3
       start_period: 15s
     restart: unless-stopped
+
+  # Unsafe local harness profiles. These mount one host LLM credential directory
+  # read-only for local testing. Start exactly one named service, for example:
+  # docker compose --profile unsafe-claude-harness up app-claude-harness
+  # Do not run the profile without naming the service, or Compose will also
+  # include the default app service.
+  app-claude-harness:
+    extends:
+      service: app
+    profiles: ["unsafe-claude-harness"]
+    volumes:
+      - type: bind
+        source: ${LLM_CLAUDE_CONFIG_DIR:-/run/discord-transcript/missing-claude-credentials}
+        target: /home/app/.claude
+        read_only: true
+        bind:
+          create_host_path: false
+
+  app-opencode-harness:
+    extends:
+      service: app
+    profiles: ["unsafe-opencode-harness"]
+    volumes:
+      - type: bind
+        source: ${LLM_OPENCODE_DATA_DIR:-/run/discord-transcript/missing-opencode-credentials}
+        target: /home/app/.local/share/opencode
+        read_only: true
+        bind:
+          create_host_path: false
+
+  app-cursor-harness:
+    extends:
+      service: app
+    profiles: ["unsafe-cursor-harness"]
+    volumes:
+      - type: bind
+        source: ${LLM_CURSOR_CONFIG_DIR:-/run/discord-transcript/missing-cursor-credentials}
+        target: /home/app/.cursor
+        read_only: true
+        bind:
+          create_host_path: false
 
   db:
     image: postgres:16
@@ -57,13 +97,12 @@ services:
     restart: unless-stopped
 
   migrate:
-    image: ghcr.io/xpadev-net/discord-transcript:latest
-    network_mode: host
+    image: ${DISCORD_TRANSCRIPT_IMAGE:?Set DISCORD_TRANSCRIPT_IMAGE to ghcr.io/xpadev-net/discord-transcript:<release-tag> or ghcr.io/xpadev-net/discord-transcript@sha256:<digest>}
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@127.0.0.1/discord_transcript
+      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@db:5432/discord_transcript
       DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-disable}
     command: ["discord-transcript", "migrate"]
 
