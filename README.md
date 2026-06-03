@@ -9,7 +9,7 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| 要約用 CLI | 既定は Claude（`claude --model <model> -p`）。`SUMMARY_HARNESS` で Cursor / OpenCode に切り替え可能（下記） |
+| 要約用 CLI | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` を明示したローカル検証用途のみ（既定 harness は Claude） |
 
 ## 環境構築
 
@@ -59,14 +59,13 @@ done
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
 | `CLAUDE_MODEL` | `haiku` | Claude harness 時の `--model`（`SUMMARY_MODEL` 未指定時のフォールバック） |
 | `SUMMARY_HARNESS` | `claude` | `claude` / `cursor_agent` / `opencode` |
+| `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | CLI harness へ untrusted transcript を渡す unsafe opt-in。production では既定で拒否します。 |
 | `SUMMARY_COMMAND` | 未設定 | 設定時は **どの harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
 | `SUMMARY_MODEL` | 未設定 | `CLAUDE_MODEL` より優先。**`opencode` では必須**（`provider/model` 形式。例: `anthropic/claude-3-5-haiku-20241022`） |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 | `OPERATIONAL_METRICS_BEARER_TOKEN` | 未設定 | `/metricsz` の Bearer 認証トークン。未設定時は `/metricsz` を無効化します。 |
 
-> **Note:** 要約・文字起こし補正（LLM によるトランスクリプト整形）は **Claude harness のみ**実行します（stdin で全文を渡せるため）。`cursor_agent` / `opencode` では要約フェーズも含め CLI が **コマンド行引数**でプロンプトを受け取るため、ホストの `ps` 等に本文が見える可能性があります。
->
-> **`cursor_agent`:** バックグラウンド要約は TTY がないため、Cursor Agent CLI に **`--trust`** を付与してワークスペース（`CHUNK_STORAGE_DIR` 配下の会議ディレクトリ）を信頼済みとして実行します。
+> **Note:** 要約 CLI harness はワークスペースや環境へアクセスできるため、既定では起動を拒否します。ローカル検証で使う場合は `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` を明示してください。文字起こし補正（LLM によるトランスクリプト整形）は全文プロンプトを扱うため、unsafe opt-in 後も built-in CLI harness では実行しません。
 
 Docker Compose の通常サービスは、ホストの LLM 認証ディレクトリをマウントしません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する unsafe override file を明示的に追加してください。これらの override file は認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
 

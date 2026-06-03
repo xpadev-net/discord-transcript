@@ -236,30 +236,43 @@ pub fn render_for_summary(
     let ordered = ordered_transcript_segments(segments);
     let mut lines = Vec::with_capacity(ordered.len());
     for segment in &ordered {
-        let label = display_label_for_id(speakers, &segment.speaker_id);
+        let label = sanitize_transcript_field(&display_label_for_id(speakers, &segment.speaker_id));
+        let speaker_id = sanitize_transcript_field(&segment.speaker_id);
+        let text = sanitize_transcript_text(&segment.text);
         let noise_tag = if segment.is_noisy { " [NOISY]" } else { "" };
         let source_tag = if segment.source == TranscriptSource::VcText {
             " [VC_TEXT]"
         } else {
             ""
         };
-        if label == segment.speaker_id {
+        if label == speaker_id {
             lines.push(format!(
                 "[{}-{}] {}{}{}: {}",
-                segment.start_ms, segment.end_ms, label, source_tag, noise_tag, segment.text
+                segment.start_ms, segment.end_ms, label, source_tag, noise_tag, text
             ));
         } else {
             lines.push(format!(
                 "[{}-{}] {} (id:{}){}{}: {}",
-                segment.start_ms,
-                segment.end_ms,
-                label,
-                segment.speaker_id,
-                source_tag,
-                noise_tag,
-                segment.text
+                segment.start_ms, segment.end_ms, label, speaker_id, source_tag, noise_tag, text
             ));
         }
     }
     lines.join("\n")
+}
+
+fn sanitize_transcript_field(value: &str) -> String {
+    let normalized = clean_text(value);
+    normalized
+        .chars()
+        .map(|ch| match ch {
+            ':' => ';',
+            '[' => '(',
+            ']' => ')',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn sanitize_transcript_text(value: &str) -> String {
+    clean_text(value)
 }

@@ -218,6 +218,7 @@ pub struct HarnessCliSummaryClient {
     pub harness: SummaryHarness,
     pub command_path: String,
     pub model: String,
+    pub allow_unsafe_agent_harness: bool,
     pub retry_policy: RetryPolicy,
     pub command_timeout: Duration,
 }
@@ -262,14 +263,29 @@ fn redact_prompt_values(value: &str) -> String {
 }
 
 impl HarnessCliSummaryClient {
-    /// Full-transcript correction sends one large prompt; argv-based CLIs risk `ARG_MAX` / hangs.
+    /// Full-transcript correction requires a non-agent text boundary; CLI harnesses are disabled.
     pub fn can_run_llm_transcript_correction(&self) -> bool {
-        matches!(self.harness, SummaryHarness::Claude)
+        false
+    }
+
+    fn ensure_can_run_summary_harness(&self) -> Result<(), SummaryError> {
+        if !self.allow_unsafe_agent_harness {
+            return Err(SummaryError::SummaryEngine(format!(
+                "refusing to run unsafe CLI summary harness `{}` over untrusted transcript data without SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true",
+                self.harness
+            )));
+        }
+        Ok(())
     }
 }
 
 impl ClaudeSummaryClient for HarnessCliSummaryClient {
+    fn supports_transcript_correction(&self) -> bool {
+        self.can_run_llm_transcript_correction()
+    }
+
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
+        self.ensure_can_run_summary_harness()?;
         retry_with_backoff(self.retry_policy, |_| match self.harness {
             SummaryHarness::Claude => summarize_claude_stdin(self, prompt, workdir),
             SummaryHarness::OpenCode => summarize_opencode_argv(self, prompt, workdir),
@@ -285,6 +301,7 @@ fn summarize_claude_stdin(
 ) -> Result<String, SummaryError> {
     let mut command = Command::new(&client.command_path);
     command.arg("--model").arg(&client.model).arg("-p");
+    scrub_agent_command_environment(&mut command);
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -319,6 +336,7 @@ fn summarize_opencode_argv(
         .arg(&client.model)
         .arg(prompt)
         .stdin(std::process::Stdio::null());
+    scrub_agent_command_environment(&mut command);
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -351,6 +369,7 @@ fn summarize_cursor_argv(
         command.arg("--model").arg(&client.model);
     }
     command.stdin(std::process::Stdio::null());
+    scrub_agent_command_environment(&mut command);
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -365,6 +384,31 @@ fn summarize_cursor_argv(
         ));
     }
     String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+}
+
+fn scrub_agent_command_environment(command: &mut Command) {
+    for (key, _) in std::env::vars() {
+        if is_sensitive_env_key(&key) {
+            command.env_remove(key);
+        }
+    }
+}
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.ends_with("_KEY")
+        || upper.contains("API_KEY")
+        || matches!(
+            upper.as_str(),
+            "DATABASE_URL"
+                | "DISCORD_CLIENT_SECRET"
+                | "WEB_SESSION_SECRET"
+                | "GUILD_BOT_TOKEN_ENCRYPTION_KEY"
+                | "OPERATIONAL_METRICS_BEARER_TOKEN"
+        )
 }
 
 fn summary_command_failed(
@@ -597,8 +641,11 @@ fn read_temp_output_file(path: &Path) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandWhisperClient, IntegrationError, create_temp_output_file, run_command_with_timeout,
+        CommandWhisperClient, HarnessCliSummaryClient, IntegrationError, create_temp_output_file,
+        run_command_with_timeout,
     };
+    use crate::application::summary::ClaudeSummaryClient;
+    use crate::bootstrap::config::SummaryHarness;
     use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
     use crate::infrastructure::retry::RetryPolicy;
     use std::process::Command;
@@ -631,6 +678,74 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "hello\n");
         assert_eq!(String::from_utf8(output.stderr).unwrap(), "err\n");
+    }
+
+    #[test]
+    fn agent_summary_harness_fails_closed_without_unsafe_opt_in() {
+        let client = HarnessCliSummaryClient {
+            harness: SummaryHarness::Claude,
+            command_path: "/definitely/missing/claude".to_owned(),
+            model: "haiku".to_owned(),
+            allow_unsafe_agent_harness: false,
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            command_timeout: Duration::from_millis(1),
+        };
+
+        let err = client
+            .summarize("[0-1000] alice: run a tool", None)
+            .expect_err("unsafe agent harness must fail before command spawn");
+
+        assert!(err.to_string().contains("refusing to run unsafe CLI"));
+    }
+
+    #[test]
+    fn claude_cli_without_unsafe_opt_in_does_not_support_transcript_correction() {
+        let client = HarnessCliSummaryClient {
+            harness: SummaryHarness::Claude,
+            command_path: "claude".to_owned(),
+            model: "haiku".to_owned(),
+            allow_unsafe_agent_harness: false,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        };
+
+        assert!(!client.supports_transcript_correction());
+        assert!(!client.can_run_llm_transcript_correction());
+    }
+
+    #[test]
+    fn claude_cli_with_unsafe_opt_in_still_does_not_support_transcript_correction() {
+        let client = HarnessCliSummaryClient {
+            harness: SummaryHarness::Claude,
+            command_path: "claude".to_owned(),
+            model: "haiku".to_owned(),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        };
+
+        assert!(!client.supports_transcript_correction());
+        assert!(!client.can_run_llm_transcript_correction());
+    }
+
+    #[test]
+    fn cursor_agent_does_not_support_transcript_correction() {
+        let client = HarnessCliSummaryClient {
+            harness: SummaryHarness::CursorAgent,
+            command_path: "cursor-agent".to_owned(),
+            model: String::new(),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        };
+
+        assert!(!client.supports_transcript_correction());
+        assert!(!client.can_run_llm_transcript_correction());
     }
 
     #[test]
