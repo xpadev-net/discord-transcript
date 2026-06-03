@@ -1,7 +1,6 @@
 use chrono::{TimeZone, Utc};
-use discord_transcript::domain::ai_memory::{
-    AiMemoryNote, AiMemorySourceType, AiMemoryTag, ConfidencePermille,
-};
+use discord_transcript::domain::ai_memory::{AiMemoryNote, AiMemorySourceType, AiMemoryTag};
+use discord_transcript::domain::confidence::ConfidencePermille;
 use discord_transcript::domain::feedback::{
     TranscriptFeedback, TranscriptFeedbackStatus, TranscriptFeedbackTermType, TranscriptFeedbackType,
 };
@@ -126,7 +125,10 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("idx_transcripts_id_meeting"));
     assert!(schema.contains("FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id)"));
     assert!(schema.contains("FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id)"));
-    assert!(schema.contains("FOREIGN KEY (transcript_segment_id, meeting_id) REFERENCES transcripts(id, meeting_id)"));
+    assert!(schema.contains("FOREIGN KEY (transcript_segment_id, meeting_id)"));
+    assert!(schema.contains("REFERENCES transcripts(id, meeting_id)"));
+    assert!(schema.contains("ON DELETE SET NULL (transcript_segment_id)"));
+    assert!(schema.contains("ON DELETE SET NULL (source_feedback_id)"));
     assert!(schema.contains("FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)"));
     assert!(schema.contains("FOREIGN KEY (source_feedback_id, tenant_id, guild_id)"));
     assert!(schema.contains("person_aliases_source_reference_check"));

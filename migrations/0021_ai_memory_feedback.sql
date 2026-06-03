@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS ai_memory_notes (
     CONSTRAINT ai_memory_notes_source_reference_check CHECK (
         (source_type = 'ai_meeting_extraction' AND source_meeting_id IS NOT NULL)
         OR (source_type = 'user_feedback' AND source_feedback_id IS NOT NULL)
-        OR source_type IN ('manual', 'vc_participant', 'promotion_candidate')
+        OR (source_type = 'vc_participant' AND source_meeting_id IS NOT NULL)
+        OR source_type IN ('manual', 'promotion_candidate')
     )
 );
 
@@ -125,7 +126,8 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
     CONSTRAINT transcript_feedback_meeting_fk
         FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id) ON DELETE CASCADE,
     CONSTRAINT transcript_feedback_segment_fk
-        FOREIGN KEY (transcript_segment_id, meeting_id) REFERENCES transcripts(id, meeting_id) ON DELETE SET NULL,
+        FOREIGN KEY (transcript_segment_id, meeting_id)
+        REFERENCES transcripts(id, meeting_id) ON DELETE SET NULL (transcript_segment_id),
     CONSTRAINT transcript_feedback_target_domain_fk
         FOREIGN KEY (target_domain_knowledge_id, tenant_id, guild_id)
         REFERENCES domain_knowledge_items(id, tenant_id, guild_id) ON DELETE RESTRICT,
@@ -199,7 +201,7 @@ BEGIN
     ALTER TABLE ai_memory_notes
     ADD CONSTRAINT ai_memory_notes_source_feedback_fk
     FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT;
+    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL (source_feedback_id);
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END
@@ -249,7 +251,7 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT person_aliases_source_feedback_fk
         FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT,
+        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL (source_feedback_id),
     CONSTRAINT person_aliases_guild_id_nonempty_check CHECK (length(btrim(guild_id)) > 0),
     CONSTRAINT person_aliases_canonical_name_nonempty_check CHECK (length(btrim(canonical_name)) > 0),
     CONSTRAINT person_aliases_alias_nonempty_check CHECK (length(btrim(alias)) > 0),

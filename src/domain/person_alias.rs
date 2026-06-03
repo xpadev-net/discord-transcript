@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use super::ai_memory::ConfidencePermille;
+use super::confidence::ConfidencePermille;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersonAliasSourceType {
