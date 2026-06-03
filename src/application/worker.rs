@@ -178,7 +178,7 @@ where
                     quantity: asr_seconds,
                     detail_json: UsageDetailJson::new(serde_json::json!({
                         "source": "audio_duration",
-                        "segment_count": transcription.segments.len(),
+                        "whisper_segment_count": transcription.segments.len(),
                         "surface": "process_meeting_summary_done"
                     }))
                     .expect("usage detail must be a JSON object"),
@@ -501,6 +501,7 @@ pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, Strin
 
 fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
     let fmt_chunk_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    let audio_format = u16::from_le_bytes([header[20], header[21]]);
     // Only the canonical 44-byte PCM layout is supported here. Files with
     // metadata chunks between `fmt ` and `data` return None so the caller can
     // warn and skip the observe-only ASR usage event.
@@ -508,6 +509,7 @@ fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
         || &header[8..12] != b"WAVE"
         || &header[12..16] != b"fmt "
         || fmt_chunk_size != 16
+        || audio_format != 1
         || &header[36..40] != b"data"
     {
         return None;
