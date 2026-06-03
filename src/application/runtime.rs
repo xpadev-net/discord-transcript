@@ -1575,15 +1575,11 @@ fn load_runtime_summary_context(
             ))
         })?;
 
-    let summary_template = if let Some(template_id) = effective_settings
-        .summary_template_id
-        .as_deref()
-        .filter(|template_id| !template_id.trim().is_empty())
-    {
-        store.get_summary_template(guild_id, template_id)
-    } else {
-        store.get_active_summary_template(guild_id)
-    }
+    let summary_template = crate::application::worker::load_effective_summary_template(
+        store,
+        guild_id,
+        Some(effective_settings),
+    )
     .map_err(|err| {
         crate::application::summary::SummaryError::SummaryEngine(format!(
             "failed to load summary template for meeting {meeting_id}: {err}"
@@ -4174,15 +4170,13 @@ impl ScaffoldHandler {
                         display_name: None,
                     });
             }
-            if !summary_context_speakers.is_empty() {
-                let rendered = crate::domain::transcript::render_for_summary(
-                    &transcription.segments,
-                    Some(&summary_context_speakers),
-                );
-                let masked = crate::domain::privacy::mask_pii(&rendered);
-                summary_transcript = masked.text;
-                summary_masking_stats = masked.stats;
-            }
+            let rendered = crate::domain::transcript::render_for_summary(
+                &transcription.segments,
+                Some(&summary_context_speakers),
+            );
+            let masked = crate::domain::privacy::mask_pii(&rendered);
+            summary_transcript = masked.text;
+            summary_masking_stats = masked.stats;
         }
 
         // The pre-correction transcript is accurate regardless of whether the

@@ -174,7 +174,7 @@ fn load_meeting_speakers<E: SqlExecutor>(
     Ok(speakers)
 }
 
-fn load_effective_summary_template<E: SqlExecutor>(
+pub(crate) fn load_effective_summary_template<E: SqlExecutor>(
     store: &mut SqlMeetingStore<E>,
     guild_id: &str,
     effective_settings: Option<&EffectiveMeetingSettings>,
