@@ -1,6 +1,7 @@
 use discord_transcript::application::meeting_flow::{MeetingFlowInput, run_meeting_flow};
 use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::application::worker::ProcessMeetingInput;
+use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig};
 use discord_transcript::audio::recording_session::RecordingSession;
 use discord_transcript::domain::MeetingStatus;
@@ -48,6 +49,8 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
     let layout = MeetingWorkspaceLayout::new(&base);
     let workspace = layout.for_meeting("g1", "vc1", "m1");
     workspace.ensure_base_dirs().expect("workspace dirs");
+    let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
+    std::fs::write(workspace.mixdown_path(), wav).expect("mixdown should be written");
     let storage = LocalChunkStorage::new(workspace.clone(), "m1");
     let mut session = RecordingSession::new(
         "m1".to_owned(),

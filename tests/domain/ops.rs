@@ -11,7 +11,7 @@ use discord_transcript::domain::retention::{
 };
 use discord_transcript::domain::usage::{
     EntitlementAction, EntitlementEvaluator, EntitlementMode, EntitlementPolicy, NewUsageEvent,
-    UsageAggregate, UsageEvent, UsageEventLedger, UsageMetric, UsageSnapshot,
+    UsageAggregate, UsageDetailJson, UsageEvent, UsageEventLedger, UsageMetric, UsageSnapshot,
     recording_minutes_from_seconds,
 };
 use discord_transcript::infrastructure::storage::{
@@ -257,6 +257,7 @@ fn audit_log_appends_and_reads_events() {
 fn usage_event_ledger_is_append_only_and_idempotent_by_event_id() {
     let mut ledger = UsageEventLedger::new();
     let observed_at = Utc.with_ymd_and_hms(2026, 6, 3, 1, 2, 3).unwrap();
+    let rounded_minutes = recording_minutes_from_seconds(61);
     let event = UsageEvent {
         id: "usage-1".to_owned(),
         tenant_id: Some("tenant-g1".to_owned()),
@@ -266,7 +267,7 @@ fn usage_event_ledger_is_append_only_and_idempotent_by_event_id() {
         resource_type: Some("meeting".to_owned()),
         resource_id: Some("m1".to_owned()),
         metric: UsageMetric::RecordingMinutes,
-        quantity: recording_minutes_from_seconds(61),
+        quantity: rounded_minutes,
         detail_json: r#"{"duration_seconds":61}"#.to_owned(),
         observed_at,
         created_at: observed_at,
@@ -276,7 +277,7 @@ fn usage_event_ledger_is_append_only_and_idempotent_by_event_id() {
     ledger.append(event);
 
     assert_eq!(ledger.list().len(), 1);
-    assert_eq!(ledger.recent(10)[0].quantity, 2);
+    assert_eq!(ledger.recent(10)[0].quantity, rounded_minutes);
 }
 
 #[test]
@@ -296,13 +297,24 @@ fn entitlement_evaluator_observe_only_never_blocks() {
         .evaluate(EntitlementAction::StartRecording, &snapshot);
 
     assert!(observe_only.allowed);
-    assert!(observe_only.observations[0].exceeded);
+    assert!(
+        observe_only.observations.iter().any(|observation| {
+            observation.metric == UsageMetric::RecordingMinutes && observation.exceeded
+        })
+    );
     assert!(!enforced.allowed);
 
     let default_observe_only =
         EntitlementEvaluator::observe_only().evaluate(EntitlementAction::StartRecording, &snapshot);
     assert!(default_observe_only.allowed);
     assert_eq!(default_observe_only.observations.len(), 5);
+}
+
+#[test]
+fn usage_detail_json_accepts_only_json_objects() {
+    assert!(UsageDetailJson::parse(r#"{"source":"test"}"#).is_ok());
+    assert!(UsageDetailJson::parse("[]").is_err());
+    assert!(UsageDetailJson::parse("").is_err());
 }
 
 #[test]
@@ -324,7 +336,7 @@ fn in_memory_usage_aggregate_honors_recent_window() {
                 resource_id: Some("m1".to_owned()),
                 metric: UsageMetric::DebugDownloads,
                 quantity: 1,
-                detail_json: "{}".to_owned(),
+                detail_json: UsageDetailJson::parse("{}").expect("usage detail should parse"),
                 observed_at,
             })
             .expect("usage event should append");
@@ -352,7 +364,7 @@ fn in_memory_usage_tenant_filter_includes_guild_scoped_events() {
             resource_id: Some("m1".to_owned()),
             metric: UsageMetric::SummaryRuns,
             quantity: 1,
-            detail_json: "{}".to_owned(),
+            detail_json: UsageDetailJson::parse("{}").expect("usage detail should parse"),
             observed_at: Utc::now(),
         })
         .expect("usage event should append");

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +35,53 @@ impl UsageMetric {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageDetailJson(String);
+
+impl UsageDetailJson {
+    pub fn new(value: Value) -> Result<Self, String> {
+        if value.is_object() {
+            Ok(Self(value.to_string()))
+        } else {
+            Err("usage detail_json must be a JSON object".to_owned())
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let parsed = serde_json::from_str(value)
+            .map_err(|err| format!("usage detail_json must be valid JSON: {err}"))?;
+        Self::new(parsed)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<Value> for UsageDetailJson {
+    type Error = String;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for UsageDetailJson {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<String> for UsageDetailJson {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageEvent {
     pub id: String,
     pub tenant_id: Option<String>,
@@ -60,7 +108,7 @@ pub struct NewUsageEvent {
     pub resource_id: Option<String>,
     pub metric: UsageMetric,
     pub quantity: i64,
-    pub detail_json: String,
+    pub detail_json: UsageDetailJson,
     pub observed_at: DateTime<Utc>,
 }
 

@@ -10,7 +10,7 @@ use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -29,7 +29,7 @@ use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{summary_template_variables, validate_summary_template};
 use crate::domain::transcript::TranscriptSource;
-use crate::domain::usage::{NewUsageEvent, UsageMetric};
+use crate::domain::usage::{NewUsageEvent, UsageDetailJson, UsageMetric};
 use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
@@ -365,6 +365,35 @@ async fn record_usage_event(state: &WebState, event: NewUsageEvent) {
             "failed to persist usage event"
         );
     }
+}
+
+fn debug_download_usage_event_id(
+    guild_id: &str,
+    meeting_id: &str,
+    artifact_id: &str,
+    filename: &str,
+    content_type: &str,
+    user_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "debug_downloads",
+        guild_id,
+        meeting_id,
+        artifact_id,
+        filename,
+        content_type,
+        user_id,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut id = String::from("usage:debug_downloads:");
+    for byte in &digest[..16] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
 }
 
 pub struct AuthConfig {
@@ -5118,28 +5147,45 @@ async fn api_debug_file(
         ),
     )
     .await;
-    record_usage_event(
-        &state,
-        NewUsageEvent {
-            id: Uuid::new_v4().to_string(),
-            tenant_id: None,
-            guild_id: access.guild_id,
-            meeting_id: Some(meeting_id.clone()),
-            job_id: None,
-            resource_type: Some("debug_artifact".to_owned()),
-            resource_id: Some(artifact_id.clone()),
-            metric: UsageMetric::DebugDownloads,
-            quantity: 1,
-            detail_json: json!({
-                "filename": audit_filename,
-                "content_type": audit_content_type,
-                "admin_only": debug_artifact_requires_admin(&artifact_id),
-            })
-            .to_string(),
-            observed_at: Utc::now(),
-        },
-    )
-    .await;
+    let usage_state = state.clone();
+    let usage_guild_id = access.guild_id.clone();
+    let usage_meeting_id = meeting_id.clone();
+    let usage_artifact_id = artifact_id.clone();
+    let usage_filename = audit_filename.clone();
+    let usage_content_type = audit_content_type.to_owned();
+    let usage_user_id = user_id.clone();
+    let usage_admin_only = debug_artifact_requires_admin(&artifact_id);
+    tokio::spawn(async move {
+        record_usage_event(
+            &usage_state,
+            NewUsageEvent {
+                id: debug_download_usage_event_id(
+                    &usage_guild_id,
+                    &usage_meeting_id,
+                    &usage_artifact_id,
+                    &usage_filename,
+                    &usage_content_type,
+                    &usage_user_id,
+                ),
+                tenant_id: None,
+                guild_id: usage_guild_id,
+                meeting_id: Some(usage_meeting_id),
+                job_id: None,
+                resource_type: Some("debug_artifact".to_owned()),
+                resource_id: Some(usage_artifact_id),
+                metric: UsageMetric::DebugDownloads,
+                quantity: 1,
+                detail_json: UsageDetailJson::new(json!({
+                    "filename": usage_filename,
+                    "content_type": usage_content_type,
+                    "admin_only": usage_admin_only,
+                }))
+                .expect("usage detail must be a JSON object"),
+                observed_at: Utc::now(),
+            },
+        )
+        .await;
+    });
     Ok(response)
 }
 

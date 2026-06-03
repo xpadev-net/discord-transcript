@@ -7,7 +7,8 @@ use crate::application::summary::{
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::usage::{
-    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageMetric, UsageSnapshot,
+    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
+    UsageSnapshot,
 };
 use crate::domain::{JobStatus, JobType, MeetingStatus};
 use crate::infrastructure::asr::WhisperClient;
@@ -17,6 +18,8 @@ use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspaceP
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::Utc;
 use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use tracing::{error, info, warn};
 
@@ -157,28 +160,39 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    // The runtime scaffold and batch worker are deployment alternatives today.
-    // Keep the same ASR event id so retries remain idempotent if topology changes.
-    record_usage_event_observe_only(
-        store,
-        NewUsageEvent {
-            id: format!("usage:asr_seconds:{}", input.meeting_id),
-            tenant_id: None,
-            guild_id: input.guild_id.clone(),
-            meeting_id: Some(input.meeting_id.clone()),
-            job_id: input.job_id.clone(),
-            resource_type: Some("meeting".to_owned()),
-            resource_id: Some(input.meeting_id.clone()),
-            metric: UsageMetric::AsrSeconds,
-            quantity: asr_seconds_from_transcription(&transcription),
-            detail_json: serde_json::json!({
-                "source": "transcript_segment_span",
-                "segment_count": transcription.segments.len()
-            })
-            .to_string(),
-            observed_at: Utc::now(),
-        },
-    );
+    match asr_seconds_from_audio_path(&input.audio_path) {
+        Ok(asr_seconds) => {
+            // The runtime scaffold and batch worker are deployment alternatives today.
+            // Keep the same ASR event id so retries remain idempotent if topology changes.
+            record_usage_event_observe_only(
+                store,
+                NewUsageEvent {
+                    id: format!("usage:asr_seconds:{}", input.meeting_id),
+                    tenant_id: None,
+                    guild_id: input.guild_id.clone(),
+                    meeting_id: Some(input.meeting_id.clone()),
+                    job_id: input.job_id.clone(),
+                    resource_type: Some("meeting".to_owned()),
+                    resource_id: Some(input.meeting_id.clone()),
+                    metric: UsageMetric::AsrSeconds,
+                    quantity: asr_seconds,
+                    detail_json: UsageDetailJson::new(serde_json::json!({
+                        "source": "audio_duration",
+                        "segment_count": transcription.segments.len(),
+                        "surface": "process_meeting_summary_done"
+                    }))
+                    .expect("usage detail must be a JSON object"),
+                    observed_at: Utc::now(),
+                },
+            );
+        }
+        Err(err) => warn!(
+            meeting_id = %input.meeting_id,
+            audio_path = %input.audio_path,
+            error = %err,
+            "skipping ASR usage event because audio duration is unavailable"
+        ),
+    }
 
     persist_pre_correction_transcript_debug_artifact(
         &request.workspace,
@@ -469,27 +483,31 @@ where
     }
 }
 
-pub(crate) fn asr_seconds_from_transcription(transcription: &TranscriptionOutput) -> i64 {
-    let Some(first_start) = transcription
-        .segments
-        .iter()
-        .map(|segment| segment.start_ms)
-        .min()
-    else {
-        return 0;
-    };
-    let Some(last_end) = transcription
-        .segments
-        .iter()
-        .map(|segment| segment.end_ms)
-        .max()
-    else {
-        return 0;
-    };
-    last_end
-        .saturating_sub(first_start)
-        .div_ceil(1000)
-        .min(i64::MAX as u64) as i64
+pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, String> {
+    let mut file =
+        File::open(audio_path).map_err(|err| format!("failed to open ASR audio file: {err}"))?;
+    let mut header = [0_u8; 44];
+    file.read_exact(&mut header)
+        .map_err(|err| format!("failed to read ASR audio header: {err}"))?;
+    let duration_ms = wav_header_duration_ms(&header)
+        .ok_or_else(|| "ASR audio file is not a supported PCM WAV".to_owned())?;
+    Ok(duration_ms.div_ceil(1000).min(i64::MAX as u64) as i64)
+}
+
+fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
+    if &header[0..4] != b"RIFF"
+        || &header[8..12] != b"WAVE"
+        || &header[12..16] != b"fmt "
+        || &header[36..40] != b"data"
+    {
+        return None;
+    }
+    let byte_rate = u32::from_le_bytes([header[28], header[29], header[30], header[31]]) as u128;
+    if byte_rate == 0 {
+        return None;
+    }
+    let data_size = u32::from_le_bytes([header[40], header[41], header[42], header[43]]) as u128;
+    Some(data_size.saturating_mul(1_000).div_ceil(byte_rate) as u64)
 }
 
 fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: NewUsageEvent) {
@@ -536,11 +554,11 @@ fn record_summary_run_usage_observe_only<S: MeetingStore + UsageEventStore>(
             resource_id: Some(meeting_id.to_owned()),
             metric: UsageMetric::SummaryRuns,
             quantity: 1,
-            detail_json: serde_json::json!({
+            detail_json: UsageDetailJson::new(serde_json::json!({
                 "chunk_count": chunk_count,
                 "surface": "process_next_summary_job_done"
-            })
-            .to_string(),
+            }))
+            .expect("usage detail must be a JSON object"),
             observed_at: Utc::now(),
         },
     );

@@ -309,7 +309,7 @@ impl UsageEventStore for InMemoryMeetingStore {
                 resource_id: event.resource_id.clone(),
                 metric: event.metric,
                 quantity: event.quantity,
-                detail_json: event.detail_json.clone(),
+                detail_json: event.detail_json.as_str().to_owned(),
                 observed_at: event.observed_at,
                 created_at: event.observed_at,
             });

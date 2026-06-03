@@ -4,6 +4,7 @@ use discord_transcript::application::bot::{
 use discord_transcript::application::command::PermissionSet;
 use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::application::worker::{ProcessMeetingInput, process_meeting_summary};
+use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
@@ -43,10 +44,11 @@ fn temp_workspace(meeting_id: &str) -> TempWorkspaceGuard {
         "discord_transcript_runtime_worker_{meeting_id}_{nanos}"
     ));
     let layout = MeetingWorkspaceLayout::new(&base);
-    TempWorkspaceGuard {
-        workspace: layout.for_meeting("g1", "vc", meeting_id),
-        base,
-    }
+    let workspace = layout.for_meeting("g1", "vc", meeting_id);
+    std::fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+    let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
+    std::fs::write(workspace.mixdown_path(), wav).expect("mixdown should be written");
+    TempWorkspaceGuard { workspace, base }
 }
 
 fn base_env() -> HashMap<String, String> {

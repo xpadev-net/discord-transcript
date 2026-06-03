@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use discord_transcript::domain::usage::{NewUsageEvent, UsageMetric};
+use discord_transcript::domain::usage::{NewUsageEvent, UsageDetailJson, UsageMetric};
 use discord_transcript::infrastructure::sql::{
     AGGREGATE_RECENT_USAGE_SQL, INCREMENTAL_MIGRATIONS_SQL, INSERT_USAGE_EVENT_SQL,
     LIST_RECENT_USAGE_EVENTS_SQL,
@@ -19,7 +19,8 @@ fn usage_event() -> NewUsageEvent {
         resource_id: Some("m1".to_owned()),
         metric: UsageMetric::AsrSeconds,
         quantity: 42,
-        detail_json: r#"{"source":"test"}"#.to_owned(),
+        detail_json: UsageDetailJson::parse(r#"{"source":"test"}"#)
+            .expect("usage detail should parse"),
         observed_at: Utc.with_ymd_and_hms(2026, 6, 3, 1, 2, 3).unwrap(),
     }
 }

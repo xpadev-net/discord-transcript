@@ -24,7 +24,9 @@ use crate::domain::transcript::{
     MAX_DB_TIMESTAMP_MS, NormalizationConfig, TranscriptSegment, TranscriptSource,
     normalize_segments, render_for_summary,
 };
-use crate::domain::usage::{NewUsageEvent, UsageMetric, recording_minutes_from_seconds};
+use crate::domain::usage::{
+    NewUsageEvent, UsageDetailJson, UsageMetric, recording_minutes_from_seconds,
+};
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
@@ -310,10 +312,10 @@ fn record_recording_duration_usage<S: MeetingStore + UsageEventStore>(
         resource_id: Some(meeting_id.to_owned()),
         metric: UsageMetric::RecordingMinutes,
         quantity: recording_minutes_from_seconds(duration_seconds),
-        detail_json: serde_json::json!({
+        detail_json: UsageDetailJson::new(serde_json::json!({
             "duration_seconds": duration_seconds
-        })
-        .to_string(),
+        }))
+        .expect("usage detail must be a JSON object"),
         observed_at: Utc::now(),
     };
     if let Err(err) = store.append_usage_event(&event) {
@@ -3331,11 +3333,11 @@ impl ScaffoldHandler {
                 resource_id: Some(meeting_id.to_owned()),
                 metric: UsageMetric::SummaryRuns,
                 quantity: 1,
-                detail_json: serde_json::json!({
+                detail_json: UsageDetailJson::new(serde_json::json!({
                     "chunk_count": chunk_count,
                     "surface": "runtime_post_success"
-                })
-                .to_string(),
+                }))
+                .expect("usage detail must be a JSON object"),
                 observed_at: Utc::now(),
             };
             if let Err(err) = service.store.append_usage_event(&event) {
@@ -3360,8 +3362,21 @@ impl ScaffoldHandler {
         guild_id: &str,
         meeting_id: &str,
         job_id: &str,
+        audio_path: &str,
         transcription: &crate::application::summary::TranscriptionOutput,
     ) {
+        let quantity = match crate::application::worker::asr_seconds_from_audio_path(audio_path) {
+            Ok(quantity) => quantity,
+            Err(err) => {
+                warn!(
+                    meeting_id,
+                    audio_path,
+                    error = %err,
+                    "skipping ASR usage event because audio duration is unavailable"
+                );
+                return;
+            }
+        };
         let event = NewUsageEvent {
             id: format!("usage:asr_seconds:{meeting_id}"),
             tenant_id: None,
@@ -3371,13 +3386,13 @@ impl ScaffoldHandler {
             resource_type: Some("meeting".to_owned()),
             resource_id: Some(meeting_id.to_owned()),
             metric: UsageMetric::AsrSeconds,
-            quantity: crate::application::worker::asr_seconds_from_transcription(transcription),
-            detail_json: serde_json::json!({
-                "source": "transcript_segment_span",
+            quantity,
+            detail_json: UsageDetailJson::new(serde_json::json!({
+                "source": "audio_duration",
                 "segment_count": transcription.segments.len(),
                 "surface": "runtime_transcription_success"
-            })
-            .to_string(),
+            }))
+            .expect("usage detail must be a JSON object"),
             observed_at: Utc::now(),
         };
         let mut service = self.service.lock().await;
@@ -3840,6 +3855,7 @@ impl ScaffoldHandler {
             &meeting.guild_id,
             &claimed_job.meeting_id,
             &claimed_job.id,
+            &request.audio_path,
             &transcription,
         )
         .await;

@@ -988,7 +988,7 @@ pub fn audit_event_params(event: &AuditEvent) -> Vec<String> {
         event.resource_type.clone(),
         event.resource_id.clone().unwrap_or_default(),
         event.request_metadata_json.clone(),
-        event.detail_json.clone(),
+        event.detail_json.as_str().to_owned(),
         event.occurred_at.to_rfc3339(),
     ]
 }
@@ -1004,7 +1004,7 @@ pub fn usage_event_params(event: &NewUsageEvent) -> Vec<String> {
         event.resource_id.clone().unwrap_or_default(),
         event.metric.as_str().to_owned(),
         event.quantity.to_string(),
-        event.detail_json.clone(),
+        event.detail_json.as_str().to_owned(),
         event.observed_at.to_rfc3339(),
     ]
 }
