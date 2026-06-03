@@ -198,7 +198,19 @@ fn render_whisper_command_for_log(
     parts.push(format!("vad={}", client.vad));
     parts.push("-F".to_owned());
     parts.push(format!("temperature={}", client.temperature));
-    parts.join(" ")
+    parts
+        .iter()
+        .map(|part| quote_log_arg(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_log_arg(part: &str) -> String {
+    if part.contains(char::is_whitespace) || part.contains('"') {
+        format!("\"{}\"", part.replace('"', "\\\""))
+    } else {
+        part.to_owned()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,7 +905,7 @@ mod tests {
             command_timeout: Duration::from_secs(5),
         };
         let request = WhisperInferenceRequest {
-            audio_path: "audio.wav".to_owned(),
+            audio_path: "audio file.wav".to_owned(),
             language: None,
             prompt: Some(secret_request.to_owned()),
         };
@@ -909,6 +921,7 @@ mod tests {
         assert!(!message.contains(secret_request));
         assert!(!message.contains("customer secret"));
         assert!(!message.contains("still secret"));
+        assert!(message.contains("\"file=@audio file.wav\""));
         assert!(message.contains("prompt=[REDACTED]"));
 
         let client_debug = format!("{client:?}");
