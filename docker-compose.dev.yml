@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    # Host networking is required for Discord voice (songbird).
+    # Host networking is required only for the Discord voice runtime (songbird).
     # Docker's bridge network does not reliably NAT the UDP traffic
     # needed for voice gateway IP discovery and audio streaming.
     network_mode: host
@@ -21,15 +21,12 @@ services:
       WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-ja}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       WEB_PORT: ${WEB_PORT:-3000}
-      WEB_BIND_HOST: ${WEB_BIND_HOST:-0.0.0.0}
+      # Keep the web UI loopback-only by default because app uses host networking.
+      WEB_BIND_HOST: ${WEB_BIND_HOST:-127.0.0.1}
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
       DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
       WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:-}
     volumes:
-      - ${HOME}/.claude:/home/app/.claude
-      # OpenCode (auth.json under ~/.local/share/opencode) and Cursor CLI (~/.cursor)
-      - ${HOME}/.local/share/opencode:/home/app/.local/share/opencode
-      - ${HOME}/.cursor:/home/app/.cursor
       - chunks:/data/chunks
     restart: unless-stopped
 
@@ -52,12 +49,11 @@ services:
 
   migrate:
     build: .
-    network_mode: host
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@127.0.0.1/discord_transcript
+      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@db:5432/discord_transcript
       DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-disable}
     command: ["discord-transcript", "migrate"]
 
