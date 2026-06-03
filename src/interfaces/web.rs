@@ -103,9 +103,12 @@ FROM job_counts, meeting_counts, live_chunk_counts
 // ---------- State ----------
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
+const PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS: u64 = 15;
 const MEMBERSHIP_CACHE_TTL_SECS: u64 = 5;
 const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 5;
-const GUILD_CACHE_TTL_SECS: u64 = 300;
+const GUILD_CACHE_TTL_SECS: u64 = 15;
+const GUILD_CACHE_REFRESH_INFLIGHT_SECS: u64 = 5;
+const GUILD_CACHE_FAILURE_TTL_SECS: u64 = 5;
 const BOT_TOKEN_CACHE_TTL_SECS: u64 = 300;
 const BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS: u64 = 5;
 const BOT_TOKEN_CACHE_FAILURE_TTL_SECS: u64 = 5;
@@ -116,7 +119,7 @@ const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
 
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
-type GuildCache = Arc<tokio::sync::RwLock<Option<(DiscordGuildFull, Instant)>>>;
+type GuildCache = Arc<tokio::sync::RwLock<GuildCacheState>>;
 type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
 type OperationalMetricsCache = Arc<Mutex<Option<OperationalMetricsCacheEntry>>>;
 type MembershipCache =
@@ -129,6 +132,20 @@ struct BotTokenCacheState {
     failure: Option<(StatusCode, Instant)>,
     revision: u64,
     refresh: Option<BotTokenRefreshEntry>,
+}
+
+#[derive(Default)]
+struct GuildCacheState {
+    entry: Option<(DiscordGuildFull, Instant)>,
+    failure: Option<(StatusCode, Instant)>,
+    revision: u64,
+    refresh: Option<GuildRefreshEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct GuildRefreshEntry {
+    notify: Arc<Notify>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -270,7 +287,7 @@ impl WebState {
             bot_token_revision_tx: guild_bot_token.revision_tx,
             operational_metrics_cache: Arc::new(Mutex::new(None)),
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            guild_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            guild_cache: Arc::new(tokio::sync::RwLock::new(GuildCacheState::default())),
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
@@ -1577,6 +1594,29 @@ fn meeting_access_from_row(
     })
 }
 
+fn permission_cache_ttl(permission: CachedChannelPermission) -> u64 {
+    if permission.can_view || permission.is_admin {
+        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS
+    } else {
+        PERMISSION_CACHE_TTL_SECS
+    }
+}
+
+async fn cache_channel_permission(
+    permission_cache: &PermissionCache,
+    cache_key: (String, String),
+    permission: CachedChannelPermission,
+) {
+    let mut cache = permission_cache.write().await;
+    let expires_at = Instant::now() + Duration::from_secs(permission_cache_ttl(permission));
+    cache.insert(cache_key, (permission, expires_at));
+
+    if cache.len() > 5000 {
+        let now = Instant::now();
+        cache.retain(|_, (_, exp)| *exp > now);
+    }
+}
+
 async fn verify_meeting_access_after_row<Fut>(
     guild_id: String,
     channel_id: String,
@@ -1608,18 +1648,7 @@ where
     // Cache miss — query Discord API
     let permission = permission_check.await?;
 
-    // Store result in cache (also evict expired entries periodically)
-    {
-        let mut cache = permission_cache.write().await;
-        let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
-        cache.insert(cache_key, (permission, expires_at));
-
-        // Evict expired entries if cache grows large
-        if cache.len() > 5000 {
-            let now = Instant::now();
-            cache.retain(|_, (_, exp)| *exp > now);
-        }
-    }
+    cache_channel_permission(permission_cache, cache_key, permission).await;
 
     if permission.can_view {
         Ok(access)
@@ -1659,8 +1688,10 @@ where
 /// voice channel where the meeting was recorded. Returns the meeting's
 /// guild/voice-channel IDs so callers can build paths without an extra
 /// DB round-trip.
-/// Results are cached per (user_id, channel_id) for 5 minutes to avoid
-/// Discord API rate-limit exhaustion on page loads (which trigger ~4 requests).
+/// Results are cached per (user_id, channel_id) to avoid Discord API
+/// rate-limit exhaustion on page loads (which trigger ~4 requests). Positive
+/// allows use a short reverify window so permission revocations take effect
+/// quickly; denials use the longer cache TTL.
 async fn verify_meeting_access(
     state: &WebState,
     meeting_id: &str,
@@ -1701,64 +1732,174 @@ async fn get_guild_info(
     get_guild_info_with_bot_auth(state, auth, &bot_auth).await
 }
 
+fn cached_guild_result(cache: &GuildCacheState) -> Option<Result<DiscordGuildFull, StatusCode>> {
+    let now = Instant::now();
+    if let Some((guild, expires_at)) = cache.entry.as_ref()
+        && now < *expires_at
+    {
+        return Some(Ok(guild.clone()));
+    }
+    if let Some((status, expires_at)) = cache.failure.as_ref()
+        && now < *expires_at
+    {
+        return Some(Err(*status));
+    }
+    None
+}
+
+fn fresh_guild_refresh_notify(cache: &GuildCacheState) -> Option<Arc<Notify>> {
+    let refresh = cache.refresh.as_ref()?;
+    if Instant::now().duration_since(refresh.started_at).as_secs()
+        < GUILD_CACHE_REFRESH_INFLIGHT_SECS
+    {
+        return Some(refresh.notify.clone());
+    }
+    None
+}
+
+async fn guild_info_from_cache_with_resolver<F, Fut>(
+    guild_cache: &GuildCache,
+    fetch_guild: F,
+) -> Result<DiscordGuildFull, StatusCode>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<DiscordGuildFull, StatusCode>>,
+{
+    loop {
+        {
+            let cache = guild_cache.read().await;
+            if let Some(result) = cached_guild_result(&cache) {
+                return result;
+            }
+            if let Some(notify) = fresh_guild_refresh_notify(&cache) {
+                let notified = notify.notified();
+                drop(cache);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(GUILD_CACHE_REFRESH_INFLIGHT_SECS),
+                    notified,
+                )
+                .await;
+                continue;
+            }
+        }
+
+        let (observed_revision, leader_notify) = {
+            let mut cache = guild_cache.write().await;
+            if let Some(result) = cached_guild_result(&cache) {
+                return result;
+            }
+            if let Some(notify) = fresh_guild_refresh_notify(&cache) {
+                let notified = notify.notified();
+                drop(cache);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(GUILD_CACHE_REFRESH_INFLIGHT_SECS),
+                    notified,
+                )
+                .await;
+                continue;
+            }
+            if let Some(stale_refresh) = cache.refresh.take() {
+                stale_refresh.notify.notify_waiters();
+            }
+            let notify = Arc::new(Notify::new());
+            cache.refresh = Some(GuildRefreshEntry {
+                notify: notify.clone(),
+                started_at: Instant::now(),
+            });
+            (cache.revision, notify)
+        };
+
+        let resolved = fetch_guild().await;
+
+        let mut cache = guild_cache.write().await;
+        let is_current_refresh = cache
+            .refresh
+            .as_ref()
+            .is_some_and(|refresh| Arc::ptr_eq(&refresh.notify, &leader_notify));
+        if !is_current_refresh {
+            if cache.revision != observed_revision {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            continue;
+        }
+        let mut refresh_notify = cache.refresh.take();
+        if let Some(result) = cached_guild_result(&cache) {
+            if let Some(notify) = refresh_notify.take() {
+                notify.notify.notify_waiters();
+            }
+            return result;
+        }
+        if cache.revision != observed_revision {
+            if let Some(notify) = refresh_notify.take() {
+                notify.notify.notify_waiters();
+            }
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        match resolved {
+            Ok(guild) => {
+                cache.entry = Some((
+                    guild.clone(),
+                    Instant::now() + Duration::from_secs(GUILD_CACHE_TTL_SECS),
+                ));
+                cache.failure = None;
+                if let Some(notify) = refresh_notify.take() {
+                    notify.notify.notify_waiters();
+                }
+                return Ok(guild);
+            }
+            Err(status) => {
+                cache.failure = Some((
+                    status,
+                    Instant::now() + Duration::from_secs(GUILD_CACHE_FAILURE_TTL_SECS),
+                ));
+                if let Some(notify) = refresh_notify.take() {
+                    notify.notify.notify_waiters();
+                }
+                return Err(status);
+            }
+        }
+    }
+}
+
 async fn get_guild_info_with_bot_auth(
     state: &WebState,
     auth: &AuthConfig,
     bot_auth: &str,
 ) -> Result<DiscordGuildFull, StatusCode> {
-    // Fast path: read lock
-    {
-        let cache = state.guild_cache.read().await;
-        if let Some((ref guild, expires_at)) = *cache
-            && Instant::now() < expires_at
-        {
-            return Ok(guild.clone());
-        }
-    }
+    guild_info_from_cache_with_resolver(&state.guild_cache, || async {
+        let guild_resp = state
+            .http_client
+            .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
+            .header("Authorization", bot_auth)
+            .send()
+            .await
+            .map_err(|err| {
+                warn!(error = %err, "discord guild API request failed");
+                StatusCode::BAD_GATEWAY
+            })?;
 
-    // Slow path: hold write lock for the entire fetch to serialize concurrent misses
-    let mut cache = state.guild_cache.write().await;
-    if let Some((ref guild, expires_at)) = *cache
-        && Instant::now() < expires_at
-    {
-        return Ok(guild.clone());
-    }
-
-    let guild_resp = state
-        .http_client
-        .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
-        .header("Authorization", bot_auth)
-        .send()
-        .await
-        .map_err(|err| {
-            warn!(error = %err, "discord guild API request failed");
+        let guild_status = guild_resp.status();
+        let guild_body = guild_resp.text().await.map_err(|err| {
+            warn!(error = %err, "discord guild API response read failed");
             StatusCode::BAD_GATEWAY
         })?;
-
-    let guild_status = guild_resp.status();
-    let guild_body = guild_resp.text().await.map_err(|err| {
-        warn!(error = %err, "discord guild API response read failed");
-        StatusCode::BAD_GATEWAY
-    })?;
-    let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
-        warn!(
-            error = %err,
-            status = %guild_status,
-            body_len = guild_body.len(),
-            "discord guild API response parse failed"
-        );
-        tracing::debug!(
-            body_len = guild_body.len(),
-            body_prefix = %utf8_safe_byte_prefix(&guild_body, 500),
-            "discord guild API response parse debug"
-        );
-        StatusCode::BAD_GATEWAY
-    })?;
-
-    let expires_at = Instant::now() + std::time::Duration::from_secs(GUILD_CACHE_TTL_SECS);
-    *cache = Some((guild.clone(), expires_at));
-
-    Ok(guild)
+        let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
+            warn!(
+                error = %err,
+                status = %guild_status,
+                body_len = guild_body.len(),
+                "discord guild API response parse failed"
+            );
+            tracing::debug!(
+                body_len = guild_body.len(),
+                body_prefix = %utf8_safe_byte_prefix(&guild_body, 500),
+                "discord guild API response parse debug"
+            );
+            StatusCode::BAD_GATEWAY
+        })?;
+        Ok(guild)
+    })
+    .await
 }
 
 /// Query Discord API for resolved channel permissions. Returns Ok(None) when
@@ -2075,16 +2216,14 @@ fn guild_admin_member_status_decision(status: reqwest::StatusCode) -> Option<Gui
 
 async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
     let mut cache = state.permission_cache.write().await;
-    let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
+    let permission = CachedChannelPermission {
+        can_view: is_admin,
+        is_admin,
+    };
+    let expires_at = Instant::now() + Duration::from_secs(permission_cache_ttl(permission));
     cache.insert(
         (user_id.to_owned(), "__guild__".to_owned()),
-        (
-            CachedChannelPermission {
-                can_view: is_admin,
-                is_admin,
-            },
-            expires_at,
-        ),
+        (permission, expires_at),
     );
 
     // Evict old entries if cache is too large (same pattern as check_channel_admin_permission)
@@ -2111,15 +2250,7 @@ async fn check_channel_admin_permission(
     }
 
     let permission = resolve_channel_permission_flags(state, auth, channel_id, user_id).await?;
-    {
-        let mut cache = state.permission_cache.write().await;
-        let expires_at = Instant::now() + std::time::Duration::from_secs(PERMISSION_CACHE_TTL_SECS);
-        cache.insert(cache_key, (permission, expires_at));
-        if cache.len() > 5000 {
-            let now = Instant::now();
-            cache.retain(|_, (_, exp)| *exp > now);
-        }
-    }
+    cache_channel_permission(&state.permission_cache, cache_key, permission).await;
     Ok(permission.is_admin)
 }
 
@@ -4119,7 +4250,16 @@ async fn invalidate_discord_caches(state: &WebState) {
     if let Some(refresh) = bot_token_refresh {
         refresh.notify.notify_waiters();
     }
-    state.guild_cache.write().await.take();
+    let guild_refresh = {
+        let mut cache = state.guild_cache.write().await;
+        cache.entry = None;
+        cache.failure = None;
+        cache.revision = cache.revision.wrapping_add(1);
+        cache.refresh.take()
+    };
+    if let Some(refresh) = guild_refresh {
+        refresh.notify.notify_waiters();
+    }
     state.membership_cache.write().await.clear();
     state.permission_cache.write().await.clear();
 }
@@ -5706,16 +5846,20 @@ mod operational_endpoint_tests {
 #[cfg(test)]
 mod guild_api_tests {
     use super::{
-        BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, DiscordBotTokenValidationError,
-        DiscordBotTokenValidationStage, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
-        GuildAdminCheck, GuildBotTokenUpdateRequest, GuildMeetingsQuery, GuildSettingsDefaults,
-        GuildSettingsUpdateRequest, StoredGuildSettings, SummaryTemplateUpsertRequest,
-        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
-        classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
-        guild_admin_required_result, guild_bot_token_delete_is_noop, guild_settings_response,
-        normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
-        normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
-        normalize_summary_template_request, validate_authorized_guild_settings_update,
+        BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, CachedChannelPermission,
+        DiscordBotTokenValidationError, DiscordBotTokenValidationStage, DiscordGuildFull,
+        DiscordRoleFull, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
+        GUILD_CACHE_REFRESH_INFLIGHT_SECS, GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache,
+        GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest,
+        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, StoredGuildSettings,
+        SummaryTemplateUpsertRequest, advance_bot_token_revision,
+        bot_auth_header_from_cache_with_resolver, classify_discord_bot_token_validation_status,
+        guild_admin_member_status_decision, guild_admin_required_result,
+        guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
+        guild_settings_response, normalize_domain_knowledge_list_filter,
+        normalize_domain_knowledge_request, normalize_guild_bot_token_update,
+        normalize_guild_meetings_pagination, normalize_summary_template_request,
+        permission_cache_ttl, validate_authorized_guild_settings_update,
         validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
         validate_guild_settings_update, validate_summary_template_id,
     };
@@ -6224,6 +6368,219 @@ mod guild_api_tests {
         assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
     }
 
+    fn test_guild(owner_id: &str) -> DiscordGuildFull {
+        DiscordGuildFull {
+            owner_id: owner_id.to_owned(),
+            roles: vec![DiscordRoleFull {
+                id: "guild".to_owned(),
+                permissions: 0,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn guild_cache_miss_singleflight_does_not_hold_write_lock_during_fetch() {
+        let cache: GuildCache = Arc::new(RwLock::new(GuildCacheState::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(6));
+        let release = Arc::new(Notify::new());
+        let tasks = (0..5)
+            .map(|_| {
+                let cache = cache.clone();
+                let calls = calls.clone();
+                let start = start.clone();
+                let release = release.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    guild_info_from_cache_with_resolver(&cache, || {
+                        let calls = calls.clone();
+                        let release = release.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            release.notified().await;
+                            Ok(test_guild("owner-1"))
+                        }
+                    })
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_refresh = cache.read().await.refresh.is_some();
+                if calls.load(Ordering::SeqCst) == 1 && has_refresh {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one guild refresh leader should start");
+
+        {
+            let _guard = tokio::time::timeout(Duration::from_millis(100), cache.read())
+                .await
+                .expect("readers should not queue behind a guild-cache write lock during fetch");
+        }
+        release.notify_waiters();
+
+        for task in tasks {
+            let guild = task.await.unwrap().expect("guild fetch should resolve");
+            assert_eq!(guild.owner_id, "owner-1");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_guild_cache_refresh_can_be_replaced() {
+        let cache: GuildCache = Arc::new(RwLock::new(GuildCacheState::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let block_fetch = Arc::new(Barrier::new(2));
+        let release_fetch = Arc::new(Barrier::new(2));
+        let leader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let block_fetch = block_fetch.clone();
+            let release_fetch = release_fetch.clone();
+            tokio::spawn(async move {
+                guild_info_from_cache_with_resolver(&cache, || {
+                    let calls = calls.clone();
+                    let block_fetch = block_fetch.clone();
+                    let release_fetch = release_fetch.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        block_fetch.wait().await;
+                        release_fetch.wait().await;
+                        Ok(test_guild("stale-owner"))
+                    }
+                })
+                .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_refresh = cache.read().await.refresh.is_some();
+                if calls.load(Ordering::SeqCst) == 1 && has_refresh {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first guild refresh leader should install sentinel");
+        leader.abort();
+        let _ = leader.await;
+        {
+            let mut cache_state = cache.write().await;
+            cache_state
+                .refresh
+                .as_mut()
+                .expect("aborted leader leaves guild refresh sentinel")
+                .started_at =
+                Instant::now() - Duration::from_secs(GUILD_CACHE_REFRESH_INFLIGHT_SECS + 1);
+        }
+
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let result = guild_info_from_cache_with_resolver(&cache, || {
+            let replacement_calls = replacement_calls.clone();
+            async move {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(test_guild("fresh-owner"))
+            }
+        })
+        .await
+        .expect("replacement guild fetch should resolve");
+
+        assert_eq!(result.owner_id, "fresh-owner");
+        assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn guild_cache_revision_change_rejects_stale_leader_result() {
+        let cache: GuildCache = Arc::new(RwLock::new(GuildCacheState::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_fetch = Arc::new(tokio::sync::Semaphore::new(0));
+        let leader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let release_fetch = release_fetch.clone();
+            tokio::spawn(async move {
+                guild_info_from_cache_with_resolver(&cache, || {
+                    let calls = calls.clone();
+                    let release_fetch = release_fetch.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let _permit = release_fetch
+                            .acquire()
+                            .await
+                            .expect("test semaphore should stay open");
+                        Ok(test_guild("stale-owner"))
+                    }
+                })
+                .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_refresh = cache.read().await.refresh.is_some();
+                if calls.load(Ordering::SeqCst) == 1 && has_refresh {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first guild refresh leader should install sentinel");
+
+        let refresh = {
+            let mut cache_state = cache.write().await;
+            cache_state.revision = cache_state.revision.wrapping_add(1);
+            cache_state.refresh.take()
+        };
+        if let Some(refresh) = refresh {
+            refresh.notify.notify_waiters();
+        }
+        release_fetch.add_permits(1);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), leader)
+            .await
+            .expect("stale leader should finish after release")
+            .unwrap();
+        match result {
+            Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+            Ok(guild) => panic!("stale leader unexpectedly cached guild {}", guild.owner_id),
+        }
+        let cache_state = cache.read().await;
+        assert!(cache_state.entry.is_none());
+        assert!(cache_state.failure.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn positive_permission_cache_entries_use_reverify_window() {
+        let admin_allow = CachedChannelPermission {
+            can_view: true,
+            is_admin: true,
+        };
+        let admin_deny = CachedChannelPermission {
+            can_view: false,
+            is_admin: false,
+        };
+
+        assert_eq!(
+            permission_cache_ttl(admin_allow),
+            PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS
+        );
+        assert_eq!(
+            permission_cache_ttl(admin_deny),
+            super::PERMISSION_CACHE_TTL_SECS
+        );
+    }
+
     #[test]
     fn guild_admin_member_status_treats_bot_auth_failures_as_upstream_errors() {
         assert_eq!(
@@ -6316,10 +6673,11 @@ mod guild_api_tests {
 mod discord_channel_full_tests {
     use super::{
         CachedChannelPermission, DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType,
-        DiscordRoleFull, PERMISSION_CACHE_TTL_SECS, PermissionCache, VIEW_CHANNEL,
-        authorize_debug_artifact_download, build_content_disposition, compute_channel_permissions,
-        debug_artifact_requires_admin, guild_meeting_channel_visible_after_row,
-        guild_meetings_response_total, meeting_access_from_row, verify_meeting_access_after_row,
+        DiscordRoleFull, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS,
+        PermissionCache, VIEW_CHANNEL, authorize_debug_artifact_download,
+        build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
+        guild_meeting_channel_visible_after_row, guild_meetings_response_total,
+        meeting_access_from_row, verify_meeting_access_after_row,
     };
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -6327,7 +6685,7 @@ mod discord_channel_full_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn channel_full_permission_overwrites_omitted() {
@@ -6560,6 +6918,49 @@ mod discord_channel_full_tests {
 
         assert!(matches!(result, Err(StatusCode::NOT_FOUND)));
         assert!(!permission_check_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn sensitive_access_denies_after_cached_allow_reverify_window() {
+        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        cache.write().await.insert(
+            ("user".to_owned(), "voice".to_owned()),
+            (
+                CachedChannelPermission {
+                    can_view: true,
+                    is_admin: false,
+                },
+                Instant::now()
+                    - Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS + 1),
+            ),
+        );
+        let permission_check_called = Arc::new(AtomicBool::new(false));
+        let permission_check_called_in_future = Arc::clone(&permission_check_called);
+
+        let result = verify_meeting_access_after_row(
+            "auth-guild".to_owned(),
+            "voice".to_owned(),
+            "auth-guild",
+            "user",
+            &cache,
+            async move {
+                permission_check_called_in_future.store(true, Ordering::SeqCst);
+                Ok(CachedChannelPermission {
+                    can_view: false,
+                    is_admin: false,
+                })
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::FORBIDDEN)));
+        assert!(permission_check_called.load(Ordering::SeqCst));
+        let cache = cache.read().await;
+        let (permission, expires_at) = cache
+            .get(&("user".to_owned(), "voice".to_owned()))
+            .expect("denial should replace stale allow");
+        assert!(!permission.can_view);
+        assert!(*expires_at > Instant::now() + Duration::from_secs(PERMISSION_CACHE_TTL_SECS / 2));
     }
 
     #[tokio::test]
