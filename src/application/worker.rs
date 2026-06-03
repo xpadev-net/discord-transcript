@@ -494,16 +494,15 @@ pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, Strin
     let mut header = [0_u8; 44];
     file.read_exact(&mut header)
         .map_err(|err| format!("failed to read ASR audio header: {err}"))?;
-    let duration_ms = wav_header_duration_ms(&header)
-        .ok_or_else(|| "ASR audio file is not a supported PCM WAV".to_owned())?;
+    let duration_ms = wav_header_duration_ms(&header)?;
     Ok(duration_ms.div_ceil(1000).min(i64::MAX as u64) as i64)
 }
 
-fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
+fn wav_header_duration_ms(header: &[u8; 44]) -> Result<u64, String> {
     let fmt_chunk_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
     let audio_format = u16::from_le_bytes([header[20], header[21]]);
     // Only the canonical 44-byte PCM layout is supported here. Files with
-    // metadata chunks between `fmt ` and `data` return None so the caller can
+    // metadata chunks between `fmt ` and `data` return Err so the caller can
     // warn and skip the observe-only ASR usage event.
     if &header[0..4] != b"RIFF"
         || &header[8..12] != b"WAVE"
@@ -512,18 +511,22 @@ fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
         || audio_format != 1
         || &header[36..40] != b"data"
     {
-        return None;
+        return Err(format!(
+            "ASR audio file is not a supported PCM WAV: audio_format={audio_format}, fmt_chunk_size={fmt_chunk_size}"
+        ));
     }
     let byte_rate = u32::from_le_bytes([header[28], header[29], header[30], header[31]]) as u128;
     if byte_rate == 0 {
-        return None;
+        return Err("ASR audio file is not a supported PCM WAV: byte_rate=0".to_owned());
     }
     let data_size = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
     if data_size == 0 || data_size == u32::MAX {
-        return None;
+        return Err(format!(
+            "ASR audio file is not a supported PCM WAV: data_size={data_size}"
+        ));
     }
     let data_size = data_size as u128;
-    Some(data_size.saturating_mul(1_000).div_ceil(byte_rate) as u64)
+    Ok(data_size.saturating_mul(1_000).div_ceil(byte_rate) as u64)
 }
 
 fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: NewUsageEvent) {

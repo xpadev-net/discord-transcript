@@ -5184,6 +5184,7 @@ async fn api_debug_file(
                     "filename": usage_filename,
                     "content_type": usage_content_type,
                     "admin_only": usage_admin_only,
+                    "user_id": usage_user_id,
                 }))
                 .expect("usage detail must be a JSON object"),
                 observed_at,
