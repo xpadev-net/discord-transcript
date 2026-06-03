@@ -14,9 +14,9 @@ regex = "1.12.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-serenity = { version = "0.12.5", features = ["client", "gateway", "model", "rustls_backend"] }
+serenity = { version = "0.12.5", default-features = false, features = ["default_native_tls", "client", "gateway", "model"] }
 sha2 = "0.10"
-songbird = { version = "0.6.0", features = ["serenity", "rustls", "receive"] }
+songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "native", "serenity", "tungstenite", "receive"] }
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "fs", "net", "signal"] }
 tokio-postgres = "0.7.15"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
