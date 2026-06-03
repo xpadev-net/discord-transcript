@@ -66,6 +66,7 @@ SELECT id,
 FROM meetings
 WHERE guild_id = $1
 ORDER BY started_at DESC
+LIMIT $2
 "#;
 const OPERATIONAL_SCHEMA_READY_SQL: &str = r#"
 SELECT
@@ -116,12 +117,20 @@ const OPERATIONAL_METRICS_CACHE_TTL_SECS: u64 = 15;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
 const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
+const GUILD_MEETINGS_VISIBILITY_SCAN_MIN: u32 = 100;
+const GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT: u32 = 500;
+const GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP: usize = 32;
+const TRANSCRIPT_SSE_MAX_PER_USER_MEETING: usize = 2;
+const TRANSCRIPT_SSE_BASE_POLL_SECS: u64 = 2;
+const TRANSCRIPT_SSE_MAX_POLL_SECS: u64 = 10;
+const TRANSCRIPT_SSE_MAX_IDLE_POLLS: u32 = 60;
 
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<GuildCacheState>>;
 type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
 type OperationalMetricsCache = Arc<Mutex<Option<OperationalMetricsCacheEntry>>>;
+type TranscriptSseLimiter = Arc<std::sync::Mutex<HashMap<(String, String), usize>>>;
 type MembershipCache =
     Arc<tokio::sync::RwLock<HashMap<String, (Result<bool, StatusCode>, Instant)>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, MembershipInflightEntry>>>;
@@ -174,6 +183,46 @@ struct AudioRangeRateLimiter {
 struct AudioRangeBucket {
     tokens: f64,
     last_refill: Instant,
+}
+
+#[derive(Debug)]
+struct TranscriptSsePermit {
+    limiter: TranscriptSseLimiter,
+    key: (String, String),
+}
+
+impl Drop for TranscriptSsePermit {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.limiter.lock() else {
+            return;
+        };
+        if let Some(count) = counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn try_acquire_transcript_sse_permit(
+    limiter: &TranscriptSseLimiter,
+    user_id: &str,
+    meeting_id: &str,
+) -> Result<TranscriptSsePermit, StatusCode> {
+    let key = (user_id.to_owned(), meeting_id.to_owned());
+    let mut counts = limiter
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let count = counts.entry(key.clone()).or_insert(0);
+    if *count >= TRANSCRIPT_SSE_MAX_PER_USER_MEETING {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    *count += 1;
+    Ok(TranscriptSsePermit {
+        limiter: limiter.clone(),
+        key,
+    })
 }
 
 impl AudioRangeRateLimiter {
@@ -264,6 +313,7 @@ pub struct WebState {
     /// In-flight guild membership verification per user id
     membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
+    transcript_sse_limiter: TranscriptSseLimiter,
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
     pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
@@ -296,6 +346,7 @@ impl WebState {
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
+            transcript_sse_limiter: Arc::new(std::sync::Mutex::new(HashMap::new())),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
         }
@@ -3108,12 +3159,53 @@ fn normalize_guild_meetings_pagination(query: GuildMeetingsQuery) -> (u32, u32) 
     (page, limit)
 }
 
+fn guild_meetings_visibility_scan_limit(page: u32, limit: u32) -> i64 {
+    let requested = u64::from(page.saturating_sub(1))
+        .saturating_mul(u64::from(limit))
+        .saturating_add(u64::from(limit));
+    i64::from(
+        requested
+            .max(u64::from(limit))
+            .max(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_MIN))
+            .min(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)) as u32,
+    )
+}
+
+fn can_scan_new_visibility_channel(known_channel_count: usize) -> bool {
+    known_channel_count < GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP
+}
+
 fn guild_meetings_response_total(is_admin: bool, raw_total: i64, visible_count: usize) -> i64 {
     if is_admin {
         raw_total
     } else {
         i64::try_from(visible_count).unwrap_or(i64::MAX)
     }
+}
+
+fn next_transcript_sse_poll_delay(current: Duration, had_segments: bool) -> Duration {
+    if had_segments {
+        return Duration::from_secs(TRANSCRIPT_SSE_BASE_POLL_SECS);
+    }
+    let current_secs = current.as_secs();
+    let next_secs = if current_secs == 0 {
+        TRANSCRIPT_SSE_BASE_POLL_SECS
+    } else {
+        current_secs.saturating_mul(2)
+    };
+    Duration::from_secs(next_secs.min(TRANSCRIPT_SSE_MAX_POLL_SECS))
+}
+
+fn next_transcript_sse_idle_polls(current: u32, had_segments: bool) -> u32 {
+    if had_segments {
+        0
+    } else {
+        current.saturating_add(1)
+    }
+}
+
+fn transcript_sse_idle_limit_reached(idle_polls: u32) -> bool {
+    idle_polls >= TRANSCRIPT_SSE_MAX_IDLE_POLLS
 }
 
 fn guild_meeting_entry_from_row(row: &tokio_postgres::Row) -> GuildMeetingEntryResponse {
@@ -3558,24 +3650,38 @@ async fn api_guild_meetings(
         }));
     }
 
+    let visibility_scan_limit = guild_meetings_visibility_scan_limit(page, limit);
     let rows = state
         .db
-        .query(LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL, &[&auth.guild_id])
+        .query(
+            LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL,
+            &[&auth.guild_id, &visibility_scan_limit],
+        )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut visible_meetings = Vec::new();
+    let mut channel_visibility: HashMap<String, bool> = HashMap::new();
 
     for row in &rows {
         let voice_channel_id: String = row.get("voice_channel_id");
-        let visible = guild_meeting_channel_visible_after_row(
-            auth.guild_id.clone(),
-            voice_channel_id.clone(),
-            &auth.guild_id,
-            &user_id,
-            &state.permission_cache,
-            resolve_channel_permission_flags(&state, auth, &voice_channel_id, &user_id),
-        )
-        .await?;
+        let visible = if let Some(visible) = channel_visibility.get(&voice_channel_id) {
+            *visible
+        } else {
+            if !can_scan_new_visibility_channel(channel_visibility.len()) {
+                continue;
+            }
+            let visible = guild_meeting_channel_visible_after_row(
+                auth.guild_id.clone(),
+                voice_channel_id.clone(),
+                &auth.guild_id,
+                &user_id,
+                &state.permission_cache,
+                resolve_channel_permission_flags(&state, auth, &voice_channel_id, &user_id),
+            )
+            .await?;
+            channel_visibility.insert(voice_channel_id.clone(), visible);
+            visible
+        };
 
         if visible {
             visible_meetings.push(guild_meeting_entry_from_row(row));
@@ -3583,8 +3689,9 @@ async fn api_guild_meetings(
     }
 
     // For non-admins we filter before pagination so hidden rows cannot create
-    // sparse pages or leak the guild-wide count. This favors privacy over DB
-    // efficiency until permission-aware persistence exists.
+    // sparse pages or leak the guild-wide count. The scan and unique-channel
+    // caps keep Discord permission work bounded until permission-aware
+    // persistence exists.
     let total = guild_meetings_response_total(false, 0, visible_meetings.len());
     let meetings = visible_meetings
         .into_iter()
@@ -4467,6 +4574,8 @@ async fn api_transcript_events(
     Path(meeting_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    let permit =
+        try_acquire_transcript_sse_permit(&state.transcript_sse_limiter, &user_id, &meeting_id)?;
 
     let stream = stream::unfold(
         (
@@ -4474,15 +4583,17 @@ async fn api_transcript_events(
             user_id,
             meeting_id,
             None::<TranscriptStreamCursor>,
-            tokio::time::interval(Duration::from_secs(2)),
+            Duration::ZERO,
+            0_u32,
+            permit,
             false,
         ),
-        |(state, user_id, meeting_id, cursor, mut interval, finished)| async move {
+        |(state, user_id, meeting_id, cursor, poll_delay, idle_polls, permit, finished)| async move {
             if finished {
                 return None;
             }
 
-            interval.tick().await;
+            tokio::time::sleep(poll_delay).await;
 
             if let Err(status) = verify_meeting_access(&state, &meeting_id, &user_id).await {
                 let code = match status {
@@ -4496,22 +4607,35 @@ async fn api_transcript_events(
                     .data(format!(r#"{{"code":"{code}"}}"#));
                 return Some((
                     Ok(event),
-                    (state, user_id, meeting_id, cursor, interval, true),
+                    (
+                        state, user_id, meeting_id, cursor, poll_delay, idle_polls, permit, true,
+                    ),
                 ));
             }
 
             match load_transcript_response(&state, &meeting_id, cursor.as_ref()).await {
                 Ok((response, next_cursor)) => {
+                    let had_segments = !response.segments.is_empty();
                     let is_final = response.is_final;
-                    let event = match serde_json::to_string(&response) {
-                        Ok(data) => Event::default().event("segments").data(data),
-                        Err(err) => Event::default().event("stream-error").data(
-                            serde_json::json!({
-                                "code": "encode",
-                                "message": err.to_string(),
-                            })
-                            .to_string(),
-                        ),
+                    let next_idle_polls = next_transcript_sse_idle_polls(idle_polls, had_segments);
+                    let stop_for_idle =
+                        !is_final && transcript_sse_idle_limit_reached(next_idle_polls);
+                    let next_poll_delay = next_transcript_sse_poll_delay(poll_delay, had_segments);
+                    let event = if stop_for_idle {
+                        Event::default()
+                            .event("stream-closed")
+                            .data(r#"{"code":"idle_timeout"}"#)
+                    } else {
+                        match serde_json::to_string(&response) {
+                            Ok(data) => Event::default().event("segments").data(data),
+                            Err(err) => Event::default().event("stream-error").data(
+                                serde_json::json!({
+                                    "code": "encode",
+                                    "message": err.to_string(),
+                                })
+                                .to_string(),
+                            ),
+                        }
                     };
                     Some((
                         Ok(event),
@@ -4520,18 +4644,38 @@ async fn api_transcript_events(
                             user_id,
                             meeting_id,
                             next_cursor.or(cursor),
-                            interval,
-                            is_final,
+                            next_poll_delay,
+                            next_idle_polls,
+                            permit,
+                            is_final || stop_for_idle,
                         ),
                     ))
                 }
                 Err(_) => {
-                    let event = Event::default()
-                        .event("stream-error")
-                        .data(r#"{"code":"transcript_unavailable"}"#);
+                    let next_idle_polls = next_transcript_sse_idle_polls(idle_polls, false);
+                    let next_poll_delay = next_transcript_sse_poll_delay(poll_delay, false);
+                    let stop_for_idle = transcript_sse_idle_limit_reached(next_idle_polls);
+                    let event = if stop_for_idle {
+                        Event::default()
+                            .event("stream-closed")
+                            .data(r#"{"code":"error_limit"}"#)
+                    } else {
+                        Event::default()
+                            .event("stream-error")
+                            .data(r#"{"code":"transcript_unavailable"}"#)
+                    };
                     Some((
                         Ok(event),
-                        (state, user_id, meeting_id, cursor, interval, false),
+                        (
+                            state,
+                            user_id,
+                            meeting_id,
+                            cursor,
+                            next_poll_delay,
+                            next_idle_polls,
+                            permit,
+                            stop_for_idle,
+                        ),
                     ))
                 }
             }
@@ -6108,13 +6252,16 @@ mod guild_api_tests {
         BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, CachedChannelPermission,
         DiscordBotTokenValidationError, DiscordBotTokenValidationStage, DiscordGuildFull,
         DiscordRoleFull, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
-        GUILD_CACHE_REFRESH_INFLIGHT_SECS, GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache,
-        GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest,
+        GUILD_CACHE_REFRESH_INFLIGHT_SECS, GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP,
+        GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT, GUILD_MEETINGS_VISIBILITY_SCAN_MIN, GuildAdminCheck,
+        GuildBotTokenUpdateRequest, GuildCache, GuildCacheState, GuildMeetingsQuery,
+        GuildSettingsDefaults, GuildSettingsUpdateRequest,
         PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, StoredGuildSettings,
         SummaryTemplateUpsertRequest, advance_bot_token_revision,
-        bot_auth_header_from_cache_with_resolver, classify_discord_bot_token_validation_status,
-        guild_admin_member_status_decision, guild_admin_required_result,
-        guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
+        bot_auth_header_from_cache_with_resolver, can_scan_new_visibility_channel,
+        classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
+        guild_admin_required_result, guild_bot_token_delete_is_noop,
+        guild_info_from_cache_with_resolver, guild_meetings_visibility_scan_limit,
         guild_settings_response, normalize_domain_knowledge_list_filter,
         normalize_domain_knowledge_request, normalize_guild_bot_token_update,
         normalize_guild_meetings_pagination, normalize_summary_template_request,
@@ -6925,6 +7072,34 @@ mod guild_api_tests {
             }),
             (2, 100)
         );
+    }
+
+    #[test]
+    fn non_admin_guild_meetings_visibility_scan_is_bounded() {
+        assert_eq!(
+            guild_meetings_visibility_scan_limit(1, 20),
+            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_MIN)
+        );
+        assert_eq!(guild_meetings_visibility_scan_limit(2, 100), 200);
+        assert_eq!(
+            guild_meetings_visibility_scan_limit(10_000, 100),
+            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)
+        );
+        assert_eq!(
+            guild_meetings_visibility_scan_limit(1, GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT + 1),
+            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)
+        );
+    }
+
+    #[test]
+    fn non_admin_guild_meetings_channel_scan_is_bounded() {
+        assert!(can_scan_new_visibility_channel(0));
+        assert!(can_scan_new_visibility_channel(
+            GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP - 1
+        ));
+        assert!(!can_scan_new_visibility_channel(
+            GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP
+        ));
     }
 }
 
@@ -7931,6 +8106,96 @@ mod transcript_source_api_tests {
             !sql.contains("ORDER BY t.start_ms, t.end_ms"),
             "raw live timestamps can be out of final timeline order after rebasing"
         );
+    }
+}
+
+#[cfg(test)]
+mod transcript_sse_limit_tests {
+    use super::{
+        TRANSCRIPT_SSE_BASE_POLL_SECS, TRANSCRIPT_SSE_MAX_IDLE_POLLS,
+        TRANSCRIPT_SSE_MAX_PER_USER_MEETING, TRANSCRIPT_SSE_MAX_POLL_SECS, TranscriptSseLimiter,
+        next_transcript_sse_idle_polls, next_transcript_sse_poll_delay,
+        transcript_sse_idle_limit_reached, try_acquire_transcript_sse_permit,
+    };
+    use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn limiter() -> TranscriptSseLimiter {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn transcript_sse_per_user_meeting_cap_rejects_extra_connection() {
+        let limiter = limiter();
+        let mut permits = Vec::new();
+        for _ in 0..TRANSCRIPT_SSE_MAX_PER_USER_MEETING {
+            permits.push(
+                try_acquire_transcript_sse_permit(&limiter, "user-1", "meeting-1")
+                    .expect("connection below cap should be accepted"),
+            );
+        }
+
+        assert_eq!(
+            try_acquire_transcript_sse_permit(&limiter, "user-1", "meeting-1")
+                .map(|_| ())
+                .unwrap_err(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(
+            try_acquire_transcript_sse_permit(&limiter, "user-1", "meeting-2").is_ok(),
+            "the cap is per user and meeting"
+        );
+        drop(permits);
+    }
+
+    #[test]
+    fn transcript_sse_permit_drop_releases_slot() {
+        let limiter = limiter();
+        let permit = try_acquire_transcript_sse_permit(&limiter, "user-1", "meeting-1")
+            .expect("first connection should be accepted");
+        assert_eq!(
+            limiter
+                .lock()
+                .expect("limiter lock should not be poisoned")
+                .get(&("user-1".to_owned(), "meeting-1".to_owned()))
+                .copied(),
+            Some(1)
+        );
+
+        drop(permit);
+
+        assert!(
+            limiter
+                .lock()
+                .expect("limiter lock should not be poisoned")
+                .is_empty()
+        );
+        assert!(try_acquire_transcript_sse_permit(&limiter, "user-1", "meeting-1").is_ok());
+    }
+
+    #[test]
+    fn transcript_sse_polling_backs_off_and_resets_on_segments() {
+        let base = Duration::from_secs(TRANSCRIPT_SSE_BASE_POLL_SECS);
+        let max = Duration::from_secs(TRANSCRIPT_SSE_MAX_POLL_SECS);
+
+        assert_eq!(next_transcript_sse_poll_delay(Duration::ZERO, false), base);
+        assert_eq!(next_transcript_sse_poll_delay(base, false), base * 2);
+        assert_eq!(next_transcript_sse_poll_delay(max, false), max);
+        assert_eq!(next_transcript_sse_poll_delay(max, true), base);
+    }
+
+    #[test]
+    fn transcript_sse_idle_counter_is_bounded_and_resets_on_segments() {
+        assert_eq!(next_transcript_sse_idle_polls(0, false), 1);
+        assert_eq!(next_transcript_sse_idle_polls(42, true), 0);
+        assert!(!transcript_sse_idle_limit_reached(
+            TRANSCRIPT_SSE_MAX_IDLE_POLLS - 1
+        ));
+        assert!(transcript_sse_idle_limit_reached(
+            TRANSCRIPT_SSE_MAX_IDLE_POLLS
+        ));
     }
 }
 
