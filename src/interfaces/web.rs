@@ -5156,16 +5156,21 @@ async fn api_debug_file(
     let usage_user_id = user_id.clone();
     let usage_admin_only = debug_artifact_requires_admin(&artifact_id);
     tokio::spawn(async move {
+        let observed_at = Utc::now();
         record_usage_event(
             &usage_state,
             NewUsageEvent {
-                id: debug_download_usage_event_id(
-                    &usage_guild_id,
-                    &usage_meeting_id,
-                    &usage_artifact_id,
-                    &usage_filename,
-                    &usage_content_type,
-                    &usage_user_id,
+                id: format!(
+                    "{}:{}",
+                    debug_download_usage_event_id(
+                        &usage_guild_id,
+                        &usage_meeting_id,
+                        &usage_artifact_id,
+                        &usage_filename,
+                        &usage_content_type,
+                        &usage_user_id,
+                    ),
+                    observed_at.timestamp_micros()
                 ),
                 tenant_id: None,
                 guild_id: usage_guild_id,
@@ -5181,7 +5186,7 @@ async fn api_debug_file(
                     "admin_only": usage_admin_only,
                 }))
                 .expect("usage detail must be a JSON object"),
-                observed_at: Utc::now(),
+                observed_at,
             },
         )
         .await;

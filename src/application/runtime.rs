@@ -3350,11 +3350,18 @@ impl ScaffoldHandler {
             }
             guild_id
         };
-        let mut service = self.service.lock().await;
-        crate::application::worker::observe_worker_completion_entitlement(
-            &mut service.store,
-            &guild_id,
-        );
+        self.spawn_worker_completion_entitlement_observation(guild_id);
+    }
+
+    fn spawn_worker_completion_entitlement_observation(&self, guild_id: String) {
+        let service = Arc::clone(&self.service);
+        tokio::spawn(async move {
+            let mut service = service.lock().await;
+            crate::application::worker::observe_worker_completion_entitlement(
+                &mut service.store,
+                &guild_id,
+            );
+        });
     }
 
     async fn record_asr_seconds_usage(
