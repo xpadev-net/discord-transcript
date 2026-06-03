@@ -4658,7 +4658,7 @@ async fn api_transcript_events(
                     let event = if stop_for_idle {
                         Event::default()
                             .event("stream-closed")
-                            .data(r#"{"code":"idle_timeout"}"#)
+                            .data(r#"{"code":"error_limit"}"#)
                     } else {
                         Event::default()
                             .event("stream-error")
