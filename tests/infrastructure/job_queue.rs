@@ -20,6 +20,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 fn stopping_meeting(id: &str) -> StoredMeeting {
+    meeting_with_status(id, MeetingStatus::Stopping)
+}
+
+fn meeting_with_status(id: &str, status: MeetingStatus) -> StoredMeeting {
     StoredMeeting {
         id: id.to_owned(),
         guild_id: "g1".to_owned(),
@@ -29,7 +33,7 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
         status_message_id: None,
         started_by_user_id: "u1".to_owned(),
         title: None,
-        status: MeetingStatus::Stopping,
+        status,
         stop_reason: None,
         error_message: None,
         started_at: None,
@@ -346,6 +350,102 @@ fn worker_job_processing_does_not_run_disabled_summary_snapshot() {
     assert_eq!(
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Posted
+    );
+}
+
+#[test]
+fn worker_job_processing_marks_disabled_summary_done_when_meeting_already_posted() {
+    let base = unique_temp_dir("worker_summary_disabled_posted");
+    write_dummy_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(meeting_with_status("m1", MeetingStatus::Posted));
+    store
+        .upsert_effective_meeting_settings("m1", effective_settings(false))
+        .expect("snapshot should be stored");
+
+    let whisper = RecordingWhisperClient::new();
+    let claude = RecordingSummaryClient {
+        calls: RefCell::new(0),
+    };
+
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 2,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: Some("option-en".to_owned()),
+            resample_to_16k: true,
+        },
+    )
+    .expect("disabled summary job should be consumed without work");
+
+    assert!(result.is_none());
+    assert!(whisper.requests.borrow().is_empty(), "ASR should not run");
+    assert_eq!(*claude.calls.borrow(), 0, "summary should not run");
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
+        JobStatus::Done
+    );
+    assert_eq!(
+        store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Posted
+    );
+}
+
+#[test]
+fn worker_job_processing_rejects_disabled_summary_for_non_terminal_pipeline_status() {
+    let base = unique_temp_dir("worker_summary_disabled_transcribing");
+    write_dummy_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(meeting_with_status("m1", MeetingStatus::Transcribing));
+    store
+        .upsert_effective_meeting_settings("m1", effective_settings(false))
+        .expect("snapshot should be stored");
+
+    let whisper = RecordingWhisperClient::new();
+    let claude = RecordingSummaryClient {
+        calls: RefCell::new(0),
+    };
+
+    let err = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 0,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: Some("option-en".to_owned()),
+            resample_to_16k: true,
+        },
+    )
+    .expect_err("disabled summary should not be suppressed from transcribing");
+
+    assert!(
+        err.to_string()
+            .contains("cannot suppress disabled summary job"),
+        "unexpected error: {err}"
+    );
+    assert!(whisper.requests.borrow().is_empty(), "ASR should not run");
+    assert_eq!(*claude.calls.borrow(), 0, "summary should not run");
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
+        JobStatus::Failed
+    );
+    assert_eq!(
+        store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Failed
     );
 }
 
