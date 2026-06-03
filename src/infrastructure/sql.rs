@@ -95,6 +95,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0019_usage_events",
         sql: include_str!("../../migrations/0019_usage_events.sql"),
     },
+    Migration {
+        version: "0020_plans_and_quotas",
+        sql: include_str!("../../migrations/0020_plans_and_quotas.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -147,6 +151,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0018_summary_templates.sql"),
     "\n",
     include_str!("../../migrations/0019_usage_events.sql"),
+    "\n",
+    include_str!("../../migrations/0020_plans_and_quotas.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -250,6 +256,117 @@ WHERE (
   AND observed_at >= NOW() - make_interval(secs => $3::BIGINT)
 GROUP BY metric
 ORDER BY metric
+"#;
+
+pub const RESOLVE_PLAN_FOR_GUILD_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), active_assignment AS (
+    SELECT gpa.id AS assignment_id,
+           gpa.tenant_id,
+           gpa.guild_id,
+           gpa.plan_id,
+           gpa.source AS assignment_source,
+           gpa.period_anchor,
+           gpa.valid_from,
+           gpa.valid_until
+    FROM guild_plan_assignments gpa
+    JOIN plans p ON p.id = gpa.plan_id
+    WHERE gpa.guild_id = $1
+      AND gpa.status = 'active'
+      AND p.status IN ('active', 'archived')
+      AND gpa.valid_from <= $2::TEXT::TIMESTAMPTZ
+      AND (gpa.valid_until IS NULL OR gpa.valid_until > $2::TEXT::TIMESTAMPTZ)
+      AND gpa.tenant_id = (SELECT tenant_id FROM active_tenant)
+    ORDER BY gpa.valid_from DESC, gpa.created_at DESC, gpa.id DESC
+    LIMIT 1
+), candidates AS (
+    SELECT aa.assignment_id,
+           aa.tenant_id,
+           aa.guild_id,
+           p.id AS plan_id,
+           p.code AS plan_code,
+           p.name AS plan_name,
+           p.kind AS plan_kind,
+           'assignment' AS resolution_source,
+           aa.assignment_source,
+           aa.period_anchor,
+           aa.valid_from,
+           aa.valid_until,
+           0 AS priority
+    FROM active_assignment aa
+    JOIN plans p ON p.id = aa.plan_id
+    UNION ALL
+    SELECT NULL AS assignment_id,
+           (SELECT tenant_id FROM active_tenant) AS tenant_id,
+           $1 AS guild_id,
+           p.id AS plan_id,
+           p.code AS plan_code,
+           p.name AS plan_name,
+           p.kind AS plan_kind,
+           'fallback' AS resolution_source,
+           NULL AS assignment_source,
+           NULL AS period_anchor,
+           NULL AS valid_from,
+           NULL AS valid_until,
+           1 AS priority
+    FROM plans p
+    WHERE p.code = $3
+      AND p.status = 'active'
+      AND EXISTS (SELECT 1 FROM active_tenant)
+    UNION ALL
+    SELECT NULL AS assignment_id,
+           (SELECT tenant_id FROM active_tenant) AS tenant_id,
+           $1 AS guild_id,
+           p.id AS plan_id,
+           p.code AS plan_code,
+           p.name AS plan_name,
+           p.kind AS plan_kind,
+           'fallback' AS resolution_source,
+           NULL AS assignment_source,
+           NULL AS period_anchor,
+           NULL AS valid_from,
+           NULL AS valid_until,
+           2 AS priority
+    FROM plans p
+    WHERE p.code = 'default'
+      AND p.status = 'active'
+      AND $3 <> 'default'
+      AND EXISTS (SELECT 1 FROM active_tenant)
+), selected_plan AS (
+    SELECT *
+    FROM candidates
+    ORDER BY priority
+    LIMIT 1
+)
+SELECT sp.assignment_id,
+       sp.tenant_id,
+       sp.guild_id,
+       sp.plan_id,
+       sp.plan_code,
+       sp.plan_name,
+       sp.plan_kind,
+       sp.resolution_source,
+       sp.assignment_source,
+       to_char(sp.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
+       to_char(sp.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
+       to_char(sp.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
+       pq.id AS quota_id,
+       pq.dimension,
+       pq.period,
+       pq.limit_value::TEXT,
+       pq.unlimited::TEXT,
+       pq.enforcement_mode
+FROM selected_plan sp
+LEFT JOIN plan_quotas pq ON pq.plan_id = sp.plan_id
+ORDER BY pq.dimension, pq.period, pq.id
 "#;
 
 pub const SET_MEETING_STATUS_CAS_SQL: &str = r#"

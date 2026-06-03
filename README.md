@@ -62,12 +62,23 @@ done
 | `SUMMARY_COMMAND` | 未設定 | 設定時は **どの harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
 | `SUMMARY_MODEL` | 未設定 | `CLAUDE_MODEL` より優先。**`opencode` では必須**（`provider/model` 形式。例: `anthropic/claude-3-5-haiku-20241022`） |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
+| `OPERATIONAL_METRICS_BEARER_TOKEN` | 未設定 | `/metricsz` の Bearer 認証トークン。未設定時は `/metricsz` を無効化します。 |
 
 > **Note:** 要約・文字起こし補正（LLM によるトランスクリプト整形）は **Claude harness のみ**実行します（stdin で全文を渡せるため）。`cursor_agent` / `opencode` では要約フェーズも含め CLI が **コマンド行引数**でプロンプトを受け取るため、ホストの `ps` 等に本文が見える可能性があります。
 >
 > **`cursor_agent`:** バックグラウンド要約は TTY がないため、Cursor Agent CLI に **`--trust`** を付与してワークスペース（`CHUNK_STORAGE_DIR` 配下の会議ディレクトリ）を信頼済みとして実行します。
 
-Docker Compose では各要約 CLI の認証用ディレクトリ（ホストの `~/.claude`・`~/.local/share/opencode`・`~/.cursor`）をコンテナの `HOME` 配下にマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
+Docker Compose の通常サービスは、ホストの LLM 認証ディレクトリをマウントしません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する unsafe override file を明示的に追加してください。これらの override file は認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.unsafe-claude.yml up app
+docker compose -f docker-compose.yml -f docker-compose.unsafe-opencode.yml up app
+docker compose -f docker-compose.yml -f docker-compose.unsafe-cursor.yml up app
+```
+
+Compose の `app` は Discord voice (songbird) の UDP 通信のため host network を使います。Web UI は既定で `127.0.0.1` に bind します。外部公開する場合は、リバースプロキシなどの公開経路を決めた上で `WEB_BIND_HOST` を明示的に変更してください。`migrate` は compose network 上の `db:5432` に接続するため host network を使いません。
+
+公開 GHCR イメージはネットワークインストーラの実行を避けるため Cursor Agent CLI を同梱しません。Docker で `cursor_agent` / `opencode` harness を使う場合は、検証済みの CLI を含む派生イメージを作るか、信頼できる方法でバイナリを配置し、`SUMMARY_COMMAND` に明示的なパスを設定してください。
 
 ### ワークスペース構造
 

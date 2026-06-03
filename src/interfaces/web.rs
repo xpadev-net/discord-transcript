@@ -240,6 +240,7 @@ pub struct GuildSettingsDefaults {
 pub struct GuildBotTokenRuntimeConfig {
     pub cipher: Option<Arc<BotTokenCipher>>,
     pub revision_tx: Option<watch::Sender<u64>>,
+    pub operational_metrics_bearer_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -249,6 +250,7 @@ pub struct WebState {
     pub auth: Option<Arc<AuthConfig>>,
     pub http_client: reqwest::Client,
     pub guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
+    operational_metrics_bearer_token: Option<Arc<str>>,
     /// Cache: resolved effective bot token for the configured guild.
     bot_token_cache: BotTokenCache,
     bot_token_revision_tx: Option<watch::Sender<u64>>,
@@ -283,6 +285,9 @@ impl WebState {
             auth,
             http_client,
             guild_bot_token_cipher: guild_bot_token.cipher,
+            operational_metrics_bearer_token: guild_bot_token
+                .operational_metrics_bearer_token
+                .map(Arc::<str>::from),
             bot_token_cache: Arc::new(tokio::sync::RwLock::new(BotTokenCacheState::default())),
             bot_token_revision_tx: guild_bot_token.revision_tx,
             operational_metrics_cache: Arc::new(Mutex::new(None)),
@@ -2737,10 +2742,16 @@ struct OperationalReadinessChecks {
     integrations: OperationalCheck,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct OperationalReadinessResponse {
     status: &'static str,
     checks: OperationalReadinessChecks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PublicOperationalReadinessResponse {
+    status: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -2864,12 +2875,35 @@ async fn healthz() -> Json<HealthResponse> {
 
 async fn readyz(State(state): State<WebState>) -> Response {
     let checks = operational_readiness_checks(&state.db).await;
-    let (status, response) = operational_readiness_response(checks);
+    let (status, response) = public_operational_readiness_response(checks);
     (status, Json(response)).into_response()
 }
 
-async fn metricsz(State(state): State<WebState>) -> Response {
-    let snapshot = load_cached_operational_metrics(&state).await;
+async fn metricsz(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    metricsz_response_with_loader(
+        state.operational_metrics_bearer_token.as_deref(),
+        &headers,
+        &state.operational_metrics_cache,
+        || load_operational_metrics(&state.db),
+    )
+    .await
+}
+
+async fn metricsz_response_with_loader<F, Fut>(
+    expected_token: Option<&str>,
+    headers: &HeaderMap,
+    cache: &OperationalMetricsCache,
+    loader: F,
+) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = OperationalMetricsResponse>,
+{
+    if let Err(status) = authorize_operational_metrics_request(expected_token, headers) {
+        return metrics_auth_failure_response(status);
+    }
+
+    let snapshot = load_cached_operational_metrics_with(cache, loader).await;
     let status = match snapshot.status {
         OperationalMetricsStatus::Ok => StatusCode::OK,
         OperationalMetricsStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -2877,17 +2911,70 @@ async fn metricsz(State(state): State<WebState>) -> Response {
     (status, Json(snapshot)).into_response()
 }
 
-async fn load_cached_operational_metrics(state: &WebState) -> OperationalMetricsResponse {
+fn authorize_operational_metrics_request(
+    expected_token: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), StatusCode> {
+    let Some(expected) = expected_token else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Some(actual) = bearer_token_from_headers(headers) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if bearer_tokens_match(actual, expected) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = raw.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn bearer_tokens_match(actual: &str, expected: &str) -> bool {
+    let actual_hash = Sha256::digest(actual.as_bytes());
+    let expected_hash = Sha256::digest(expected.as_bytes());
+    constant_time_eq(&actual_hash, &expected_hash)
+}
+
+fn metrics_auth_failure_response(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static(r#"Bearer realm="metricsz""#),
+        );
+    }
+    response
+}
+
+async fn load_cached_operational_metrics_with<F, Fut>(
+    cache: &OperationalMetricsCache,
+    loader: F,
+) -> OperationalMetricsResponse
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = OperationalMetricsResponse>,
+{
     let now = Instant::now();
-    let mut cache = state.operational_metrics_cache.lock().await;
-    if let Some(entry) = cache.as_ref()
+    let mut guard = cache.lock().await;
+    if let Some(entry) = guard.as_ref()
         && now.duration_since(entry.cached_at).as_secs() < OPERATIONAL_METRICS_CACHE_TTL_SECS
     {
         return entry.snapshot.clone();
     }
 
-    let snapshot = load_operational_metrics(&state.db).await;
-    *cache = Some(OperationalMetricsCacheEntry {
+    let snapshot = loader().await;
+    *guard = Some(OperationalMetricsCacheEntry {
         snapshot: snapshot.clone(),
         cached_at: now,
     });
@@ -2956,9 +3043,23 @@ async fn operational_readiness_checks(db: &PgClient) -> OperationalReadinessChec
     }
 }
 
+#[cfg(test)]
 fn operational_readiness_response(
     checks: OperationalReadinessChecks,
 ) -> (StatusCode, OperationalReadinessResponse) {
+    let (http_status, public) = public_operational_readiness_response(checks.clone());
+    (
+        http_status,
+        OperationalReadinessResponse {
+            status: public.status,
+            checks,
+        },
+    )
+}
+
+fn public_operational_readiness_response(
+    checks: OperationalReadinessChecks,
+) -> (StatusCode, PublicOperationalReadinessResponse) {
     let ready = matches!(checks.database.status, OperationalStatus::Ok)
         && matches!(checks.migrations.status, OperationalStatus::Ok)
         && matches!(checks.queue.status, OperationalStatus::Ok);
@@ -2968,7 +3069,7 @@ fn operational_readiness_response(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (http_status, OperationalReadinessResponse { status, checks })
+    (http_status, PublicOperationalReadinessResponse { status })
 }
 
 fn integration_readiness_not_checked() -> OperationalCheck {
@@ -5716,13 +5817,20 @@ async fn stream_file_range(
 mod operational_endpoint_tests {
     use super::{
         OperationalCheck, OperationalCounters, OperationalMetricsResponse,
-        OperationalMetricsStatus, OperationalReadinessChecks, OperationalStatus, healthz,
-        integration_readiness_not_checked, operational_readiness_response,
+        OperationalMetricsStatus, OperationalReadinessChecks, OperationalStatus,
+        authorize_operational_metrics_request, healthz, integration_readiness_not_checked,
+        metricsz_response_with_loader, operational_readiness_response,
+        public_operational_readiness_response,
     };
     use axum::body::to_bytes;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::IntoResponse;
     use serde_json::Value;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn healthz_returns_liveness_without_state_or_auth() {
@@ -5763,6 +5871,24 @@ mod operational_endpoint_tests {
                 "runtime integration state is not shared with the web server in this operational slice"
             )
         );
+    }
+
+    #[test]
+    fn public_readiness_response_hides_operational_check_details() {
+        let checks = OperationalReadinessChecks {
+            database: OperationalCheck::unavailable("database query failed"),
+            migrations: OperationalCheck::unavailable("database unavailable"),
+            queue: OperationalCheck::unavailable("database unavailable"),
+            integrations: integration_readiness_not_checked(),
+        };
+
+        let (status, response) = public_operational_readiness_response(checks);
+        let json =
+            serde_json::to_value(&response).expect("public readiness response should serialize");
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json, serde_json::json!({ "status": "not_ready" }));
+        assert!(json.get("checks").is_none());
     }
 
     #[test]
@@ -5840,6 +5966,139 @@ mod operational_endpoint_tests {
         assert!(!serialized.contains("token"));
         assert!(!serialized.contains("user_id"));
         assert!(!serialized.contains("guild_id"));
+    }
+
+    #[test]
+    fn metrics_route_rejects_missing_or_invalid_bearer_token() {
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            authorize_operational_metrics_request(Some("expected-token"), &empty_headers),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            authorize_operational_metrics_request(None, &empty_headers),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        assert_eq!(
+            authorize_operational_metrics_request(Some("expected-token"), &headers),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn metrics_route_accepts_matching_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer expected-token"),
+        );
+
+        assert_eq!(
+            authorize_operational_metrics_request(Some("expected-token"), &headers),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_response_denies_without_loading_metrics() {
+        let cache = Arc::new(Mutex::new(None));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let first_loads = Arc::clone(&loads);
+
+        let response =
+            metricsz_response_with_loader(None, &HeaderMap::new(), &cache, move || async move {
+                first_loads.fetch_add(1, Ordering::SeqCst);
+                OperationalMetricsResponse {
+                    status: OperationalMetricsStatus::Ok,
+                    counters: OperationalCounters::default(),
+                }
+            })
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+
+        let second_loads = Arc::clone(&loads);
+        let response = metricsz_response_with_loader(
+            Some("expected-token"),
+            &HeaderMap::new(),
+            &cache,
+            move || async move {
+                second_loads.fetch_add(1, Ordering::SeqCst);
+                OperationalMetricsResponse {
+                    status: OperationalMetricsStatus::Ok,
+                    counters: OperationalCounters::default(),
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_response_accepts_token_and_reuses_recent_snapshot() {
+        let cache = Arc::new(Mutex::new(None));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer expected-token"),
+        );
+        let first_loads = Arc::clone(&loads);
+
+        let first = metricsz_response_with_loader(
+            Some("expected-token"),
+            &headers,
+            &cache,
+            move || async move {
+                first_loads.fetch_add(1, Ordering::SeqCst);
+                OperationalMetricsResponse {
+                    status: OperationalMetricsStatus::Ok,
+                    counters: OperationalCounters {
+                        failed_jobs: 1,
+                        running_jobs: 2,
+                        queued_jobs: 3,
+                        running_meetings: 4,
+                        failed_live_transcription_chunks: 5,
+                    },
+                }
+            },
+        )
+        .await;
+
+        let second_loads = Arc::clone(&loads);
+        let second = metricsz_response_with_loader(
+            Some("expected-token"),
+            &headers,
+            &cache,
+            move || async move {
+                second_loads.fetch_add(1, Ordering::SeqCst);
+                OperationalMetricsResponse {
+                    status: OperationalMetricsStatus::Unavailable,
+                    counters: OperationalCounters::default(),
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        let body = to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("metrics response body should be readable");
+        let json: Value =
+            serde_json::from_slice(&body).expect("metrics response should be valid JSON");
+        assert_eq!(json["counters"]["failed_jobs"], 1);
     }
 }
 
