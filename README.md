@@ -62,6 +62,7 @@ done
 | `SUMMARY_COMMAND` | 未設定 | 設定時は **どの harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
 | `SUMMARY_MODEL` | 未設定 | `CLAUDE_MODEL` より優先。**`opencode` では必須**（`provider/model` 形式。例: `anthropic/claude-3-5-haiku-20241022`） |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
+| `OPERATIONAL_METRICS_BEARER_TOKEN` | 未設定 | `/metricsz` の Bearer 認証トークン。未設定時は `/metricsz` を無効化します。 |
 
 > **Note:** 要約・文字起こし補正（LLM によるトランスクリプト整形）は **Claude harness のみ**実行します（stdin で全文を渡せるため）。`cursor_agent` / `opencode` では要約フェーズも含め CLI が **コマンド行引数**でプロンプトを受け取るため、ホストの `ps` 等に本文が見える可能性があります。
 >
