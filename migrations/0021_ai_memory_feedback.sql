@@ -244,9 +244,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_feedback_id_tenant_guild
 DO $$
 BEGIN
     ALTER TABLE ai_memory_notes
-    ADD CONSTRAINT ai_memory_notes_source_feedback_fk
+    ADD CONSTRAINT ai_memory_notes_source_feedback_scope_fk
     FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL;
+    REFERENCES transcript_feedback(id, tenant_id, guild_id)
+    DEFERRABLE INITIALLY DEFERRED;
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
+
+DO $$
+BEGIN
+    ALTER TABLE ai_memory_notes
+    ADD CONSTRAINT ai_memory_notes_source_feedback_delete_fk
+    FOREIGN KEY (source_feedback_id)
+    REFERENCES transcript_feedback(id) ON DELETE SET NULL;
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END
@@ -294,9 +306,13 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         REFERENCES tenant_discord_guilds(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT person_aliases_source_meeting_fk
         FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id) ON DELETE RESTRICT,
-    CONSTRAINT person_aliases_source_feedback_fk
+    CONSTRAINT person_aliases_source_feedback_scope_fk
         FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL,
+        REFERENCES transcript_feedback(id, tenant_id, guild_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT person_aliases_source_feedback_delete_fk
+        FOREIGN KEY (source_feedback_id)
+        REFERENCES transcript_feedback(id) ON DELETE SET NULL,
     CONSTRAINT person_aliases_guild_id_nonempty_check CHECK (length(btrim(guild_id)) > 0),
     CONSTRAINT person_aliases_canonical_name_nonempty_check CHECK (length(btrim(canonical_name)) > 0),
     CONSTRAINT person_aliases_alias_nonempty_check CHECK (length(btrim(alias)) > 0),
@@ -361,11 +377,13 @@ BEGIN
 
     UPDATE ai_memory_notes
     SET source_meeting_id = NULL
-    WHERE source_meeting_id = OLD.id;
+    WHERE source_meeting_id = OLD.id
+      AND guild_id = OLD.guild_id;
 
     UPDATE person_aliases
     SET source_meeting_id = NULL
-    WHERE source_meeting_id = OLD.id;
+    WHERE source_meeting_id = OLD.id
+      AND guild_id = OLD.guild_id;
 
     RETURN OLD;
 END;
@@ -385,6 +403,10 @@ CREATE INDEX IF NOT EXISTS idx_person_aliases_tenant_guild_active
 CREATE INDEX IF NOT EXISTS idx_person_aliases_guild_discord_user
     ON person_aliases (guild_id, discord_user_id, active)
     WHERE discord_user_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_person_aliases_guild_source_meeting
+    ON person_aliases (guild_id, source_meeting_id)
+    WHERE source_meeting_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_person_aliases_guild_alias_active
     ON person_aliases (guild_id, lower(alias), active);

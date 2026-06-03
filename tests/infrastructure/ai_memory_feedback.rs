@@ -67,6 +67,7 @@ fn incremental_migrations_include_ai_memory_feedback_schema() {
     assert!(schema.contains("idx_person_aliases_tenant_guild_active"));
     assert!(schema.contains("idx_person_aliases_active_identity"));
     assert!(schema.contains("idx_person_aliases_source_feedback"));
+    assert!(schema.contains("idx_person_aliases_guild_source_meeting"));
 }
 
 #[test]
@@ -184,9 +185,9 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("SET meeting_id = NULL,\n        transcript_segment_id = NULL"));
     assert!(schema.contains("UPDATE ai_memory_notes\n    SET source_meeting_id = NULL"));
     assert!(schema.contains("UPDATE person_aliases\n    SET source_meeting_id = NULL"));
-    assert!(
-        schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL")
-    );
+    assert!(schema.contains("REFERENCES transcript_feedback(id) ON DELETE SET NULL"));
+    assert!(schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id)\n    DEFERRABLE INITIALLY DEFERRED"));
+    assert!(schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id)\n        DEFERRABLE INITIALLY DEFERRED"));
     assert!(schema.contains("FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)"));
     assert!(schema.contains("FOREIGN KEY (source_feedback_id, tenant_id, guild_id)"));
     assert!(schema.contains("person_aliases_source_reference_check"));
@@ -200,10 +201,11 @@ fn source_feedback_delete_paths_keep_set_null_compatible_with_checks() {
 
     assert_eq!(
         schema
-            .matches("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL")
+            .matches("REFERENCES transcript_feedback(id) ON DELETE SET NULL")
             .count(),
         2
     );
+    assert!(!schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL"));
 
     let ai_memory_user_feedback_check = sql_between(
         schema,
