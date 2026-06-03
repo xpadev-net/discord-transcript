@@ -23,7 +23,7 @@ const dashboardForbiddenText =
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    statusText: status === 403 ? "Forbidden" : "OK",
+    statusText: statusText(status),
     headers: { "Content-Type": "application/json" },
   });
 }
@@ -31,8 +31,27 @@ function jsonResponse(body: unknown, status = 200): Response {
 function emptyResponse(status: number): Response {
   return new Response(null, {
     status,
-    statusText: status === 403 ? "Forbidden" : "Unauthorized",
+    statusText: statusText(status),
   });
+}
+
+function statusText(status: number): string {
+  switch (status) {
+    case 400:
+      return "Bad Request";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
+    case 404:
+      return "Not Found";
+    case 409:
+      return "Conflict";
+    case 500:
+      return "Internal Server Error";
+    default:
+      return "OK";
+  }
 }
 
 function settingsResponse() {
@@ -50,6 +69,39 @@ function settingsResponse() {
     discord_bot_user_id: null,
     discord_bot_username: null,
     is_admin: true,
+  };
+}
+
+function domainKnowledgeItem(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "domain-1",
+    content_type: "glossary",
+    title: "Project Alpha",
+    body: "Alpha terms",
+    active: true,
+    version: 1,
+    updated_actor_user_id: "admin-1",
+    archived_at: null,
+    archived_actor_user_id: null,
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function summaryTemplate(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "template-1",
+    name: "Default summary",
+    template: "Summarize {{ transcript_path }}",
+    active: true,
+    version: 1,
+    updated_actor_user_id: "admin-1",
+    archived_at: null,
+    archived_actor_user_id: null,
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -305,6 +357,301 @@ describe("App access controls", () => {
     expect(screen.getByRole("button", { name: "\u524a\u9664" })).toBeTruthy();
   });
 
+  it("loads active domain knowledge and summary template versions for admins", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([domainKnowledgeItem()]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([summaryTemplate()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    expect(await screen.findByText("AI カスタマイズ")).toBeTruthy();
+    expect(screen.getByText("有効: Project Alpha v1")).toBeTruthy();
+    expect(screen.getByText("有効: Default summary v1")).toBeTruthy();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/guild/domain-knowledge?include_archived=true",
+        expect.anything(),
+      ),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guild/summary-templates?include_archived=true",
+      expect.anything(),
+    );
+  });
+
+  it("saves edited domain knowledge drafts with trimmed fields", async () => {
+    let savedRequest: unknown = null;
+    let currentDomain = domainKnowledgeItem();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([currentDomain]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (
+        url === "/api/guild/domain-knowledge/domain-1" &&
+        init?.method === "PUT"
+      ) {
+        savedRequest = JSON.parse(String(init.body));
+        currentDomain = domainKnowledgeItem({
+          title: "Beta Term",
+          body: "Beta body",
+          version: 2,
+          updated_at: "2026-06-02T00:00:00.000Z",
+        });
+        return Promise.resolve(jsonResponse(currentDomain));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("タイトル"), {
+      target: { value: "  Beta Term  " },
+    });
+    fireEvent.change(screen.getByLabelText("本文"), {
+      target: { value: "  Beta body  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "ドメイン知識を保存" }));
+
+    await waitFor(() =>
+      expect(savedRequest).toEqual({
+        content_type: "glossary",
+        title: "Beta Term",
+        body: "Beta body",
+        active: true,
+      }),
+    );
+    expect(await screen.findByText("有効: Beta Term v2")).toBeTruthy();
+  });
+
+  it("activates a summary template and refreshes the active version", async () => {
+    let activateCalls = 0;
+    let templates = [
+      summaryTemplate(),
+      summaryTemplate({
+        id: "template-2",
+        name: "Focus summary",
+        template: "Focus {{ speaker_roster }}",
+        active: false,
+        version: 1,
+      }),
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse(templates));
+      }
+      if (
+        url === "/api/guild/summary-templates/template-2/activate" &&
+        init?.method === "POST"
+      ) {
+        activateCalls += 1;
+        templates = [
+          summaryTemplate({ active: false, version: 2 }),
+          summaryTemplate({
+            id: "template-2",
+            name: "Focus summary",
+            template: "Focus {{ speaker_roster }}",
+            active: true,
+            version: 2,
+          }),
+        ];
+        return Promise.resolve(jsonResponse(templates[1]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    const versionSelects = (await screen.findAllByLabelText(
+      "バージョン",
+    )) as HTMLSelectElement[];
+    fireEvent.change(versionSelects[1], {
+      target: { value: "template-2" },
+    });
+    const activateButton = screen
+      .getAllByRole("button", { name: "有効化" })
+      .find((button) => !(button as HTMLButtonElement).disabled);
+    expect(activateButton).toBeTruthy();
+    fireEvent.click(activateButton as HTMLButtonElement);
+
+    await waitFor(() => expect(activateCalls).toBe(1));
+    expect(await screen.findByText("有効: Focus summary v2")).toBeTruthy();
+  });
+
+  it("shows inline validation errors without calling summary template APIs", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([summaryTemplate()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("テンプレート"), {
+      target: { value: "Summarize {{ unknown_variable }}" },
+    });
+    const callsBeforeSave = fetchMock.mock.calls.length;
+    fireEvent.click(
+      screen.getByRole("button", { name: "要約テンプレートを保存" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "使用できない要約テンプレート変数です: unknown_variable",
+      ),
+    ).toBeTruthy();
+    expect(fetchMock.mock.calls.length).toBe(callsBeforeSave);
+  });
+
+  it("validates domain knowledge title byte length before saving", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([domainKnowledgeItem()]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("タイトル"), {
+      target: { value: "議".repeat(80) },
+    });
+    const callsBeforeSave = fetchMock.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "ドメイン知識を保存" }));
+
+    expect(
+      await screen.findByText(
+        "ドメイン知識のタイトルはUTF-8で200バイト以内で入力してください",
+      ),
+    ).toBeTruthy();
+    expect(fetchMock.mock.calls.length).toBe(callsBeforeSave);
+  });
+
+  it("shows server validation errors inline for domain knowledge saves", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([domainKnowledgeItem()]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (
+        url === "/api/guild/domain-knowledge/domain-1" &&
+        init?.method === "PUT"
+      ) {
+        return Promise.resolve(emptyResponse(400));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("本文"), {
+      target: { value: "Changed body" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "ドメイン知識を保存" }));
+
+    expect(
+      await screen.findByText("入力内容がサーバーの検証に通りませんでした"),
+    ).toBeTruthy();
+  });
+
   it("hides settings navigation and blocks direct settings access for non-admin members", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
@@ -327,6 +674,14 @@ describe("App access controls", () => {
     expect(screen.queryByRole("button", { name: saveButtonName })).toBeNull();
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/guild/settings",
+      expect.anything(),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/domain-knowledge?include_archived=true",
+      expect.anything(),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/summary-templates?include_archived=true",
       expect.anything(),
     );
   });
