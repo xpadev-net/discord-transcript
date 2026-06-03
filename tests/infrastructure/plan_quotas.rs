@@ -70,6 +70,7 @@ fn resolve_plan_sql_scopes_to_active_tenant_and_valid_assignment() {
     assert!(sql.contains("gpa.valid_until IS NULL OR gpa.valid_until > $2::TEXT::TIMESTAMPTZ"));
     assert!(sql.contains("p.code = $3"));
     assert!(sql.contains("p.code = 'default'"));
+    assert!(sql.contains("$3 <> 'default'"));
     assert!(sql.contains("EXISTS (SELECT 1 FROM active_tenant)"));
 }
 

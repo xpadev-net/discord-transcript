@@ -334,6 +334,7 @@ WITH active_tenant AS (
     FROM plans p
     WHERE p.code = 'default'
       AND p.status = 'active'
+      AND $3 <> 'default'
       AND EXISTS (SELECT 1 FROM active_tenant)
 ), selected_plan AS (
     SELECT *
