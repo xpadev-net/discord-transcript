@@ -29,6 +29,7 @@ fn tenant_installation_backfill_uses_existing_guild_ids_idempotently() {
     assert!(sql.contains("ON CONFLICT (id) DO NOTHING"));
     assert!(sql.contains("'migration:default-tenant:' || guild_id"));
     assert!(sql.contains("WHERE existing.guild_id = existing_guilds.guild_id"));
+    assert!(!sql.contains("AND existing.status = 'active'"));
     assert!(!sql.contains("INSERT INTO tenant_memberships"));
 }
 

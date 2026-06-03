@@ -36,8 +36,7 @@ use crate::infrastructure::integrations::{
 use crate::infrastructure::queue::{Job, JobQueue};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
-    HEARTBEAT_RUNNING_JOB_SQL, INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL,
-    RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
+    HEARTBEAT_RUNNING_JOB_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
     RECOVERY_SUMMARY_JOB_STATUS_SQL,
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
@@ -1460,10 +1459,7 @@ pub async fn run_bot(
             .map_err(RuntimeError::DatabaseConnect)?;
     let mut migration_store = SqlMeetingStore::new(base_executor);
     migration_store
-        .apply_initial_migration(INITIAL_SCHEMA_SQL)
-        .map_err(RuntimeError::DatabaseMigration)?;
-    migration_store
-        .apply_initial_migration(INCREMENTAL_MIGRATIONS_SQL)
+        .apply_pending_migrations()
         .map_err(RuntimeError::DatabaseMigration)?;
     let base_executor = migration_store.executor;
 

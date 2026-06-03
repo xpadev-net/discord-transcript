@@ -1,5 +1,114 @@
 pub const INITIAL_SCHEMA_SQL: &str = include_str!("../../migrations/0001_mvp_schema.sql");
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Migration {
+    pub version: &'static str,
+    pub sql: &'static str,
+}
+
+pub const CREATE_SCHEMA_MIGRATIONS_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"#;
+
+pub const LOCK_SCHEMA_MIGRATIONS_SQL: &str = "SELECT pg_advisory_lock(760918997406360681)";
+pub const UNLOCK_SCHEMA_MIGRATIONS_SQL: &str = "SELECT pg_advisory_unlock(760918997406360681)";
+
+pub const SELECT_SCHEMA_MIGRATION_SQL: &str = "SELECT 1 FROM schema_migrations WHERE version = $1";
+
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "0001_mvp_schema",
+        sql: include_str!("../../migrations/0001_mvp_schema.sql"),
+    },
+    Migration {
+        version: "0002_add_is_noisy",
+        sql: include_str!("../../migrations/0002_add_is_noisy.sql"),
+    },
+    Migration {
+        version: "0003_add_meeting_speakers",
+        sql: include_str!("../../migrations/0003_add_meeting_speakers.sql"),
+    },
+    Migration {
+        version: "0004_add_transcript_source",
+        sql: include_str!("../../migrations/0004_add_transcript_source.sql"),
+    },
+    Migration {
+        version: "0005_add_enum_constraints",
+        sql: include_str!("../../migrations/0005_add_enum_constraints.sql"),
+    },
+    Migration {
+        version: "0006_add_status_messages_and_retention",
+        sql: include_str!("../../migrations/0006_add_status_messages_and_retention.sql"),
+    },
+    Migration {
+        version: "0007_session_revocations",
+        sql: include_str!("../../migrations/0007_session_revocations.sql"),
+    },
+    Migration {
+        version: "0008_add_job_lease",
+        sql: include_str!("../../migrations/0008_add_job_lease.sql"),
+    },
+    Migration {
+        version: "0009_add_stop_reason_check",
+        sql: include_str!("../../migrations/0009_add_stop_reason_check.sql"),
+    },
+    Migration {
+        version: "0010_guild_settings",
+        sql: include_str!("../../migrations/0010_guild_settings.sql"),
+    },
+    Migration {
+        version: "0011_transcript_cursor_index",
+        sql: include_str!("../../migrations/0011_transcript_cursor_index.sql"),
+    },
+    Migration {
+        version: "0012_add_transcript_stage",
+        sql: include_str!("../../migrations/0012_add_transcript_stage.sql"),
+    },
+    Migration {
+        version: "0013_guild_bot_tokens",
+        sql: include_str!("../../migrations/0013_guild_bot_tokens.sql"),
+    },
+    Migration {
+        version: "0014_tenants_and_installations",
+        sql: include_str!("../../migrations/0014_tenants_and_installations.sql"),
+    },
+    Migration {
+        version: "0015_effective_meeting_settings",
+        sql: include_str!("../../migrations/0015_effective_meeting_settings.sql"),
+    },
+    Migration {
+        version: "0016_audit_events",
+        sql: include_str!("../../migrations/0016_audit_events.sql"),
+    },
+    Migration {
+        version: "0017_domain_knowledge",
+        sql: include_str!("../../migrations/0017_domain_knowledge.sql"),
+    },
+    Migration {
+        version: "0018_summary_templates",
+        sql: include_str!("../../migrations/0018_summary_templates.sql"),
+    },
+    Migration {
+        version: "0019_usage_events",
+        sql: include_str!("../../migrations/0019_usage_events.sql"),
+    },
+];
+
+pub fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+pub fn migration_transaction_sql(migration: Migration) -> String {
+    format!(
+        "BEGIN;\n{}\nINSERT INTO schema_migrations (version) VALUES ({}) ON CONFLICT (version) DO NOTHING;\nCOMMIT;",
+        migration.sql.trim_end(),
+        sql_literal(migration.version),
+    )
+}
+
 /// Incremental migrations applied after the initial schema.
 /// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
 pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
@@ -613,7 +722,6 @@ WITH existing_guilds AS (
         SELECT 1
         FROM tenant_discord_guilds existing
         WHERE existing.guild_id = existing_guilds.guild_id
-          AND existing.status = 'active'
     )
     ON CONFLICT (id) DO NOTHING
     RETURNING id

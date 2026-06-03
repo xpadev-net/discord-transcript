@@ -31,18 +31,24 @@ CREATE TABLE IF NOT EXISTS transcripts (
     confidence DOUBLE PRECISION,
     is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
     source TEXT NOT NULL DEFAULT 'voice',
-    transcript_stage TEXT NOT NULL DEFAULT 'final',
-    live_chunk_id TEXT,
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
 
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting_cursor
     ON transcripts (meeting_id, created_at, id)
     WHERE NOT is_deleted;
+
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS transcript_stage TEXT NOT NULL DEFAULT 'final';
+
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS live_chunk_id TEXT;
 
 DO $$
 BEGIN

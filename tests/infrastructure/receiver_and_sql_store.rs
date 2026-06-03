@@ -3,9 +3,10 @@ use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::StopReason;
 use discord_transcript::domain::{JobStatus, JobType};
 use discord_transcript::infrastructure::queue::JobQueue;
-use discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL;
 use discord_transcript::infrastructure::sql::{
-    CLAIM_JOB_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
+    CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
+    MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_MEETING_STATUS_CAS_SQL,
+    UNLOCK_SCHEMA_MIGRATIONS_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, SqlMeetingStore, sql_row_from_strings,
@@ -197,6 +198,67 @@ fn schema_defines_enum_check_constraints() {
         !discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
             .contains("transcripts_source_check")
     );
+}
+
+#[test]
+fn pending_migrations_skip_versions_recorded_in_schema_migrations() {
+    let mut executor = FakeSqlExecutor::default();
+    for migration in MIGRATIONS {
+        executor.query_rows_result.insert(
+            format!("{SELECT_SCHEMA_MIGRATION_SQL}|{}", migration.version),
+            vec![sql_row_from_strings(vec!["1".to_owned()])],
+        );
+    }
+
+    let mut store = SqlMeetingStore::new(executor);
+    store
+        .apply_pending_migrations()
+        .expect("migration check should succeed");
+
+    assert_eq!(store.executor.executed.len(), MIGRATIONS.len() + 3);
+    assert_eq!(store.executor.executed[0].0, LOCK_SCHEMA_MIGRATIONS_SQL);
+    assert_eq!(store.executor.executed[1].0, CREATE_SCHEMA_MIGRATIONS_SQL);
+    assert_eq!(
+        store.executor.executed.last().expect("unlock").0,
+        UNLOCK_SCHEMA_MIGRATIONS_SQL
+    );
+    assert!(
+        store
+            .executor
+            .executed
+            .iter()
+            .skip(2)
+            .take(MIGRATIONS.len())
+            .all(|(sql, _)| *sql == SELECT_SCHEMA_MIGRATION_SQL)
+    );
+}
+
+#[test]
+fn pending_migrations_apply_and_record_unseen_versions() {
+    let mut store = SqlMeetingStore::new(FakeSqlExecutor::default());
+
+    store
+        .apply_pending_migrations()
+        .expect("migrations should apply");
+
+    assert_eq!(store.executor.executed[0].0, LOCK_SCHEMA_MIGRATIONS_SQL);
+    assert_eq!(store.executor.executed[1].0, CREATE_SCHEMA_MIGRATIONS_SQL);
+    assert_eq!(
+        store.executor.executed.last().expect("unlock").0,
+        UNLOCK_SCHEMA_MIGRATIONS_SQL
+    );
+    let applied_sql: Vec<&str> = store
+        .executor
+        .executed
+        .iter()
+        .map(|(sql, _)| sql.as_str())
+        .filter(|sql| sql.starts_with("BEGIN;"))
+        .collect();
+    assert_eq!(applied_sql.len(), MIGRATIONS.len());
+    assert!(applied_sql[0].contains("CREATE TABLE IF NOT EXISTS meetings"));
+    assert!(applied_sql[0].contains(
+        "INSERT INTO schema_migrations (version) VALUES ('0001_mvp_schema')"
+    ));
 }
 
 #[test]

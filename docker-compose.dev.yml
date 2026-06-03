@@ -51,16 +51,15 @@ services:
     restart: unless-stopped
 
   migrate:
-    image: postgres:16
+    build: .
+    network_mode: host
     depends_on:
       db:
         condition: service_healthy
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - ./migrations:/migrations:ro
-    entrypoint: >
-      sh -c 'set -e; find /migrations -maxdepth 1 -name "*.sql" | sort | while read -r f; do psql -v ON_ERROR_STOP=1 --single-transaction -h db -U discord_transcript -d discord_transcript -f "$$f"; done'
+      DATABASE_URL: postgresql://discord_transcript:${POSTGRES_PASSWORD}@127.0.0.1/discord_transcript
+      DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-disable}
+    command: ["discord-transcript", "migrate"]
 
 volumes:
   pgdata:
