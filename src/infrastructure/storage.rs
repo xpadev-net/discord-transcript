@@ -325,8 +325,7 @@ impl UsageEventStore for InMemoryMeetingStore {
         let mut events = self
             .usage_events
             .values()
-            .filter(|event| in_memory_usage_tenant_matches(event, tenant_id, guild_id))
-            .filter(|event| guild_id.is_none_or(|guild_id| event.guild_id == guild_id))
+            .filter(|event| in_memory_usage_scope_matches(event, tenant_id, guild_id))
             .cloned()
             .collect::<Vec<_>>();
         events.sort_by(|left, right| {
@@ -351,8 +350,7 @@ impl UsageEventStore for InMemoryMeetingStore {
         for event in self
             .usage_events
             .values()
-            .filter(|event| in_memory_usage_tenant_matches(event, tenant_id, guild_id))
-            .filter(|event| guild_id.is_none_or(|guild_id| event.guild_id == guild_id))
+            .filter(|event| in_memory_usage_scope_matches(event, tenant_id, guild_id))
             .filter(|event| {
                 now.signed_duration_since(event.observed_at)
                     .num_seconds()
@@ -369,18 +367,21 @@ impl UsageEventStore for InMemoryMeetingStore {
     }
 }
 
-fn in_memory_usage_tenant_matches(
+fn in_memory_usage_scope_matches(
     event: &UsageEvent,
     tenant_id: Option<&str>,
     guild_id: Option<&str>,
 ) -> bool {
+    if guild_id.is_some_and(|guild_id| event.guild_id != guild_id) {
+        return false;
+    }
     let Some(tenant_id) = tenant_id else {
         return true;
     };
     if event.tenant_id.as_deref() == Some(tenant_id) {
         return true;
     }
-    event.tenant_id.is_none() && guild_id.is_some_and(|guild_id| event.guild_id == guild_id)
+    event.tenant_id.is_none() && guild_id.is_some()
 }
 
 impl MeetingStore for InMemoryMeetingStore {

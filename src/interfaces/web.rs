@@ -5155,8 +5155,8 @@ async fn api_debug_file(
     let usage_content_type = audit_content_type.to_owned();
     let usage_user_id = user_id.clone();
     let usage_admin_only = debug_artifact_requires_admin(&artifact_id);
+    let observed_at = Utc::now();
     tokio::spawn(async move {
-        let observed_at = Utc::now();
         record_usage_event(
             &usage_state,
             NewUsageEvent {
