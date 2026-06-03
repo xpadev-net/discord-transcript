@@ -73,6 +73,7 @@ pub struct AppConfig {
     pub discord_client_id: Option<String>,
     pub discord_client_secret: Option<String>,
     pub web_session_secret: Option<String>,
+    pub operational_metrics_bearer_token: Option<String>,
     pub guild_bot_token_encryption_key: Option<String>,
     pub static_files_dir: String,
     pub discord_bot_admin_user_ids: Vec<String>,
@@ -168,6 +169,9 @@ impl AppConfig {
             discord_client_id: optional_env("DISCORD_CLIENT_ID"),
             discord_client_secret: optional_env("DISCORD_CLIENT_SECRET"),
             web_session_secret: optional_env("WEB_SESSION_SECRET"),
+            operational_metrics_bearer_token: optional_env("OPERATIONAL_METRICS_BEARER_TOKEN")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             guild_bot_token_encryption_key: optional_env("GUILD_BOT_TOKEN_ENCRYPTION_KEY")
                 .map(|value| value.trim().to_owned()),
             static_files_dir: optional_env("STATIC_FILES_DIR")
@@ -269,6 +273,10 @@ impl AppConfig {
             discord_client_id: optional_from_map(values, "DISCORD_CLIENT_ID"),
             discord_client_secret: optional_from_map(values, "DISCORD_CLIENT_SECRET"),
             web_session_secret: optional_from_map(values, "WEB_SESSION_SECRET"),
+            operational_metrics_bearer_token: optional_from_map(
+                values,
+                "OPERATIONAL_METRICS_BEARER_TOKEN",
+            ),
             guild_bot_token_encryption_key: optional_from_map(
                 values,
                 "GUILD_BOT_TOKEN_ENCRYPTION_KEY",

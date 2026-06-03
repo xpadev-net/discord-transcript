@@ -1,0 +1,10 @@
+services:
+  app:
+    # Unsafe local harness override. Mount only OpenCode credentials, read-only.
+    volumes:
+      - type: bind
+        source: ${LLM_OPENCODE_DATA_DIR:?Set LLM_OPENCODE_DATA_DIR to an absolute path for local OpenCode harness testing}
+        target: /home/app/.local/share/opencode
+        read_only: true
+        bind:
+          create_host_path: false
