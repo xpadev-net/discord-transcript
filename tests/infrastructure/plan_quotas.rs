@@ -26,6 +26,7 @@ fn assigned_quota_row(quota_id: &str, dimension: &str, limit: Option<&str>, mode
         Some("assignment"),
         Some("admin"),
         Some("2026-06-01T00:00:00.000Z"),
+        Some("2026-06-01T00:00:00.000Z"),
         Some("2026-07-01T00:00:00.000Z"),
         Some(quota_id),
         Some(dimension),
@@ -44,6 +45,7 @@ fn incremental_migrations_include_plan_quota_assignment_schema() {
     assert!(schema.contains("CREATE TABLE IF NOT EXISTS plan_quotas"));
     assert!(schema.contains("CREATE TABLE IF NOT EXISTS guild_plan_assignments"));
     assert!(schema.contains("plan_quotas_limit_check"));
+    assert!(schema.contains("period_anchor TIMESTAMPTZ NOT NULL"));
     assert!(schema.contains("observe_only"));
     assert!(schema.contains("'enforce'"));
     assert!(schema.contains("'daily'"));
@@ -52,8 +54,9 @@ fn incremental_migrations_include_plan_quota_assignment_schema() {
     assert!(schema.contains("'current'"));
     assert!(schema.contains("guild_plan_assignments_no_active_overlap"));
     assert!(schema.contains("EXCLUDE USING gist"));
-    assert!(schema.contains("'plan:default'"));
-    assert!(schema.contains("'plan:beta'"));
+    assert!(schema.contains("idx_plan_quotas_plan_dimension"));
+    assert!(schema.contains("'quota:default:debug_downloads:monthly'"));
+    assert!(schema.contains("'quota:beta:debug_downloads:monthly'"));
     assert!(schema.contains("ON CONFLICT DO NOTHING"));
 }
 
@@ -101,6 +104,10 @@ fn sql_store_resolves_active_assignment_with_quotas() {
     assert_eq!(resolved.plan_kind, PlanKind::Custom);
     assert_eq!(resolved.resolution_source, "assignment");
     assert_eq!(
+        resolved.period_anchor.expect("period_anchor").to_rfc3339(),
+        "2026-06-01T00:00:00+00:00"
+    );
+    assert_eq!(
         resolved.valid_from.expect("valid_from").to_rfc3339(),
         "2026-06-01T00:00:00+00:00"
     );
@@ -137,6 +144,7 @@ fn sql_store_resolves_beta_and_default_fallbacks() {
             None,
             None,
             None,
+            None,
             Some("quota:beta:summary_runs:monthly"),
             Some("summary_runs"),
             Some("monthly"),
@@ -159,6 +167,7 @@ fn sql_store_resolves_beta_and_default_fallbacks() {
             Some("Default"),
             Some("default"),
             Some("fallback"),
+            None,
             None,
             None,
             None,

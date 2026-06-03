@@ -274,6 +274,7 @@ WITH active_tenant AS (
            gpa.guild_id,
            gpa.plan_id,
            gpa.source AS assignment_source,
+           gpa.period_anchor,
            gpa.valid_from,
            gpa.valid_until
     FROM guild_plan_assignments gpa
@@ -296,6 +297,7 @@ WITH active_tenant AS (
            p.kind AS plan_kind,
            'assignment' AS resolution_source,
            aa.assignment_source,
+           aa.period_anchor,
            aa.valid_from,
            aa.valid_until,
            0 AS priority
@@ -311,6 +313,7 @@ WITH active_tenant AS (
            p.kind AS plan_kind,
            'fallback' AS resolution_source,
            NULL AS assignment_source,
+           NULL AS period_anchor,
            NULL AS valid_from,
            NULL AS valid_until,
            1 AS priority
@@ -328,6 +331,7 @@ WITH active_tenant AS (
            p.kind AS plan_kind,
            'fallback' AS resolution_source,
            NULL AS assignment_source,
+           NULL AS period_anchor,
            NULL AS valid_from,
            NULL AS valid_until,
            2 AS priority
@@ -351,6 +355,7 @@ SELECT sp.assignment_id,
        sp.plan_kind,
        sp.resolution_source,
        sp.assignment_source,
+       to_char(sp.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
        to_char(sp.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
        to_char(sp.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
        pq.id AS quota_id,

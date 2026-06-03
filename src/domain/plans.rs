@@ -193,6 +193,7 @@ pub struct ResolvedPlan {
     pub plan_kind: PlanKind,
     pub resolution_source: String,
     pub assignment_source: Option<String>,
+    pub period_anchor: Option<DateTime<Utc>>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_until: Option<DateTime<Utc>>,
     pub quotas: Vec<PlanQuota>,

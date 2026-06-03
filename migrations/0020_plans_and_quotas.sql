@@ -113,8 +113,10 @@ EXCEPTION
 END
 $$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_quotas_plan_dimension_period
-    ON plan_quotas (plan_id, dimension, period);
+DROP INDEX IF EXISTS idx_plan_quotas_plan_dimension_period;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_quotas_plan_dimension
+    ON plan_quotas (plan_id, dimension);
 
 CREATE TABLE IF NOT EXISTS guild_plan_assignments (
     id TEXT PRIMARY KEY,
@@ -123,12 +125,25 @@ CREATE TABLE IF NOT EXISTS guild_plan_assignments (
     plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
     status TEXT NOT NULL DEFAULT 'active',
     valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    period_anchor TIMESTAMPTZ NOT NULL,
     valid_until TIMESTAMPTZ,
     assigned_by_user_id TEXT,
     source TEXT NOT NULL DEFAULT 'system',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE guild_plan_assignments
+    ADD COLUMN IF NOT EXISTS period_anchor TIMESTAMPTZ;
+
+UPDATE guild_plan_assignments gpa
+SET period_anchor = COALESCE(gpa.period_anchor, t.period_anchor, gpa.valid_from)
+FROM tenants t
+WHERE t.id = gpa.tenant_id
+  AND gpa.period_anchor IS NULL;
+
+ALTER TABLE guild_plan_assignments
+    ALTER COLUMN period_anchor SET NOT NULL;
 
 DO $$
 BEGIN
@@ -214,10 +229,10 @@ VALUES
     ('quota:default:asr_seconds:monthly', 'plan:default', 'asr_seconds', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:default:summary_runs:monthly', 'plan:default', 'summary_runs', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:default:storage_bytes:current', 'plan:default', 'storage_bytes', 'current', NULL, true, 'observe_only', NOW(), NOW()),
-    ('quota:default:debug_downloads:daily', 'plan:default', 'debug_downloads', 'daily', NULL, true, 'observe_only', NOW(), NOW()),
+    ('quota:default:debug_downloads:monthly', 'plan:default', 'debug_downloads', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:beta:recording_minutes:monthly', 'plan:beta', 'recording_minutes', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:beta:asr_seconds:monthly', 'plan:beta', 'asr_seconds', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:beta:summary_runs:monthly', 'plan:beta', 'summary_runs', 'monthly', NULL, true, 'observe_only', NOW(), NOW()),
     ('quota:beta:storage_bytes:current', 'plan:beta', 'storage_bytes', 'current', NULL, true, 'observe_only', NOW(), NOW()),
-    ('quota:beta:debug_downloads:daily', 'plan:beta', 'debug_downloads', 'daily', NULL, true, 'observe_only', NOW(), NOW())
+    ('quota:beta:debug_downloads:monthly', 'plan:beta', 'debug_downloads', 'monthly', NULL, true, 'observe_only', NOW(), NOW())
 ON CONFLICT DO NOTHING;

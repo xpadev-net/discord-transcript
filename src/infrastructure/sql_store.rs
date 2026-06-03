@@ -781,7 +781,7 @@ fn parse_resolved_plan_rows(rows: Vec<SqlRow>) -> Result<Option<ResolvedPlan>, S
 }
 
 fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlan, StoreError> {
-    if row.len() < 17 {
+    if row.len() < 18 {
         return Err(StoreError::Backend(format!(
             "invalid plan resolver row length: {}",
             row.len()
@@ -803,12 +803,16 @@ fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlan, StoreError> 
         plan_kind,
         resolution_source: require_store_column(row, 7, "resolution_source")?,
         assignment_source: row.get(8).and_then(|v| v.clone()),
-        valid_from: parse_optional_plan_timestamp(
+        period_anchor: parse_optional_plan_timestamp(
             row.get(9).and_then(|v| v.clone()),
+            "period_anchor",
+        )?,
+        valid_from: parse_optional_plan_timestamp(
+            row.get(10).and_then(|v| v.clone()),
             "valid_from",
         )?,
         valid_until: parse_optional_plan_timestamp(
-            row.get(10).and_then(|v| v.clone()),
+            row.get(11).and_then(|v| v.clone()),
             "valid_until",
         )?,
         quotas: Vec::new(),
@@ -825,29 +829,30 @@ fn resolved_plan_headers_match(left: &ResolvedPlan, right: &ResolvedPlan) -> boo
         && left.plan_kind == right.plan_kind
         && left.resolution_source == right.resolution_source
         && left.assignment_source == right.assignment_source
+        && left.period_anchor == right.period_anchor
         && left.valid_from == right.valid_from
         && left.valid_until == right.valid_until
 }
 
 fn parse_resolved_plan_quota_row(row: &SqlRow) -> Result<Option<PlanQuota>, StoreError> {
-    let Some(quota_id) = row.get(11).and_then(|v| v.clone()) else {
+    let Some(quota_id) = row.get(12).and_then(|v| v.clone()) else {
         return Ok(None);
     };
-    let dimension_raw = require_store_column(row, 12, "quota_dimension")?;
+    let dimension_raw = require_store_column(row, 13, "quota_dimension")?;
     let dimension = QuotaDimension::parse_str(&dimension_raw).ok_or_else(|| {
         StoreError::Backend(format!(
             "unknown quota dimension in resolver row: {dimension_raw}"
         ))
     })?;
-    let period_raw = require_store_column(row, 13, "quota_period")?;
+    let period_raw = require_store_column(row, 14, "quota_period")?;
     let period = QuotaPeriod::parse_str(&period_raw).ok_or_else(|| {
         StoreError::Backend(format!(
             "unknown quota period in resolver row: {period_raw}"
         ))
     })?;
-    let limit_value = optional_i64_column(row, 14, "quota_limit_value")?;
-    let unlimited = required_bool_column(row, 15, "quota_unlimited")?;
-    let enforcement_mode_raw = require_store_column(row, 16, "quota_enforcement_mode")?;
+    let limit_value = optional_i64_column(row, 15, "quota_limit_value")?;
+    let unlimited = required_bool_column(row, 16, "quota_unlimited")?;
+    let enforcement_mode_raw = require_store_column(row, 17, "quota_enforcement_mode")?;
     let enforcement_mode =
         QuotaEnforcementMode::parse_str(&enforcement_mode_raw).ok_or_else(|| {
             StoreError::Backend(format!(
