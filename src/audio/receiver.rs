@@ -319,7 +319,7 @@ impl ReceiverState {
             None
         } else {
             Some(UserChunkCandidate {
-                user_id: user.user_id.clone(),
+                user_id: user.user_id,
                 start_ms,
                 frames,
             })

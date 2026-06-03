@@ -275,7 +275,6 @@ fn append_silence_bounded(
     max: usize,
     context: &str,
 ) -> Result<(), String> {
-    let duration_ms = duration_ms.min(MAX_MEETING_AUDIO_SPAN_MS);
     let silence_bytes =
         pcm_byte_len_for_duration_ms(duration_ms, sample_rate).unwrap_or(usize::MAX);
     let next_len = checked_pcm_growth(pcm_out.len(), silence_bytes, max)
