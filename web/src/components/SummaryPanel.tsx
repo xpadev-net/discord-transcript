@@ -1,3 +1,4 @@
+import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import { LoadingSpinner } from "./LoadingSpinner";
 
@@ -7,6 +8,52 @@ interface Props {
   error: string | null;
   onRetry: () => void;
 }
+
+function safeSummaryHref(href: string | undefined): string | null {
+  const trimmed = href?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("#")) {
+    return trimmed;
+  }
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const currentOrigin = window.location.origin;
+    const url = new URL(trimmed, currentOrigin);
+    if (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      url.origin === currentOrigin
+    ) {
+      return trimmed;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+const summaryMarkdownComponents: Components = {
+  a({ children, href }) {
+    const safeHref = safeSummaryHref(href);
+    if (!safeHref) {
+      return <span>{children}</span>;
+    }
+
+    return (
+      <a href={safeHref} rel="noreferrer noopener">
+        {children}
+      </a>
+    );
+  },
+  img({ alt }) {
+    return alt ? <span>{alt}</span> : null;
+  },
+};
 
 export function SummaryPanel({ markdown, loading, error, onRetry }: Props) {
   return (
@@ -24,7 +71,9 @@ export function SummaryPanel({ markdown, loading, error, onRetry }: Props) {
           <LoadingSpinner text={"\u8aad\u307f\u8fbc\u307f\u4e2d..."} />
         ) : markdown ? (
           <div className="summary-content">
-            <Markdown>{markdown}</Markdown>
+            <Markdown components={summaryMarkdownComponents}>
+              {markdown}
+            </Markdown>
           </div>
         ) : (
           <div className="empty-state">
