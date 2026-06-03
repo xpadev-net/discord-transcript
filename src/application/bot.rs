@@ -4,10 +4,8 @@ use crate::application::command::{
 use crate::application::stop::StopOutcome;
 use crate::domain::StopReason;
 use crate::domain::authz::UserRole;
-use crate::domain::usage::{EntitlementAction, EntitlementEvaluator, UsageSnapshot};
 use crate::infrastructure::storage::EffectiveMeetingSettings;
-use crate::infrastructure::storage::{MeetingStore, UsageEventStore};
-use tracing::warn;
+use crate::infrastructure::storage::MeetingStore;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartCommandInput {
@@ -49,7 +47,6 @@ impl<S: MeetingStore> BotCommandService<S> {
         &mut self,
         input: StartCommandInput,
     ) -> Result<String, CommandError> {
-        observe_record_start_entitlement(&mut self.store, &input.guild_id);
         let result = record_start(
             &mut self.store,
             RecordStartRequest {
@@ -97,33 +94,5 @@ impl<S: MeetingStore> BotCommandService<S> {
             outcome: result.outcome,
             message,
         })
-    }
-}
-
-fn observe_record_start_entitlement<S: UsageEventStore>(store: &mut S, guild_id: &str) {
-    let aggregates = match store.aggregate_recent_usage(None, Some(guild_id), 30 * 24 * 60 * 60) {
-        Ok(aggregates) => aggregates,
-        Err(err) => {
-            warn!(
-                guild_id,
-                error = %err,
-                "usage entitlement observation failed before recording start"
-            );
-            return;
-        }
-    };
-    let snapshot = UsageSnapshot::from_aggregates(aggregates);
-    let decision =
-        EntitlementEvaluator::observe_only().evaluate(EntitlementAction::StartRecording, &snapshot);
-    if decision
-        .observations
-        .iter()
-        .any(|observation| observation.exceeded)
-    {
-        warn!(
-            guild_id,
-            observations = ?decision.observations,
-            "usage entitlement would exceed policy; observe-only mode allows recording"
-        );
     }
 }

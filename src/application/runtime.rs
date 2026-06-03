@@ -25,7 +25,8 @@ use crate::domain::transcript::{
     normalize_segments, render_for_summary,
 };
 use crate::domain::usage::{
-    NewUsageEvent, UsageDetailJson, UsageMetric, recording_minutes_from_seconds,
+    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
+    UsageSnapshot, recording_minutes_from_seconds,
 };
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
@@ -2812,6 +2813,7 @@ impl ScaffoldHandler {
             },
         )?;
         drop(service);
+        self.spawn_record_start_entitlement_observation(guild_id.get().to_string());
 
         // Reset SSRC tracker so stale mappings from previous recordings
         // cannot mis-attribute audio when Discord reuses an SSRC value.
@@ -3360,6 +3362,42 @@ impl ScaffoldHandler {
                 &mut service.store,
                 &guild_id,
             );
+        });
+    }
+
+    fn spawn_record_start_entitlement_observation(&self, guild_id: String) {
+        let service = Arc::clone(&self.service);
+        tokio::spawn(async move {
+            let mut service = service.lock().await;
+            let aggregates =
+                match service
+                    .store
+                    .aggregate_recent_usage(None, Some(&guild_id), 30 * 24 * 60 * 60)
+                {
+                    Ok(aggregates) => aggregates,
+                    Err(err) => {
+                        warn!(
+                            guild_id,
+                            error = %err,
+                            "usage entitlement observation failed before recording start"
+                        );
+                        return;
+                    }
+                };
+            let snapshot = UsageSnapshot::from_aggregates(aggregates);
+            let decision = EntitlementEvaluator::observe_only()
+                .evaluate(EntitlementAction::StartRecording, &snapshot);
+            if decision
+                .observations
+                .iter()
+                .any(|observation| observation.exceeded)
+            {
+                warn!(
+                    guild_id,
+                    observations = ?decision.observations,
+                    "usage entitlement would exceed policy; observe-only mode allows recording"
+                );
+            }
         });
     }
 
