@@ -3,13 +3,19 @@ use discord_transcript::application::worker::{
     SummaryJobOptions, enqueue_summary_job, process_next_summary_job,
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus};
-use discord_transcript::infrastructure::asr::StubWhisperClient;
+use discord_transcript::infrastructure::asr::{
+    StubWhisperClient, WhisperClient, WhisperInferenceRequest, WhisperParseError,
+    WhisperTranscriptionResult, parse_whisper_response,
+};
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
 use discord_transcript::infrastructure::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, sql_row_from_strings,
 };
-use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use discord_transcript::infrastructure::storage::{
+    EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoredMeeting,
+};
+use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +34,68 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
         error_message: None,
         started_at: None,
         stopped_at: None,
+    }
+}
+
+fn effective_settings(summary_enabled: bool) -> EffectiveMeetingSettings {
+    EffectiveMeetingSettings {
+        whisper_language: Some("snapshot-ja".to_owned()),
+        whisper_vad: false,
+        whisper_beam_size: 8,
+        whisper_suppress_non_speech: false,
+        whisper_prompt: Some("snapshot prompt".to_owned()),
+        whisper_temperature: 0.25,
+        whisper_resample_to_16k: false,
+        auto_stop_grace_seconds: 120,
+        retention_raw_audio_ttl_days: 14,
+        retention_transcript_ttl_days: 60,
+        retention_summary_ttl_days: None,
+        summary_enabled,
+        summary_template_id: None,
+        domain_knowledge_version_id: None,
+    }
+}
+
+struct RecordingWhisperClient {
+    mocked_response_json: String,
+    requests: RefCell<Vec<WhisperInferenceRequest>>,
+}
+
+impl RecordingWhisperClient {
+    fn new() -> Self {
+        Self {
+            mocked_response_json: r#"{
+              "text":"ok",
+              "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+            }"#
+            .to_owned(),
+            requests: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl WhisperClient for RecordingWhisperClient {
+    fn infer(
+        &self,
+        request: &WhisperInferenceRequest,
+    ) -> Result<WhisperTranscriptionResult, WhisperParseError> {
+        self.requests.borrow_mut().push(request.clone());
+        parse_whisper_response(&self.mocked_response_json)
+    }
+}
+
+struct RecordingSummaryClient {
+    calls: RefCell<usize>,
+}
+
+impl discord_transcript::application::summary::ClaudeSummaryClient for RecordingSummaryClient {
+    fn summarize(
+        &self,
+        _prompt: &str,
+        _workdir: Option<&Path>,
+    ) -> Result<String, discord_transcript::application::summary::SummaryError> {
+        *self.calls.borrow_mut() += 1;
+        Ok("## Summary\ndone".to_owned())
     }
 }
 
@@ -184,6 +252,100 @@ fn worker_job_processing_marks_done_on_success() {
     assert_eq!(
         queue.get("j1").expect("job should exist").status,
         JobStatus::Done
+    );
+    assert_eq!(
+        store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Posted
+    );
+}
+
+#[test]
+fn worker_job_processing_uses_snapshot_language_for_asr() {
+    let base = unique_temp_dir("worker_snapshot_language");
+    write_dummy_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+    store
+        .upsert_effective_meeting_settings("m1", effective_settings(true))
+        .expect("snapshot should be stored");
+
+    let whisper = RecordingWhisperClient::new();
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "## Summary\ndone".to_owned(),
+    };
+
+    process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 2,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: Some("option-en".to_owned()),
+            resample_to_16k: true,
+        },
+    )
+    .expect("worker should succeed")
+    .expect("job result should exist");
+
+    let requests = whisper.requests.borrow();
+    assert!(!requests.is_empty(), "ASR should be invoked");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.language.as_deref() == Some("snapshot-ja")),
+        "ASR language should come from the meeting snapshot: {requests:?}"
+    );
+}
+
+#[test]
+fn worker_job_processing_does_not_run_disabled_summary_snapshot() {
+    let base = unique_temp_dir("worker_summary_disabled");
+    write_dummy_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+    store
+        .upsert_effective_meeting_settings("m1", effective_settings(false))
+        .expect("snapshot should be stored");
+
+    let whisper = RecordingWhisperClient::new();
+    let claude = RecordingSummaryClient {
+        calls: RefCell::new(0),
+    };
+
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 2,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: Some("option-en".to_owned()),
+            resample_to_16k: true,
+        },
+    )
+    .expect("disabled summary job should be consumed without work");
+
+    assert!(result.is_none());
+    assert!(whisper.requests.borrow().is_empty(), "ASR should not run");
+    assert_eq!(*claude.calls.borrow(), 0, "summary should not run");
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
+        JobStatus::Done
+    );
+    assert_eq!(
+        store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Posted
     );
 }
 

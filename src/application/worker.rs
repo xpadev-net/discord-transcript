@@ -301,6 +301,35 @@ where
         let effective_settings = store
             .get_effective_meeting_settings(&job.meeting_id)
             .map_err(WorkerError::from)?;
+        if effective_settings
+            .as_ref()
+            .is_some_and(|settings| !settings.summary_enabled)
+        {
+            match meeting.status {
+                MeetingStatus::Posted => {}
+                MeetingStatus::Stopping => {
+                    store.set_meeting_status(
+                        &job.meeting_id,
+                        MeetingStatus::Posted,
+                        Some(MeetingStatus::Stopping),
+                    )?;
+                }
+                status => {
+                    return Err(WorkerError::Store(format!(
+                        "cannot suppress disabled summary job for meeting {} in status {}",
+                        job.meeting_id,
+                        status.as_str()
+                    )));
+                }
+            }
+            queue.mark_done(&job.id)?;
+            info!(
+                job_id = %job.id,
+                meeting_id = %job.meeting_id,
+                "summary job marked done without processing because meeting snapshot disabled summaries"
+            );
+            return Ok(None);
+        }
         let layout = MeetingWorkspaceLayout::new(&options.audio_base_dir);
         let workspace = layout.for_meeting(
             &meeting.guild_id,
@@ -359,10 +388,10 @@ where
                 .or_else(|| options.language.clone()),
             workspace,
         };
-        process_meeting_summary(store, whisper, claude, &input)
+        process_meeting_summary(store, whisper, claude, &input).map(Some)
     })();
     match result {
-        Ok(output) => {
+        Ok(Some(output)) => {
             // Set meeting status first: if this fails the job stays Running
             // and can be retried. The reverse order (mark_done first) would
             // leave the meeting stuck in Summarizing with no way to recover.
@@ -378,6 +407,7 @@ where
                 output,
             }))
         }
+        Ok(None) => Ok(None),
         Err(err) => {
             let status = queue.retry(&job.id, err.to_string(), options.max_retries)?;
             if status == JobStatus::Failed {
