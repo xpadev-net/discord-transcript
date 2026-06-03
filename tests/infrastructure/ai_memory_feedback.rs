@@ -16,8 +16,16 @@ fn migrations_register_ai_memory_feedback_schema_after_plan_quotas() {
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
 
-    assert!(version.contains(&"0020_plans_and_quotas"));
-    assert_eq!(version.last().copied(), Some("0021_ai_memory_feedback"));
+    let plan_quota_position = version
+        .iter()
+        .position(|version| *version == "0020_plans_and_quotas")
+        .expect("plan quota migration should be registered");
+    let ai_memory_position = version
+        .iter()
+        .position(|version| *version == "0021_ai_memory_feedback")
+        .expect("ai memory migration should be registered");
+
+    assert!(ai_memory_position > plan_quota_position);
 }
 
 #[test]
@@ -62,7 +70,11 @@ fn ai_memory_feedback_migration_uses_idempotent_statements() {
 
 #[test]
 fn schema_keeps_ai_memory_and_aliases_separate_from_domain_knowledge() {
-    let schema = INCREMENTAL_MIGRATIONS_SQL;
+    let schema = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0021_ai_memory_feedback")
+        .expect("ai memory migration should be registered")
+        .sql;
 
     assert!(schema.contains("target_domain_knowledge_id TEXT"));
     assert!(schema.contains("transcript_feedback_target_domain_fk"));
@@ -91,8 +103,13 @@ fn schema_constrains_source_confidence_active_archive_and_review_fields() {
     assert!(schema.contains("ai_memory_notes_source_reference_check"));
     assert!(schema.contains("person_aliases_source_reference_check"));
     assert!(schema.contains("archived_at IS NULL OR active = FALSE"));
-    assert!(schema.contains("source_type = 'user_feedback' AND source_feedback_id IS NOT NULL"));
-    assert!(schema.contains("source_type = 'vc_participant' AND source_meeting_id IS NOT NULL"));
+    assert!(schema.contains("source_type = 'user_feedback'"));
+    assert!(schema.contains("source_feedback_id IS NOT NULL"));
+    assert!(schema.contains("source_type = 'vc_participant'"));
+    assert!(schema.contains("source_meeting_id IS NOT NULL"));
+    assert!(schema.contains("source_meeting_id IS NULL"));
+    assert!(schema.contains("source_feedback_id IS NULL"));
+    assert!(schema.contains("archived_at IS NOT NULL"));
     assert!(schema.contains("reviewed_actor_user_id IS NOT NULL"));
     assert!(schema.contains("archived_actor_user_id IS NOT NULL"));
     assert!(schema.contains("length(btrim(reviewed_actor_user_id)) > 0"));
@@ -112,11 +129,14 @@ fn schema_constrains_feedback_kinds_and_targets() {
     assert!(schema.contains("'ai_memory'"));
     assert!(schema.contains("transcript_feedback_mistranscription_text_required_check"));
     assert!(schema.contains("transcript_feedback_speaker_required_check"));
+    assert!(schema.contains("transcript_feedback_person_alias_required_check"));
     assert!(schema.contains("COALESCE(length(btrim(original_text)) > 0, FALSE)"));
     assert!(schema.contains("COALESCE(length(btrim(corrected_speaker_id)) > 0, FALSE)"));
     assert!(schema.contains("transcript_feedback_term_type_required_check"));
     assert!(schema.contains("transcript_feedback_target_domain_check"));
     assert!(schema.contains("transcript_feedback_target_ai_memory_check"));
+    assert!(schema.contains("transcript_feedback_converted_domain_target_check"));
+    assert!(schema.contains("transcript_feedback_converted_ai_memory_target_check"));
     assert!(schema.contains("transcript_feedback_target_exclusive_check"));
     assert!(schema.contains("transcript_feedback_segment_meeting_check"));
 }
@@ -159,7 +179,16 @@ fn ai_memory_domain_types_match_schema_values() {
             .as_sql_decimal(),
         "0.875"
     );
+    assert_eq!(
+        ConfidencePermille::parse_sql_decimal("0.875").expect("valid decimal"),
+        ConfidencePermille::new(875).unwrap()
+    );
+    assert_eq!(
+        ConfidencePermille::parse_sql_decimal("1.000").expect("valid full confidence"),
+        ConfidencePermille::new(1000).unwrap()
+    );
     assert!(ConfidencePermille::new(1001).is_err());
+    assert!(ConfidencePermille::parse_sql_decimal("1.001").is_err());
 }
 
 #[test]

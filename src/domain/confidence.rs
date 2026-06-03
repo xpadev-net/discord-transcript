@@ -19,4 +19,37 @@ impl ConfidencePermille {
     pub fn as_sql_decimal(self) -> String {
         format!("{}.{:03}", self.0 / 1000, self.0 % 1000)
     }
+
+    pub fn parse_sql_decimal(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err("confidence decimal must not be empty".to_owned());
+        }
+
+        let (whole, fractional) = trimmed
+            .split_once('.')
+            .map_or((trimmed, ""), |(whole, fractional)| (whole, fractional));
+        if !matches!(whole, "0" | "1") {
+            return Err(format!(
+                "confidence decimal whole part must be 0 or 1: {value}"
+            ));
+        }
+        if fractional.len() > 3 || !fractional.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(format!(
+                "confidence decimal must have at most 3 fractional digits: {value}"
+            ));
+        }
+        if whole == "1" && fractional.chars().any(|ch| ch != '0') {
+            return Err(format!("confidence decimal must be <= 1.000: {value}"));
+        }
+
+        let mut permille = if whole == "1" { 1000 } else { 0 };
+        if whole == "0" && !fractional.is_empty() {
+            let padded = format!("{fractional:0<3}");
+            permille = padded
+                .parse::<u16>()
+                .map_err(|err| format!("confidence decimal is invalid: {err}"))?;
+        }
+        Self::new(permille)
+    }
 }

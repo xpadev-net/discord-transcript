@@ -68,17 +68,37 @@ CREATE TABLE IF NOT EXISTS ai_memory_notes (
         confidence IS NULL OR (confidence >= 0.000 AND confidence <= 1.000)
     ),
     CONSTRAINT ai_memory_notes_archived_actor_check CHECK (
-        archived_at IS NULL
-        OR (archived_actor_user_id IS NOT NULL AND length(btrim(archived_actor_user_id)) > 0)
+        (archived_at IS NULL AND archived_actor_user_id IS NULL)
+        OR (
+            archived_at IS NOT NULL
+            AND archived_actor_user_id IS NOT NULL
+            AND length(btrim(archived_actor_user_id)) > 0
+        )
     ),
     CONSTRAINT ai_memory_notes_archive_active_check CHECK (
         archived_at IS NULL OR active = FALSE
     ),
     CONSTRAINT ai_memory_notes_source_reference_check CHECK (
-        (source_type = 'ai_meeting_extraction' AND source_meeting_id IS NOT NULL)
-        OR (source_type = 'user_feedback' AND source_feedback_id IS NOT NULL)
-        OR (source_type = 'vc_participant' AND source_meeting_id IS NOT NULL)
-        OR source_type IN ('manual', 'promotion_candidate')
+        (
+            source_type = 'ai_meeting_extraction'
+            AND source_meeting_id IS NOT NULL
+            AND source_feedback_id IS NULL
+        )
+        OR (
+            source_type = 'user_feedback'
+            AND source_feedback_id IS NOT NULL
+            AND source_meeting_id IS NULL
+        )
+        OR (
+            source_type = 'vc_participant'
+            AND source_meeting_id IS NOT NULL
+            AND source_feedback_id IS NULL
+        )
+        OR (
+            source_type IN ('manual', 'promotion_candidate')
+            AND source_meeting_id IS NULL
+            AND source_feedback_id IS NULL
+        )
     )
 );
 
@@ -180,6 +200,13 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
         OR COALESCE(length(btrim(speaker_id)) > 0, FALSE)
         OR COALESCE(length(btrim(corrected_speaker_id)) > 0, FALSE)
     ),
+    CONSTRAINT transcript_feedback_person_alias_required_check CHECK (
+        feedback_type <> 'person_alias'
+        OR COALESCE(length(btrim(original_text)) > 0, FALSE)
+        OR COALESCE(length(btrim(corrected_text)) > 0, FALSE)
+        OR COALESCE(length(btrim(speaker_id)) > 0, FALSE)
+        OR COALESCE(length(btrim(corrected_speaker_id)) > 0, FALSE)
+    ),
     CONSTRAINT transcript_feedback_term_type_required_check CHECK (
         feedback_type <> 'term' OR term_type IS NOT NULL
     ),
@@ -188,6 +215,12 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
     ),
     CONSTRAINT transcript_feedback_target_ai_memory_check CHECK (
         feedback_type <> 'ai_memory' OR target_ai_memory_note_id IS NOT NULL
+    ),
+    CONSTRAINT transcript_feedback_converted_domain_target_check CHECK (
+        status <> 'converted_to_domain_knowledge' OR target_domain_knowledge_id IS NOT NULL
+    ),
+    CONSTRAINT transcript_feedback_converted_ai_memory_target_check CHECK (
+        status <> 'converted_to_ai_memory' OR target_ai_memory_note_id IS NOT NULL
     ),
     CONSTRAINT transcript_feedback_target_exclusive_check CHECK (
         target_domain_knowledge_id IS NULL OR target_ai_memory_note_id IS NULL
@@ -289,16 +322,32 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         )
     ),
     CONSTRAINT person_aliases_archived_actor_check CHECK (
-        archived_at IS NULL
-        OR (archived_actor_user_id IS NOT NULL AND length(btrim(archived_actor_user_id)) > 0)
+        (archived_at IS NULL AND archived_actor_user_id IS NULL)
+        OR (
+            archived_at IS NOT NULL
+            AND archived_actor_user_id IS NOT NULL
+            AND length(btrim(archived_actor_user_id)) > 0
+        )
     ),
     CONSTRAINT person_aliases_archive_active_check CHECK (
         archived_at IS NULL OR active = FALSE
     ),
     CONSTRAINT person_aliases_source_reference_check CHECK (
-        (source_type = 'user_feedback' AND source_feedback_id IS NOT NULL)
-        OR (source_type = 'vc_participant' AND source_meeting_id IS NOT NULL)
-        OR source_type IN ('manual', 'ai_inference')
+        (
+            source_type = 'user_feedback'
+            AND source_feedback_id IS NOT NULL
+            AND source_meeting_id IS NULL
+        )
+        OR (
+            source_type = 'vc_participant'
+            AND source_meeting_id IS NOT NULL
+            AND source_feedback_id IS NULL
+        )
+        OR (
+            source_type IN ('manual', 'ai_inference')
+            AND source_meeting_id IS NULL
+            AND source_feedback_id IS NULL
+        )
     )
 );
 
