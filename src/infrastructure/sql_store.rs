@@ -1,17 +1,22 @@
 use crate::domain::MeetingStatus;
 use crate::domain::StopReason;
 use crate::domain::audit::AuditEvent;
+use crate::domain::domain_knowledge::{
+    DomainKnowledgeContentType, DomainKnowledgeItem, NewDomainKnowledgeItem,
+    UpdateDomainKnowledgeItem,
+};
 use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
     BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
-    ENQUEUE_JOB_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
+    ENQUEUE_JOB_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
     GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
-    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
-    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL,
-    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
-    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
+    LIST_RECENT_AUDIT_EVENTS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
+    MARK_STOPPING_IF_RECORDING_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
+    SET_MEETING_STATUS_CAS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -182,6 +187,129 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             )
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_audit_event_row).collect()
+    }
+
+    pub fn list_domain_knowledge(
+        &mut self,
+        guild_id: &str,
+        include_archived: bool,
+        content_type: Option<DomainKnowledgeContentType>,
+    ) -> Result<Vec<DomainKnowledgeItem>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_DOMAIN_KNOWLEDGE_SQL,
+                &[
+                    guild_id.to_owned(),
+                    include_archived.to_string(),
+                    content_type
+                        .map(|content_type| content_type.as_str().to_owned())
+                        .unwrap_or_default(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_domain_knowledge_row).collect()
+    }
+
+    pub fn get_domain_knowledge(
+        &mut self,
+        guild_id: &str,
+        id: &str,
+    ) -> Result<Option<DomainKnowledgeItem>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                GET_DOMAIN_KNOWLEDGE_SQL,
+                &[guild_id.to_owned(), id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_domain_knowledge_row(&row).map(Some)
+    }
+
+    pub fn create_domain_knowledge(
+        &mut self,
+        item: &NewDomainKnowledgeItem,
+    ) -> Result<DomainKnowledgeItem, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                INSERT_DOMAIN_KNOWLEDGE_SQL,
+                &new_domain_knowledge_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::Backend(
+                "domain knowledge insert returned no row".to_owned(),
+            ));
+        };
+        parse_domain_knowledge_row(&row)
+    }
+
+    pub fn update_domain_knowledge(
+        &mut self,
+        item: &UpdateDomainKnowledgeItem,
+    ) -> Result<Option<DomainKnowledgeItem>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                UPDATE_DOMAIN_KNOWLEDGE_SQL,
+                &update_domain_knowledge_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_domain_knowledge_row(&row).map(Some)
+    }
+
+    pub fn activate_domain_knowledge(
+        &mut self,
+        guild_id: &str,
+        id: &str,
+        actor_user_id: Option<&str>,
+    ) -> Result<Option<DomainKnowledgeItem>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                ACTIVATE_DOMAIN_KNOWLEDGE_SQL,
+                &[
+                    id.to_owned(),
+                    guild_id.to_owned(),
+                    actor_user_id.unwrap_or_default().to_owned(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_domain_knowledge_row(&row).map(Some)
+    }
+
+    pub fn archive_domain_knowledge(
+        &mut self,
+        guild_id: &str,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<DomainKnowledgeItem>, StoreError> {
+        if actor_user_id.trim().is_empty() {
+            return Err(StoreError::Backend(
+                "domain knowledge archive actor is required".to_owned(),
+            ));
+        }
+        let rows = self
+            .executor
+            .query_rows(
+                ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
+                &[id.to_owned(), guild_id.to_owned(), actor_user_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_domain_knowledge_row(&row).map(Some)
     }
 }
 
@@ -496,6 +624,88 @@ fn parse_effective_meeting_settings_row(
         summary_template_id: row.get(12).and_then(|v| v.clone()),
         domain_knowledge_version_id: row.get(13).and_then(|v| v.clone()),
     })
+}
+
+fn new_domain_knowledge_params(item: &NewDomainKnowledgeItem) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.guild_id.clone(),
+        item.content_type.as_str().to_owned(),
+        item.title.clone(),
+        item.body.clone(),
+        item.active.to_string(),
+        item.updated_actor_user_id.clone().unwrap_or_default(),
+    ]
+}
+
+fn update_domain_knowledge_params(item: &UpdateDomainKnowledgeItem) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.guild_id.clone(),
+        item.content_type.as_str().to_owned(),
+        item.title.clone(),
+        item.body.clone(),
+        item.active.to_string(),
+        item.updated_actor_user_id.clone().unwrap_or_default(),
+    ]
+}
+
+fn parse_domain_knowledge_row(row: &SqlRow) -> Result<DomainKnowledgeItem, StoreError> {
+    if row.len() < 13 {
+        return Err(StoreError::Backend(format!(
+            "invalid domain knowledge row length: {}",
+            row.len()
+        )));
+    }
+    let content_type_raw = require_store_column(row, 3, "content_type")?;
+    let content_type =
+        DomainKnowledgeContentType::parse_str(&content_type_raw).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "invalid domain knowledge content_type '{content_type_raw}'"
+            ))
+        })?;
+    let created_at_raw = require_store_column(row, 11, "created_at")?;
+    let updated_at_raw = require_store_column(row, 12, "updated_at")?;
+
+    Ok(DomainKnowledgeItem {
+        id: require_store_column(row, 0, "id")?,
+        tenant_id: row.get(1).and_then(|v| v.clone()),
+        guild_id: require_store_column(row, 2, "guild_id")?,
+        content_type,
+        title: require_store_column(row, 4, "title")?,
+        body: require_store_column(row, 5, "body")?,
+        active: required_bool_column(row, 6, "active")?,
+        version: required_u32_column(row, 7, "version")?,
+        updated_actor_user_id: row.get(8).and_then(|v| v.clone()),
+        archived_at: parse_optional_domain_knowledge_timestamp(
+            row.get(9).and_then(|v| v.clone()),
+            "archived_at",
+        )?,
+        archived_actor_user_id: row.get(10).and_then(|v| v.clone()),
+        created_at: parse_required_domain_knowledge_timestamp(&created_at_raw, "created_at")?,
+        updated_at: parse_required_domain_knowledge_timestamp(&updated_at_raw, "updated_at")?,
+    })
+}
+
+fn parse_required_domain_knowledge_timestamp(
+    raw: &str,
+    field: &str,
+) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|ts| ts.with_timezone(&Utc))
+        .map_err(|err| {
+            StoreError::Backend(format!("invalid domain knowledge {field} '{raw}': {err}"))
+        })
+}
+
+fn parse_optional_domain_knowledge_timestamp(
+    raw: Option<String>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    parse_required_domain_knowledge_timestamp(&raw, field).map(Some)
 }
 
 pub fn audit_event_params(event: &AuditEvent) -> Vec<String> {

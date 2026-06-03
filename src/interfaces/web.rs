@@ -24,14 +24,17 @@ use uuid::Uuid;
 
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::audit::AuditEvent;
+use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
 use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use crate::infrastructure::sql::{
-    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL,
-    INSERT_AUDIT_EVENT_SQL, LIST_GUILD_MEETINGS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL,
+    COUNT_GUILD_MEETINGS_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
+    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
+    LIST_GUILD_MEETINGS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
     UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::audit_event_params;
@@ -378,6 +381,22 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/guild/settings/bot-token",
             put(api_update_guild_bot_token).delete(api_delete_guild_bot_token),
+        )
+        .route(
+            "/api/guild/domain-knowledge",
+            get(api_list_domain_knowledge).post(api_create_domain_knowledge),
+        )
+        .route(
+            "/api/guild/domain-knowledge/{item_id}",
+            get(api_get_domain_knowledge).put(api_update_domain_knowledge),
+        )
+        .route(
+            "/api/guild/domain-knowledge/{item_id}/activate",
+            post(api_activate_domain_knowledge),
+        )
+        .route(
+            "/api/guild/domain-knowledge/{item_id}/archive",
+            post(api_archive_domain_knowledge),
         )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
@@ -2394,6 +2413,35 @@ struct GuildBotTokenUpdateRequest {
     bot_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DomainKnowledgeListQuery {
+    include_archived: Option<bool>,
+    content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DomainKnowledgeUpsertRequest {
+    content_type: String,
+    title: String,
+    body: String,
+    active: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DomainKnowledgeItemResponse {
+    id: String,
+    content_type: String,
+    title: String,
+    body: String,
+    active: bool,
+    version: i32,
+    updated_actor_user_id: Option<String>,
+    archived_at: Option<String>,
+    archived_actor_user_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 impl std::fmt::Debug for GuildBotTokenUpdateRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuildBotTokenUpdateRequest")
@@ -2753,6 +2801,73 @@ fn guild_meeting_entry_from_row(row: &tokio_postgres::Row) -> GuildMeetingEntryR
         stopped_at: row.get("stopped_at"),
         duration_seconds: row.get("meeting_duration_seconds"),
         stop_reason: row.get("stop_reason"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedDomainKnowledgeRequest {
+    content_type: DomainKnowledgeContentType,
+    title: String,
+    body: String,
+    active: Option<bool>,
+}
+
+fn validate_domain_knowledge_item_id(id: &str) -> Result<(), StatusCode> {
+    if id.trim().is_empty() || id.len() > 128 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn parse_domain_knowledge_content_type(
+    content_type: &str,
+) -> Result<DomainKnowledgeContentType, StatusCode> {
+    DomainKnowledgeContentType::parse_str(content_type).ok_or(StatusCode::BAD_REQUEST)
+}
+
+fn normalize_domain_knowledge_request(
+    request: &DomainKnowledgeUpsertRequest,
+) -> Result<NormalizedDomainKnowledgeRequest, StatusCode> {
+    let content_type = parse_domain_knowledge_content_type(&request.content_type)?;
+    let title = request.title.trim();
+    let body = request.body.trim();
+    if title.is_empty() || title.len() > 200 || body.is_empty() || body.len() > 20_000 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(NormalizedDomainKnowledgeRequest {
+        content_type,
+        title: title.to_owned(),
+        body: body.to_owned(),
+        active: request.active,
+    })
+}
+
+fn normalize_domain_knowledge_list_filter(
+    query: &DomainKnowledgeListQuery,
+) -> Result<(bool, String), StatusCode> {
+    let content_type = query
+        .content_type
+        .as_deref()
+        .map(parse_domain_knowledge_content_type)
+        .transpose()?
+        .map(|content_type| content_type.as_str().to_owned())
+        .unwrap_or_default();
+    Ok((query.include_archived.unwrap_or(false), content_type))
+}
+
+fn domain_knowledge_response_from_row(row: &tokio_postgres::Row) -> DomainKnowledgeItemResponse {
+    DomainKnowledgeItemResponse {
+        id: row.get("id"),
+        content_type: row.get("content_type"),
+        title: row.get("title"),
+        body: row.get("body"),
+        active: row.get("active"),
+        version: row.get("version"),
+        updated_actor_user_id: row.get("updated_actor_user_id"),
+        archived_at: row.get("archived_at"),
+        archived_actor_user_id: row.get("archived_actor_user_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }
 }
 
@@ -3193,6 +3308,241 @@ async fn api_update_guild_settings(
         stored,
         true,
     )))
+}
+
+async fn api_list_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Query(query): Query<DomainKnowledgeListQuery>,
+) -> Result<Json<Vec<DomainKnowledgeItemResponse>>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let (include_archived, content_type_filter) = normalize_domain_knowledge_list_filter(&query)?;
+    let include_archived_text = include_archived.to_string();
+    let rows = state
+        .db
+        .query(
+            LIST_DOMAIN_KNOWLEDGE_SQL,
+            &[&auth.guild_id, &include_archived_text, &content_type_filter],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        rows.iter()
+            .map(domain_knowledge_response_from_row)
+            .collect(),
+    ))
+}
+
+async fn api_get_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(item_id): Path<String>,
+) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
+    validate_domain_knowledge_item_id(&item_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let row = state
+        .db
+        .query_opt(GET_DOMAIN_KNOWLEDGE_SQL, &[&auth.guild_id, &item_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(domain_knowledge_response_from_row(&row)))
+}
+
+async fn api_create_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+    Json(request): Json<DomainKnowledgeUpsertRequest>,
+) -> Result<(StatusCode, Json<DomainKnowledgeItemResponse>), StatusCode> {
+    let normalized = normalize_domain_knowledge_request(&request)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let id = Uuid::new_v4().to_string();
+    let content_type = normalized.content_type.as_str().to_owned();
+    let active = normalized.active.unwrap_or(true).to_string();
+    let row = state
+        .db
+        .query_opt(
+            INSERT_DOMAIN_KNOWLEDGE_SQL,
+            &[
+                &id,
+                &auth.guild_id,
+                &content_type,
+                &normalized.title,
+                &normalized.body,
+                &active,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let response = domain_knowledge_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "domain_knowledge.create",
+            "domain_knowledge",
+            Some(response.id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/guild/domain-knowledge"),
+            json!({
+                "content_type": response.content_type.clone(),
+                "active": response.active,
+                "version": response.version,
+            }),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn api_update_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DomainKnowledgeUpsertRequest>,
+) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
+    validate_domain_knowledge_item_id(&item_id)?;
+    let normalized = normalize_domain_knowledge_request(&request)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let content_type = normalized.content_type.as_str().to_owned();
+    let active = normalized
+        .active
+        .map(|active| active.to_string())
+        .unwrap_or_default();
+    let row = state
+        .db
+        .query_opt(
+            UPDATE_DOMAIN_KNOWLEDGE_SQL,
+            &[
+                &item_id,
+                &auth.guild_id,
+                &content_type,
+                &normalized.title,
+                &normalized.body,
+                &active,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = domain_knowledge_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "domain_knowledge.update",
+            "domain_knowledge",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &format!("/api/guild/domain-knowledge/{item_id}"),
+            ),
+            json!({
+                "content_type": response.content_type.clone(),
+                "active": response.active,
+                "version": response.version,
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_activate_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
+    validate_domain_knowledge_item_id(&item_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let row = state
+        .db
+        .query_opt(
+            ACTIVATE_DOMAIN_KNOWLEDGE_SQL,
+            &[&item_id, &auth.guild_id, &user_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = domain_knowledge_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "domain_knowledge.activate",
+            "domain_knowledge",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/domain-knowledge/{item_id}/activate"),
+            ),
+            json!({
+                "active": response.active,
+                "version": response.version,
+                "archived": response.archived_at.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_archive_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
+    validate_domain_knowledge_item_id(&item_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let row = state
+        .db
+        .query_opt(
+            ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
+            &[&item_id, &auth.guild_id, &user_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = domain_knowledge_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "domain_knowledge.archive",
+            "domain_knowledge",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/domain-knowledge/{item_id}/archive"),
+            ),
+            json!({
+                "active": response.active,
+                "version": response.version,
+                "archived": response.archived_at.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
 }
 
 async fn api_update_guild_bot_token(
@@ -4926,13 +5276,16 @@ mod operational_endpoint_tests {
 mod guild_api_tests {
     use super::{
         BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, DiscordBotTokenValidationError,
-        DiscordBotTokenValidationStage, GuildAdminCheck, GuildBotTokenUpdateRequest,
-        GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, StoredGuildSettings,
-        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
-        classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
-        guild_admin_required_result, guild_bot_token_delete_is_noop, guild_settings_response,
+        DiscordBotTokenValidationStage, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
+        GuildAdminCheck, GuildBotTokenUpdateRequest, GuildMeetingsQuery, GuildSettingsDefaults,
+        GuildSettingsUpdateRequest, StoredGuildSettings, advance_bot_token_revision,
+        bot_auth_header_from_cache_with_resolver, classify_discord_bot_token_validation_status,
+        guild_admin_member_status_decision, guild_admin_required_result,
+        guild_bot_token_delete_is_noop, guild_settings_response,
+        normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
-        validate_authorized_guild_settings_update, validate_guild_settings_update,
+        validate_authorized_guild_settings_update, validate_domain_knowledge_item_id,
+        validate_guild_settings_update,
     };
     use axum::http::StatusCode;
     use std::sync::{
@@ -5147,6 +5500,75 @@ mod guild_api_tests {
                 bot_token: "  token-value  ".to_owned()
             }),
             Ok("token-value".to_owned())
+        );
+    }
+
+    #[test]
+    fn domain_knowledge_validation_accepts_and_trims_valid_request() {
+        let normalized = normalize_domain_knowledge_request(&DomainKnowledgeUpsertRequest {
+            content_type: "project_context".to_owned(),
+            title: "  Launch plan  ".to_owned(),
+            body: "  Internal wording guidance.  ".to_owned(),
+            active: None,
+        })
+        .expect("valid domain knowledge request should normalize");
+
+        assert_eq!(normalized.content_type.as_str(), "project_context");
+        assert_eq!(normalized.title, "Launch plan");
+        assert_eq!(normalized.body, "Internal wording guidance.");
+        assert_eq!(normalized.active, None);
+    }
+
+    #[test]
+    fn domain_knowledge_validation_rejects_invalid_type_and_blank_body() {
+        assert_eq!(
+            normalize_domain_knowledge_request(&DomainKnowledgeUpsertRequest {
+                content_type: "secret".to_owned(),
+                title: "Title".to_owned(),
+                body: "Body".to_owned(),
+                active: Some(true),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_domain_knowledge_request(&DomainKnowledgeUpsertRequest {
+                content_type: "glossary".to_owned(),
+                title: "Title".to_owned(),
+                body: "   ".to_owned(),
+                active: Some(true),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn domain_knowledge_list_filter_accepts_archived_and_type() {
+        assert_eq!(
+            normalize_domain_knowledge_list_filter(&DomainKnowledgeListQuery {
+                include_archived: Some(true),
+                content_type: Some("prohibited_item".to_owned()),
+            }),
+            Ok((true, "prohibited_item".to_owned()))
+        );
+        assert_eq!(
+            normalize_domain_knowledge_list_filter(&DomainKnowledgeListQuery {
+                include_archived: None,
+                content_type: None,
+            }),
+            Ok((false, String::new()))
+        );
+    }
+
+    #[test]
+    fn domain_knowledge_item_id_validation_rejects_blank_or_oversized_ids() {
+        assert_eq!(validate_domain_knowledge_item_id("dk-1"), Ok(()));
+        assert_eq!(
+            validate_domain_knowledge_item_id("   "),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_domain_knowledge_item_id(&"x".repeat(129)),
+            Err(StatusCode::BAD_REQUEST)
         );
     }
 

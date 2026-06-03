@@ -1,5 +1,8 @@
 import type {
   DebugArtifact,
+  DomainKnowledgeContentType,
+  DomainKnowledgeItem,
+  DomainKnowledgeUpsertRequest,
   GuildSettingsResponse,
   MeetingListResponse,
   MeetingResponse,
@@ -15,6 +18,11 @@ import type {
 
 function basePath(meetingId: string): string {
   return `/api/meetings/${encodeURIComponent(meetingId)}`;
+}
+
+function domainKnowledgePath(itemId?: string): string {
+  const base = "/api/guild/domain-knowledge";
+  return itemId ? `${base}/${encodeURIComponent(itemId)}` : base;
 }
 
 export function buildLoginRedirectUrl(path: string): string {
@@ -142,6 +150,85 @@ export function deleteGuildBotToken(
     method: "DELETE",
     signal,
   }).then(handleGuildSettingsResponse);
+}
+
+export function fetchDomainKnowledgeItems(
+  options: {
+    includeArchived?: boolean;
+    contentType?: DomainKnowledgeContentType;
+  } = {},
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem[]> {
+  const params = new URLSearchParams();
+  if (options.includeArchived !== undefined) {
+    params.set("include_archived", String(options.includeArchived));
+  }
+  if (options.contentType) {
+    params.set("content_type", options.contentType);
+  }
+  const query = params.toString();
+  const path = query
+    ? `${domainKnowledgePath()}?${query}`
+    : domainKnowledgePath();
+  return fetch(path, { signal }).then(handleResponse<DomainKnowledgeItem[]>);
+}
+
+export function fetchDomainKnowledgeItem(
+  itemId: string,
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem> {
+  return fetch(domainKnowledgePath(itemId), { signal }).then(
+    handleResponse<DomainKnowledgeItem>,
+  );
+}
+
+export function createDomainKnowledgeItem(
+  request: DomainKnowledgeUpsertRequest,
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem> {
+  return fetch(domainKnowledgePath(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<DomainKnowledgeItem>);
+}
+
+export function updateDomainKnowledgeItem(
+  itemId: string,
+  request: DomainKnowledgeUpsertRequest,
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem> {
+  return fetch(domainKnowledgePath(itemId), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<DomainKnowledgeItem>);
+}
+
+export function activateDomainKnowledgeItem(
+  itemId: string,
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem> {
+  return fetch(`${domainKnowledgePath(itemId)}/activate`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<DomainKnowledgeItem>);
+}
+
+export function archiveDomainKnowledgeItem(
+  itemId: string,
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem> {
+  return fetch(`${domainKnowledgePath(itemId)}/archive`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<DomainKnowledgeItem>);
 }
 
 export function fetchMeeting(

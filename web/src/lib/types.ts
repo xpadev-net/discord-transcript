@@ -60,6 +60,34 @@ export interface UpdateGuildBotTokenRequest {
   bot_token: string;
 }
 
+export type DomainKnowledgeContentType =
+  | "glossary"
+  | "person_name"
+  | "project_context"
+  | "wording_rule"
+  | "prohibited_item";
+
+export interface DomainKnowledgeItem {
+  id: string;
+  content_type: DomainKnowledgeContentType;
+  title: string;
+  body: string;
+  active: boolean;
+  version: number;
+  updated_actor_user_id: string | null;
+  archived_at: string | null;
+  archived_actor_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DomainKnowledgeUpsertRequest {
+  content_type: DomainKnowledgeContentType;
+  title: string;
+  body: string;
+  active?: boolean;
+}
+
 export interface SpeakerResponse {
   id: string;
   username: string | null;
