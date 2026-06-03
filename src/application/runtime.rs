@@ -2331,6 +2331,10 @@ impl EventHandler for ScaffoldHandler {
                         let mut states = handler.auto_stop_states.lock().await;
                         states.remove(&guild_for_task);
                     }
+                    if let Some(session) = &removed_session {
+                        let mut titles = handler.live_transcription_titles.lock().await;
+                        titles.remove(&session.meeting_id);
+                    }
                     if let Some(manager) = songbird::get(&ctx_for_task).await {
                         let _ = manager.leave(handler.guild_id).await;
                     }
