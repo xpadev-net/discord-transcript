@@ -9,7 +9,7 @@ RUN pnpm run build
 
 FROM rust:1.94-bookworm AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends cmake libopus-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends cmake libopus-dev libssl-dev pkg-config && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ RUN touch src/main.rs && cargo build --release
 FROM node:24-bookworm-slim
 
 # curl is required at runtime by CommandWhisperClient for whisper.cpp inference.
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libopus0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libopus0 libssl3 && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code
 
 RUN groupadd -r app && useradd -r -g app -m -d /home/app app
