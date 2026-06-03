@@ -42,7 +42,7 @@ use crate::infrastructure::sql::{
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, MeetingSettingsDefaults, MeetingStore, StatusMessageMetadata,
-    StoredMeeting, UsageEventStore,
+    StoredMeeting,
 };
 use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
@@ -159,7 +159,7 @@ pub fn dispatch_runtime_command<S>(
     input: RuntimeCommandInput,
 ) -> Result<String, CommandError>
 where
-    S: MeetingStore + UsageEventStore,
+    S: MeetingStore,
 {
     match input {
         RuntimeCommandInput::RecordStart(value) => service.handle_record_start(*value),
@@ -182,7 +182,7 @@ fn complete_record_start_after_runtime_setup<S>(
     input: StartCommandInput,
 ) -> Result<String, String>
 where
-    S: MeetingStore + UsageEventStore,
+    S: MeetingStore,
 {
     service
         .handle_record_start(input)
@@ -199,7 +199,7 @@ pub fn stop_and_enqueue_summary_job<S, Q>(
     reason: StopReason,
 ) -> Result<crate::application::bot::StopCommandResult, String>
 where
-    S: MeetingStore + UsageEventStore,
+    S: MeetingStore,
     Q: crate::infrastructure::queue::JobQueue,
 {
     if let Some(expected_meeting_id) = expected_meeting_id {
@@ -274,10 +274,7 @@ where
     Ok(stop_result)
 }
 
-fn record_recording_duration_usage<S: MeetingStore + UsageEventStore>(
-    store: &mut S,
-    meeting_id: &str,
-) {
+fn record_recording_duration_usage<S: MeetingStore>(store: &mut S, meeting_id: &str) {
     let meeting = match store.get_meeting(meeting_id) {
         Ok(Some(meeting)) => meeting,
         Ok(None) => {

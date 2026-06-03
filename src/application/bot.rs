@@ -45,10 +45,10 @@ impl<S: MeetingStore> BotCommandService<S> {
         Self { store }
     }
 
-    pub fn handle_record_start(&mut self, input: StartCommandInput) -> Result<String, CommandError>
-    where
-        S: UsageEventStore,
-    {
+    pub fn handle_record_start(
+        &mut self,
+        input: StartCommandInput,
+    ) -> Result<String, CommandError> {
         observe_record_start_entitlement(&mut self.store, &input.guild_id);
         let result = record_start(
             &mut self.store,

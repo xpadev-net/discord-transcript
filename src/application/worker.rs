@@ -134,7 +134,7 @@ pub fn process_meeting_summary<S, W, C>(
     input: &ProcessMeetingInput,
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
-    S: MeetingStore + UsageEventStore,
+    S: MeetingStore,
     W: WhisperClient,
     C: ClaudeSummaryClient,
 {
@@ -327,7 +327,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
     options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
-    S: MeetingStore + UsageEventStore,
+    S: MeetingStore,
     Q: JobQueue,
     W: WhisperClient,
     C: ClaudeSummaryClient,
@@ -496,6 +496,9 @@ pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, Strin
 
 fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
     let fmt_chunk_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    // Only the canonical 44-byte PCM layout is supported here. Files with
+    // metadata chunks between `fmt ` and `data` return None so the caller can
+    // warn and skip the observe-only ASR usage event.
     if &header[0..4] != b"RIFF"
         || &header[8..12] != b"WAVE"
         || &header[12..16] != b"fmt "
@@ -523,7 +526,7 @@ fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: New
     }
 }
 
-fn record_summary_run_usage_observe_only<S: MeetingStore + UsageEventStore>(
+fn record_summary_run_usage_observe_only<S: MeetingStore>(
     store: &mut S,
     meeting_id: &str,
     job_id: &str,
