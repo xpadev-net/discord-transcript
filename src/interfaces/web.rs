@@ -3165,9 +3165,9 @@ fn guild_meetings_visibility_scan_limit(page: u32, limit: u32) -> i64 {
         .saturating_add(u64::from(limit));
     i64::from(
         requested
+            .max(u64::from(limit))
             .max(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_MIN))
-            .min(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT))
-            .max(u64::from(limit)) as u32,
+            .min(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)) as u32,
     )
 }
 
@@ -4618,17 +4618,24 @@ async fn api_transcript_events(
                     let had_segments = !response.segments.is_empty();
                     let is_final = response.is_final;
                     let next_idle_polls = next_transcript_sse_idle_polls(idle_polls, had_segments);
-                    let stop_for_idle = transcript_sse_idle_limit_reached(next_idle_polls);
+                    let stop_for_idle =
+                        !is_final && transcript_sse_idle_limit_reached(next_idle_polls);
                     let next_poll_delay = next_transcript_sse_poll_delay(poll_delay, had_segments);
-                    let event = match serde_json::to_string(&response) {
-                        Ok(data) => Event::default().event("segments").data(data),
-                        Err(err) => Event::default().event("stream-error").data(
-                            serde_json::json!({
-                                "code": "encode",
-                                "message": err.to_string(),
-                            })
-                            .to_string(),
-                        ),
+                    let event = if stop_for_idle {
+                        Event::default()
+                            .event("stream-closed")
+                            .data(r#"{"code":"idle_timeout"}"#)
+                    } else {
+                        match serde_json::to_string(&response) {
+                            Ok(data) => Event::default().event("segments").data(data),
+                            Err(err) => Event::default().event("stream-error").data(
+                                serde_json::json!({
+                                    "code": "encode",
+                                    "message": err.to_string(),
+                                })
+                                .to_string(),
+                            ),
+                        }
                     };
                     Some((
                         Ok(event),
@@ -4647,9 +4654,16 @@ async fn api_transcript_events(
                 Err(_) => {
                     let next_idle_polls = next_transcript_sse_idle_polls(idle_polls, false);
                     let next_poll_delay = next_transcript_sse_poll_delay(poll_delay, false);
-                    let event = Event::default()
-                        .event("stream-error")
-                        .data(r#"{"code":"transcript_unavailable"}"#);
+                    let stop_for_idle = transcript_sse_idle_limit_reached(next_idle_polls);
+                    let event = if stop_for_idle {
+                        Event::default()
+                            .event("stream-closed")
+                            .data(r#"{"code":"idle_timeout"}"#)
+                    } else {
+                        Event::default()
+                            .event("stream-error")
+                            .data(r#"{"code":"transcript_unavailable"}"#)
+                    };
                     Some((
                         Ok(event),
                         (
@@ -4660,7 +4674,7 @@ async fn api_transcript_events(
                             next_poll_delay,
                             next_idle_polls,
                             permit,
-                            transcript_sse_idle_limit_reached(next_idle_polls),
+                            stop_for_idle,
                         ),
                     ))
                 }
@@ -7069,6 +7083,10 @@ mod guild_api_tests {
         assert_eq!(guild_meetings_visibility_scan_limit(2, 100), 200);
         assert_eq!(
             guild_meetings_visibility_scan_limit(10_000, 100),
+            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)
+        );
+        assert_eq!(
+            guild_meetings_visibility_scan_limit(1, GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT + 1),
             i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)
         );
     }
