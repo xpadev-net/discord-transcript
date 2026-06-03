@@ -24,10 +24,7 @@ use crate::domain::transcript::{
     MAX_DB_TIMESTAMP_MS, NormalizationConfig, TranscriptSegment, TranscriptSource,
     normalize_segments, render_for_summary,
 };
-use crate::domain::usage::{
-    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageMetric, UsageSnapshot,
-    recording_minutes_from_seconds,
-};
+use crate::domain::usage::{NewUsageEvent, UsageMetric, recording_minutes_from_seconds};
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
@@ -334,37 +331,6 @@ fn recording_duration_seconds(meeting: &StoredMeeting) -> Option<u64> {
     let stopped_at = meeting.stopped_at?;
     let seconds = stopped_at.signed_duration_since(started_at).num_seconds();
     Some(seconds.max(0) as u64)
-}
-
-fn observe_usage_entitlement_after_worker_completion<S: UsageEventStore>(
-    store: &mut S,
-    guild_id: &str,
-) {
-    let aggregates = match store.aggregate_recent_usage(None, Some(guild_id), 30 * 24 * 60 * 60) {
-        Ok(aggregates) => aggregates,
-        Err(err) => {
-            warn!(
-                guild_id,
-                error = %err,
-                "usage entitlement observation failed after worker completion"
-            );
-            return;
-        }
-    };
-    let snapshot = UsageSnapshot::from_aggregates(aggregates);
-    let decision =
-        EntitlementEvaluator::observe_only().evaluate(EntitlementAction::CompleteWorker, &snapshot);
-    if decision
-        .observations
-        .iter()
-        .any(|observation| observation.exceeded)
-    {
-        warn!(
-            guild_id,
-            observations = ?decision.observations,
-            "usage entitlement would exceed policy; observe-only mode allows worker completion"
-        );
-    }
 }
 
 pub fn meeting_audio_dir(
@@ -3378,7 +3344,10 @@ impl ScaffoldHandler {
                 "failed to append summary usage event; continuing in observe-only mode"
             );
         }
-        observe_usage_entitlement_after_worker_completion(&mut service.store, &meeting.guild_id);
+        crate::application::worker::observe_worker_completion_entitlement(
+            &mut service.store,
+            &meeting.guild_id,
+        );
     }
 
     async fn record_asr_seconds_usage(

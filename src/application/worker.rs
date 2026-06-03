@@ -545,7 +545,10 @@ fn record_summary_run_usage_observe_only<S: MeetingStore + UsageEventStore>(
     observe_worker_completion_entitlement(store, &meeting.guild_id);
 }
 
-fn observe_worker_completion_entitlement<S: UsageEventStore>(store: &mut S, guild_id: &str) {
+pub(crate) fn observe_worker_completion_entitlement<S: UsageEventStore>(
+    store: &mut S,
+    guild_id: &str,
+) {
     let aggregates = match store.aggregate_recent_usage(None, Some(guild_id), 30 * 24 * 60 * 60) {
         Ok(aggregates) => aggregates,
         Err(err) => {
