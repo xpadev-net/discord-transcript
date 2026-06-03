@@ -47,7 +47,7 @@ impl ConfidencePermille {
         }
 
         let mut permille = if whole == "1" { 1000 } else { 0 };
-        if whole == "0" && !fractional.is_empty() {
+        if whole == "0" {
             let padded = format!("{fractional:0<3}");
             permille = padded
                 .parse::<u16>()

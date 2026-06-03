@@ -145,8 +145,6 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
     CONSTRAINT transcript_feedback_meeting_fk
         FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id)
         DEFERRABLE INITIALLY DEFERRED,
-    CONSTRAINT transcript_feedback_meeting_delete_fk
-        FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL,
     CONSTRAINT transcript_feedback_segment_fk
         FOREIGN KEY (transcript_segment_id, meeting_id) REFERENCES transcripts(id, meeting_id)
         DEFERRABLE INITIALLY DEFERRED,

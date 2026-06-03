@@ -163,7 +163,7 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     let meeting_fk = sql_between(
         schema,
         "CONSTRAINT transcript_feedback_meeting_fk",
-        "CONSTRAINT transcript_feedback_meeting_delete_fk",
+        "CONSTRAINT transcript_feedback_segment_fk",
     );
     assert!(meeting_fk.contains("FOREIGN KEY (meeting_id, guild_id)"));
     assert!(meeting_fk.contains("REFERENCES meetings(id, guild_id)"));
@@ -176,8 +176,6 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(segment_fk.contains("FOREIGN KEY (transcript_segment_id, meeting_id)"));
     assert!(segment_fk.contains("REFERENCES transcripts(id, meeting_id)"));
     assert!(segment_fk.contains("DEFERRABLE INITIALLY DEFERRED"));
-    assert!(schema.contains("transcript_feedback_meeting_delete_fk"));
-    assert!(schema.contains("FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL"));
     assert!(schema.contains("transcript_feedback_segment_delete_fk"));
     assert!(schema.contains("FOREIGN KEY (transcript_segment_id) REFERENCES transcripts(id) ON DELETE SET NULL"));
     assert!(schema.contains("CREATE OR REPLACE FUNCTION clear_transcript_feedback_meeting_refs()"));
