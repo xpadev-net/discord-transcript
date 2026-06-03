@@ -3222,8 +3222,8 @@ impl ScaffoldHandler {
                     .map_err(|err| err.to_string())?;
                 drop(service);
                 let mut summary_job_done = true;
+                let job_id = format!("summary-{meeting_id}");
                 {
-                    let job_id = format!("summary-{meeting_id}");
                     let mut queue = self.queue.lock().await;
                     if let Err(err) = queue.mark_done(&job_id) {
                         error!(
@@ -3236,7 +3236,7 @@ impl ScaffoldHandler {
                     }
                 }
                 if summary_job_done {
-                    self.record_summary_run_usage(meeting_id, chunks.len())
+                    self.record_summary_run_usage(meeting_id, &job_id, chunks.len())
                         .await;
                 }
                 Ok(())
@@ -3301,7 +3301,7 @@ impl ScaffoldHandler {
         post_failure_to_report_channel(http, report_channel_id, meeting_id, error_message).await
     }
 
-    async fn record_summary_run_usage(&self, meeting_id: &str, chunk_count: usize) {
+    async fn record_summary_run_usage(&self, meeting_id: &str, job_id: &str, chunk_count: usize) {
         let guild_id = {
             let mut service = self.service.lock().await;
             let meeting = match service.store.get_meeting(meeting_id) {
@@ -3325,7 +3325,7 @@ impl ScaffoldHandler {
                 tenant_id: None,
                 guild_id: guild_id.clone(),
                 meeting_id: Some(meeting_id.to_owned()),
-                job_id: Some(format!("summary-{meeting_id}")),
+                job_id: Some(job_id.to_owned()),
                 resource_type: Some("meeting".to_owned()),
                 resource_id: Some(meeting_id.to_owned()),
                 metric: UsageMetric::SummaryRuns,
