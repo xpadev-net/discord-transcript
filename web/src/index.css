@@ -307,7 +307,9 @@ button {
 
 .settings-field input[type="text"],
 .settings-field input[type="number"],
-.settings-field input[type="password"] {
+.settings-field input[type="password"],
+.settings-field select,
+.settings-field textarea {
   width: min(100%, 320px);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -316,13 +318,27 @@ button {
   padding: 8px 10px;
 }
 
-.settings-field input:focus-visible {
+.settings-field textarea {
+  width: 100%;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.settings-field select {
+  cursor: pointer;
+}
+
+.settings-field input:focus-visible,
+.settings-field select:focus-visible,
+.settings-field textarea:focus-visible {
   border-color: var(--accent);
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .settings-field input:disabled,
+.settings-field select:disabled,
+.settings-field textarea:disabled,
 .settings-checkbox input:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -372,6 +388,69 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.settings-section-heading,
+.settings-customization-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.settings-section-heading p,
+.settings-customization-header p,
+.settings-version-meta {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.settings-customization-section {
+  margin-top: 16px;
+}
+
+.settings-inline-status,
+.settings-inline-error {
+  margin-top: 12px;
+}
+
+.settings-inline-status {
+  justify-content: flex-start;
+  min-height: auto;
+}
+
+.settings-inline-error {
+  border: 1px solid rgba(224, 108, 117, 0.45);
+  border-radius: 6px;
+  background: rgba(224, 108, 117, 0.08);
+  color: var(--speaker-2);
+  padding: 10px 12px;
+  font-size: 0.9rem;
+}
+
+.settings-customization-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 16px;
+}
+
+.settings-customization-panel {
+  min-width: 0;
+}
+
+.settings-customization-panel h3 {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.settings-customization-panel .settings-token-actions {
+  margin-top: 12px;
+}
+
+.settings-version-meta {
+  margin-top: 10px;
 }
 
 .secondary-button {
@@ -960,6 +1039,13 @@ audio::-webkit-media-controls-panel {
   .dashboard-header {
     flex-direction: column;
     align-items: stretch;
+  }
+  .settings-customization-grid {
+    grid-template-columns: 1fr;
+  }
+  .settings-section-heading,
+  .settings-customization-header {
+    flex-direction: column;
   }
   .dashboard-header .secondary-button {
     width: fit-content;
