@@ -2,6 +2,9 @@ use discord_transcript::application::recovery_runner::{RecoveryEffect, run_recov
 use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::audit::{AuditEvent, AuditLog};
 use discord_transcript::domain::authz::{Action, UserRole, is_allowed};
+use discord_transcript::domain::plans::{
+    PlanQuota, QuotaDimension, QuotaEnforcementMode, QuotaLimit, QuotaPeriod,
+};
 use discord_transcript::domain::recovery::RecoveryAction;
 use discord_transcript::domain::recovery::RecoveryCandidate;
 use discord_transcript::domain::recovery::decide_recovery_action;
@@ -308,6 +311,57 @@ fn entitlement_evaluator_observe_only_never_blocks() {
         EntitlementEvaluator::observe_only().evaluate(EntitlementAction::StartRecording, &snapshot);
     assert!(default_observe_only.allowed);
     assert_eq!(default_observe_only.observations.len(), 5);
+}
+
+#[test]
+fn plan_quota_limit_validation_distinguishes_unlimited_and_finite_limits() {
+    let finite = PlanQuota::from_parts(
+        "quota-finite".to_owned(),
+        QuotaDimension::RecordingMinutes,
+        QuotaPeriod::Monthly,
+        false,
+        Some(100),
+        QuotaEnforcementMode::ObserveOnly,
+    )
+    .expect("finite quota should be valid");
+    let unlimited = PlanQuota::from_parts(
+        "quota-unlimited".to_owned(),
+        QuotaDimension::StorageBytes,
+        QuotaPeriod::Current,
+        true,
+        None,
+        QuotaEnforcementMode::Enforce,
+    )
+    .expect("unlimited quota should be valid");
+
+    assert_eq!(finite.limit, QuotaLimit::Finite(100));
+    assert_eq!(finite.limit.limit_value(), Some(100));
+    assert!(!finite.limit.is_unlimited());
+    assert_eq!(unlimited.limit, QuotaLimit::Unlimited);
+    assert_eq!(unlimited.limit.limit_value(), None);
+    assert!(unlimited.limit.is_unlimited());
+    assert!(
+        PlanQuota::from_parts(
+            "quota-invalid".to_owned(),
+            QuotaDimension::SummaryRuns,
+            QuotaPeriod::Monthly,
+            false,
+            None,
+            QuotaEnforcementMode::ObserveOnly,
+        )
+        .is_err()
+    );
+    assert!(
+        PlanQuota::from_parts(
+            "quota-invalid".to_owned(),
+            QuotaDimension::SummaryRuns,
+            QuotaPeriod::Monthly,
+            true,
+            Some(10),
+            QuotaEnforcementMode::ObserveOnly,
+        )
+        .is_err()
+    );
 }
 
 #[test]
