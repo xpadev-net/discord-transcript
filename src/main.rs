@@ -176,6 +176,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.chunk_storage_dir.clone(),
         auth,
         reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
