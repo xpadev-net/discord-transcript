@@ -483,6 +483,11 @@ where
     }
 }
 
+/// Compute the audio duration in whole seconds from a WAV file header.
+/// Only the canonical 44-byte PCM layout is supported (RIFF/WAVE, `fmt `
+/// chunk size == 16, `data` chunk starting at byte 36). Files with extended
+/// format chunks or interleaved metadata chunks return `Err` so the caller
+/// can warn and skip the observe-only ASR usage event without failing.
 pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, String> {
     let mut file =
         File::open(audio_path).map_err(|err| format!("failed to open ASR audio file: {err}"))?;
@@ -571,6 +576,9 @@ fn record_summary_run_usage_observe_only<S: MeetingStore>(
             observed_at: Utc::now(),
         },
     );
+    // Unlike the scaffold path, the batch worker observes synchronously.
+    // The aggregate includes the summary_runs event just written above,
+    // giving the desired post-completion usage snapshot.
     observe_worker_completion_entitlement(store, &meeting.guild_id);
 }
 
