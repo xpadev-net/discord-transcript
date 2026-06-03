@@ -1,15 +1,19 @@
+use crate::domain::domain_knowledge::DomainKnowledgeItem;
 use crate::domain::privacy::{MaskingStats, mask_pii};
+use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{
-    SummaryTemplateValidationError, SummaryTemplateVariables, render_summary_template,
+    SummaryTemplate, SummaryTemplateValidationError, SummaryTemplateVariables,
+    render_summary_template,
 };
 use crate::domain::transcript::{NormalizationConfig, normalize_segments, render_for_summary};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
 use crate::infrastructure::workspace::{
+    CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME, CONTEXT_SPEAKERS_FILENAME,
     MASKED_TRANSCRIPT_FILENAME, MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
 };
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -26,6 +30,15 @@ pub struct SummaryRequest {
     pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
     pub workspace: MeetingWorkspacePaths,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SummaryContextInput {
+    pub speakers: Vec<SpeakerProfile>,
+    pub domain_knowledge: Vec<DomainKnowledgeItem>,
+    pub summary_template: Option<SummaryTemplate>,
+    pub effective_summary_template_id: Option<String>,
+    pub effective_domain_knowledge_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +116,50 @@ pub struct TranscriptManifest {
     pub masked_transcript_path: String,
     pub generated_at: String,
     pub masking_stats: MaskingStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SummaryContextManifest {
+    pub meeting_id: String,
+    pub guild_id: String,
+    pub voice_channel_id: String,
+    pub generated_at: String,
+    pub manifest_path: String,
+    pub speaker_roster_path: String,
+    pub speaker_count: usize,
+    pub domain_knowledge_path: String,
+    pub domain_knowledge_count: usize,
+    pub domain_knowledge_items: Vec<DomainKnowledgeContextMetadata>,
+    pub effective_domain_knowledge_version_id: Option<String>,
+    pub summary_template_path: Option<String>,
+    pub summary_template: Option<SummaryTemplateContextMetadata>,
+    pub effective_summary_template_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DomainKnowledgeContextMetadata {
+    pub id: String,
+    pub content_type: String,
+    pub version: u32,
+    pub active: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SummaryTemplateContextMetadata {
+    pub id: String,
+    pub version: u32,
+    pub active: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SpeakerRosterEntry {
+    speaker_id: String,
+    display_label: String,
+    username: Option<String>,
+    nickname: Option<String>,
+    display_name: Option<String>,
 }
 
 pub fn run_transcription<W: WhisperClient>(
@@ -326,6 +383,198 @@ pub fn write_transcript_files(
     Ok(manifest)
 }
 
+pub fn materialize_summary_context(
+    request: &SummaryRequest,
+    context: &SummaryContextInput,
+) -> Result<SummaryContextManifest, SummaryError> {
+    request.workspace.ensure_base_dirs().map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to prepare workspace {}: {err}",
+            request.workspace.root().display()
+        ))
+    })?;
+
+    let mut speakers = context.speakers.clone();
+    speakers.sort_by(|left, right| left.speaker_id.cmp(&right.speaker_id));
+    let speaker_entries = speakers
+        .iter()
+        .map(|speaker| SpeakerRosterEntry {
+            speaker_id: speaker.speaker_id.clone(),
+            display_label: speaker.display_label(),
+            username: speaker.username.clone(),
+            nickname: speaker.nickname.clone(),
+            display_name: speaker.display_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let speaker_path = request.workspace.context_speakers_path();
+    write_json_file(&speaker_path, &speaker_entries, "speaker roster")?;
+
+    let mut domain_knowledge = context
+        .domain_knowledge
+        .iter()
+        .filter(|item| item.active && item.archived_at.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    domain_knowledge.sort_by(|left, right| {
+        left.content_type
+            .as_str()
+            .cmp(right.content_type.as_str())
+            .then(left.title.cmp(&right.title))
+            .then(left.id.cmp(&right.id))
+    });
+    let domain_path = request.workspace.context_domain_knowledge_path();
+    fs::write(
+        &domain_path,
+        render_domain_knowledge_context(&domain_knowledge),
+    )
+    .map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to write domain knowledge context {}: {err}",
+            domain_path.display()
+        ))
+    })?;
+
+    let summary_template_path = if let Some(template) = context.summary_template.as_ref() {
+        if !template.active || template.archived_at.is_some() {
+            remove_stale_optional_context_file(&request.workspace.context_summary_template_path())?;
+            None
+        } else {
+            let path = request.workspace.context_summary_template_path();
+            fs::write(&path, &template.template).map_err(|err| {
+                SummaryError::SummaryEngine(format!(
+                    "failed to write summary template context {}: {err}",
+                    path.display()
+                ))
+            })?;
+            Some(relative_workspace_path(&request.workspace, &path)?)
+        }
+    } else {
+        remove_stale_optional_context_file(&request.workspace.context_summary_template_path())?;
+        None
+    };
+    let summary_template_metadata = context
+        .summary_template
+        .as_ref()
+        .filter(|template| template.active && template.archived_at.is_none())
+        .map(|template| SummaryTemplateContextMetadata {
+            id: template.id.clone(),
+            version: template.version,
+            active: template.active,
+            updated_at: template
+                .updated_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        });
+
+    let manifest_path = request.workspace.context_manifest_path();
+    let manifest = SummaryContextManifest {
+        meeting_id: request.meeting_id.clone(),
+        guild_id: request.guild_id.clone(),
+        voice_channel_id: request.voice_channel_id.clone(),
+        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        manifest_path: relative_workspace_path(&request.workspace, &manifest_path)?,
+        speaker_roster_path: relative_workspace_path(&request.workspace, &speaker_path)?,
+        speaker_count: speaker_entries.len(),
+        domain_knowledge_path: relative_workspace_path(&request.workspace, &domain_path)?,
+        domain_knowledge_count: domain_knowledge.len(),
+        domain_knowledge_items: domain_knowledge
+            .iter()
+            .map(|item| DomainKnowledgeContextMetadata {
+                id: item.id.clone(),
+                content_type: item.content_type.as_str().to_owned(),
+                version: item.version,
+                active: item.active,
+                updated_at: item.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            })
+            .collect(),
+        effective_domain_knowledge_version_id: context
+            .effective_domain_knowledge_version_id
+            .clone(),
+        summary_template_path,
+        summary_template: summary_template_metadata,
+        effective_summary_template_id: context.effective_summary_template_id.clone(),
+    };
+    write_json_file(&manifest_path, &manifest, "summary context manifest")?;
+
+    Ok(manifest)
+}
+
+pub fn materialize_or_load_summary_context(
+    request: &SummaryRequest,
+    context: &SummaryContextInput,
+) -> Result<SummaryContextManifest, SummaryError> {
+    let manifest_path = request.workspace.context_manifest_path();
+    if manifest_path.exists() {
+        let manifest_json = fs::read(&manifest_path).map_err(|err| {
+            SummaryError::SummaryEngine(format!(
+                "failed to read summary context manifest {}: {err}",
+                manifest_path.display()
+            ))
+        })?;
+        return serde_json::from_slice(&manifest_json).map_err(|err| {
+            SummaryError::SummaryEngine(format!(
+                "failed to parse summary context manifest {}: {err}",
+                manifest_path.display()
+            ))
+        });
+    }
+
+    materialize_summary_context(request, context)
+}
+
+fn remove_stale_optional_context_file(path: &Path) -> Result<(), SummaryError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SummaryError::SummaryEngine(format!(
+            "failed to remove stale optional context file {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<(), SummaryError> {
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|err| SummaryError::SummaryEngine(err.to_string()))?;
+    fs::write(path, json).map_err(|err| {
+        SummaryError::SummaryEngine(format!("failed to write {label} {}: {err}", path.display()))
+    })
+}
+
+fn relative_workspace_path(
+    workspace: &MeetingWorkspacePaths,
+    path: &Path,
+) -> Result<String, SummaryError> {
+    workspace
+        .relative_path(path)
+        .ok_or_else(|| {
+            SummaryError::SummaryEngine(format!(
+                "context path {:?} escaped workspace {:?}",
+                path,
+                workspace.root()
+            ))
+        })
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn render_domain_knowledge_context(items: &[DomainKnowledgeItem]) -> String {
+    if items.is_empty() {
+        return "# Domain Knowledge\n\nNo active domain knowledge was materialized.\n".to_owned();
+    }
+
+    let mut rendered = String::from("# Domain Knowledge\n");
+    for item in items {
+        rendered.push_str(&format!(
+            "\n## {}\n\n- id: {}\n- content_type: {}\n- version: {}\n\n{}\n",
+            item.title,
+            item.id,
+            item.content_type.as_str(),
+            item.version,
+            item.body
+        ));
+    }
+    rendered
+}
+
 pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
     whisper: &W,
     claude: &C,
@@ -336,7 +585,9 @@ pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
     // so we do not write the correction-prompt debug artifact here — doing so
     // would mislead a reader into thinking the GEC step had executed.
     let manifest = write_transcript_files(request, &transcription)?;
-    let prompt = build_summary_prompt(request, &manifest);
+    let context_manifest =
+        materialize_or_load_summary_context(request, &SummaryContextInput::default())?;
+    let prompt = build_summary_prompt_with_context(request, &manifest, Some(&context_manifest));
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let markdown = claude.summarize(&prompt, Some(request.workspace.root()))?;
     let message_chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
@@ -351,6 +602,14 @@ pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
 }
 
 pub fn build_summary_prompt(request: &SummaryRequest, manifest: &TranscriptManifest) -> String {
+    build_summary_prompt_with_context(request, manifest, None)
+}
+
+pub fn build_summary_prompt_with_context(
+    request: &SummaryRequest,
+    manifest: &TranscriptManifest,
+    context: Option<&SummaryContextManifest>,
+) -> String {
     let title = request
         .title
         .as_ref()
@@ -361,6 +620,17 @@ pub fn build_summary_prompt(request: &SummaryRequest, manifest: &TranscriptManif
         .language
         .as_deref()
         .unwrap_or("unknown or auto-detected");
+    let context_files = summary_context_file_list(context);
+    let summary_template_instruction = if let Some(context) = context
+        && let Some(path) = context.summary_template_path.as_deref()
+    {
+        format!(
+            "- If `{path}` is present, read it as the materialized active summary template and follow it as the primary summary structure/instruction set. Interpret any template variables using these values: transcript_path={transcript_path}, manifest_path={manifest_path}, language={language}, speaker_roster={}, domain_context_path={}.\n",
+            context.speaker_roster_path, context.domain_knowledge_path
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         "You are an assistant that summarizes meeting transcripts.\n\
@@ -368,9 +638,9 @@ The transcript is provided as a file in the current workspace (not inline in thi
 Files available:\n\
 - {transcript_path}: PII-masked transcript to read\n\
 - {manifest_path}: metadata about the meeting and transcript (including masking counts)\n\
-- context/: reserved for additional knowledge (may be empty)\n\
+{context_files}\
 \n\
-Keep speaker attributions by using the provided speaker names when describing Summary, Decisions, TODO, and Open Questions.\n\
+Keep speaker attributions by reading the materialized speaker roster when available and using the provided speaker names when describing Summary, Decisions, TODO, and Open Questions.\n\
 Output in markdown using the exact sections below:\n\
 ## Summary\n\
 ## Decisions\n\
@@ -385,6 +655,9 @@ Masking stats: mentions={}, emails={}, phones={}\n\
 \n\
 Instructions:\n\
 - Read the transcript file to produce the summary; do not expect transcript text inline.\n\
+- Read `context/{CONTEXT_MANIFEST_FILENAME}` first when it is listed above; it records reproducibility metadata and paths for materialized context without inlining sensitive context bodies.\n\
+- Read the materialized speaker roster and domain knowledge files when they are listed above; do not assume live database context beyond those files.\n\
+{summary_template_instruction}\
 - Output language: Write the **entire** markdown output in the **same language** as the Whisper setting above (this matches how the transcript was transcribed). That includes all section headings, paragraphs, and list items. Examples: if the setting is `ja`, use Japanese throughout; if `en`, English throughout; if `de`, German throughout.\n\
 - If the Whisper language is shown as `unknown or auto-detected`, infer the output language from the dominant language of the transcript text.\n\
 - Keep the summary concise and actionable without leaking placeholder tokens.\n",
@@ -397,6 +670,29 @@ Instructions:\n\
         manifest.masking_stats.email_replacements,
         manifest.masking_stats.phone_replacements
     )
+}
+
+fn summary_context_file_list(context: Option<&SummaryContextManifest>) -> String {
+    let Some(context) = context else {
+        return "- context/: reserved for additional knowledge (may be empty)\n".to_owned();
+    };
+
+    let mut lines = format!(
+        "- {}: materialized context metadata and file paths\n\
+- {}: materialized speaker roster ({} speakers)\n\
+- {}: materialized active domain knowledge ({} items)\n",
+        context.manifest_path,
+        context.speaker_roster_path,
+        context.speaker_count,
+        context.domain_knowledge_path,
+        context.domain_knowledge_count
+    );
+    if let Some(path) = &context.summary_template_path {
+        lines.push_str(&format!(
+            "- {path}: materialized active summary template instructions\n"
+        ));
+    }
+    lines
 }
 
 pub fn build_summary_prompt_with_template(
@@ -423,8 +719,8 @@ fn summary_template_values(
             .as_deref()
             .unwrap_or("unknown or auto-detected")
             .to_owned(),
-        speaker_roster: "not materialized".to_owned(),
-        domain_context_path: "context/".to_owned(),
+        speaker_roster: format!("context/{CONTEXT_SPEAKERS_FILENAME}"),
+        domain_context_path: format!("context/{CONTEXT_DOMAIN_KNOWLEDGE_FILENAME}"),
     }
 }
 

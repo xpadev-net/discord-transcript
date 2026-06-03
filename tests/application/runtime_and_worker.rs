@@ -2,7 +2,9 @@ use discord_transcript::application::bot::{
     BotCommandService, StartCommandInput, StopCommandInput,
 };
 use discord_transcript::application::command::PermissionSet;
-use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
+use discord_transcript::application::summary::{
+    SpeakerAudioInput, StubClaudeSummaryClient, SummaryContextInput,
+};
 use discord_transcript::application::worker::{ProcessMeetingInput, process_meeting_summary};
 use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
@@ -563,6 +565,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
             }],
             language: None,
             workspace: workspace.clone(),
+            summary_context: SummaryContextInput::default(),
         },
     );
 
@@ -622,6 +625,7 @@ fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
             }],
             language: None,
             workspace: workspace.clone(),
+            summary_context: SummaryContextInput::default(),
         },
     )
     .expect("retry should reach whisper when meeting is still transcribing");
@@ -679,6 +683,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
             }],
             language: None,
             workspace: workspace.clone(),
+            summary_context: SummaryContextInput::default(),
         },
     )
     .expect("worker should succeed");

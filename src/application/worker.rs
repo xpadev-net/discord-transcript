@@ -1,11 +1,14 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
-    ClaudeSummaryClient, SpeakerAudioInput, SummaryError, SummaryRequest, TranscriptionOutput,
-    build_correction_prompt, build_summary_prompt, correct_transcript_with_prompt,
+    ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
+    TranscriptionOutput, build_correction_prompt, build_summary_prompt_with_context,
+    correct_transcript_with_prompt, materialize_or_load_summary_context,
     persist_correction_prompt_debug_artifact, persist_pre_correction_transcript_debug_artifact,
     persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
+use crate::domain::speaker::SpeakerProfile;
+use crate::domain::summary_template::SummaryTemplate;
 use crate::domain::usage::{
     EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
     UsageSnapshot,
@@ -13,7 +16,10 @@ use crate::domain::usage::{
 use crate::domain::{JobStatus, JobType, MeetingStatus};
 use crate::infrastructure::asr::WhisperClient;
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
-use crate::infrastructure::storage::{MeetingStore, StoreError, UsageEventStore};
+use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
+use crate::infrastructure::storage::{
+    EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoreError, UsageEventStore,
+};
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::Utc;
@@ -34,6 +40,7 @@ pub struct ProcessMeetingInput {
     pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
     pub workspace: MeetingWorkspacePaths,
+    pub summary_context: SummaryContextInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +90,112 @@ impl From<SummaryError> for WorkerError {
     fn from(value: SummaryError) -> Self {
         Self::Summary(value.to_string())
     }
+}
+
+pub trait SummaryContextStore {
+    fn load_summary_context(
+        &mut self,
+        meeting_id: &str,
+        guild_id: &str,
+        effective_settings: Option<&EffectiveMeetingSettings>,
+    ) -> Result<SummaryContextInput, StoreError>;
+}
+
+impl SummaryContextStore for InMemoryMeetingStore {
+    fn load_summary_context(
+        &mut self,
+        _meeting_id: &str,
+        _guild_id: &str,
+        effective_settings: Option<&EffectiveMeetingSettings>,
+    ) -> Result<SummaryContextInput, StoreError> {
+        Ok(SummaryContextInput {
+            effective_summary_template_id: effective_settings
+                .and_then(|settings| settings.summary_template_id.clone()),
+            effective_domain_knowledge_version_id: effective_settings
+                .and_then(|settings| settings.domain_knowledge_version_id.clone()),
+            ..SummaryContextInput::default()
+        })
+    }
+}
+
+impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
+    fn load_summary_context(
+        &mut self,
+        meeting_id: &str,
+        guild_id: &str,
+        effective_settings: Option<&EffectiveMeetingSettings>,
+    ) -> Result<SummaryContextInput, StoreError> {
+        let speakers = load_meeting_speakers(self, meeting_id)?;
+        let domain_knowledge = self
+            .list_domain_knowledge(guild_id, false, None)?
+            .into_iter()
+            .filter(|item| item.active && item.archived_at.is_none())
+            .collect::<Vec<_>>();
+        let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
+
+        Ok(SummaryContextInput {
+            speakers,
+            domain_knowledge,
+            summary_template,
+            effective_summary_template_id: effective_settings
+                .and_then(|settings| settings.summary_template_id.clone()),
+            effective_domain_knowledge_version_id: effective_settings
+                .and_then(|settings| settings.domain_knowledge_version_id.clone()),
+        })
+    }
+}
+
+fn load_meeting_speakers<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
+    meeting_id: &str,
+) -> Result<Vec<SpeakerProfile>, StoreError> {
+    let rows = store
+        .executor
+        .query_rows(
+            "SELECT speaker_id, username, nickname, display_name \
+             FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id",
+            &[meeting_id.to_owned()],
+        )
+        .map_err(StoreError::Backend)?;
+    let mut speakers = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() < 4 {
+            return Err(StoreError::Backend(format!(
+                "invalid meeting speaker row length: {}",
+                row.len()
+            )));
+        }
+        let Some(speaker_id) = row.first().and_then(|value| value.clone()) else {
+            continue;
+        };
+        speakers.push(SpeakerProfile {
+            speaker_id,
+            username: row.get(1).and_then(|value| value.clone()),
+            nickname: row.get(2).and_then(|value| value.clone()),
+            display_name: row.get(3).and_then(|value| value.clone()),
+        });
+    }
+    Ok(speakers)
+}
+
+fn load_effective_summary_template<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
+    guild_id: &str,
+    effective_settings: Option<&EffectiveMeetingSettings>,
+) -> Result<Option<SummaryTemplate>, StoreError> {
+    if let Some(template_id) = effective_settings
+        .and_then(|settings| settings.summary_template_id.as_deref())
+        .filter(|template_id| !template_id.trim().is_empty())
+    {
+        return store
+            .get_summary_template(guild_id, template_id)
+            .map(|template| {
+                template.filter(|template| template.active && template.archived_at.is_none())
+            });
+    }
+    store.get_active_summary_template(guild_id).map(|template| {
+        template.filter(|template| template.active && template.archived_at.is_none())
+    })
 }
 
 fn advance_to_transcribing<S: MeetingStore>(
@@ -243,7 +356,18 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    let prompt = build_summary_prompt(&request, &manifest);
+    let context_manifest = match materialize_or_load_summary_context(
+        &request,
+        &input.summary_context,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            error!(meeting_id = %input.meeting_id, error = %err, "summary context materialization failed");
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
+            return Err(WorkerError::from(err));
+        }
+    };
+    let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let markdown = match claude.summarize(&prompt, Some(request.workspace.root())) {
         Ok(value) => value,
@@ -327,7 +451,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
     options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
-    S: MeetingStore,
+    S: MeetingStore + SummaryContextStore,
     Q: JobQueue,
     W: WhisperClient,
     C: ClaudeSummaryClient,
@@ -434,6 +558,13 @@ where
                 .and_then(|settings| settings.whisper_language.clone())
                 .or_else(|| options.language.clone()),
             workspace,
+            summary_context: store
+                .load_summary_context(
+                    &job.meeting_id,
+                    &meeting.guild_id,
+                    effective_settings.as_ref(),
+                )
+                .map_err(WorkerError::from)?,
         };
         process_meeting_summary(store, whisper, claude, &input).map(Some)
     })();

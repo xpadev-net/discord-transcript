@@ -1558,6 +1558,53 @@ async fn wait_for_bot_token_revision_change(revision: &mut watch::Receiver<u64>)
     }
 }
 
+fn load_runtime_summary_context(
+    store: &mut SqlMeetingStore<PgSqlExecutor>,
+    meeting_id: &str,
+    guild_id: &str,
+    effective_settings: &EffectiveMeetingSettings,
+) -> Result<
+    crate::application::summary::SummaryContextInput,
+    crate::application::summary::SummaryError,
+> {
+    let domain_knowledge = store
+        .list_domain_knowledge(guild_id, false, None)
+        .map_err(|err| {
+            crate::application::summary::SummaryError::SummaryEngine(format!(
+                "failed to load domain knowledge for meeting {meeting_id}: {err}"
+            ))
+        })?
+        .into_iter()
+        .filter(|item| item.active && item.archived_at.is_none())
+        .collect::<Vec<_>>();
+
+    let summary_template = if let Some(template_id) = effective_settings
+        .summary_template_id
+        .as_deref()
+        .filter(|template_id| !template_id.trim().is_empty())
+    {
+        store.get_summary_template(guild_id, template_id)
+    } else {
+        store.get_active_summary_template(guild_id)
+    }
+    .map_err(|err| {
+        crate::application::summary::SummaryError::SummaryEngine(format!(
+            "failed to load summary template for meeting {meeting_id}: {err}"
+        ))
+    })?
+    .filter(|template| template.active && template.archived_at.is_none());
+
+    Ok(crate::application::summary::SummaryContextInput {
+        speakers: Vec::new(),
+        domain_knowledge,
+        summary_template,
+        effective_summary_template_id: effective_settings.summary_template_id.clone(),
+        effective_domain_knowledge_version_id: effective_settings
+            .domain_knowledge_version_id
+            .clone(),
+    })
+}
+
 #[derive(Clone)]
 struct ScaffoldHandler {
     guild_id: GuildId,
@@ -4116,14 +4163,25 @@ impl ScaffoldHandler {
         // Resolve speaker labels for summarization and snapshot to DB (best-effort)
         let mut summary_transcript = transcription.transcript_for_summary.clone();
         let mut summary_masking_stats = transcription.masking_stats;
+        let mut summary_context_speakers = HashMap::new();
         if !transcription.segments.is_empty() {
-            let speaker_profiles = self
+            summary_context_speakers = self
                 .resolve_and_upsert_speakers(http, &claimed_job.meeting_id, &transcription.segments)
                 .await;
-            if !speaker_profiles.is_empty() {
+            for segment in &transcription.segments {
+                summary_context_speakers
+                    .entry(segment.speaker_id.clone())
+                    .or_insert_with(|| SpeakerProfile {
+                        speaker_id: segment.speaker_id.clone(),
+                        username: None,
+                        nickname: None,
+                        display_name: None,
+                    });
+            }
+            if !summary_context_speakers.is_empty() {
                 let rendered = crate::domain::transcript::render_for_summary(
                     &transcription.segments,
-                    Some(&speaker_profiles),
+                    Some(&summary_context_speakers),
                 );
                 let masked = crate::domain::privacy::mask_pii(&rendered);
                 summary_transcript = masked.text;
@@ -4222,7 +4280,29 @@ impl ScaffoldHandler {
                 &request,
                 &transcription_for_summary,
             )?;
-            let prompt = crate::application::summary::build_summary_prompt(&request, &manifest);
+            let mut summary_context = {
+                let mut service = self.service.blocking_lock();
+                load_runtime_summary_context(
+                    &mut service.store,
+                    &claimed_job.meeting_id,
+                    &meeting.guild_id,
+                    &effective_settings,
+                )?
+            };
+            summary_context.speakers = summary_context_speakers
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let context_manifest =
+                crate::application::summary::materialize_or_load_summary_context(
+                    &request,
+                    &summary_context,
+                )?;
+            let prompt = crate::application::summary::build_summary_prompt_with_context(
+                &request,
+                &manifest,
+                Some(&context_manifest),
+            );
             crate::application::summary::persist_summary_prompt_debug_artifact(
                 &request.workspace,
                 &prompt,
