@@ -1,7 +1,11 @@
+pub mod ai_memory;
 pub mod audit;
 pub mod authz;
+pub mod confidence;
 pub mod domain_knowledge;
+pub mod feedback;
 pub mod model;
+pub mod person_alias;
 pub mod plans;
 pub mod privacy;
 pub mod recovery;
