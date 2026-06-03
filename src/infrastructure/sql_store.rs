@@ -5,6 +5,10 @@ use crate::domain::domain_knowledge::{
     DomainKnowledgeContentType, DomainKnowledgeItem, NewDomainKnowledgeItem,
     UpdateDomainKnowledgeItem,
 };
+use crate::domain::plans::{
+    PlanFallback, PlanKind, PlanQuota, QuotaDimension, QuotaEnforcementMode, QuotaPeriod,
+    ResolvedPlan,
+};
 use crate::domain::summary_template::{NewSummaryTemplate, SummaryTemplate, UpdateSummaryTemplate};
 use crate::domain::usage::{NewUsageEvent, UsageAggregate, UsageEvent, UsageMetric};
 use crate::domain::{JobStatus, JobType};
@@ -21,9 +25,10 @@ use crate::infrastructure::sql::{
     INSERT_USAGE_EVENT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
     LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
     MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
-    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
-    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
-    UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, migration_transaction_sql,
+    RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
+    SELECT_SCHEMA_MIGRATION_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, migration_transaction_sql,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -183,6 +188,26 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             ));
         };
         parse_default_tenant_backfill_row(&row)
+    }
+
+    pub fn resolve_plan_for_guild(
+        &mut self,
+        guild_id: &str,
+        fallback: PlanFallback,
+        at: DateTime<Utc>,
+    ) -> Result<Option<ResolvedPlan>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                RESOLVE_PLAN_FOR_GUILD_SQL,
+                &[
+                    guild_id.to_owned(),
+                    at.to_rfc3339(),
+                    fallback.as_str().to_owned(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        parse_resolved_plan_rows(rows)
     }
 
     pub fn get_guild_settings_for_meeting_snapshot(
@@ -732,6 +757,141 @@ fn parse_resolved_tenant_installation_row(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPlanHeader {
+    assignment_id: Option<String>,
+    tenant_id: Option<String>,
+    guild_id: String,
+    plan_id: String,
+    plan_code: String,
+    plan_name: String,
+    plan_kind: PlanKind,
+    resolution_source: String,
+    assignment_source: Option<String>,
+    period_anchor: Option<DateTime<Utc>>,
+    valid_from: Option<DateTime<Utc>>,
+    valid_until: Option<DateTime<Utc>>,
+}
+
+impl ResolvedPlanHeader {
+    fn into_resolved_plan(self) -> ResolvedPlan {
+        ResolvedPlan {
+            assignment_id: self.assignment_id,
+            tenant_id: self.tenant_id,
+            guild_id: self.guild_id,
+            plan_id: self.plan_id,
+            plan_code: self.plan_code,
+            plan_name: self.plan_name,
+            plan_kind: self.plan_kind,
+            resolution_source: self.resolution_source,
+            assignment_source: self.assignment_source,
+            period_anchor: self.period_anchor,
+            valid_from: self.valid_from,
+            valid_until: self.valid_until,
+            quotas: Vec::new(),
+        }
+    }
+}
+
+fn parse_resolved_plan_rows(rows: Vec<SqlRow>) -> Result<Option<ResolvedPlan>, StoreError> {
+    let mut rows = rows.iter();
+    let Some(first) = rows.next() else {
+        return Ok(None);
+    };
+    let first_header = parse_resolved_plan_header(first)?;
+    let mut resolved = first_header.clone().into_resolved_plan();
+    if let Some(quota) = parse_resolved_plan_quota_row(first)? {
+        resolved.quotas.push(quota);
+    }
+    for row in rows {
+        let row_header = parse_resolved_plan_header(row)?;
+        if row_header != first_header {
+            return Err(StoreError::Backend(
+                "plan resolver returned rows for multiple plans or assignments".to_owned(),
+            ));
+        }
+        if let Some(quota) = parse_resolved_plan_quota_row(row)? {
+            resolved.quotas.push(quota);
+        }
+    }
+    Ok(Some(resolved))
+}
+
+fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlanHeader, StoreError> {
+    if row.len() < 18 {
+        return Err(StoreError::Backend(format!(
+            "invalid plan resolver row length: {}",
+            row.len()
+        )));
+    }
+    let plan_kind_raw = require_store_column(row, 6, "plan_kind")?;
+    let plan_kind = PlanKind::parse_str(&plan_kind_raw).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "unknown plan kind in resolver row: {plan_kind_raw}"
+        ))
+    })?;
+    Ok(ResolvedPlanHeader {
+        assignment_id: row.first().and_then(|v| v.clone()),
+        tenant_id: row.get(1).and_then(|v| v.clone()),
+        guild_id: require_store_column(row, 2, "guild_id")?,
+        plan_id: require_store_column(row, 3, "plan_id")?,
+        plan_code: require_store_column(row, 4, "plan_code")?,
+        plan_name: require_store_column(row, 5, "plan_name")?,
+        plan_kind,
+        resolution_source: require_store_column(row, 7, "resolution_source")?,
+        assignment_source: row.get(8).and_then(|v| v.clone()),
+        period_anchor: parse_optional_plan_timestamp(
+            row.get(9).and_then(|v| v.clone()),
+            "period_anchor",
+        )?,
+        valid_from: parse_optional_plan_timestamp(
+            row.get(10).and_then(|v| v.clone()),
+            "valid_from",
+        )?,
+        valid_until: parse_optional_plan_timestamp(
+            row.get(11).and_then(|v| v.clone()),
+            "valid_until",
+        )?,
+    })
+}
+
+fn parse_resolved_plan_quota_row(row: &SqlRow) -> Result<Option<PlanQuota>, StoreError> {
+    let Some(quota_id) = row.get(12).and_then(|v| v.clone()) else {
+        return Ok(None);
+    };
+    let dimension_raw = require_store_column(row, 13, "quota_dimension")?;
+    let dimension = QuotaDimension::parse_str(&dimension_raw).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "unknown quota dimension in resolver row: {dimension_raw}"
+        ))
+    })?;
+    let period_raw = require_store_column(row, 14, "quota_period")?;
+    let period = QuotaPeriod::parse_str(&period_raw).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "unknown quota period in resolver row: {period_raw}"
+        ))
+    })?;
+    let limit_value = optional_i64_column(row, 15, "quota_limit_value")?;
+    let unlimited = required_bool_column(row, 16, "quota_unlimited")?;
+    let enforcement_mode_raw = require_store_column(row, 17, "quota_enforcement_mode")?;
+    let enforcement_mode =
+        QuotaEnforcementMode::parse_str(&enforcement_mode_raw).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "unknown quota enforcement mode in resolver row: {enforcement_mode_raw}"
+            ))
+        })?;
+    PlanQuota::from_parts(
+        quota_id,
+        dimension,
+        period,
+        unlimited,
+        limit_value,
+        enforcement_mode,
+    )
+    .map(Some)
+    .map_err(StoreError::Backend)
+}
+
 fn parse_default_tenant_backfill_row(row: &SqlRow) -> Result<DefaultTenantBackfill, StoreError> {
     if row.len() < 2 {
         return Err(StoreError::Backend(format!(
@@ -770,6 +930,15 @@ fn optional_u32_column(row: &SqlRow, idx: usize, field: &str) -> Result<Option<u
         return Ok(None);
     };
     raw.parse::<u32>()
+        .map(Some)
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn optional_i64_column(row: &SqlRow, idx: usize, field: &str) -> Result<Option<i64>, StoreError> {
+    let Some(raw) = row.get(idx).and_then(|v| v.clone()) else {
+        return Ok(None);
+    };
+    raw.parse::<i64>()
         .map(Some)
         .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
 }
@@ -1137,6 +1306,18 @@ fn parse_optional_tenant_period_anchor(
     DateTime::parse_from_rfc3339(&raw)
         .map(|ts| Some(ts.with_timezone(&Utc)))
         .map_err(|err| StoreError::Backend(format!("invalid tenant period_anchor '{raw}': {err}")))
+}
+
+fn parse_optional_plan_timestamp(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|ts| Some(ts.with_timezone(&Utc)))
+        .map_err(|err| StoreError::Backend(format!("invalid plan {field} '{raw}': {err}")))
 }
 
 impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
