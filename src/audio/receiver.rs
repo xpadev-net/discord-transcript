@@ -43,6 +43,8 @@ pub struct UserAudioBuffer {
     last_frame_instant: Option<Instant>,
     buffered_bytes: usize,
     frame_instants: Vec<Instant>,
+    min_start_ms: Option<u64>,
+    max_end_ms: Option<u64>,
 }
 
 impl UserAudioBuffer {
@@ -55,14 +57,25 @@ impl UserAudioBuffer {
             last_frame_instant: None,
             buffered_bytes: 0,
             frame_instants: Vec::new(),
+            min_start_ms: None,
+            max_end_ms: None,
         }
     }
 
     pub fn push_frame(&mut self, frame: BufferedFrame) {
         let now = Instant::now();
+        let frame_end_ms = frame_end_ms(&frame).unwrap_or(u64::MAX);
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_add(frame.pcm_16le_bytes.len());
+        self.min_start_ms = Some(
+            self.min_start_ms
+                .map_or(frame.timestamp_ms, |start| start.min(frame.timestamp_ms)),
+        );
+        self.max_end_ms = Some(
+            self.max_end_ms
+                .map_or(frame_end_ms, |end| end.max(frame_end_ms)),
+        );
         if self.first_frame_ms.is_none() {
             self.first_frame_ms = Some(frame.timestamp_ms);
             self.first_frame_instant = Some(now);
@@ -93,6 +106,8 @@ impl UserAudioBuffer {
         self.last_frame_instant = None;
         self.buffered_bytes = 0;
         self.frame_instants.clear();
+        self.min_start_ms = None;
+        self.max_end_ms = None;
         (start_ms, std::mem::take(&mut self.frames))
     }
 
@@ -113,38 +128,38 @@ impl UserAudioBuffer {
         let (frames, instants): (Vec<_>, Vec<_>) = timed_frames.into_iter().unzip();
         self.frames = frames;
         self.frame_instants = instants;
-        self.refresh_timing_metadata();
+        self.refresh_metadata();
     }
 
-    fn can_accept_frame(&self, frame: &BufferedFrame) -> bool {
+    fn can_accept_frame(&self, frame: &BufferedFrame, frame_end_ms: u64) -> bool {
         self.frames.len() < MAX_RECEIVER_BUFFERED_FRAMES_PER_USER
             && self
                 .buffered_bytes
                 .checked_add(frame.pcm_16le_bytes.len())
                 .is_some_and(|bytes| bytes <= MAX_RECEIVER_BUFFERED_BYTES_PER_USER)
-            && self
-                .buffered_span_after(frame)
-                .is_some_and(|span_ms| span_ms <= MAX_RECEIVER_BUFFERED_SPAN_MS)
+            && self.buffered_span_after(frame, frame_end_ms) <= MAX_RECEIVER_BUFFERED_SPAN_MS
     }
 
-    fn buffered_span_after(&self, frame: &BufferedFrame) -> Option<u64> {
-        let mut start_ms = frame.timestamp_ms;
-        let mut end_ms = frame.timestamp_ms.checked_add(pcm_duration_ms(
-            &frame.pcm_16le_bytes,
-            RECEIVER_SPAN_SAMPLE_RATE,
-        ))?;
-        for existing in &self.frames {
-            start_ms = start_ms.min(existing.timestamp_ms);
-            let existing_end = frame_end_ms(existing)?;
-            end_ms = end_ms.max(existing_end);
-        }
-        end_ms.checked_sub(start_ms)
+    fn buffered_span_after(&self, frame: &BufferedFrame, frame_end_ms: u64) -> u64 {
+        let start_ms = self
+            .min_start_ms
+            .map_or(frame.timestamp_ms, |start| start.min(frame.timestamp_ms));
+        let end_ms = self
+            .max_end_ms
+            .map_or(frame_end_ms, |end| end.max(frame_end_ms));
+        end_ms.saturating_sub(start_ms)
     }
 
-    fn refresh_timing_metadata(&mut self) {
+    fn refresh_metadata(&mut self) {
         self.first_frame_ms = self.frames.first().map(|frame| frame.timestamp_ms);
         self.first_frame_instant = self.frame_instants.iter().min().copied();
         self.last_frame_instant = self.frame_instants.iter().max().copied();
+        self.min_start_ms = self.frames.iter().map(|frame| frame.timestamp_ms).min();
+        self.max_end_ms = self
+            .frames
+            .iter()
+            .map(|frame| frame_end_ms(frame).unwrap_or(u64::MAX))
+            .max();
     }
 
     fn drop_oldest_over_limits(&mut self) -> usize {
@@ -181,7 +196,7 @@ impl UserAudioBuffer {
             self.frames.drain(0..drop_count);
             self.frame_instants.drain(0..drop_count);
             self.buffered_bytes = retained_bytes;
-            self.refresh_timing_metadata();
+            self.refresh_metadata();
         }
 
         dropped_bytes
@@ -220,6 +235,16 @@ impl ReceiverState {
             return;
         }
 
+        let Some(frame_end_ms) = frame_end_ms(&frame) else {
+            tracing::warn!(
+                user_id,
+                timestamp_ms = frame.timestamp_ms,
+                frame_bytes,
+                "dropping audio frame because receiver frame timestamp overflows"
+            );
+            return;
+        };
+
         if !self.per_user.contains_key(user_id) && self.per_user.len() >= MAX_RECEIVER_USERS {
             tracing::warn!(
                 user_id,
@@ -245,20 +270,30 @@ impl ReceiverState {
             return;
         }
 
-        let user = self.ensure_user(user_id);
-        if !user.can_accept_frame(&frame) {
+        if let Some(user) = self.per_user.get(user_id) {
+            if !user.can_accept_frame(&frame, frame_end_ms) {
+                tracing::warn!(
+                    user_id,
+                    frame_bytes,
+                    buffered_bytes = user.buffered_bytes,
+                    buffered_frames = user.frames.len(),
+                    max_bytes = MAX_RECEIVER_BUFFERED_BYTES_PER_USER,
+                    max_frames = MAX_RECEIVER_BUFFERED_FRAMES_PER_USER,
+                    "dropping audio frame because receiver user buffer limit is reached"
+                );
+                return;
+            }
+        } else if frame_end_ms.saturating_sub(frame.timestamp_ms) > MAX_RECEIVER_BUFFERED_SPAN_MS {
             tracing::warn!(
                 user_id,
                 frame_bytes,
-                buffered_bytes = user.buffered_bytes,
-                buffered_frames = user.frames.len(),
-                max_bytes = MAX_RECEIVER_BUFFERED_BYTES_PER_USER,
-                max_frames = MAX_RECEIVER_BUFFERED_FRAMES_PER_USER,
-                "dropping audio frame because receiver user buffer limit is reached"
+                max_span_ms = MAX_RECEIVER_BUFFERED_SPAN_MS,
+                "dropping audio frame because receiver user buffer span limit is reached"
             );
             return;
         }
 
+        let user = self.ensure_user(user_id);
         user.push_frame(frame);
         self.buffered_bytes = self.buffered_bytes.saturating_add(frame_bytes);
     }

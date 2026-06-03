@@ -150,6 +150,32 @@ fn receiver_state_drops_oversized_frames() {
 }
 
 #[test]
+fn receiver_state_drops_timestamp_overflow_without_reserving_user_slots() {
+    let mut state = ReceiverState::default();
+    for user_index in 0..=MAX_RECEIVER_USERS {
+        state.track_frame(
+            &format!("overflow-{user_index}"),
+            BufferedFrame {
+                timestamp_ms: u64::MAX,
+                pcm_16le_bytes: vec![0; 96_000],
+            },
+        );
+    }
+
+    state.track_frame(
+        "legitimate-user",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![1, 0],
+        },
+    );
+
+    let chunks = state.flush_all_chunks();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_id, "legitimate-user");
+}
+
+#[test]
 fn receiver_state_drops_frames_after_user_limit() {
     let mut state = ReceiverState::default();
     for user_index in 0..=MAX_RECEIVER_USERS {
