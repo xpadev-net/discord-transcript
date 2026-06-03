@@ -99,6 +99,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0020_plans_and_quotas",
         sql: include_str!("../../migrations/0020_plans_and_quotas.sql"),
     },
+    Migration {
+        version: "0021_ai_memory_feedback",
+        sql: include_str!("../../migrations/0021_ai_memory_feedback.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -153,6 +157,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0019_usage_events.sql"),
     "\n",
     include_str!("../../migrations/0020_plans_and_quotas.sql"),
+    "\n",
+    include_str!("../../migrations/0021_ai_memory_feedback.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
