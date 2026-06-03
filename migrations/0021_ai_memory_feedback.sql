@@ -295,6 +295,8 @@ CREATE TABLE IF NOT EXISTS person_aliases (
     confidence NUMERIC(4,3),
     active BOOLEAN NOT NULL DEFAULT TRUE,
     review_status TEXT NOT NULL DEFAULT 'unreviewed',
+    created_actor_user_id TEXT NOT NULL,
+    updated_actor_user_id TEXT NOT NULL,
     reviewed_at TIMESTAMPTZ,
     reviewed_actor_user_id TEXT,
     archived_at TIMESTAMPTZ,
@@ -316,6 +318,8 @@ CREATE TABLE IF NOT EXISTS person_aliases (
     CONSTRAINT person_aliases_guild_id_nonempty_check CHECK (length(btrim(guild_id)) > 0),
     CONSTRAINT person_aliases_canonical_name_nonempty_check CHECK (length(btrim(canonical_name)) > 0),
     CONSTRAINT person_aliases_alias_nonempty_check CHECK (length(btrim(alias)) > 0),
+    CONSTRAINT person_aliases_created_actor_nonempty_check CHECK (length(btrim(created_actor_user_id)) > 0),
+    CONSTRAINT person_aliases_updated_actor_nonempty_check CHECK (length(btrim(updated_actor_user_id)) > 0),
     CONSTRAINT person_aliases_source_type_check CHECK (
         source_type IN (
             'user_feedback',
@@ -373,7 +377,8 @@ BEGIN
     UPDATE transcript_feedback
     SET meeting_id = NULL,
         transcript_segment_id = NULL
-    WHERE meeting_id = OLD.id;
+    WHERE meeting_id = OLD.id
+      AND guild_id = OLD.guild_id;
 
     UPDATE ai_memory_notes
     SET source_meeting_id = NULL

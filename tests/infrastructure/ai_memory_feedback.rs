@@ -108,6 +108,8 @@ fn schema_constrains_source_confidence_active_archive_and_review_fields() {
     assert!(schema.contains("'promotion_candidate'"));
     assert!(schema.contains("ai_memory_notes_confidence_check"));
     assert!(schema.contains("person_aliases_confidence_check"));
+    assert!(schema.contains("person_aliases_created_actor_nonempty_check"));
+    assert!(schema.contains("person_aliases_updated_actor_nonempty_check"));
     assert!(schema.contains("confidence >= 0.000 AND confidence <= 1.000"));
     assert!(schema.contains("ai_memory_notes_archive_active_check"));
     assert!(schema.contains("person_aliases_archive_active_check"));
@@ -183,6 +185,7 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("DROP TRIGGER IF EXISTS trg_clear_ai_feedback_meeting_refs ON meetings"));
     assert!(schema.contains("CREATE TRIGGER trg_clear_ai_feedback_meeting_refs"));
     assert!(schema.contains("SET meeting_id = NULL,\n        transcript_segment_id = NULL"));
+    assert!(schema.contains("WHERE meeting_id = OLD.id\n      AND guild_id = OLD.guild_id"));
     assert!(schema.contains("UPDATE ai_memory_notes\n    SET source_meeting_id = NULL"));
     assert!(schema.contains("UPDATE person_aliases\n    SET source_meeting_id = NULL"));
     assert!(schema.contains("REFERENCES transcript_feedback(id) ON DELETE SET NULL"));
@@ -394,6 +397,8 @@ fn domain_models_cover_schema_identity_source_confidence_and_lifecycle_fields() 
         confidence: Some(ConfidencePermille::new(875).unwrap()),
         active: false,
         review_status: PersonAliasReviewStatus::Accepted,
+        created_actor_user_id: "actor-1".to_owned(),
+        updated_actor_user_id: "actor-2".to_owned(),
         reviewed_at: Some(reviewed_at),
         reviewed_actor_user_id: Some("reviewer-1".to_owned()),
         archived_at: Some(archived_at),
@@ -404,5 +409,7 @@ fn domain_models_cover_schema_identity_source_confidence_and_lifecycle_fields() 
     assert_eq!(alias.discord_user_id.as_deref(), Some("123"));
     assert_eq!(alias.source_type, PersonAliasSourceType::UserFeedback);
     assert_eq!(alias.review_status, PersonAliasReviewStatus::Accepted);
+    assert_eq!(alias.created_actor_user_id, "actor-1");
+    assert_eq!(alias.updated_actor_user_id, "actor-2");
     assert!(!alias.active);
 }

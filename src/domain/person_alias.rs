@@ -72,6 +72,8 @@ pub struct PersonAlias {
     pub confidence: Option<ConfidencePermille>,
     pub active: bool,
     pub review_status: PersonAliasReviewStatus,
+    pub created_actor_user_id: String,
+    pub updated_actor_user_id: String,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub reviewed_actor_user_id: Option<String>,
     pub archived_at: Option<DateTime<Utc>>,
