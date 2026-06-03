@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
         FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)
         REFERENCES tenant_discord_guilds(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT transcript_feedback_meeting_fk
-        FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id) ON DELETE CASCADE,
+        FOREIGN KEY (meeting_id, guild_id)
+        REFERENCES meetings(id, guild_id) ON DELETE SET NULL (meeting_id),
     CONSTRAINT transcript_feedback_segment_fk
         FOREIGN KEY (transcript_segment_id, meeting_id)
         REFERENCES transcripts(id, meeting_id) ON DELETE SET NULL (transcript_segment_id),
@@ -244,7 +245,7 @@ BEGIN
     ALTER TABLE ai_memory_notes
     ADD CONSTRAINT ai_memory_notes_source_feedback_fk
     FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL (source_feedback_id);
+    REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT;
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END
@@ -294,7 +295,7 @@ CREATE TABLE IF NOT EXISTS person_aliases (
         FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT person_aliases_source_feedback_fk
         FOREIGN KEY (source_feedback_id, tenant_id, guild_id)
-        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL (source_feedback_id),
+        REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT person_aliases_guild_id_nonempty_check CHECK (length(btrim(guild_id)) > 0),
     CONSTRAINT person_aliases_canonical_name_nonempty_check CHECK (length(btrim(canonical_name)) > 0),
     CONSTRAINT person_aliases_alias_nonempty_check CHECK (length(btrim(alias)) > 0),

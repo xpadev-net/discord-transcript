@@ -148,11 +148,13 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("idx_meetings_id_guild"));
     assert!(schema.contains("idx_transcripts_id_meeting"));
     assert!(schema.contains("FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id)"));
-    assert!(schema.contains("FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id)"));
+    assert!(schema.contains("FOREIGN KEY (meeting_id, guild_id)"));
+    assert!(schema.contains("REFERENCES meetings(id, guild_id)"));
     assert!(schema.contains("FOREIGN KEY (transcript_segment_id, meeting_id)"));
     assert!(schema.contains("REFERENCES transcripts(id, meeting_id)"));
     assert!(schema.contains("ON DELETE SET NULL (transcript_segment_id)"));
-    assert!(schema.contains("ON DELETE SET NULL (source_feedback_id)"));
+    assert!(schema.contains("ON DELETE SET NULL (meeting_id)"));
+    assert!(schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE RESTRICT"));
     assert!(schema.contains("FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)"));
     assert!(schema.contains("FOREIGN KEY (source_feedback_id, tenant_id, guild_id)"));
     assert!(schema.contains("person_aliases_source_reference_check"));
@@ -242,7 +244,7 @@ fn domain_models_cover_schema_identity_source_confidence_and_lifecycle_fields() 
         body: "xpa may refer to xpadev.".to_owned(),
         tags: vec![AiMemoryTag::Person, AiMemoryTag::Alias],
         source_type: AiMemorySourceType::UserFeedback,
-        source_meeting_id: Some("meeting-1".to_owned()),
+        source_meeting_id: None,
         source_feedback_id: Some("feedback-1".to_owned()),
         confidence: Some(ConfidencePermille::new(900).unwrap()),
         active: false,
@@ -296,7 +298,7 @@ fn domain_models_cover_schema_identity_source_confidence_and_lifecycle_fields() 
         alias: "xpa".to_owned(),
         discord_user_id: Some("123".to_owned()),
         source_type: PersonAliasSourceType::UserFeedback,
-        source_meeting_id: Some("meeting-1".to_owned()),
+        source_meeting_id: None,
         source_feedback_id: Some("feedback-1".to_owned()),
         confidence: Some(ConfidencePermille::new(875).unwrap()),
         active: false,
