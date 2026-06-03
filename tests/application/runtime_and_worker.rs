@@ -96,7 +96,24 @@ fn app_config_loads_from_map() {
     assert!(config.whisper_vad);
     assert_eq!(config.whisper_temperature, 0.0);
     assert!(config.whisper_resample_to_16k);
+    assert_eq!(config.operational_metrics_bearer_token, None);
     assert_eq!(config.guild_bot_token_encryption_key, None);
+}
+
+#[test]
+fn app_config_loads_operational_metrics_bearer_token() {
+    let mut values = base_env();
+    values.insert(
+        "OPERATIONAL_METRICS_BEARER_TOKEN".to_owned(),
+        "metrics-secret".to_owned(),
+    );
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+
+    assert_eq!(
+        config.operational_metrics_bearer_token.as_deref(),
+        Some("metrics-secret")
+    );
 }
 
 #[test]
