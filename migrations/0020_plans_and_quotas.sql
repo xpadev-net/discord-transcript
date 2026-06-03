@@ -115,6 +115,10 @@ $$;
 
 DROP INDEX IF EXISTS idx_plan_quotas_plan_dimension_period;
 
+-- 0020 introduces plan_quotas for production databases, so there are no
+-- existing per-period duplicates to preserve when enforcing one quota per
+-- plan/dimension. If a partially applied local database has duplicates, the
+-- unique index creation should fail rather than silently choosing a quota.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_quotas_plan_dimension
     ON plan_quotas (plan_id, dimension);
 

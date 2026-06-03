@@ -757,18 +757,55 @@ fn parse_resolved_tenant_installation_row(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPlanHeader {
+    assignment_id: Option<String>,
+    tenant_id: Option<String>,
+    guild_id: String,
+    plan_id: String,
+    plan_code: String,
+    plan_name: String,
+    plan_kind: PlanKind,
+    resolution_source: String,
+    assignment_source: Option<String>,
+    period_anchor: Option<DateTime<Utc>>,
+    valid_from: Option<DateTime<Utc>>,
+    valid_until: Option<DateTime<Utc>>,
+}
+
+impl ResolvedPlanHeader {
+    fn into_resolved_plan(self) -> ResolvedPlan {
+        ResolvedPlan {
+            assignment_id: self.assignment_id,
+            tenant_id: self.tenant_id,
+            guild_id: self.guild_id,
+            plan_id: self.plan_id,
+            plan_code: self.plan_code,
+            plan_name: self.plan_name,
+            plan_kind: self.plan_kind,
+            resolution_source: self.resolution_source,
+            assignment_source: self.assignment_source,
+            period_anchor: self.period_anchor,
+            valid_from: self.valid_from,
+            valid_until: self.valid_until,
+            quotas: Vec::new(),
+        }
+    }
+}
+
 fn parse_resolved_plan_rows(rows: Vec<SqlRow>) -> Result<Option<ResolvedPlan>, StoreError> {
     let mut rows = rows.iter();
     let Some(first) = rows.next() else {
         return Ok(None);
     };
-    let mut resolved = parse_resolved_plan_header(first)?;
+    let first_header = parse_resolved_plan_header(first)?;
+    let mut resolved = first_header.clone().into_resolved_plan();
     if let Some(quota) = parse_resolved_plan_quota_row(first)? {
         resolved.quotas.push(quota);
     }
     for row in rows {
         let row_header = parse_resolved_plan_header(row)?;
-        if !resolved_plan_headers_match(&resolved, &row_header) {
+        if row_header != first_header {
             return Err(StoreError::Backend(
                 "plan resolver returned rows for multiple plans or assignments".to_owned(),
             ));
@@ -780,7 +817,7 @@ fn parse_resolved_plan_rows(rows: Vec<SqlRow>) -> Result<Option<ResolvedPlan>, S
     Ok(Some(resolved))
 }
 
-fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlan, StoreError> {
+fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlanHeader, StoreError> {
     if row.len() < 18 {
         return Err(StoreError::Backend(format!(
             "invalid plan resolver row length: {}",
@@ -793,7 +830,7 @@ fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlan, StoreError> 
             "unknown plan kind in resolver row: {plan_kind_raw}"
         ))
     })?;
-    Ok(ResolvedPlan {
+    Ok(ResolvedPlanHeader {
         assignment_id: row.first().and_then(|v| v.clone()),
         tenant_id: row.get(1).and_then(|v| v.clone()),
         guild_id: require_store_column(row, 2, "guild_id")?,
@@ -815,23 +852,7 @@ fn parse_resolved_plan_header(row: &SqlRow) -> Result<ResolvedPlan, StoreError> 
             row.get(11).and_then(|v| v.clone()),
             "valid_until",
         )?,
-        quotas: Vec::new(),
     })
-}
-
-fn resolved_plan_headers_match(left: &ResolvedPlan, right: &ResolvedPlan) -> bool {
-    left.assignment_id == right.assignment_id
-        && left.tenant_id == right.tenant_id
-        && left.guild_id == right.guild_id
-        && left.plan_id == right.plan_id
-        && left.plan_code == right.plan_code
-        && left.plan_name == right.plan_name
-        && left.plan_kind == right.plan_kind
-        && left.resolution_source == right.resolution_source
-        && left.assignment_source == right.assignment_source
-        && left.period_anchor == right.period_anchor
-        && left.valid_from == right.valid_from
-        && left.valid_until == right.valid_until
 }
 
 fn parse_resolved_plan_quota_row(row: &SqlRow) -> Result<Option<PlanQuota>, StoreError> {
