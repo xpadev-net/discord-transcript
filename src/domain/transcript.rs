@@ -1,4 +1,5 @@
 use crate::domain::speaker::{SpeakerProfile, display_label_for_id};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub const MAX_DB_TIMESTAMP_MS: u64 = i32::MAX as u64;
@@ -24,6 +25,13 @@ impl TranscriptSource {
             _ => None,
         }
     }
+
+    pub fn order_priority(self) -> u8 {
+        match self {
+            Self::Voice => 0,
+            Self::VcText => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +45,79 @@ pub struct TranscriptSegment {
     pub source: TranscriptSource,
     /// Number of original segments merged into this one (for weighted confidence).
     pub merged_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptTimelineOrderKey<'a> {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub source: TranscriptSource,
+    pub stable_id: Option<&'a str>,
+}
+
+impl<'a> TranscriptTimelineOrderKey<'a> {
+    pub fn new(
+        start_ms: i64,
+        end_ms: i64,
+        source: TranscriptSource,
+        stable_id: Option<&'a str>,
+    ) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            source,
+            stable_id,
+        }
+    }
+}
+
+pub fn compare_transcript_timeline_order(
+    left: TranscriptTimelineOrderKey<'_>,
+    right: TranscriptTimelineOrderKey<'_>,
+) -> Ordering {
+    left.start_ms
+        .cmp(&right.start_ms)
+        .then(left.end_ms.cmp(&right.end_ms))
+        .then(
+            left.source
+                .order_priority()
+                .cmp(&right.source.order_priority()),
+        )
+        .then_with(|| match (left.stable_id, right.stable_id) {
+            (Some(left), Some(right)) => left.cmp(right),
+            _ => Ordering::Equal,
+        })
+}
+
+pub fn sort_transcript_segments(segments: &mut [TranscriptSegment]) {
+    segments.sort_by(|left, right| {
+        compare_transcript_timeline_order(
+            transcript_segment_order_key(left, None),
+            transcript_segment_order_key(right, None),
+        )
+    });
+}
+
+pub fn ordered_transcript_segments(input: &[TranscriptSegment]) -> Vec<TranscriptSegment> {
+    let mut ordered = input.to_vec();
+    sort_transcript_segments(&mut ordered);
+    ordered
+}
+
+fn transcript_segment_order_key<'a>(
+    segment: &TranscriptSegment,
+    stable_id: Option<&'a str>,
+) -> TranscriptTimelineOrderKey<'a> {
+    TranscriptTimelineOrderKey::new(
+        order_timestamp_ms(segment.start_ms),
+        order_timestamp_ms(segment.end_ms),
+        segment.source,
+        stable_id,
+    )
+}
+
+fn order_timestamp_ms(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,8 +138,9 @@ pub fn normalize_segments(
     config: NormalizationConfig,
 ) -> Vec<TranscriptSegment> {
     let mut normalized = Vec::new();
+    let ordered = ordered_transcript_segments(input);
 
-    for segment in input {
+    for segment in &ordered {
         let cleaned_text = clean_text(&segment.text);
         if cleaned_text.is_empty() {
             continue;
@@ -84,7 +166,7 @@ pub fn normalize_segments(
         if let Some(prev) = normalized.last_mut()
             && can_merge(prev, &normalized_segment)
         {
-            prev.end_ms = normalized_segment.end_ms;
+            prev.end_ms = prev.end_ms.max(normalized_segment.end_ms);
             prev.text.push(' ');
             prev.text.push_str(&normalized_segment.text);
             prev.is_noisy = prev.is_noisy || normalized_segment.is_noisy;
@@ -151,8 +233,9 @@ pub fn render_for_summary(
     segments: &[TranscriptSegment],
     speakers: Option<&HashMap<String, SpeakerProfile>>,
 ) -> String {
-    let mut lines = Vec::with_capacity(segments.len());
-    for segment in segments {
+    let ordered = ordered_transcript_segments(segments);
+    let mut lines = Vec::with_capacity(ordered.len());
+    for segment in &ordered {
         let label = display_label_for_id(speakers, &segment.speaker_id);
         let noise_tag = if segment.is_noisy { " [NOISY]" } else { "" };
         let source_tag = if segment.source == TranscriptSource::VcText {
