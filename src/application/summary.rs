@@ -113,6 +113,7 @@ pub fn run_transcription<W: WhisperClient>(
         let transcription = whisper.infer(&WhisperInferenceRequest {
             audio_path: request.audio_path.clone(),
             language: request.language.clone(),
+            prompt: build_whisper_prompt(request, None),
         })?;
         persist_whisper_debug_response(
             &request.workspace.mixdown_whisper_response_path(),
@@ -126,6 +127,7 @@ pub fn run_transcription<W: WhisperClient>(
         let transcription = whisper.infer(&WhisperInferenceRequest {
             audio_path: speaker.audio_path.clone(),
             language: request.language.clone(),
+            prompt: build_whisper_prompt(request, Some(speaker)),
         })?;
         persist_whisper_debug_response(
             &request.workspace.whisper_response_path(&speaker.speaker_id),
@@ -146,6 +148,40 @@ pub fn run_transcription<W: WhisperClient>(
             .then(a.speaker_id.cmp(&b.speaker_id))
     });
     build_transcription_output(merged_segments)
+}
+
+pub fn build_whisper_prompt(
+    request: &SummaryRequest,
+    speaker: Option<&SpeakerAudioInput>,
+) -> Option<String> {
+    build_whisper_context_prompt(
+        request.title.as_deref(),
+        speaker.map(|speaker| speaker.speaker_id.as_str()),
+    )
+}
+
+pub fn build_whisper_context_prompt(
+    title: Option<&str>,
+    speaker_id: Option<&str>,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(title) = title.map(str::trim)
+        && !title.is_empty()
+    {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(format!("Meeting title: {title}"));
+    }
+    if let Some(speaker_id) = speaker_id.map(str::trim)
+        && !speaker_id.is_empty()
+    {
+        let speaker_id = speaker_id.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(format!("Speaker ID: {speaker_id}"));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Best-effort write of a Whisper raw response JSON for debugging. Failures
