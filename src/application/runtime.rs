@@ -24,6 +24,10 @@ use crate::domain::transcript::{
     MAX_DB_TIMESTAMP_MS, NormalizationConfig, TranscriptSegment, TranscriptSource,
     normalize_segments, render_for_summary,
 };
+use crate::domain::usage::{
+    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageMetric, UsageSnapshot,
+    recording_minutes_from_seconds,
+};
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
@@ -39,11 +43,12 @@ use crate::infrastructure::sql::{
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, MeetingSettingsDefaults, MeetingStore, StatusMessageMetadata,
-    StoredMeeting,
+    StoredMeeting, UsageEventStore,
 };
 use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
+use chrono::Utc;
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
@@ -150,10 +155,13 @@ pub enum RuntimeCommandInput {
     },
 }
 
-pub fn dispatch_runtime_command<S: MeetingStore>(
+pub fn dispatch_runtime_command<S>(
     service: &mut BotCommandService<S>,
     input: RuntimeCommandInput,
-) -> Result<String, CommandError> {
+) -> Result<String, CommandError>
+where
+    S: MeetingStore + UsageEventStore,
+{
     match input {
         RuntimeCommandInput::RecordStart(value) => service.handle_record_start(*value),
         RuntimeCommandInput::RecordStop {
@@ -175,7 +183,7 @@ fn complete_record_start_after_runtime_setup<S>(
     input: StartCommandInput,
 ) -> Result<String, String>
 where
-    S: MeetingStore,
+    S: MeetingStore + UsageEventStore,
 {
     service
         .handle_record_start(input)
@@ -192,7 +200,7 @@ pub fn stop_and_enqueue_summary_job<S, Q>(
     reason: StopReason,
 ) -> Result<crate::application::bot::StopCommandResult, String>
 where
-    S: MeetingStore,
+    S: MeetingStore + UsageEventStore,
     Q: crate::infrastructure::queue::JobQueue,
 {
     if let Some(expected_meeting_id) = expected_meeting_id {
@@ -217,6 +225,10 @@ where
             reason,
         })
         .map_err(|err| err.to_string())?;
+
+    if stop_result.outcome == StopOutcome::Owner {
+        record_recording_duration_usage(&mut service.store, &stop_result.meeting_id);
+    }
 
     let should_enqueue = match stop_result.outcome {
         StopOutcome::Owner => true,
@@ -261,6 +273,123 @@ where
     }
 
     Ok(stop_result)
+}
+
+fn record_recording_duration_usage<S: MeetingStore + UsageEventStore>(
+    store: &mut S,
+    meeting_id: &str,
+) {
+    let meeting = match store.get_meeting(meeting_id) {
+        Ok(Some(meeting)) => meeting,
+        Ok(None) => {
+            warn!(meeting_id, "meeting missing while recording usage duration");
+            return;
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                error = %err,
+                "failed to load meeting for recording usage duration"
+            );
+            return;
+        }
+    };
+    let Some(duration_seconds) = recording_duration_seconds(&meeting) else {
+        warn!(
+            meeting_id,
+            started_at = %meeting.started_at.is_some(),
+            stopped_at = %meeting.stopped_at.is_some(),
+            "skipping recording usage duration because timestamps are unavailable"
+        );
+        return;
+    };
+    let event = NewUsageEvent {
+        id: format!("usage:recording_minutes:{meeting_id}"),
+        tenant_id: None,
+        guild_id: meeting.guild_id,
+        meeting_id: Some(meeting_id.to_owned()),
+        job_id: None,
+        resource_type: Some("meeting".to_owned()),
+        resource_id: Some(meeting_id.to_owned()),
+        metric: UsageMetric::RecordingMinutes,
+        quantity: recording_minutes_from_seconds(duration_seconds),
+        detail_json: serde_json::json!({
+            "duration_seconds": duration_seconds
+        })
+        .to_string(),
+        observed_at: Utc::now(),
+    };
+    if let Err(err) = store.append_usage_event(&event) {
+        warn!(
+            meeting_id,
+            usage_event_id = %event.id,
+            error = %err,
+            "failed to append recording usage event; continuing in observe-only mode"
+        );
+    }
+}
+
+fn recording_duration_seconds(meeting: &StoredMeeting) -> Option<u64> {
+    let started_at = meeting.started_at?;
+    let stopped_at = meeting.stopped_at?;
+    let seconds = stopped_at.signed_duration_since(started_at).num_seconds();
+    Some(seconds.max(0) as u64)
+}
+
+fn asr_seconds_from_transcription(
+    transcription: &crate::application::summary::TranscriptionOutput,
+) -> i64 {
+    let Some(first_start) = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.start_ms)
+        .min()
+    else {
+        return 0;
+    };
+    let Some(last_end) = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.end_ms)
+        .max()
+    else {
+        return 0;
+    };
+    last_end
+        .saturating_sub(first_start)
+        .div_ceil(1000)
+        .min(i64::MAX as u64) as i64
+}
+
+fn observe_usage_entitlement_after_worker_completion<S: UsageEventStore>(
+    store: &mut S,
+    guild_id: &str,
+) {
+    let aggregates = match store.aggregate_recent_usage(None, Some(guild_id), 30 * 24 * 60 * 60) {
+        Ok(aggregates) => aggregates,
+        Err(err) => {
+            warn!(
+                guild_id,
+                error = %err,
+                "usage entitlement observation failed after worker completion"
+            );
+            return;
+        }
+    };
+    let snapshot = UsageSnapshot::from_aggregates(aggregates);
+    let decision =
+        EntitlementEvaluator::observe_only().evaluate(EntitlementAction::CompleteWorker, &snapshot);
+    if decision
+        .observations
+        .iter()
+        .any(|observation| observation.exceeded)
+    {
+        warn!(
+            guild_id,
+            observations = ?decision.observations,
+            "usage entitlement would exceed policy; observe-only mode allows worker completion"
+        );
+    }
 }
 
 pub fn meeting_audio_dir(
@@ -3152,6 +3281,7 @@ impl ScaffoldHandler {
                     .set_error_message(meeting_id, None)
                     .map_err(|err| err.to_string())?;
                 drop(service);
+                let mut summary_job_done = true;
                 {
                     let job_id = format!("summary-{meeting_id}");
                     let mut queue = self.queue.lock().await;
@@ -3162,7 +3292,12 @@ impl ScaffoldHandler {
                             error = %err,
                             "failed to mark summary job as done — job may be re-processed on restart"
                         );
+                        summary_job_done = false;
                     }
+                }
+                if summary_job_done {
+                    self.record_summary_run_usage(meeting_id, chunks.len())
+                        .await;
                 }
                 Ok(())
             }
@@ -3224,6 +3359,87 @@ impl ScaffoldHandler {
             );
         }
         post_failure_to_report_channel(http, report_channel_id, meeting_id, error_message).await
+    }
+
+    async fn record_summary_run_usage(&self, meeting_id: &str, chunk_count: usize) {
+        let mut service = self.service.lock().await;
+        let meeting = match service.store.get_meeting(meeting_id) {
+            Ok(Some(meeting)) => meeting,
+            Ok(None) => {
+                warn!(meeting_id, "meeting missing while recording summary usage");
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    meeting_id,
+                    error = %err,
+                    "failed to load meeting for summary usage"
+                );
+                return;
+            }
+        };
+        let event = NewUsageEvent {
+            id: format!("usage:summary_runs:{meeting_id}"),
+            tenant_id: None,
+            guild_id: meeting.guild_id.clone(),
+            meeting_id: Some(meeting_id.to_owned()),
+            job_id: Some(format!("summary-{meeting_id}")),
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(meeting_id.to_owned()),
+            metric: UsageMetric::SummaryRuns,
+            quantity: 1,
+            detail_json: serde_json::json!({
+                "chunk_count": chunk_count,
+                "surface": "runtime_post_success"
+            })
+            .to_string(),
+            observed_at: Utc::now(),
+        };
+        if let Err(err) = service.store.append_usage_event(&event) {
+            warn!(
+                meeting_id,
+                usage_event_id = %event.id,
+                error = %err,
+                "failed to append summary usage event; continuing in observe-only mode"
+            );
+        }
+        observe_usage_entitlement_after_worker_completion(&mut service.store, &meeting.guild_id);
+    }
+
+    async fn record_asr_seconds_usage(
+        &self,
+        guild_id: &str,
+        meeting_id: &str,
+        job_id: &str,
+        transcription: &crate::application::summary::TranscriptionOutput,
+    ) {
+        let event = NewUsageEvent {
+            id: format!("usage:asr_seconds:{meeting_id}"),
+            tenant_id: None,
+            guild_id: guild_id.to_owned(),
+            meeting_id: Some(meeting_id.to_owned()),
+            job_id: Some(job_id.to_owned()),
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(meeting_id.to_owned()),
+            metric: UsageMetric::AsrSeconds,
+            quantity: asr_seconds_from_transcription(transcription),
+            detail_json: serde_json::json!({
+                "source": "transcript_segment_span",
+                "segment_count": transcription.segments.len(),
+                "surface": "runtime_transcription_success"
+            })
+            .to_string(),
+            observed_at: Utc::now(),
+        };
+        let mut service = self.service.lock().await;
+        if let Err(err) = service.store.append_usage_event(&event) {
+            warn!(
+                meeting_id,
+                usage_event_id = %event.id,
+                error = %err,
+                "failed to append ASR usage event; continuing in observe-only mode"
+            );
+        }
     }
 
     async fn report_channel_id_for_meeting(&self, meeting_id: &str) -> Result<u64, String> {
@@ -3670,6 +3886,14 @@ impl ScaffoldHandler {
                 return Err(SummaryJobRunError::Terminal(err_string));
             }
         };
+
+        self.record_asr_seconds_usage(
+            &meeting.guild_id,
+            &claimed_job.meeting_id,
+            &claimed_job.id,
+            &transcription,
+        )
+        .await;
 
         if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
             match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at)

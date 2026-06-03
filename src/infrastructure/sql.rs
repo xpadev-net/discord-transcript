@@ -36,6 +36,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0017_domain_knowledge.sql"),
     "\n",
     include_str!("../../migrations/0018_summary_templates.sql"),
+    "\n",
+    include_str!("../../migrations/0019_usage_events.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -58,9 +60,87 @@ SET
   status = 'stopping',
   stop_reason = $1,
   stopped_at = NOW(),
+  meeting_duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::INTEGER),
   updated_at = NOW()
 WHERE id = $2
   AND status = 'recording'
+"#;
+
+pub const INSERT_USAGE_EVENT_SQL: &str = r#"
+INSERT INTO usage_events (
+    id, tenant_id, guild_id, meeting_id, job_id, resource_type, resource_id,
+    metric, quantity, detail_json, observed_at, created_at
+)
+SELECT
+    $1,
+    COALESCE(
+        NULLIF($2, ''),
+        (
+            SELECT tenant_id
+            FROM tenant_discord_guilds
+            WHERE guild_id = $3
+              AND status = 'active'
+            ORDER BY effective_at DESC
+            LIMIT 1
+        )
+    ),
+    $3,
+    NULLIF($4,''),
+    NULLIF($5,''),
+    NULLIF($6,''),
+    NULLIF($7,''),
+    $8,
+    $9::TEXT::BIGINT,
+    $10::TEXT::JSONB,
+    $11::TEXT::TIMESTAMPTZ,
+    NOW()
+ON CONFLICT (id) DO NOTHING
+"#;
+
+pub const LIST_RECENT_USAGE_EVENTS_SQL: &str = r#"
+SELECT id, tenant_id, guild_id, meeting_id, job_id, resource_type, resource_id,
+       metric, quantity, detail_json::TEXT,
+       to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS observed_at,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+FROM usage_events
+WHERE (
+    NULLIF($1, '') IS NULL
+    OR tenant_id = NULLIF($1, '')
+    OR (
+        tenant_id IS NULL
+        AND guild_id IN (
+            SELECT guild_id
+            FROM tenant_discord_guilds
+            WHERE tenant_id = NULLIF($1, '')
+              AND status = 'active'
+        )
+    )
+)
+  AND (NULLIF($2, '') IS NULL OR guild_id = NULLIF($2, ''))
+ORDER BY observed_at DESC, id DESC
+LIMIT $3::TEXT::INTEGER
+"#;
+
+pub const AGGREGATE_RECENT_USAGE_SQL: &str = r#"
+SELECT metric, COALESCE(SUM(quantity), 0)::TEXT AS quantity
+FROM usage_events
+WHERE (
+    NULLIF($1, '') IS NULL
+    OR tenant_id = NULLIF($1, '')
+    OR (
+        tenant_id IS NULL
+        AND guild_id IN (
+            SELECT guild_id
+            FROM tenant_discord_guilds
+            WHERE tenant_id = NULLIF($1, '')
+              AND status = 'active'
+        )
+    )
+)
+  AND (NULLIF($2, '') IS NULL OR guild_id = NULLIF($2, ''))
+  AND observed_at >= NOW() - ($3::TEXT || ' seconds')::INTERVAL
+GROUP BY metric
+ORDER BY metric
 "#;
 
 pub const SET_MEETING_STATUS_CAS_SQL: &str = r#"

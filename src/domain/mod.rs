@@ -8,5 +8,6 @@ pub mod retention;
 pub mod speaker;
 pub mod summary_template;
 pub mod transcript;
+pub mod usage;
 
 pub use model::*;

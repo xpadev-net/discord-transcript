@@ -6,25 +6,27 @@ use crate::domain::domain_knowledge::{
     UpdateDomainKnowledgeItem,
 };
 use crate::domain::summary_template::{NewSummaryTemplate, SummaryTemplate, UpdateSummaryTemplate};
+use crate::domain::usage::{NewUsageEvent, UsageAggregate, UsageEvent, UsageMetric};
 use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
-    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
-    ARCHIVE_SUMMARY_TEMPLATE_SQL, BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL,
-    CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, ENQUEUE_JOB_SQL, GET_ACTIVE_SUMMARY_TEMPLATE_SQL,
-    GET_DOMAIN_KNOWLEDGE_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
-    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL, GET_SUMMARY_TEMPLATE_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, AGGREGATE_RECENT_USAGE_SQL,
+    ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
+    BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
+    ENQUEUE_JOB_SQL, GET_ACTIVE_SUMMARY_TEMPLATE_SQL, GET_DOMAIN_KNOWLEDGE_SQL,
+    GET_EFFECTIVE_MEETING_SETTINGS_SQL, GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
+    GET_SUMMARY_TEMPLATE_SQL, INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL,
+    INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
     INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
-    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL,
-    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
-    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    INSERT_USAGE_EVENT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
+    LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL, MARK_JOB_DONE_SQL,
+    MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
+    RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
+    UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
-    StatusMessageMetadata, StopTransition, StoreError, StoredMeeting,
+    StatusMessageMetadata, StopTransition, StoreError, StoredMeeting, UsageEventStore,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -191,6 +193,53 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             )
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_audit_event_row).collect()
+    }
+
+    pub fn append_usage_event(&mut self, event: &NewUsageEvent) -> Result<(), StoreError> {
+        self.executor
+            .execute(INSERT_USAGE_EVENT_SQL, &usage_event_params(event))
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
+    pub fn list_recent_usage_events(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UsageEvent>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_RECENT_USAGE_EVENTS_SQL,
+                &[
+                    tenant_id.unwrap_or_default().to_owned(),
+                    guild_id.unwrap_or_default().to_owned(),
+                    limit.min(100).to_string(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_usage_event_row).collect()
+    }
+
+    pub fn aggregate_recent_usage(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        window_seconds: u64,
+    ) -> Result<Vec<UsageAggregate>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                AGGREGATE_RECENT_USAGE_SQL,
+                &[
+                    tenant_id.unwrap_or_default().to_owned(),
+                    guild_id.unwrap_or_default().to_owned(),
+                    window_seconds.max(1).to_string(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_usage_aggregate_row).collect()
     }
 
     pub fn list_domain_knowledge(
@@ -447,6 +496,30 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
     }
 }
 
+impl<E: SqlExecutor> UsageEventStore for SqlMeetingStore<E> {
+    fn append_usage_event(&mut self, event: &NewUsageEvent) -> Result<(), StoreError> {
+        SqlMeetingStore::append_usage_event(self, event)
+    }
+
+    fn list_recent_usage_events(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UsageEvent>, StoreError> {
+        SqlMeetingStore::list_recent_usage_events(self, tenant_id, guild_id, limit)
+    }
+
+    fn aggregate_recent_usage(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        window_seconds: u64,
+    ) -> Result<Vec<UsageAggregate>, StoreError> {
+        SqlMeetingStore::aggregate_recent_usage(self, tenant_id, guild_id, window_seconds)
+    }
+}
+
 pub struct SqlJobQueue<E: SqlExecutor> {
     pub executor: E,
 }
@@ -668,6 +741,12 @@ fn optional_u32_column(row: &SqlRow, idx: usize, field: &str) -> Result<Option<u
 fn required_u64_column(row: &SqlRow, idx: usize, field: &str) -> Result<u64, StoreError> {
     let raw = require_store_column(row, idx, field)?;
     raw.parse::<u64>()
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn required_i64_column(row: &SqlRow, idx: usize, field: &str) -> Result<i64, StoreError> {
+    let raw = require_store_column(row, idx, field)?;
+    raw.parse::<i64>()
         .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
 }
 
@@ -910,6 +989,22 @@ pub fn audit_event_params(event: &AuditEvent) -> Vec<String> {
     ]
 }
 
+pub fn usage_event_params(event: &NewUsageEvent) -> Vec<String> {
+    vec![
+        event.id.clone(),
+        event.tenant_id.clone().unwrap_or_default(),
+        event.guild_id.clone(),
+        event.meeting_id.clone().unwrap_or_default(),
+        event.job_id.clone().unwrap_or_default(),
+        event.resource_type.clone().unwrap_or_default(),
+        event.resource_id.clone().unwrap_or_default(),
+        event.metric.as_str().to_owned(),
+        event.quantity.to_string(),
+        event.detail_json.clone(),
+        event.observed_at.to_rfc3339(),
+    ]
+}
+
 fn parse_audit_event_row(row: &SqlRow) -> Result<AuditEvent, StoreError> {
     if row.len() < 11 {
         return Err(StoreError::Backend(format!(
@@ -944,6 +1039,57 @@ fn parse_audit_event_row(row: &SqlRow) -> Result<AuditEvent, StoreError> {
                 ))
             })?,
     })
+}
+
+fn parse_usage_event_row(row: &SqlRow) -> Result<UsageEvent, StoreError> {
+    if row.len() < 12 {
+        return Err(StoreError::Backend(format!(
+            "invalid usage event row length: {}",
+            row.len()
+        )));
+    }
+    let metric_raw = require_store_column(row, 7, "metric")?;
+    let metric = UsageMetric::parse_str(&metric_raw)
+        .ok_or_else(|| StoreError::Backend(format!("unknown usage metric: {metric_raw}")))?;
+    let observed_at_raw = require_store_column(row, 10, "observed_at")?;
+    let created_at_raw = require_store_column(row, 11, "created_at")?;
+
+    Ok(UsageEvent {
+        id: require_store_column(row, 0, "id")?,
+        tenant_id: row.get(1).and_then(|v| v.clone()),
+        guild_id: require_store_column(row, 2, "guild_id")?,
+        meeting_id: row.get(3).and_then(|v| v.clone()),
+        job_id: row.get(4).and_then(|v| v.clone()),
+        resource_type: row.get(5).and_then(|v| v.clone()),
+        resource_id: row.get(6).and_then(|v| v.clone()),
+        metric,
+        quantity: required_i64_column(row, 8, "quantity")?,
+        detail_json: require_store_column(row, 9, "detail_json")?,
+        observed_at: parse_required_usage_timestamp(&observed_at_raw, "observed_at")?,
+        created_at: parse_required_usage_timestamp(&created_at_raw, "created_at")?,
+    })
+}
+
+fn parse_usage_aggregate_row(row: &SqlRow) -> Result<UsageAggregate, StoreError> {
+    if row.len() < 2 {
+        return Err(StoreError::Backend(format!(
+            "invalid usage aggregate row length: {}",
+            row.len()
+        )));
+    }
+    let metric_raw = require_store_column(row, 0, "metric")?;
+    let metric = UsageMetric::parse_str(&metric_raw)
+        .ok_or_else(|| StoreError::Backend(format!("unknown usage metric: {metric_raw}")))?;
+    Ok(UsageAggregate {
+        metric,
+        quantity: required_i64_column(row, 1, "quantity")?,
+    })
+}
+
+fn parse_required_usage_timestamp(raw: &str, field: &str) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|ts| ts.with_timezone(&Utc))
+        .map_err(|err| StoreError::Backend(format!("invalid usage {field} '{raw}': {err}")))
 }
 
 fn parse_optional_tenant_period_anchor(

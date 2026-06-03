@@ -6,12 +6,16 @@ use crate::application::summary::{
     persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
+use crate::domain::usage::{
+    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageMetric, UsageSnapshot,
+};
 use crate::domain::{JobStatus, JobType, MeetingStatus};
 use crate::infrastructure::asr::WhisperClient;
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
-use crate::infrastructure::storage::{MeetingStore, StoreError};
+use crate::infrastructure::storage::{MeetingStore, StoreError, UsageEventStore};
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
+use chrono::Utc;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 use tracing::{error, info, warn};
@@ -119,12 +123,17 @@ fn revert_to_stopping_for_retry<S: MeetingStore>(
     }
 }
 
-pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSummaryClient>(
+pub fn process_meeting_summary<S, W, C>(
     store: &mut S,
     whisper: &W,
     claude: &C,
     input: &ProcessMeetingInput,
-) -> Result<ProcessMeetingOutput, WorkerError> {
+) -> Result<ProcessMeetingOutput, WorkerError>
+where
+    S: MeetingStore + UsageEventStore,
+    W: WhisperClient,
+    C: ClaudeSummaryClient,
+{
     info!(meeting_id = %input.meeting_id, "summary pipeline started");
 
     let request = SummaryRequest {
@@ -147,6 +156,26 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
             return Err(WorkerError::from(err));
         }
     };
+    record_usage_event_observe_only(
+        store,
+        NewUsageEvent {
+            id: format!("usage:asr_seconds:{}", input.meeting_id),
+            tenant_id: None,
+            guild_id: input.guild_id.clone(),
+            meeting_id: Some(input.meeting_id.clone()),
+            job_id: None,
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(input.meeting_id.clone()),
+            metric: UsageMetric::AsrSeconds,
+            quantity: asr_seconds_from_transcription(&transcription),
+            detail_json: serde_json::json!({
+                "source": "transcript_segment_span",
+                "segment_count": transcription.segments.len()
+            })
+            .to_string(),
+            observed_at: Utc::now(),
+        },
+    );
 
     persist_pre_correction_transcript_debug_artifact(
         &request.workspace,
@@ -281,7 +310,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
     options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
-    S: MeetingStore,
+    S: MeetingStore + UsageEventStore,
     Q: JobQueue,
     W: WhisperClient,
     C: ClaudeSummaryClient,
@@ -401,6 +430,12 @@ where
                 Some(MeetingStatus::Summarizing),
             )?;
             queue.mark_done(&job.id)?;
+            record_summary_run_usage_observe_only(
+                store,
+                &job.meeting_id,
+                &job.id,
+                output.chunks.len(),
+            );
             info!(job_id = %job.id, "summary job marked done");
             Ok(Some(ProcessJobResult {
                 job_id: job.id,
@@ -427,6 +462,112 @@ where
             }
             Err(err)
         }
+    }
+}
+
+fn asr_seconds_from_transcription(transcription: &TranscriptionOutput) -> i64 {
+    let Some(first_start) = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.start_ms)
+        .min()
+    else {
+        return 0;
+    };
+    let Some(last_end) = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.end_ms)
+        .max()
+    else {
+        return 0;
+    };
+    last_end
+        .saturating_sub(first_start)
+        .div_ceil(1000)
+        .min(i64::MAX as u64) as i64
+}
+
+fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: NewUsageEvent) {
+    if let Err(err) = store.append_usage_event(&event) {
+        warn!(
+            usage_event_id = %event.id,
+            metric = %event.metric.as_str(),
+            error = %err,
+            "failed to append usage event; continuing in observe-only mode"
+        );
+    }
+}
+
+fn record_summary_run_usage_observe_only<S: MeetingStore + UsageEventStore>(
+    store: &mut S,
+    meeting_id: &str,
+    job_id: &str,
+    chunk_count: usize,
+) {
+    let meeting = match store.get_meeting(meeting_id) {
+        Ok(Some(meeting)) => meeting,
+        Ok(None) => {
+            warn!(meeting_id, "meeting missing while recording summary usage");
+            return;
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                error = %err,
+                "failed to load meeting for summary usage"
+            );
+            return;
+        }
+    };
+    record_usage_event_observe_only(
+        store,
+        NewUsageEvent {
+            id: format!("usage:summary_runs:{meeting_id}"),
+            tenant_id: None,
+            guild_id: meeting.guild_id.clone(),
+            meeting_id: Some(meeting_id.to_owned()),
+            job_id: Some(job_id.to_owned()),
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(meeting_id.to_owned()),
+            metric: UsageMetric::SummaryRuns,
+            quantity: 1,
+            detail_json: serde_json::json!({
+                "chunk_count": chunk_count,
+                "surface": "process_next_summary_job_done"
+            })
+            .to_string(),
+            observed_at: Utc::now(),
+        },
+    );
+    observe_worker_completion_entitlement(store, &meeting.guild_id);
+}
+
+fn observe_worker_completion_entitlement<S: UsageEventStore>(store: &mut S, guild_id: &str) {
+    let aggregates = match store.aggregate_recent_usage(None, Some(guild_id), 30 * 24 * 60 * 60) {
+        Ok(aggregates) => aggregates,
+        Err(err) => {
+            warn!(
+                guild_id,
+                error = %err,
+                "usage entitlement observation failed after worker completion"
+            );
+            return;
+        }
+    };
+    let snapshot = UsageSnapshot::from_aggregates(aggregates);
+    let decision =
+        EntitlementEvaluator::observe_only().evaluate(EntitlementAction::CompleteWorker, &snapshot);
+    if decision
+        .observations
+        .iter()
+        .any(|observation| observation.exceeded)
+    {
+        warn!(
+            guild_id,
+            observations = ?decision.observations,
+            "usage entitlement would exceed policy; observe-only mode allows worker completion"
+        );
     }
 }
 

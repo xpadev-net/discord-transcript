@@ -9,7 +9,14 @@ use discord_transcript::domain::retention::{
     ArtifactRecord, RetentionKind, RetentionPolicy, select_cleanup_candidates,
     should_delete_artifact,
 };
-use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use discord_transcript::domain::usage::{
+    EntitlementAction, EntitlementEvaluator, EntitlementMode, EntitlementPolicy, NewUsageEvent,
+    UsageAggregate, UsageEvent, UsageEventLedger, UsageMetric, UsageSnapshot,
+    recording_minutes_from_seconds,
+};
+use discord_transcript::infrastructure::storage::{
+    InMemoryMeetingStore, StoredMeeting, UsageEventStore,
+};
 use chrono::{TimeZone, Utc};
 use std::num::NonZeroU32;
 
@@ -244,4 +251,84 @@ fn audit_log_appends_and_reads_events() {
     assert_eq!(log.list().len(), 1);
     assert_eq!(log.list()[0].action, "delete_transcript");
     assert_eq!(log.recent(1)[0].resource_id.as_deref(), Some("m1"));
+}
+
+#[test]
+fn usage_event_ledger_is_append_only_and_idempotent_by_event_id() {
+    let mut ledger = UsageEventLedger::new();
+    let observed_at = Utc.with_ymd_and_hms(2026, 6, 3, 1, 2, 3).unwrap();
+    let event = UsageEvent {
+        id: "usage-1".to_owned(),
+        tenant_id: Some("tenant-g1".to_owned()),
+        guild_id: "g1".to_owned(),
+        meeting_id: Some("m1".to_owned()),
+        job_id: None,
+        resource_type: Some("meeting".to_owned()),
+        resource_id: Some("m1".to_owned()),
+        metric: UsageMetric::RecordingMinutes,
+        quantity: recording_minutes_from_seconds(61),
+        detail_json: r#"{"duration_seconds":61}"#.to_owned(),
+        observed_at,
+        created_at: observed_at,
+    };
+
+    ledger.append(event.clone());
+    ledger.append(event);
+
+    assert_eq!(ledger.list().len(), 1);
+    assert_eq!(ledger.recent(10)[0].quantity, 2);
+}
+
+#[test]
+fn entitlement_evaluator_observe_only_never_blocks() {
+    let snapshot = UsageSnapshot::from_aggregates(vec![UsageAggregate {
+        metric: UsageMetric::RecordingMinutes,
+        quantity: 200,
+    }]);
+    let policy = EntitlementPolicy {
+        recording_minutes_limit: Some(100),
+        ..EntitlementPolicy::default()
+    };
+
+    let observe_only = EntitlementEvaluator::new(EntitlementMode::ObserveOnly, policy.clone())
+        .evaluate(EntitlementAction::StartRecording, &snapshot);
+    let enforced = EntitlementEvaluator::new(EntitlementMode::Enforce, policy)
+        .evaluate(EntitlementAction::StartRecording, &snapshot);
+
+    assert!(observe_only.allowed);
+    assert!(observe_only.observations[0].exceeded);
+    assert!(!enforced.allowed);
+}
+
+#[test]
+fn in_memory_usage_aggregate_honors_recent_window() {
+    let mut store = InMemoryMeetingStore::new();
+    let now = Utc::now();
+    for (id, observed_at) in [
+        ("old", now - chrono::Duration::seconds(3_600)),
+        ("recent", now - chrono::Duration::seconds(30)),
+    ] {
+        store
+            .append_usage_event(&NewUsageEvent {
+                id: format!("usage-{id}"),
+                tenant_id: None,
+                guild_id: "g1".to_owned(),
+                meeting_id: Some("m1".to_owned()),
+                job_id: None,
+                resource_type: Some("meeting".to_owned()),
+                resource_id: Some("m1".to_owned()),
+                metric: UsageMetric::DebugDownloads,
+                quantity: 1,
+                detail_json: "{}".to_owned(),
+                observed_at,
+            })
+            .expect("usage event should append");
+    }
+
+    let aggregate = store
+        .aggregate_recent_usage(None, Some("g1"), 60)
+        .expect("usage aggregate should succeed");
+
+    assert_eq!(aggregate.len(), 1);
+    assert_eq!(aggregate[0].quantity, 1);
 }

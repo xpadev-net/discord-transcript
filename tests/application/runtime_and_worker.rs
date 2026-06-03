@@ -7,8 +7,11 @@ use discord_transcript::application::worker::{ProcessMeetingInput, process_meeti
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
+use discord_transcript::domain::usage::UsageMetric;
 use discord_transcript::infrastructure::asr::StubWhisperClient;
-use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use discord_transcript::infrastructure::storage::{
+    InMemoryMeetingStore, StoredMeeting, UsageEventStore,
+};
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -662,4 +665,12 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.status, MeetingStatus::Summarizing);
     assert_eq!(saved.error_message, None);
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage events should list");
+    assert!(
+        usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::AsrSeconds && event.quantity == 1)
+    );
 }

@@ -3,6 +3,7 @@ use discord_transcript::application::worker::{
     SummaryJobOptions, enqueue_summary_job, process_next_summary_job,
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus};
+use discord_transcript::domain::usage::UsageMetric;
 use discord_transcript::infrastructure::asr::{
     StubWhisperClient, WhisperClient, WhisperInferenceRequest, WhisperParseError,
     WhisperTranscriptionResult, parse_whisper_response,
@@ -13,7 +14,7 @@ use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, sql_row_from_strings,
 };
 use discord_transcript::infrastructure::storage::{
-    EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoredMeeting,
+    EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoredMeeting, UsageEventStore,
 };
 use std::cell::RefCell;
 use std::io::ErrorKind;
@@ -260,6 +261,14 @@ fn worker_job_processing_marks_done_on_success() {
     assert_eq!(
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Posted
+    );
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage should list");
+    assert!(
+        usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::SummaryRuns && event.quantity == 1)
     );
 }
 

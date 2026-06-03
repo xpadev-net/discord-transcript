@@ -8,9 +8,11 @@ use discord_transcript::application::runtime::{
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
+use discord_transcript::domain::usage::UsageMetric;
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, Job, JobQueue, QueueError};
 use discord_transcript::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore,
+    UsageEventStore,
 };
 use serenity::all::GuildId;
 use std::sync::{
@@ -340,6 +342,17 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
         .claim_next(JobType::Summarize)
         .expect("second claim should succeed");
     assert!(second_job.is_none());
+    let usage = service
+        .store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage should list");
+    assert_eq!(
+        usage
+            .iter()
+            .filter(|event| event.metric == UsageMetric::RecordingMinutes)
+            .count(),
+        1
+    );
 }
 
 #[test]

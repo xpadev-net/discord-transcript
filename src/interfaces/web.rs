@@ -29,6 +29,7 @@ use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{summary_template_variables, validate_summary_template};
 use crate::domain::transcript::TranscriptSource;
+use crate::domain::usage::{NewUsageEvent, UsageMetric};
 use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
@@ -37,11 +38,11 @@ use crate::infrastructure::sql::{
     ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL,
     GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
     INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
-    UPSERT_GUILD_SETTINGS_SQL,
+    INSERT_USAGE_EVENT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETINGS_SQL,
+    LIST_SUMMARY_TEMPLATES_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
-use crate::infrastructure::sql_store::audit_event_params;
+use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -346,6 +347,22 @@ async fn record_audit_event(state: &WebState, event: AuditEvent) {
             action = %event.action,
             resource_type = %event.resource_type,
             "failed to persist audit event"
+        );
+    }
+}
+
+async fn record_usage_event(state: &WebState, event: NewUsageEvent) {
+    let params = usage_event_params(&event);
+    let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+        .iter()
+        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    if let Err(err) = state.db.execute(INSERT_USAGE_EVENT_SQL, &bind).await {
+        warn!(
+            error = %err,
+            usage_event_id = %event.id,
+            metric = %event.metric.as_str(),
+            "failed to persist usage event"
         );
     }
 }
@@ -5099,6 +5116,28 @@ async fn api_debug_file(
                 "admin_only": debug_artifact_requires_admin(&artifact_id),
             }),
         ),
+    )
+    .await;
+    record_usage_event(
+        &state,
+        NewUsageEvent {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: None,
+            guild_id: access.guild_id,
+            meeting_id: Some(meeting_id.clone()),
+            job_id: None,
+            resource_type: Some("debug_artifact".to_owned()),
+            resource_id: Some(artifact_id.clone()),
+            metric: UsageMetric::DebugDownloads,
+            quantity: 1,
+            detail_json: json!({
+                "filename": audit_filename,
+                "content_type": audit_content_type,
+                "admin_only": debug_artifact_requires_admin(&artifact_id),
+            })
+            .to_string(),
+            observed_at: Utc::now(),
+        },
     )
     .await;
     Ok(response)

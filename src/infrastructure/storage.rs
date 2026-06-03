@@ -1,3 +1,4 @@
+use crate::domain::usage::{NewUsageEvent, UsageAggregate, UsageEvent};
 use crate::domain::{MeetingStatus, StopReason};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -56,7 +57,7 @@ impl Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-pub trait MeetingStore {
+pub trait MeetingStore: UsageEventStore {
     fn mark_stopping_if_recording(
         &mut self,
         meeting_id: &str,
@@ -118,6 +119,24 @@ pub trait MeetingStore {
         &mut self,
         meeting_id: &str,
     ) -> Result<Option<EffectiveMeetingSettings>, StoreError>;
+}
+
+pub trait UsageEventStore {
+    fn append_usage_event(&mut self, event: &NewUsageEvent) -> Result<(), StoreError>;
+
+    fn list_recent_usage_events(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UsageEvent>, StoreError>;
+
+    fn aggregate_recent_usage(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        window_seconds: u64,
+    ) -> Result<Vec<UsageAggregate>, StoreError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +265,7 @@ impl EffectiveMeetingSettings {
 pub struct InMemoryMeetingStore {
     meetings: HashMap<String, StoredMeeting>,
     effective_settings: HashMap<String, EffectiveMeetingSettings>,
+    usage_events: HashMap<String, UsageEvent>,
 }
 
 impl InMemoryMeetingStore {
@@ -270,6 +290,84 @@ impl InMemoryMeetingStore {
             status,
             MeetingStatus::Scheduled | MeetingStatus::Recording | MeetingStatus::Stopping
         )
+    }
+}
+
+impl UsageEventStore for InMemoryMeetingStore {
+    fn append_usage_event(&mut self, event: &NewUsageEvent) -> Result<(), StoreError> {
+        self.usage_events
+            .entry(event.id.clone())
+            .or_insert_with(|| UsageEvent {
+                id: event.id.clone(),
+                tenant_id: event.tenant_id.clone(),
+                guild_id: event.guild_id.clone(),
+                meeting_id: event.meeting_id.clone(),
+                job_id: event.job_id.clone(),
+                resource_type: event.resource_type.clone(),
+                resource_id: event.resource_id.clone(),
+                metric: event.metric,
+                quantity: event.quantity,
+                detail_json: event.detail_json.clone(),
+                observed_at: event.observed_at,
+                created_at: event.observed_at,
+            });
+        Ok(())
+    }
+
+    fn list_recent_usage_events(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UsageEvent>, StoreError> {
+        let mut events = self
+            .usage_events
+            .values()
+            .filter(|event| {
+                tenant_id.is_none_or(|tenant_id| event.tenant_id.as_deref() == Some(tenant_id))
+            })
+            .filter(|event| guild_id.is_none_or(|guild_id| event.guild_id == guild_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            right
+                .observed_at
+                .cmp(&left.observed_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        events.truncate(limit as usize);
+        Ok(events)
+    }
+
+    fn aggregate_recent_usage(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        window_seconds: u64,
+    ) -> Result<Vec<UsageAggregate>, StoreError> {
+        let now = Utc::now();
+        let window_seconds = window_seconds.max(1);
+        let mut quantities: HashMap<crate::domain::usage::UsageMetric, i64> = HashMap::new();
+        for event in self
+            .usage_events
+            .values()
+            .filter(|event| {
+                tenant_id.is_none_or(|tenant_id| event.tenant_id.as_deref() == Some(tenant_id))
+            })
+            .filter(|event| guild_id.is_none_or(|guild_id| event.guild_id == guild_id))
+            .filter(|event| {
+                now.signed_duration_since(event.observed_at)
+                    .num_seconds()
+                    .max(0) as u64
+                    <= window_seconds
+            })
+        {
+            *quantities.entry(event.metric).or_default() += event.quantity;
+        }
+        Ok(quantities
+            .into_iter()
+            .map(|(metric, quantity)| UsageAggregate { metric, quantity })
+            .collect())
     }
 }
 
