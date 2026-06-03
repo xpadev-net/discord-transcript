@@ -84,6 +84,7 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
     };
     let summary_input = ProcessMeetingInput {
         meeting_id: "m1".to_owned(),
+        job_id: Some("summary-m1".to_owned()),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         title: Some("Weekly".to_owned()),

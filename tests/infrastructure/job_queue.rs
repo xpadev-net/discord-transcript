@@ -270,6 +270,9 @@ fn worker_job_processing_marks_done_on_success() {
             .iter()
             .any(|event| event.metric == UsageMetric::SummaryRuns && event.quantity == 1)
     );
+    assert!(usage.iter().any(|event| {
+        event.metric == UsageMetric::AsrSeconds && event.job_id.as_deref() == Some("j1")
+    }));
 }
 
 #[test]

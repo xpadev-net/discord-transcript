@@ -532,6 +532,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            job_id: None,
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc".to_owned(),
             title: None,
@@ -590,6 +591,7 @@ fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            job_id: None,
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc".to_owned(),
             title: None,
@@ -646,6 +648,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            job_id: None,
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc".to_owned(),
             title: None,

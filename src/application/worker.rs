@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMeetingInput {
     pub meeting_id: String,
+    pub job_id: Option<String>,
     pub guild_id: String,
     pub voice_channel_id: String,
     pub title: Option<String>,
@@ -163,7 +164,7 @@ where
             tenant_id: None,
             guild_id: input.guild_id.clone(),
             meeting_id: Some(input.meeting_id.clone()),
-            job_id: None,
+            job_id: input.job_id.clone(),
             resource_type: Some("meeting".to_owned()),
             resource_id: Some(input.meeting_id.clone()),
             metric: UsageMetric::AsrSeconds,
@@ -405,6 +406,7 @@ where
             .map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
+            job_id: Some(job.id.clone()),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
