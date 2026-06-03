@@ -1,16 +1,26 @@
 use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
 use crate::audio::songbird_adapter::SsrcTracker;
-use crate::audio::wav::{pcm_duration_ms, resample_pcm_16le};
+use crate::audio::wav::{
+    MAX_WAV_CHUNK_PCM_BYTES, checked_pcm_growth, pcm_byte_len_for_duration_ms, pcm_duration_ms,
+    resample_pcm_16le,
+};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use crate::infrastructure::workspace::SSRC_MAPPING_FILENAME;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 /// Maximum wall-clock span for a single meeting mixdown (24 hours).
 pub const MAX_MEETING_AUDIO_SPAN_MS: u64 = 24 * 3600 * 1000;
+pub const MAX_MEETING_AUDIO_CHUNKS: usize = 4_096;
+pub const MAX_MEETING_AUDIO_INPUT_PCM_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_SPEAKER_AUDIO_OUTPUTS: usize = 256;
+pub const MAX_SPEAKER_AUDIO_PCM_BYTES: usize = 512 * 1024 * 1024;
+const WAV_HEADER_BYTES: usize = 44;
+const MAX_LOADED_WAV_FILE_BYTES: u64 = (MAX_WAV_CHUNK_PCM_BYTES + WAV_HEADER_BYTES) as u64;
+const SPEAKER_BUILD_TMP_DIR: &str = ".speaker-build-tmp";
 
 #[derive(Debug, Clone)]
 pub struct LoadedChunk {
@@ -40,6 +50,7 @@ struct ParsedFilename {
 pub fn load_chunks(meeting_dir: &Path) -> Result<Vec<LoadedChunk>, String> {
     let mut chunks = Vec::new();
     let mut skipped_chunks = 0u32;
+    let mut total_pcm_bytes = 0usize;
     let entries = fs::read_dir(meeting_dir).map_err(|err| {
         format!(
             "failed to read meeting dir {}: {err}",
@@ -59,7 +70,26 @@ pub fn load_chunks(meeting_dir: &Path) -> Result<Vec<LoadedChunk>, String> {
             && path.file_stem().and_then(|s| s.to_str()) != Some("mixdown")
         {
             match load_single_chunk(&path) {
-                Ok(chunk) => chunks.push(chunk),
+                Ok(chunk) => {
+                    if chunks.len() >= MAX_MEETING_AUDIO_CHUNKS {
+                        return Err(format!(
+                            "too many audio chunks in {}: max {MAX_MEETING_AUDIO_CHUNKS}",
+                            meeting_dir.display()
+                        ));
+                    }
+                    total_pcm_bytes = checked_pcm_growth(
+                        total_pcm_bytes,
+                        chunk.pcm.len(),
+                        MAX_MEETING_AUDIO_INPUT_PCM_BYTES,
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "meeting audio input PCM exceeds limit in {}: {err}",
+                            meeting_dir.display()
+                        )
+                    })?;
+                    chunks.push(chunk);
+                }
                 Err(reason) => {
                     skipped_chunks += 1;
                     warn!(
@@ -141,6 +171,17 @@ fn parse_chunk_filename(path: &Path) -> Result<ParsedFilename, String> {
 }
 
 fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
+    let file_size = path
+        .metadata()
+        .map_err(|err| format!("failed to stat {}: {err}", path.display()))?
+        .len();
+    if file_size > MAX_LOADED_WAV_FILE_BYTES {
+        return Err(format!(
+            "WAV file too large in {}: {file_size} bytes (max {MAX_LOADED_WAV_FILE_BYTES})",
+            path.display()
+        ));
+    }
+
     let data = fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     if data.len() < 44 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
         return Err(format!(
@@ -169,6 +210,12 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
     let data_chunk_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as usize;
     if data_chunk_size == 0 {
         return Err(format!("empty PCM data chunk in {}", path.display()));
+    }
+    if !data_chunk_size.is_multiple_of(2) {
+        return Err(format!(
+            "invalid PCM byte length in {}: {data_chunk_size}",
+            path.display()
+        ));
     }
     let pcm_start = 44usize;
     let pcm_end = pcm_start.saturating_add(data_chunk_size);
@@ -206,12 +253,37 @@ pub(crate) fn compute_meeting_start_ms(chunks: &[LoadedChunk]) -> u64 {
         .unwrap_or(0)
 }
 
-fn silence_bytes(duration_ms: u64, sample_rate: u32) -> Vec<u8> {
-    let duration_ms = duration_ms.min(MAX_MEETING_AUDIO_SPAN_MS);
-    let samples = (duration_ms as u128)
-        .saturating_mul(sample_rate as u128)
-        .saturating_div(1_000) as usize;
-    vec![0; samples.saturating_mul(2)]
+fn append_pcm_bounded(
+    pcm_out: &mut Vec<u8>,
+    bytes: &[u8],
+    max: usize,
+    context: &str,
+) -> Result<(), String> {
+    let next_len = checked_pcm_growth(pcm_out.len(), bytes.len(), max)
+        .map_err(|err| format!("{context} exceeds PCM limit: {err}"))?;
+    pcm_out
+        .try_reserve(next_len.saturating_sub(pcm_out.len()))
+        .map_err(|_| format!("{context} exceeds PCM limit: unable to reserve {next_len} bytes"))?;
+    pcm_out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_silence_bounded(
+    pcm_out: &mut Vec<u8>,
+    duration_ms: u64,
+    sample_rate: u32,
+    max: usize,
+    context: &str,
+) -> Result<(), String> {
+    let silence_bytes =
+        pcm_byte_len_for_duration_ms(duration_ms, sample_rate).unwrap_or(usize::MAX);
+    let next_len = checked_pcm_growth(pcm_out.len(), silence_bytes, max)
+        .map_err(|err| format!("{context} exceeds PCM limit: {err}"))?;
+    pcm_out
+        .try_reserve(next_len.saturating_sub(pcm_out.len()))
+        .map_err(|_| format!("{context} exceeds PCM limit: unable to reserve {next_len} bytes"))?;
+    pcm_out.resize(next_len, 0);
+    Ok(())
 }
 
 /// Load the persisted SSRC-to-user mapping and build a lookup from sanitized
@@ -322,6 +394,14 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
             .push(chunk);
     }
 
+    if per_user.len() > MAX_SPEAKER_AUDIO_OUTPUTS {
+        return Err(format!(
+            "too many speaker audio outputs in {}: {} (max {MAX_SPEAKER_AUDIO_OUTPUTS})",
+            meeting_dir.display(),
+            per_user.len()
+        ));
+    }
+
     let speaker_dir = meeting_dir.join("speakers");
     fs::create_dir_all(&speaker_dir).map_err(|err| {
         format!(
@@ -329,8 +409,25 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
             speaker_dir.display()
         )
     })?;
+    let speaker_tmp_dir = speaker_dir.join(SPEAKER_BUILD_TMP_DIR);
+    if speaker_tmp_dir.exists() {
+        fs::remove_dir_all(&speaker_tmp_dir).map_err(|err| {
+            format!(
+                "failed to remove stale speaker temp dir {}: {err}",
+                speaker_tmp_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(&speaker_tmp_dir).map_err(|err| {
+        format!(
+            "failed to create speaker temp dir {}: {err}",
+            speaker_tmp_dir.display()
+        )
+    })?;
 
     let mut outputs = Vec::new();
+    let mut generated_speaker_files = HashSet::new();
+    let mut staged_speaker_files = Vec::new();
     for (user_id, mut user_chunks) in per_user {
         user_chunks.sort_by(|a, b| {
             a.start_ms
@@ -342,12 +439,24 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
         };
 
         let mut pcm_out = Vec::new();
-        let mut current_ms = first.start_ms + first.duration_ms;
-        pcm_out.extend_from_slice(&first.pcm);
+        let mut current_ms = first.start_ms.saturating_add(first.duration_ms);
+        append_pcm_bounded(
+            &mut pcm_out,
+            &first.pcm,
+            MAX_SPEAKER_AUDIO_PCM_BYTES,
+            "speaker audio assembly",
+        )?;
         for chunk in user_chunks.iter().skip(1) {
             if chunk.start_ms > current_ms {
                 let gap_ms = chunk.start_ms - current_ms;
-                pcm_out.extend_from_slice(&silence_bytes(gap_ms, sample_rate));
+                append_silence_bounded(
+                    &mut pcm_out,
+                    gap_ms,
+                    sample_rate,
+                    MAX_SPEAKER_AUDIO_PCM_BYTES,
+                    "speaker audio assembly",
+                )?;
+                current_ms = chunk.start_ms;
             }
             let chunk_pcm = &chunk.pcm;
             if chunk.start_ms < current_ms {
@@ -372,12 +481,22 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
                     "trimming overlapping chunk while stitching speaker audio"
                 );
                 let trimmed = &chunk_pcm[bytes_to_skip..];
-                pcm_out.extend_from_slice(trimmed);
+                append_pcm_bounded(
+                    &mut pcm_out,
+                    trimmed,
+                    MAX_SPEAKER_AUDIO_PCM_BYTES,
+                    "speaker audio assembly",
+                )?;
                 current_ms = current_ms.saturating_add(pcm_duration_ms(trimmed, sample_rate));
                 continue;
             }
-            pcm_out.extend_from_slice(chunk_pcm);
-            current_ms = chunk.start_ms + chunk.duration_ms;
+            append_pcm_bounded(
+                &mut pcm_out,
+                chunk_pcm,
+                MAX_SPEAKER_AUDIO_PCM_BYTES,
+                "speaker audio assembly",
+            )?;
+            current_ms = chunk.start_ms.saturating_add(chunk.duration_ms);
         }
         let (final_pcm, final_rate) = if resample_to_16k {
             let (resampled, rate) = resample_pcm_16le(&pcm_out, sample_rate, 16_000);
@@ -395,9 +514,18 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
         let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
             .map_err(|err| format!("failed to build speaker wav for {user_id}: {err}"))?;
         let safe_user = sanitize_path_component(&user_id);
-        let output_path = speaker_dir.join(format!("{safe_user}_speaker.wav"));
-        fs::write(&output_path, &wav_bytes)
+        let output_file_name = format!("{safe_user}_speaker.wav");
+        if generated_speaker_files.contains(&output_file_name) {
+            return Err(format!(
+                "speaker audio output filename collision for sanitized user id: {safe_user}"
+            ));
+        }
+        let output_path = speaker_dir.join(&output_file_name);
+        let staged_path = speaker_tmp_dir.join(&output_file_name);
+        fs::write(&staged_path, &wav_bytes)
             .map_err(|err| format!("failed to write speaker audio for {user_id}: {err}"))?;
+        generated_speaker_files.insert(output_file_name);
+        staged_speaker_files.push((staged_path, output_path.clone()));
 
         outputs.push(SpeakerAudioInput {
             speaker_id: user_id,
@@ -406,6 +534,54 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
         });
     }
 
+    for (staged_path, output_path) in &staged_speaker_files {
+        fs::rename(staged_path, output_path).map_err(|err| {
+            format!(
+                "failed to promote speaker audio {} to {}: {err}",
+                staged_path.display(),
+                output_path.display()
+            )
+        })?;
+    }
+    fs::remove_dir_all(&speaker_tmp_dir).map_err(|err| {
+        format!(
+            "failed to remove speaker temp dir {}: {err}",
+            speaker_tmp_dir.display()
+        )
+    })?;
+    remove_stale_speaker_wavs(&speaker_dir, &generated_speaker_files)?;
+
     outputs.sort_by(|a, b| a.speaker_id.cmp(&b.speaker_id));
     Ok(outputs)
+}
+
+fn remove_stale_speaker_wavs(
+    speaker_dir: &Path,
+    generated_speaker_files: &HashSet<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(speaker_dir).map_err(|err| {
+        format!(
+            "failed to read speaker dir {}: {err}",
+            speaker_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read speaker dir entry: {err}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with("_speaker.wav") && !generated_speaker_files.contains(file_name) {
+            fs::remove_file(&path).map_err(|err| {
+                format!(
+                    "failed to remove stale speaker wav {}: {err}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }

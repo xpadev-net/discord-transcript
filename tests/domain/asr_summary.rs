@@ -1,7 +1,7 @@
 use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
     build_correction_prompt, build_summary_prompt, build_summary_prompt_with_template,
-    run_summary_pipeline,
+    build_whisper_context_prompt, run_summary_pipeline, run_transcription,
 };
 use discord_transcript::domain::privacy::MaskingStats;
 use discord_transcript::domain::speaker::SpeakerProfile;
@@ -12,8 +12,12 @@ use discord_transcript::domain::summary_template::{
 use discord_transcript::domain::transcript::{
     NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments, render_for_summary,
 };
-use discord_transcript::infrastructure::asr::{StubWhisperClient, parse_whisper_response};
+use discord_transcript::infrastructure::asr::{
+    StubWhisperClient, WhisperClient, WhisperInferenceRequest, WhisperParseError,
+    WhisperTranscriptionResult, parse_whisper_response,
+};
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -45,6 +49,34 @@ fn unique_workspace(test_name: &str, meeting_id: &str) -> TempWorkspaceGuard {
     TempWorkspaceGuard {
         workspace: layout.for_meeting("g1", "vc1", meeting_id),
         base,
+    }
+}
+
+struct RecordingWhisperClient {
+    requests: RefCell<Vec<WhisperInferenceRequest>>,
+    response_json: String,
+}
+
+impl RecordingWhisperClient {
+    fn new() -> Self {
+        Self {
+            requests: RefCell::new(Vec::new()),
+            response_json: r#"{
+              "text":"ok",
+              "segments":[{"speaker":"unknown","start":0.0,"end":1.0,"text":"hello"}]
+            }"#
+            .to_owned(),
+        }
+    }
+}
+
+impl WhisperClient for RecordingWhisperClient {
+    fn infer(
+        &self,
+        request: &WhisperInferenceRequest,
+    ) -> Result<WhisperTranscriptionResult, WhisperParseError> {
+        self.requests.borrow_mut().push(request.clone());
+        parse_whisper_response(&self.response_json)
     }
 }
 
@@ -307,6 +339,74 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
     assert!(result.masking_stats.mention_replacements >= 1);
+}
+
+#[test]
+fn transcription_passes_meeting_prompt_to_per_speaker_whisper_requests() {
+    let whisper = RecordingWhisperClient::new();
+    let temp = unique_workspace("whisper_prompt_speakers", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: Some("障害対応会議".to_owned()),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![
+            SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "alice.wav".to_owned(),
+                offset_ms: 0,
+            },
+            SpeakerAudioInput {
+                speaker_id: "bob".to_owned(),
+                audio_path: "bob.wav".to_owned(),
+                offset_ms: 1_000,
+            },
+        ],
+        language: Some("ja".to_owned()),
+        workspace,
+    };
+
+    run_transcription(&whisper, &request).expect("transcription should succeed");
+
+    let requests = whisper.requests.borrow();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].prompt.as_deref(), Some("Meeting title: 障害対応会議\nSpeaker ID: alice"));
+    assert_eq!(requests[1].prompt.as_deref(), Some("Meeting title: 障害対応会議\nSpeaker ID: bob"));
+}
+
+#[test]
+fn transcription_passes_meeting_prompt_to_mixdown_whisper_request() {
+    let whisper = RecordingWhisperClient::new();
+    let temp = unique_workspace("whisper_prompt_mixdown", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: Some("Sprint Planning".to_owned()),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+
+    run_transcription(&whisper, &request).expect("transcription should succeed");
+
+    let requests = whisper.requests.borrow();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].prompt.as_deref(), Some("Meeting title: Sprint Planning"));
+}
+
+#[test]
+fn whisper_context_prompt_omits_blank_context() {
+    assert_eq!(build_whisper_context_prompt(Some("  "), Some("\t")), None);
+    assert_eq!(
+        build_whisper_context_prompt(Some("定例会\n運用\t確認"), Some("  user-1\nalice  "))
+            .as_deref(),
+        Some("Meeting title: 定例会 運用 確認\nSpeaker ID: user-1 alice")
+    );
 }
 
 #[test]

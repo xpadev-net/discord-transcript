@@ -1475,6 +1475,7 @@ pub async fn run_bot(
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_bases: Arc::new(Mutex::new(HashMap::new())),
+        live_transcription_titles: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_gate: Arc::new(Semaphore::new(1)),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         command_gate: Arc::new(RwLock::new(())),
@@ -1565,6 +1566,7 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
+    live_transcription_titles: Arc<Mutex<HashMap<String, Option<String>>>>,
     live_transcription_gate: Arc<Semaphore>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     command_gate: Arc<RwLock<()>>,
@@ -1687,18 +1689,34 @@ impl ScaffoldHandler {
         Some(*entry)
     }
 
-    fn spawn_live_transcription_tasks(&self, chunks: Vec<PersistedChunk>, base_start_ms: u64) {
+    async fn live_transcription_title(&self, meeting_id: &str) -> Option<String> {
+        let titles = self.live_transcription_titles.lock().await;
+        titles.get(meeting_id).cloned().flatten()
+    }
+
+    fn spawn_live_transcription_tasks(
+        &self,
+        chunks: Vec<PersistedChunk>,
+        base_start_ms: u64,
+        meeting_title: Option<String>,
+    ) {
         for chunk in chunks {
             let runtime = self.clone();
+            let meeting_title = meeting_title.clone();
             self.spawn_background(async move {
                 runtime
-                    .process_live_transcription_chunk(chunk, base_start_ms)
+                    .process_live_transcription_chunk(chunk, base_start_ms, meeting_title)
                     .await;
             });
         }
     }
 
-    async fn process_live_transcription_chunk(&self, chunk: PersistedChunk, base_start_ms: u64) {
+    async fn process_live_transcription_chunk(
+        &self,
+        chunk: PersistedChunk,
+        base_start_ms: u64,
+        meeting_title: Option<String>,
+    ) {
         let Ok(_permit) = Arc::clone(&self.live_transcription_gate)
             .acquire_owned()
             .await
@@ -1755,6 +1773,10 @@ impl ScaffoldHandler {
         let request = WhisperInferenceRequest {
             audio_path: chunk.saved.path.to_string_lossy().to_string(),
             language: effective_settings.whisper_language.clone(),
+            prompt: crate::application::summary::build_whisper_context_prompt(
+                meeting_title.as_deref(),
+                Some(&chunk.user_id),
+            ),
         };
         let transcription = tokio::task::block_in_place(|| whisper.infer(&request));
         let mut segments = match transcription {
@@ -2309,6 +2331,10 @@ impl EventHandler for ScaffoldHandler {
                         let mut states = handler.auto_stop_states.lock().await;
                         states.remove(&guild_for_task);
                     }
+                    if let Some(session) = &removed_session {
+                        let mut titles = handler.live_transcription_titles.lock().await;
+                        titles.remove(&session.meeting_id);
+                    }
                     if let Some(manager) = songbird::get(&ctx_for_task).await {
                         let _ = manager.leave(handler.guild_id).await;
                     }
@@ -2808,6 +2834,18 @@ impl ScaffoldHandler {
                 effective_settings: Some(effective_settings),
             },
         )?;
+        let meeting_title = match service.store.get_meeting(&meeting_id) {
+            Ok(Some(meeting)) => meeting.title,
+            Ok(None) => None,
+            Err(err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    error = %err,
+                    "failed to cache meeting title for live transcription prompt"
+                );
+                None
+            }
+        };
         drop(service);
         self.spawn_record_start_entitlement_observation(guild_id.get().to_string());
 
@@ -2833,6 +2871,10 @@ impl ScaffoldHandler {
                     48_000,
                 ),
             );
+        }
+        {
+            let mut titles = self.live_transcription_titles.lock().await;
+            titles.insert(meeting_id.clone(), meeting_title);
         }
 
         // Register handlers BEFORE voice WS connects to capture initial SSRC
@@ -3042,6 +3084,10 @@ impl ScaffoldHandler {
         {
             let mut states = self.auto_stop_states.lock().await;
             states.remove(&guild_key);
+        }
+        if let Some(session) = &removed_session {
+            let mut titles = self.live_transcription_titles.lock().await;
+            titles.remove(&session.meeting_id);
         }
 
         if let Some(manager) = songbird::get(ctx).await {
@@ -4560,8 +4606,15 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         .live_transcription_base_for_chunks(&persisted_chunks)
                         .await
                 {
-                    self.runtime
-                        .spawn_live_transcription_tasks(persisted_chunks, base_start_ms);
+                    let meeting_title = self
+                        .runtime
+                        .live_transcription_title(&persisted_chunks[0].meeting_id)
+                        .await;
+                    self.runtime.spawn_live_transcription_tasks(
+                        persisted_chunks,
+                        base_start_ms,
+                        meeting_title,
+                    );
                 }
             }
             EventContext::DriverDisconnect(data) => {
@@ -4669,6 +4722,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         {
                             let mut states = runtime.auto_stop_states.lock().await;
                             states.remove(&guild_key);
+                        }
+                        if let Some(session) = &removed_session {
+                            let mut titles = runtime.live_transcription_titles.lock().await;
+                            titles.remove(&session.meeting_id);
                         }
                         // Persist SSRC mapping after session removal so all
                         // events received up to disconnect are captured.
