@@ -22,7 +22,7 @@ use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::{
     MAX_DB_TIMESTAMP_MS, NormalizationConfig, TranscriptSegment, TranscriptSource,
-    normalize_segments, render_for_summary,
+    normalize_segments, ordered_transcript_segments, render_for_summary, sort_transcript_segments,
 };
 use crate::domain::usage::{
     EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
@@ -493,12 +493,15 @@ fn persist_transcript_segments<E: SqlExecutor>(
         return Ok(());
     }
 
-    let base_sql =
-        crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(segments.len(), 1);
+    let ordered_segments = ordered_transcript_segments(segments);
+    let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(
+        ordered_segments.len(),
+        1,
+    );
     let sql = format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
-    let mut params = Vec::with_capacity(segments.len() * 9 + 1);
+    let mut params = Vec::with_capacity(ordered_segments.len() * 9 + 1);
     params.push(meeting_id.to_owned());
-    for (i, seg) in segments.iter().enumerate() {
+    for (i, seg) in ordered_segments.iter().enumerate() {
         let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)
             .map_err(TranscriptPersistError::Validation)?;
         let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)
@@ -776,12 +779,7 @@ fn load_live_transcript_segments<E: SqlExecutor>(
             Ok(segment)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    segments.sort_by(|a, b| {
-        a.start_ms
-            .cmp(&b.start_ms)
-            .then(a.end_ms.cmp(&b.end_ms))
-            .then(a.speaker_id.cmp(&b.speaker_id))
-    });
+    sort_transcript_segments(&mut segments);
     Ok(segments)
 }
 
@@ -1831,12 +1829,7 @@ impl ScaffoldHandler {
                         segment
                     })
                     .collect::<Vec<_>>();
-                segments.sort_by(|a, b| {
-                    a.start_ms
-                        .cmp(&b.start_ms)
-                        .then(a.end_ms.cmp(&b.end_ms))
-                        .then(a.speaker_id.cmp(&b.speaker_id))
-                });
+                sort_transcript_segments(&mut segments);
                 normalize_segments(&segments, NormalizationConfig::default())
             }
             Err(err) => {
@@ -3895,12 +3888,7 @@ impl ScaffoldHandler {
                     return Ok(output);
                 }
                 output.segments.extend(live_segments.clone());
-                output.segments.sort_by(|a, b| {
-                    a.start_ms
-                        .cmp(&b.start_ms)
-                        .then(a.end_ms.cmp(&b.end_ms))
-                        .then(a.speaker_id.cmp(&b.speaker_id))
-                });
+                sort_transcript_segments(&mut output.segments);
                 crate::application::summary::build_transcription_output(output.segments)
             })
         };
@@ -4022,12 +4010,7 @@ impl ScaffoldHandler {
                     }
                     if !vc_segments.is_empty() {
                         transcription.segments.extend(vc_segments);
-                        transcription.segments.sort_by(|a, b| {
-                            a.start_ms
-                                .cmp(&b.start_ms)
-                                .then(a.end_ms.cmp(&b.end_ms))
-                                .then(a.speaker_id.cmp(&b.speaker_id))
-                        });
+                        sort_transcript_segments(&mut transcription.segments);
                         transcription.segments = normalize_segments(
                             &transcription.segments,
                             NormalizationConfig::default(),
@@ -5629,6 +5612,33 @@ mod status_message_tests {
                 .contains("failed to persist transcript segments")
         );
         assert!(err.to_string().contains("integer out of range"));
+    }
+
+    #[test]
+    fn transcript_persist_orders_rows_by_canonical_timeline() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let mut early_alice = transcript_segment(0, 5_000);
+        early_alice.text = "first alice".to_owned();
+        let mut late_alice = transcript_segment(2_200, 2_600);
+        late_alice.text = "second alice".to_owned();
+        let mut bob = transcript_segment(1_200, 1_800);
+        bob.speaker_id = "bob".to_owned();
+        bob.text = "bob cuts in".to_owned();
+
+        persist_transcript_segments(&mut executor, "m1", &[late_alice, early_alice, bob])
+            .expect("transcript should persist");
+
+        let (_, params) = executor
+            .executed
+            .iter()
+            .find(|(sql, _)| sql.contains("INSERT INTO transcripts"))
+            .expect("transcript insert should execute");
+        assert_eq!(params[3], "alice");
+        assert_eq!(params[4], "0");
+        assert_eq!(params[12], "bob");
+        assert_eq!(params[13], "1200");
+        assert_eq!(params[21], "alice");
+        assert_eq!(params[22], "2200");
     }
 
     #[test]

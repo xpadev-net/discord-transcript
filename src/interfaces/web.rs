@@ -28,7 +28,9 @@ use crate::domain::audit::AuditEvent;
 use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{summary_template_variables, validate_summary_template};
-use crate::domain::transcript::TranscriptSource;
+use crate::domain::transcript::{
+    TranscriptSource, TranscriptTimelineOrderKey, compare_transcript_timeline_order,
+};
 use crate::domain::usage::{NewUsageEvent, UsageDetailJson, UsageMetric};
 use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
@@ -4816,15 +4818,31 @@ async fn load_transcript_segments_after(
         });
     }
 
-    segments.sort_by(|a, b| {
-        a.start_ms
-            .cmp(&b.start_ms)
-            .then(a.end_ms.cmp(&b.end_ms))
-            .then(a.speaker_id.cmp(&b.speaker_id))
-            .then(a.id.cmp(&b.id))
-    });
+    sort_transcript_segment_responses(&mut segments);
 
     Ok((segments, next_cursor))
+}
+
+fn sort_transcript_segment_responses(segments: &mut [TranscriptSegmentResponse]) {
+    segments.sort_by(|left, right| {
+        compare_transcript_timeline_order(
+            transcript_response_order_key(left),
+            transcript_response_order_key(right),
+        )
+    });
+}
+
+fn transcript_response_order_key(
+    segment: &TranscriptSegmentResponse,
+) -> TranscriptTimelineOrderKey<'_> {
+    let source = TranscriptSource::parse_str(&segment.source)
+        .expect("transcript response source is validated before sorting");
+    TranscriptTimelineOrderKey::new(
+        i64::from(segment.start_ms),
+        i64::from(segment.end_ms),
+        source,
+        Some(&segment.id),
+    )
 }
 
 async fn api_transcript_state(
@@ -8063,7 +8081,10 @@ mod session_reverify_tests {
 
 #[cfg(test)]
 mod transcript_source_api_tests {
-    use super::{api_transcript_sql, transcript_source_for_api};
+    use super::{
+        SpeakerResponse, TranscriptSegmentResponse, api_transcript_sql,
+        sort_transcript_segment_responses, transcript_source_for_api,
+    };
     use crate::domain::transcript::TranscriptSource;
 
     #[test]
@@ -8106,6 +8127,58 @@ mod transcript_source_api_tests {
             !sql.contains("ORDER BY t.start_ms, t.end_ms"),
             "raw live timestamps can be out of final timeline order after rebasing"
         );
+    }
+
+    #[test]
+    fn api_transcript_response_uses_canonical_timeline_order() {
+        let mut segments = vec![
+            transcript_segment_response(
+                "late-alice",
+                "alice",
+                2_200,
+                2_600,
+                TranscriptSource::Voice,
+            ),
+            transcript_segment_response("early-alice", "alice", 0, 5_000, TranscriptSource::Voice),
+            transcript_segment_response("bob", "bob", 1_200, 1_800, TranscriptSource::Voice),
+            transcript_segment_response("vc", "carol", 1_200, 1_800, TranscriptSource::VcText),
+        ];
+
+        sort_transcript_segment_responses(&mut segments);
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["early-alice", "bob", "vc", "late-alice"]
+        );
+    }
+
+    fn transcript_segment_response(
+        id: &str,
+        speaker_id: &str,
+        start_ms: i32,
+        end_ms: i32,
+        source: TranscriptSource,
+    ) -> TranscriptSegmentResponse {
+        TranscriptSegmentResponse {
+            id: id.to_owned(),
+            speaker_id: speaker_id.to_owned(),
+            speaker: SpeakerResponse {
+                id: speaker_id.to_owned(),
+                username: None,
+                nickname: None,
+                display_name: None,
+                display_label: speaker_id.to_owned(),
+            },
+            start_ms,
+            end_ms,
+            text: id.to_owned(),
+            confidence: None,
+            is_noisy: false,
+            source: source.as_str().to_owned(),
+        }
     }
 }
 
