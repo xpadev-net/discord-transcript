@@ -50,6 +50,7 @@ pub struct AppConfig {
     pub summary_harness: SummaryHarness,
     pub summary_command: String,
     pub summary_model: String,
+    pub summary_allow_unsafe_agent_harness: bool,
     pub summary_enabled: bool,
     pub database_url: String,
     pub database_ssl_mode: String,
@@ -112,6 +113,9 @@ impl AppConfig {
             .map(|s| SummaryHarness::parse(&s))
             .transpose()?
             .unwrap_or(SummaryHarness::Claude);
+        let summary_allow_unsafe_agent_harness =
+            optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
+        validate_unsafe_agent_harness_opt_in(summary_harness, summary_allow_unsafe_agent_harness)?;
         let (summary_command, summary_model) = resolve_summary_settings(
             summary_harness,
             optional_env("SUMMARY_COMMAND"),
@@ -127,6 +131,7 @@ impl AppConfig {
             summary_harness,
             summary_command,
             summary_model,
+            summary_allow_unsafe_agent_harness,
             summary_enabled: optional_env_parse_bool("SUMMARY_ENABLED", true)?,
             database_url,
             database_ssl_mode: optional_env("DATABASE_SSL_MODE")
@@ -201,6 +206,9 @@ impl AppConfig {
             .map(|s| SummaryHarness::parse(&s))
             .transpose()?
             .unwrap_or(SummaryHarness::Claude);
+        let summary_allow_unsafe_agent_harness =
+            optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
+        validate_unsafe_agent_harness_opt_in(summary_harness, summary_allow_unsafe_agent_harness)?;
         let (summary_command, summary_model) = resolve_summary_settings(
             summary_harness,
             optional_from_map(values, "SUMMARY_COMMAND"),
@@ -216,6 +224,7 @@ impl AppConfig {
             summary_harness,
             summary_command,
             summary_model,
+            summary_allow_unsafe_agent_harness,
             summary_enabled: optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?,
             database_url,
             database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
@@ -315,6 +324,18 @@ fn parse_csv_list(value: Option<String>) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn validate_unsafe_agent_harness_opt_in(
+    _harness: SummaryHarness,
+    allow_unsafe_agent_harness: bool,
+) -> Result<(), ConfigError> {
+    if !allow_unsafe_agent_harness {
+        return Err(ConfigError::MissingEnv {
+            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS",
+        });
+    }
+    Ok(())
 }
 
 fn resolve_summary_settings(

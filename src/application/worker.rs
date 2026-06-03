@@ -301,35 +301,44 @@ where
         &request.workspace,
         &transcription.transcript_for_summary,
     );
-    // Reuse the persisted prompt (when one was written) instead of rebuilding
-    // it inside `correct_transcript`. Falls back to a fresh build only for the
-    // (rare) case where the artifact was skipped — e.g., transcript fully
-    // empty — but `correct_transcript_with_prompt` still short-circuits there.
-    let correction_prompt = persist_correction_prompt_debug_artifact(
-        &request.workspace,
-        &transcription.transcript_for_summary,
-        request.language.as_deref(),
-    )
-    .unwrap_or_else(|| {
-        build_correction_prompt(
+
+    // Apply LLM-based error correction to the transcript before summarization.
+    let transcription = if !claude.supports_transcript_correction() {
+        info!(
+            meeting_id = %input.meeting_id,
+            "skipping LLM transcript correction (not supported by summary harness)"
+        );
+        transcription
+    } else {
+        // Reuse the persisted prompt (when one was written) instead of rebuilding
+        // it inside `correct_transcript`. Falls back to a fresh build only for the
+        // (rare) case where the artifact was skipped — e.g., transcript fully
+        // empty — but `correct_transcript_with_prompt` still short-circuits there.
+        let correction_prompt = persist_correction_prompt_debug_artifact(
+            &request.workspace,
             &transcription.transcript_for_summary,
             request.language.as_deref(),
         )
-    });
+        .unwrap_or_else(|| {
+            build_correction_prompt(
+                &transcription.transcript_for_summary,
+                request.language.as_deref(),
+            )
+        });
 
-    // Apply LLM-based error correction to the transcript before summarization.
-    let transcription = match correct_transcript_with_prompt(
-        claude,
-        &transcription.transcript_for_summary,
-        &correction_prompt,
-    ) {
-        Ok(corrected) => TranscriptionOutput {
-            transcript_for_summary: corrected,
-            ..transcription
-        },
-        Err(err) => {
-            warn!(meeting_id = %input.meeting_id, error = %err, "transcript correction failed, using original");
-            transcription
+        match correct_transcript_with_prompt(
+            claude,
+            &transcription.transcript_for_summary,
+            &correction_prompt,
+        ) {
+            Ok(corrected) => TranscriptionOutput {
+                transcript_for_summary: corrected,
+                ..transcription
+            },
+            Err(err) => {
+                warn!(meeting_id = %input.meeting_id, error = %err, "transcript correction failed, using original");
+                transcription
+            }
         }
     };
 

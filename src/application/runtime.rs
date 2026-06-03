@@ -1489,6 +1489,7 @@ pub async fn run_bot(
         summary_harness: config.summary_harness,
         summary_command: config.summary_command.clone(),
         summary_model: config.summary_model.clone(),
+        summary_allow_unsafe_agent_harness: config.summary_allow_unsafe_agent_harness,
         whisper_language: config.whisper_language.clone(),
         whisper_beam_size: config.whisper_beam_size,
         whisper_suppress_non_speech: config.whisper_suppress_non_speech,
@@ -1619,6 +1620,7 @@ struct ScaffoldHandler {
     summary_harness: SummaryHarness,
     summary_command: String,
     summary_model: String,
+    summary_allow_unsafe_agent_harness: bool,
     whisper_language: Option<String>,
     whisper_beam_size: u32,
     whisper_suppress_non_speech: bool,
@@ -3586,6 +3588,7 @@ impl ScaffoldHandler {
             harness: self.summary_harness,
             command_path: self.summary_command.clone(),
             model: self.summary_model.clone(),
+            allow_unsafe_agent_harness: self.summary_allow_unsafe_agent_harness,
             retry_policy: self.integration_retry_policy,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
