@@ -17,12 +17,12 @@ function safeSummaryHref(href: string | undefined): string | null {
   if (trimmed.startsWith("#")) {
     return trimmed;
   }
+  if (typeof window === "undefined") {
+    return null;
+  }
 
   try {
-    const currentOrigin =
-      typeof window === "undefined"
-        ? "http://localhost"
-        : window.location.origin;
+    const currentOrigin = window.location.origin;
     const url = new URL(trimmed, currentOrigin);
     if (
       (url.protocol === "http:" || url.protocol === "https:") &&

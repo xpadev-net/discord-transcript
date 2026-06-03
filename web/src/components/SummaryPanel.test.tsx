@@ -34,6 +34,19 @@ describe("SummaryPanel markdown rendering", () => {
     expect(screen.getByText("external reference")).toBeTruthy();
   });
 
+  it("renders hash and same-origin links as safe links", () => {
+    renderSummary("[section](#decisions) [meeting](/meetings/meeting-1)");
+
+    expect(screen.getByRole("link", { name: "section" })).toHaveProperty(
+      "hash",
+      "#decisions",
+    );
+    expect(screen.getByRole("link", { name: "meeting" })).toHaveProperty(
+      "pathname",
+      "/meetings/meeting-1",
+    );
+  });
+
   it("continues to render normal summary markdown text", () => {
     renderSummary(
       "## Decisions\n\n- Ship the safe renderer\n\n**Owner:** team",
