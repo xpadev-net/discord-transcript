@@ -3371,14 +3371,28 @@ impl ScaffoldHandler {
         audio_path: &str,
         transcription: &crate::application::summary::TranscriptionOutput,
     ) {
-        let quantity = match crate::application::worker::asr_seconds_from_audio_path(audio_path) {
-            Ok(quantity) => quantity,
-            Err(err) => {
+        let audio_path_for_read = audio_path.to_owned();
+        let quantity = match tokio::task::spawn_blocking(move || {
+            crate::application::worker::asr_seconds_from_audio_path(&audio_path_for_read)
+        })
+        .await
+        {
+            Ok(Ok(quantity)) => quantity,
+            Ok(Err(err)) => {
                 warn!(
                     meeting_id,
                     audio_path,
                     error = %err,
                     "skipping ASR usage event because audio duration is unavailable"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    meeting_id,
+                    audio_path,
+                    error = %err,
+                    "skipping ASR usage event because audio duration task failed"
                 );
                 return;
             }
