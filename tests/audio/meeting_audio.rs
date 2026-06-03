@@ -1,13 +1,16 @@
 use discord_transcript::audio::receiver::BufferedFrame;
+use discord_transcript::audio::wav::MAX_WAV_CHUNK_PCM_BYTES;
 use discord_transcript::audio::{build_wav_bytes_raw, build_wav_chunk};
 use discord_transcript::application::runtime::merge_user_chunks_to_mixdown;
 use discord_transcript::audio::meeting_audio::{
-    ProcessedAudioChunk, build_speaker_audio_inputs,
-    build_speaker_audio_inputs_excluding_processed_chunks, load_chunks,
+    MAX_MEETING_AUDIO_CHUNKS, MAX_MEETING_AUDIO_SPAN_MS, MAX_SPEAKER_AUDIO_OUTPUTS,
+    ProcessedAudioChunk, build_speaker_audio_inputs, build_speaker_audio_inputs_excluding_processed_chunks,
+    load_chunks,
 };
 use discord_transcript::audio::wav::resample_pcm_16le;
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
 
 fn unique_temp_dir(test_name: &str) -> PathBuf {
@@ -123,6 +126,32 @@ fn speaker_audio_writes_to_workspace_speakers_dir() {
 }
 
 #[test]
+fn speaker_audio_removes_stale_generated_wavs_on_rebuild() {
+    let root = unique_temp_dir("speaker_cleanup");
+    let workspace =
+        MeetingWorkspaceLayout::new(root.to_string_lossy().as_ref()).for_meeting("g1", "vc1", "m1");
+    fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+    fs::create_dir_all(workspace.speakers_dir()).expect("speaker dir should be created");
+
+    let stale_path = workspace.speakers_dir().join("old_speaker.wav");
+    fs::write(&stale_path, b"stale").expect("stale speaker wav should be written");
+    let keep_path = workspace.speakers_dir().join("notes.txt");
+    fs::write(&keep_path, b"keep").expect("non-speaker file should be written");
+
+    let chunk = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).unwrap();
+    fs::write(workspace.audio_dir().join("alice_1_1000.wav"), &chunk).unwrap();
+
+    let outputs = build_speaker_audio_inputs(&workspace.audio_dir(), false)
+        .expect("speaker audio should build");
+
+    assert_eq!(outputs.len(), 1);
+    assert!(!stale_path.exists());
+    assert!(keep_path.exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn build_wav_chunk_preserves_timestamp_gaps_as_silence() {
     let first = i16_pcm(&[1; 10]);
     let second = i16_pcm(&[2; 10]);
@@ -205,6 +234,29 @@ fn build_wav_chunk_keeps_overlapping_frames_without_dropping_pcm() {
 }
 
 #[test]
+fn build_wav_chunk_rejects_far_future_gap_before_allocating() {
+    let first = i16_pcm(&[1]);
+    let second = i16_pcm(&[2]);
+    let gap_ms = ((MAX_WAV_CHUNK_PCM_BYTES as u64 / 2) * 1_000 / 48_000) + 1_000;
+    let err = build_wav_chunk(
+        &[
+            BufferedFrame {
+                timestamp_ms: 0,
+                pcm_16le_bytes: first,
+            },
+            BufferedFrame {
+                timestamp_ms: gap_ms,
+                pcm_16le_bytes: second,
+            },
+        ],
+        48_000,
+    )
+    .expect_err("far-future frame gap should be rejected before allocating silence");
+
+    assert!(err.to_string().contains("PCM assembly too large"));
+}
+
+#[test]
 fn speaker_audio_does_not_normalize_pcm_amplitude() {
     let base = unique_temp_dir("no_normalize");
     fs::create_dir_all(&base).expect("dir should be created");
@@ -216,6 +268,136 @@ fn speaker_audio_does_not_normalize_pcm_amplitude() {
     let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should build");
     let speaker_wav = fs::read(&outputs[0].audio_path).expect("speaker wav should exist");
     assert_eq!(&speaker_wav[44..], pcm.as_slice());
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn speaker_audio_rejects_long_gap_before_allocating_silence() {
+    let base = unique_temp_dir("speaker_gap_limit");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let wav = build_wav_bytes_raw(&i16_pcm(&[1]), 48_000, 1, 16).unwrap();
+    fs::write(base.join("alice_1_0.wav"), &wav).unwrap();
+    fs::write(
+        base.join(format!("alice_2_{}.wav", MAX_MEETING_AUDIO_SPAN_MS + 60_000)),
+        &wav,
+    )
+    .unwrap();
+
+    let err = build_speaker_audio_inputs(&base, false)
+        .expect_err("speaker stitching should reject oversized silence gaps");
+    assert!(err.contains("speaker audio assembly exceeds PCM limit"));
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn speaker_audio_keeps_existing_outputs_when_rebuild_fails() {
+    let root = unique_temp_dir("speaker_failure_keeps_existing");
+    let workspace =
+        MeetingWorkspaceLayout::new(root.to_string_lossy().as_ref()).for_meeting("g1", "vc1", "m1");
+    fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+    fs::create_dir_all(workspace.speakers_dir()).expect("speaker dir should be created");
+
+    let stale_path = workspace.speakers_dir().join("old_speaker.wav");
+    fs::write(&stale_path, b"stale").expect("stale speaker wav should be written");
+    let existing_output = workspace.speakers_dir().join("alice_speaker.wav");
+    fs::write(&existing_output, b"existing").expect("existing speaker wav should be written");
+
+    let wav = build_wav_bytes_raw(&i16_pcm(&[1]), 48_000, 1, 16).unwrap();
+    fs::write(workspace.audio_dir().join("alice_1_0.wav"), &wav).unwrap();
+    fs::write(workspace.audio_dir().join("bob_1_0.wav"), &wav).unwrap();
+    fs::write(
+        workspace
+            .audio_dir()
+            .join(format!("bob_2_{}.wav", MAX_MEETING_AUDIO_SPAN_MS + 60_000)),
+        &wav,
+    )
+    .unwrap();
+
+    let err = build_speaker_audio_inputs(&workspace.audio_dir(), false)
+        .expect_err("oversized speaker rebuild should fail");
+    assert!(err.contains("speaker audio assembly exceeds PCM limit"));
+    assert!(stale_path.exists());
+    assert_eq!(fs::read(&existing_output).unwrap(), b"existing");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn speaker_audio_rejects_sanitized_filename_collisions_before_overwrite() {
+    let root = unique_temp_dir("speaker_collision");
+    let workspace =
+        MeetingWorkspaceLayout::new(root.to_string_lossy().as_ref()).for_meeting("g1", "vc1", "m1");
+    fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+    fs::create_dir_all(workspace.speakers_dir()).expect("speaker dir should be created");
+
+    let existing_output = workspace.speakers_dir().join("ab_speaker.wav");
+    fs::write(&existing_output, b"existing").expect("existing speaker wav should be written");
+
+    let wav = build_wav_bytes_raw(&i16_pcm(&[1]), 1_000, 1, 16).unwrap();
+    fs::write(workspace.audio_dir().join("a:b_1_0.wav"), &wav).unwrap();
+    fs::write(workspace.audio_dir().join("ab_1_0.wav"), &wav).unwrap();
+
+    let err = build_speaker_audio_inputs(&workspace.audio_dir(), false)
+        .expect_err("sanitized output collision should fail");
+    assert!(err.contains("speaker audio output filename collision"));
+    assert_eq!(fs::read(&existing_output).unwrap(), b"existing");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn speaker_audio_rejects_too_many_output_files() {
+    let base = unique_temp_dir("speaker_output_limit");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let wav = build_wav_bytes_raw(&i16_pcm(&[1]), 1_000, 1, 16).unwrap();
+    for speaker_index in 0..=MAX_SPEAKER_AUDIO_OUTPUTS {
+        fs::write(
+            base.join(format!("speaker{speaker_index}_1_0.wav")),
+            &wav,
+        )
+        .unwrap();
+    }
+
+    let err = build_speaker_audio_inputs(&base, false)
+        .expect_err("speaker stitching should reject too many output files");
+    assert!(err.contains("too many speaker audio outputs"));
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_rejects_too_many_valid_chunk_files() {
+    let base = unique_temp_dir("chunk_count_limit");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let wav = build_wav_bytes_raw(&i16_pcm(&[1]), 1_000, 1, 16).unwrap();
+    for chunk_index in 0..=MAX_MEETING_AUDIO_CHUNKS {
+        fs::write(base.join(format!("alice_{chunk_index}_0.wav")), &wav).unwrap();
+    }
+
+    let err = load_chunks(&base).expect_err("chunk loading should reject too many valid files");
+    assert!(err.contains("too many audio chunks"));
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_rejects_oversized_wav_before_reading_body() {
+    let base = unique_temp_dir("oversized_file");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let path = base.join("alice_1_0.wav");
+    let file = File::create(&path).expect("sparse wav placeholder should be created");
+    file.set_len((MAX_WAV_CHUNK_PCM_BYTES + 45) as u64)
+        .expect("sparse oversized wav should be extended");
+
+    let err = load_chunks(&base).expect_err("oversized wav should not be loaded");
+    assert!(err.contains("no audio chunks found"));
+    assert!(err.contains("skipped 1 corrupt chunk(s)"));
 
     let _ = fs::remove_dir_all(base);
 }

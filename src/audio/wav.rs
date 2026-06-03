@@ -11,6 +11,7 @@ pub struct WavChunk {
 pub enum AudioError {
     InvalidPcmLength(usize),
     PcmTooLarge(usize),
+    PcmAssemblyTooLarge { attempted: usize, max: usize },
 }
 
 impl Display for AudioError {
@@ -28,11 +29,19 @@ impl Display for AudioError {
                     "PCM data too large for WAV format (max ~4GB): {length} bytes"
                 )
             }
+            Self::PcmAssemblyTooLarge { attempted, max } => {
+                write!(
+                    f,
+                    "PCM assembly too large: attempted {attempted} bytes (max {max})"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for AudioError {}
+
+pub const MAX_WAV_CHUNK_PCM_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn build_wav_chunk(frames: &[BufferedFrame], sample_rate: u32) -> Result<WavChunk, AudioError> {
     let mut pcm = Vec::new();
@@ -49,13 +58,27 @@ pub fn build_wav_chunk(frames: &[BufferedFrame], sample_rate: u32) -> Result<Wav
             && frame.timestamp_ms > end_ms
         {
             let gap_ms = frame.timestamp_ms - end_ms;
-            let gap_samples = (gap_ms as u128)
-                .saturating_mul(sample_rate as u128)
-                .saturating_div(1_000) as usize;
-            pcm.resize(pcm.len().saturating_add(gap_samples.saturating_mul(2)), 0);
+            let gap_bytes = pcm_byte_len_for_duration_ms(gap_ms, sample_rate).unwrap_or(usize::MAX);
+            let next_len = checked_pcm_growth(pcm.len(), gap_bytes, MAX_WAV_CHUNK_PCM_BYTES)?;
+            pcm.try_reserve(next_len.saturating_sub(pcm.len()))
+                .map_err(|_| AudioError::PcmAssemblyTooLarge {
+                    attempted: next_len,
+                    max: MAX_WAV_CHUNK_PCM_BYTES,
+                })?;
+            pcm.resize(next_len, 0);
             output_end_ms = Some(frame.timestamp_ms);
         }
 
+        let next_len = checked_pcm_growth(
+            pcm.len(),
+            frame.pcm_16le_bytes.len(),
+            MAX_WAV_CHUNK_PCM_BYTES,
+        )?;
+        pcm.try_reserve(next_len.saturating_sub(pcm.len()))
+            .map_err(|_| AudioError::PcmAssemblyTooLarge {
+                attempted: next_len,
+                max: MAX_WAV_CHUNK_PCM_BYTES,
+            })?;
         pcm.extend_from_slice(&frame.pcm_16le_bytes);
         output_end_ms = Some(
             output_end_ms
@@ -66,6 +89,34 @@ pub fn build_wav_chunk(frames: &[BufferedFrame], sample_rate: u32) -> Result<Wav
 
     let wav = build_wav_bytes(&pcm, sample_rate, 1, 16)?;
     Ok(WavChunk { bytes: wav })
+}
+
+pub(crate) fn checked_pcm_growth(
+    current: usize,
+    additional: usize,
+    max: usize,
+) -> Result<usize, AudioError> {
+    let Some(next) = current.checked_add(additional) else {
+        return Err(AudioError::PcmAssemblyTooLarge {
+            attempted: usize::MAX,
+            max,
+        });
+    };
+    if next > max {
+        return Err(AudioError::PcmAssemblyTooLarge {
+            attempted: next,
+            max,
+        });
+    }
+    Ok(next)
+}
+
+pub(crate) fn pcm_byte_len_for_duration_ms(duration_ms: u64, sample_rate: u32) -> Option<usize> {
+    let samples = (duration_ms as u128)
+        .checked_mul(sample_rate as u128)?
+        .checked_div(1_000)?;
+    let bytes = samples.checked_mul(2)?;
+    usize::try_from(bytes).ok()
 }
 
 pub fn pcm_duration_ms(pcm_16le: &[u8], sample_rate: u32) -> u64 {
