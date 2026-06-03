@@ -620,6 +620,8 @@ pub fn build_summary_prompt(request: &SummaryRequest, manifest: &TranscriptManif
     build_summary_prompt_with_context(request, manifest, None)
 }
 
+/// Build the default summary prompt while referencing materialized context
+/// only when a context manifest is supplied.
 pub fn build_summary_prompt_with_context(
     request: &SummaryRequest,
     manifest: &TranscriptManifest,
@@ -636,6 +638,14 @@ pub fn build_summary_prompt_with_context(
         .as_deref()
         .unwrap_or("unknown or auto-detected");
     let context_files = summary_context_file_list(context);
+    let context_instructions = context
+        .map(|_| {
+            format!(
+                "- Read `context/{CONTEXT_MANIFEST_FILENAME}` first; it records reproducibility metadata and paths for materialized context without inlining sensitive context bodies.\n\
+- Read the materialized speaker roster and domain knowledge files; do not assume live database context beyond those files.\n"
+            )
+        })
+        .unwrap_or_default();
     let summary_template_instruction = if let Some(context) = context
         && let Some(path) = context.summary_template_path.as_deref()
     {
@@ -670,8 +680,7 @@ Masking stats: mentions={}, emails={}, phones={}\n\
 \n\
 Instructions:\n\
 - Read the transcript file to produce the summary; do not expect transcript text inline.\n\
-- Read `context/{CONTEXT_MANIFEST_FILENAME}` first when it is listed above; it records reproducibility metadata and paths for materialized context without inlining sensitive context bodies.\n\
-- Read the materialized speaker roster and domain knowledge files when they are listed above; do not assume live database context beyond those files.\n\
+{context_instructions}\
 {summary_template_instruction}\
 - Output language: Write the **entire** markdown output in the **same language** as the Whisper setting above (this matches how the transcript was transcribed). That includes all section headings, paragraphs, and list items. Examples: if the setting is `ja`, use Japanese throughout; if `en`, English throughout; if `de`, German throughout.\n\
 - If the Whisper language is shown as `unknown or auto-detected`, infer the output language from the dominant language of the transcript text.\n\
@@ -710,6 +719,9 @@ fn summary_context_file_list(context: Option<&SummaryContextManifest>) -> String
     lines
 }
 
+/// Render a custom summary template. Templates that use
+/// `{{speaker_roster}}` or `{{domain_context_path}}` expect the caller to have
+/// materialized summary context in the workspace first.
 pub fn build_summary_prompt_with_template(
     request: &SummaryRequest,
     manifest: &TranscriptManifest,

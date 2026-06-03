@@ -455,6 +455,9 @@ fn prompt_contains_required_sections() {
         "prompt should guide model to retain speaker attribution"
     );
     assert!(!prompt.contains(forbidden));
+    assert!(!prompt.contains("context/manifest.json"));
+    assert!(!prompt.contains("context/speakers.json"));
+    assert!(!prompt.contains("context/domain_knowledge.md"));
 }
 
 #[test]
