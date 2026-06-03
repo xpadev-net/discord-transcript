@@ -298,6 +298,11 @@ fn entitlement_evaluator_observe_only_never_blocks() {
     assert!(observe_only.allowed);
     assert!(observe_only.observations[0].exceeded);
     assert!(!enforced.allowed);
+
+    let default_observe_only =
+        EntitlementEvaluator::observe_only().evaluate(EntitlementAction::StartRecording, &snapshot);
+    assert!(default_observe_only.allowed);
+    assert_eq!(default_observe_only.observations.len(), 5);
 }
 
 #[test]
@@ -331,4 +336,34 @@ fn in_memory_usage_aggregate_honors_recent_window() {
 
     assert_eq!(aggregate.len(), 1);
     assert_eq!(aggregate[0].quantity, 1);
+}
+
+#[test]
+fn in_memory_usage_tenant_filter_includes_guild_scoped_events() {
+    let mut store = InMemoryMeetingStore::new();
+    store
+        .append_usage_event(&NewUsageEvent {
+            id: "usage-guild-scoped".to_owned(),
+            tenant_id: None,
+            guild_id: "g1".to_owned(),
+            meeting_id: Some("m1".to_owned()),
+            job_id: None,
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some("m1".to_owned()),
+            metric: UsageMetric::SummaryRuns,
+            quantity: 1,
+            detail_json: "{}".to_owned(),
+            observed_at: Utc::now(),
+        })
+        .expect("usage event should append");
+
+    let by_tenant_and_guild = store
+        .list_recent_usage_events(Some("tenant-g1"), Some("g1"), 500)
+        .expect("usage list should succeed");
+    let by_tenant_only = store
+        .list_recent_usage_events(Some("tenant-g1"), None, 500)
+        .expect("usage list should succeed");
+
+    assert_eq!(by_tenant_and_guild.len(), 1);
+    assert!(by_tenant_only.is_empty());
 }

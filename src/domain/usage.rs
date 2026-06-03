@@ -111,6 +111,16 @@ pub struct EntitlementPolicy {
 }
 
 impl EntitlementPolicy {
+    pub fn observe_all() -> Self {
+        Self {
+            recording_minutes_limit: Some(i64::MAX),
+            asr_seconds_limit: Some(i64::MAX),
+            summary_runs_limit: Some(i64::MAX),
+            storage_bytes_limit: Some(i64::MAX),
+            debug_downloads_limit: Some(i64::MAX),
+        }
+    }
+
     fn limit_for(&self, metric: UsageMetric) -> Option<i64> {
         match metric {
             UsageMetric::RecordingMinutes => self.recording_minutes_limit,
@@ -148,7 +158,7 @@ impl EntitlementEvaluator {
     pub fn observe_only() -> Self {
         Self {
             mode: EntitlementMode::ObserveOnly,
-            policy: EntitlementPolicy::default(),
+            policy: EntitlementPolicy::observe_all(),
         }
     }
 

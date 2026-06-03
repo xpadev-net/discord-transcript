@@ -124,6 +124,8 @@ pub trait MeetingStore: UsageEventStore {
 pub trait UsageEventStore {
     fn append_usage_event(&mut self, event: &NewUsageEvent) -> Result<(), StoreError>;
 
+    /// List recent immutable usage events. Implementations clamp `limit` to at
+    /// most 100 rows to keep observe-only reads bounded.
     fn list_recent_usage_events(
         &mut self,
         tenant_id: Option<&str>,
@@ -323,9 +325,7 @@ impl UsageEventStore for InMemoryMeetingStore {
         let mut events = self
             .usage_events
             .values()
-            .filter(|event| {
-                tenant_id.is_none_or(|tenant_id| event.tenant_id.as_deref() == Some(tenant_id))
-            })
+            .filter(|event| in_memory_usage_tenant_matches(event, tenant_id, guild_id))
             .filter(|event| guild_id.is_none_or(|guild_id| event.guild_id == guild_id))
             .cloned()
             .collect::<Vec<_>>();
@@ -335,7 +335,7 @@ impl UsageEventStore for InMemoryMeetingStore {
                 .cmp(&left.observed_at)
                 .then_with(|| right.id.cmp(&left.id))
         });
-        events.truncate(limit as usize);
+        events.truncate(limit.min(100) as usize);
         Ok(events)
     }
 
@@ -351,9 +351,7 @@ impl UsageEventStore for InMemoryMeetingStore {
         for event in self
             .usage_events
             .values()
-            .filter(|event| {
-                tenant_id.is_none_or(|tenant_id| event.tenant_id.as_deref() == Some(tenant_id))
-            })
+            .filter(|event| in_memory_usage_tenant_matches(event, tenant_id, guild_id))
             .filter(|event| guild_id.is_none_or(|guild_id| event.guild_id == guild_id))
             .filter(|event| {
                 now.signed_duration_since(event.observed_at)
@@ -369,6 +367,20 @@ impl UsageEventStore for InMemoryMeetingStore {
             .map(|(metric, quantity)| UsageAggregate { metric, quantity })
             .collect())
     }
+}
+
+fn in_memory_usage_tenant_matches(
+    event: &UsageEvent,
+    tenant_id: Option<&str>,
+    guild_id: Option<&str>,
+) -> bool {
+    let Some(tenant_id) = tenant_id else {
+        return true;
+    };
+    if event.tenant_id.as_deref() == Some(tenant_id) {
+        return true;
+    }
+    event.tenant_id.is_none() && guild_id.is_some_and(|guild_id| event.guild_id == guild_id)
 }
 
 impl MeetingStore for InMemoryMeetingStore {

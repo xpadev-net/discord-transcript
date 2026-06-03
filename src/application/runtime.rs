@@ -336,31 +336,6 @@ fn recording_duration_seconds(meeting: &StoredMeeting) -> Option<u64> {
     Some(seconds.max(0) as u64)
 }
 
-fn asr_seconds_from_transcription(
-    transcription: &crate::application::summary::TranscriptionOutput,
-) -> i64 {
-    let Some(first_start) = transcription
-        .segments
-        .iter()
-        .map(|segment| segment.start_ms)
-        .min()
-    else {
-        return 0;
-    };
-    let Some(last_end) = transcription
-        .segments
-        .iter()
-        .map(|segment| segment.end_ms)
-        .max()
-    else {
-        return 0;
-    };
-    last_end
-        .saturating_sub(first_start)
-        .div_ceil(1000)
-        .min(i64::MAX as u64) as i64
-}
-
 fn observe_usage_entitlement_after_worker_completion<S: UsageEventStore>(
     store: &mut S,
     guild_id: &str,
@@ -3422,7 +3397,7 @@ impl ScaffoldHandler {
             resource_type: Some("meeting".to_owned()),
             resource_id: Some(meeting_id.to_owned()),
             metric: UsageMetric::AsrSeconds,
-            quantity: asr_seconds_from_transcription(transcription),
+            quantity: crate::application::worker::asr_seconds_from_transcription(transcription),
             detail_json: serde_json::json!({
                 "source": "transcript_segment_span",
                 "segment_count": transcription.segments.len(),

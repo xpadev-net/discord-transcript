@@ -465,7 +465,7 @@ where
     }
 }
 
-fn asr_seconds_from_transcription(transcription: &TranscriptionOutput) -> i64 {
+pub(crate) fn asr_seconds_from_transcription(transcription: &TranscriptionOutput) -> i64 {
     let Some(first_start) = transcription
         .segments
         .iter()
