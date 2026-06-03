@@ -5,9 +5,11 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
+use chrono::Utc;
 use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -21,6 +23,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::bootstrap::config::is_iso639_1_format;
+use crate::domain::audit::AuditEvent;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::TranscriptSource;
 use crate::infrastructure::bot_token::{
@@ -28,8 +31,10 @@ use crate::infrastructure::bot_token::{
 };
 use crate::infrastructure::sql::{
     CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, GET_GUILD_SETTINGS_SQL,
-    LIST_GUILD_MEETINGS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    INSERT_AUDIT_EVENT_SQL, LIST_GUILD_MEETINGS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
+    UPSERT_GUILD_SETTINGS_SQL,
 };
+use crate::infrastructure::sql_store::audit_event_params;
 use crate::infrastructure::storage_fs::sanitize_path_component;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -281,6 +286,60 @@ async fn check_audio_range_rate_limit(state: &WebState, user_id: &str) -> Result
         Ok(())
     } else {
         Err(audio_range_rate_limited_response())
+    }
+}
+
+fn audit_request_metadata(headers: &HeaderMap, method: &str, path: &str) -> String {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(512).collect::<String>());
+    json!({
+        "method": method,
+        "path": path,
+        "user_agent": user_agent,
+    })
+    .to_string()
+}
+
+fn web_audit_event(
+    guild_id: Option<String>,
+    actor_user_id: Option<String>,
+    action: &str,
+    resource_type: &str,
+    resource_id: Option<String>,
+    request_metadata_json: String,
+    detail: Value,
+) -> AuditEvent {
+    let now = Utc::now();
+    AuditEvent {
+        id: Uuid::new_v4().to_string(),
+        tenant_id: None,
+        guild_id,
+        actor_user_id,
+        action: action.to_owned(),
+        resource_type: resource_type.to_owned(),
+        resource_id,
+        request_metadata_json,
+        detail_json: detail.to_string(),
+        occurred_at: now,
+        created_at: now,
+    }
+}
+
+async fn record_audit_event(state: &WebState, event: AuditEvent) {
+    let params = audit_event_params(&event);
+    let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+        .iter()
+        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    if let Err(err) = state.db.execute(INSERT_AUDIT_EVENT_SQL, &bind).await {
+        warn!(
+            error = %err,
+            action = %event.action,
+            resource_type = %event.resource_type,
+            "failed to persist audit event"
+        );
     }
 }
 
@@ -1116,6 +1175,19 @@ async fn auth_callback(
     let redirect = sanitize_redirect(&redirect);
     let session_cookie = session_cookie_value(&user.id, &auth.guild_id, auth);
     let clear_oauth_nonce_cookie = format_oauth_nonce_cookie("", auth.secure_cookie, 0);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user.id.clone()),
+            "auth.login",
+            "session",
+            Some(user.id.clone()),
+            audit_request_metadata(&headers, "GET", "/auth/callback"),
+            json!({"result": "success"}),
+        ),
+    )
+    .await;
 
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
@@ -1136,17 +1208,35 @@ async fn auth_logout(State(state): State<WebState>, headers: HeaderMap) -> Respo
     } else {
         ""
     };
+    let mut revoked_session: Option<(String, String)> = None;
     if let Some(ref auth) = state.auth
         && let Some(cookie_val) = get_cookie(&headers, SESSION_COOKIE_NAME)
         && let Some(session) = verify_session(&cookie_val, &auth.session_secret)
-        && let Err(err) = revoke_session(&state.db, &session.uid, session.issued_at).await
     {
-        warn!(
-            error = %err,
-            user_id = %session.uid,
-            "failed to persist session revocation"
-        );
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        if let Err(err) = revoke_session(&state.db, &session.uid, session.issued_at).await {
+            warn!(
+                error = %err,
+                user_id = %session.uid,
+                "failed to persist session revocation"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        revoked_session = Some((auth.guild_id.clone(), session.uid));
+    }
+    if let Some((guild_id, user_id)) = revoked_session {
+        record_audit_event(
+            &state,
+            web_audit_event(
+                Some(guild_id),
+                Some(user_id.clone()),
+                "auth.logout",
+                "session",
+                Some(user_id),
+                audit_request_metadata(&headers, "POST", "/auth/logout"),
+                json!({"revoked": true}),
+            ),
+        )
+        .await;
     }
     let cookie =
         format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_flag}",);
@@ -3051,6 +3141,7 @@ async fn api_guild_settings(
 async fn api_update_guild_settings(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
     Json(request): Json<GuildSettingsUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
@@ -3075,6 +3166,26 @@ async fn api_update_guild_settings(
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "guild_settings.update",
+            "guild_settings",
+            Some(auth.guild_id.clone()),
+            audit_request_metadata(&headers, "PUT", "/api/guild/settings"),
+            json!({
+                "whisper_language_set": request.whisper_language.is_some(),
+                "whisper_vad": request.whisper_vad,
+                "auto_stop_grace_seconds": request.auto_stop_grace_seconds,
+                "retention_raw_audio_ttl_days": request.retention_raw_audio_ttl_days,
+                "retention_transcript_ttl_days": request.retention_transcript_ttl_days,
+                "summary_enabled": request.summary_enabled,
+            }),
+        ),
+    )
+    .await;
 
     let stored = load_guild_settings(&state, &auth.guild_id).await?;
     Ok(Json(guild_settings_response(
@@ -3087,6 +3198,7 @@ async fn api_update_guild_settings(
 async fn api_update_guild_bot_token(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
     Json(request): Json<GuildBotTokenUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, Response> {
     let token = normalize_guild_bot_token_update(&request).map_err(|status| {
@@ -3160,6 +3272,23 @@ async fn api_update_guild_bot_token(
         })?;
     invalidate_discord_caches(&state).await;
     notify_bot_token_changed(&state);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "guild_bot_token.update",
+            "guild_bot_token",
+            Some(auth.guild_id.clone()),
+            audit_request_metadata(&headers, "PUT", "/api/guild/settings/bot-token"),
+            json!({
+                "bot_user_id": validated.bot_user_id,
+                "bot_username": validated.bot_username,
+                "token_registered": true,
+            }),
+        ),
+    )
+    .await;
 
     let stored = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -3174,6 +3303,7 @@ async fn api_update_guild_bot_token(
 async fn api_delete_guild_bot_token(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
 ) -> Result<Json<GuildSettingsResponse>, Response> {
     let auth = state
         .auth
@@ -3215,6 +3345,22 @@ async fn api_delete_guild_bot_token(
         })?;
     invalidate_discord_caches(&state).await;
     notify_bot_token_changed(&state);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "guild_bot_token.delete",
+            "guild_bot_token",
+            Some(auth.guild_id.clone()),
+            audit_request_metadata(&headers, "DELETE", "/api/guild/settings/bot-token"),
+            json!({
+                "token_registered": false,
+                "previously_registered": true,
+            }),
+        ),
+    )
+    .await;
 
     let stored = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -3945,6 +4091,20 @@ enum DebugArtifactSource {
     },
 }
 
+impl DebugArtifactSource {
+    fn filename(&self) -> &str {
+        match self {
+            Self::File { filename, .. } | Self::Inline { filename, .. } => filename,
+        }
+    }
+
+    fn content_type(&self) -> &'static str {
+        match self {
+            Self::File { content_type, .. } | Self::Inline { content_type, .. } => content_type,
+        }
+    }
+}
+
 async fn api_debug_manifest(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -4205,6 +4365,7 @@ async fn api_debug_manifest(
 async fn api_debug_file(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
     Path((meeting_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
@@ -4214,7 +4375,9 @@ async fn api_debug_file(
     }
 
     let source = resolve_debug_artifact(&state, &meeting_id, &access, &artifact_id).await?;
-    match source {
+    let audit_filename = source.filename().to_owned();
+    let audit_content_type = source.content_type();
+    let response = match source {
         DebugArtifactSource::File {
             path,
             filename,
@@ -4225,7 +4388,30 @@ async fn api_debug_file(
             filename,
             content_type,
         } => Ok(build_inline_debug_response(bytes, &filename, content_type)),
-    }
+    }?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(access.guild_id.clone()),
+            Some(user_id.clone()),
+            "debug_artifact.download",
+            "debug_artifact",
+            Some(artifact_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "GET",
+                &format!("/api/meetings/{meeting_id}/debug/files/{artifact_id}"),
+            ),
+            json!({
+                "meeting_id": meeting_id,
+                "filename": audit_filename,
+                "content_type": audit_content_type,
+                "admin_only": debug_artifact_requires_admin(&artifact_id),
+            }),
+        ),
+    )
+    .await;
+    Ok(response)
 }
 
 async fn verify_raw_debug_artifact_access(

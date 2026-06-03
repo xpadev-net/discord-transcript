@@ -30,6 +30,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0014_tenants_and_installations.sql"),
     "\n",
     include_str!("../../migrations/0015_effective_meeting_settings.sql"),
+    "\n",
+    include_str!("../../migrations/0016_audit_events.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -252,6 +254,54 @@ ON CONFLICT (guild_id) DO UPDATE SET
     retention_transcript_ttl_days = EXCLUDED.retention_transcript_ttl_days,
     summary_enabled = EXCLUDED.summary_enabled,
     updated_at = NOW()
+"#;
+
+pub const INSERT_AUDIT_EVENT_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = NULLIF($3, '')
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+INSERT INTO audit_events (
+    id, tenant_id, guild_id, actor_user_id, action, resource_type, resource_id,
+    request_metadata, detail_json, occurred_at, created_at
+) VALUES (
+    $1,
+    COALESCE(NULLIF($2, ''), (SELECT tenant_id FROM active_tenant)),
+    NULLIF($3, ''),
+    NULLIF($4, ''),
+    $5,
+    $6,
+    NULLIF($7, ''),
+    COALESCE(NULLIF($8, '')::jsonb, '{}'::jsonb),
+    COALESCE(NULLIF($9, '')::jsonb, '{}'::jsonb),
+    COALESCE(NULLIF($10, '')::timestamptz, NOW()),
+    NOW()
+)
+"#;
+
+pub const LIST_RECENT_AUDIT_EVENTS_SQL: &str = r#"
+SELECT id,
+       tenant_id,
+       guild_id,
+       actor_user_id,
+       action,
+       resource_type,
+       resource_id,
+       request_metadata::text,
+       detail_json::text,
+       to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+FROM audit_events
+WHERE (NULLIF($1, '') IS NULL OR tenant_id = $1)
+  AND (NULLIF($2, '') IS NULL OR guild_id = $2)
+ORDER BY occurred_at DESC, created_at DESC, id DESC
+LIMIT $3::integer
 "#;
 
 pub const GET_GUILD_SETTINGS_SQL: &str = r#"

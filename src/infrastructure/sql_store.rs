@@ -1,15 +1,17 @@
 use crate::domain::MeetingStatus;
 use crate::domain::StopReason;
+use crate::domain::audit::AuditEvent;
 use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
     BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
     ENQUEUE_JOB_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
-    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
+    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL, INSERT_AUDIT_EVENT_SQL,
     INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
-    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
-    MARK_STOPPING_IF_RECORDING_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
-    SET_MEETING_STATUS_CAS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
+    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL,
+    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -153,6 +155,33 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             return Ok(None);
         };
         parse_guild_settings_for_snapshot_row(&row).map(Some)
+    }
+
+    pub fn append_audit_event(&mut self, event: &AuditEvent) -> Result<(), StoreError> {
+        self.executor
+            .execute(INSERT_AUDIT_EVENT_SQL, &audit_event_params(event))
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
+    pub fn list_recent_audit_events(
+        &mut self,
+        tenant_id: Option<&str>,
+        guild_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_RECENT_AUDIT_EVENTS_SQL,
+                &[
+                    tenant_id.unwrap_or_default().to_owned(),
+                    guild_id.unwrap_or_default().to_owned(),
+                    limit.min(100).to_string(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_audit_event_row).collect()
     }
 }
 
@@ -466,6 +495,57 @@ fn parse_effective_meeting_settings_row(
         summary_enabled: required_bool_column(row, 11, "summary_enabled")?,
         summary_template_id: row.get(12).and_then(|v| v.clone()),
         domain_knowledge_version_id: row.get(13).and_then(|v| v.clone()),
+    })
+}
+
+pub fn audit_event_params(event: &AuditEvent) -> Vec<String> {
+    vec![
+        event.id.clone(),
+        event.tenant_id.clone().unwrap_or_default(),
+        event.guild_id.clone().unwrap_or_default(),
+        event.actor_user_id.clone().unwrap_or_default(),
+        event.action.clone(),
+        event.resource_type.clone(),
+        event.resource_id.clone().unwrap_or_default(),
+        event.request_metadata_json.clone(),
+        event.detail_json.clone(),
+        event.occurred_at.to_rfc3339(),
+    ]
+}
+
+fn parse_audit_event_row(row: &SqlRow) -> Result<AuditEvent, StoreError> {
+    if row.len() < 11 {
+        return Err(StoreError::Backend(format!(
+            "invalid audit event row length: {}",
+            row.len()
+        )));
+    }
+    let occurred_at_raw = require_store_column(row, 9, "occurred_at")?;
+    let created_at_raw = require_store_column(row, 10, "created_at")?;
+    Ok(AuditEvent {
+        id: require_store_column(row, 0, "id")?,
+        tenant_id: row.get(1).and_then(|v| v.clone()),
+        guild_id: row.get(2).and_then(|v| v.clone()),
+        actor_user_id: row.get(3).and_then(|v| v.clone()),
+        action: require_store_column(row, 4, "action")?,
+        resource_type: require_store_column(row, 5, "resource_type")?,
+        resource_id: row.get(6).and_then(|v| v.clone()),
+        request_metadata_json: require_store_column(row, 7, "request_metadata")?,
+        detail_json: require_store_column(row, 8, "detail_json")?,
+        occurred_at: DateTime::parse_from_rfc3339(&occurred_at_raw)
+            .map(|ts| ts.with_timezone(&Utc))
+            .map_err(|err| {
+                StoreError::Backend(format!(
+                    "invalid audit occurred_at '{occurred_at_raw}': {err}"
+                ))
+            })?,
+        created_at: DateTime::parse_from_rfc3339(&created_at_raw)
+            .map(|ts| ts.with_timezone(&Utc))
+            .map_err(|err| {
+                StoreError::Backend(format!(
+                    "invalid audit created_at '{created_at_raw}': {err}"
+                ))
+            })?,
     })
 }
 
