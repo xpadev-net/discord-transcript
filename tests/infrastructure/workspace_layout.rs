@@ -70,6 +70,26 @@ fn debug_paths_are_under_workspace_root() {
             .summary_prompt_path()
             .starts_with(workspace.debug_dir())
     );
+    assert!(
+        workspace
+            .context_manifest_path()
+            .starts_with(workspace.context_dir())
+    );
+    assert!(
+        workspace
+            .context_speakers_path()
+            .starts_with(workspace.context_dir())
+    );
+    assert!(
+        workspace
+            .context_domain_knowledge_path()
+            .starts_with(workspace.context_dir())
+    );
+    assert!(
+        workspace
+            .context_summary_template_path()
+            .starts_with(workspace.context_dir())
+    );
 }
 
 #[test]

@@ -1,13 +1,15 @@
 use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
-    build_correction_prompt, build_summary_prompt, build_summary_prompt_with_template,
-    build_whisper_context_prompt, run_summary_pipeline, run_transcription,
+    build_correction_prompt, build_summary_prompt, build_summary_prompt_with_context,
+    build_summary_prompt_with_template, build_whisper_context_prompt, materialize_or_load_summary_context,
+    materialize_summary_context, run_summary_pipeline, run_transcription, SummaryContextInput,
 };
+use discord_transcript::domain::domain_knowledge::{DomainKnowledgeContentType, DomainKnowledgeItem};
 use discord_transcript::domain::privacy::MaskingStats;
 use discord_transcript::domain::speaker::SpeakerProfile;
 use discord_transcript::domain::summary_template::{
-    SummaryTemplateValidationError, SummaryTemplateVariables, render_summary_template,
-    validate_summary_template,
+    SummaryTemplate, SummaryTemplateValidationError, SummaryTemplateVariables,
+    render_summary_template, validate_summary_template,
 };
 use discord_transcript::domain::transcript::{
     NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments, render_for_summary,
@@ -17,6 +19,7 @@ use discord_transcript::infrastructure::asr::{
     WhisperTranscriptionResult, parse_whisper_response,
 };
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
+use chrono::{TimeZone, Utc};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -339,6 +342,9 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
     assert!(result.masking_stats.mention_replacements >= 1);
+    assert!(!workspace.context_manifest_path().exists());
+    assert!(!workspace.context_speakers_path().exists());
+    assert!(!workspace.context_domain_knowledge_path().exists());
 }
 
 #[test]
@@ -449,6 +455,254 @@ fn prompt_contains_required_sections() {
         "prompt should guide model to retain speaker attribution"
     );
     assert!(!prompt.contains(forbidden));
+    assert!(!prompt.contains("context/manifest.json"));
+    assert!(!prompt.contains("context/speakers.json"));
+    assert!(!prompt.contains("context/domain_knowledge.md"));
+}
+
+#[test]
+fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies() {
+    let temp = unique_workspace("context_materialized", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: Some("Planning".to_owned()),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let secret_domain_body = "SECRET_DOMAIN_BODY";
+    let secret_template_body = "SECRET_TEMPLATE_BODY {{transcript_path}}";
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "u1".to_owned(),
+            username: Some("alice".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: None,
+        }],
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-1".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Roadmap".to_owned(),
+            body: secret_domain_body.to_owned(),
+            active: true,
+            version: 7,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        summary_template: Some(SummaryTemplate {
+            id: "st-1".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            name: "Executive".to_owned(),
+            template: secret_template_body.to_owned(),
+            active: true,
+            version: 3,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }),
+        effective_summary_template_id: Some("st-1".to_owned()),
+        effective_domain_knowledge_version_id: Some("dk-snapshot-7".to_owned()),
+    };
+    let context_manifest =
+        materialize_summary_context(&request, &context).expect("context should materialize");
+    let transcript_manifest = TranscriptManifest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        language: Some("en".to_owned()),
+        masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
+        generated_at: "2026-01-01T00:00:00Z".to_owned(),
+        masking_stats: MaskingStats::default(),
+    };
+
+    let manifest_json =
+        std::fs::read_to_string(request.workspace.context_manifest_path()).expect("manifest");
+    assert!(manifest_json.contains("context/speakers.json"));
+    assert!(manifest_json.contains("\"id\": \"dk-1\""));
+    assert!(manifest_json.contains("\"version\": 7"));
+    assert!(manifest_json.contains("\"id\": \"st-1\""));
+    assert!(manifest_json.contains("\"version\": 3"));
+    assert!(!manifest_json.contains(secret_domain_body));
+    assert!(!manifest_json.contains(secret_template_body));
+    assert!(
+        std::fs::read_to_string(request.workspace.context_domain_knowledge_path())
+            .expect("domain knowledge")
+            .contains(secret_domain_body)
+    );
+    assert!(
+        std::fs::read_to_string(request.workspace.context_summary_template_path())
+            .expect("summary template")
+            .contains(secret_template_body)
+    );
+
+    let prompt =
+        build_summary_prompt_with_context(&request, &transcript_manifest, Some(&context_manifest));
+    assert!(prompt.contains("context/manifest.json"));
+    assert!(prompt.contains("context/speakers.json"));
+    assert!(prompt.contains("context/domain_knowledge.md"));
+    assert!(prompt.contains("context/summary_template.txt"));
+    assert!(!prompt.contains(secret_domain_body));
+    assert!(!prompt.contains(secret_template_body));
+}
+
+#[test]
+fn materialized_summary_context_removes_stale_optional_template_file() {
+    let temp = unique_workspace("context_stale_template", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: None,
+        workspace,
+    };
+    request
+        .workspace
+        .ensure_base_dirs()
+        .expect("workspace dirs should be created");
+    std::fs::write(
+        request.workspace.context_summary_template_path(),
+        "stale template",
+    )
+    .expect("stale template should be written");
+
+    let context_manifest = materialize_summary_context(&request, &SummaryContextInput::default())
+        .expect("context should materialize");
+
+    assert_eq!(context_manifest.summary_template_path, None);
+    assert!(!request.workspace.context_summary_template_path().exists());
+}
+
+#[test]
+fn materialized_summary_context_omits_inactive_template() {
+    let temp = unique_workspace("context_inactive_template", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: None,
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let context = SummaryContextInput {
+        summary_template: Some(SummaryTemplate {
+            id: "st-inactive".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            name: "Inactive".to_owned(),
+            template: "SHOULD_NOT_WRITE".to_owned(),
+            active: false,
+            version: 4,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }),
+        effective_summary_template_id: Some("st-inactive".to_owned()),
+        ..SummaryContextInput::default()
+    };
+
+    let context_manifest =
+        materialize_summary_context(&request, &context).expect("context should materialize");
+
+    assert_eq!(context_manifest.summary_template_path, None);
+    assert_eq!(context_manifest.summary_template, None);
+    assert!(!request.workspace.context_summary_template_path().exists());
+}
+
+#[test]
+fn materialized_summary_context_reuses_existing_manifest_on_retry() {
+    let temp = unique_workspace("context_retry_reuse", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: None,
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let first_context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-first".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "First".to_owned(),
+            body: "FIRST_BODY".to_owned(),
+            active: true,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ..SummaryContextInput::default()
+    };
+    let second_context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-second".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Second".to_owned(),
+            body: "SECOND_BODY".to_owned(),
+            active: true,
+            version: 2,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ..SummaryContextInput::default()
+    };
+
+    let first_manifest = materialize_or_load_summary_context(&request, &first_context)
+        .expect("first context should materialize");
+    let second_manifest = materialize_or_load_summary_context(&request, &second_context)
+        .expect("retry should reuse manifest");
+    let domain_context =
+        std::fs::read_to_string(request.workspace.context_domain_knowledge_path())
+            .expect("domain context should be readable");
+
+    assert_eq!(second_manifest.domain_knowledge_items, first_manifest.domain_knowledge_items);
+    assert!(domain_context.contains("FIRST_BODY"));
+    assert!(!domain_context.contains("SECOND_BODY"));
 }
 
 #[test]
