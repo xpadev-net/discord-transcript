@@ -3350,6 +3350,8 @@ impl ScaffoldHandler {
             }
             guild_id
         };
+        // Observe-only entitlement checks are intentionally asynchronous here:
+        // they must not add an aggregate query to the just-finished usage write path.
         self.spawn_worker_completion_entitlement_observation(guild_id);
     }
 

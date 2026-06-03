@@ -495,9 +495,11 @@ pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, Strin
 }
 
 fn wav_header_duration_ms(header: &[u8; 44]) -> Option<u64> {
+    let fmt_chunk_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
     if &header[0..4] != b"RIFF"
         || &header[8..12] != b"WAVE"
         || &header[12..16] != b"fmt "
+        || fmt_chunk_size != 16
         || &header[36..40] != b"data"
     {
         return None;
