@@ -157,6 +157,8 @@ where
             return Err(WorkerError::from(err));
         }
     };
+    // The runtime scaffold and batch worker are deployment alternatives today.
+    // Keep the same ASR event id so retries remain idempotent if topology changes.
     record_usage_event_observe_only(
         store,
         NewUsageEvent {

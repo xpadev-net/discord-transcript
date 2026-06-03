@@ -3303,50 +3303,55 @@ impl ScaffoldHandler {
     }
 
     async fn record_summary_run_usage(&self, meeting_id: &str, chunk_count: usize) {
-        let mut service = self.service.lock().await;
-        let meeting = match service.store.get_meeting(meeting_id) {
-            Ok(Some(meeting)) => meeting,
-            Ok(None) => {
-                warn!(meeting_id, "meeting missing while recording summary usage");
-                return;
-            }
-            Err(err) => {
+        let guild_id = {
+            let mut service = self.service.lock().await;
+            let meeting = match service.store.get_meeting(meeting_id) {
+                Ok(Some(meeting)) => meeting,
+                Ok(None) => {
+                    warn!(meeting_id, "meeting missing while recording summary usage");
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        meeting_id,
+                        error = %err,
+                        "failed to load meeting for summary usage"
+                    );
+                    return;
+                }
+            };
+            let guild_id = meeting.guild_id.clone();
+            let event = NewUsageEvent {
+                id: format!("usage:summary_runs:{meeting_id}"),
+                tenant_id: None,
+                guild_id: guild_id.clone(),
+                meeting_id: Some(meeting_id.to_owned()),
+                job_id: Some(format!("summary-{meeting_id}")),
+                resource_type: Some("meeting".to_owned()),
+                resource_id: Some(meeting_id.to_owned()),
+                metric: UsageMetric::SummaryRuns,
+                quantity: 1,
+                detail_json: serde_json::json!({
+                    "chunk_count": chunk_count,
+                    "surface": "runtime_post_success"
+                })
+                .to_string(),
+                observed_at: Utc::now(),
+            };
+            if let Err(err) = service.store.append_usage_event(&event) {
                 warn!(
                     meeting_id,
+                    usage_event_id = %event.id,
                     error = %err,
-                    "failed to load meeting for summary usage"
+                    "failed to append summary usage event; continuing in observe-only mode"
                 );
-                return;
             }
+            guild_id
         };
-        let event = NewUsageEvent {
-            id: format!("usage:summary_runs:{meeting_id}"),
-            tenant_id: None,
-            guild_id: meeting.guild_id.clone(),
-            meeting_id: Some(meeting_id.to_owned()),
-            job_id: Some(format!("summary-{meeting_id}")),
-            resource_type: Some("meeting".to_owned()),
-            resource_id: Some(meeting_id.to_owned()),
-            metric: UsageMetric::SummaryRuns,
-            quantity: 1,
-            detail_json: serde_json::json!({
-                "chunk_count": chunk_count,
-                "surface": "runtime_post_success"
-            })
-            .to_string(),
-            observed_at: Utc::now(),
-        };
-        if let Err(err) = service.store.append_usage_event(&event) {
-            warn!(
-                meeting_id,
-                usage_event_id = %event.id,
-                error = %err,
-                "failed to append summary usage event; continuing in observe-only mode"
-            );
-        }
+        let mut service = self.service.lock().await;
         crate::application::worker::observe_worker_completion_entitlement(
             &mut service.store,
-            &meeting.guild_id,
+            &guild_id,
         );
     }
 
