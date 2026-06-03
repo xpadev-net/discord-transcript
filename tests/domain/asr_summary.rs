@@ -342,6 +342,9 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
     assert!(result.masking_stats.mention_replacements >= 1);
+    assert!(!workspace.context_manifest_path().exists());
+    assert!(!workspace.context_speakers_path().exists());
+    assert!(!workspace.context_domain_knowledge_path().exists());
 }
 
 #[test]

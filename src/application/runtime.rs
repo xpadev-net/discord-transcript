@@ -1573,10 +1573,7 @@ fn load_runtime_summary_context(
             crate::application::summary::SummaryError::SummaryEngine(format!(
                 "failed to load domain knowledge for meeting {meeting_id}: {err}"
             ))
-        })?
-        .into_iter()
-        .filter(|item| item.active && item.archived_at.is_none())
-        .collect::<Vec<_>>();
+        })?;
 
     let summary_template = if let Some(template_id) = effective_settings
         .summary_template_id
@@ -1591,8 +1588,7 @@ fn load_runtime_summary_context(
         crate::application::summary::SummaryError::SummaryEngine(format!(
             "failed to load summary template for meeting {meeting_id}: {err}"
         ))
-    })?
-    .filter(|template| template.active && template.archived_at.is_none());
+    })?;
 
     Ok(crate::application::summary::SummaryContextInput {
         speakers: Vec::new(),

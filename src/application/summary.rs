@@ -35,7 +35,11 @@ pub struct SummaryRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SummaryContextInput {
     pub speakers: Vec<SpeakerProfile>,
+    /// Raw domain knowledge candidates. [`materialize_summary_context`] is
+    /// responsible for selecting active, non-archived items.
     pub domain_knowledge: Vec<DomainKnowledgeItem>,
+    /// Raw summary template candidate. [`materialize_summary_context`] is
+    /// responsible for selecting active, non-archived templates.
     pub summary_template: Option<SummaryTemplate>,
     pub effective_summary_template_id: Option<String>,
     pub effective_domain_knowledge_version_id: Option<String>,
@@ -502,23 +506,35 @@ pub fn materialize_or_load_summary_context(
     request: &SummaryRequest,
     context: &SummaryContextInput,
 ) -> Result<SummaryContextManifest, SummaryError> {
+    if let Some(manifest) = load_summary_context_manifest(request)? {
+        return Ok(manifest);
+    }
+
+    materialize_summary_context(request, context)
+}
+
+pub fn load_summary_context_manifest(
+    request: &SummaryRequest,
+) -> Result<Option<SummaryContextManifest>, SummaryError> {
     let manifest_path = request.workspace.context_manifest_path();
-    if manifest_path.exists() {
-        let manifest_json = fs::read(&manifest_path).map_err(|err| {
-            SummaryError::SummaryEngine(format!(
-                "failed to read summary context manifest {}: {err}",
-                manifest_path.display()
-            ))
-        })?;
-        return serde_json::from_slice(&manifest_json).map_err(|err| {
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let manifest_json = fs::read(&manifest_path).map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to read summary context manifest {}: {err}",
+            manifest_path.display()
+        ))
+    })?;
+    serde_json::from_slice(&manifest_json)
+        .map(Some)
+        .map_err(|err| {
             SummaryError::SummaryEngine(format!(
                 "failed to parse summary context manifest {}: {err}",
                 manifest_path.display()
             ))
-        });
-    }
-
-    materialize_summary_context(request, context)
+        })
 }
 
 fn remove_stale_optional_context_file(path: &Path) -> Result<(), SummaryError> {
@@ -585,9 +601,8 @@ pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
     // so we do not write the correction-prompt debug artifact here — doing so
     // would mislead a reader into thinking the GEC step had executed.
     let manifest = write_transcript_files(request, &transcription)?;
-    let context_manifest =
-        materialize_or_load_summary_context(request, &SummaryContextInput::default())?;
-    let prompt = build_summary_prompt_with_context(request, &manifest, Some(&context_manifest));
+    let context_manifest = load_summary_context_manifest(request)?;
+    let prompt = build_summary_prompt_with_context(request, &manifest, context_manifest.as_ref());
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let markdown = claude.summarize(&prompt, Some(request.workspace.root()))?;
     let message_chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);

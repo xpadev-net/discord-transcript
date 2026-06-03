@@ -126,11 +126,7 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         effective_settings: Option<&EffectiveMeetingSettings>,
     ) -> Result<SummaryContextInput, StoreError> {
         let speakers = load_meeting_speakers(self, meeting_id)?;
-        let domain_knowledge = self
-            .list_domain_knowledge(guild_id, false, None)?
-            .into_iter()
-            .filter(|item| item.active && item.archived_at.is_none())
-            .collect::<Vec<_>>();
+        let domain_knowledge = self.list_domain_knowledge(guild_id, false, None)?;
         let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
 
         Ok(SummaryContextInput {
@@ -187,15 +183,9 @@ fn load_effective_summary_template<E: SqlExecutor>(
         .and_then(|settings| settings.summary_template_id.as_deref())
         .filter(|template_id| !template_id.trim().is_empty())
     {
-        return store
-            .get_summary_template(guild_id, template_id)
-            .map(|template| {
-                template.filter(|template| template.active && template.archived_at.is_none())
-            });
+        return store.get_summary_template(guild_id, template_id);
     }
-    store.get_active_summary_template(guild_id).map(|template| {
-        template.filter(|template| template.active && template.archived_at.is_none())
-    })
+    store.get_active_summary_template(guild_id)
 }
 
 fn advance_to_transcribing<S: MeetingStore>(
