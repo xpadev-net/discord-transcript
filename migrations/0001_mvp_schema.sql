@@ -31,9 +31,6 @@ CREATE TABLE IF NOT EXISTS transcripts (
     confidence DOUBLE PRECISION,
     is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
     source TEXT NOT NULL DEFAULT 'voice',
-    transcript_stage TEXT NOT NULL DEFAULT 'final',
-    live_chunk_id TEXT,
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

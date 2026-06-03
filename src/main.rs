@@ -116,62 +116,8 @@ async fn apply_pending_migrations_locked(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::database_url_with_ssl_mode;
-
-    #[test]
-    fn database_url_with_ssl_mode_appends_query_param_separator() {
-        assert_eq!(
-            database_url_with_ssl_mode("postgresql://user:pass@localhost/db", "disable")
-                .expect("url should build"),
-            "postgresql://user:pass@localhost/db?sslmode=disable"
-        );
-        assert_eq!(
-            database_url_with_ssl_mode(
-                "postgresql://user:pass@localhost/db?connect_timeout=10",
-                "disable",
-            )
-            .expect("url should build"),
-            "postgresql://user:pass@localhost/db?connect_timeout=10&sslmode=disable"
-        );
-    }
-
-    #[test]
-    fn database_url_with_ssl_mode_preserves_existing_sslmode() {
-        assert_eq!(
-            database_url_with_ssl_mode(
-                "postgresql://user:pass@localhost/db?sslmode=disable",
-                "disable",
-            )
-            .expect("url should build"),
-            "postgresql://user:pass@localhost/db?sslmode=disable"
-        );
-    }
-
-    #[test]
-    fn database_url_with_ssl_mode_rejects_unsupported_embedded_sslmode() {
-        let err = database_url_with_ssl_mode(
-            "postgresql://user:pass@localhost/db?sslmode=require",
-            "disable",
-        )
-        .expect_err("unsupported sslmode should fail");
-
-        assert!(err.to_string().contains("sslmode=require"));
-    }
-}
-
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
-
-    // The web server's async tokio_postgres connection uses NoTls,
-    // so reject non-"disable" SSL modes to avoid silent downgrade.
-    if config.database_ssl_mode != "disable" {
-        return Err(format!(
-            "DATABASE_SSL_MODE={} is not supported for the web server connection (only \"disable\" is supported with NoTls)",
-            config.database_ssl_mode,
-        ).into());
-    }
 
     // Establish async DB connection for the web server
     let db_url = database_url_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
@@ -305,4 +251,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::database_url_with_ssl_mode;
+
+    #[test]
+    fn database_url_with_ssl_mode_appends_query_param_separator() {
+        assert_eq!(
+            database_url_with_ssl_mode("postgresql://user:pass@localhost/db", "disable")
+                .expect("url should build"),
+            "postgresql://user:pass@localhost/db?sslmode=disable"
+        );
+        assert_eq!(
+            database_url_with_ssl_mode(
+                "postgresql://user:pass@localhost/db?connect_timeout=10",
+                "disable",
+            )
+            .expect("url should build"),
+            "postgresql://user:pass@localhost/db?connect_timeout=10&sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn database_url_with_ssl_mode_preserves_existing_sslmode() {
+        assert_eq!(
+            database_url_with_ssl_mode(
+                "postgresql://user:pass@localhost/db?sslmode=disable",
+                "disable",
+            )
+            .expect("url should build"),
+            "postgresql://user:pass@localhost/db?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn database_url_with_ssl_mode_rejects_unsupported_embedded_sslmode() {
+        let err = database_url_with_ssl_mode(
+            "postgresql://user:pass@localhost/db?sslmode=require",
+            "disable",
+        )
+        .expect_err("unsupported sslmode should fail");
+
+        assert!(err.to_string().contains("sslmode=require"));
+    }
 }
