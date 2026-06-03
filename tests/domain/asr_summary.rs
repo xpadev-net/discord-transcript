@@ -135,6 +135,106 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
 }
 
 #[test]
+fn normalize_segments_orders_interleaved_speakers_before_merging() {
+    let segments = vec![
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 0,
+            end_ms: 5_000,
+            text: "first alice".to_owned(),
+            confidence: Some(0.9),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        },
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 2_200,
+            end_ms: 2_600,
+            text: "second alice".to_owned(),
+            confidence: Some(0.9),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        },
+        TranscriptSegment {
+            speaker_id: "bob".to_owned(),
+            start_ms: 1_200,
+            end_ms: 1_800,
+            text: "bob cuts in".to_owned(),
+            confidence: Some(0.9),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        },
+    ];
+
+    let normalized = normalize_segments(&segments, NormalizationConfig::default());
+
+    assert_eq!(normalized.len(), 3);
+    assert_eq!(
+        normalized
+            .iter()
+            .map(|segment| (segment.speaker_id.as_str(), segment.start_ms, segment.end_ms))
+            .collect::<Vec<_>>(),
+        vec![
+            ("alice", 0, 5_000),
+            ("bob", 1_200, 1_800),
+            ("alice", 2_200, 2_600),
+        ]
+    );
+    assert_eq!(normalized[0].text, "first alice");
+    assert_eq!(normalized[2].text, "second alice");
+}
+
+#[test]
+fn render_for_summary_uses_canonical_timeline_order() {
+    let segments = vec![
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 2_200,
+            end_ms: 2_600,
+            text: "second alice".to_owned(),
+            confidence: None,
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        },
+        TranscriptSegment {
+            speaker_id: "bob".to_owned(),
+            start_ms: 1_200,
+            end_ms: 1_800,
+            text: "bob cuts in".to_owned(),
+            confidence: None,
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        },
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 0,
+            end_ms: 5_000,
+            text: "first alice".to_owned(),
+            confidence: None,
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 1,
+        },
+    ];
+
+    let rendered = render_for_summary(&segments, None);
+
+    assert_eq!(
+        rendered.lines().collect::<Vec<_>>(),
+        vec![
+            "[0-5000] alice: first alice",
+            "[1200-1800] bob: bob cuts in",
+            "[2200-2600] alice: second alice",
+        ]
+    );
+}
+
+#[test]
 fn render_for_summary_prefers_speaker_labels() {
     let segment = TranscriptSegment {
         speaker_id: "user-1".to_owned(),

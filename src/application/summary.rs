@@ -5,7 +5,9 @@ use crate::domain::summary_template::{
     SummaryTemplate, SummaryTemplateValidationError, SummaryTemplateVariables,
     render_summary_template,
 };
-use crate::domain::transcript::{NormalizationConfig, normalize_segments, render_for_summary};
+use crate::domain::transcript::{
+    NormalizationConfig, normalize_segments, render_for_summary, sort_transcript_segments,
+};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
 use crate::infrastructure::workspace::{
     CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME, CONTEXT_SPEAKERS_FILENAME,
@@ -202,12 +204,7 @@ pub fn run_transcription<W: WhisperClient>(
         }
     }
 
-    merged_segments.sort_by(|a, b| {
-        a.start_ms
-            .cmp(&b.start_ms)
-            .then(a.end_ms.cmp(&b.end_ms))
-            .then(a.speaker_id.cmp(&b.speaker_id))
-    });
+    sort_transcript_segments(&mut merged_segments);
     build_transcription_output(merged_segments)
 }
 
