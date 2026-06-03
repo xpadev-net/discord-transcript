@@ -111,7 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_memory_notes_guild_source_meeting
     ON ai_memory_notes (guild_id, source_meeting_id)
     WHERE source_meeting_id IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_ai_memory_notes_guild_tags
+CREATE INDEX IF NOT EXISTS idx_ai_memory_notes_tags_gin
     ON ai_memory_notes USING GIN (tags);
 
 CREATE INDEX IF NOT EXISTS idx_ai_memory_notes_source_feedback
@@ -143,11 +143,13 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
         FOREIGN KEY (tenant_discord_guild_id, tenant_id, guild_id)
         REFERENCES tenant_discord_guilds(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT transcript_feedback_meeting_fk
-        FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id),
+        FOREIGN KEY (meeting_id, guild_id) REFERENCES meetings(id, guild_id)
+        DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT transcript_feedback_meeting_delete_fk
         FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL,
     CONSTRAINT transcript_feedback_segment_fk
-        FOREIGN KEY (transcript_segment_id, meeting_id) REFERENCES transcripts(id, meeting_id),
+        FOREIGN KEY (transcript_segment_id, meeting_id) REFERENCES transcripts(id, meeting_id)
+        DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT transcript_feedback_segment_delete_fk
         FOREIGN KEY (transcript_segment_id) REFERENCES transcripts(id) ON DELETE SET NULL,
     CONSTRAINT transcript_feedback_target_domain_fk
@@ -155,6 +157,8 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
         REFERENCES domain_knowledge_items(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT transcript_feedback_target_ai_memory_fk
         FOREIGN KEY (target_ai_memory_note_id, tenant_id, guild_id)
+        -- Keep converted feedback anchored to the AI memory record it produced;
+        -- deletion workflows must clear or reclassify feedback before removal.
         REFERENCES ai_memory_notes(id, tenant_id, guild_id) ON DELETE RESTRICT,
     CONSTRAINT transcript_feedback_guild_id_nonempty_check CHECK (length(btrim(guild_id)) > 0),
     CONSTRAINT transcript_feedback_actor_nonempty_check CHECK (length(btrim(actor_user_id)) > 0),
@@ -268,6 +272,24 @@ CREATE INDEX IF NOT EXISTS idx_transcript_feedback_target_domain
 CREATE INDEX IF NOT EXISTS idx_transcript_feedback_target_ai_memory
     ON transcript_feedback (target_ai_memory_note_id)
     WHERE target_ai_memory_note_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION clear_transcript_feedback_meeting_refs()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE transcript_feedback
+    SET meeting_id = NULL,
+        transcript_segment_id = NULL
+    WHERE meeting_id = OLD.id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_clear_transcript_feedback_meeting_refs ON meetings;
+
+CREATE TRIGGER trg_clear_transcript_feedback_meeting_refs
+BEFORE DELETE ON meetings
+FOR EACH ROW
+EXECUTE FUNCTION clear_transcript_feedback_meeting_refs();
 
 CREATE TABLE IF NOT EXISTS person_aliases (
     id TEXT PRIMARY KEY,

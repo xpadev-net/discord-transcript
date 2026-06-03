@@ -9,6 +9,23 @@ use discord_transcript::domain::person_alias::{
 };
 use discord_transcript::infrastructure::sql::{INCREMENTAL_MIGRATIONS_SQL, MIGRATIONS};
 
+fn ai_memory_feedback_migration_sql() -> &'static str {
+    MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0021_ai_memory_feedback")
+        .expect("ai memory migration should be registered")
+        .sql
+}
+
+fn sql_between<'a>(sql: &'a str, start: &str, end: &str) -> &'a str {
+    sql.split_once(start)
+        .expect("start marker should be present")
+        .1
+        .split_once(end)
+        .expect("end marker should be present")
+        .0
+}
+
 #[test]
 fn migrations_register_ai_memory_feedback_schema_after_plan_quotas() {
     let version = MIGRATIONS
@@ -44,6 +61,7 @@ fn incremental_migrations_include_ai_memory_feedback_schema() {
     assert!(schema.contains("REFERENCES ai_memory_notes(id, tenant_id, guild_id)"));
     assert!(schema.contains("idx_ai_memory_notes_tenant_guild_active"));
     assert!(schema.contains("idx_ai_memory_notes_id_tenant_guild"));
+    assert!(schema.contains("idx_ai_memory_notes_tags_gin"));
     assert!(schema.contains("idx_transcript_feedback_tenant_guild_status"));
     assert!(schema.contains("idx_transcript_feedback_id_tenant_guild"));
     assert!(schema.contains("idx_person_aliases_tenant_guild_active"));
@@ -53,29 +71,22 @@ fn incremental_migrations_include_ai_memory_feedback_schema() {
 
 #[test]
 fn ai_memory_feedback_migration_uses_idempotent_statements() {
-    let migration = MIGRATIONS
-        .iter()
-        .find(|migration| migration.version == "0021_ai_memory_feedback")
-        .expect("ai memory migration should be registered");
+    let sql = ai_memory_feedback_migration_sql();
 
-    assert!(migration.sql.contains("CREATE TABLE IF NOT EXISTS ai_memory_notes"));
-    assert!(migration.sql.contains("CREATE TABLE IF NOT EXISTS transcript_feedback"));
-    assert!(migration.sql.contains("CREATE TABLE IF NOT EXISTS person_aliases"));
-    assert!(migration.sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_id_guild"));
-    assert!(migration.sql.contains("CREATE INDEX IF NOT EXISTS idx_person_aliases_tenant_guild_active"));
-    assert!(migration.sql.contains("ALTER TABLE ai_memory_notes"));
-    assert!(migration.sql.contains("EXCEPTION\n    WHEN duplicate_object THEN NULL"));
-    assert!(!migration.sql.contains("DROP TABLE"));
-    assert!(!migration.sql.contains("DROP COLUMN"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS ai_memory_notes"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS transcript_feedback"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS person_aliases"));
+    assert!(sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_id_guild"));
+    assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_person_aliases_tenant_guild_active"));
+    assert!(sql.contains("ALTER TABLE ai_memory_notes"));
+    assert!(sql.contains("EXCEPTION\n    WHEN duplicate_object THEN NULL"));
+    assert!(!sql.contains("DROP TABLE"));
+    assert!(!sql.contains("DROP COLUMN"));
 }
 
 #[test]
 fn schema_keeps_ai_memory_and_aliases_separate_from_domain_knowledge() {
-    let schema = MIGRATIONS
-        .iter()
-        .find(|migration| migration.version == "0021_ai_memory_feedback")
-        .expect("ai memory migration should be registered")
-        .sql;
+    let schema = ai_memory_feedback_migration_sql();
 
     assert!(schema.contains("target_domain_knowledge_id TEXT"));
     assert!(schema.contains("transcript_feedback_target_domain_fk"));
@@ -149,14 +160,30 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("idx_meetings_id_guild"));
     assert!(schema.contains("idx_transcripts_id_meeting"));
     assert!(schema.contains("FOREIGN KEY (source_meeting_id, guild_id) REFERENCES meetings(id, guild_id)"));
-    assert!(schema.contains("FOREIGN KEY (meeting_id, guild_id)"));
-    assert!(schema.contains("REFERENCES meetings(id, guild_id)"));
-    assert!(schema.contains("FOREIGN KEY (transcript_segment_id, meeting_id)"));
-    assert!(schema.contains("REFERENCES transcripts(id, meeting_id)"));
+    let meeting_fk = sql_between(
+        schema,
+        "CONSTRAINT transcript_feedback_meeting_fk",
+        "CONSTRAINT transcript_feedback_meeting_delete_fk",
+    );
+    assert!(meeting_fk.contains("FOREIGN KEY (meeting_id, guild_id)"));
+    assert!(meeting_fk.contains("REFERENCES meetings(id, guild_id)"));
+    assert!(meeting_fk.contains("DEFERRABLE INITIALLY DEFERRED"));
+    let segment_fk = sql_between(
+        schema,
+        "CONSTRAINT transcript_feedback_segment_fk",
+        "CONSTRAINT transcript_feedback_segment_delete_fk",
+    );
+    assert!(segment_fk.contains("FOREIGN KEY (transcript_segment_id, meeting_id)"));
+    assert!(segment_fk.contains("REFERENCES transcripts(id, meeting_id)"));
+    assert!(segment_fk.contains("DEFERRABLE INITIALLY DEFERRED"));
     assert!(schema.contains("transcript_feedback_meeting_delete_fk"));
     assert!(schema.contains("FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL"));
     assert!(schema.contains("transcript_feedback_segment_delete_fk"));
     assert!(schema.contains("FOREIGN KEY (transcript_segment_id) REFERENCES transcripts(id) ON DELETE SET NULL"));
+    assert!(schema.contains("CREATE OR REPLACE FUNCTION clear_transcript_feedback_meeting_refs()"));
+    assert!(schema.contains("DROP TRIGGER IF EXISTS trg_clear_transcript_feedback_meeting_refs ON meetings"));
+    assert!(schema.contains("CREATE TRIGGER trg_clear_transcript_feedback_meeting_refs"));
+    assert!(schema.contains("SET meeting_id = NULL,\n        transcript_segment_id = NULL"));
     assert!(
         schema.contains("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL")
     );
@@ -165,6 +192,42 @@ fn schema_scopes_meeting_and_segment_references_to_guild_and_meeting() {
     assert!(schema.contains("person_aliases_source_reference_check"));
     assert!(schema.contains("idx_person_aliases_active_identity"));
     assert!(schema.contains("ON person_aliases (tenant_id, guild_id, lower(canonical_name), lower(alias))"));
+}
+
+#[test]
+fn source_feedback_delete_paths_keep_set_null_compatible_with_checks() {
+    let schema = ai_memory_feedback_migration_sql();
+
+    assert_eq!(
+        schema
+            .matches("REFERENCES transcript_feedback(id, tenant_id, guild_id) ON DELETE SET NULL")
+            .count(),
+        2
+    );
+
+    let ai_memory_user_feedback_check = sql_between(
+        schema,
+        "CONSTRAINT ai_memory_notes_source_reference_check",
+        "source_type = 'vc_participant'",
+    );
+    assert!(ai_memory_user_feedback_check.contains("source_type = 'user_feedback'"));
+    assert!(ai_memory_user_feedback_check.contains("source_meeting_id IS NULL"));
+    assert!(
+        !ai_memory_user_feedback_check.contains("source_feedback_id IS NOT NULL"),
+        "ai memory source feedback must be nullable after feedback deletion"
+    );
+
+    let alias_user_feedback_check = sql_between(
+        schema,
+        "CONSTRAINT person_aliases_source_reference_check",
+        "source_type = 'vc_participant'",
+    );
+    assert!(alias_user_feedback_check.contains("source_type = 'user_feedback'"));
+    assert!(alias_user_feedback_check.contains("source_meeting_id IS NULL"));
+    assert!(
+        !alias_user_feedback_check.contains("source_feedback_id IS NOT NULL"),
+        "person alias source feedback must be nullable after feedback deletion"
+    );
 }
 
 #[test]
