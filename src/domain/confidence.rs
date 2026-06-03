@@ -28,7 +28,7 @@ impl ConfidencePermille {
 
         let (whole, fractional) = trimmed
             .split_once('.')
-            .map_or((trimmed, ""), |(whole, fractional)| (whole, fractional));
+            .ok_or_else(|| format!("confidence decimal must contain a decimal point: {value}"))?;
         if !matches!(whole, "0" | "1") {
             return Err(format!(
                 "confidence decimal whole part must be 0 or 1: {value}"

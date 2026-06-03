@@ -193,6 +193,7 @@ fn ai_memory_domain_types_match_schema_values() {
         ConfidencePermille::new(1000).unwrap()
     );
     assert!(ConfidencePermille::new(1001).is_err());
+    assert!(ConfidencePermille::parse_sql_decimal("1").is_err());
     assert!(ConfidencePermille::parse_sql_decimal("1.001").is_err());
 }
 
