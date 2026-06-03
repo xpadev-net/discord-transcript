@@ -32,6 +32,8 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
 
+const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64 / 1_000_000;
+
 /// Prefix added to error messages when PostgreSQL returns SQLSTATE 23505
 /// (unique_violation). Callers can check `err.starts_with(UNIQUE_VIOLATION_PREFIX)`
 /// instead of locale-dependent string matching.
@@ -235,7 +237,9 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
                 &[
                     tenant_id.unwrap_or_default().to_owned(),
                     guild_id.unwrap_or_default().to_owned(),
-                    window_seconds.max(1).to_string(),
+                    window_seconds
+                        .clamp(1, MAX_POSTGRES_INTERVAL_SECONDS)
+                        .to_string(),
                 ],
             )
             .map_err(StoreError::Backend)?;

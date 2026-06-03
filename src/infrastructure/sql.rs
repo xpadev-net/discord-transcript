@@ -138,7 +138,7 @@ WHERE (
     )
 )
   AND (NULLIF($2, '') IS NULL OR guild_id = NULLIF($2, ''))
-  AND observed_at >= NOW() - ($3::TEXT || ' seconds')::INTERVAL
+  AND observed_at >= NOW() - make_interval(secs => $3::BIGINT)
 GROUP BY metric
 ORDER BY metric
 "#;

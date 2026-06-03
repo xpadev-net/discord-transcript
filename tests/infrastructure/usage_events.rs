@@ -58,6 +58,26 @@ fn usage_event_params_omit_missing_optional_fields_as_empty_strings() {
 }
 
 #[test]
+fn sql_store_clamps_usage_aggregate_window_before_querying() {
+    let executor = FakeSqlExecutor::default();
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .aggregate_recent_usage(Some("tenant-g1"), Some("g1"), u64::MAX)
+        .expect("empty fake result should parse");
+
+    assert_eq!(store.executor.executed[0].0, AGGREGATE_RECENT_USAGE_SQL);
+    assert_eq!(
+        store.executor.executed[0].1,
+        vec![
+            "tenant-g1".to_owned(),
+            "g1".to_owned(),
+            (i64::MAX / 1_000_000).to_string()
+        ]
+    );
+}
+
+#[test]
 fn sql_store_appends_lists_and_aggregates_usage_events() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
