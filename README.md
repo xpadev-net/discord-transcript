@@ -78,6 +78,8 @@ docker compose -f docker-compose.yml -f docker-compose.unsafe-cursor.yml up app
 
 Compose の `app` は Discord voice (songbird) の UDP 通信のため host network を使います。Web UI は既定で `127.0.0.1` に bind します。外部公開する場合は、リバースプロキシなどの公開経路を決めた上で `WEB_BIND_HOST` を明示的に変更してください。`migrate` は compose network 上の `db:5432` に接続するため host network を使いません。
 
+公開 GHCR イメージはネットワークインストーラの実行を避けるため Cursor Agent CLI を同梱しません。Docker で `cursor_agent` / `opencode` harness を使う場合は、検証済みの CLI を含む派生イメージを作るか、信頼できる方法でバイナリを配置し、`SUMMARY_COMMAND` に明示的なパスを設定してください。
+
 ### ワークスペース構造
 
 `CHUNK_STORAGE_DIR` 配下に会議ごとのワークスペースを作成します。
