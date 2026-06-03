@@ -170,7 +170,8 @@ impl AppConfig {
             discord_client_secret: optional_env("DISCORD_CLIENT_SECRET"),
             web_session_secret: optional_env("WEB_SESSION_SECRET"),
             operational_metrics_bearer_token: optional_env("OPERATIONAL_METRICS_BEARER_TOKEN")
-                .map(|value| value.trim().to_owned()),
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             guild_bot_token_encryption_key: optional_env("GUILD_BOT_TOKEN_ENCRYPTION_KEY")
                 .map(|value| value.trim().to_owned()),
             static_files_dir: optional_env("STATIC_FILES_DIR")
