@@ -10,6 +10,7 @@ use discord_transcript::domain::retention::{
     should_delete_artifact,
 };
 use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use chrono::{TimeZone, Utc};
 use std::num::NonZeroU32;
 
 fn nonzero(value: u32) -> NonZeroU32 {
@@ -226,12 +227,21 @@ fn access_control_matches_mvp_rules() {
 #[test]
 fn audit_log_appends_and_reads_events() {
     let mut log = AuditLog::new();
+    let occurred_at = Utc.with_ymd_and_hms(2026, 6, 3, 1, 2, 3).unwrap();
     log.append(AuditEvent {
-        actor_user_id: "u1".to_owned(),
+        id: "audit-1".to_owned(),
+        tenant_id: Some("tenant-g1".to_owned()),
+        guild_id: Some("g1".to_owned()),
+        actor_user_id: Some("u1".to_owned()),
         action: "delete_transcript".to_owned(),
-        meeting_id: "m1".to_owned(),
-        detail: "manual cleanup".to_owned(),
+        resource_type: "meeting".to_owned(),
+        resource_id: Some("m1".to_owned()),
+        request_metadata_json: r#"{"method":"DELETE"}"#.to_owned(),
+        detail_json: r#"{"reason":"manual_cleanup"}"#.to_owned(),
+        occurred_at,
+        created_at: occurred_at,
     });
     assert_eq!(log.list().len(), 1);
     assert_eq!(log.list()[0].action, "delete_transcript");
+    assert_eq!(log.recent(1)[0].resource_id.as_deref(), Some("m1"));
 }
