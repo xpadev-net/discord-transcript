@@ -110,6 +110,10 @@ fn schema_constrains_feedback_kinds_and_targets() {
     assert!(schema.contains("'person_alias'"));
     assert!(schema.contains("'domain_knowledge'"));
     assert!(schema.contains("'ai_memory'"));
+    assert!(schema.contains("transcript_feedback_mistranscription_text_required_check"));
+    assert!(schema.contains("transcript_feedback_speaker_required_check"));
+    assert!(schema.contains("COALESCE(length(btrim(original_text)) > 0, FALSE)"));
+    assert!(schema.contains("COALESCE(length(btrim(corrected_speaker_id)) > 0, FALSE)"));
     assert!(schema.contains("transcript_feedback_term_type_required_check"));
     assert!(schema.contains("transcript_feedback_target_domain_check"));
     assert!(schema.contains("transcript_feedback_target_ai_memory_check"));

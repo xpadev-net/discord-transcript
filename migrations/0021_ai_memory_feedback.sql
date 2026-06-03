@@ -170,6 +170,16 @@ CREATE TABLE IF NOT EXISTS transcript_feedback (
     CONSTRAINT transcript_feedback_segment_meeting_check CHECK (
         transcript_segment_id IS NULL OR meeting_id IS NOT NULL
     ),
+    CONSTRAINT transcript_feedback_mistranscription_text_required_check CHECK (
+        feedback_type <> 'mistranscription'
+        OR COALESCE(length(btrim(original_text)) > 0, FALSE)
+        OR COALESCE(length(btrim(corrected_text)) > 0, FALSE)
+    ),
+    CONSTRAINT transcript_feedback_speaker_required_check CHECK (
+        feedback_type <> 'speaker'
+        OR COALESCE(length(btrim(speaker_id)) > 0, FALSE)
+        OR COALESCE(length(btrim(corrected_speaker_id)) > 0, FALSE)
+    ),
     CONSTRAINT transcript_feedback_term_type_required_check CHECK (
         feedback_type <> 'term' OR term_type IS NOT NULL
     ),
