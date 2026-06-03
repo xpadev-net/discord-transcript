@@ -110,14 +110,9 @@ impl UserAudioBuffer {
                 .zip(std::mem::take(&mut other.frame_instants)),
         );
         timed_frames.sort_by_key(|(frame, _)| frame.timestamp_ms);
-        self.frames = timed_frames
-            .iter()
-            .map(|(frame, _)| frame.clone())
-            .collect();
-        self.frame_instants = timed_frames
-            .into_iter()
-            .map(|(_, instant)| instant)
-            .collect();
+        let (frames, instants): (Vec<_>, Vec<_>) = timed_frames.into_iter().unzip();
+        self.frames = frames;
+        self.frame_instants = instants;
         self.refresh_timing_metadata();
     }
 
@@ -140,29 +135,8 @@ impl UserAudioBuffer {
         ))?;
         for existing in &self.frames {
             start_ms = start_ms.min(existing.timestamp_ms);
-            let existing_end = existing.timestamp_ms.checked_add(pcm_duration_ms(
-                &existing.pcm_16le_bytes,
-                RECEIVER_SPAN_SAMPLE_RATE,
-            ))?;
+            let existing_end = frame_end_ms(existing)?;
             end_ms = end_ms.max(existing_end);
-        }
-        end_ms.checked_sub(start_ms)
-    }
-
-    fn buffered_span_ms(frames: &[BufferedFrame]) -> Option<u64> {
-        let first = frames.first()?;
-        let mut start_ms = first.timestamp_ms;
-        let mut end_ms = first.timestamp_ms.checked_add(pcm_duration_ms(
-            &first.pcm_16le_bytes,
-            RECEIVER_SPAN_SAMPLE_RATE,
-        ))?;
-        for frame in frames.iter().skip(1) {
-            start_ms = start_ms.min(frame.timestamp_ms);
-            let frame_end = frame.timestamp_ms.checked_add(pcm_duration_ms(
-                &frame.pcm_16le_bytes,
-                RECEIVER_SPAN_SAMPLE_RATE,
-            ))?;
-            end_ms = end_ms.max(frame_end);
         }
         end_ms.checked_sub(start_ms)
     }
@@ -177,12 +151,23 @@ impl UserAudioBuffer {
         let mut dropped_bytes = 0usize;
         let mut drop_count = 0usize;
         let mut retained_bytes = self.buffered_bytes;
+
+        let mut suffix_max_end_ms = vec![0u64; self.frames.len()];
+        let mut running_max_end_ms = 0u64;
+        for (index, frame) in self.frames.iter().enumerate().rev() {
+            running_max_end_ms = running_max_end_ms.max(frame_end_ms(frame).unwrap_or(u64::MAX));
+            suffix_max_end_ms[index] = running_max_end_ms;
+        }
+
         for frame in &self.frames {
-            let retained_frames = &self.frames[drop_count..];
-            if retained_frames.len() <= MAX_RECEIVER_BUFFERED_FRAMES_PER_USER
+            let retained_len = self.frames.len().saturating_sub(drop_count);
+            let span_ok = retained_len == 0
+                || suffix_max_end_ms[drop_count]
+                    .checked_sub(self.frames[drop_count].timestamp_ms)
+                    .is_some_and(|span_ms| span_ms <= MAX_RECEIVER_BUFFERED_SPAN_MS);
+            if retained_len <= MAX_RECEIVER_BUFFERED_FRAMES_PER_USER
                 && retained_bytes <= MAX_RECEIVER_BUFFERED_BYTES_PER_USER
-                && Self::buffered_span_ms(retained_frames)
-                    .is_some_and(|span_ms| span_ms <= MAX_RECEIVER_BUFFERED_SPAN_MS)
+                && span_ok
             {
                 break;
             }
@@ -201,6 +186,13 @@ impl UserAudioBuffer {
 
         dropped_bytes
     }
+}
+
+fn frame_end_ms(frame: &BufferedFrame) -> Option<u64> {
+    frame.timestamp_ms.checked_add(pcm_duration_ms(
+        &frame.pcm_16le_bytes,
+        RECEIVER_SPAN_SAMPLE_RATE,
+    ))
 }
 
 #[derive(Debug, Default)]
