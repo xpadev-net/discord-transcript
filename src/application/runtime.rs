@@ -3395,7 +3395,7 @@ impl ScaffoldHandler {
             quantity,
             detail_json: UsageDetailJson::new(serde_json::json!({
                 "source": "audio_duration",
-                "segment_count": transcription.segments.len(),
+                "whisper_segment_count": transcription.segments.len(),
                 "surface": "runtime_transcription_success"
             }))
             .expect("usage detail must be a JSON object"),
