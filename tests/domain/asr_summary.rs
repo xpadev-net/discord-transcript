@@ -1,9 +1,14 @@
 use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
-    build_correction_prompt, build_summary_prompt, run_summary_pipeline,
+    build_correction_prompt, build_summary_prompt, build_summary_prompt_with_template,
+    run_summary_pipeline,
 };
 use discord_transcript::domain::privacy::MaskingStats;
 use discord_transcript::domain::speaker::SpeakerProfile;
+use discord_transcript::domain::summary_template::{
+    SummaryTemplateValidationError, SummaryTemplateVariables, render_summary_template,
+    validate_summary_template,
+};
 use discord_transcript::domain::transcript::{
     NormalizationConfig, TranscriptSegment, TranscriptSource, normalize_segments, render_for_summary,
 };
@@ -224,6 +229,37 @@ fn build_correction_prompt_returns_empty_string_for_blank_transcript() {
 }
 
 #[test]
+fn summary_template_validation_accepts_approved_variables() {
+    let template = "Read {{ transcript_path }} and {{manifest_path}} in {{language}}.";
+
+    assert_eq!(validate_summary_template(template), Ok(()));
+    assert_eq!(
+        render_summary_template(
+            template,
+            &SummaryTemplateVariables {
+                transcript_path: "transcript/transcript_masked.md".to_owned(),
+                manifest_path: "transcript/manifest.json".to_owned(),
+                language: "ja".to_owned(),
+                speaker_roster: "Alice".to_owned(),
+                domain_context_path: "context/".to_owned(),
+            },
+        )
+        .expect("approved variables should render"),
+        "Read transcript/transcript_masked.md and transcript/manifest.json in ja."
+    );
+}
+
+#[test]
+fn summary_template_validation_rejects_unknown_variables() {
+    assert_eq!(
+        validate_summary_template("Read {{secret_path}}."),
+        Err(SummaryTemplateValidationError::UnknownVariable(
+            "secret_path".to_owned()
+        ))
+    );
+}
+
+#[test]
 fn summary_pipeline_masks_pii_and_chunks_output() {
     let original_email = "alice@example.com";
     let original_phone = "+81 90-1234-5678";
@@ -313,4 +349,72 @@ fn prompt_contains_required_sections() {
         "prompt should guide model to retain speaker attribution"
     );
     assert!(!prompt.contains(forbidden));
+}
+
+#[test]
+fn summary_prompt_template_none_preserves_builtin_default() {
+    let temp = unique_workspace("prompt_default", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: Some("Weekly".to_owned()),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("ja".to_owned()),
+        workspace,
+    };
+    let manifest = TranscriptManifest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        language: Some("ja".to_owned()),
+        masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
+        generated_at: "2026-01-01T00:00:00Z".to_owned(),
+        masking_stats: MaskingStats::default(),
+    };
+
+    assert_eq!(
+        build_summary_prompt_with_template(&request, &manifest, None)
+            .expect("default prompt should render"),
+        build_summary_prompt(&request, &manifest)
+    );
+}
+
+#[test]
+fn summary_prompt_template_renders_custom_template() {
+    let temp = unique_workspace("prompt_custom", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        title: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let manifest = TranscriptManifest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        language: Some("en".to_owned()),
+        masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
+        generated_at: "2026-01-01T00:00:00Z".to_owned(),
+        masking_stats: MaskingStats::default(),
+    };
+
+    let prompt = build_summary_prompt_with_template(
+        &request,
+        &manifest,
+        Some("Summarize {{transcript_path}} with {{manifest_path}} in {{language}}."),
+    )
+    .expect("custom template should render");
+
+    assert_eq!(
+        prompt,
+        "Summarize transcript/transcript_masked.md with transcript/manifest.json in en."
+    );
 }

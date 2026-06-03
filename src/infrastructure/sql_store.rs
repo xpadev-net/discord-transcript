@@ -5,18 +5,22 @@ use crate::domain::domain_knowledge::{
     DomainKnowledgeContentType, DomainKnowledgeItem, NewDomainKnowledgeItem,
     UpdateDomainKnowledgeItem,
 };
+use crate::domain::summary_template::{NewSummaryTemplate, SummaryTemplate, UpdateSummaryTemplate};
 use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
-    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
-    BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
-    ENQUEUE_JOB_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
-    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL, INSERT_AUDIT_EVENT_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
+    ARCHIVE_SUMMARY_TEMPLATE_SQL, BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL,
+    CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, ENQUEUE_JOB_SQL, GET_ACTIVE_SUMMARY_TEMPLATE_SQL,
+    GET_DOMAIN_KNOWLEDGE_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
+    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL, GET_SUMMARY_TEMPLATE_SQL, INSERT_AUDIT_EVENT_SQL,
     INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
-    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
-    LIST_RECENT_AUDIT_EVENTS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
-    MARK_STOPPING_IF_RECORDING_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
-    SET_MEETING_STATUS_CAS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
+    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL,
+    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -310,6 +314,136 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             return Ok(None);
         };
         parse_domain_knowledge_row(&row).map(Some)
+    }
+
+    pub fn list_summary_templates(
+        &mut self,
+        guild_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SummaryTemplate>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_SUMMARY_TEMPLATES_SQL,
+                &[guild_id.to_owned(), include_archived.to_string()],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_summary_template_row).collect()
+    }
+
+    pub fn get_summary_template(
+        &mut self,
+        guild_id: &str,
+        id: &str,
+    ) -> Result<Option<SummaryTemplate>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                GET_SUMMARY_TEMPLATE_SQL,
+                &[guild_id.to_owned(), id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_summary_template_row(&row).map(Some)
+    }
+
+    pub fn get_active_summary_template(
+        &mut self,
+        guild_id: &str,
+    ) -> Result<Option<SummaryTemplate>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(GET_ACTIVE_SUMMARY_TEMPLATE_SQL, &[guild_id.to_owned()])
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_summary_template_row(&row).map(Some)
+    }
+
+    pub fn create_summary_template(
+        &mut self,
+        item: &NewSummaryTemplate,
+    ) -> Result<SummaryTemplate, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                INSERT_SUMMARY_TEMPLATE_SQL,
+                &new_summary_template_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::Backend(
+                "summary template insert returned no row".to_owned(),
+            ));
+        };
+        parse_summary_template_row(&row)
+    }
+
+    pub fn update_summary_template(
+        &mut self,
+        item: &UpdateSummaryTemplate,
+    ) -> Result<Option<SummaryTemplate>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                UPDATE_SUMMARY_TEMPLATE_SQL,
+                &update_summary_template_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_summary_template_row(&row).map(Some)
+    }
+
+    pub fn activate_summary_template(
+        &mut self,
+        guild_id: &str,
+        id: &str,
+        actor_user_id: Option<&str>,
+    ) -> Result<Option<SummaryTemplate>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                ACTIVATE_SUMMARY_TEMPLATE_SQL,
+                &[
+                    id.to_owned(),
+                    guild_id.to_owned(),
+                    actor_user_id.unwrap_or_default().to_owned(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_summary_template_row(&row).map(Some)
+    }
+
+    pub fn archive_summary_template(
+        &mut self,
+        guild_id: &str,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<SummaryTemplate>, StoreError> {
+        if actor_user_id.trim().is_empty() {
+            return Err(StoreError::Backend(
+                "summary template archive actor is required".to_owned(),
+            ));
+        }
+        let rows = self
+            .executor
+            .query_rows(
+                ARCHIVE_SUMMARY_TEMPLATE_SQL,
+                &[id.to_owned(), guild_id.to_owned(), actor_user_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_summary_template_row(&row).map(Some)
     }
 }
 
@@ -706,6 +840,59 @@ fn parse_optional_domain_knowledge_timestamp(
         return Ok(None);
     };
     parse_required_domain_knowledge_timestamp(&raw, field).map(Some)
+}
+
+fn new_summary_template_params(item: &NewSummaryTemplate) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.guild_id.clone(),
+        item.name.clone(),
+        item.template.clone(),
+        item.active.to_string(),
+        item.updated_actor_user_id.clone().unwrap_or_default(),
+    ]
+}
+
+fn update_summary_template_params(item: &UpdateSummaryTemplate) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.guild_id.clone(),
+        item.name.clone(),
+        item.template.clone(),
+        item.active
+            .map(|active| active.to_string())
+            .unwrap_or_default(),
+        item.updated_actor_user_id.clone().unwrap_or_default(),
+    ]
+}
+
+fn parse_summary_template_row(row: &SqlRow) -> Result<SummaryTemplate, StoreError> {
+    if row.len() < 12 {
+        return Err(StoreError::Backend(format!(
+            "invalid summary template row length: {}",
+            row.len()
+        )));
+    }
+    let created_at_raw = require_store_column(row, 10, "created_at")?;
+    let updated_at_raw = require_store_column(row, 11, "updated_at")?;
+
+    Ok(SummaryTemplate {
+        id: require_store_column(row, 0, "id")?,
+        tenant_id: row.get(1).and_then(|v| v.clone()),
+        guild_id: require_store_column(row, 2, "guild_id")?,
+        name: require_store_column(row, 3, "name")?,
+        template: require_store_column(row, 4, "template")?,
+        active: required_bool_column(row, 5, "active")?,
+        version: required_u32_column(row, 6, "version")?,
+        updated_actor_user_id: row.get(7).and_then(|v| v.clone()),
+        archived_at: parse_optional_domain_knowledge_timestamp(
+            row.get(8).and_then(|v| v.clone()),
+            "archived_at",
+        )?,
+        archived_actor_user_id: row.get(9).and_then(|v| v.clone()),
+        created_at: parse_required_domain_knowledge_timestamp(&created_at_raw, "created_at")?,
+        updated_at: parse_required_domain_knowledge_timestamp(&updated_at_raw, "updated_at")?,
+    })
 }
 
 pub fn audit_event_params(event: &AuditEvent) -> Vec<String> {

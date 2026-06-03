@@ -1,4 +1,7 @@
 use crate::domain::privacy::{MaskingStats, mask_pii};
+use crate::domain::summary_template::{
+    SummaryTemplateValidationError, SummaryTemplateVariables, render_summary_template,
+};
 use crate::domain::transcript::{NormalizationConfig, normalize_segments, render_for_summary};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
 use crate::infrastructure::workspace::{
@@ -62,6 +65,7 @@ impl ClaudeSummaryClient for StubClaudeSummaryClient {
 pub enum SummaryError {
     Asr(String),
     SummaryEngine(String),
+    InvalidSummaryTemplate(String),
 }
 
 impl Display for SummaryError {
@@ -69,6 +73,7 @@ impl Display for SummaryError {
         match self {
             Self::Asr(err) => write!(f, "asr failed: {err}"),
             Self::SummaryEngine(err) => write!(f, "summary engine failed: {err}"),
+            Self::InvalidSummaryTemplate(err) => write!(f, "invalid summary template: {err}"),
         }
     }
 }
@@ -356,6 +361,49 @@ Instructions:\n\
         manifest.masking_stats.email_replacements,
         manifest.masking_stats.phone_replacements
     )
+}
+
+pub fn build_summary_prompt_with_template(
+    request: &SummaryRequest,
+    manifest: &TranscriptManifest,
+    template: Option<&str>,
+) -> Result<String, SummaryError> {
+    let Some(template) = template else {
+        return Ok(build_summary_prompt(request, manifest));
+    };
+    let values = summary_template_values(request, manifest);
+    render_summary_template(template, &values).map_err(summary_template_error)
+}
+
+fn summary_template_values(
+    request: &SummaryRequest,
+    _manifest: &TranscriptManifest,
+) -> SummaryTemplateVariables {
+    SummaryTemplateVariables {
+        transcript_path: format!("transcript/{MASKED_TRANSCRIPT_FILENAME}"),
+        manifest_path: format!("transcript/{TRANSCRIPT_MANIFEST_FILENAME}"),
+        language: request
+            .language
+            .as_deref()
+            .unwrap_or("unknown or auto-detected")
+            .to_owned(),
+        speaker_roster: "not materialized".to_owned(),
+        domain_context_path: "context/".to_owned(),
+    }
+}
+
+fn summary_template_error(err: SummaryTemplateValidationError) -> SummaryError {
+    SummaryError::InvalidSummaryTemplate(match err {
+        SummaryTemplateValidationError::Empty => "template is empty".to_owned(),
+        SummaryTemplateValidationError::TooLarge => "template is too large".to_owned(),
+        SummaryTemplateValidationError::UnclosedVariable => {
+            "template variable is unclosed".to_owned()
+        }
+        SummaryTemplateValidationError::EmptyVariable => "template variable is empty".to_owned(),
+        SummaryTemplateValidationError::UnknownVariable(name) => {
+            format!("unknown template variable '{name}'")
+        }
+    })
 }
 
 pub fn build_transcription_output(

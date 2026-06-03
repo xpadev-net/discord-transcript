@@ -34,6 +34,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0016_audit_events.sql"),
     "\n",
     include_str!("../../migrations/0017_domain_knowledge.sql"),
+    "\n",
+    include_str!("../../migrations/0018_summary_templates.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -784,6 +786,324 @@ WITH active_tenant AS (
               content_type,
               title,
               body,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM updated
+"#;
+
+pub const LIST_SUMMARY_TEMPLATES_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+SELECT id,
+       tenant_id,
+       guild_id,
+       name,
+       template,
+       active,
+       version,
+       updated_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM summary_templates
+WHERE guild_id = $1
+  AND tenant_id = (SELECT tenant_id FROM active_tenant)
+  AND ($2::TEXT::BOOLEAN OR archived_at IS NULL)
+ORDER BY active DESC, updated_at DESC, id DESC
+"#;
+
+pub const GET_SUMMARY_TEMPLATE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+SELECT id,
+       tenant_id,
+       guild_id,
+       name,
+       template,
+       active,
+       version,
+       updated_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM summary_templates
+WHERE guild_id = $1
+  AND id = $2
+  AND tenant_id = (SELECT tenant_id FROM active_tenant)
+"#;
+
+pub const GET_ACTIVE_SUMMARY_TEMPLATE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+SELECT id,
+       tenant_id,
+       guild_id,
+       name,
+       template,
+       active,
+       version,
+       updated_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM summary_templates
+WHERE guild_id = $1
+  AND tenant_id = (SELECT tenant_id FROM active_tenant)
+  AND active = TRUE
+  AND archived_at IS NULL
+ORDER BY updated_at DESC, id DESC
+LIMIT 1
+"#;
+
+pub const INSERT_SUMMARY_TEMPLATE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), deactivate_others AS (
+    UPDATE summary_templates
+    SET active = FALSE,
+        version = version + 1,
+        updated_actor_user_id = NULLIF($6, ''),
+        updated_at = NOW()
+    WHERE $5::TEXT::BOOLEAN
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+      AND active = TRUE
+      AND archived_at IS NULL
+), inserted AS (
+    INSERT INTO summary_templates (
+        id, tenant_id, guild_id, name, template, active,
+        version, updated_actor_user_id, created_at, updated_at
+    )
+    SELECT
+        $1, tenant_id, $2, $3, $4,
+        $5::TEXT::BOOLEAN, 1, NULLIF($6, ''), NOW(), NOW()
+    FROM active_tenant
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              name,
+              template,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM inserted
+"#;
+
+pub const UPDATE_SUMMARY_TEMPLATE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), desired AS (
+    SELECT COALESCE(NULLIF($5, '')::TEXT::BOOLEAN, active) AS active
+    FROM summary_templates
+    WHERE id = $1
+      AND guild_id = $2
+      AND archived_at IS NULL
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+), deactivate_others AS (
+    UPDATE summary_templates
+    SET active = FALSE,
+        version = version + 1,
+        updated_actor_user_id = NULLIF($6, ''),
+        updated_at = NOW()
+    WHERE (SELECT active FROM desired)
+      AND id <> $1
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+      AND active = TRUE
+      AND archived_at IS NULL
+), updated AS (
+    UPDATE summary_templates
+    SET name = $3,
+        template = $4,
+        active = (SELECT active FROM desired),
+        version = CASE
+            WHEN name IS DISTINCT FROM $3
+              OR template IS DISTINCT FROM $4
+              OR active IS DISTINCT FROM (SELECT active FROM desired)
+            THEN version + 1
+            ELSE version
+        END,
+        updated_actor_user_id = CASE
+            WHEN name IS DISTINCT FROM $3
+              OR template IS DISTINCT FROM $4
+              OR active IS DISTINCT FROM (SELECT active FROM desired)
+            THEN NULLIF($6, '')
+            ELSE updated_actor_user_id
+        END,
+        updated_at = CASE
+            WHEN name IS DISTINCT FROM $3
+              OR template IS DISTINCT FROM $4
+              OR active IS DISTINCT FROM (SELECT active FROM desired)
+            THEN NOW()
+            ELSE updated_at
+        END
+    WHERE id = $1
+      AND guild_id = $2
+      AND archived_at IS NULL
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              name,
+              template,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM updated
+"#;
+
+pub const ACTIVATE_SUMMARY_TEMPLATE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), deactivate_others AS (
+    UPDATE summary_templates
+    SET active = FALSE,
+        version = version + 1,
+        updated_actor_user_id = NULLIF($3, ''),
+        updated_at = NOW()
+    WHERE id <> $1
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+      AND active = TRUE
+      AND archived_at IS NULL
+), updated AS (
+    UPDATE summary_templates
+    SET active = TRUE,
+        archived_at = NULL,
+        archived_actor_user_id = NULL,
+        version = CASE
+            WHEN NOT active OR archived_at IS NOT NULL THEN version + 1
+            ELSE version
+        END,
+        updated_actor_user_id = CASE
+            WHEN NOT active OR archived_at IS NOT NULL THEN NULLIF($3, '')
+            ELSE updated_actor_user_id
+        END,
+        updated_at = CASE
+            WHEN NOT active OR archived_at IS NOT NULL THEN NOW()
+            ELSE updated_at
+        END
+    WHERE id = $1
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              name,
+              template,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM updated
+"#;
+
+pub const ARCHIVE_SUMMARY_TEMPLATE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), updated AS (
+    UPDATE summary_templates
+    SET active = CASE
+            WHEN archived_at IS NULL THEN FALSE
+            ELSE active
+        END,
+        archived_at = COALESCE(archived_at, NOW()),
+        archived_actor_user_id = COALESCE(archived_actor_user_id, NULLIF($3, '')),
+        version = CASE
+            WHEN archived_at IS NULL THEN version + 1
+            ELSE version
+        END,
+        updated_actor_user_id = CASE
+            WHEN archived_at IS NULL THEN NULLIF($3, '')
+            ELSE updated_actor_user_id
+        END,
+        updated_at = CASE
+            WHEN archived_at IS NULL THEN NOW()
+            ELSE updated_at
+        END
+    WHERE id = $1
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              name,
+              template,
               active,
               version,
               updated_actor_user_id,

@@ -9,6 +9,8 @@ import type {
   MeResponse,
   SpeakerAudioInfo,
   SummaryResponse,
+  SummaryTemplate,
+  SummaryTemplateUpsertRequest,
   TranscriptResponse,
   TranscriptSegment,
   TranscriptStateResponse,
@@ -23,6 +25,11 @@ function basePath(meetingId: string): string {
 function domainKnowledgePath(itemId?: string): string {
   const base = "/api/guild/domain-knowledge";
   return itemId ? `${base}/${encodeURIComponent(itemId)}` : base;
+}
+
+function summaryTemplatePath(templateId?: string): string {
+  const base = "/api/guild/summary-templates";
+  return templateId ? `${base}/${encodeURIComponent(templateId)}` : base;
 }
 
 export function buildLoginRedirectUrl(path: string): string {
@@ -229,6 +236,81 @@ export function archiveDomainKnowledgeItem(
     method: "POST",
     signal,
   }).then(handleResponse<DomainKnowledgeItem>);
+}
+
+export function fetchSummaryTemplates(
+  options: {
+    includeArchived?: boolean;
+  } = {},
+  signal?: AbortSignal,
+): Promise<SummaryTemplate[]> {
+  const params = new URLSearchParams();
+  if (options.includeArchived !== undefined) {
+    params.set("include_archived", String(options.includeArchived));
+  }
+  const query = params.toString();
+  const path = query
+    ? `${summaryTemplatePath()}?${query}`
+    : summaryTemplatePath();
+  return fetch(path, { signal }).then(handleResponse<SummaryTemplate[]>);
+}
+
+export function fetchSummaryTemplate(
+  templateId: string,
+  signal?: AbortSignal,
+): Promise<SummaryTemplate> {
+  return fetch(summaryTemplatePath(templateId), { signal }).then(
+    handleResponse<SummaryTemplate>,
+  );
+}
+
+export function createSummaryTemplate(
+  request: SummaryTemplateUpsertRequest,
+  signal?: AbortSignal,
+): Promise<SummaryTemplate> {
+  return fetch(summaryTemplatePath(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<SummaryTemplate>);
+}
+
+export function updateSummaryTemplate(
+  templateId: string,
+  request: SummaryTemplateUpsertRequest,
+  signal?: AbortSignal,
+): Promise<SummaryTemplate> {
+  return fetch(summaryTemplatePath(templateId), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<SummaryTemplate>);
+}
+
+export function activateSummaryTemplate(
+  templateId: string,
+  signal?: AbortSignal,
+): Promise<SummaryTemplate> {
+  return fetch(`${summaryTemplatePath(templateId)}/activate`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<SummaryTemplate>);
+}
+
+export function archiveSummaryTemplate(
+  templateId: string,
+  signal?: AbortSignal,
+): Promise<SummaryTemplate> {
+  return fetch(`${summaryTemplatePath(templateId)}/archive`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<SummaryTemplate>);
 }
 
 export function fetchMeeting(
