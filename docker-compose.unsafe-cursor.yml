@@ -1,0 +1,10 @@
+services:
+  app:
+    # Unsafe local harness override. Mount only Cursor credentials, read-only.
+    volumes:
+      - type: bind
+        source: ${LLM_CURSOR_CONFIG_DIR:?Set LLM_CURSOR_CONFIG_DIR to an absolute path for local Cursor harness testing}
+        target: /home/app/.cursor
+        read_only: true
+        bind:
+          create_host_path: false

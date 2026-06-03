@@ -1,0 +1,10 @@
+services:
+  app:
+    # Unsafe local harness override. Mount only Claude credentials, read-only.
+    volumes:
+      - type: bind
+        source: ${LLM_CLAUDE_CONFIG_DIR:?Set LLM_CLAUDE_CONFIG_DIR to an absolute path for local Claude harness testing}
+        target: /home/app/.claude
+        read_only: true
+        bind:
+          create_host_path: false
