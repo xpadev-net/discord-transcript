@@ -32,6 +32,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0015_effective_meeting_settings.sql"),
     "\n",
     include_str!("../../migrations/0016_audit_events.sql"),
+    "\n",
+    include_str!("../../migrations/0017_domain_knowledge.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -537,4 +539,258 @@ WITH existing_guilds AS (
 SELECT
     (SELECT count(*) FROM inserted_tenants) AS tenants_inserted,
     (SELECT count(*) FROM inserted_installations) AS installations_inserted
+"#;
+
+pub const LIST_DOMAIN_KNOWLEDGE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+SELECT id,
+       tenant_id,
+       guild_id,
+       content_type,
+       title,
+       body,
+       active,
+       version,
+       updated_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM domain_knowledge_items
+WHERE guild_id = $1
+  AND tenant_id = (SELECT tenant_id FROM active_tenant)
+  AND ($2::TEXT::BOOLEAN OR archived_at IS NULL)
+  AND (NULLIF($3, '') IS NULL OR content_type = $3)
+ORDER BY active DESC, updated_at DESC, id DESC
+"#;
+
+pub const GET_DOMAIN_KNOWLEDGE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+SELECT id,
+       tenant_id,
+       guild_id,
+       content_type,
+       title,
+       body,
+       active,
+       version,
+       updated_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM domain_knowledge_items
+WHERE guild_id = $1
+  AND id = $2
+  AND tenant_id = (SELECT tenant_id FROM active_tenant)
+"#;
+
+pub const INSERT_DOMAIN_KNOWLEDGE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+INSERT INTO domain_knowledge_items (
+    id, tenant_id, guild_id, content_type, title, body, active,
+    version, updated_actor_user_id, created_at, updated_at
+)
+SELECT
+    $1, tenant_id, $2, $3, $4, $5,
+    $6::TEXT::BOOLEAN, 1, NULLIF($7, ''), NOW(), NOW()
+FROM active_tenant
+RETURNING id,
+          tenant_id,
+          guild_id,
+          content_type,
+          title,
+          body,
+          active,
+          version,
+          updated_actor_user_id,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const UPDATE_DOMAIN_KNOWLEDGE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), updated AS (
+    UPDATE domain_knowledge_items
+    SET content_type = $3,
+        title = $4,
+        body = $5,
+        active = COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active),
+        version = CASE
+            WHEN content_type IS DISTINCT FROM $3
+              OR title IS DISTINCT FROM $4
+              OR body IS DISTINCT FROM $5
+              OR active IS DISTINCT FROM COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)
+            THEN version + 1
+            ELSE version
+        END,
+        updated_actor_user_id = CASE
+            WHEN content_type IS DISTINCT FROM $3
+              OR title IS DISTINCT FROM $4
+              OR body IS DISTINCT FROM $5
+              OR active IS DISTINCT FROM COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)
+            THEN NULLIF($7, '')
+            ELSE updated_actor_user_id
+        END,
+        updated_at = CASE
+            WHEN content_type IS DISTINCT FROM $3
+              OR title IS DISTINCT FROM $4
+              OR body IS DISTINCT FROM $5
+              OR active IS DISTINCT FROM COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)
+            THEN NOW()
+            ELSE updated_at
+        END
+    WHERE id = $1
+      AND guild_id = $2
+      AND archived_at IS NULL
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              content_type,
+              title,
+              body,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM updated
+"#;
+
+pub const ACTIVATE_DOMAIN_KNOWLEDGE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), updated AS (
+    UPDATE domain_knowledge_items
+    SET active = TRUE,
+        archived_at = NULL,
+        archived_actor_user_id = NULL,
+        version = CASE
+            WHEN NOT active OR archived_at IS NOT NULL THEN version + 1
+            ELSE version
+        END,
+        updated_actor_user_id = CASE
+            WHEN NOT active OR archived_at IS NOT NULL THEN NULLIF($3, '')
+            ELSE updated_actor_user_id
+        END,
+        updated_at = CASE
+            WHEN NOT active OR archived_at IS NOT NULL THEN NOW()
+            ELSE updated_at
+        END
+    WHERE id = $1
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              content_type,
+              title,
+              body,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM updated
+"#;
+
+pub const ARCHIVE_DOMAIN_KNOWLEDGE_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $2
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+), updated AS (
+    UPDATE domain_knowledge_items
+    SET active = CASE
+            WHEN archived_at IS NULL THEN FALSE
+            ELSE active
+        END,
+        archived_at = COALESCE(archived_at, NOW()),
+        archived_actor_user_id = COALESCE(archived_actor_user_id, NULLIF($3, '')),
+        version = CASE
+            WHEN archived_at IS NULL THEN version + 1
+            ELSE version
+        END,
+        updated_actor_user_id = CASE
+            WHEN archived_at IS NULL THEN NULLIF($3, '')
+            ELSE updated_actor_user_id
+        END,
+        updated_at = CASE
+            WHEN archived_at IS NULL THEN NOW()
+            ELSE updated_at
+        END
+    WHERE id = $1
+      AND guild_id = $2
+      AND tenant_id = (SELECT tenant_id FROM active_tenant)
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              content_type,
+              title,
+              body,
+              active,
+              version,
+              updated_actor_user_id,
+              to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+              archived_actor_user_id,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+)
+SELECT * FROM updated
 "#;

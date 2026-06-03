@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod authz;
+pub mod domain_knowledge;
 pub mod model;
 pub mod privacy;
 pub mod recovery;
