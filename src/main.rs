@@ -182,6 +182,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         web::GuildBotTokenRuntimeConfig {
             cipher: guild_bot_token_cipher.clone(),
             revision_tx: Some(bot_token_revision_tx),
+            operational_metrics_bearer_token: config.operational_metrics_bearer_token.clone(),
         },
         config.static_files_dir.clone(),
         web::GuildSettingsDefaults {
