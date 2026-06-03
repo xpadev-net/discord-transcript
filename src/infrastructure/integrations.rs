@@ -254,9 +254,10 @@ fn redact_prompt_values(value: &str) -> String {
     let Some(index) = value.to_ascii_lowercase().find("prompt=") else {
         return value.to_owned();
     };
-    let mut output = String::with_capacity(index + "prompt=[REDACTED]".len());
+    const REDACTED_SUFFIX: &str = "prompt=[REDACTED]... (truncated after prompt)";
+    let mut output = String::with_capacity(index + REDACTED_SUFFIX.len());
     output.push_str(&value[..index]);
-    output.push_str("prompt=[REDACTED]... (truncated after prompt)");
+    output.push_str(REDACTED_SUFFIX);
     output
 }
 
