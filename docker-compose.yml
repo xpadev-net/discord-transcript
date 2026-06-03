@@ -38,47 +38,6 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # Unsafe local harness profiles. These mount one host LLM credential directory
-  # read-only for local testing. Start exactly one named service, for example:
-  # docker compose --profile unsafe-claude-harness up app-claude-harness
-  # Do not run the profile without naming the service, or Compose will also
-  # include the default app service.
-  app-claude-harness:
-    extends:
-      service: app
-    profiles: ["unsafe-claude-harness"]
-    volumes:
-      - type: bind
-        source: ${LLM_CLAUDE_CONFIG_DIR:-/run/discord-transcript/missing-claude-credentials}
-        target: /home/app/.claude
-        read_only: true
-        bind:
-          create_host_path: false
-
-  app-opencode-harness:
-    extends:
-      service: app
-    profiles: ["unsafe-opencode-harness"]
-    volumes:
-      - type: bind
-        source: ${LLM_OPENCODE_DATA_DIR:-/run/discord-transcript/missing-opencode-credentials}
-        target: /home/app/.local/share/opencode
-        read_only: true
-        bind:
-          create_host_path: false
-
-  app-cursor-harness:
-    extends:
-      service: app
-    profiles: ["unsafe-cursor-harness"]
-    volumes:
-      - type: bind
-        source: ${LLM_CURSOR_CONFIG_DIR:-/run/discord-transcript/missing-cursor-credentials}
-        target: /home/app/.cursor
-        read_only: true
-        bind:
-          create_host_path: false
-
   db:
     image: postgres:16
     environment:
