@@ -4,11 +4,15 @@ use discord_transcript::application::bot::{
 use discord_transcript::application::command::PermissionSet;
 use discord_transcript::application::summary::{SpeakerAudioInput, StubClaudeSummaryClient};
 use discord_transcript::application::worker::{ProcessMeetingInput, process_meeting_summary};
+use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
+use discord_transcript::domain::usage::UsageMetric;
 use discord_transcript::infrastructure::asr::StubWhisperClient;
-use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use discord_transcript::infrastructure::storage::{
+    InMemoryMeetingStore, StoredMeeting, UsageEventStore,
+};
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -40,10 +44,11 @@ fn temp_workspace(meeting_id: &str) -> TempWorkspaceGuard {
         "discord_transcript_runtime_worker_{meeting_id}_{nanos}"
     ));
     let layout = MeetingWorkspaceLayout::new(&base);
-    TempWorkspaceGuard {
-        workspace: layout.for_meeting("g1", "vc", meeting_id),
-        base,
-    }
+    let workspace = layout.for_meeting("g1", "vc", meeting_id);
+    std::fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+    let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
+    std::fs::write(workspace.mixdown_path(), wav).expect("mixdown should be written");
+    TempWorkspaceGuard { workspace, base }
 }
 
 fn base_env() -> HashMap<String, String> {
@@ -529,6 +534,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            job_id: None,
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc".to_owned(),
             title: None,
@@ -587,6 +593,7 @@ fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            job_id: None,
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc".to_owned(),
             title: None,
@@ -643,6 +650,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         &claude,
         &ProcessMeetingInput {
             meeting_id: "m1".to_owned(),
+            job_id: None,
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc".to_owned(),
             title: None,
@@ -662,4 +670,12 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.status, MeetingStatus::Summarizing);
     assert_eq!(saved.error_message, None);
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage events should list");
+    assert!(
+        usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::AsrSeconds && event.quantity == 1)
+    );
 }

@@ -6,19 +6,27 @@ use crate::application::summary::{
     persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
+use crate::domain::usage::{
+    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
+    UsageSnapshot,
+};
 use crate::domain::{JobStatus, JobType, MeetingStatus};
 use crate::infrastructure::asr::WhisperClient;
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
-use crate::infrastructure::storage::{MeetingStore, StoreError};
+use crate::infrastructure::storage::{MeetingStore, StoreError, UsageEventStore};
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
+use chrono::Utc;
 use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMeetingInput {
     pub meeting_id: String,
+    pub job_id: Option<String>,
     pub guild_id: String,
     pub voice_channel_id: String,
     pub title: Option<String>,
@@ -119,12 +127,17 @@ fn revert_to_stopping_for_retry<S: MeetingStore>(
     }
 }
 
-pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSummaryClient>(
+pub fn process_meeting_summary<S, W, C>(
     store: &mut S,
     whisper: &W,
     claude: &C,
     input: &ProcessMeetingInput,
-) -> Result<ProcessMeetingOutput, WorkerError> {
+) -> Result<ProcessMeetingOutput, WorkerError>
+where
+    S: MeetingStore,
+    W: WhisperClient,
+    C: ClaudeSummaryClient,
+{
     info!(meeting_id = %input.meeting_id, "summary pipeline started");
 
     let request = SummaryRequest {
@@ -147,6 +160,39 @@ pub fn process_meeting_summary<S: MeetingStore, W: WhisperClient, C: ClaudeSumma
             return Err(WorkerError::from(err));
         }
     };
+    match asr_seconds_from_audio_path(&input.audio_path) {
+        Ok(asr_seconds) => {
+            // The runtime scaffold and batch worker are deployment alternatives today.
+            // Keep the same ASR event id so retries remain idempotent if topology changes.
+            record_usage_event_observe_only(
+                store,
+                NewUsageEvent {
+                    id: format!("usage:asr_seconds:{}", input.meeting_id),
+                    tenant_id: None,
+                    guild_id: input.guild_id.clone(),
+                    meeting_id: Some(input.meeting_id.clone()),
+                    job_id: input.job_id.clone(),
+                    resource_type: Some("meeting".to_owned()),
+                    resource_id: Some(input.meeting_id.clone()),
+                    metric: UsageMetric::AsrSeconds,
+                    quantity: asr_seconds,
+                    detail_json: UsageDetailJson::new(serde_json::json!({
+                        "source": "audio_duration",
+                        "whisper_segment_count": transcription.segments.len(),
+                        "surface": "process_meeting_summary_done"
+                    }))
+                    .expect("usage detail must be a JSON object"),
+                    observed_at: Utc::now(),
+                },
+            );
+        }
+        Err(err) => warn!(
+            meeting_id = %input.meeting_id,
+            audio_path = %input.audio_path,
+            error = %err,
+            "skipping ASR usage event because audio duration is unavailable"
+        ),
+    }
 
     persist_pre_correction_transcript_debug_artifact(
         &request.workspace,
@@ -376,6 +422,7 @@ where
             .map_err(WorkerError::Summary)?;
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
+            job_id: Some(job.id.clone()),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
             title: meeting.title.clone(),
@@ -401,6 +448,12 @@ where
                 Some(MeetingStatus::Summarizing),
             )?;
             queue.mark_done(&job.id)?;
+            record_summary_run_usage_observe_only(
+                store,
+                &job.meeting_id,
+                &job.id,
+                output.chunks.len(),
+            );
             info!(job_id = %job.id, "summary job marked done");
             Ok(Some(ProcessJobResult {
                 job_id: job.id,
@@ -427,6 +480,143 @@ where
             }
             Err(err)
         }
+    }
+}
+
+/// Compute the audio duration in whole seconds from a WAV file header.
+/// Only the canonical 44-byte PCM layout is supported (RIFF/WAVE, `fmt `
+/// chunk size == 16, `data` chunk starting at byte 36). Files with extended
+/// format chunks or interleaved metadata chunks return `Err` so the caller
+/// can warn and skip the observe-only ASR usage event without failing.
+pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, String> {
+    let mut file =
+        File::open(audio_path).map_err(|err| format!("failed to open ASR audio file: {err}"))?;
+    let mut header = [0_u8; 44];
+    file.read_exact(&mut header)
+        .map_err(|err| format!("failed to read ASR audio header: {err}"))?;
+    let duration_ms = wav_header_duration_ms(&header)?;
+    Ok(duration_ms.div_ceil(1000).min(i64::MAX as u64) as i64)
+}
+
+fn wav_header_duration_ms(header: &[u8; 44]) -> Result<u64, String> {
+    let fmt_chunk_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    let audio_format = u16::from_le_bytes([header[20], header[21]]);
+    // Only the canonical 44-byte PCM layout is supported here. Files with
+    // metadata chunks between `fmt ` and `data` return Err so the caller can
+    // warn and skip the observe-only ASR usage event.
+    if &header[0..4] != b"RIFF"
+        || &header[8..12] != b"WAVE"
+        || &header[12..16] != b"fmt "
+        || fmt_chunk_size != 16
+        || audio_format != 1
+        || &header[36..40] != b"data"
+    {
+        return Err(format!(
+            "ASR audio file is not a supported PCM WAV: audio_format={audio_format}, fmt_chunk_size={fmt_chunk_size}"
+        ));
+    }
+    let byte_rate = u32::from_le_bytes([header[28], header[29], header[30], header[31]]) as u128;
+    if byte_rate == 0 {
+        return Err("ASR audio file is not a supported PCM WAV: byte_rate=0".to_owned());
+    }
+    let data_size = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
+    // Conforming RF64 streaming files should fail the canonical-header checks
+    // above, but keep this defensive guard for malformed sentinel-like inputs.
+    if data_size == 0 || data_size == u32::MAX {
+        return Err(format!(
+            "ASR audio file is not a supported PCM WAV: data_size={data_size}"
+        ));
+    }
+    let data_size = data_size as u128;
+    Ok(data_size.saturating_mul(1_000).div_ceil(byte_rate) as u64)
+}
+
+fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: NewUsageEvent) {
+    if let Err(err) = store.append_usage_event(&event) {
+        warn!(
+            usage_event_id = %event.id,
+            metric = %event.metric.as_str(),
+            error = %err,
+            "failed to append usage event; continuing in observe-only mode"
+        );
+    }
+}
+
+fn record_summary_run_usage_observe_only<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    job_id: &str,
+    chunk_count: usize,
+) {
+    let meeting = match store.get_meeting(meeting_id) {
+        Ok(Some(meeting)) => meeting,
+        Ok(None) => {
+            warn!(meeting_id, "meeting missing while recording summary usage");
+            return;
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                error = %err,
+                "failed to load meeting for summary usage"
+            );
+            return;
+        }
+    };
+    record_usage_event_observe_only(
+        store,
+        NewUsageEvent {
+            id: format!("usage:summary_runs:{meeting_id}"),
+            tenant_id: None,
+            guild_id: meeting.guild_id.clone(),
+            meeting_id: Some(meeting_id.to_owned()),
+            job_id: Some(job_id.to_owned()),
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(meeting_id.to_owned()),
+            metric: UsageMetric::SummaryRuns,
+            quantity: 1,
+            detail_json: UsageDetailJson::new(serde_json::json!({
+                "chunk_count": chunk_count,
+                "surface": "process_next_summary_job_done"
+            }))
+            .expect("usage detail must be a JSON object"),
+            observed_at: Utc::now(),
+        },
+    );
+    // Unlike the scaffold path, the batch worker observes synchronously.
+    // The aggregate includes the summary_runs event just written above,
+    // giving the desired post-completion usage snapshot.
+    observe_worker_completion_entitlement(store, &meeting.guild_id);
+}
+
+pub(crate) fn observe_worker_completion_entitlement<S: UsageEventStore>(
+    store: &mut S,
+    guild_id: &str,
+) {
+    let aggregates = match store.aggregate_recent_usage(None, Some(guild_id), 30 * 24 * 60 * 60) {
+        Ok(aggregates) => aggregates,
+        Err(err) => {
+            warn!(
+                guild_id,
+                error = %err,
+                "usage entitlement observation failed after worker completion"
+            );
+            return;
+        }
+    };
+    let snapshot = UsageSnapshot::from_aggregates(aggregates);
+    let decision =
+        EntitlementEvaluator::observe_only().evaluate(EntitlementAction::CompleteWorker, &snapshot);
+    if decision
+        .observations
+        .iter()
+        .any(|observation| observation.exceeded)
+    {
+        warn!(
+            guild_id,
+            observations = ?decision.observations,
+            "usage entitlement would exceed policy; observe-only mode allows worker completion"
+        );
     }
 }
 

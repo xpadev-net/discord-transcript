@@ -24,6 +24,10 @@ use crate::domain::transcript::{
     MAX_DB_TIMESTAMP_MS, NormalizationConfig, TranscriptSegment, TranscriptSource,
     normalize_segments, render_for_summary,
 };
+use crate::domain::usage::{
+    EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
+    UsageSnapshot, recording_minutes_from_seconds,
+};
 use crate::domain::{MeetingStatus, StopReason};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
@@ -44,6 +48,7 @@ use crate::infrastructure::storage::{
 use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
+use chrono::Utc;
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
@@ -150,10 +155,13 @@ pub enum RuntimeCommandInput {
     },
 }
 
-pub fn dispatch_runtime_command<S: MeetingStore>(
+pub fn dispatch_runtime_command<S>(
     service: &mut BotCommandService<S>,
     input: RuntimeCommandInput,
-) -> Result<String, CommandError> {
+) -> Result<String, CommandError>
+where
+    S: MeetingStore,
+{
     match input {
         RuntimeCommandInput::RecordStart(value) => service.handle_record_start(*value),
         RuntimeCommandInput::RecordStop {
@@ -218,6 +226,10 @@ where
         })
         .map_err(|err| err.to_string())?;
 
+    if stop_result.outcome == StopOutcome::Owner {
+        record_recording_duration_usage(&mut service.store, &stop_result.meeting_id);
+    }
+
     let should_enqueue = match stop_result.outcome {
         StopOutcome::Owner => true,
         StopOutcome::AlreadyHandled => service
@@ -261,6 +273,64 @@ where
     }
 
     Ok(stop_result)
+}
+
+fn record_recording_duration_usage<S: MeetingStore>(store: &mut S, meeting_id: &str) {
+    let meeting = match store.get_meeting(meeting_id) {
+        Ok(Some(meeting)) => meeting,
+        Ok(None) => {
+            warn!(meeting_id, "meeting missing while recording usage duration");
+            return;
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                error = %err,
+                "failed to load meeting for recording usage duration"
+            );
+            return;
+        }
+    };
+    let Some(duration_seconds) = recording_duration_seconds(&meeting) else {
+        warn!(
+            meeting_id,
+            started_at = %meeting.started_at.is_some(),
+            stopped_at = %meeting.stopped_at.is_some(),
+            "skipping recording usage duration because timestamps are unavailable"
+        );
+        return;
+    };
+    let event = NewUsageEvent {
+        id: format!("usage:recording_minutes:{meeting_id}"),
+        tenant_id: None,
+        guild_id: meeting.guild_id,
+        meeting_id: Some(meeting_id.to_owned()),
+        job_id: None,
+        resource_type: Some("meeting".to_owned()),
+        resource_id: Some(meeting_id.to_owned()),
+        metric: UsageMetric::RecordingMinutes,
+        quantity: recording_minutes_from_seconds(duration_seconds),
+        detail_json: UsageDetailJson::new(serde_json::json!({
+            "duration_seconds": duration_seconds
+        }))
+        .expect("usage detail must be a JSON object"),
+        observed_at: Utc::now(),
+    };
+    if let Err(err) = store.append_usage_event(&event) {
+        warn!(
+            meeting_id,
+            usage_event_id = %event.id,
+            error = %err,
+            "failed to append recording usage event; continuing in observe-only mode"
+        );
+    }
+}
+
+fn recording_duration_seconds(meeting: &StoredMeeting) -> Option<u64> {
+    let started_at = meeting.started_at?;
+    let stopped_at = meeting.stopped_at?;
+    let seconds = stopped_at.signed_duration_since(started_at).num_seconds();
+    Some(seconds.max(0) as u64)
 }
 
 pub fn meeting_audio_dir(
@@ -2743,6 +2813,7 @@ impl ScaffoldHandler {
             },
         )?;
         drop(service);
+        self.spawn_record_start_entitlement_observation(guild_id.get().to_string());
 
         // Reset SSRC tracker so stale mappings from previous recordings
         // cannot mis-attribute audio when Discord reuses an SSRC value.
@@ -3152,8 +3223,9 @@ impl ScaffoldHandler {
                     .set_error_message(meeting_id, None)
                     .map_err(|err| err.to_string())?;
                 drop(service);
+                let mut summary_job_done = true;
+                let job_id = format!("summary-{meeting_id}");
                 {
-                    let job_id = format!("summary-{meeting_id}");
                     let mut queue = self.queue.lock().await;
                     if let Err(err) = queue.mark_done(&job_id) {
                         error!(
@@ -3162,7 +3234,12 @@ impl ScaffoldHandler {
                             error = %err,
                             "failed to mark summary job as done — job may be re-processed on restart"
                         );
+                        summary_job_done = false;
                     }
+                }
+                if summary_job_done {
+                    self.record_summary_run_usage(meeting_id, &job_id, chunks.len())
+                        .await;
                 }
                 Ok(())
             }
@@ -3224,6 +3301,167 @@ impl ScaffoldHandler {
             );
         }
         post_failure_to_report_channel(http, report_channel_id, meeting_id, error_message).await
+    }
+
+    async fn record_summary_run_usage(&self, meeting_id: &str, job_id: &str, chunk_count: usize) {
+        let guild_id = {
+            let mut service = self.service.lock().await;
+            let meeting = match service.store.get_meeting(meeting_id) {
+                Ok(Some(meeting)) => meeting,
+                Ok(None) => {
+                    warn!(meeting_id, "meeting missing while recording summary usage");
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        meeting_id,
+                        error = %err,
+                        "failed to load meeting for summary usage"
+                    );
+                    return;
+                }
+            };
+            let guild_id = meeting.guild_id.clone();
+            let event = NewUsageEvent {
+                id: format!("usage:summary_runs:{meeting_id}"),
+                tenant_id: None,
+                guild_id: guild_id.clone(),
+                meeting_id: Some(meeting_id.to_owned()),
+                job_id: Some(job_id.to_owned()),
+                resource_type: Some("meeting".to_owned()),
+                resource_id: Some(meeting_id.to_owned()),
+                metric: UsageMetric::SummaryRuns,
+                quantity: 1,
+                detail_json: UsageDetailJson::new(serde_json::json!({
+                    "chunk_count": chunk_count,
+                    "surface": "runtime_post_success"
+                }))
+                .expect("usage detail must be a JSON object"),
+                observed_at: Utc::now(),
+            };
+            if let Err(err) = service.store.append_usage_event(&event) {
+                warn!(
+                    meeting_id,
+                    usage_event_id = %event.id,
+                    error = %err,
+                    "failed to append summary usage event; continuing in observe-only mode"
+                );
+            }
+            guild_id
+        };
+        // Observe-only entitlement checks are intentionally asynchronous here:
+        // they must not add an aggregate query to the just-finished usage write path.
+        self.spawn_worker_completion_entitlement_observation(guild_id);
+    }
+
+    fn spawn_worker_completion_entitlement_observation(&self, guild_id: String) {
+        let service = Arc::clone(&self.service);
+        tokio::spawn(async move {
+            let mut service = service.lock().await;
+            crate::application::worker::observe_worker_completion_entitlement(
+                &mut service.store,
+                &guild_id,
+            );
+        });
+    }
+
+    fn spawn_record_start_entitlement_observation(&self, guild_id: String) {
+        let service = Arc::clone(&self.service);
+        tokio::spawn(async move {
+            let mut service = service.lock().await;
+            let aggregates =
+                match service
+                    .store
+                    .aggregate_recent_usage(None, Some(&guild_id), 30 * 24 * 60 * 60)
+                {
+                    Ok(aggregates) => aggregates,
+                    Err(err) => {
+                        warn!(
+                            guild_id,
+                            error = %err,
+                            "usage entitlement observation failed before recording start"
+                        );
+                        return;
+                    }
+                };
+            let snapshot = UsageSnapshot::from_aggregates(aggregates);
+            let decision = EntitlementEvaluator::observe_only()
+                .evaluate(EntitlementAction::StartRecording, &snapshot);
+            if decision
+                .observations
+                .iter()
+                .any(|observation| observation.exceeded)
+            {
+                warn!(
+                    guild_id,
+                    observations = ?decision.observations,
+                    "usage entitlement would exceed policy; observe-only mode allows recording"
+                );
+            }
+        });
+    }
+
+    async fn record_asr_seconds_usage(
+        &self,
+        guild_id: &str,
+        meeting_id: &str,
+        job_id: &str,
+        audio_path: &str,
+        transcription: &crate::application::summary::TranscriptionOutput,
+    ) {
+        let audio_path_for_read = audio_path.to_owned();
+        let quantity = match tokio::task::spawn_blocking(move || {
+            crate::application::worker::asr_seconds_from_audio_path(&audio_path_for_read)
+        })
+        .await
+        {
+            Ok(Ok(quantity)) => quantity,
+            Ok(Err(err)) => {
+                warn!(
+                    meeting_id,
+                    audio_path,
+                    error = %err,
+                    "skipping ASR usage event because audio duration is unavailable"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    meeting_id,
+                    audio_path,
+                    error = %err,
+                    "skipping ASR usage event because audio duration task failed"
+                );
+                return;
+            }
+        };
+        let event = NewUsageEvent {
+            id: format!("usage:asr_seconds:{meeting_id}"),
+            tenant_id: None,
+            guild_id: guild_id.to_owned(),
+            meeting_id: Some(meeting_id.to_owned()),
+            job_id: Some(job_id.to_owned()),
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(meeting_id.to_owned()),
+            metric: UsageMetric::AsrSeconds,
+            quantity,
+            detail_json: UsageDetailJson::new(serde_json::json!({
+                "source": "audio_duration",
+                "whisper_segment_count": transcription.segments.len(),
+                "surface": "runtime_transcription_success"
+            }))
+            .expect("usage detail must be a JSON object"),
+            observed_at: Utc::now(),
+        };
+        let mut service = self.service.lock().await;
+        if let Err(err) = service.store.append_usage_event(&event) {
+            warn!(
+                meeting_id,
+                usage_event_id = %event.id,
+                error = %err,
+                "failed to append ASR usage event; continuing in observe-only mode"
+            );
+        }
     }
 
     async fn report_channel_id_for_meeting(&self, meeting_id: &str) -> Result<u64, String> {
@@ -3670,6 +3908,15 @@ impl ScaffoldHandler {
                 return Err(SummaryJobRunError::Terminal(err_string));
             }
         };
+
+        self.record_asr_seconds_usage(
+            &meeting.guild_id,
+            &claimed_job.meeting_id,
+            &claimed_job.id,
+            &request.audio_path,
+            &transcription,
+        )
+        .await;
 
         if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
             match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at)
