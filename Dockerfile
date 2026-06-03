@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS frontend
+FROM node:24-bookworm-slim AS frontend
 
 RUN npm install -g pnpm@10
 WORKDIR /app/web
@@ -20,7 +20,7 @@ COPY src/ src/
 COPY migrations/ migrations/
 RUN touch src/main.rs && cargo build --release
 
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
 # curl is required at runtime by CommandWhisperClient for whisper.cpp inference.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libopus0 && rm -rf /var/lib/apt/lists/*
