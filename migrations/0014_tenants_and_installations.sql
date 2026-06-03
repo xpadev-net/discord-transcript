@@ -156,6 +156,5 @@ WHERE NOT EXISTS (
     SELECT 1
     FROM tenant_discord_guilds existing
     WHERE existing.guild_id = existing_guilds.guild_id
-      AND existing.status = 'active'
 )
 ON CONFLICT (id) DO NOTHING;

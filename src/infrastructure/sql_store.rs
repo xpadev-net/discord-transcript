@@ -21,8 +21,13 @@ use crate::infrastructure::sql::{
     INSERT_USAGE_EVENT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
     LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL, MARK_JOB_DONE_SQL,
     MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
-    RETRY_JOB_SQL, SET_MEETING_STATUS_CAS_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
-    UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_MEETING_STATUS_CAS_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+};
+use crate::infrastructure::sql::{
+    CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS, Migration,
+    UNLOCK_SCHEMA_MIGRATIONS_SQL, migration_transaction_sql,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -122,6 +127,37 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
 
     pub fn apply_initial_migration(&mut self, migration_sql: &str) -> Result<(), String> {
         self.executor.run_migration(migration_sql)
+    }
+
+    pub fn apply_pending_migrations(&mut self) -> Result<(), String> {
+        self.executor.run_migration(LOCK_SCHEMA_MIGRATIONS_SQL)?;
+        let result = self.apply_pending_migrations_locked();
+        let unlock_result = self.executor.run_migration(UNLOCK_SCHEMA_MIGRATIONS_SQL);
+        match (result, unlock_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn apply_pending_migrations_locked(&mut self) -> Result<(), String> {
+        self.executor.run_migration(CREATE_SCHEMA_MIGRATIONS_SQL)?;
+        for migration in MIGRATIONS {
+            self.apply_pending_migration(*migration)?;
+        }
+        Ok(())
+    }
+
+    fn apply_pending_migration(&mut self, migration: Migration) -> Result<(), String> {
+        if !self
+            .executor
+            .query_rows(SELECT_SCHEMA_MIGRATION_SQL, &[migration.version.to_owned()])?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.executor
+            .run_migration(&migration_transaction_sql(migration))
     }
 
     pub fn resolve_tenant_by_guild(

@@ -40,9 +40,18 @@ CREATE TABLE IF NOT EXISTS transcripts (
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
     ON transcripts (meeting_id, start_ms);
 
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting_cursor
     ON transcripts (meeting_id, created_at, id)
     WHERE NOT is_deleted;
+
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS transcript_stage TEXT NOT NULL DEFAULT 'final';
+
+ALTER TABLE transcripts
+ADD COLUMN IF NOT EXISTS live_chunk_id TEXT;
 
 DO $$
 BEGIN
