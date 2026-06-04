@@ -41,8 +41,9 @@ use crate::infrastructure::sql::{
     GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
     INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
     INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
-    LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
-    UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
+    UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -67,8 +68,9 @@ SELECT id,
        voice_channel_id
 FROM meetings
 WHERE guild_id = $1
+  AND ($2::TEXT IS NULL OR voice_channel_id = $2)
 ORDER BY started_at DESC
-LIMIT $2
+LIMIT $3
 "#;
 const OPERATIONAL_SCHEMA_READY_SQL: &str = r#"
 SELECT
@@ -486,6 +488,7 @@ fn debug_download_usage_event_id(
     id
 }
 
+#[derive(Clone)]
 pub struct AuthConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -515,6 +518,18 @@ pub fn create_router(state: WebState) -> Router {
         .route("/api/me", get(api_me))
         .route("/api/me/guilds", get(api_me_guilds))
         .route("/api/guild/meetings", get(api_guild_meetings))
+        .route(
+            "/api/guilds/{guild_id}/meetings",
+            get(api_target_guild_meetings),
+        )
+        .route(
+            "/api/guilds/{guild_id}/settings",
+            get(api_target_guild_settings).put(api_update_target_guild_settings),
+        )
+        .route(
+            "/api/guilds/{guild_id}/settings/bot-token",
+            put(api_update_target_guild_bot_token).delete(api_delete_target_guild_bot_token),
+        )
         .route(
             "/api/guild/settings",
             get(api_guild_settings).put(api_update_guild_settings),
@@ -753,6 +768,23 @@ fn allows_settings_token_recovery(path: &str) -> bool {
     matches!(
         path,
         "/api/me" | "/api/me/guilds" | "/api/guild/settings" | "/api/guild/settings/bot-token"
+    ) || is_target_guild_settings_recovery_path(path)
+}
+
+fn is_target_guild_settings_recovery_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/guilds/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let Some(guild_id) = parts.next() else {
+        return false;
+    };
+    if guild_id.is_empty() {
+        return false;
+    }
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some("settings"), None, None) | (Some("settings"), Some("bot-token"), None)
     )
 }
 
@@ -793,6 +825,9 @@ async fn bot_auth_header_for_guild(
     state: &WebState,
     auth: &AuthConfig,
 ) -> Result<String, StatusCode> {
+    if !is_configured_auth_guild(state, &auth.guild_id) {
+        return resolve_bot_auth_header_for_guild_uncached(state, auth).await;
+    }
     bot_auth_header_from_cache_with_resolver(&state.bot_token_cache, || async {
         resolve_effective_bot_token(
             &state.db,
@@ -813,6 +848,37 @@ async fn bot_auth_header_for_guild(
         })
     })
     .await
+}
+
+fn is_configured_auth_guild(state: &WebState, guild_id: &str) -> bool {
+    state
+        .auth
+        .as_ref()
+        .is_some_and(|configured| configured.guild_id == guild_id)
+}
+
+async fn resolve_bot_auth_header_for_guild_uncached(
+    state: &WebState,
+    auth: &AuthConfig,
+) -> Result<String, StatusCode> {
+    resolve_effective_bot_token(
+        &state.db,
+        &auth.guild_id,
+        &auth.bot_token,
+        state.guild_bot_token_cipher.as_deref(),
+    )
+    .await
+    .map(|token| format!("Bot {token}"))
+    .map_err(|err| {
+        let status = bot_token_resolve_status(&err);
+        warn!(
+            error = %err,
+            guild_id = %auth.guild_id,
+            status = %status,
+            "failed to resolve guild bot token"
+        );
+        status
+    })
 }
 
 async fn bot_auth_header_from_cache_with_resolver<F, Fut>(
@@ -1959,40 +2025,51 @@ async fn get_guild_info_with_bot_auth(
     auth: &AuthConfig,
     bot_auth: &str,
 ) -> Result<DiscordGuildFull, StatusCode> {
+    if !is_configured_auth_guild(state, &auth.guild_id) {
+        return fetch_guild_info_with_bot_auth(state, auth, bot_auth).await;
+    }
     guild_info_from_cache_with_resolver(&state.guild_cache, || async {
-        let guild_resp = state
-            .http_client
-            .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
-            .header("Authorization", bot_auth)
-            .send()
-            .await
-            .map_err(|err| {
-                warn!(error = %err, "discord guild API request failed");
-                StatusCode::BAD_GATEWAY
-            })?;
-
-        let guild_status = guild_resp.status();
-        let guild_body = guild_resp.text().await.map_err(|err| {
-            warn!(error = %err, "discord guild API response read failed");
-            StatusCode::BAD_GATEWAY
-        })?;
-        let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
-            warn!(
-                error = %err,
-                status = %guild_status,
-                body_len = guild_body.len(),
-                "discord guild API response parse failed"
-            );
-            tracing::debug!(
-                body_len = guild_body.len(),
-                body_prefix = %utf8_safe_byte_prefix(&guild_body, 500),
-                "discord guild API response parse debug"
-            );
-            StatusCode::BAD_GATEWAY
-        })?;
-        Ok(guild)
+        fetch_guild_info_with_bot_auth(state, auth, bot_auth).await
     })
     .await
+}
+
+async fn fetch_guild_info_with_bot_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    bot_auth: &str,
+) -> Result<DiscordGuildFull, StatusCode> {
+    let guild_resp = state
+        .http_client
+        .get(format!("https://discord.com/api/guilds/{}", auth.guild_id))
+        .header("Authorization", bot_auth)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "discord guild API request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let guild_status = guild_resp.status();
+    let guild_body = guild_resp.text().await.map_err(|err| {
+        warn!(error = %err, "discord guild API response read failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let guild: DiscordGuildFull = serde_json::from_str(&guild_body).map_err(|err| {
+        warn!(
+            error = %err,
+            status = %guild_status,
+            body_len = guild_body.len(),
+            "discord guild API response parse failed"
+        );
+        tracing::debug!(
+            body_len = guild_body.len(),
+            body_prefix = %utf8_safe_byte_prefix(&guild_body, 500),
+            "discord guild API response parse debug"
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
+    Ok(guild)
 }
 
 /// Query Discord API for resolved channel permissions. Returns Ok(None) when
@@ -2146,7 +2223,7 @@ async fn check_guild_admin_permission_with_bot_auth(
     bot_auth: &str,
     use_cache: bool,
 ) -> Result<GuildAdminCheck, StatusCode> {
-    let cache_key = (user_id.to_owned(), "__guild__".to_owned());
+    let cache_key = guild_admin_permission_cache_key(&auth.guild_id, user_id);
 
     // Check cache first
     if use_cache {
@@ -2166,7 +2243,7 @@ async fn check_guild_admin_permission_with_bot_auth(
     let guild = get_guild_info_with_bot_auth(state, auth, bot_auth).await?;
     if user_id == guild.owner_id {
         if use_cache {
-            cache_guild_admin_permission(state, user_id, true).await;
+            cache_guild_admin_permission(state, &auth.guild_id, user_id, true).await;
         }
         return Ok(GuildAdminCheck::Admin);
     }
@@ -2194,7 +2271,7 @@ async fn check_guild_admin_permission_with_bot_auth(
         match decision {
             GuildAdminCheck::NotAdmin => {
                 if use_cache {
-                    cache_guild_admin_permission(state, user_id, false).await;
+                    cache_guild_admin_permission(state, &auth.guild_id, user_id, false).await;
                 }
                 return Ok(GuildAdminCheck::NotAdmin);
             }
@@ -2238,7 +2315,7 @@ async fn check_guild_admin_permission_with_bot_auth(
     let is_admin = permissions & ADMINISTRATOR != 0;
 
     if use_cache {
-        cache_guild_admin_permission(state, user_id, is_admin).await;
+        cache_guild_admin_permission(state, &auth.guild_id, user_id, is_admin).await;
     }
     Ok(if is_admin {
         GuildAdminCheck::Admin
@@ -2307,7 +2384,16 @@ fn guild_admin_member_status_decision(status: reqwest::StatusCode) -> Option<Gui
     }
 }
 
-async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin: bool) {
+fn guild_admin_permission_cache_key(guild_id: &str, user_id: &str) -> (String, String) {
+    (user_id.to_owned(), format!("__guild__:{guild_id}"))
+}
+
+async fn cache_guild_admin_permission(
+    state: &WebState,
+    guild_id: &str,
+    user_id: &str,
+    is_admin: bool,
+) {
     let mut cache = state.permission_cache.write().await;
     let permission = CachedChannelPermission {
         can_view: is_admin,
@@ -2315,7 +2401,7 @@ async fn cache_guild_admin_permission(state: &WebState, user_id: &str, is_admin:
     };
     let expires_at = Instant::now() + Duration::from_secs(permission_cache_ttl(permission));
     cache.insert(
-        (user_id.to_owned(), "__guild__".to_owned()),
+        guild_admin_permission_cache_key(guild_id, user_id),
         (permission, expires_at),
     );
 
@@ -2656,10 +2742,11 @@ struct CurrentUserGuildResponse {
     tenant_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GuildMeetingsQuery {
     page: Option<u32>,
     limit: Option<u32>,
+    voice_channel_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2671,11 +2758,20 @@ struct GuildMeetingEntryResponse {
     stopped_at: Option<String>,
     duration_seconds: Option<i32>,
     stop_reason: Option<String>,
+    voice_channel_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildMeetingVoiceChannelResponse {
+    id: String,
+    label: String,
 }
 
 #[derive(Serialize)]
 struct GuildMeetingsResponse {
+    guild_id: String,
     meetings: Vec<GuildMeetingEntryResponse>,
+    voice_channels: Vec<GuildMeetingVoiceChannelResponse>,
     page: u32,
     limit: u32,
     total: i64,
@@ -3200,10 +3296,19 @@ async fn load_operational_counters(
     })
 }
 
-fn normalize_guild_meetings_pagination(query: GuildMeetingsQuery) -> (u32, u32) {
+fn normalize_guild_meetings_pagination(query: &GuildMeetingsQuery) -> (u32, u32) {
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     (page, limit)
+}
+
+fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Option<String> {
+    query
+        .voice_channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|voice_channel_id| !voice_channel_id.is_empty())
+        .map(str::to_owned)
 }
 
 fn guild_meetings_visibility_scan_limit(page: u32, limit: u32) -> i64 {
@@ -3228,6 +3333,17 @@ fn guild_meetings_response_total(is_admin: bool, raw_total: i64, visible_count: 
     } else {
         i64::try_from(visible_count).unwrap_or(i64::MAX)
     }
+}
+
+fn user_can_access_target_guild(discord_guilds: &[DiscordGuild], guild_id: &str) -> bool {
+    discord_guilds.iter().any(|guild| guild.id == guild_id)
+}
+
+fn target_guild_has_active_installation(
+    tenant_by_guild_id: &HashMap<String, String>,
+    guild_id: &str,
+) -> bool {
+    tenant_by_guild_id.contains_key(guild_id)
 }
 
 fn next_transcript_sse_poll_delay(current: Duration, had_segments: bool) -> Duration {
@@ -3264,6 +3380,14 @@ fn guild_meeting_entry_from_row(row: &tokio_postgres::Row) -> GuildMeetingEntryR
         stopped_at: row.get("stopped_at"),
         duration_seconds: row.get("meeting_duration_seconds"),
         stop_reason: row.get("stop_reason"),
+        voice_channel_id: row.get("voice_channel_id"),
+    }
+}
+
+fn guild_meeting_voice_channel_response(id: String) -> GuildMeetingVoiceChannelResponse {
+    GuildMeetingVoiceChannelResponse {
+        label: format!("VC ID: {id}"),
+        id,
     }
 }
 
@@ -3647,6 +3771,14 @@ fn validate_authorized_guild_settings_update(
     validate_guild_settings_update(request)
 }
 
+fn validate_authorized_guild_bot_token_update(
+    is_admin: bool,
+    request: &GuildBotTokenUpdateRequest,
+) -> Result<String, StatusCode> {
+    guild_admin_required_result(is_admin)?;
+    normalize_guild_bot_token_update(request)
+}
+
 fn oauth_access_token_expires_at(expires_in: Option<u64>) -> Instant {
     let ttl = expires_in
         .unwrap_or(OAUTH_ACCESS_TOKEN_DEFAULT_TTL_SECS)
@@ -3862,15 +3994,47 @@ async fn api_guild_meetings(
     Query(query): Query<GuildMeetingsQuery>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let (page, limit) = normalize_guild_meetings_pagination(query);
+    list_guild_meetings_for_auth(&state, &user_id, auth, query).await
+}
+
+async fn api_target_guild_meetings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+    Query(query): Query<GuildMeetingsQuery>,
+) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    require_active_target_guild_installation(&state, &guild_id).await?;
+    let discord_guilds = load_current_user_discord_guilds(&state, &user_id).await?;
+    if !user_can_access_target_guild(&discord_guilds, &guild_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let target_auth = target_auth_config(auth, &guild_id);
+    list_guild_meetings_for_auth(&state, &user_id, &target_auth, query).await
+}
+
+async fn list_guild_meetings_for_auth(
+    state: &WebState,
+    user_id: &str,
+    auth: &AuthConfig,
+    query: GuildMeetingsQuery,
+) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
+    let (page, limit) = normalize_guild_meetings_pagination(&query);
+    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
-    let is_admin = check_guild_admin_permission(&state, auth, &user_id).await?;
+    let is_admin = check_guild_admin_permission(state, auth, user_id).await?;
+    let (voice_channels, mut channel_visibility) =
+        list_guild_meeting_voice_channels(state, auth, user_id, is_admin).await?;
 
     if is_admin {
         let count_row = state
             .db
-            .query_one(COUNT_GUILD_MEETINGS_SQL, &[&auth.guild_id])
+            .query_one(
+                COUNT_GUILD_MEETINGS_SQL,
+                &[&auth.guild_id, &voice_channel_filter],
+            )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let total: i64 = count_row.get(0);
@@ -3879,14 +4043,16 @@ async fn api_guild_meetings(
             .db
             .query(
                 LIST_GUILD_MEETINGS_SQL,
-                &[&auth.guild_id, &limit_i64, &offset],
+                &[&auth.guild_id, &voice_channel_filter, &limit_i64, &offset],
             )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
 
         return Ok(Json(GuildMeetingsResponse {
+            guild_id: auth.guild_id.clone(),
             meetings,
+            voice_channels,
             page,
             limit,
             total,
@@ -3898,31 +4064,36 @@ async fn api_guild_meetings(
         .db
         .query(
             LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL,
-            &[&auth.guild_id, &visibility_scan_limit],
+            &[
+                &auth.guild_id,
+                &voice_channel_filter,
+                &visibility_scan_limit,
+            ],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut visible_meetings = Vec::new();
-    let mut channel_visibility: HashMap<String, bool> = HashMap::new();
 
     for row in &rows {
-        let voice_channel_id: String = row.get("voice_channel_id");
-        let visible = if let Some(visible) = channel_visibility.get(&voice_channel_id) {
+        let row_voice_channel_id: String = row.get("voice_channel_id");
+        let visible = if let Some(visible) = channel_visibility.get(&row_voice_channel_id) {
             *visible
         } else {
-            if !can_scan_new_visibility_channel(channel_visibility.len()) {
+            let filter_targets_row =
+                voice_channel_filter.as_deref() == Some(row_voice_channel_id.as_str());
+            if !filter_targets_row && !can_scan_new_visibility_channel(channel_visibility.len()) {
                 continue;
             }
             let visible = guild_meeting_channel_visible_after_row(
                 auth.guild_id.clone(),
-                voice_channel_id.clone(),
+                row_voice_channel_id.clone(),
                 &auth.guild_id,
-                &user_id,
+                user_id,
                 &state.permission_cache,
-                resolve_channel_permission_flags(&state, auth, &voice_channel_id, &user_id),
+                resolve_channel_permission_flags(state, auth, &row_voice_channel_id, user_id),
             )
             .await?;
-            channel_visibility.insert(voice_channel_id.clone(), visible);
+            channel_visibility.insert(row_voice_channel_id.clone(), visible);
             visible
         };
 
@@ -3943,11 +4114,58 @@ async fn api_guild_meetings(
         .collect();
 
     Ok(Json(GuildMeetingsResponse {
+        guild_id: auth.guild_id.clone(),
         meetings,
+        voice_channels,
         page,
         limit,
         total,
     }))
+}
+
+async fn list_guild_meeting_voice_channels(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(Vec<GuildMeetingVoiceChannelResponse>, HashMap<String, bool>), StatusCode> {
+    let channel_limit = i64::try_from(GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP).unwrap_or(i64::MAX);
+    let rows = state
+        .db
+        .query(
+            LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
+            &[&auth.guild_id, &channel_limit],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut voice_channels = Vec::new();
+    let mut channel_visibility = HashMap::new();
+
+    for row in rows {
+        let voice_channel_id: String = row.get("voice_channel_id");
+        if is_admin {
+            channel_visibility.insert(voice_channel_id.clone(), true);
+            voice_channels.push(guild_meeting_voice_channel_response(voice_channel_id));
+            continue;
+        }
+
+        let visible = guild_meeting_channel_visible_after_row(
+            auth.guild_id.clone(),
+            voice_channel_id.clone(),
+            &auth.guild_id,
+            user_id,
+            &state.permission_cache,
+            resolve_channel_permission_flags(state, auth, &voice_channel_id, user_id),
+        )
+        .await?;
+        channel_visibility.insert(voice_channel_id.clone(), visible);
+        if visible {
+            voice_channels.push(guild_meeting_voice_channel_response(voice_channel_id));
+        }
+    }
+
+    Ok((voice_channels, channel_visibility))
 }
 
 async fn load_guild_settings(
@@ -3976,6 +4194,72 @@ async fn load_guild_settings(
     }))
 }
 
+fn normalize_target_guild_id(guild_id: &str) -> Result<String, StatusCode> {
+    let trimmed = guild_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed.contains('/')
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn target_auth_config(auth: &AuthConfig, guild_id: &str) -> AuthConfig {
+    let mut target = auth.clone();
+    target.guild_id = guild_id.to_owned();
+    target
+}
+
+fn target_guild_settings_path(guild_id: &str, suffix: &str) -> String {
+    format!("/api/guilds/{guild_id}/settings{suffix}")
+}
+
+async fn require_active_target_guild_installation(
+    state: &WebState,
+    guild_id: &str,
+) -> Result<(), StatusCode> {
+    let tenant_by_guild_id =
+        list_active_tenant_guilds_for_visible_ids(state, &[guild_id.to_owned()]).await?;
+    let installed = target_guild_has_active_installation(&tenant_by_guild_id, guild_id);
+    if installed {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+async fn require_user_is_target_guild_admin(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    guild_id: &str,
+) -> Result<AuthConfig, StatusCode> {
+    require_active_target_guild_installation(state, guild_id).await?;
+    let target_auth = target_auth_config(auth, guild_id);
+    let is_admin = check_guild_admin_permission_for_settings(state, &target_auth, user_id).await?;
+    guild_admin_required_result(is_admin)?;
+    Ok(target_auth)
+}
+
+async fn api_target_guild_settings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+) -> Result<Json<GuildSettingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let stored = load_guild_settings(&state, &target_auth.guild_id).await?;
+
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        true,
+    )))
+}
+
 async fn api_guild_settings(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -3984,6 +4268,69 @@ async fn api_guild_settings(
     require_current_user_is_guild_admin(&state, &user_id).await?;
     let stored = load_guild_settings(&state, &auth.guild_id).await?;
 
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        true,
+    )))
+}
+
+async fn api_update_target_guild_settings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<GuildSettingsUpdateRequest>,
+) -> Result<Json<GuildSettingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    validate_guild_settings_update(&request)?;
+
+    let whisper_language_explicit = request.whisper_language.is_some();
+    state
+        .db
+        .execute(
+            UPSERT_GUILD_SETTINGS_SQL,
+            &[
+                &target_auth.guild_id,
+                &request.whisper_language,
+                &whisper_language_explicit,
+                &request.whisper_vad,
+                &request.auto_stop_grace_seconds,
+                &request.retention_raw_audio_ttl_days,
+                &request.retention_transcript_ttl_days,
+                &request.summary_enabled,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(target_auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "guild_settings.update",
+            "guild_settings",
+            Some(target_auth.guild_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &target_guild_settings_path(&target_auth.guild_id, ""),
+            ),
+            json!({
+                "whisper_language_set": request.whisper_language.is_some(),
+                "whisper_vad": request.whisper_vad,
+                "auto_stop_grace_seconds": request.auto_stop_grace_seconds,
+                "retention_raw_audio_ttl_days": request.retention_raw_audio_ttl_days,
+                "retention_transcript_ttl_days": request.retention_transcript_ttl_days,
+                "summary_enabled": request.summary_enabled,
+            }),
+        ),
+    )
+    .await;
+
+    let stored = load_guild_settings(&state, &target_auth.guild_id).await?;
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
@@ -4511,6 +4858,181 @@ async fn api_archive_summary_template(
     )
     .await;
     Ok(Json(response))
+}
+
+async fn api_update_target_guild_bot_token(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<GuildBotTokenUpdateRequest>,
+) -> Result<Json<GuildSettingsResponse>, Response> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    let token = validate_authorized_guild_bot_token_update(true, &request).map_err(|status| {
+        api_error_response(
+            status,
+            "invalid_bot_token_request",
+            "Discord bot token is required.",
+        )
+    })?;
+
+    let cipher = state.guild_bot_token_cipher.as_ref().ok_or_else(|| {
+        api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing_guild_bot_token_encryption_key",
+            "Guild bot token encryption key is not configured.",
+        )
+    })?;
+    let validated = validate_discord_bot_token_for_guild(&state, &target_auth.guild_id, &token)
+        .await
+        .map_err(bot_token_validation_error_response)?;
+    let encrypted = cipher
+        .encrypt_for_guild(&target_auth.guild_id, &token)
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %target_auth.guild_id,
+                "failed to encrypt guild bot token"
+            );
+            api_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "guild_bot_token_encrypt_failed",
+                "Failed to store Discord bot token.",
+            )
+        })?;
+
+    state
+        .db
+        .execute(
+            UPSERT_GUILD_BOT_TOKEN_SQL,
+            &[
+                &target_auth.guild_id,
+                &encrypted.ciphertext,
+                &encrypted.nonce,
+                &encrypted.key_version,
+                &validated.bot_user_id,
+                &validated.bot_username,
+            ],
+        )
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %target_auth.guild_id,
+                "failed to store guild bot token"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+    invalidate_discord_caches(&state).await;
+    notify_bot_token_changed(&state);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(target_auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "guild_bot_token.update",
+            "guild_bot_token",
+            Some(target_auth.guild_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &target_guild_settings_path(&target_auth.guild_id, "/bot-token"),
+            ),
+            json!({
+                "bot_user_id": validated.bot_user_id,
+                "bot_username": validated.bot_username,
+                "token_registered": true,
+            }),
+        ),
+    )
+    .await;
+
+    let stored = load_guild_settings(&state, &target_auth.guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        true,
+    )))
+}
+
+async fn api_delete_target_guild_bot_token(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<GuildSettingsResponse>, Response> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+
+    let current = load_guild_settings(&state, &target_auth.guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    if guild_bot_token_delete_is_noop(current.as_ref()) {
+        return Ok(Json(guild_settings_response(
+            &state.guild_settings_defaults,
+            current,
+            true,
+        )));
+    }
+
+    state
+        .db
+        .execute(CLEAR_GUILD_BOT_TOKEN_SQL, &[&target_auth.guild_id])
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %target_auth.guild_id,
+                "failed to delete guild bot token"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+    invalidate_discord_caches(&state).await;
+    notify_bot_token_changed(&state);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(target_auth.guild_id.clone()),
+            Some(user_id.clone()),
+            "guild_bot_token.delete",
+            "guild_bot_token",
+            Some(target_auth.guild_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "DELETE",
+                &target_guild_settings_path(&target_auth.guild_id, "/bot-token"),
+            ),
+            json!({
+                "token_registered": false,
+                "previously_registered": true,
+            }),
+        ),
+    )
+    .await;
+
+    let stored = load_guild_settings(&state, &target_auth.guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    Ok(Json(guild_settings_response(
+        &state.guild_settings_defaults,
+        stored,
+        true,
+    )))
 }
 
 async fn api_update_guild_bot_token(
@@ -6508,7 +7030,7 @@ mod operational_endpoint_tests {
 #[cfg(test)]
 mod guild_api_tests {
     use super::{
-        ADMINISTRATOR, BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState,
+        ADMINISTRATOR, AuthConfig, BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState,
         CachedChannelPermission, DiscordBotTokenValidationError, DiscordBotTokenValidationStage,
         DiscordGuild, DiscordGuildFull, DiscordRoleFull, DomainKnowledgeListQuery,
         DomainKnowledgeUpsertRequest, GUILD_CACHE_REFRESH_INFLIGHT_SECS,
@@ -6520,14 +7042,21 @@ mod guild_api_tests {
         bot_auth_header_from_cache_with_resolver, can_scan_new_visibility_channel,
         classify_discord_bot_token_validation_status, current_user_guilds_response,
         discord_user_guilds_api_status, guild_admin_member_status_decision,
-        guild_admin_required_result, guild_bot_token_delete_is_noop,
-        guild_info_from_cache_with_resolver, guild_meetings_visibility_scan_limit,
-        guild_settings_response, normalize_domain_knowledge_list_filter,
-        normalize_domain_knowledge_request, normalize_guild_bot_token_update,
-        normalize_guild_meetings_pagination, normalize_summary_template_request,
-        permission_cache_ttl, validate_authorized_guild_settings_update,
-        validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
-        validate_guild_settings_update, validate_summary_template_id,
+        guild_admin_permission_cache_key, guild_admin_required_result,
+        guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
+        guild_meetings_visibility_scan_limit, guild_settings_response,
+        normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
+        normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
+        normalize_guild_meetings_voice_channel_id, normalize_summary_template_request,
+        normalize_target_guild_id, permission_cache_ttl, target_auth_config,
+        target_guild_has_active_installation, target_guild_settings_path,
+        user_can_access_target_guild, validate_authorized_guild_bot_token_update,
+        validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
+        validate_domain_knowledge_item_id, validate_guild_settings_update,
+        validate_summary_template_id,
+    };
+    use crate::infrastructure::sql::{
+        COUNT_GUILD_MEETINGS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
     };
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -6832,6 +7361,74 @@ mod guild_api_tests {
         assert_eq!(
             validate_authorized_guild_settings_update(true, &request),
             Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_bot_token_update_checks_admin_before_token_validation() {
+        let request = GuildBotTokenUpdateRequest {
+            bot_token: "   ".to_owned(),
+        };
+
+        assert_eq!(
+            validate_authorized_guild_bot_token_update(false, &request),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_authorized_guild_bot_token_update(true, &request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn target_guild_settings_helpers_scope_to_requested_guild() {
+        let auth = AuthConfig {
+            client_id: "client".to_owned(),
+            client_secret: "secret".to_owned(),
+            session_secret: "session".to_owned(),
+            redirect_uri: "http://localhost/auth/callback".to_owned(),
+            guild_id: "guild-current".to_owned(),
+            bot_token: "bot-token".to_owned(),
+            secure_cookie: false,
+        };
+
+        let target = target_auth_config(&auth, "guild-target");
+
+        assert_eq!(auth.guild_id, "guild-current");
+        assert_eq!(target.guild_id, "guild-target");
+        assert_eq!(target.bot_token, auth.bot_token);
+        assert_eq!(
+            target_guild_settings_path("guild-target", "/bot-token"),
+            "/api/guilds/guild-target/settings/bot-token"
+        );
+    }
+
+    #[test]
+    fn target_guild_id_validation_fails_closed() {
+        assert_eq!(
+            normalize_target_guild_id(" guild-1 "),
+            Ok("guild-1".to_owned())
+        );
+        assert_eq!(normalize_target_guild_id(""), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            normalize_target_guild_id("guild/1"),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_target_guild_id("guild\n1"),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_admin_permission_cache_key_includes_target_guild() {
+        assert_ne!(
+            guild_admin_permission_cache_key("guild-a", "user-1"),
+            guild_admin_permission_cache_key("guild-b", "user-1")
+        );
+        assert_eq!(
+            guild_admin_permission_cache_key("guild-a", "user-1"),
+            ("user-1".to_owned(), "__guild__:guild-a".to_owned())
         );
     }
 
@@ -7412,26 +8009,110 @@ mod guild_api_tests {
     #[test]
     fn guild_meetings_pagination_is_bounded() {
         assert_eq!(
-            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+            normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: None,
-                limit: None
+                limit: None,
+                voice_channel_id: None
             }),
             (1, 20)
         );
         assert_eq!(
-            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+            normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: Some(0),
-                limit: Some(0)
+                limit: Some(0),
+                voice_channel_id: None
             }),
             (1, 1)
         );
         assert_eq!(
-            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+            normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: Some(2),
-                limit: Some(250)
+                limit: Some(250),
+                voice_channel_id: None
             }),
             (2, 100)
         );
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_ignores_blank_values() {
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: None,
+            }),
+            None
+        );
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some("  ".to_owned()),
+            }),
+            None
+        );
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some(" vc-2 ".to_owned()),
+            }),
+            Some("vc-2".to_owned())
+        );
+    }
+
+    #[test]
+    fn target_guild_meetings_require_visible_installed_guild() {
+        let visible = vec![
+            visible_guild("guild-current", "Current", 0),
+            visible_guild("guild-target", "Target", 0),
+        ];
+        let tenant_by_guild_id =
+            HashMap::from([("guild-target".to_owned(), "tenant-target".to_owned())]);
+
+        assert!(user_can_access_target_guild(&visible, "guild-target"));
+        assert!(target_guild_has_active_installation(
+            &tenant_by_guild_id,
+            "guild-target"
+        ));
+        assert!(!user_can_access_target_guild(&visible, "guild-stale"));
+        assert!(!target_guild_has_active_installation(
+            &tenant_by_guild_id,
+            "guild-stale"
+        ));
+    }
+
+    #[test]
+    fn guild_meetings_queries_filter_guild_before_pagination() {
+        let list_sql = LIST_GUILD_MEETINGS_SQL.to_ascii_uppercase();
+        let count_sql = COUNT_GUILD_MEETINGS_SQL.to_ascii_uppercase();
+        let visibility_sql = super::LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL.to_ascii_uppercase();
+        let channel_sql = LIST_GUILD_MEETING_VOICE_CHANNELS_SQL.to_ascii_uppercase();
+
+        let list_where = list_sql.find("WHERE GUILD_ID = $1").unwrap();
+        let list_voice = list_sql.find("VOICE_CHANNEL_ID = $2").unwrap();
+        let list_order = list_sql.find("ORDER BY").unwrap();
+        let list_limit = list_sql.find("LIMIT $3").unwrap();
+        let list_offset = list_sql.find("OFFSET $4").unwrap();
+        assert!(list_where < list_order);
+        assert!(list_where < list_voice);
+        assert!(list_voice < list_order);
+        assert!(list_where < list_limit);
+        assert!(list_where < list_offset);
+
+        let visibility_where = visibility_sql.find("WHERE GUILD_ID = $1").unwrap();
+        let visibility_voice = visibility_sql.find("VOICE_CHANNEL_ID = $2").unwrap();
+        let visibility_limit = visibility_sql.find("LIMIT $3").unwrap();
+        assert!(visibility_where < visibility_voice);
+        assert!(visibility_voice < visibility_limit);
+        assert!(visibility_where < visibility_limit);
+        assert!(!visibility_sql.contains("OFFSET"));
+
+        assert!(count_sql.contains("WHERE GUILD_ID = $1"));
+        assert!(count_sql.contains("VOICE_CHANNEL_ID = $2"));
+        assert!(channel_sql.contains("WHERE GUILD_ID = $1"));
+        assert!(!channel_sql.contains("VOICE_CHANNEL_ID = $2"));
     }
 
     #[test]
@@ -8046,8 +8727,15 @@ mod session_reverify_tests {
         assert!(allows_settings_token_recovery(
             "/api/guild/settings/bot-token"
         ));
+        assert!(allows_settings_token_recovery("/api/guilds/123/settings"));
+        assert!(allows_settings_token_recovery(
+            "/api/guilds/123/settings/bot-token"
+        ));
         assert!(!allows_settings_token_recovery(
             "/api/guild/settings/notifications"
+        ));
+        assert!(!allows_settings_token_recovery(
+            "/api/guilds/123/settings/notifications"
         ));
         assert!(!allows_settings_token_recovery("/api/meetings/meeting-1"));
         assert!(!allows_settings_token_recovery("/"));

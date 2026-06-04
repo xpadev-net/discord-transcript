@@ -1,4 +1,10 @@
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { ForbiddenState } from "../components/ForbiddenState";
 import {
   activateDomainKnowledgeItem,
@@ -355,7 +361,19 @@ function guildSettingsErrorMessage(err: unknown, fallback: string): string {
   }
 }
 
-export function SettingsPage() {
+interface SettingsPageProps {
+  guildId?: string;
+  guildName?: string;
+  showCustomizations?: boolean;
+}
+
+export function SettingsPage({
+  guildId,
+  guildName,
+  showCustomizations = true,
+}: SettingsPageProps = {}) {
+  const currentGuildKeyRef = useRef<string | null>(guildId ?? null);
+  currentGuildKeyRef.current = guildId ?? null;
   const [settings, setSettings] = useState<GuildSettingsResponse | null>(null);
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [domainKnowledgeItems, setDomainKnowledgeItems] = useState<
@@ -447,13 +465,24 @@ export function SettingsPage() {
     setCustomizationError(null);
     setForbidden(false);
     setMessage(null);
+    setActiveOperation(null);
+    setSettings(null);
+    setForm(null);
+    setBotTokenValue("");
+    setTokenDeleteConfirmPending(false);
+    if (!showCustomizations) {
+      setDomainKnowledgeItems([]);
+      setSummaryTemplates([]);
+      setDomainKnowledgeDraft(emptyDomainKnowledgeDraft());
+      setSummaryTemplateDraft(emptySummaryTemplateDraft());
+    }
 
-    fetchGuildSettings(controller.signal)
+    fetchGuildSettings(guildId, controller.signal)
       .then((settingsResponse) => {
         if (!controller.signal.aborted) {
           setSettings(settingsResponse);
           setForm(formFromSettings(settingsResponse));
-          if (settingsResponse.is_admin) {
+          if (settingsResponse.is_admin && showCustomizations) {
             void refreshCustomizations(controller.signal);
           }
         }
@@ -479,7 +508,7 @@ export function SettingsPage() {
       });
 
     return () => controller.abort();
-  }, [refreshCustomizations]);
+  }, [guildId, refreshCustomizations, showCustomizations]);
 
   const canEdit = settings?.is_admin ?? false;
   const isSavingAny = activeOperation !== null;
@@ -569,20 +598,29 @@ export function SettingsPage() {
     setActiveOperation("settings");
     setError(null);
     setMessage(null);
+    const requestGuildKey = guildId ?? null;
 
     try {
-      const updated = await updateGuildSettings(requestFromForm(form));
+      const updated = await updateGuildSettings(requestFromForm(form), guildId);
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
       setSettings(updated);
       setForm(formFromSettings(updated));
       setMessage("\u8a2d\u5b9a\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f");
     } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
       const text =
         err instanceof Error && err.message === "forbidden"
           ? "\u7ba1\u7406\u6a29\u9650\u304c\u306a\u3044\u305f\u3081\u4fdd\u5b58\u3067\u304d\u307e\u305b\u3093"
           : "\u8a2d\u5b9a\u306e\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
       setError(text);
     } finally {
-      setActiveOperation(null);
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
     }
   }
 
@@ -604,15 +642,22 @@ export function SettingsPage() {
     setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
+    const requestGuildKey = guildId ?? null;
 
     try {
-      const updated = await updateGuildBotToken({ bot_token: token });
+      const updated = await updateGuildBotToken({ bot_token: token }, guildId);
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
       setSettings(updated);
       setBotTokenValue("");
       setMessage(
         "Discord Bot token \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f",
       );
     } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
       setError(
         guildSettingsErrorMessage(
           err,
@@ -620,7 +665,9 @@ export function SettingsPage() {
         ),
       );
     } finally {
-      setActiveOperation(null);
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
     }
   }
 
@@ -641,15 +688,22 @@ export function SettingsPage() {
     setTokenDeleteConfirmPending(false);
     setError(null);
     setMessage(null);
+    const requestGuildKey = guildId ?? null;
 
     try {
-      const updated = await deleteGuildBotToken();
+      const updated = await deleteGuildBotToken(guildId);
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
       setSettings(updated);
       setBotTokenValue("");
       setMessage(
         "Discord Bot token \u306e\u30ae\u30eb\u30c9\u500b\u5225\u8a2d\u5b9a\u3092\u524a\u9664\u3057\u307e\u3057\u305f",
       );
     } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
       setError(
         guildSettingsErrorMessage(
           err,
@@ -657,8 +711,10 @@ export function SettingsPage() {
         ),
       );
     } finally {
-      setTokenDeleteConfirmPending(false);
-      setActiveOperation(null);
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setTokenDeleteConfirmPending(false);
+        setActiveOperation(null);
+      }
     }
   }
 
@@ -905,7 +961,11 @@ export function SettingsPage() {
       <main className="settings-page">
         <div className="settings-header">
           <div>
-            <h1>{"\u30ae\u30eb\u30c9\u8a2d\u5b9a"}</h1>
+            <h1>
+              {guildName
+                ? `${guildName} \u306e\u30ae\u30eb\u30c9\u8a2d\u5b9a`
+                : "\u30ae\u30eb\u30c9\u8a2d\u5b9a"}
+            </h1>
             <p>
               {
                 "\u7ba1\u7406\u6a29\u9650\u304c\u3042\u308b\u30e6\u30fc\u30b6\u30fc\u306e\u307f\u8868\u793a\u3067\u304d\u307e\u3059"
@@ -922,7 +982,11 @@ export function SettingsPage() {
     <main className="settings-page">
       <div className="settings-header">
         <div>
-          <h1>{"\u30ae\u30eb\u30c9\u8a2d\u5b9a"}</h1>
+          <h1>
+            {guildName
+              ? `${guildName} \u306e\u30ae\u30eb\u30c9\u8a2d\u5b9a`
+              : "\u30ae\u30eb\u30c9\u8a2d\u5b9a"}
+          </h1>
           <p>
             {
               "\u9332\u97f3\u3068\u8981\u7d04\u306e\u30c7\u30d5\u30a9\u30eb\u30c8\u52d5\u4f5c\u3092\u5909\u66f4\u3067\u304d\u307e\u3059"
@@ -1081,7 +1145,7 @@ export function SettingsPage() {
         </form>
       ) : null}
 
-      {settings ? (
+      {settings && showCustomizations ? (
         <section className="settings-section settings-customization-section">
           <div className="settings-section-heading">
             <div>

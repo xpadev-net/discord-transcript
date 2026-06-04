@@ -105,13 +105,37 @@ function summaryTemplate(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function meetingsResponse() {
+function meetingsResponse(
+  guildId = "guild-1",
+  meetings: unknown[] = [],
+  voiceChannels: unknown[] = [],
+) {
   return {
-    meetings: [],
+    guild_id: guildId,
+    meetings,
+    voice_channels: voiceChannels,
     page: 1,
     limit: 20,
-    total: 0,
+    total: meetings.length,
   };
+}
+
+function meetingItem(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "meeting-1",
+    title: "Meeting One",
+    status: "completed",
+    started_at: "2026-06-01T00:00:00Z",
+    stopped_at: "2026-06-01T00:10:00Z",
+    duration_seconds: 600,
+    stop_reason: null,
+    voice_channel_id: "vc-1",
+    ...overrides,
+  };
+}
+
+function voiceChannel(id: string, label = `VC ID: ${id}`) {
+  return { id, label };
 }
 
 function guildsResponse() {
@@ -141,6 +165,14 @@ function guildsResponse() {
       tenant_id: null,
     },
   ];
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
@@ -750,6 +782,11 @@ describe("App access controls", () => {
       if (url.startsWith("/api/guild/meetings")) {
         return Promise.resolve(jsonResponse(meetingsResponse()));
       }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error(
+          "selector-unavailable fallback should use current-guild route",
+        );
+      }
       return Promise.resolve(emptyResponse(404));
     });
 
@@ -776,8 +813,11 @@ describe("App access controls", () => {
       if (url === "/api/me/guilds") {
         return Promise.resolve(jsonResponse(guildsResponse()));
       }
-      if (url.startsWith("/api/guild/meetings")) {
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
         return Promise.resolve(jsonResponse(meetingsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(jsonResponse(meetingsResponse("guild-2")));
       }
       return Promise.resolve(emptyResponse(404));
     });
@@ -788,7 +828,9 @@ describe("App access controls", () => {
       name: "\u30ae\u30eb\u30c9",
     })) as HTMLSelectElement;
     expect(selector.value).toBe("guild-1");
-    expect(screen.getByRole("link", { name: settingsLinkName })).toBeTruthy();
+    expect(
+      await screen.findByRole("link", { name: settingsLinkName }),
+    ).toBeTruthy();
 
     const uninstalled = screen.getByRole("option", {
       name: "Guild Three（未導入）",
@@ -800,6 +842,699 @@ describe("App access controls", () => {
     expect(selector.value).toBe("guild-2");
     expect(window.localStorage.getItem("dt.selectedGuildId")).toBe("guild-2");
     expect(screen.queryByRole("link", { name: settingsLinkName })).toBeNull();
+  });
+
+  it("loads dashboard meetings for the stored selected guild", async () => {
+    window.localStorage.setItem("dt.selectedGuildId", "guild-2");
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse("guild-2", [
+              {
+                id: "meeting-2",
+                title: "Guild Two meeting",
+                status: "completed",
+                started_at: "2026-06-01T00:00:00Z",
+                stopped_at: "2026-06-01T00:10:00Z",
+                duration_seconds: 600,
+                stop_reason: null,
+              },
+            ]),
+          ),
+        );
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error("stale current-guild dashboard request");
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("Guild Two meeting")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guilds/guild-2/meetings?page=1&limit=20",
+      expect.anything(),
+    );
+  });
+
+  it("filters dashboard meetings by VC and clears the VC filter", async () => {
+    const channels = [voiceChannel("vc-1"), voiceChannel("vc-2")];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        const params = new URL(`http://localhost${url}`).searchParams;
+        if (params.get("voice_channel_id") === "vc-2") {
+          return Promise.resolve(
+            jsonResponse(
+              meetingsResponse(
+                "guild-1",
+                [
+                  meetingItem({
+                    id: "meeting-2",
+                    title: "VC Two meeting",
+                    voice_channel_id: "vc-2",
+                  }),
+                ],
+                channels,
+              ),
+            ),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse(
+              "guild-1",
+              [
+                meetingItem({
+                  id: "meeting-1",
+                  title: "VC One meeting",
+                  voice_channel_id: "vc-1",
+                }),
+                meetingItem({
+                  id: "meeting-2",
+                  title: "VC Two meeting",
+                  voice_channel_id: "vc-2",
+                }),
+              ],
+              channels,
+            ),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("VC One meeting")).toBeTruthy();
+    const vcSelector = (await screen.findByRole("combobox", {
+      name: "VC",
+    })) as HTMLSelectElement;
+    fireEvent.change(vcSelector, { target: { value: "vc-2" } });
+
+    expect(await screen.findByText("VC Two meeting")).toBeTruthy();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/guilds/guild-1/meetings?page=1&limit=20&voice_channel_id=vc-2",
+        expect.anything(),
+      ),
+    );
+
+    fireEvent.change(vcSelector, { target: { value: "" } });
+
+    await waitFor(() => {
+      const unfilteredCalls = fetchMock.mock.calls.filter(
+        ([calledUrl]) =>
+          calledUrl.toString() ===
+          "/api/guilds/guild-1/meetings?page=1&limit=20",
+      );
+      expect(unfilteredCalls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("shows an empty state when the selected VC has no meetings", async () => {
+    const channels = [voiceChannel("vc-1"), voiceChannel("vc-empty")];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        const params = new URL(`http://localhost${url}`).searchParams;
+        if (params.get("voice_channel_id") === "vc-empty") {
+          return Promise.resolve(
+            jsonResponse(meetingsResponse("guild-1", [], [])),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse(
+              "guild-1",
+              [
+                meetingItem({
+                  title: "VC One meeting",
+                  voice_channel_id: "vc-1",
+                }),
+              ],
+              channels,
+            ),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("VC One meeting")).toBeTruthy();
+    const vcSelector = (await screen.findByRole("combobox", {
+      name: "VC",
+    })) as HTMLSelectElement;
+    fireEvent.change(vcSelector, { target: { value: "vc-empty" } });
+
+    expect(
+      (await screen.findAllByText("このVCの会議はありません")).length,
+    ).toBeGreaterThan(0);
+    expect(vcSelector.disabled).toBe(false);
+
+    fireEvent.change(vcSelector, { target: { value: "" } });
+
+    await waitFor(() => {
+      const unfilteredCalls = fetchMock.mock.calls.filter(
+        ([calledUrl]) =>
+          calledUrl.toString() ===
+          "/api/guilds/guild-1/meetings?page=1&limit=20",
+      );
+      expect(unfilteredCalls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("clears the selected VC when switching guilds", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse(
+              "guild-1",
+              [
+                meetingItem({
+                  title: "Guild One meeting",
+                  voice_channel_id: "vc-1",
+                }),
+              ],
+              [voiceChannel("vc-1")],
+            ),
+          ),
+        );
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse(
+              "guild-2",
+              [
+                meetingItem({
+                  id: "meeting-2",
+                  title: "Guild Two meeting",
+                  voice_channel_id: "vc-9",
+                }),
+              ],
+              [voiceChannel("vc-9")],
+            ),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("Guild One meeting")).toBeTruthy();
+    const vcSelector = (await screen.findByRole("combobox", {
+      name: "VC",
+    })) as HTMLSelectElement;
+    fireEvent.change(vcSelector, { target: { value: "vc-1" } });
+
+    const guildSelector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    fireEvent.change(guildSelector, { target: { value: "guild-2" } });
+
+    expect(await screen.findByText("Guild Two meeting")).toBeTruthy();
+    const guildTwoCalls = fetchMock.mock.calls
+      .map(([calledUrl]) => calledUrl.toString())
+      .filter((calledUrl) =>
+        calledUrl.startsWith("/api/guilds/guild-2/meetings"),
+      );
+    expect(guildTwoCalls.length).toBeGreaterThan(0);
+    expect(
+      guildTwoCalls.every(
+        (calledUrl) => !calledUrl.includes("voice_channel_id"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not display stale meetings after switching guilds", async () => {
+    const staleGuildOne = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        return staleGuildOne.promise;
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse("guild-2", [
+              {
+                id: "meeting-2",
+                title: "Guild Two meeting",
+                status: "completed",
+                started_at: "2026-06-01T00:00:00Z",
+                stopped_at: "2026-06-01T00:10:00Z",
+                duration_seconds: 600,
+                stop_reason: null,
+              },
+            ]),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    const selector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+    expect(await screen.findByText("Guild Two meeting")).toBeTruthy();
+
+    staleGuildOne.resolve(
+      jsonResponse(
+        meetingsResponse("guild-1", [
+          {
+            id: "meeting-1",
+            title: "Guild One stale meeting",
+            status: "completed",
+            started_at: "2026-06-01T00:00:00Z",
+            stopped_at: "2026-06-01T00:10:00Z",
+            duration_seconds: 600,
+            stop_reason: null,
+          },
+        ]),
+      ),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByText("Guild One stale meeting")).toBeNull(),
+    );
+  });
+
+  it("loads guild-targeted settings and displays the target guild name", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            ...guildsResponse().slice(0, 1),
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-2/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guilds/guild-2/settings",
+      expect.anything(),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/settings",
+      expect.anything(),
+    );
+  });
+
+  it("saves guild-targeted settings to the route guild", async () => {
+    let savedUrl: string | null = null;
+    let savedRequest: unknown = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            ...guildsResponse().slice(0, 1),
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-2/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings" && init?.method === "PUT") {
+        savedUrl = url;
+        savedRequest = JSON.parse(String(init.body));
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            auto_stop_grace_seconds: 240,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && init?.method === "PUT") {
+        throw new Error("stale current-guild save");
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    const autoStopInput = (await screen.findByLabelText(
+      "\u81ea\u52d5\u505c\u6b62\u307e\u3067\u306e\u79d2\u6570",
+    )) as HTMLInputElement;
+    fireEvent.change(autoStopInput, { target: { value: "240" } });
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    await waitFor(() => expect(savedUrl).toBe("/api/guilds/guild-2/settings"));
+    expect(savedRequest).toMatchObject({
+      auto_stop_grace_seconds: 240,
+    });
+  });
+
+  it("ignores stale save responses after switching target guilds", async () => {
+    const staleSave = deferred<Response>();
+    let guildTwoSaveRequest: unknown = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-1",
+              name: "Guild One",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-1",
+            },
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-1/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-1/settings" && init?.method === "PUT") {
+        return staleSave.promise;
+      }
+      if (url === "/api/guilds/guild-2/settings" && !init?.method) {
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            auto_stop_grace_seconds: 240,
+          }),
+        );
+      }
+      if (url === "/api/guilds/guild-2/settings" && init?.method === "PUT") {
+        guildTwoSaveRequest = JSON.parse(String(init.body));
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            auto_stop_grace_seconds: 240,
+          }),
+        );
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-1/settings", fetchMock);
+
+    const autoStopInput = (await screen.findByLabelText(
+      "\u81ea\u52d5\u505c\u6b62\u307e\u3067\u306e\u79d2\u6570",
+    )) as HTMLInputElement;
+    fireEvent.change(autoStopInput, { target: { value: "333" } });
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    const selector = screen.getByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    }) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    const guildTwoAutoStopInput = screen.getByLabelText(
+      "\u81ea\u52d5\u505c\u6b62\u307e\u3067\u306e\u79d2\u6570",
+    ) as HTMLInputElement;
+    await waitFor(() => expect(guildTwoAutoStopInput.value).toBe("240"));
+
+    staleSave.resolve(
+      jsonResponse({
+        ...settingsResponse(),
+        auto_stop_grace_seconds: 333,
+      }),
+    );
+
+    await waitFor(() => expect(guildTwoAutoStopInput.value).toBe("240"));
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    await waitFor(() =>
+      expect(guildTwoSaveRequest).toMatchObject({
+        auto_stop_grace_seconds: 240,
+      }),
+    );
+  });
+
+  it("moves an open settings page to the newly selected guild", async () => {
+    let savedUrl: string | null = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-1",
+              name: "Guild One",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-1",
+            },
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-1/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings" && init?.method === "PUT") {
+        savedUrl = url;
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-1/settings", fetchMock);
+
+    const selector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    await waitFor(() => expect(savedUrl).toBe("/api/guilds/guild-2/settings"));
+  });
+
+  it("blocks a guild-targeted settings route for non-admin selected guilds", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guilds/guild-2/settings",
+      expect.anything(),
+    );
+  });
+
+  it("shows a no-selectable-guild state for guild-targeted settings", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-3",
+              name: "Guild Three",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: null,
+            },
+          ]),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-3/settings", fetchMock);
+
+    expect(
+      await screen.findByText("設定できるギルドがありません"),
+    ).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guilds/guild-3/settings",
+      expect.anything(),
+    );
   });
 
   it("falls back to the authenticated guild when guild selector data is unavailable", async () => {
@@ -821,6 +1556,11 @@ describe("App access controls", () => {
       if (url.startsWith("/api/guild/meetings")) {
         return Promise.resolve(jsonResponse(meetingsResponse()));
       }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error(
+          "selector-unavailable fallback should use current-guild route",
+        );
+      }
       return Promise.resolve(emptyResponse(404));
     });
 
@@ -838,10 +1578,135 @@ describe("App access controls", () => {
     expect(screen.getByRole("link", { name: settingsLinkName })).toBeTruthy();
   });
 
+  it("keeps VC filtering on the current-guild fallback meetings route", async () => {
+    const channels = [voiceChannel("vc-1"), voiceChannel("vc-2")];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(emptyResponse(503));
+      }
+      if (url.startsWith("/api/guild/meetings")) {
+        const params = new URL(`http://localhost${url}`).searchParams;
+        if (params.get("voice_channel_id") === "vc-2") {
+          return Promise.resolve(
+            jsonResponse(
+              meetingsResponse(
+                "guild-1",
+                [
+                  meetingItem({
+                    id: "meeting-2",
+                    title: "Fallback VC Two",
+                    voice_channel_id: "vc-2",
+                  }),
+                ],
+                channels,
+              ),
+            ),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse(
+              "guild-1",
+              [
+                meetingItem({
+                  title: "Fallback VC One",
+                  voice_channel_id: "vc-1",
+                }),
+              ],
+              channels,
+            ),
+          ),
+        );
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error(
+          "selector-unavailable fallback should use current-guild route",
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("Fallback VC One")).toBeTruthy();
+    const vcSelector = (await screen.findByRole("combobox", {
+      name: "VC",
+    })) as HTMLSelectElement;
+    fireEvent.change(vcSelector, { target: { value: "vc-2" } });
+
+    expect(await screen.findByText("Fallback VC Two")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guild/meetings?page=1&limit=20&voice_channel_id=vc-2",
+      expect.anything(),
+    );
+  });
+
+  it("shows a no-guild dashboard state when visible guilds are not installed", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-3",
+              name: "Guild Three",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: null,
+            },
+          ]),
+        );
+      }
+      if (url.includes("/meetings")) {
+        throw new Error("uninstalled guild should not load meetings");
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(
+      (await screen.findAllByText("表示できるギルドがありません")).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
   it("does not render dashboard table data when membership is denied", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
-      if (url === "/api/me" || url.startsWith("/api/guild/meetings")) {
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
         return Promise.resolve(emptyResponse(403));
       }
       return Promise.resolve(emptyResponse(404));

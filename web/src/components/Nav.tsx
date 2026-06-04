@@ -1,10 +1,11 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { UserGuild } from "../lib/types";
 
 interface NavProps {
   isAdmin: boolean;
   guilds: UserGuild[];
   selectedGuildId: string | null;
+  settingsGuildId: string | null;
   onSelectedGuildIdChange: (guildId: string) => void;
 }
 
@@ -26,8 +27,11 @@ export function Nav({
   isAdmin,
   guilds,
   selectedGuildId,
+  settingsGuildId,
   onSelectedGuildIdChange,
 }: NavProps) {
+  const location = useLocation();
+  const navigate = useNavigate();
   const selectableGuilds = guilds.filter(canSelectGuild);
   const shouldShowGuildSelector =
     guilds.length > 1 && selectableGuilds.length > 0;
@@ -36,6 +40,12 @@ export function Nav({
       ?.guild_id ??
     selectableGuilds[0]?.guild_id ??
     "";
+  const settingsPath = settingsGuildId
+    ? `/guilds/${encodeURIComponent(settingsGuildId)}/settings`
+    : "/settings";
+  const isSettingsRoute =
+    location.pathname === "/settings" ||
+    /^\/guilds\/[^/]+\/settings$/.test(location.pathname);
 
   return (
     <nav
@@ -55,7 +65,7 @@ export function Nav({
           </NavLink>
           {isAdmin ? (
             <NavLink
-              to="/settings"
+              to={settingsPath}
               className={({ isActive }) =>
                 `app-nav-link${isActive ? " active" : ""}`
               }
@@ -70,7 +80,13 @@ export function Nav({
             <select
               aria-label="ギルド"
               value={selectedValue}
-              onChange={(event) => onSelectedGuildIdChange(event.target.value)}
+              onChange={(event) => {
+                const guildId = event.target.value;
+                onSelectedGuildIdChange(guildId);
+                if (isSettingsRoute) {
+                  navigate(`/guilds/${encodeURIComponent(guildId)}/settings`);
+                }
+              }}
             >
               {guilds.map((guild) => (
                 <option
