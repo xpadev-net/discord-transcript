@@ -517,6 +517,10 @@ pub fn create_router(state: WebState) -> Router {
         .route("/api/me/guilds", get(api_me_guilds))
         .route("/api/guild/meetings", get(api_guild_meetings))
         .route(
+            "/api/guilds/{guild_id}/meetings",
+            get(api_target_guild_meetings),
+        )
+        .route(
             "/api/guilds/{guild_id}/settings",
             get(api_target_guild_settings).put(api_update_target_guild_settings),
         )
@@ -2755,6 +2759,7 @@ struct GuildMeetingEntryResponse {
 
 #[derive(Serialize)]
 struct GuildMeetingsResponse {
+    guild_id: String,
     meetings: Vec<GuildMeetingEntryResponse>,
     page: u32,
     limit: u32,
@@ -3308,6 +3313,19 @@ fn guild_meetings_response_total(is_admin: bool, raw_total: i64, visible_count: 
     } else {
         i64::try_from(visible_count).unwrap_or(i64::MAX)
     }
+}
+
+fn user_can_access_target_guild(discord_guilds: &[DiscordGuild], guild_id: &str) -> bool {
+    discord_guilds
+        .iter()
+        .any(|guild| guild.id.trim() == guild_id)
+}
+
+fn target_guild_has_active_installation(
+    tenant_by_guild_id: &HashMap<String, String>,
+    guild_id: &str,
+) -> bool {
+    tenant_by_guild_id.contains_key(guild_id)
 }
 
 fn next_transcript_sse_poll_delay(current: Duration, had_segments: bool) -> Duration {
@@ -3950,10 +3968,36 @@ async fn api_guild_meetings(
     Query(query): Query<GuildMeetingsQuery>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    list_guild_meetings_for_auth(&state, &user_id, auth, query).await
+}
+
+async fn api_target_guild_meetings(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+    Query(query): Query<GuildMeetingsQuery>,
+) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    require_active_target_guild_installation(&state, &guild_id).await?;
+    let discord_guilds = load_current_user_discord_guilds(&state, &user_id).await?;
+    if !user_can_access_target_guild(&discord_guilds, &guild_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let target_auth = target_auth_config(auth, &guild_id);
+    list_guild_meetings_for_auth(&state, &user_id, &target_auth, query).await
+}
+
+async fn list_guild_meetings_for_auth(
+    state: &WebState,
+    user_id: &str,
+    auth: &AuthConfig,
+    query: GuildMeetingsQuery,
+) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let (page, limit) = normalize_guild_meetings_pagination(query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
-    let is_admin = check_guild_admin_permission(&state, auth, &user_id).await?;
+    let is_admin = check_guild_admin_permission(state, auth, user_id).await?;
 
     if is_admin {
         let count_row = state
@@ -3974,6 +4018,7 @@ async fn api_guild_meetings(
         let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
 
         return Ok(Json(GuildMeetingsResponse {
+            guild_id: auth.guild_id.clone(),
             meetings,
             page,
             limit,
@@ -4005,9 +4050,9 @@ async fn api_guild_meetings(
                 auth.guild_id.clone(),
                 voice_channel_id.clone(),
                 &auth.guild_id,
-                &user_id,
+                user_id,
                 &state.permission_cache,
-                resolve_channel_permission_flags(&state, auth, &voice_channel_id, &user_id),
+                resolve_channel_permission_flags(state, auth, &voice_channel_id, user_id),
             )
             .await?;
             channel_visibility.insert(voice_channel_id.clone(), visible);
@@ -4031,6 +4076,7 @@ async fn api_guild_meetings(
         .collect();
 
     Ok(Json(GuildMeetingsResponse {
+        guild_id: auth.guild_id.clone(),
         meetings,
         page,
         limit,
@@ -4090,9 +4136,9 @@ async fn require_active_target_guild_installation(
     state: &WebState,
     guild_id: &str,
 ) -> Result<(), StatusCode> {
-    let installed = list_active_tenant_guilds_for_visible_ids(state, &[guild_id.to_owned()])
-        .await?
-        .contains_key(guild_id);
+    let tenant_by_guild_id =
+        list_active_tenant_guilds_for_visible_ids(state, &[guild_id.to_owned()]).await?;
+    let installed = target_guild_has_active_installation(&tenant_by_guild_id, guild_id);
     if installed {
         Ok(())
     } else {
@@ -6918,11 +6964,13 @@ mod guild_api_tests {
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
         normalize_summary_template_request, normalize_target_guild_id, permission_cache_ttl,
-        target_auth_config, target_guild_settings_path, validate_authorized_guild_bot_token_update,
+        target_auth_config, target_guild_has_active_installation, target_guild_settings_path,
+        user_can_access_target_guild, validate_authorized_guild_bot_token_update,
         validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
         validate_domain_knowledge_item_id, validate_guild_settings_update,
         validate_summary_template_id,
     };
+    use crate::infrastructure::sql::{COUNT_GUILD_MEETINGS_SQL, LIST_GUILD_MEETINGS_SQL};
     use axum::http::StatusCode;
     use std::collections::HashMap;
     use std::sync::{
@@ -7894,6 +7942,49 @@ mod guild_api_tests {
             }),
             (2, 100)
         );
+    }
+
+    #[test]
+    fn target_guild_meetings_require_visible_installed_guild() {
+        let visible = vec![
+            visible_guild("guild-current", "Current", 0),
+            visible_guild(" guild-target ", "Target", 0),
+        ];
+        let tenant_by_guild_id =
+            HashMap::from([("guild-target".to_owned(), "tenant-target".to_owned())]);
+
+        assert!(user_can_access_target_guild(&visible, "guild-target"));
+        assert!(target_guild_has_active_installation(
+            &tenant_by_guild_id,
+            "guild-target"
+        ));
+        assert!(!user_can_access_target_guild(&visible, "guild-stale"));
+        assert!(!target_guild_has_active_installation(
+            &tenant_by_guild_id,
+            "guild-stale"
+        ));
+    }
+
+    #[test]
+    fn guild_meetings_queries_filter_guild_before_pagination() {
+        let list_sql = LIST_GUILD_MEETINGS_SQL.to_ascii_uppercase();
+        let count_sql = COUNT_GUILD_MEETINGS_SQL.to_ascii_uppercase();
+        let visibility_sql = super::LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL.to_ascii_uppercase();
+
+        let list_where = list_sql.find("WHERE GUILD_ID = $1").unwrap();
+        let list_order = list_sql.find("ORDER BY").unwrap();
+        let list_limit = list_sql.find("LIMIT $2").unwrap();
+        let list_offset = list_sql.find("OFFSET $3").unwrap();
+        assert!(list_where < list_order);
+        assert!(list_where < list_limit);
+        assert!(list_where < list_offset);
+
+        let visibility_where = visibility_sql.find("WHERE GUILD_ID = $1").unwrap();
+        let visibility_limit = visibility_sql.find("LIMIT $2").unwrap();
+        assert!(visibility_where < visibility_limit);
+        assert!(!visibility_sql.contains("OFFSET"));
+
+        assert!(count_sql.contains("WHERE GUILD_ID = $1"));
     }
 
     #[test]

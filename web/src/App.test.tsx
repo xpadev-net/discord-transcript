@@ -105,12 +105,13 @@ function summaryTemplate(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function meetingsResponse() {
+function meetingsResponse(guildId = "guild-1", meetings: unknown[] = []) {
   return {
-    meetings: [],
+    guild_id: guildId,
+    meetings,
     page: 1,
     limit: 20,
-    total: 0,
+    total: meetings.length,
   };
 }
 
@@ -758,6 +759,11 @@ describe("App access controls", () => {
       if (url.startsWith("/api/guild/meetings")) {
         return Promise.resolve(jsonResponse(meetingsResponse()));
       }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error(
+          "selector-unavailable fallback should use current-guild route",
+        );
+      }
       return Promise.resolve(emptyResponse(404));
     });
 
@@ -784,8 +790,11 @@ describe("App access controls", () => {
       if (url === "/api/me/guilds") {
         return Promise.resolve(jsonResponse(guildsResponse()));
       }
-      if (url.startsWith("/api/guild/meetings")) {
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
         return Promise.resolve(jsonResponse(meetingsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(jsonResponse(meetingsResponse("guild-2")));
       }
       return Promise.resolve(emptyResponse(404));
     });
@@ -796,7 +805,9 @@ describe("App access controls", () => {
       name: "\u30ae\u30eb\u30c9",
     })) as HTMLSelectElement;
     expect(selector.value).toBe("guild-1");
-    expect(screen.getByRole("link", { name: settingsLinkName })).toBeTruthy();
+    expect(
+      await screen.findByRole("link", { name: settingsLinkName }),
+    ).toBeTruthy();
 
     const uninstalled = screen.getByRole("option", {
       name: "Guild Three（未導入）",
@@ -808,6 +819,122 @@ describe("App access controls", () => {
     expect(selector.value).toBe("guild-2");
     expect(window.localStorage.getItem("dt.selectedGuildId")).toBe("guild-2");
     expect(screen.queryByRole("link", { name: settingsLinkName })).toBeNull();
+  });
+
+  it("loads dashboard meetings for the stored selected guild", async () => {
+    window.localStorage.setItem("dt.selectedGuildId", "guild-2");
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse("guild-2", [
+              {
+                id: "meeting-2",
+                title: "Guild Two meeting",
+                status: "completed",
+                started_at: "2026-06-01T00:00:00Z",
+                stopped_at: "2026-06-01T00:10:00Z",
+                duration_seconds: 600,
+                stop_reason: null,
+              },
+            ]),
+          ),
+        );
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error("stale current-guild dashboard request");
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("Guild Two meeting")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guilds/guild-2/meetings?page=1&limit=20",
+      expect.anything(),
+    );
+  });
+
+  it("does not display stale meetings after switching guilds", async () => {
+    const staleGuildOne = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        return staleGuildOne.promise;
+      }
+      if (url.startsWith("/api/guilds/guild-2/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse("guild-2", [
+              {
+                id: "meeting-2",
+                title: "Guild Two meeting",
+                status: "completed",
+                started_at: "2026-06-01T00:00:00Z",
+                stopped_at: "2026-06-01T00:10:00Z",
+                duration_seconds: 600,
+                stop_reason: null,
+              },
+            ]),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    const selector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+    expect(await screen.findByText("Guild Two meeting")).toBeTruthy();
+
+    staleGuildOne.resolve(
+      jsonResponse(
+        meetingsResponse("guild-1", [
+          {
+            id: "meeting-1",
+            title: "Guild One stale meeting",
+            status: "completed",
+            started_at: "2026-06-01T00:00:00Z",
+            stopped_at: "2026-06-01T00:10:00Z",
+            duration_seconds: 600,
+            stop_reason: null,
+          },
+        ]),
+      ),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByText("Guild One stale meeting")).toBeNull(),
+    );
   });
 
   it("loads guild-targeted settings and displays the target guild name", async () => {
@@ -1175,6 +1302,11 @@ describe("App access controls", () => {
       if (url.startsWith("/api/guild/meetings")) {
         return Promise.resolve(jsonResponse(meetingsResponse()));
       }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        throw new Error(
+          "selector-unavailable fallback should use current-guild route",
+        );
+      }
       return Promise.resolve(emptyResponse(404));
     });
 
@@ -1192,10 +1324,62 @@ describe("App access controls", () => {
     expect(screen.getByRole("link", { name: settingsLinkName })).toBeTruthy();
   });
 
+  it("shows a no-guild dashboard state when visible guilds are not installed", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-3",
+              name: "Guild Three",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: null,
+            },
+          ]),
+        );
+      }
+      if (url.includes("/meetings")) {
+        throw new Error("uninstalled guild should not load meetings");
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(
+      (await screen.findAllByText("表示できるギルドがありません")).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
   it("does not render dashboard table data when membership is denied", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
-      if (url === "/api/me" || url.startsWith("/api/guild/meetings")) {
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
         return Promise.resolve(emptyResponse(403));
       }
       return Promise.resolve(emptyResponse(404));

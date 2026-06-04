@@ -34,7 +34,7 @@ function chooseSelectedGuildId(
   me: MeResponse,
   guilds: UserGuild[],
   preferredGuildId: string | null,
-): string {
+): string | null {
   const selectableGuilds = guilds.filter(canSelectGuild);
   if (
     preferredGuildId &&
@@ -45,7 +45,7 @@ function chooseSelectedGuildId(
   if (selectableGuilds.some((guild) => guild.guild_id === me.guild_id)) {
     return me.guild_id;
   }
-  return selectableGuilds[0]?.guild_id ?? me.guild_id;
+  return selectableGuilds[0]?.guild_id ?? null;
 }
 
 export function App() {
@@ -53,6 +53,7 @@ export function App() {
   const [guilds, setGuilds] = useState<UserGuild[]>([]);
   const [selectedGuildId, setSelectedGuildId] = useState<string | null>(null);
   const [guildsLoaded, setGuildsLoaded] = useState(false);
+  const [guildsUnavailable, setGuildsUnavailable] = useState(false);
   const [loadingMe, setLoadingMe] = useState(true);
   const [sessionForbidden, setSessionForbidden] = useState(false);
   const [sessionError, setSessionError] = useState(false);
@@ -64,6 +65,7 @@ export function App() {
     setGuilds([]);
     setSelectedGuildId(null);
     setGuildsLoaded(false);
+    setGuildsUnavailable(false);
     setSessionForbidden(false);
     setSessionError(false);
 
@@ -101,6 +103,7 @@ export function App() {
       .then((response) => {
         if (!controller.signal.aborted) {
           setGuilds(response);
+          setGuildsUnavailable(false);
           setGuildsLoaded(true);
         }
       })
@@ -109,6 +112,7 @@ export function App() {
           setGuilds([]);
           setSelectedGuildId(me.guild_id);
           storeSelectedGuildId(me.guild_id);
+          setGuildsUnavailable(true);
           setGuildsLoaded(true);
         }
       });
@@ -130,7 +134,9 @@ export function App() {
         guilds,
         current ?? readStoredGuildId(),
       );
-      storeSelectedGuildId(selected);
+      if (selected) {
+        storeSelectedGuildId(selected);
+      }
       return selected;
     });
   }, [me, guilds, guildsLoaded]);
@@ -138,9 +144,15 @@ export function App() {
   const loadingGuilds = me !== null && !guildsLoaded;
   const selectedGuild =
     guilds.find((guild) => guild.guild_id === selectedGuildId) ?? null;
+  const noSelectableGuilds =
+    guildsLoaded &&
+    guilds.length > 0 &&
+    guilds.every((guild) => !canSelectGuild(guild));
   const canUseSelectedGuildSettings = selectedGuild
     ? canSelectGuild(selectedGuild) && selectedGuild.is_admin
     : me?.is_admin === true && selectedGuildId === me.guild_id;
+  const useCurrentGuildMeetings =
+    guildsUnavailable && me !== null && selectedGuildId === me.guild_id;
 
   return (
     <>
@@ -155,7 +167,23 @@ export function App() {
         }}
       />
       <Routes>
-        <Route path="/" element={<DashboardPage />} />
+        <Route
+          path="/"
+          element={
+            <DashboardPage
+              key={selectedGuildId ?? "no-guild"}
+              selectedGuildId={selectedGuildId}
+              selectedGuildName={selectedGuild?.name}
+              useCurrentGuildMeetings={useCurrentGuildMeetings}
+              loadingGuildSelection={
+                loadingMe ||
+                loadingGuilds ||
+                (me !== null && selectedGuildId === null && !noSelectableGuilds)
+              }
+              noSelectableGuilds={noSelectableGuilds}
+            />
+          }
+        />
         <Route
           path="/settings"
           element={
