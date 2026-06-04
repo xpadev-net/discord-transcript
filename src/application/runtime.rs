@@ -3374,7 +3374,7 @@ impl ScaffoldHandler {
         // the terminal DB mark. If the mark fails, retry flags in the caller
         // continue teardown without depending on already-removed timer/session
         // state, so recordings do not remain active forever.
-        let removed_session = {
+        let mut removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let removed_session = {
                 let mut sessions = self.sessions.lock().await;
@@ -3419,6 +3419,10 @@ impl ScaffoldHandler {
                 "teardown exhaustion",
             )
             .await;
+        }
+
+        if let Some(session) = removed_session.as_mut() {
+            flush_removed_session_after_stop(session, guild_key, "teardown exhaustion");
         }
 
         let latest_tracker = {
