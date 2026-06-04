@@ -3254,7 +3254,7 @@ impl ScaffoldHandler {
         ),
         RecordingTeardownError,
     > {
-        {
+        let (stop_result, removed_session) = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let tracker = {
                 let tracker = self.ssrc_tracker.lock().await;
@@ -3273,34 +3273,35 @@ impl ScaffoldHandler {
                 session.persist_ssrc_mapping(&tracker);
                 flush_result.map_err(RecordingTeardownError::FinalFlush)?;
             }
-        }
 
-        let stop_result = {
-            let mut service = self.service.lock().await;
-            let mut queue = self.queue.lock().await;
-            stop_and_enqueue_summary_job(
-                &mut service,
-                &mut *queue,
-                request.guild_key,
-                request.caller_user_id,
-                request.caller_role,
-                Some(request.expected_meeting_id),
-                request.reason,
-            )
-            .map_err(RecordingTeardownError::Stop)?
-        };
+            let stop_result = {
+                let mut service = self.service.lock().await;
+                let mut queue = self.queue.lock().await;
+                stop_and_enqueue_summary_job(
+                    &mut service,
+                    &mut *queue,
+                    request.guild_key,
+                    request.caller_user_id,
+                    request.caller_role,
+                    Some(request.expected_meeting_id),
+                    request.reason,
+                )
+                .map_err(RecordingTeardownError::Stop)?
+            };
 
-        let removed_session = {
-            let mut sessions = self.sessions.lock().await;
-            match sessions
-                .get(request.guild_key)
-                .map(|session| session.meeting_id.as_str())
-            {
-                Some(current) if current == request.expected_meeting_id => {
-                    sessions.remove(request.guild_key)
+            let removed_session = {
+                let mut sessions = self.sessions.lock().await;
+                match sessions
+                    .get(request.guild_key)
+                    .map(|session| session.meeting_id.as_str())
+                {
+                    Some(current) if current == request.expected_meeting_id => {
+                        sessions.remove(request.guild_key)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
+            };
+            (stop_result, removed_session)
         };
         {
             let mut states = self.auto_stop_states.lock().await;
@@ -3358,17 +3359,8 @@ impl ScaffoldHandler {
         error_message: &str,
     ) -> Result<(), String> {
         let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
-        let removed_session = {
+        let (removed_session, mark_result) = {
             let _voice_event_guard = self.voice_event_gate.write().await;
-            {
-                let mut service = self.service.lock().await;
-                mark_recording_failed_after_teardown_exhaustion(
-                    &mut service.store,
-                    expected_meeting_id,
-                    error_message,
-                )
-                .map_err(|err| err.to_string())?;
-            }
             let removed_session = {
                 let mut sessions = self.sessions.lock().await;
                 match sessions
@@ -3391,7 +3383,16 @@ impl ScaffoldHandler {
                 let mut startups = self.recording_startups.lock().await;
                 clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
             }
-            removed_session
+            let mark_result = {
+                let mut service = self.service.lock().await;
+                mark_recording_failed_after_teardown_exhaustion(
+                    &mut service.store,
+                    expected_meeting_id,
+                    error_message,
+                )
+                .map_err(|err| err.to_string())
+            };
+            (removed_session, mark_result)
         };
 
         if let Some(manager) = songbird::get(ctx).await {
@@ -3413,7 +3414,7 @@ impl ScaffoldHandler {
             session.persist_ssrc_mapping(&latest_tracker);
         }
 
-        Ok(())
+        mark_result
     }
 
     async fn cleanup_failed_recording_start(
@@ -5532,6 +5533,15 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 target_voice_channel_id,
                             );
                             match decide_driver_disconnect_grace_expiry(reconnected, non_bot) {
+                                GraceExpiryDecision::Reschedule
+                                    if retry_teardown_after_failed_terminal_cleanup =>
+                                {
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = expected_meeting_id_ref,
+                                        "driver-disconnect teardown retry has no local state; continuing cleanup despite unavailable voice state cache"
+                                    );
+                                }
                                 GraceExpiryDecision::Reschedule => {
                                     let terminal_error = driver_disconnect_cache_miss_terminal_error(
                                         &mut grace_cache_misses,
