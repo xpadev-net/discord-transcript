@@ -2,14 +2,57 @@ import { useEffect, useState } from "react";
 import { Route, Routes } from "react-router-dom";
 import { ForbiddenState } from "./components/ForbiddenState";
 import { Nav } from "./components/Nav";
-import { fetchMe } from "./lib/api";
-import type { MeResponse } from "./lib/types";
+import { fetchMe, fetchMeGuilds } from "./lib/api";
+import type { MeResponse, UserGuild } from "./lib/types";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
+const selectedGuildStorageKey = "dt.selectedGuildId";
+
+function readStoredGuildId(): string | null {
+  try {
+    return window.localStorage.getItem(selectedGuildStorageKey);
+  } catch {
+    return null;
+  }
+}
+
+function storeSelectedGuildId(guildId: string): void {
+  try {
+    window.localStorage.setItem(selectedGuildStorageKey, guildId);
+  } catch {
+    // Ignore storage failures; the in-memory selection still works.
+  }
+}
+
+function canSelectGuild(guild: UserGuild): boolean {
+  return guild.is_member && guild.tenant_id !== null;
+}
+
+function chooseSelectedGuildId(
+  me: MeResponse,
+  guilds: UserGuild[],
+  preferredGuildId: string | null,
+): string {
+  const selectableGuilds = guilds.filter(canSelectGuild);
+  if (
+    preferredGuildId &&
+    selectableGuilds.some((guild) => guild.guild_id === preferredGuildId)
+  ) {
+    return preferredGuildId;
+  }
+  if (selectableGuilds.some((guild) => guild.guild_id === me.guild_id)) {
+    return me.guild_id;
+  }
+  return selectableGuilds[0]?.guild_id ?? me.guild_id;
+}
+
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null);
+  const [guilds, setGuilds] = useState<UserGuild[]>([]);
+  const [selectedGuildId, setSelectedGuildId] = useState<string | null>(null);
+  const [guildsLoaded, setGuildsLoaded] = useState(false);
   const [loadingMe, setLoadingMe] = useState(true);
   const [sessionForbidden, setSessionForbidden] = useState(false);
   const [sessionError, setSessionError] = useState(false);
@@ -18,6 +61,9 @@ export function App() {
     const controller = new AbortController();
     setLoadingMe(true);
     setMe(null);
+    setGuilds([]);
+    setSelectedGuildId(null);
+    setGuildsLoaded(false);
     setSessionForbidden(false);
     setSessionError(false);
 
@@ -46,19 +92,72 @@ export function App() {
     return () => controller.abort();
   }, []);
 
-  const isAdmin = me?.is_admin === true;
+  useEffect(() => {
+    if (!me) {
+      return;
+    }
+    const controller = new AbortController();
+    fetchMeGuilds(controller.signal)
+      .then((response) => {
+        if (!controller.signal.aborted) {
+          setGuilds(response);
+          setGuildsLoaded(true);
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setGuilds([]);
+          setSelectedGuildId(me.guild_id);
+          storeSelectedGuildId(me.guild_id);
+          setGuildsLoaded(true);
+        }
+      });
+    return () => controller.abort();
+  }, [me]);
+
+  useEffect(() => {
+    if (!me || !guildsLoaded) {
+      return;
+    }
+    if (guilds.length === 0) {
+      setSelectedGuildId(me.guild_id);
+      storeSelectedGuildId(me.guild_id);
+      return;
+    }
+    setSelectedGuildId((current) => {
+      const selected = chooseSelectedGuildId(
+        me,
+        guilds,
+        current ?? readStoredGuildId(),
+      );
+      storeSelectedGuildId(selected);
+      return selected;
+    });
+  }, [me, guilds, guildsLoaded]);
+
+  const loadingGuilds = me !== null && !guildsLoaded;
+  const canUseCurrentGuildSettings =
+    me?.is_admin === true && selectedGuildId === me.guild_id;
 
   return (
     <>
-      <Nav isAdmin={isAdmin} />
+      <Nav
+        isAdmin={canUseCurrentGuildSettings}
+        guilds={guilds}
+        selectedGuildId={selectedGuildId}
+        onSelectedGuildIdChange={(guildId) => {
+          setSelectedGuildId(guildId);
+          storeSelectedGuildId(guildId);
+        }}
+      />
       <Routes>
         <Route path="/" element={<DashboardPage />} />
         <Route
           path="/settings"
           element={
             <SettingsRoute
-              isAdmin={isAdmin}
-              loading={loadingMe}
+              isAdmin={canUseCurrentGuildSettings}
+              loading={loadingMe || loadingGuilds}
               forbidden={sessionForbidden}
               error={sessionError}
             />

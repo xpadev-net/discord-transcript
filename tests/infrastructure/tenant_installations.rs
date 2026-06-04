@@ -1,6 +1,6 @@
 use discord_transcript::infrastructure::sql::{
     BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, INCREMENTAL_MIGRATIONS_SQL,
-    RESOLVE_TENANT_BY_GUILD_SQL,
+    LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlMeetingStore, sql_row_from_strings,
@@ -38,6 +38,16 @@ fn resolve_tenant_by_guild_requires_active_binding_and_tenant() {
     let sql = RESOLVE_TENANT_BY_GUILD_SQL;
 
     assert!(sql.contains("tg.guild_id = $1"));
+    assert!(sql.contains("tg.status = 'active'"));
+    assert!(sql.contains("t.status = 'active'"));
+}
+
+#[test]
+fn list_active_tenant_guilds_filters_to_visible_guild_ids_and_active_rows() {
+    let sql = LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL;
+
+    assert!(sql.contains("tg.guild_id = ANY($1::TEXT[])"));
+    assert!(sql.contains("JOIN tenants t ON t.id = tg.tenant_id"));
     assert!(sql.contains("tg.status = 'active'"));
     assert!(sql.contains("t.status = 'active'"));
 }

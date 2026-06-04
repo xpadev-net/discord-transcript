@@ -16,6 +16,7 @@ import type {
   TranscriptStateResponse,
   UpdateGuildBotTokenRequest,
   UpdateGuildSettingsRequest,
+  UserGuild,
 } from "./types";
 
 function basePath(meetingId: string): string {
@@ -97,6 +98,10 @@ function handleGuildMeetingsResponse(
 
 export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
   return fetch("/api/me", { signal }).then(handleMeResponse);
+}
+
+export function fetchMeGuilds(signal?: AbortSignal): Promise<UserGuild[]> {
+  return fetch("/api/me/guilds", { signal }).then(handleResponse<UserGuild[]>);
 }
 
 export function fetchGuildMeetings(
