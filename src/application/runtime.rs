@@ -2996,6 +2996,16 @@ impl ScaffoldHandler {
         error_message: &str,
     ) {
         let _command_guard = self.command_gate.write().await;
+        self.cleanup_failed_recording_start_locked(guild_key, meeting_id, error_message)
+            .await;
+    }
+
+    async fn cleanup_failed_recording_start_locked(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+    ) {
         {
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
@@ -3085,13 +3095,12 @@ impl ScaffoldHandler {
                 "failed to leave stale voice join after record-start setup race"
             );
         }
-        {
-            let mut startups = self.recording_startups.lock().await;
-            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-        }
-        Err(shutdown_error
+        let error_message = shutdown_error
             .or(lookup_error)
-            .unwrap_or_else(|| "recording changed before voice join completed".to_owned()))
+            .unwrap_or_else(|| "recording changed before voice join completed".to_owned());
+        self.cleanup_failed_recording_start_locked(guild_key, meeting_id, &error_message)
+            .await;
+        Err(error_message)
     }
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
