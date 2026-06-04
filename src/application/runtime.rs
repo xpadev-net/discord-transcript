@@ -3417,6 +3417,10 @@ impl ScaffoldHandler {
             }
         }
         {
+            let mut states = self.auto_stop_states.lock().await;
+            states.remove(guild_key);
+        }
+        {
             let mut titles = self.live_transcription_titles.lock().await;
             titles.remove(meeting_id);
         }
