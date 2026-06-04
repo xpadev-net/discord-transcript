@@ -11,6 +11,8 @@ import type {
   SummaryResponse,
   SummaryTemplate,
   SummaryTemplateUpsertRequest,
+  TranscriptFeedbackRequest,
+  TranscriptFeedbackResponse,
   TranscriptResponse,
   TranscriptSegment,
   TranscriptStateResponse,
@@ -390,6 +392,21 @@ export function normalizeTranscriptResponse(
 
 export function getTranscriptEventsUrl(meetingId: string): string {
   return `${basePath(meetingId)}/transcript/events`;
+}
+
+export function createMeetingFeedback(
+  meetingId: string,
+  request: TranscriptFeedbackRequest,
+  signal?: AbortSignal,
+): Promise<TranscriptFeedbackResponse> {
+  return fetch(`${basePath(meetingId)}/feedback`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<TranscriptFeedbackResponse>);
 }
 
 export function fetchSummary(

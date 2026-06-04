@@ -7,6 +7,7 @@ interface Props {
   segments: TranscriptSegment[] | null;
   activeIndex: number;
   onSeek: (startMs: number) => void;
+  onFeedback?: (segment: TranscriptSegment, returnFocusTo: HTMLElement) => void;
   error: string | null;
   onRetry: () => void;
   streamState?: TranscriptStreamState;
@@ -48,6 +49,7 @@ export const TranscriptPanel = forwardRef<HTMLDivElement, Props>(
       segments,
       activeIndex,
       onSeek,
+      onFeedback,
       error,
       onRetry,
       streamState,
@@ -113,6 +115,7 @@ export const TranscriptPanel = forwardRef<HTMLDivElement, Props>(
             segment={seg}
             isActive={i === activeIndex}
             onSeek={onSeek}
+            onFeedback={onFeedback}
           />
         ))}
       </div>
