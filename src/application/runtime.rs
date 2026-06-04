@@ -516,6 +516,10 @@ enum RecordingStartJoinVerification {
     AlreadyStopped,
 }
 
+// Join completion can race with a stop command after the DB row/session were
+// created but before Songbird reports success. Only statuses reached by the
+// normal stop pipeline are accepted as benign here; terminal failure statuses
+// still force failed-start cleanup so setup errors remain visible.
 fn recording_start_join_completed_after_stop(status: MeetingStatus) -> bool {
     matches!(
         status,
@@ -3365,6 +3369,10 @@ impl ScaffoldHandler {
         error_message: &str,
     ) -> Result<(), String> {
         let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
+        // Local runtime cleanup is intentionally idempotent and happens before
+        // the terminal DB mark. If the mark fails, retry flags in the caller
+        // continue teardown without depending on already-removed timer/session
+        // state, so recordings do not remain active forever.
         let (removed_session, mark_result) = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let removed_session = {
