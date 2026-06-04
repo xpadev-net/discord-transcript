@@ -595,8 +595,6 @@ enum RecordingTeardownError {
 }
 
 struct RecordingStopTeardownRequest<'a> {
-    ctx: &'a Context,
-    guild_id: GuildId,
     guild_key: &'a str,
     caller_user_id: &'a str,
     caller_role: UserRole,
@@ -2439,7 +2437,7 @@ impl EventHandler for ScaffoldHandler {
                             return;
                         }
                     }
-                    let _command_guard = handler.command_gate.write().await;
+                    let command_guard = handler.command_gate.write().await;
                     if handler.shutting_down.load(Ordering::Acquire) {
                         return;
                     }
@@ -2574,20 +2572,31 @@ impl EventHandler for ScaffoldHandler {
                         }
                         return;
                     }
+                    let teardown_request = RecordingStopTeardownRequest {
+                        guild_key: &guild_for_task,
+                        caller_user_id: "auto-stop",
+                        caller_role: UserRole::BotAdmin,
+                        expected_meeting_id: expected_meeting_id_ref,
+                        reason: StopReason::AutoEmpty,
+                        phase: "auto-stop",
+                    };
                     match handler
-                        .finalize_recording_stop_after_teardown(RecordingStopTeardownRequest {
-                            ctx: &ctx_for_task,
-                            guild_id: handler.guild_id,
-                            guild_key: &guild_for_task,
-                            caller_user_id: "auto-stop",
-                            caller_role: UserRole::BotAdmin,
-                            expected_meeting_id: expected_meeting_id_ref,
-                            reason: StopReason::AutoEmpty,
-                            phase: "auto-stop",
-                        })
+                        .prepare_recording_stop_after_teardown(&teardown_request)
                         .await
                     {
-                        Ok(result) => break result,
+                        Ok((result, removed_session)) => {
+                            drop(command_guard);
+                            handler
+                                .leave_after_recording_stop(
+                                    &ctx_for_task,
+                                    handler.guild_id,
+                                    expected_meeting_id_ref,
+                                    "auto-stop",
+                                    &removed_session,
+                                )
+                                .await;
+                            break result;
+                        }
                         Err(RecordingTeardownError::FinalFlush(err)) => {
                             final_flush_failures += 1;
                             if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
@@ -3080,86 +3089,93 @@ impl ScaffoldHandler {
             .map(|base_url| format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id))
     }
 
-    async fn finalize_recording_stop_after_teardown(
+    async fn prepare_recording_stop_after_teardown(
         &self,
-        request: RecordingStopTeardownRequest<'_>,
-    ) -> Result<StopCommandResult, RecordingTeardownError> {
-        let (stop_result, removed_session) = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let tracker = {
-                let tracker = self.ssrc_tracker.lock().await;
-                tracker.clone()
-            };
+        request: &RecordingStopTeardownRequest<'_>,
+    ) -> Result<
+        (
+            StopCommandResult,
+            Option<RecordingSession<LocalChunkStorage>>,
+        ),
+        RecordingTeardownError,
+    > {
+        let _voice_event_guard = self.voice_event_gate.write().await;
+        let tracker = {
+            let tracker = self.ssrc_tracker.lock().await;
+            tracker.clone()
+        };
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions
+                .get_mut(request.guild_key)
+                .filter(|session| session.meeting_id == request.expected_meeting_id)
             {
-                let mut sessions = self.sessions.lock().await;
-                if let Some(session) = sessions
-                    .get_mut(request.guild_key)
-                    .filter(|session| session.meeting_id == request.expected_meeting_id)
-                {
-                    let flush_result =
-                        flush_session_for_teardown(session, request.guild_key, request.phase);
-                    // The write voice_event_gate held for this block keeps
-                    // SpeakingStateUpdate from changing the tracker while a
-                    // retryable flush error is propagated.
-                    session.persist_ssrc_mapping(&tracker);
-                    flush_result.map_err(RecordingTeardownError::FinalFlush)?;
-                }
+                let flush_result =
+                    flush_session_for_teardown(session, request.guild_key, request.phase);
+                // The write voice_event_gate held for this block keeps
+                // SpeakingStateUpdate from changing the tracker while a
+                // retryable flush error is propagated.
+                session.persist_ssrc_mapping(&tracker);
+                flush_result.map_err(RecordingTeardownError::FinalFlush)?;
             }
+        }
 
-            let stop_result = {
-                let mut service = self.service.lock().await;
-                let mut queue = self.queue.lock().await;
-                stop_and_enqueue_summary_job(
-                    &mut service,
-                    &mut *queue,
-                    request.guild_key,
-                    request.caller_user_id,
-                    request.caller_role,
-                    Some(request.expected_meeting_id),
-                    request.reason,
-                )
-                .map_err(RecordingTeardownError::Stop)?
-            };
-
-            let removed_session = {
-                let mut sessions = self.sessions.lock().await;
-                match sessions
-                    .get(request.guild_key)
-                    .map(|session| session.meeting_id.as_str())
-                {
-                    Some(current) if current == request.expected_meeting_id => {
-                        sessions.remove(request.guild_key)
-                    }
-                    _ => None,
-                }
-            };
-            {
-                let mut states = self.auto_stop_states.lock().await;
-                states.remove(request.guild_key);
-            }
-            if let Some(session) = &removed_session {
-                let mut titles = self.live_transcription_titles.lock().await;
-                titles.remove(&session.meeting_id);
-            }
-            {
-                let mut startups = self.recording_startups.lock().await;
-                clear_matching_recording_startup(
-                    &mut startups,
-                    request.guild_key,
-                    request.expected_meeting_id,
-                );
-            }
-            (stop_result, removed_session)
+        let stop_result = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
+            stop_and_enqueue_summary_job(
+                &mut service,
+                &mut *queue,
+                request.guild_key,
+                request.caller_user_id,
+                request.caller_role,
+                Some(request.expected_meeting_id),
+                request.reason,
+            )
+            .map_err(RecordingTeardownError::Stop)?
         };
 
-        if let Some(manager) = songbird::get(request.ctx).await {
-            leave_voice_with_timeout(
-                manager.as_ref(),
-                request.guild_id,
+        let removed_session = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions
+                .get(request.guild_key)
+                .map(|session| session.meeting_id.as_str())
+            {
+                Some(current) if current == request.expected_meeting_id => {
+                    sessions.remove(request.guild_key)
+                }
+                _ => None,
+            }
+        };
+        {
+            let mut states = self.auto_stop_states.lock().await;
+            states.remove(request.guild_key);
+        }
+        if let Some(session) = &removed_session {
+            let mut titles = self.live_transcription_titles.lock().await;
+            titles.remove(&session.meeting_id);
+        }
+        {
+            let mut startups = self.recording_startups.lock().await;
+            clear_matching_recording_startup(
+                &mut startups,
+                request.guild_key,
                 request.expected_meeting_id,
-                request.phase,
-            )
-            .await;
+            );
+        }
+        Ok((stop_result, removed_session))
+    }
+
+    async fn leave_after_recording_stop(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+        meeting_id: &str,
+        phase: &str,
+        removed_session: &Option<RecordingSession<LocalChunkStorage>>,
+    ) {
+        if let Some(manager) = songbird::get(ctx).await {
+            leave_voice_with_timeout(manager.as_ref(), guild_id, meeting_id, phase).await;
         }
 
         // Re-read after voice teardown so late SpeakingStateUpdate events that
@@ -3171,8 +3187,6 @@ impl ScaffoldHandler {
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&latest_tracker);
         }
-
-        Ok(stop_result)
     }
 
     async fn fail_recording_after_teardown_exhaustion(
@@ -3183,17 +3197,17 @@ impl ScaffoldHandler {
         expected_meeting_id: &str,
         error_message: &str,
     ) -> Result<(), String> {
-        let removed_session = {
+        let (removed_session, mark_result) = {
             let _voice_event_guard = self.voice_event_gate.write().await;
-            {
+            let mark_result = {
                 let mut service = self.service.lock().await;
                 mark_recording_failed_after_teardown_exhaustion(
                     &mut service.store,
                     expected_meeting_id,
                     error_message,
                 )
-                .map_err(|err| err.to_string())?;
-            }
+                .map_err(|err| err.to_string())
+            };
             let removed_session = {
                 let mut sessions = self.sessions.lock().await;
                 match sessions
@@ -3216,7 +3230,7 @@ impl ScaffoldHandler {
                 let mut startups = self.recording_startups.lock().await;
                 clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
             }
-            removed_session
+            (removed_session, mark_result)
         };
 
         if let Some(manager) = songbird::get(ctx).await {
@@ -3237,7 +3251,7 @@ impl ScaffoldHandler {
             session.persist_ssrc_mapping(&latest_tracker);
         }
 
-        Ok(())
+        mark_result
     }
 
     async fn cleanup_failed_recording_start(
@@ -3650,7 +3664,7 @@ impl ScaffoldHandler {
         );
         let caller_user_id = command.user.id.get().to_string();
 
-        let stop_result = {
+        let (stop_result, removed_session, authorized_meeting_id) = {
             let _command_guard = self.command_gate.write().await;
             self.reject_if_shutting_down()?;
             let mut service = self.service.lock().await;
@@ -3664,19 +3678,28 @@ impl ScaffoldHandler {
             let authorized_meeting_id = meeting.id;
             drop(service);
 
-            self.finalize_recording_stop_after_teardown(RecordingStopTeardownRequest {
-                ctx,
-                guild_id,
+            let request = RecordingStopTeardownRequest {
                 guild_key: &guild_key,
                 caller_user_id: &caller_user_id,
                 caller_role,
                 expected_meeting_id: &authorized_meeting_id,
                 reason: StopReason::Manual,
                 phase: "manual stop",
-            })
-            .await
-            .map_err(|err| err.to_string())?
+            };
+            let (stop_result, removed_session) = self
+                .prepare_recording_stop_after_teardown(&request)
+                .await
+                .map_err(|err| err.to_string())?;
+            (stop_result, removed_session, authorized_meeting_id)
         };
+        self.leave_after_recording_stop(
+            ctx,
+            guild_id,
+            &authorized_meeting_id,
+            "manual stop",
+            &removed_session,
+        )
+        .await;
 
         {
             let result = stop_result;
@@ -5245,7 +5268,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     return;
                                 }
                             }
-                            let _command_guard = runtime.command_gate.write().await;
+                            let command_guard = runtime.command_gate.write().await;
                             if runtime.shutting_down.load(Ordering::Acquire) {
                                 return;
                             }
@@ -5350,22 +5373,31 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     grace_cache_misses = 0;
                                 }
                             }
+                            let teardown_request = RecordingStopTeardownRequest {
+                                guild_key: &guild_key,
+                                caller_user_id: "driver-disconnect",
+                                caller_role: UserRole::BotAdmin,
+                                expected_meeting_id: expected_meeting_id_ref,
+                                reason: StopReason::ClientDisconnect,
+                                phase: "driver disconnect",
+                            };
                             match runtime
-                                .finalize_recording_stop_after_teardown(
-                                    RecordingStopTeardownRequest {
-                                        ctx: &ctx_for_task,
-                                        guild_id: runtime.guild_id,
-                                        guild_key: &guild_key,
-                                        caller_user_id: "driver-disconnect",
-                                        caller_role: UserRole::BotAdmin,
-                                        expected_meeting_id: expected_meeting_id_ref,
-                                        reason: StopReason::ClientDisconnect,
-                                        phase: "driver disconnect",
-                                    },
-                                )
+                                .prepare_recording_stop_after_teardown(&teardown_request)
                                 .await
                             {
-                                Ok(result) => break result,
+                                Ok((result, removed_session)) => {
+                                    drop(command_guard);
+                                    runtime
+                                        .leave_after_recording_stop(
+                                            &ctx_for_task,
+                                            runtime.guild_id,
+                                            expected_meeting_id_ref,
+                                            "driver disconnect",
+                                            &removed_session,
+                                        )
+                                        .await;
+                                    break result;
+                                }
                                 Err(RecordingTeardownError::FinalFlush(err)) => {
                                     final_flush_failures += 1;
                                     if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
