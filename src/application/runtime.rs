@@ -484,6 +484,10 @@ fn recording_stop_terminal_error(
     ))
 }
 
+fn reset_final_flush_failures_after_successful_flush(final_flush_failures: &mut u32) {
+    *final_flush_failures = 0;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordingStartJoinVerification {
     Active,
@@ -668,6 +672,16 @@ struct RecordingStopTeardownRequest<'a> {
     expected_meeting_id: &'a str,
     reason: StopReason,
     phase: &'a str,
+}
+
+struct RecordingLifecycleWritePermit<'a> {
+    guard: RwLockWriteGuard<'a, ()>,
+}
+
+impl RecordingLifecycleWritePermit<'_> {
+    fn assert_held(&self) {
+        let _ = &self.guard;
+    }
 }
 
 impl Display for RecordingTeardownError {
@@ -2513,7 +2527,7 @@ impl EventHandler for ScaffoldHandler {
                             return;
                         }
                     }
-                    let command_guard = handler.command_gate.write().await;
+                    let lifecycle_permit = handler.recording_lifecycle_write_permit().await;
                     if handler.shutting_down.load(Ordering::Acquire) {
                         return;
                     }
@@ -2674,13 +2688,16 @@ impl EventHandler for ScaffoldHandler {
                         phase: "auto-stop",
                     };
                     match handler
-                        .prepare_recording_stop_after_teardown(&command_guard, &teardown_request)
+                        .prepare_recording_stop_after_teardown(
+                            &lifecycle_permit,
+                            &teardown_request,
+                        )
                         .await
                     {
                         Ok((result, removed_session)) => {
                             let reset_guard =
                                 Arc::clone(&handler.ssrc_tracker_reset_gate).lock_owned().await;
-                            drop(command_guard);
+                            drop(lifecycle_permit);
                             handler
                                 .leave_after_recording_stop(
                                     &ctx_for_task,
@@ -2759,6 +2776,9 @@ impl EventHandler for ScaffoldHandler {
                             continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
+                            reset_final_flush_failures_after_successful_flush(
+                                &mut final_flush_failures,
+                            );
                             let terminal_error =
                                 recording_stop_terminal_error(&mut stop_failures, "auto-stop", &err);
                             warn!(
@@ -3195,9 +3215,15 @@ impl ScaffoldHandler {
             .map(|base_url| format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id))
     }
 
+    async fn recording_lifecycle_write_permit(&self) -> RecordingLifecycleWritePermit<'_> {
+        RecordingLifecycleWritePermit {
+            guard: self.command_gate.write().await,
+        }
+    }
+
     async fn prepare_recording_stop_after_teardown(
         &self,
-        _command_guard: &RwLockWriteGuard<'_, ()>,
+        permit: &RecordingLifecycleWritePermit<'_>,
         request: &RecordingStopTeardownRequest<'_>,
     ) -> Result<
         (
@@ -3206,6 +3232,7 @@ impl ScaffoldHandler {
         ),
         RecordingTeardownError,
     > {
+        permit.assert_held();
         {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let tracker = {
@@ -3808,7 +3835,7 @@ impl ScaffoldHandler {
         let caller_user_id = command.user.id.get().to_string();
 
         let (stop_result, removed_session, authorized_meeting_id, reset_guard) = {
-            let command_guard = self.command_gate.write().await;
+            let lifecycle_permit = self.recording_lifecycle_write_permit().await;
             self.reject_if_shutting_down()?;
             let mut service = self.service.lock().await;
             let meeting = service
@@ -3830,7 +3857,7 @@ impl ScaffoldHandler {
                 phase: "manual stop",
             };
             let (stop_result, removed_session) = self
-                .prepare_recording_stop_after_teardown(&command_guard, &request)
+                .prepare_recording_stop_after_teardown(&lifecycle_permit, &request)
                 .await
                 .map_err(|err| err.to_string())?;
             let reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
@@ -5425,7 +5452,8 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     return;
                                 }
                             }
-                            let command_guard = runtime.command_gate.write().await;
+                            let lifecycle_permit =
+                                runtime.recording_lifecycle_write_permit().await;
                             if runtime.shutting_down.load(Ordering::Acquire) {
                                 return;
                             }
@@ -5550,7 +5578,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             };
                             match runtime
                                 .prepare_recording_stop_after_teardown(
-                                    &command_guard,
+                                    &lifecycle_permit,
                                     &teardown_request,
                                 )
                                 .await
@@ -5560,7 +5588,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         Arc::clone(&runtime.ssrc_tracker_reset_gate)
                                             .lock_owned()
                                             .await;
-                                    drop(command_guard);
+                                    drop(lifecycle_permit);
                                     runtime
                                         .leave_after_recording_stop(
                                             &ctx_for_task,
@@ -5630,6 +5658,9 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     continue;
                                 }
                                 Err(RecordingTeardownError::Stop(err)) => {
+                                    reset_final_flush_failures_after_successful_flush(
+                                        &mut final_flush_failures,
+                                    );
                                     let terminal_error = recording_stop_terminal_error(
                                         &mut stop_failures,
                                         "driver-disconnect",
@@ -7176,6 +7207,15 @@ mod status_message_tests {
         assert_eq!(stop_failures, RECORDING_STOP_MAX_RETRIES);
         assert!(error.contains("recording stop failed"));
         assert!(error.contains("queue down"));
+    }
+
+    #[test]
+    fn successful_flush_before_stop_resets_final_flush_failure_budget() {
+        let mut final_flush_failures = AUTO_STOP_FINAL_FLUSH_MAX_RETRIES - 1;
+
+        reset_final_flush_failures_after_successful_flush(&mut final_flush_failures);
+
+        assert_eq!(final_flush_failures, 0);
     }
 
     #[test]
