@@ -31,11 +31,18 @@ export interface MeetingListItem {
   stopped_at: string | null;
   duration_seconds: number | null;
   stop_reason: string | null;
+  voice_channel_id: string;
+}
+
+export interface MeetingVoiceChannel {
+  id: string;
+  label: string;
 }
 
 export interface MeetingListResponse {
   guild_id: string;
   meetings: MeetingListItem[];
+  voice_channels: MeetingVoiceChannel[];
   page: number;
   limit: number;
   total: number;

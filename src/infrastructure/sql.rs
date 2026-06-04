@@ -787,15 +787,28 @@ SELECT id,
        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as stopped_at,
        meeting_duration_seconds,
        title,
-       stop_reason
+       stop_reason,
+       voice_channel_id
 FROM meetings
 WHERE guild_id = $1
+  AND ($2::TEXT IS NULL OR voice_channel_id = $2)
 ORDER BY started_at DESC
-LIMIT $2 OFFSET $3
+LIMIT $3 OFFSET $4
 "#;
 
 pub const COUNT_GUILD_MEETINGS_SQL: &str = r#"
-SELECT count(*) FROM meetings WHERE guild_id = $1
+SELECT count(*) FROM meetings
+WHERE guild_id = $1
+  AND ($2::TEXT IS NULL OR voice_channel_id = $2)
+"#;
+
+pub const LIST_GUILD_MEETING_VOICE_CHANNELS_SQL: &str = r#"
+SELECT voice_channel_id
+FROM meetings
+WHERE guild_id = $1
+GROUP BY voice_channel_id
+ORDER BY MAX(started_at) DESC NULLS LAST, voice_channel_id ASC
+LIMIT $2
 "#;
 
 pub const LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL: &str = r#"

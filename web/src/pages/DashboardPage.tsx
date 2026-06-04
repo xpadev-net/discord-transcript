@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchGuildMeetings } from "../lib/api";
 import { formatDate, formatDuration } from "../lib/formatters";
@@ -53,8 +53,12 @@ export function DashboardPage({
 }: DashboardPageProps) {
   const [request, setRequest] = useState({ page: 1, reloadKey: 0 });
   const [data, setData] = useState<MeetingListResponse | null>(null);
+  const [selectedVoiceChannelId, setSelectedVoiceChannelId] = useState<
+    string | null
+  >(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const previousGuildIdRef = useRef(selectedGuildId);
   const page = request.page;
   const responseGuildId = useCurrentGuildMeetings
     ? selectedGuildId
@@ -67,6 +71,15 @@ export function DashboardPage({
   useEffect(() => {
     document.title = "\u4f1a\u8b70\u4e00\u89a7";
   }, []);
+
+  useEffect(() => {
+    if (previousGuildIdRef.current === selectedGuildId) {
+      return;
+    }
+    previousGuildIdRef.current = selectedGuildId;
+    setSelectedVoiceChannelId(null);
+    setRequest((current) => ({ ...current, page: 1 }));
+  }, [selectedGuildId]);
 
   useEffect(() => {
     if (loadingGuildSelection) {
@@ -90,6 +103,7 @@ export function DashboardPage({
       useCurrentGuildMeetings ? null : selectedGuildId,
       request.page,
       PAGE_SIZE,
+      selectedVoiceChannelId,
       controller.signal,
     )
       .then((response) => {
@@ -115,9 +129,42 @@ export function DashboardPage({
   }, [
     request,
     selectedGuildId,
+    selectedVoiceChannelId,
     useCurrentGuildMeetings,
     loadingGuildSelection,
   ]);
+
+  const voiceChannelOptions = useMemo(() => {
+    if (!activeData) {
+      return [];
+    }
+    const options =
+      activeData.voice_channels?.map((channel) => ({
+        id: channel.id,
+        label: channel.label || `VC ID: ${channel.id}`,
+      })) ?? [];
+    for (const meeting of activeData.meetings) {
+      if (
+        meeting.voice_channel_id &&
+        !options.some((option) => option.id === meeting.voice_channel_id)
+      ) {
+        options.push({
+          id: meeting.voice_channel_id,
+          label: `VC ID: ${meeting.voice_channel_id}`,
+        });
+      }
+    }
+    if (
+      selectedVoiceChannelId &&
+      !options.some((option) => option.id === selectedVoiceChannelId)
+    ) {
+      options.push({
+        id: selectedVoiceChannelId,
+        label: `VC ID: ${selectedVoiceChannelId}`,
+      });
+    }
+    return options;
+  }, [activeData, selectedVoiceChannelId]);
 
   const totalPages = useMemo(() => {
     if (!activeData) {
@@ -135,7 +182,9 @@ export function DashboardPage({
   const meetingCountText =
     activeData && activeData.total > 0
       ? `${showingFrom}-${showingTo} / ${activeData.total}`
-      : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
+      : selectedVoiceChannelId
+        ? "\u3053\u306eVC\u306e\u4f1a\u8b70\u306f\u3042\u308a\u307e\u305b\u3093"
+        : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
   const hasLiveMeetings =
     activeData?.meetings.some((meeting) =>
       LIVE_MEETING_STATUSES.has(meeting.status),
@@ -175,19 +224,48 @@ export function DashboardPage({
                   : emptyGuildMessage}
           </p>
         </div>
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() =>
-            setRequest((current) => ({
-              ...current,
-              reloadKey: current.reloadKey + 1,
-            }))
-          }
-          disabled={loading}
-        >
-          {"\u518d\u8aad\u307f\u8fbc\u307f"}
-        </button>
+        <div className="dashboard-actions">
+          <label className="dashboard-filter">
+            <span>{"VC"}</span>
+            <select
+              aria-label="VC"
+              value={selectedVoiceChannelId ?? ""}
+              onChange={(event) => {
+                const nextVoiceChannelId = event.target.value || null;
+                setSelectedVoiceChannelId(nextVoiceChannelId);
+                setRequest((current) => ({
+                  page: 1,
+                  reloadKey: current.reloadKey + 1,
+                }));
+              }}
+              disabled={
+                loading ||
+                !selectedGuildId ||
+                (!selectedVoiceChannelId && voiceChannelOptions.length === 0)
+              }
+            >
+              <option value="">{"\u3059\u3079\u3066\u306eVC"}</option>
+              {voiceChannelOptions.map((channel) => (
+                <option key={channel.id} value={channel.id}>
+                  {channel.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() =>
+              setRequest((current) => ({
+                ...current,
+                reloadKey: current.reloadKey + 1,
+              }))
+            }
+            disabled={loading}
+          >
+            {"\u518d\u8aad\u307f\u8fbc\u307f"}
+          </button>
+        </div>
       </div>
 
       {error ? (
@@ -277,7 +355,9 @@ export function DashboardPage({
 
           {!loading && activeData?.meetings.length === 0 ? (
             <div className="empty-state dashboard-panel-message">
-              {"\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093"}
+              {selectedVoiceChannelId
+                ? "\u3053\u306eVC\u306e\u4f1a\u8b70\u306f\u3042\u308a\u307e\u305b\u3093"
+                : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093"}
             </div>
           ) : null}
         </section>

@@ -124,12 +124,17 @@ export function fetchGuildMeetings(
   guildId?: string | null,
   page = 1,
   limit = 20,
+  voiceChannelId?: string | null,
   signal?: AbortSignal,
 ): Promise<MeetingListResponse> {
   const params = new URLSearchParams({
     page: String(page),
     limit: String(limit),
   });
+  const normalizedVoiceChannelId = voiceChannelId?.trim();
+  if (normalizedVoiceChannelId) {
+    params.set("voice_channel_id", normalizedVoiceChannelId);
+  }
 
   return fetch(`${guildMeetingsPath(guildId)}?${params.toString()}`, {
     signal,
