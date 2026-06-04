@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { AudioPlayer } from "../components/AudioPlayer";
 import { DebugDownloads } from "../components/DebugDownloads";
@@ -8,9 +8,323 @@ import { SummaryPanel } from "../components/SummaryPanel";
 import { TranscriptPanel } from "../components/TranscriptPanel";
 import { useAudioSync } from "../hooks/useAudioSync";
 import { useMeetingData } from "../hooks/useMeetingData";
-import { fetchDebugManifest, getAudioUrl } from "../lib/api";
+import {
+  createMeetingFeedback,
+  fetchDebugManifest,
+  getAudioUrl,
+} from "../lib/api";
 import { isLiveMeetingStatus } from "../lib/meetingStatus";
-import type { DebugArtifact } from "../lib/types";
+import type {
+  DebugArtifact,
+  TranscriptFeedbackRequest,
+  TranscriptFeedbackTermType,
+  TranscriptFeedbackType,
+  TranscriptSegment,
+} from "../lib/types";
+
+const feedbackTypeOptions: Array<{
+  value: TranscriptFeedbackType;
+  label: string;
+}> = [
+  { value: "mistranscription", label: "文字起こし" },
+  { value: "speaker", label: "話者" },
+  { value: "term", label: "用語" },
+];
+
+const termTypeOptions: Array<{
+  value: TranscriptFeedbackTermType;
+  label: string;
+}> = [
+  { value: "general_term", label: "一般用語" },
+  { value: "person_name", label: "人名" },
+  { value: "project_name", label: "プロジェクト名" },
+  { value: "product_name", label: "製品名" },
+  { value: "organization", label: "組織名" },
+  { value: "acronym", label: "略語" },
+  { value: "wording_rule", label: "表記ルール" },
+  { value: "prohibited_item", label: "禁止語" },
+];
+
+interface FeedbackDraft {
+  feedbackType: TranscriptFeedbackType;
+  correctedText: string;
+  correctedSpeakerId: string;
+  termType: TranscriptFeedbackTermType;
+  note: string;
+}
+
+function emptyFeedbackDraft(segment: TranscriptSegment): FeedbackDraft {
+  return {
+    feedbackType: "mistranscription",
+    correctedText: segment.text,
+    correctedSpeakerId: "",
+    termType: "general_term",
+    note: "",
+  };
+}
+
+function segmentSpeakerId(segment: TranscriptSegment): string {
+  return segment.speaker?.id || segment.speaker_id;
+}
+
+function optionalText(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function buildFeedbackRequest(
+  segment: TranscriptSegment,
+  draft: FeedbackDraft,
+): TranscriptFeedbackRequest {
+  const request: TranscriptFeedbackRequest = {
+    transcript_segment_id: segment.id,
+    feedback_type: draft.feedbackType,
+    original_text: segment.text,
+    note: optionalText(draft.note),
+  };
+
+  if (draft.feedbackType === "mistranscription") {
+    request.corrected_text = optionalText(draft.correctedText);
+  }
+  if (draft.feedbackType === "speaker") {
+    request.speaker_id = segmentSpeakerId(segment);
+    request.corrected_speaker_id = optionalText(draft.correctedSpeakerId);
+  }
+  if (draft.feedbackType === "term") {
+    request.term_type = draft.termType;
+    request.corrected_text = optionalText(draft.correctedText);
+  }
+
+  return request;
+}
+
+function validateFeedbackDraft(draft: FeedbackDraft): string | null {
+  if (
+    draft.feedbackType === "mistranscription" &&
+    !draft.correctedText.trim()
+  ) {
+    return "修正後の文字起こしを入力してください";
+  }
+  if (draft.feedbackType === "speaker" && !draft.correctedSpeakerId.trim()) {
+    return "正しい話者IDまたは名前を入力してください";
+  }
+  return null;
+}
+
+function feedbackSubmitErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.startsWith("400")) {
+    return "入力内容がサーバーの検証に通りませんでした";
+  }
+  if (error instanceof Error && error.message.startsWith("403")) {
+    return "この会議にフィードバックを送信する権限がありません";
+  }
+  return "フィードバックの送信に失敗しました";
+}
+
+interface FeedbackDialogProps {
+  segment: TranscriptSegment;
+  draft: FeedbackDraft;
+  submitting: boolean;
+  error: string | null;
+  onDraftChange: (draft: FeedbackDraft) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onClose: () => void;
+}
+
+function FeedbackDialog({
+  segment,
+  draft,
+  submitting,
+  error,
+  onDraftChange,
+  onSubmit,
+  onClose,
+}: FeedbackDialogProps) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const focusableSelector =
+    'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
+
+  useEffect(() => {
+    const firstField = dialogRef.current?.querySelector<HTMLElement>(
+      "select:not(:disabled), textarea:not(:disabled), input:not(:disabled)",
+    );
+    firstField?.focus();
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!dialogRef.current?.contains(document.activeElement)) {
+        return;
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const focusable = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(focusableSelector) ??
+          [],
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        return;
+      }
+
+      const activeIndex = focusable.indexOf(
+        document.activeElement as HTMLElement,
+      );
+      const nextIndex = event.shiftKey
+        ? activeIndex <= 0
+          ? focusable.length - 1
+          : activeIndex - 1
+        : activeIndex < 0 || activeIndex === focusable.length - 1
+          ? 0
+          : activeIndex + 1;
+      event.preventDefault();
+      focusable[nextIndex].focus();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="feedback-modal-backdrop" role="presentation">
+      <section
+        ref={dialogRef}
+        className="feedback-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="feedback-dialog-title"
+      >
+        <div className="feedback-modal-header">
+          <div>
+            <h2 id="feedback-dialog-title">フィードバック</h2>
+            <p>{segment.text}</p>
+          </div>
+          <button
+            type="button"
+            className="feedback-close-button"
+            onClick={onClose}
+            aria-label="フィードバックを閉じる"
+            disabled={submitting}
+          >
+            ×
+          </button>
+        </div>
+        <form className="feedback-form" onSubmit={onSubmit}>
+          <label className="feedback-field">
+            <span>種類</span>
+            <select
+              value={draft.feedbackType}
+              onChange={(event) =>
+                onDraftChange({
+                  ...draft,
+                  feedbackType: event.target.value as TranscriptFeedbackType,
+                })
+              }
+              disabled={submitting}
+            >
+              {feedbackTypeOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {draft.feedbackType !== "speaker" ? (
+            <label className="feedback-field">
+              <span>修正後の文字起こし</span>
+              <textarea
+                value={draft.correctedText}
+                rows={4}
+                onChange={(event) =>
+                  onDraftChange({ ...draft, correctedText: event.target.value })
+                }
+                disabled={submitting}
+              />
+            </label>
+          ) : null}
+          {draft.feedbackType === "speaker" ? (
+            <label className="feedback-field">
+              <span>正しい話者IDまたは名前</span>
+              <input
+                type="text"
+                value={draft.correctedSpeakerId}
+                placeholder={segmentSpeakerId(segment)}
+                onChange={(event) =>
+                  onDraftChange({
+                    ...draft,
+                    correctedSpeakerId: event.target.value,
+                  })
+                }
+                disabled={submitting}
+              />
+            </label>
+          ) : null}
+          {draft.feedbackType === "term" ? (
+            <label className="feedback-field">
+              <span>用語タイプ</span>
+              <select
+                value={draft.termType}
+                onChange={(event) =>
+                  onDraftChange({
+                    ...draft,
+                    termType: event.target.value as TranscriptFeedbackTermType,
+                  })
+                }
+                disabled={submitting}
+              >
+                {termTypeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <label className="feedback-field">
+            <span>メモ・ヒント</span>
+            <textarea
+              value={draft.note}
+              rows={3}
+              onChange={(event) =>
+                onDraftChange({ ...draft, note: event.target.value })
+              }
+              disabled={submitting}
+            />
+          </label>
+          {error ? (
+            <div className="feedback-error" role="alert">
+              {error}
+            </div>
+          ) : null}
+          <div className="feedback-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={onClose}
+              disabled={submitting}
+            >
+              キャンセル
+            </button>
+            <button
+              type="submit"
+              className="primary-button"
+              disabled={submitting}
+            >
+              {submitting ? "送信中..." : "送信"}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
 
 function inProgressMessage(status: string | undefined): string | null {
   if (status === "recording") {
@@ -32,6 +346,8 @@ export function MeetingPage() {
   const { meetingId } = useParams<{ meetingId: string }>();
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const feedbackSubmitControllerRef = useRef<AbortController | null>(null);
+  const feedbackReturnFocusRef = useRef<HTMLElement | null>(null);
 
   const {
     meeting,
@@ -56,6 +372,14 @@ export function MeetingPage() {
   );
   const [debugLoading, setDebugLoading] = useState(true);
   const [debugError, setDebugError] = useState(false);
+  const [feedbackSegment, setFeedbackSegment] =
+    useState<TranscriptSegment | null>(null);
+  const [feedbackDraft, setFeedbackDraft] = useState<FeedbackDraft | null>(
+    null,
+  );
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [feedbackSuccess, setFeedbackSuccess] = useState<string | null>(null);
   const isLive = isLiveMeetingStatus(meeting?.status);
   const progressMessage = inProgressMessage(meeting?.status);
   const showAudioAndDebug = meeting?.status === "posted";
@@ -95,6 +419,91 @@ export function MeetingPage() {
       });
     return () => controller.abort();
   }, [meetingId, showAudioAndDebug]);
+
+  useEffect(() => {
+    if (!meetingId) {
+      return;
+    }
+    feedbackSubmitControllerRef.current?.abort();
+    setFeedbackSegment(null);
+    setFeedbackDraft(null);
+    setFeedbackSubmitting(false);
+    setFeedbackError(null);
+    setFeedbackSuccess(null);
+    return () => feedbackSubmitControllerRef.current?.abort();
+  }, [meetingId]);
+
+  const openFeedback = (
+    segment: TranscriptSegment,
+    returnFocusTo: HTMLElement,
+  ) => {
+    feedbackReturnFocusRef.current = returnFocusTo;
+    setFeedbackSegment(segment);
+    setFeedbackDraft(emptyFeedbackDraft(segment));
+    setFeedbackError(null);
+    setFeedbackSuccess(null);
+  };
+
+  const restoreFeedbackFocus = () => {
+    window.setTimeout(() => {
+      feedbackReturnFocusRef.current?.focus();
+      feedbackReturnFocusRef.current = null;
+    }, 0);
+  };
+
+  const closeFeedback = () => {
+    if (feedbackSubmitting) {
+      return;
+    }
+    setFeedbackSegment(null);
+    setFeedbackDraft(null);
+    setFeedbackError(null);
+    restoreFeedbackFocus();
+  };
+
+  const submitFeedback = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!meetingId || !feedbackSegment || !feedbackDraft) {
+      return;
+    }
+    const validationError = validateFeedbackDraft(feedbackDraft);
+    if (validationError) {
+      setFeedbackError(validationError);
+      return;
+    }
+
+    setFeedbackSubmitting(true);
+    setFeedbackError(null);
+    feedbackSubmitControllerRef.current?.abort();
+    const controller = new AbortController();
+    feedbackSubmitControllerRef.current = controller;
+    createMeetingFeedback(
+      meetingId,
+      buildFeedbackRequest(feedbackSegment, feedbackDraft),
+      controller.signal,
+    )
+      .then(() => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setFeedbackSuccess("フィードバックを送信しました");
+        setFeedbackSegment(null);
+        setFeedbackDraft(null);
+        restoreFeedbackFocus();
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setFeedbackError(feedbackSubmitErrorMessage(err));
+      })
+      .finally(() => {
+        if (feedbackSubmitControllerRef.current === controller) {
+          feedbackSubmitControllerRef.current = null;
+          setFeedbackSubmitting(false);
+        }
+      });
+  };
 
   if (error) {
     return (
@@ -140,6 +549,11 @@ export function MeetingPage() {
               {seekNotice}
             </div>
           ) : null}
+          {feedbackSuccess ? (
+            <div className="feedback-success" role="status">
+              {feedbackSuccess}
+            </div>
+          ) : null}
           <ErrorBoundary
             title={
               "\u30c8\u30e9\u30f3\u30b9\u30af\u30ea\u30d7\u30c8\u306e\u8868\u793a\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
@@ -152,6 +566,7 @@ export function MeetingPage() {
               onSeek={seekTo}
               error={transcriptError}
               onRetry={retryTranscript}
+              onFeedback={openFeedback}
               streamState={transcriptStreamState}
               streamError={transcriptStreamError}
               isLive={isLive}
@@ -176,6 +591,17 @@ export function MeetingPage() {
           />
         </ErrorBoundary>
       </div>
+      {feedbackSegment && feedbackDraft ? (
+        <FeedbackDialog
+          segment={feedbackSegment}
+          draft={feedbackDraft}
+          submitting={feedbackSubmitting}
+          error={feedbackError}
+          onDraftChange={setFeedbackDraft}
+          onSubmit={submitFeedback}
+          onClose={closeFeedback}
+        />
+      ) : null}
     </>
   );
 }

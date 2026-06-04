@@ -134,6 +134,48 @@ function meetingItem(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function meetingResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "meeting-1",
+    title: "Meeting One",
+    status: "posted",
+    started_at: "2026-06-01T00:00:00Z",
+    stopped_at: "2026-06-01T00:10:00Z",
+    duration_seconds: 600,
+    ...overrides,
+  };
+}
+
+function transcriptSegment(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "segment-1",
+    speaker_id: "speaker-1",
+    speaker: {
+      id: "speaker-1",
+      username: "alice",
+      nickname: "Alice",
+      display_name: "Alice Display",
+      display_label: "Alice",
+    },
+    start_ms: 5000,
+    end_ms: 8000,
+    text: "Alpha term",
+    confidence: null,
+    is_noisy: false,
+    source: "voice",
+    ...overrides,
+  };
+}
+
+function transcriptResponse(segments: unknown[] = [transcriptSegment()]) {
+  return {
+    segments,
+    status: "posted",
+    is_final: true,
+    updated_at: "2026-06-01T00:10:00Z",
+  };
+}
+
 function voiceChannel(id: string, label = `VC ID: ${id}`) {
   return { id, label };
 }
@@ -182,6 +224,72 @@ function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
       <App />
     </MemoryRouter>,
   );
+}
+
+function meetingPageFetch(options: { feedbackStatus?: number } = {}) {
+  let feedbackRequest: unknown = null;
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input.toString();
+    if (url === "/api/me") {
+      return Promise.resolve(
+        jsonResponse({
+          user_id: "member-1",
+          guild_id: "guild-1",
+          is_admin: false,
+        }),
+      );
+    }
+    if (url === "/api/me/guilds") {
+      return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+    }
+    if (url === "/api/meetings/meeting-1") {
+      return Promise.resolve(jsonResponse(meetingResponse()));
+    }
+    if (url === "/api/meetings/meeting-1/transcript") {
+      return Promise.resolve(jsonResponse(transcriptResponse()));
+    }
+    if (url === "/api/meetings/meeting-1/summary") {
+      return Promise.resolve(jsonResponse({ markdown: null }));
+    }
+    if (url === "/api/meetings/meeting-1/debug/manifest") {
+      return Promise.resolve(jsonResponse([]));
+    }
+    if (url === "/api/meetings/meeting-1/feedback" && init?.method === "POST") {
+      feedbackRequest = JSON.parse(String(init.body));
+      const status = options.feedbackStatus ?? 201;
+      if (status >= 400) {
+        return Promise.resolve(emptyResponse(status));
+      }
+      return Promise.resolve(
+        jsonResponse(
+          {
+            id: "feedback-1",
+            meeting_id: "meeting-1",
+            transcript_segment_id: "segment-1",
+            feedback_type: "mistranscription",
+            term_type: null,
+            original_text: "Alpha term",
+            corrected_text: "Alpha team",
+            speaker_id: null,
+            corrected_speaker_id: null,
+            note: null,
+            actor_user_id: "member-1",
+            status: "open",
+            created_at: "2026-06-01T00:11:00Z",
+            reviewed_at: null,
+            reviewed_actor_user_id: null,
+          },
+          201,
+        ),
+      );
+    }
+    return Promise.resolve(emptyResponse(404));
+  });
+
+  return {
+    fetchMock,
+    feedbackRequest: () => feedbackRequest,
+  };
 }
 
 afterEach(() => {
@@ -1227,9 +1335,11 @@ describe("App access controls", () => {
     renderApp("/guilds/guild-2/settings", fetchMock);
 
     expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/guilds/guild-2/settings",
-      expect.anything(),
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/guilds/guild-2/settings",
+        expect.anything(),
+      ),
     );
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/guild/settings",
@@ -1716,6 +1826,159 @@ describe("App access controls", () => {
 
     expect(await screen.findByText(dashboardForbiddenText)).toBeTruthy();
     expect(screen.queryByRole("table")).toBeNull();
+  });
+
+  it("opens transcript feedback without consuming row seek clicks", async () => {
+    const { fetchMock } = meetingPageFetch();
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    expect(await screen.findByText("Alpha term")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "00:05 のフィードバック" }),
+    );
+
+    expect(screen.getByRole("dialog", { name: "フィードバック" })).toBeTruthy();
+    expect(screen.queryByText("音声の読み込みが完了していません")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "キャンセル" }));
+    const segmentButton = screen.getByText("Alpha term").closest("button");
+    expect(segmentButton).toBeTruthy();
+    fireEvent.click(segmentButton as HTMLButtonElement);
+
+    expect(
+      await screen.findByText("音声の読み込みが完了していません"),
+    ).toBeTruthy();
+  });
+
+  it("submits corrected transcript feedback to the meeting API", async () => {
+    const { fetchMock, feedbackRequest } = meetingPageFetch();
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "00:05 のフィードバック",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("修正後の文字起こし"), {
+      target: { value: "Alpha team" },
+    });
+    fireEvent.change(screen.getByLabelText("メモ・ヒント"), {
+      target: { value: "team name" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/meetings/meeting-1/feedback",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    expect(feedbackRequest()).toEqual({
+      transcript_segment_id: "segment-1",
+      feedback_type: "mistranscription",
+      original_text: "Alpha term",
+      corrected_text: "Alpha team",
+      note: "team name",
+    });
+    expect(
+      await screen.findByText("フィードバックを送信しました"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "フィードバック" })).toBeNull();
+  });
+
+  it("keeps feedback open and reports API validation errors", async () => {
+    const { fetchMock } = meetingPageFetch({ feedbackStatus: 400 });
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "00:05 のフィードバック",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+
+    expect(
+      await screen.findByText("入力内容がサーバーの検証に通りませんでした"),
+    ).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "フィードバック" })).toBeTruthy();
+  });
+
+  it("exposes speaker and term feedback controls accessibly", async () => {
+    const { fetchMock } = meetingPageFetch();
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    const feedbackButton = await screen.findByRole("button", {
+      name: "00:05 のフィードバック",
+    });
+    fireEvent.click(feedbackButton);
+    const dialog = screen.getByRole("dialog", { name: "フィードバック" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(screen.getByLabelText("種類")).toBe(document.activeElement);
+
+    fireEvent.change(screen.getByLabelText("種類"), {
+      target: { value: "speaker" },
+    });
+    expect(screen.getByLabelText("正しい話者IDまたは名前")).toBeTruthy();
+    expect(screen.queryByLabelText("修正後の文字起こし")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+    expect(
+      await screen.findByText("正しい話者IDまたは名前を入力してください"),
+    ).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("種類"), {
+      target: { value: "term" },
+    });
+    expect(screen.getByLabelText("用語タイプ")).toBeTruthy();
+
+    const submitButton = screen.getByRole("button", { name: "送信" });
+    submitButton.focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(screen.getByLabelText("種類")).toBe(document.activeElement);
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "フィードバック" }),
+      ).toBeNull(),
+    );
+    await waitFor(() => expect(feedbackButton).toBe(document.activeElement));
+  });
+
+  it("submits speaker correction feedback without a dropped text field", async () => {
+    const { fetchMock, feedbackRequest } = meetingPageFetch();
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "00:05 のフィードバック",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("種類"), {
+      target: { value: "speaker" },
+    });
+    fireEvent.change(screen.getByLabelText("正しい話者IDまたは名前"), {
+      target: { value: "speaker-2" },
+    });
+    fireEvent.change(screen.getByLabelText("メモ・ヒント"), {
+      target: { value: "Bob was speaking" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/meetings/meeting-1/feedback",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    expect(feedbackRequest()).toEqual({
+      transcript_segment_id: "segment-1",
+      feedback_type: "speaker",
+      original_text: "Alpha term",
+      speaker_id: "speaker-1",
+      corrected_speaker_id: "speaker-2",
+      note: "Bob was speaking",
+    });
   });
 
   it("builds the expired-session login redirect with the current route preserved", () => {
