@@ -2544,6 +2544,7 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop cache-miss exhaustion; rescheduling"
                                         );
+                                        continue;
                                     }
                                 }
                             }
@@ -2663,6 +2664,7 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop final flush exhaustion; rescheduling"
                                         );
+                                        continue;
                                     }
                                 }
                             }
@@ -2728,6 +2730,7 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop stop exhaustion; rescheduling"
                                         );
+                                        continue;
                                     }
                                 }
                             }
