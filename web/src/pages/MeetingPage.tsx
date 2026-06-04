@@ -167,10 +167,26 @@ function FeedbackDialog({
   const dialogRef = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
-    const firstField = dialogRef.current?.querySelector<HTMLElement>(
+    const dialog = dialogRef.current;
+    if (!dialog) {
+      return;
+    }
+    if (typeof dialog.showModal === "function" && !dialog.open) {
+      dialog.showModal();
+    } else if (!dialog.open) {
+      dialog.setAttribute("open", "");
+    }
+    const firstField = dialog.querySelector<HTMLElement>(
       INITIAL_FEEDBACK_FOCUS_SELECTOR,
     );
     firstField?.focus();
+    return () => {
+      if (typeof dialog.close === "function" && dialog.open) {
+        dialog.close();
+      } else {
+        dialog.removeAttribute("open");
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -217,10 +233,33 @@ function FeedbackDialog({
     <div className="feedback-modal-backdrop" role="presentation">
       <dialog
         ref={dialogRef}
-        open
         className="feedback-modal"
         aria-modal="true"
         aria-labelledby="feedback-dialog-title"
+        onClick={(event) => {
+          if (event.target !== event.currentTarget) {
+            return;
+          }
+          const rect = event.currentTarget.getBoundingClientRect();
+          const clickedBackdrop =
+            event.clientX < rect.left ||
+            event.clientX > rect.right ||
+            event.clientY < rect.top ||
+            event.clientY > rect.bottom;
+          if (clickedBackdrop) {
+            onClose();
+          }
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onClose();
+          }
+        }}
+        onCancel={(event) => {
+          event.preventDefault();
+          onClose();
+        }}
       >
         <div className="feedback-modal-header">
           <div>
