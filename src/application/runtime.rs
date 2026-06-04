@@ -519,22 +519,30 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
             ) {
                 Ok(()) => {}
                 Err(StoreError::CasConflict { .. }) => {
-                    if let Some(meeting) = store.get_meeting(meeting_id)?
-                        && !matches!(
+                    if let Some(meeting) = store.get_meeting(meeting_id)? {
+                        if matches!(
                             meeting.status,
                             MeetingStatus::Recording | MeetingStatus::Stopping
-                        )
-                    {
-                        debug!(
-                            meeting_id,
-                            status = ?meeting.status,
-                            "teardown exhaustion reached meeting that is no longer recording or stopping"
-                        );
-                        return Ok(());
+                        ) {
+                            warn!(
+                                meeting_id,
+                                status = ?meeting.status,
+                                "forcing recording failure after repeated teardown status CAS conflicts"
+                            );
+                            store.set_meeting_status(meeting_id, MeetingStatus::Failed, None)?;
+                        } else {
+                            debug!(
+                                meeting_id,
+                                status = ?meeting.status,
+                                "teardown exhaustion reached meeting that is no longer recording or stopping"
+                            );
+                            return Ok(());
+                        }
+                    } else {
+                        return Err(StoreError::CasConflict {
+                            meeting_id: meeting_id.to_owned(),
+                        });
                     }
-                    return Err(StoreError::CasConflict {
-                        meeting_id: meeting_id.to_owned(),
-                    });
                 }
                 Err(err) => return Err(err),
             }
@@ -2562,14 +2570,17 @@ impl EventHandler for ScaffoldHandler {
                             }
                             return;
                         }
+                        GraceExpiryDecision::Cancel if retry_teardown_without_auto_stop_state => {
+                            // A previous terminal cleanup attempt already removed local
+                            // session/timer state and attempted voice leave; continue DB
+                            // teardown instead of reviving an orphaned recording.
+                            warn!(
+                                guild_id = %guild_for_task,
+                                meeting_id = expected_meeting_id_ref,
+                                "auto-stop teardown retry has no timer state; continuing cleanup despite recovered member count"
+                            );
+                        }
                         GraceExpiryDecision::Cancel => {
-                            if retry_teardown_without_auto_stop_state {
-                                warn!(
-                                    guild_id = %guild_for_task,
-                                    meeting_id = expected_meeting_id_ref,
-                                    "auto-stop teardown retry has no timer state; continuing cleanup despite recovered member count"
-                                );
-                            } else {
                             let Some(non_bot) = non_bot_at_fire else {
                                 unreachable!("Cancel decision requires a known non-bot count")
                             };
@@ -2584,7 +2595,6 @@ impl EventHandler for ScaffoldHandler {
                                 let _ = state.on_non_bot_member_count_changed(non_bot);
                             }
                             return;
-                            }
                         }
                         GraceExpiryDecision::Stop => {
                             grace_cache_misses = 0;
