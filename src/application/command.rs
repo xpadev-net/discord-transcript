@@ -33,6 +33,11 @@ pub struct RecordStartResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStartPreflight {
+    pub voice_channel_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordStopRequest {
     pub guild_id: String,
     pub caller_user_id: String,
@@ -103,8 +108,34 @@ pub fn record_start<S: MeetingStore>(
     store: &mut S,
     request: RecordStartRequest,
 ) -> Result<RecordStartResult, CommandError> {
+    let preflight = validate_record_start_preconditions(store, &request)?;
+
+    store.create_meeting_as_recording(CreateMeetingRequest {
+        id: request.meeting_id.clone(),
+        guild_id: request.guild_id.clone(),
+        voice_channel_id: preflight.voice_channel_id.clone(),
+        report_channel_id: request.command_channel_id.clone(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: request.started_by_user_id,
+        effective_settings: request.effective_settings,
+    })?;
+
+    Ok(RecordStartResult {
+        meeting_id: request.meeting_id,
+        guild_id: request.guild_id,
+        voice_channel_id: preflight.voice_channel_id,
+        report_channel_id: request.command_channel_id,
+    })
+}
+
+pub fn validate_record_start_preconditions<S: MeetingStore>(
+    store: &mut S,
+    request: &RecordStartRequest,
+) -> Result<RecordStartPreflight, CommandError> {
     let voice_channel_id = request
         .user_voice_channel_id
+        .clone()
         .ok_or(CommandError::UserNotInVoice)?;
 
     if !request.permissions.can_connect_voice {
@@ -132,23 +163,7 @@ pub fn record_start<S: MeetingStore>(
         }
     }
 
-    store.create_meeting_as_recording(CreateMeetingRequest {
-        id: request.meeting_id.clone(),
-        guild_id: request.guild_id.clone(),
-        voice_channel_id: voice_channel_id.clone(),
-        report_channel_id: request.command_channel_id.clone(),
-        status_message_channel_id: None,
-        status_message_id: None,
-        started_by_user_id: request.started_by_user_id,
-        effective_settings: request.effective_settings,
-    })?;
-
-    Ok(RecordStartResult {
-        meeting_id: request.meeting_id,
-        guild_id: request.guild_id,
-        voice_channel_id,
-        report_channel_id: request.command_channel_id,
-    })
+    Ok(RecordStartPreflight { voice_channel_id })
 }
 
 pub fn record_stop<S: MeetingStore>(

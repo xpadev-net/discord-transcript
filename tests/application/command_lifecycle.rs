@@ -1,6 +1,7 @@
 use discord_transcript::application::auto_stop::{AutoStopSignal, AutoStopState};
 use discord_transcript::application::command::{
     CommandError, PermissionSet, RecordStartRequest, RecordStopRequest, record_start, record_stop,
+    validate_record_start_preconditions,
 };
 use discord_transcript::application::stop::StopOutcome;
 use discord_transcript::domain::MeetingStatus;
@@ -113,6 +114,69 @@ fn record_start_rejects_plain_member() {
 
     let error = record_start(&mut store, request).expect_err("member must not start");
     assert_eq!(error, CommandError::Unauthorized("start recording"));
+}
+
+#[test]
+fn record_start_preflight_rejects_plain_member_without_creating_meeting() {
+    let mut store = InMemoryMeetingStore::new();
+    let request = RecordStartRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        started_by_user_id: "u1".to_owned(),
+        command_channel_id: "report-chan".to_owned(),
+        user_voice_channel_id: Some("vc-1".to_owned()),
+        permissions: default_permissions(),
+        caller_role: UserRole::Member,
+        effective_settings: None,
+    };
+
+    let error =
+        validate_record_start_preconditions(&mut store, &request).expect_err("must fail");
+    assert_eq!(error, CommandError::Unauthorized("start recording"));
+    assert!(store.get("m1").is_none(), "preflight must not create rows");
+}
+
+#[test]
+fn record_start_preflight_rejects_active_meeting_without_creating_requested_meeting() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "existing".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-1".to_owned(),
+        report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Recording,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+    let request = RecordStartRequest {
+        meeting_id: "new".to_owned(),
+        guild_id: "g1".to_owned(),
+        started_by_user_id: "u2".to_owned(),
+        command_channel_id: "report-chan".to_owned(),
+        user_voice_channel_id: Some("vc-2".to_owned()),
+        permissions: default_permissions(),
+        caller_role: UserRole::GuildAdmin,
+        effective_settings: None,
+    };
+
+    let error =
+        validate_record_start_preconditions(&mut store, &request).expect_err("must fail");
+    assert_eq!(
+        error,
+        CommandError::ActiveMeetingExists {
+            meeting_id: "existing".to_owned()
+        }
+    );
+    assert!(
+        store.get("new").is_none(),
+        "preflight must not create the requested row"
+    );
 }
 
 #[test]
