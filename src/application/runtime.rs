@@ -2601,7 +2601,7 @@ impl EventHandler for ScaffoldHandler {
                         .prepare_recording_stop_after_teardown(&teardown_request)
                         .await
                     {
-                        Ok((result, removed_session)) => {
+                        Ok((result, removed_session, final_tracker)) => {
                             drop(command_guard);
                             handler
                                 .leave_after_recording_stop(
@@ -2610,6 +2610,7 @@ impl EventHandler for ScaffoldHandler {
                                     expected_meeting_id_ref,
                                     "auto-stop",
                                     &removed_session,
+                                    &final_tracker,
                                 )
                                 .await;
                             break result;
@@ -3115,6 +3116,7 @@ impl ScaffoldHandler {
         (
             StopCommandResult,
             Option<RecordingSession<LocalChunkStorage>>,
+            SsrcTracker,
         ),
         RecordingTeardownError,
     > {
@@ -3182,7 +3184,12 @@ impl ScaffoldHandler {
                 request.expected_meeting_id,
             );
         }
-        Ok((stop_result, removed_session))
+        let final_tracker = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let tracker = self.ssrc_tracker.lock().await;
+            tracker.clone()
+        };
+        Ok((stop_result, removed_session, final_tracker))
     }
 
     async fn leave_after_recording_stop(
@@ -3192,19 +3199,14 @@ impl ScaffoldHandler {
         meeting_id: &str,
         phase: &str,
         removed_session: &Option<RecordingSession<LocalChunkStorage>>,
+        final_tracker: &SsrcTracker,
     ) {
         if let Some(manager) = songbird::get(ctx).await {
             leave_voice_with_timeout(manager.as_ref(), guild_id, meeting_id, phase).await;
         }
 
-        // Re-read after voice teardown so late SpeakingStateUpdate events that
-        // arrived during leave are included in the final mapping file.
-        let latest_tracker = {
-            let tracker = self.ssrc_tracker.lock().await;
-            tracker.clone()
-        };
         if let Some(session) = &removed_session {
-            session.persist_ssrc_mapping(&latest_tracker);
+            session.persist_ssrc_mapping(final_tracker);
         }
     }
 
@@ -3302,6 +3304,10 @@ impl ScaffoldHandler {
             {
                 sessions.remove(guild_key);
             }
+        }
+        {
+            let mut titles = self.live_transcription_titles.lock().await;
+            titles.remove(meeting_id);
         }
         let mut service = self.service.lock().await;
         match service.store.set_meeting_status(
@@ -3714,7 +3720,7 @@ impl ScaffoldHandler {
         );
         let caller_user_id = command.user.id.get().to_string();
 
-        let (stop_result, removed_session, authorized_meeting_id) = {
+        let (stop_result, removed_session, authorized_meeting_id, final_tracker) = {
             let _command_guard = self.command_gate.write().await;
             self.reject_if_shutting_down()?;
             let mut service = self.service.lock().await;
@@ -3736,11 +3742,16 @@ impl ScaffoldHandler {
                 reason: StopReason::Manual,
                 phase: "manual stop",
             };
-            let (stop_result, removed_session) = self
+            let (stop_result, removed_session, final_tracker) = self
                 .prepare_recording_stop_after_teardown(&request)
                 .await
                 .map_err(|err| err.to_string())?;
-            (stop_result, removed_session, authorized_meeting_id)
+            (
+                stop_result,
+                removed_session,
+                authorized_meeting_id,
+                final_tracker,
+            )
         };
         self.leave_after_recording_stop(
             ctx,
@@ -3748,6 +3759,7 @@ impl ScaffoldHandler {
             &authorized_meeting_id,
             "manual stop",
             &removed_session,
+            &final_tracker,
         )
         .await;
 
@@ -5435,7 +5447,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 .prepare_recording_stop_after_teardown(&teardown_request)
                                 .await
                             {
-                                Ok((result, removed_session)) => {
+                                Ok((result, removed_session, final_tracker)) => {
                                     drop(command_guard);
                                     runtime
                                         .leave_after_recording_stop(
@@ -5444,6 +5456,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             expected_meeting_id_ref,
                                             "driver disconnect",
                                             &removed_session,
+                                            &final_tracker,
                                         )
                                         .await;
                                     break result;
