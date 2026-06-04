@@ -1944,6 +1944,7 @@ describe("App access controls", () => {
     fireEvent.click(feedbackButton);
     const dialog = screen.getByRole("dialog", { name: "フィードバック" });
     expect(dialog.tagName).toBe("DIALOG");
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
     expect(screen.getByLabelText("種類")).toBe(document.activeElement);
 
     fireEvent.change(screen.getByLabelText("種類"), {
@@ -1970,9 +1971,8 @@ describe("App access controls", () => {
     const submitButton = screen.getByRole("button", { name: "送信" });
     submitButton.focus();
     fireEvent.keyDown(document, { key: "Tab" });
-    expect(screen.getByRole("button", { name: "フィードバックを閉じる" })).toBe(
-      document.activeElement,
-    );
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(submitButton);
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() =>

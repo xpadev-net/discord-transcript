@@ -54,8 +54,8 @@ const termTypeOptions: Array<{
 const INITIAL_FEEDBACK_FOCUS_SELECTOR =
   "select:not(:disabled), textarea:not(:disabled), input:not(:disabled)";
 
-const FEEDBACK_ACTION_SELECTOR = ".feedback-actions button:not(:disabled)";
-const FEEDBACK_CLOSE_SELECTOR = ".feedback-close-button:not(:disabled)";
+const FOCUSABLE_SELECTOR =
+  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
 
 interface FeedbackDraft {
   feedbackType: TranscriptFeedbackType;
@@ -111,17 +111,7 @@ function buildFeedbackRequest(
 }
 
 function feedbackFocusableElements(dialog: HTMLElement): HTMLElement[] {
-  return [
-    ...Array.from(
-      dialog.querySelectorAll<HTMLElement>(INITIAL_FEEDBACK_FOCUS_SELECTOR),
-    ),
-    ...Array.from(
-      dialog.querySelectorAll<HTMLElement>(FEEDBACK_ACTION_SELECTOR),
-    ),
-    ...Array.from(
-      dialog.querySelectorAll<HTMLElement>(FEEDBACK_CLOSE_SELECTOR),
-    ),
-  ];
+  return Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
 }
 
 function validateFeedbackDraft(
@@ -229,6 +219,7 @@ function FeedbackDialog({
         ref={dialogRef}
         open
         className="feedback-modal"
+        aria-modal="true"
         aria-labelledby="feedback-dialog-title"
       >
         <div className="feedback-modal-header">
