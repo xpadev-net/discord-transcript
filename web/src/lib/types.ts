@@ -34,6 +34,7 @@ export interface MeetingListItem {
 }
 
 export interface MeetingListResponse {
+  guild_id: string;
   meetings: MeetingListItem[];
   page: number;
   limit: number;

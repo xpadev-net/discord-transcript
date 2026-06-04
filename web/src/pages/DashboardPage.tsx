@@ -36,25 +36,67 @@ function dashboardErrorMessage(error: unknown): string {
     : "\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
 }
 
-export function DashboardPage() {
+interface DashboardPageProps {
+  selectedGuildId?: string | null;
+  selectedGuildName?: string;
+  useCurrentGuildMeetings?: boolean;
+  loadingGuildSelection?: boolean;
+  noSelectableGuilds?: boolean;
+}
+
+export function DashboardPage({
+  selectedGuildId,
+  selectedGuildName,
+  useCurrentGuildMeetings = false,
+  loadingGuildSelection = false,
+  noSelectableGuilds = false,
+}: DashboardPageProps) {
   const [request, setRequest] = useState({ page: 1, reloadKey: 0 });
   const [data, setData] = useState<MeetingListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const page = request.page;
+  const responseGuildId = useCurrentGuildMeetings
+    ? selectedGuildId
+    : data?.guild_id;
+  const activeData =
+    data && selectedGuildId && responseGuildId === selectedGuildId
+      ? data
+      : null;
 
   useEffect(() => {
     document.title = "\u4f1a\u8b70\u4e00\u89a7";
   }, []);
 
   useEffect(() => {
+    if (loadingGuildSelection) {
+      setLoading(true);
+      setError(null);
+      return;
+    }
+    if (!selectedGuildId) {
+      setData(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
     const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setData(null);
 
-    fetchGuildMeetings(request.page, PAGE_SIZE, controller.signal)
+    fetchGuildMeetings(
+      useCurrentGuildMeetings ? null : selectedGuildId,
+      request.page,
+      PAGE_SIZE,
+      controller.signal,
+    )
       .then((response) => {
-        if (!controller.signal.aborted) {
+        if (
+          !controller.signal.aborted &&
+          (useCurrentGuildMeetings || response.guild_id === selectedGuildId)
+        ) {
           setData(response);
         }
       })
@@ -70,27 +112,40 @@ export function DashboardPage() {
       });
 
     return () => controller.abort();
-  }, [request]);
+  }, [
+    request,
+    selectedGuildId,
+    useCurrentGuildMeetings,
+    loadingGuildSelection,
+  ]);
 
   const totalPages = useMemo(() => {
-    if (!data) {
+    if (!activeData) {
       return 1;
     }
-    return Math.max(1, Math.ceil(data.total / PAGE_SIZE));
-  }, [data]);
+    return Math.max(1, Math.ceil(activeData.total / PAGE_SIZE));
+  }, [activeData]);
 
   const showingFrom =
-    data && data.total > 0 ? (request.page - 1) * PAGE_SIZE + 1 : 0;
+    activeData && activeData.total > 0 ? (request.page - 1) * PAGE_SIZE + 1 : 0;
   const showingTo =
-    data && data.total > 0 ? Math.min(request.page * PAGE_SIZE, data.total) : 0;
+    activeData && activeData.total > 0
+      ? Math.min(request.page * PAGE_SIZE, activeData.total)
+      : 0;
   const meetingCountText =
-    data && data.total > 0
-      ? `${showingFrom}-${showingTo} / ${data.total}`
+    activeData && activeData.total > 0
+      ? `${showingFrom}-${showingTo} / ${activeData.total}`
       : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
   const hasLiveMeetings =
-    data?.meetings.some((meeting) =>
+    activeData?.meetings.some((meeting) =>
       LIVE_MEETING_STATUSES.has(meeting.status),
     ) ?? false;
+  const emptyGuildMessage = noSelectableGuilds
+    ? "\u8868\u793a\u3067\u304d\u308b\u30ae\u30eb\u30c9\u304c\u3042\u308a\u307e\u305b\u3093"
+    : "\u30ae\u30eb\u30c9\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044";
+  const headerDescription = selectedGuildName
+    ? `${selectedGuildName} / ${meetingCountText}`
+    : meetingCountText;
 
   useEffect(() => {
     if (!hasLiveMeetings) {
@@ -111,9 +166,13 @@ export function DashboardPage() {
         <div>
           <h1>{"\u4f1a\u8b70\u4e00\u89a7"}</h1>
           <p>
-            {data
-              ? meetingCountText
-              : "\u6700\u65b0\u306e\u4f1a\u8b70\u3092\u8aad\u307f\u8fbc\u3093\u3067\u3044\u307e\u3059"}
+            {activeData
+              ? headerDescription
+              : loading
+                ? "\u6700\u65b0\u306e\u4f1a\u8b70\u3092\u8aad\u307f\u8fbc\u3093\u3067\u3044\u307e\u3059"
+                : selectedGuildId
+                  ? meetingCountText
+                  : emptyGuildMessage}
           </p>
         </div>
         <button
@@ -148,6 +207,10 @@ export function DashboardPage() {
             {"\u518d\u8a66\u884c"}
           </button>
         </div>
+      ) : !loading && !selectedGuildId ? (
+        <div className="empty-state dashboard-panel-message">
+          {emptyGuildMessage}
+        </div>
       ) : (
         <section className="dashboard-table-shell" aria-busy={loading}>
           <table className="meeting-table">
@@ -161,7 +224,7 @@ export function DashboardPage() {
               </tr>
             </thead>
             <tbody>
-              {data?.meetings.map((meeting) => {
+              {activeData?.meetings.map((meeting) => {
                 const path = meetingPath(meeting.id);
                 return (
                   <tr key={meeting.id} className="meeting-table-row">
@@ -212,7 +275,7 @@ export function DashboardPage() {
             </div>
           ) : null}
 
-          {!loading && data?.meetings.length === 0 ? (
+          {!loading && activeData?.meetings.length === 0 ? (
             <div className="empty-state dashboard-panel-message">
               {"\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093"}
             </div>
@@ -220,7 +283,7 @@ export function DashboardPage() {
         </section>
       )}
 
-      {!error && data ? (
+      {!error && activeData ? (
         <div className="pagination">
           <button
             type="button"

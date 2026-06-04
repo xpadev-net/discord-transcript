@@ -43,6 +43,12 @@ function guildBotTokenPath(guildId?: string): string {
   return `${guildSettingsPath(guildId)}/bot-token`;
 }
 
+function guildMeetingsPath(guildId?: string | null): string {
+  return guildId
+    ? `/api/guilds/${encodeURIComponent(guildId)}/meetings`
+    : "/api/guild/meetings";
+}
+
 export function buildLoginRedirectUrl(path: string): string {
   return `/auth/login?redirect=${encodeURIComponent(path)}`;
 }
@@ -115,6 +121,7 @@ export function fetchMeGuilds(signal?: AbortSignal): Promise<UserGuild[]> {
 }
 
 export function fetchGuildMeetings(
+  guildId?: string | null,
   page = 1,
   limit = 20,
   signal?: AbortSignal,
@@ -124,9 +131,9 @@ export function fetchGuildMeetings(
     limit: String(limit),
   });
 
-  return fetch(`/api/guild/meetings?${params.toString()}`, { signal }).then(
-    handleGuildMeetingsResponse,
-  );
+  return fetch(`${guildMeetingsPath(guildId)}?${params.toString()}`, {
+    signal,
+  }).then(handleGuildMeetingsResponse);
 }
 
 export function fetchGuildSettings(
