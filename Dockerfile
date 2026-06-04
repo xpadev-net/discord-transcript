@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake libopus-d
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 
 COPY src/ src/
