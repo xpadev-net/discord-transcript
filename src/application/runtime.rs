@@ -3111,6 +3111,14 @@ impl ScaffoldHandler {
                 let mut titles = self.live_transcription_titles.lock().await;
                 titles.remove(&session.meeting_id);
             }
+            {
+                let mut startups = self.recording_startups.lock().await;
+                clear_matching_recording_startup(
+                    &mut startups,
+                    request.guild_key,
+                    request.expected_meeting_id,
+                );
+            }
             (stop_result, removed_session)
         };
 
@@ -3173,6 +3181,10 @@ impl ScaffoldHandler {
             if let Some(session) = &removed_session {
                 let mut titles = self.live_transcription_titles.lock().await;
                 titles.remove(&session.meeting_id);
+            }
+            {
+                let mut startups = self.recording_startups.lock().await;
+                clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
             }
             removed_session
         };
