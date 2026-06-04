@@ -3260,18 +3260,20 @@ impl ScaffoldHandler {
                 let tracker = self.ssrc_tracker.lock().await;
                 tracker.clone()
             };
-            let mut sessions = self.sessions.lock().await;
-            if let Some(session) = sessions
-                .get_mut(request.guild_key)
-                .filter(|session| session.meeting_id == request.expected_meeting_id)
             {
-                let flush_result =
-                    flush_session_for_teardown(session, request.guild_key, request.phase);
-                // The write voice_event_gate held for this block keeps
-                // SpeakingStateUpdate from changing the tracker while a
-                // retryable flush error is propagated.
-                session.persist_ssrc_mapping(&tracker);
-                flush_result.map_err(RecordingTeardownError::FinalFlush)?;
+                let mut sessions = self.sessions.lock().await;
+                if let Some(session) = sessions
+                    .get_mut(request.guild_key)
+                    .filter(|session| session.meeting_id == request.expected_meeting_id)
+                {
+                    let flush_result =
+                        flush_session_for_teardown(session, request.guild_key, request.phase);
+                    // The write voice_event_gate held for this block keeps
+                    // SpeakingStateUpdate from changing the tracker while a
+                    // retryable flush error is propagated.
+                    session.persist_ssrc_mapping(&tracker);
+                    flush_result.map_err(RecordingTeardownError::FinalFlush)?;
+                }
             }
 
             let stop_result = {
