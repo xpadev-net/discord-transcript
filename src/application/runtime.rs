@@ -3373,7 +3373,7 @@ impl ScaffoldHandler {
         // the terminal DB mark. If the mark fails, retry flags in the caller
         // continue teardown without depending on already-removed timer/session
         // state, so recordings do not remain active forever.
-        let (removed_session, mark_result) = {
+        let removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let removed_session = {
                 let mut sessions = self.sessions.lock().await;
@@ -3397,16 +3397,17 @@ impl ScaffoldHandler {
                 let mut startups = self.recording_startups.lock().await;
                 clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
             }
-            let mark_result = {
-                let mut service = self.service.lock().await;
-                mark_recording_failed_after_teardown_exhaustion(
-                    &mut service.store,
-                    expected_meeting_id,
-                    error_message,
-                )
-                .map_err(|err| err.to_string())
-            };
-            (removed_session, mark_result)
+            removed_session
+        };
+
+        let mark_result = {
+            let mut service = self.service.lock().await;
+            mark_recording_failed_after_teardown_exhaustion(
+                &mut service.store,
+                expected_meeting_id,
+                error_message,
+            )
+            .map_err(|err| err.to_string())
         };
 
         if let Some(manager) = songbird::get(ctx).await {
@@ -3664,7 +3665,7 @@ impl ScaffoldHandler {
         let manager = songbird::get(ctx)
             .await
             .ok_or_else(|| "songbird not initialized".to_owned())?;
-        let (response, meeting_title) = {
+        let response = {
             let mut service = self.service.lock().await;
             let preflight = validate_record_start_preconditions(
                 &mut service.store,
@@ -3687,7 +3688,7 @@ impl ScaffoldHandler {
                 .map_err(|err| err.to_string())?;
             let effective_settings =
                 EffectiveMeetingSettings::resolve(&defaults, guild_settings.as_ref());
-            let response = complete_record_start_after_runtime_setup(
+            complete_record_start_after_runtime_setup(
                 &mut service,
                 StartCommandInput {
                     meeting_id: meeting_id.clone(),
@@ -3700,8 +3701,15 @@ impl ScaffoldHandler {
                     effective_settings: Some(effective_settings),
                 },
                 preflight,
-            )?;
-            let meeting_title = match service.store.get_meeting(&meeting_id) {
+            )?
+        };
+        {
+            let mut startups = self.recording_startups.lock().await;
+            startups.insert(guild_key.clone(), meeting_id.clone());
+        }
+        let meeting_title = {
+            let mut service = self.service.lock().await;
+            match service.store.get_meeting(&meeting_id) {
                 Ok(Some(meeting)) => meeting.title,
                 Ok(None) => None,
                 Err(err) => {
@@ -3712,13 +3720,8 @@ impl ScaffoldHandler {
                     );
                     None
                 }
-            };
-            (response, meeting_title)
+            }
         };
-        {
-            let mut startups = self.recording_startups.lock().await;
-            startups.insert(guild_key.clone(), meeting_id.clone());
-        }
         let layout =
             crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
         let workspace =
