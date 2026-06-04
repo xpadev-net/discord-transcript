@@ -3747,6 +3747,13 @@ impl ScaffoldHandler {
             .verify_recording_start_after_join(manager.as_ref(), guild_id, &guild_key, &meeting_id)
             .await?;
         if join_verification == RecordingStartJoinVerification::AlreadyStopped {
+            leave_voice_with_timeout(
+                manager.as_ref(),
+                guild_id,
+                &meeting_id,
+                "already-stopped record-start",
+            )
+            .await;
             return Ok(format!(
                 "{response}\n(参加完了前に停止処理が始まりました。停止処理の完了を待っています。)"
             ));
