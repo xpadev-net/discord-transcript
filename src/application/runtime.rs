@@ -436,6 +436,30 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
     Ok(())
 }
 
+fn recording_startup_conflict(
+    startups: &HashMap<String, String>,
+    guild_key: &str,
+) -> Option<CommandError> {
+    startups
+        .get(guild_key)
+        .map(|meeting_id| CommandError::ActiveMeetingExists {
+            meeting_id: meeting_id.clone(),
+        })
+}
+
+fn clear_matching_recording_startup(
+    startups: &mut HashMap<String, String>,
+    guild_key: &str,
+    meeting_id: &str,
+) {
+    if startups
+        .get(guild_key)
+        .is_some_and(|current| current == meeting_id)
+    {
+        startups.remove(guild_key);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordingTeardownError {
     FinalFlush(String),
@@ -1549,6 +1573,7 @@ pub async fn run_bot(
         ))),
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        recording_startups: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_bases: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_titles: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_gate: Arc::new(Semaphore::new(1)),
@@ -1680,6 +1705,7 @@ struct ScaffoldHandler {
     queue: Arc<Mutex<SqlJobQueue<PgSqlExecutor>>>,
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
+    recording_startups: Arc<Mutex<HashMap<String, String>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
     live_transcription_titles: Arc<Mutex<HashMap<String, Option<String>>>>,
     live_transcription_gate: Arc<Semaphore>,
@@ -2344,7 +2370,9 @@ impl EventHandler for ScaffoldHandler {
                             return;
                         }
                         GraceExpiryDecision::Cancel => {
-                            let non_bot = non_bot_at_fire.unwrap_or(1);
+                            let Some(non_bot) = non_bot_at_fire else {
+                                unreachable!("Cancel decision requires a known non-bot count")
+                            };
                             debug!(
                                 guild_id = %handler.guild_id,
                                 target_voice_channel_id = target_channel_for_task,
@@ -2961,6 +2989,111 @@ impl ScaffoldHandler {
         Ok(())
     }
 
+    async fn cleanup_failed_recording_start(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+    ) {
+        let _command_guard = self.command_gate.write().await;
+        {
+            let mut startups = self.recording_startups.lock().await;
+            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+        }
+        {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(guild_key)
+                .is_some_and(|session| session.meeting_id == meeting_id)
+            {
+                sessions.remove(guild_key);
+            }
+        }
+        let mut service = self.service.lock().await;
+        match service.store.set_meeting_status(
+            meeting_id,
+            MeetingStatus::Failed,
+            Some(MeetingStatus::Recording),
+        ) {
+            Ok(()) => {
+                if let Err(err) = service
+                    .store
+                    .set_error_message(meeting_id, Some(error_message.to_owned()))
+                {
+                    warn!(
+                        meeting_id,
+                        error = %err,
+                        "failed to persist record-start setup error"
+                    );
+                }
+            }
+            Err(StoreError::CasConflict { .. } | StoreError::NotFound { .. }) => {
+                debug!(
+                    meeting_id,
+                    "record-start setup failed after meeting was already changed"
+                );
+            }
+            Err(err) => {
+                error!(
+                    meeting_id,
+                    error = %err,
+                    "failed to mark meeting as failed after voice join error"
+                );
+            }
+        }
+    }
+
+    async fn verify_recording_start_after_join(
+        &self,
+        manager: &songbird::Songbird,
+        guild_id: GuildId,
+        guild_key: &str,
+        meeting_id: &str,
+    ) -> Result<(), String> {
+        let _command_guard = self.command_gate.write().await;
+        let shutdown_error = self.reject_if_shutting_down().err();
+        let (active_matches, lookup_error) = {
+            let mut service = self.service.lock().await;
+            match service.store.find_active_meeting_by_guild(guild_key) {
+                Ok(active) => (
+                    active.is_some_and(|meeting| {
+                        meeting.id == meeting_id && meeting.status == MeetingStatus::Recording
+                    }),
+                    None,
+                ),
+                Err(err) => (false, Some(err.to_string())),
+            }
+        };
+        let session_matches = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(guild_key)
+                .is_some_and(|session| session.meeting_id == meeting_id)
+        };
+
+        if shutdown_error.is_none() && active_matches && session_matches {
+            let mut startups = self.recording_startups.lock().await;
+            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+            return Ok(());
+        }
+
+        if let Err(err) = manager.leave(guild_id).await {
+            warn!(
+                guild_id = %guild_id.get(),
+                meeting_id,
+                error = %err,
+                "failed to leave stale voice join after record-start setup race"
+            );
+        }
+        {
+            let mut startups = self.recording_startups.lock().await;
+            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+        }
+        Err(shutdown_error
+            .or(lookup_error)
+            .unwrap_or_else(|| "recording changed before voice join completed".to_owned()))
+    }
+
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> String {
         run_guild_scoped_command(command.guild_id, self.guild_id, |_| async {
             self.reject_if_shutting_down()?;
@@ -3008,6 +3141,7 @@ impl ScaffoldHandler {
     ) -> Result<String, String> {
         self.reject_if_shutting_down()?;
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
+        let guild_key = guild_id.get().to_string();
         let voice_channel_id_u64 = resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
 
         let meeting_id = format!("{}-{}", guild_id.get(), command.id.get());
@@ -3027,15 +3161,21 @@ impl ScaffoldHandler {
         let voice_channel_id_u64 =
             voice_channel_id_u64.ok_or_else(|| CommandError::UserNotInVoice.to_string())?;
 
-        let _command_guard = self.command_gate.write().await;
+        let command_guard = self.command_gate.write().await;
         self.reject_if_shutting_down()?;
+        {
+            let startups = self.recording_startups.lock().await;
+            if let Some(err) = recording_startup_conflict(&startups, &guild_key) {
+                return Err(err.to_string());
+            }
+        }
         {
             let mut service = self.service.lock().await;
             validate_record_start_preconditions(
                 &mut service.store,
                 &RecordStartRequest {
                     meeting_id: meeting_id.clone(),
-                    guild_id: guild_id.get().to_string(),
+                    guild_id: guild_key.clone(),
                     started_by_user_id: command.user.id.get().to_string(),
                     command_channel_id: command.channel_id.get().to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
@@ -3047,18 +3187,15 @@ impl ScaffoldHandler {
             .map_err(|err| err.to_string())?;
         }
         let effective_settings = self
-            .resolve_effective_settings_for_guild(&guild_id.get().to_string())
+            .resolve_effective_settings_for_guild(&guild_key)
             .await?;
         let manager = songbird::get(ctx)
             .await
             .ok_or_else(|| "songbird not initialized".to_owned())?;
         let layout =
             crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
-        let workspace = layout.for_meeting(
-            &guild_id.get().to_string(),
-            &voice_channel_id_u64.to_string(),
-            &meeting_id,
-        );
+        let workspace =
+            layout.for_meeting(&guild_key, &voice_channel_id_u64.to_string(), &meeting_id);
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
@@ -3068,7 +3205,7 @@ impl ScaffoldHandler {
             &mut service,
             StartCommandInput {
                 meeting_id: meeting_id.clone(),
-                guild_id: guild_id.get().to_string(),
+                guild_id: guild_key.clone(),
                 user_id: command.user.id.get().to_string(),
                 command_channel_id: command.channel_id.get().to_string(),
                 user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
@@ -3090,7 +3227,7 @@ impl ScaffoldHandler {
             }
         };
         drop(service);
-        self.spawn_record_start_entitlement_observation(guild_id.get().to_string());
+        self.spawn_record_start_entitlement_observation(guild_key.clone());
 
         // Reset SSRC tracker so stale mappings from previous recordings
         // cannot mis-attribute audio when Discord reuses an SSRC value.
@@ -3106,7 +3243,7 @@ impl ScaffoldHandler {
         {
             let mut sessions = self.sessions.lock().await;
             sessions.insert(
-                guild_id.get().to_string(),
+                guild_key.clone(),
                 RecordingSession::new(
                     meeting_id.clone(),
                     LocalChunkStorage::new(workspace.clone(), meeting_id.clone()),
@@ -3124,6 +3261,11 @@ impl ScaffoldHandler {
         // mappings (SpeakingStateUpdate for users already speaking).
         self.register_voice_handlers(manager.as_ref(), ctx, guild_id)
             .await;
+        {
+            let mut startups = self.recording_startups.lock().await;
+            startups.insert(guild_key.clone(), meeting_id.clone());
+        }
+        drop(command_guard);
 
         let _call = {
             let channel_id = ChannelId::new(voice_channel_id_u64);
@@ -3180,38 +3322,15 @@ impl ScaffoldHandler {
                         error_debug = ?err,
                         "failed to join voice channel after 3 attempts"
                     );
-                    let mut sessions = self.sessions.lock().await;
-                    sessions.remove(&guild_id.get().to_string());
-                    drop(sessions);
                     // manager.leave() already called in the retry loop above
-                    let mut service = self.service.lock().await;
-                    if let Err(e) =
-                        service
-                            .store
-                            .set_meeting_status(&meeting_id, MeetingStatus::Failed, None)
-                    {
-                        error!(
-                            guild_id = %guild_id.get(),
-                            meeting_id = %meeting_id,
-                            error = %e,
-                            "failed to mark meeting as failed in database"
-                        );
-                    }
-                    if let Err(e) = service
-                        .store
-                        .set_error_message(&meeting_id, Some(err_msg.clone()))
-                    {
-                        error!(
-                            guild_id = %guild_id.get(),
-                            meeting_id = %meeting_id,
-                            error = %e,
-                            "failed to persist error message in database"
-                        );
-                    }
+                    self.cleanup_failed_recording_start(&guild_key, &meeting_id, &err_msg)
+                        .await;
                     return Err(err_msg);
                 }
             }
         };
+        self.verify_recording_start_after_join(manager.as_ref(), guild_id, &guild_key, &meeting_id)
+            .await?;
 
         info!(
             guild_id = %guild_id.get(),
@@ -5296,7 +5415,7 @@ mod status_message_tests {
     use serenity::async_trait;
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
 
     #[derive(Debug, Clone)]
@@ -6448,27 +6567,28 @@ mod status_message_tests {
         assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
     }
 
-    #[tokio::test]
-    async fn lifecycle_write_gate_excludes_concurrent_holders() {
-        let gate = Arc::new(RwLock::new(()));
-        let first_guard = gate.write().await;
-        let acquired = Arc::new(AtomicBool::new(false));
-        let task_acquired = Arc::clone(&acquired);
-        let task_gate = Arc::clone(&gate);
+    #[test]
+    fn recording_startup_reservation_blocks_concurrent_start() {
+        let startups = HashMap::from([("g1".to_owned(), "m1".to_owned())]);
 
-        let waiter = tokio::spawn(async move {
-            let _second_guard = task_gate.write().await;
-            task_acquired.store(true, Ordering::SeqCst);
-        });
-        tokio::task::yield_now().await;
-
-        assert!(
-            !acquired.load(Ordering::SeqCst),
-            "second lifecycle holder must wait while the first holds the write gate"
+        assert_eq!(
+            recording_startup_conflict(&startups, "g1"),
+            Some(CommandError::ActiveMeetingExists {
+                meeting_id: "m1".to_owned()
+            })
         );
-        drop(first_guard);
-        waiter.await.expect("waiter should complete");
-        assert!(acquired.load(Ordering::SeqCst));
+        assert_eq!(recording_startup_conflict(&startups, "g2"), None);
+    }
+
+    #[test]
+    fn recording_startup_clear_preserves_newer_reservation() {
+        let mut startups = HashMap::from([("g1".to_owned(), "newer".to_owned())]);
+
+        clear_matching_recording_startup(&mut startups, "g1", "older");
+        assert_eq!(startups.get("g1").map(String::as_str), Some("newer"));
+
+        clear_matching_recording_startup(&mut startups, "g1", "newer");
+        assert!(!startups.contains_key("g1"));
     }
 
     fn start_input_for_runtime_setup_test() -> StartCommandInput {
