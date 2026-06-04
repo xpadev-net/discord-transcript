@@ -76,7 +76,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, Semaphore, watch};
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard, Semaphore, watch};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -511,6 +511,13 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
         Some(MeetingStatus::Recording),
     ) {
         Ok(()) => {}
+        Err(StoreError::NotFound { .. }) => {
+            debug!(
+                meeting_id,
+                "meeting not found during teardown exhaustion; treating as already handled"
+            );
+            return Ok(());
+        }
         Err(StoreError::CasConflict { .. }) => {
             match store.set_meeting_status(
                 meeting_id,
@@ -518,6 +525,13 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
                 Some(MeetingStatus::Stopping),
             ) {
                 Ok(()) => {}
+                Err(StoreError::NotFound { .. }) => {
+                    debug!(
+                        meeting_id,
+                        "meeting not found during teardown exhaustion; treating as already handled"
+                    );
+                    return Ok(());
+                }
                 Err(StoreError::CasConflict { .. }) => {
                     if let Some(meeting) = store.get_meeting(meeting_id)? {
                         if matches!(
@@ -539,9 +553,11 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
                             return Ok(());
                         }
                     } else {
-                        return Err(StoreError::CasConflict {
-                            meeting_id: meeting_id.to_owned(),
-                        });
+                        debug!(
+                            meeting_id,
+                            "meeting not found during teardown exhaustion; treating as already handled"
+                        );
+                        return Ok(());
                     }
                 }
                 Err(err) => return Err(err),
@@ -557,6 +573,33 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
         );
     }
     Ok(())
+}
+
+fn mark_recording_start_failed_after_setup_error<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    error_message: &str,
+) -> Result<(), StoreError> {
+    match store.set_meeting_status(
+        meeting_id,
+        MeetingStatus::Failed,
+        Some(MeetingStatus::Recording),
+    ) {
+        Ok(()) => {
+            if let Err(err) = store.set_error_message(meeting_id, Some(error_message.to_owned())) {
+                warn!(
+                    meeting_id,
+                    error = %err,
+                    "failed to persist record-start setup error"
+                );
+            }
+            Ok(())
+        }
+        Err(StoreError::CasConflict { .. } | StoreError::NotFound { .. }) => {
+            mark_recording_failed_after_teardown_exhaustion(store, meeting_id, error_message)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn recording_startup_conflict(
@@ -2631,7 +2674,7 @@ impl EventHandler for ScaffoldHandler {
                         phase: "auto-stop",
                     };
                     match handler
-                        .prepare_recording_stop_after_teardown(&teardown_request)
+                        .prepare_recording_stop_after_teardown(&command_guard, &teardown_request)
                         .await
                     {
                         Ok((result, removed_session)) => {
@@ -3154,6 +3197,7 @@ impl ScaffoldHandler {
 
     async fn prepare_recording_stop_after_teardown(
         &self,
+        _command_guard: &RwLockWriteGuard<'_, ()>,
         request: &RecordingStopTeardownRequest<'_>,
     ) -> Result<
         (
@@ -3354,28 +3398,13 @@ impl ScaffoldHandler {
             titles.remove(meeting_id);
         }
         let mut service = self.service.lock().await;
-        match service.store.set_meeting_status(
+        match mark_recording_start_failed_after_setup_error(
+            &mut service.store,
             meeting_id,
-            MeetingStatus::Failed,
-            Some(MeetingStatus::Recording),
+            error_message,
         ) {
             Ok(()) => {
-                if let Err(err) = service
-                    .store
-                    .set_error_message(meeting_id, Some(error_message.to_owned()))
-                {
-                    warn!(
-                        meeting_id,
-                        error = %err,
-                        "failed to persist record-start setup error"
-                    );
-                }
-            }
-            Err(StoreError::CasConflict { .. } | StoreError::NotFound { .. }) => {
-                debug!(
-                    meeting_id,
-                    "record-start setup failed after meeting was already changed"
-                );
+                debug!(meeting_id, "record-start setup failure cleanup completed");
             }
             Err(err) => {
                 error!(
@@ -3772,7 +3801,7 @@ impl ScaffoldHandler {
         let caller_user_id = command.user.id.get().to_string();
 
         let (stop_result, removed_session, authorized_meeting_id, reset_guard) = {
-            let _command_guard = self.command_gate.write().await;
+            let command_guard = self.command_gate.write().await;
             self.reject_if_shutting_down()?;
             let mut service = self.service.lock().await;
             let meeting = service
@@ -3794,7 +3823,7 @@ impl ScaffoldHandler {
                 phase: "manual stop",
             };
             let (stop_result, removed_session) = self
-                .prepare_recording_stop_after_teardown(&request)
+                .prepare_recording_stop_after_teardown(&command_guard, &request)
                 .await
                 .map_err(|err| err.to_string())?;
             let reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
@@ -5499,7 +5528,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 phase: "driver disconnect",
                             };
                             match runtime
-                                .prepare_recording_stop_after_teardown(&teardown_request)
+                                .prepare_recording_stop_after_teardown(
+                                    &command_guard,
+                                    &teardown_request,
+                                )
                                 .await
                             {
                                 Ok((result, removed_session)) => {
@@ -7181,6 +7213,42 @@ mod status_message_tests {
         let meeting = store.get("m1").expect("meeting should remain");
         assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
         assert_eq!(meeting.error_message, None);
+    }
+
+    #[test]
+    fn teardown_exhaustion_ignores_missing_meeting() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+
+        mark_recording_failed_after_teardown_exhaustion(
+            &mut store,
+            "missing",
+            "final audio flush failed after retries",
+        )
+        .expect("missing rows should be treated as already handled");
+
+        assert!(store.get("missing").is_none());
+    }
+
+    #[test]
+    fn record_start_setup_cleanup_marks_concurrent_stop_failed() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = recording_meeting();
+        meeting.status = crate::domain::MeetingStatus::Stopping;
+        store.insert(meeting);
+
+        mark_recording_start_failed_after_setup_error(
+            &mut store,
+            "m1",
+            "voice join failed after stop started",
+        )
+        .expect("stopping setup failures should become terminal");
+
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("voice join failed after stop started")
+        );
     }
 
     #[test]
