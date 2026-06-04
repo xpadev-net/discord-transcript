@@ -6,6 +6,7 @@ interface Props {
   segment: Segment;
   isActive: boolean;
   onSeek: (startMs: number) => void;
+  onFeedback?: (segment: Segment, returnFocusTo: HTMLElement) => void;
 }
 
 function normalizeSpeaker(seg: Segment) {
@@ -33,7 +34,12 @@ function SpeakerMeta({
   return <span className="speaker-meta">{parts.join(" / ")}</span>;
 }
 
-export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
+export function TranscriptSegmentRow({
+  segment,
+  isActive,
+  onSeek,
+  onFeedback,
+}: Props) {
   const speaker = normalizeSpeaker(segment);
   const color = getSpeakerColor(speaker.id || segment.speaker_id);
   const isVcText = segment.source === "vc_text";
@@ -49,18 +55,33 @@ export function TranscriptSegmentRow({ segment, isActive, onSeek }: Props) {
     .join(" ");
 
   return (
-    <button type="button" className={className} onClick={handleClick}>
-      <span className="segment-meta">
-        <span className="speaker-badge" style={{ background: color }}>
-          {speaker.displayLabel}
+    <div className="segment-row">
+      <button type="button" className={className} onClick={handleClick}>
+        <span className="segment-meta">
+          <span className="speaker-badge" style={{ background: color }}>
+            {speaker.displayLabel}
+          </span>
+          <SpeakerMeta speaker={speaker} />
+          <span className="segment-time">
+            {formatTimestamp(segment.start_ms)}
+          </span>
+          {isVcText && <span className="segment-source">Chat</span>}
         </span>
-        <SpeakerMeta speaker={speaker} />
-        <span className="segment-time">
-          {formatTimestamp(segment.start_ms)}
-        </span>
-        {isVcText && <span className="segment-source">Chat</span>}
-      </span>
-      <span className="segment-text">{segment.text}</span>
-    </button>
+        <span className="segment-text">{segment.text}</span>
+      </button>
+      {onFeedback && segment.id ? (
+        <button
+          type="button"
+          className="segment-feedback-button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onFeedback(segment, event.currentTarget);
+          }}
+          aria-label={`${formatTimestamp(segment.start_ms)} のフィードバック`}
+        >
+          フィードバック
+        </button>
+      ) : null}
+    </div>
   );
 }

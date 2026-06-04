@@ -157,6 +157,47 @@ export interface TranscriptStateResponse {
   updated_at: string | null;
 }
 
+export type TranscriptFeedbackType = "mistranscription" | "speaker" | "term";
+
+export type TranscriptFeedbackTermType =
+  | "general_term"
+  | "person_name"
+  | "project_name"
+  | "product_name"
+  | "organization"
+  | "acronym"
+  | "wording_rule"
+  | "prohibited_item";
+
+export interface TranscriptFeedbackRequest {
+  transcript_segment_id?: string;
+  feedback_type: TranscriptFeedbackType;
+  term_type?: TranscriptFeedbackTermType;
+  original_text?: string;
+  corrected_text?: string;
+  speaker_id?: string;
+  corrected_speaker_id?: string;
+  note?: string;
+}
+
+export interface TranscriptFeedbackResponse {
+  id: string;
+  meeting_id: string | null;
+  transcript_segment_id: string | null;
+  feedback_type: string;
+  term_type: string | null;
+  original_text: string | null;
+  corrected_text: string | null;
+  speaker_id: string | null;
+  corrected_speaker_id: string | null;
+  note: string | null;
+  actor_user_id: string;
+  status: string;
+  created_at: string;
+  reviewed_at: string | null;
+  reviewed_actor_user_id: string | null;
+}
+
 export type TranscriptStreamState =
   | "idle"
   | "connecting"
