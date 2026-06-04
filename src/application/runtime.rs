@@ -412,6 +412,28 @@ fn flush_session_for_teardown<S: ChunkStorage>(
     }
 }
 
+fn flush_removed_session_after_stop<S: ChunkStorage>(
+    session: &mut RecordingSession<S>,
+    guild_id: &str,
+    phase: &str,
+) {
+    match session.flush_all() {
+        Ok(result) if result.failed.is_empty() => {}
+        Ok(result) => warn!(
+            guild_id = %guild_id,
+            failed = result.failed.len(),
+            phase,
+            "tail audio chunks failed to persist after recording stop; dropping removed session"
+        ),
+        Err(err) => warn!(
+            guild_id = %guild_id,
+            error = %err,
+            phase,
+            "failed to flush tail audio after recording stop; dropping removed session"
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraceExpiryDecision {
     Stop,
@@ -2697,10 +2719,10 @@ impl EventHandler for ScaffoldHandler {
                             handler
                                 .leave_after_recording_stop(
                                     &ctx_for_task,
-                                    handler.guild_id,
+                                    &guild_for_task,
                                     expected_meeting_id_ref,
                                     "auto-stop",
-                                    &removed_session,
+                                    removed_session,
                                     reset_guard,
                                 )
                                 .await;
@@ -3298,14 +3320,18 @@ impl ScaffoldHandler {
     async fn leave_after_recording_stop(
         &self,
         ctx: &Context,
-        guild_id: GuildId,
+        guild_key: &str,
         meeting_id: &str,
         phase: &str,
-        removed_session: &Option<RecordingSession<LocalChunkStorage>>,
+        mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
         _reset_guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
         if let Some(manager) = songbird::get(ctx).await {
-            leave_voice_with_timeout(manager.as_ref(), guild_id, meeting_id, phase).await;
+            leave_voice_with_timeout(manager.as_ref(), self.guild_id, meeting_id, phase).await;
+        }
+
+        if let Some(session) = removed_session.as_mut() {
+            flush_removed_session_after_stop(session, guild_key, phase);
         }
 
         let final_tracker = {
@@ -3328,17 +3354,17 @@ impl ScaffoldHandler {
         error_message: &str,
     ) -> Result<(), String> {
         let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
-        let (removed_session, mark_result) = {
+        let removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
-            let mark_result = {
+            {
                 let mut service = self.service.lock().await;
                 mark_recording_failed_after_teardown_exhaustion(
                     &mut service.store,
                     expected_meeting_id,
                     error_message,
                 )
-                .map_err(|err| err.to_string())
-            };
+                .map_err(|err| err.to_string())?;
+            }
             let removed_session = {
                 let mut sessions = self.sessions.lock().await;
                 match sessions
@@ -3361,7 +3387,7 @@ impl ScaffoldHandler {
                 let mut startups = self.recording_startups.lock().await;
                 clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
             }
-            (removed_session, mark_result)
+            removed_session
         };
 
         if let Some(manager) = songbird::get(ctx).await {
@@ -3383,7 +3409,7 @@ impl ScaffoldHandler {
             session.persist_ssrc_mapping(&latest_tracker);
         }
 
-        mark_result
+        Ok(())
     }
 
     async fn cleanup_failed_recording_start(
@@ -3879,10 +3905,10 @@ impl ScaffoldHandler {
         };
         self.leave_after_recording_stop(
             ctx,
-            guild_id,
+            &guild_key,
             &authorized_meeting_id,
             "manual stop",
-            &removed_session,
+            removed_session,
             reset_guard,
         )
         .await;
@@ -5606,10 +5632,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     runtime
                                         .leave_after_recording_stop(
                                             &ctx_for_task,
-                                            runtime.guild_id,
+                                            &guild_key,
                                             expected_meeting_id_ref,
                                             "driver disconnect",
-                                            &removed_session,
+                                            removed_session,
                                             reset_guard,
                                         )
                                         .await;
