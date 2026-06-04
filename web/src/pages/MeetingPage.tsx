@@ -443,16 +443,16 @@ export function MeetingPage() {
     return () => feedbackSubmitControllerRef.current?.abort();
   }, [meetingId]);
 
-  const openFeedback = (
-    segment: TranscriptSegment,
-    returnFocusTo: HTMLElement,
-  ) => {
-    feedbackReturnFocusRef.current = returnFocusTo;
-    setFeedbackSegment(segment);
-    setFeedbackDraft(emptyFeedbackDraft(segment));
-    setFeedbackError(null);
-    setFeedbackSuccess(null);
-  };
+  const openFeedback = useCallback(
+    (segment: TranscriptSegment, returnFocusTo: HTMLElement) => {
+      feedbackReturnFocusRef.current = returnFocusTo;
+      setFeedbackSegment(segment);
+      setFeedbackDraft(emptyFeedbackDraft(segment));
+      setFeedbackError(null);
+      setFeedbackSuccess(null);
+    },
+    [],
+  );
 
   const restoreFeedbackFocus = useCallback(() => {
     window.setTimeout(() => {
