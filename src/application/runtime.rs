@@ -3262,56 +3262,56 @@ impl ScaffoldHandler {
         ),
         RecordingTeardownError,
     > {
-        let (stop_result, removed_session) = {
+        {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let tracker = {
                 let tracker = self.ssrc_tracker.lock().await;
                 tracker.clone()
             };
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions
+                .get_mut(request.guild_key)
+                .filter(|session| session.meeting_id == request.expected_meeting_id)
             {
-                let mut sessions = self.sessions.lock().await;
-                if let Some(session) = sessions
-                    .get_mut(request.guild_key)
-                    .filter(|session| session.meeting_id == request.expected_meeting_id)
-                {
-                    let flush_result =
-                        flush_session_for_teardown(session, request.guild_key, request.phase);
-                    // The write voice_event_gate held for this block keeps
-                    // SpeakingStateUpdate from changing the tracker while a
-                    // retryable flush error is propagated.
-                    session.persist_ssrc_mapping(&tracker);
-                    flush_result.map_err(RecordingTeardownError::FinalFlush)?;
-                }
+                flush_session_for_teardown(session, request.guild_key, request.phase)
+                    .map_err(RecordingTeardownError::FinalFlush)?;
+                // The write voice_event_gate held for this block keeps
+                // SpeakingStateUpdate from changing the tracker while the
+                // successful final-flush mapping is persisted. Failed flushes
+                // keep the session in memory and retry with a fresh snapshot.
+                session.persist_ssrc_mapping(&tracker);
             }
+        }
 
-            let stop_result = {
-                let mut service = self.service.lock().await;
-                let mut queue = self.queue.lock().await;
-                stop_and_enqueue_summary_job(
-                    &mut service,
-                    &mut *queue,
-                    request.guild_key,
-                    request.caller_user_id,
-                    request.caller_role,
-                    Some(request.expected_meeting_id),
-                    request.reason,
-                )
-                .map_err(RecordingTeardownError::Stop)?
-            };
+        // Release voice_event_gate before DB/queue I/O. Any VoiceTick that
+        // lands before session removal mutates the session below and is
+        // carried into the post-leave tail flush.
+        let stop_result = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
+            stop_and_enqueue_summary_job(
+                &mut service,
+                &mut *queue,
+                request.guild_key,
+                request.caller_user_id,
+                request.caller_role,
+                Some(request.expected_meeting_id),
+                request.reason,
+            )
+            .map_err(RecordingTeardownError::Stop)?
+        };
 
-            let removed_session = {
-                let mut sessions = self.sessions.lock().await;
-                match sessions
-                    .get(request.guild_key)
-                    .map(|session| session.meeting_id.as_str())
-                {
-                    Some(current) if current == request.expected_meeting_id => {
-                        sessions.remove(request.guild_key)
-                    }
-                    _ => None,
+        let removed_session = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions
+                .get(request.guild_key)
+                .map(|session| session.meeting_id.as_str())
+            {
+                Some(current) if current == request.expected_meeting_id => {
+                    sessions.remove(request.guild_key)
                 }
-            };
-            (stop_result, removed_session)
+                _ => None,
+            }
         };
         {
             let mut states = self.auto_stop_states.lock().await;
