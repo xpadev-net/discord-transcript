@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Route, Routes } from "react-router-dom";
+import { Route, Routes, useParams } from "react-router-dom";
 import { ForbiddenState } from "./components/ForbiddenState";
 import { Nav } from "./components/Nav";
 import { fetchMe, fetchMeGuilds } from "./lib/api";
@@ -136,15 +136,19 @@ export function App() {
   }, [me, guilds, guildsLoaded]);
 
   const loadingGuilds = me !== null && !guildsLoaded;
-  const canUseCurrentGuildSettings =
-    me?.is_admin === true && selectedGuildId === me.guild_id;
+  const selectedGuild =
+    guilds.find((guild) => guild.guild_id === selectedGuildId) ?? null;
+  const canUseSelectedGuildSettings = selectedGuild
+    ? canSelectGuild(selectedGuild) && selectedGuild.is_admin
+    : me?.is_admin === true && selectedGuildId === me.guild_id;
 
   return (
     <>
       <Nav
-        isAdmin={canUseCurrentGuildSettings}
+        isAdmin={canUseSelectedGuildSettings}
         guilds={guilds}
         selectedGuildId={selectedGuildId}
+        settingsGuildId={selectedGuildId}
         onSelectedGuildIdChange={(guildId) => {
           setSelectedGuildId(guildId);
           storeSelectedGuildId(guildId);
@@ -156,7 +160,29 @@ export function App() {
           path="/settings"
           element={
             <SettingsRoute
-              isAdmin={canUseCurrentGuildSettings}
+              isAdmin={me?.is_admin === true && selectedGuildId === me.guild_id}
+              loading={loadingMe || loadingGuilds}
+              forbidden={sessionForbidden}
+              error={sessionError}
+              guildName={
+                selectedGuild && me && selectedGuild.guild_id === me.guild_id
+                  ? selectedGuild.name
+                  : undefined
+              }
+            />
+          }
+        />
+        <Route
+          path="/guilds/:guildId/settings"
+          element={
+            <TargetSettingsRoute
+              me={me}
+              guilds={guilds}
+              selectedGuildId={selectedGuildId}
+              onSelectedGuildIdChange={(guildId) => {
+                setSelectedGuildId(guildId);
+                storeSelectedGuildId(guildId);
+              }}
               loading={loadingMe || loadingGuilds}
               forbidden={sessionForbidden}
               error={sessionError}
@@ -184,6 +210,7 @@ interface SettingsRouteProps {
   loading: boolean;
   forbidden: boolean;
   error: boolean;
+  guildName?: string;
 }
 
 function SettingsRoute({
@@ -191,6 +218,7 @@ function SettingsRoute({
   loading,
   forbidden,
   error,
+  guildName,
 }: SettingsRouteProps) {
   if (loading) {
     return (
@@ -223,5 +251,102 @@ function SettingsRoute({
     );
   }
 
-  return <SettingsPage />;
+  return <SettingsPage guildName={guildName} />;
+}
+
+interface TargetSettingsRouteProps {
+  me: MeResponse | null;
+  guilds: UserGuild[];
+  selectedGuildId: string | null;
+  onSelectedGuildIdChange: (guildId: string) => void;
+  loading: boolean;
+  forbidden: boolean;
+  error: boolean;
+}
+
+function TargetSettingsRoute({
+  me,
+  guilds,
+  selectedGuildId,
+  onSelectedGuildIdChange,
+  loading,
+  forbidden,
+  error,
+}: TargetSettingsRouteProps) {
+  const { guildId } = useParams();
+  const targetGuild =
+    guilds.find((guild) => guild.guild_id === guildId) ?? null;
+  const selectableGuilds = guilds.filter(canSelectGuild);
+  const canFallbackToCurrentGuild =
+    guilds.length === 0 && me !== null && guildId === me.guild_id;
+  const targetIsSelectable =
+    targetGuild !== null
+      ? canSelectGuild(targetGuild)
+      : canFallbackToCurrentGuild;
+  const targetIsAdmin =
+    targetGuild !== null
+      ? targetGuild.is_admin
+      : canFallbackToCurrentGuild && me.is_admin;
+
+  useEffect(() => {
+    if (
+      guildId &&
+      targetGuild &&
+      canSelectGuild(targetGuild) &&
+      selectedGuildId !== guildId
+    ) {
+      onSelectedGuildIdChange(guildId);
+    }
+  }, [guildId, onSelectedGuildIdChange, selectedGuildId, targetGuild]);
+
+  if (loading) {
+    return (
+      <main className="settings-page">
+        <output className="loading settings-panel-message">
+          <span className="loading-spinner" />
+          {"\u8aad\u307f\u8fbc\u307f\u4e2d"}
+        </output>
+      </main>
+    );
+  }
+
+  if (error || !guildId) {
+    return (
+      <main className="settings-page">
+        <div className="panel-error settings-panel-message" role="alert">
+          {
+            "\u6a29\u9650\u60c5\u5831\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f"
+          }
+        </div>
+      </main>
+    );
+  }
+
+  if (selectableGuilds.length === 0 && guilds.length > 0) {
+    return (
+      <main className="settings-page">
+        <div className="empty-state">
+          {
+            "\u8a2d\u5b9a\u3067\u304d\u308b\u30ae\u30eb\u30c9\u304c\u3042\u308a\u307e\u305b\u3093"
+          }
+        </div>
+      </main>
+    );
+  }
+
+  if (forbidden || !targetIsSelectable || !targetIsAdmin) {
+    return (
+      <main className="settings-page">
+        <ForbiddenState message="\u3053\u306e\u30ae\u30eb\u30c9\u8a2d\u5b9a\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093" />
+      </main>
+    );
+  }
+
+  return (
+    <SettingsPage
+      guildId={guildId}
+      guildName={targetGuild?.name ?? guildId}
+      showCustomizations={me?.guild_id === guildId}
+    />
+  );
 }

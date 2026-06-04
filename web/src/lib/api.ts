@@ -33,6 +33,16 @@ function summaryTemplatePath(templateId?: string): string {
   return templateId ? `${base}/${encodeURIComponent(templateId)}` : base;
 }
 
+function guildSettingsPath(guildId?: string): string {
+  return guildId
+    ? `/api/guilds/${encodeURIComponent(guildId)}/settings`
+    : "/api/guild/settings";
+}
+
+function guildBotTokenPath(guildId?: string): string {
+  return `${guildSettingsPath(guildId)}/bot-token`;
+}
+
 export function buildLoginRedirectUrl(path: string): string {
   return `/auth/login?redirect=${encodeURIComponent(path)}`;
 }
@@ -120,18 +130,20 @@ export function fetchGuildMeetings(
 }
 
 export function fetchGuildSettings(
+  guildId?: string,
   signal?: AbortSignal,
 ): Promise<GuildSettingsResponse> {
-  return fetch("/api/guild/settings", { signal }).then(
+  return fetch(guildSettingsPath(guildId), { signal }).then(
     handleGuildSettingsResponse,
   );
 }
 
 export function updateGuildSettings(
   request: UpdateGuildSettingsRequest,
+  guildId?: string,
   signal?: AbortSignal,
 ): Promise<GuildSettingsResponse> {
-  return fetch("/api/guild/settings", {
+  return fetch(guildSettingsPath(guildId), {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
@@ -143,9 +155,10 @@ export function updateGuildSettings(
 
 export function updateGuildBotToken(
   request: UpdateGuildBotTokenRequest,
+  guildId?: string,
   signal?: AbortSignal,
 ): Promise<GuildSettingsResponse> {
-  return fetch("/api/guild/settings/bot-token", {
+  return fetch(guildBotTokenPath(guildId), {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
@@ -156,9 +169,10 @@ export function updateGuildBotToken(
 }
 
 export function deleteGuildBotToken(
+  guildId?: string,
   signal?: AbortSignal,
 ): Promise<GuildSettingsResponse> {
-  return fetch("/api/guild/settings/bot-token", {
+  return fetch(guildBotTokenPath(guildId), {
     method: "DELETE",
     signal,
   }).then(handleGuildSettingsResponse);
