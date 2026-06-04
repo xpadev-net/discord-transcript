@@ -2596,7 +2596,18 @@ impl EventHandler for ScaffoldHandler {
                         return;
                     };
                     // Verify the same meeting is still active (not a new recording)
-                    let current_meeting_id = handler.active_meeting_id().await;
+                    let current_meeting_id = match handler.active_meeting_id_result().await {
+                        Ok(current_meeting_id) => current_meeting_id,
+                        Err(err) => {
+                            warn!(
+                                guild_id = %guild_for_task,
+                                meeting_id = expected_meeting_id_ref,
+                                error = %err,
+                                "failed to verify active meeting during auto-stop grace; rescheduling"
+                            );
+                            continue;
+                        }
+                    };
                     if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
                         // Clear timer flag before returning.
                         let mut states = handler.auto_stop_states.lock().await;
@@ -3206,13 +3217,26 @@ impl ScaffoldHandler {
     }
 
     async fn active_meeting_id(&self) -> Option<String> {
+        match self.active_meeting_id_result().await {
+            Ok(meeting_id) => meeting_id,
+            Err(err) => {
+                warn!(
+                    guild_id = %self.guild_id,
+                    error = %err,
+                    "failed to resolve active meeting id"
+                );
+                None
+            }
+        }
+    }
+
+    async fn active_meeting_id_result(&self) -> Result<Option<String>, String> {
         let mut service = self.service.lock().await;
         service
             .store
             .find_active_meeting_by_guild(&self.guild_id.get().to_string())
-            .ok()
-            .flatten()
-            .map(|m| m.id)
+            .map_err(|err| err.to_string())
+            .map(|meeting| meeting.map(|meeting| meeting.id))
     }
 
     async fn status_message_metadata(
@@ -3421,10 +3445,19 @@ impl ScaffoldHandler {
         error_message: &str,
     ) -> Result<(), String> {
         let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
-        // Local runtime cleanup is intentionally idempotent and happens before
-        // the terminal DB mark. If the mark fails, retry flags in the caller
-        // continue teardown without depending on already-removed timer/session
-        // state, so recordings do not remain active forever.
+        {
+            let mut service = self.service.lock().await;
+            mark_recording_failed_after_teardown_exhaustion(
+                &mut service.store,
+                expected_meeting_id,
+                error_message,
+            )
+            .map_err(|err| err.to_string())?;
+        }
+
+        // Local runtime cleanup is intentionally idempotent and happens only
+        // after the terminal DB transition is known handled. If the store is
+        // unavailable, callers retry with the session/startup handles intact.
         let mut removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let removed_session = {
@@ -3452,16 +3485,6 @@ impl ScaffoldHandler {
             removed_session
         };
 
-        let mark_result = {
-            let mut service = self.service.lock().await;
-            mark_recording_failed_after_teardown_exhaustion(
-                &mut service.store,
-                expected_meeting_id,
-                error_message,
-            )
-            .map_err(|err| err.to_string())
-        };
-
         if let Some(manager) = songbird::get(ctx).await {
             leave_voice_with_timeout(
                 manager.as_ref(),
@@ -3485,7 +3508,7 @@ impl ScaffoldHandler {
             session.persist_ssrc_mapping(&latest_tracker);
         }
 
-        mark_result
+        Ok(())
     }
 
     async fn cleanup_failed_recording_start(
@@ -3506,10 +3529,31 @@ impl ScaffoldHandler {
         error_message: &str,
     ) {
         {
+            let mut service = self.service.lock().await;
+            match mark_recording_start_failed_after_setup_error(
+                &mut service.store,
+                meeting_id,
+                error_message,
+            ) {
+                Ok(()) => {
+                    debug!(meeting_id, "record-start setup failure cleanup completed");
+                }
+                Err(err) => {
+                    error!(
+                        meeting_id,
+                        error = %err,
+                        "failed to mark meeting as failed after voice join error; retaining local recording state for retry"
+                    );
+                    return;
+                }
+            }
+        }
+        {
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
         }
         {
+            let _voice_event_guard = self.voice_event_gate.write().await;
             let mut sessions = self.sessions.lock().await;
             if sessions
                 .get(guild_key)
@@ -3525,23 +3569,6 @@ impl ScaffoldHandler {
         {
             let mut titles = self.live_transcription_titles.lock().await;
             titles.remove(meeting_id);
-        }
-        let mut service = self.service.lock().await;
-        match mark_recording_start_failed_after_setup_error(
-            &mut service.store,
-            meeting_id,
-            error_message,
-        ) {
-            Ok(()) => {
-                debug!(meeting_id, "record-start setup failure cleanup completed");
-            }
-            Err(err) => {
-                error!(
-                    meeting_id,
-                    error = %err,
-                    "failed to mark meeting as failed after voice join error"
-                );
-            }
         }
     }
 
@@ -3591,19 +3618,7 @@ impl ScaffoldHandler {
                 clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
                 return Ok(RecordingStartJoinVerification::Active);
             }
-            if shutdown_error.is_none() && lookup_error.is_some() && session_matches {
-                warn!(
-                    guild_id = %guild_key,
-                    meeting_id,
-                    error = %lookup_error.as_deref().unwrap_or("unknown store error"),
-                    "could not verify active recording after voice join; keeping joined recording because session still matches"
-                );
-                // Keep the startup reservation while the DB cannot confirm
-                // the row. Stop/cleanup paths still use it as a local handle.
-                return Ok(RecordingStartJoinVerification::Active);
-            }
             if shutdown_error.is_none()
-                && !session_matches
                 && meeting_status.is_some_and(recording_start_join_completed_after_stop)
             {
                 info!(
@@ -3621,9 +3636,56 @@ impl ScaffoldHandler {
                     "already-stopped record-start",
                 )
                 .await;
+
+                let mut removed_session = {
+                    let _voice_event_guard = self.voice_event_gate.write().await;
+                    let mut sessions = self.sessions.lock().await;
+                    if sessions
+                        .get(guild_key)
+                        .is_some_and(|session| session.meeting_id == meeting_id)
+                    {
+                        sessions.remove(guild_key)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(session) = removed_session.as_mut() {
+                    flush_removed_session_after_stop(
+                        session,
+                        guild_key,
+                        "already-stopped record-start",
+                    );
+                }
+                let latest_tracker = {
+                    let _voice_event_guard = self.voice_event_gate.write().await;
+                    let tracker = self.ssrc_tracker.lock().await;
+                    tracker.clone()
+                };
+                if let Some(session) = &removed_session {
+                    session.persist_ssrc_mapping(&latest_tracker);
+                }
+                {
+                    let mut states = self.auto_stop_states.lock().await;
+                    states.remove(guild_key);
+                }
+                {
+                    let mut titles = self.live_transcription_titles.lock().await;
+                    titles.remove(meeting_id);
+                }
                 let mut startups = self.recording_startups.lock().await;
                 clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
                 return Ok(RecordingStartJoinVerification::AlreadyStopped);
+            }
+            if shutdown_error.is_none() && lookup_error.is_some() && session_matches {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id,
+                    error = %lookup_error.as_deref().unwrap_or("unknown store error"),
+                    "could not verify active recording after voice join; keeping joined recording because session still matches"
+                );
+                // Keep the startup reservation while the DB cannot confirm
+                // the row. Stop/cleanup paths still use it as a local handle.
+                return Ok(RecordingStartJoinVerification::Active);
             }
 
             let error_message = shutdown_error
@@ -5621,7 +5683,19 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             else {
                                 return;
                             };
-                            let current_meeting_id = runtime.active_meeting_id().await;
+                            let current_meeting_id = match runtime.active_meeting_id_result().await
+                            {
+                                Ok(current_meeting_id) => current_meeting_id,
+                                Err(err) => {
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = expected_meeting_id_ref,
+                                        error = %err,
+                                        "failed to verify active meeting during driver-disconnect grace; rescheduling"
+                                    );
+                                    continue;
+                                }
+                            };
                             if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
                                 let mut startups = runtime.recording_startups.lock().await;
                                 clear_matching_recording_startup(
