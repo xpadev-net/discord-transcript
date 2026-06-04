@@ -245,12 +245,6 @@ function FeedbackDialog({
         className="feedback-modal"
         aria-modal="true"
         aria-labelledby="feedback-dialog-title"
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            onClose();
-          }
-        }}
         onCancel={(event) => {
           event.preventDefault();
           onClose();
