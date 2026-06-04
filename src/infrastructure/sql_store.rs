@@ -1,9 +1,20 @@
 use crate::domain::MeetingStatus;
 use crate::domain::StopReason;
+use crate::domain::ai_memory::{
+    AiMemoryNote, AiMemorySourceType, AiMemoryTag, NewAiMemoryNote, UpdateAiMemoryNote,
+};
 use crate::domain::audit::AuditEvent;
+use crate::domain::confidence::ConfidencePermille;
 use crate::domain::domain_knowledge::{
     DomainKnowledgeContentType, DomainKnowledgeItem, NewDomainKnowledgeItem,
     UpdateDomainKnowledgeItem,
+};
+use crate::domain::feedback::{
+    NewTranscriptFeedback, TranscriptFeedback, TranscriptFeedbackStatus,
+    TranscriptFeedbackTermType, TranscriptFeedbackType, UpdateTranscriptFeedbackStatus,
+};
+use crate::domain::person_alias::{
+    NewPersonAlias, PersonAlias, PersonAliasReviewStatus, PersonAliasSourceType, UpdatePersonAlias,
 };
 use crate::domain::plans::{
     PlanFallback, PlanKind, PlanQuota, QuotaDimension, QuotaEnforcementMode, QuotaPeriod,
@@ -15,19 +26,24 @@ use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, AGGREGATE_RECENT_USAGE_SQL,
-    ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
-    BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
-    CREATE_SCHEMA_MIGRATIONS_SQL, ENQUEUE_JOB_SQL, GET_ACTIVE_SUMMARY_TEMPLATE_SQL,
-    GET_DOMAIN_KNOWLEDGE_SQL, GET_EFFECTIVE_MEETING_SETTINGS_SQL,
-    GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL, GET_SUMMARY_TEMPLATE_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+    ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL,
+    ARCHIVE_SUMMARY_TEMPLATE_SQL, BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL,
+    CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL, ENQUEUE_JOB_SQL,
+    GET_ACTIVE_SUMMARY_TEMPLATE_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL,
+    GET_EFFECTIVE_MEETING_SETTINGS_SQL, GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
+    GET_SUMMARY_TEMPLATE_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
+    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_PERSON_ALIAS_SQL,
+    INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
     INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    INSERT_USAGE_EVENT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
-    LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
-    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
-    RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
-    SELECT_SCHEMA_MIGRATION_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL, LIST_AI_MEMORY_NOTES_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
+    LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+    LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
+    MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration, RESOLVE_PLAN_FOR_GUILD_SQL,
+    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
+    SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
+    UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
     UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, migration_transaction_sql,
 };
 use crate::infrastructure::storage::{
@@ -424,6 +440,275 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             return Ok(None);
         };
         parse_domain_knowledge_row(&row).map(Some)
+    }
+
+    pub fn list_ai_memory_notes(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        include_archived: bool,
+        source_type: Option<AiMemorySourceType>,
+    ) -> Result<Vec<AiMemoryNote>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_AI_MEMORY_NOTES_SQL,
+                &[
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    include_archived.to_string(),
+                    source_type
+                        .map(|source_type| source_type.as_str().to_owned())
+                        .unwrap_or_default(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_ai_memory_note_row).collect()
+    }
+
+    pub fn get_ai_memory_note(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        id: &str,
+    ) -> Result<Option<AiMemoryNote>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                GET_AI_MEMORY_NOTE_SQL,
+                &[id.to_owned(), tenant_id.to_owned(), guild_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_ai_memory_note_row(&row).map(Some)
+    }
+
+    pub fn create_ai_memory_note(
+        &mut self,
+        item: &NewAiMemoryNote,
+    ) -> Result<AiMemoryNote, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(INSERT_AI_MEMORY_NOTE_SQL, &new_ai_memory_note_params(item))
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::Backend(
+                "ai memory insert returned no row".to_owned(),
+            ));
+        };
+        parse_ai_memory_note_row(&row)
+    }
+
+    pub fn update_ai_memory_note(
+        &mut self,
+        item: &UpdateAiMemoryNote,
+    ) -> Result<Option<AiMemoryNote>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                UPDATE_AI_MEMORY_NOTE_SQL,
+                &update_ai_memory_note_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_ai_memory_note_row(&row).map(Some)
+    }
+
+    pub fn set_ai_memory_pinned(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        id: &str,
+        pinned: bool,
+        actor_user_id: &str,
+    ) -> Result<Option<AiMemoryNote>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                SET_AI_MEMORY_PINNED_SQL,
+                &[
+                    id.to_owned(),
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    pinned.to_string(),
+                    actor_user_id.to_owned(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_ai_memory_note_row(&row).map(Some)
+    }
+
+    pub fn archive_ai_memory_note(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<AiMemoryNote>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                ARCHIVE_AI_MEMORY_NOTE_SQL,
+                &[
+                    id.to_owned(),
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    actor_user_id.to_owned(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_ai_memory_note_row(&row).map(Some)
+    }
+
+    pub fn create_transcript_feedback(
+        &mut self,
+        item: &NewTranscriptFeedback,
+    ) -> Result<TranscriptFeedback, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                INSERT_TRANSCRIPT_FEEDBACK_SQL,
+                &new_transcript_feedback_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::Backend(
+                "transcript feedback insert returned no row".to_owned(),
+            ));
+        };
+        parse_transcript_feedback_row(&row)
+    }
+
+    pub fn list_transcript_feedback(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        status: Option<TranscriptFeedbackStatus>,
+        feedback_type: Option<TranscriptFeedbackType>,
+    ) -> Result<Vec<TranscriptFeedback>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_TRANSCRIPT_FEEDBACK_SQL,
+                &[
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    status
+                        .map(|status| status.as_str().to_owned())
+                        .unwrap_or_default(),
+                    feedback_type
+                        .map(|feedback_type| feedback_type.as_str().to_owned())
+                        .unwrap_or_default(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_transcript_feedback_row).collect()
+    }
+
+    pub fn update_transcript_feedback_status(
+        &mut self,
+        item: &UpdateTranscriptFeedbackStatus,
+    ) -> Result<Option<TranscriptFeedback>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+                &update_transcript_feedback_status_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_transcript_feedback_row(&row).map(Some)
+    }
+
+    pub fn list_person_aliases(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        include_archived: bool,
+        review_status: Option<PersonAliasReviewStatus>,
+    ) -> Result<Vec<PersonAlias>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_PERSON_ALIASES_SQL,
+                &[
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    include_archived.to_string(),
+                    review_status
+                        .map(|status| status.as_str().to_owned())
+                        .unwrap_or_default(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_person_alias_row).collect()
+    }
+
+    pub fn create_person_alias(
+        &mut self,
+        item: &NewPersonAlias,
+    ) -> Result<PersonAlias, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(INSERT_PERSON_ALIAS_SQL, &new_person_alias_params(item))
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Err(StoreError::Backend(
+                "person alias insert returned no row".to_owned(),
+            ));
+        };
+        parse_person_alias_row(&row)
+    }
+
+    pub fn update_person_alias(
+        &mut self,
+        item: &UpdatePersonAlias,
+    ) -> Result<Option<PersonAlias>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(UPDATE_PERSON_ALIAS_SQL, &update_person_alias_params(item))
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_person_alias_row(&row).map(Some)
+    }
+
+    pub fn archive_person_alias(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<PersonAlias>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                ARCHIVE_PERSON_ALIAS_SQL,
+                &[
+                    id.to_owned(),
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    actor_user_id.to_owned(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_person_alias_row(&row).map(Some)
     }
 
     pub fn list_summary_templates(
@@ -1124,6 +1409,317 @@ fn parse_optional_domain_knowledge_timestamp(
         return Ok(None);
     };
     parse_required_domain_knowledge_timestamp(&raw, field).map(Some)
+}
+
+fn postgres_text_array_literal(values: &[String]) -> String {
+    let escaped = values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{escaped}}}")
+}
+
+fn parse_text_array_projection(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.split(',').map(str::to_owned).collect()
+}
+
+fn new_ai_memory_note_params(item: &NewAiMemoryNote) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.tenant_discord_guild_id.clone(),
+        item.tenant_id.clone(),
+        item.guild_id.clone(),
+        item.title.clone(),
+        item.body.clone(),
+        postgres_text_array_literal(&ai_memory_tag_param_values(&item.tags)),
+        item.source_type.as_str().to_owned(),
+        item.source_meeting_id.clone().unwrap_or_default(),
+        item.source_feedback_id.clone().unwrap_or_default(),
+        item.confidence
+            .map(ConfidencePermille::as_sql_decimal)
+            .unwrap_or_default(),
+        item.active.to_string(),
+        item.pinned.to_string(),
+        item.actor_user_id.clone(),
+    ]
+}
+
+fn update_ai_memory_note_params(item: &UpdateAiMemoryNote) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.tenant_id.clone(),
+        item.guild_id.clone(),
+        item.title.clone(),
+        item.body.clone(),
+        postgres_text_array_literal(&ai_memory_tag_param_values(&item.tags)),
+        item.confidence
+            .map(ConfidencePermille::as_sql_decimal)
+            .unwrap_or_default(),
+        item.active.to_string(),
+        item.pinned.to_string(),
+        item.actor_user_id.clone(),
+    ]
+}
+
+fn ai_memory_tag_param_values(tags: &[AiMemoryTag]) -> Vec<String> {
+    tags.iter().map(|tag| tag.as_str().to_owned()).collect()
+}
+
+fn parse_ai_memory_note_row(row: &SqlRow) -> Result<AiMemoryNote, StoreError> {
+    if row.len() < 20 {
+        return Err(StoreError::Backend(format!(
+            "invalid ai memory row length: {}",
+            row.len()
+        )));
+    }
+    let source_type_raw = require_store_column(row, 7, "source_type")?;
+    let source_type = AiMemorySourceType::parse_str(&source_type_raw).ok_or_else(|| {
+        StoreError::Backend(format!("invalid ai memory source_type '{source_type_raw}'"))
+    })?;
+    let tags_raw = require_store_column(row, 6, "tags")?;
+    let tags = parse_text_array_projection(&tags_raw)
+        .into_iter()
+        .map(|tag| {
+            AiMemoryTag::parse_str(&tag)
+                .ok_or_else(|| StoreError::Backend(format!("invalid ai memory tag '{tag}'")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AiMemoryNote {
+        id: require_store_column(row, 0, "id")?,
+        tenant_discord_guild_id: require_store_column(row, 1, "tenant_discord_guild_id")?,
+        tenant_id: require_store_column(row, 2, "tenant_id")?,
+        guild_id: require_store_column(row, 3, "guild_id")?,
+        title: require_store_column(row, 4, "title")?,
+        body: require_store_column(row, 5, "body")?,
+        tags,
+        source_type,
+        source_meeting_id: row.get(8).and_then(|v| v.clone()),
+        source_feedback_id: row.get(9).and_then(|v| v.clone()),
+        confidence: parse_optional_confidence(row.get(10).and_then(|v| v.clone()), "confidence")?,
+        active: required_bool_column(row, 11, "active")?,
+        pinned: required_bool_column(row, 12, "pinned")?,
+        created_actor_user_id: require_store_column(row, 13, "created_actor_user_id")?,
+        updated_actor_user_id: require_store_column(row, 14, "updated_actor_user_id")?,
+        last_used_at: parse_optional_domain_knowledge_timestamp(
+            row.get(15).and_then(|v| v.clone()),
+            "last_used_at",
+        )?,
+        created_at: parse_required_domain_knowledge_timestamp(
+            &require_store_column(row, 16, "created_at")?,
+            "created_at",
+        )?,
+        updated_at: parse_required_domain_knowledge_timestamp(
+            &require_store_column(row, 17, "updated_at")?,
+            "updated_at",
+        )?,
+        archived_at: parse_optional_domain_knowledge_timestamp(
+            row.get(18).and_then(|v| v.clone()),
+            "archived_at",
+        )?,
+        archived_actor_user_id: row.get(19).and_then(|v| v.clone()),
+    })
+}
+
+fn parse_optional_confidence(
+    raw: Option<String>,
+    field: &str,
+) -> Result<Option<ConfidencePermille>, StoreError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    ConfidencePermille::parse_sql_decimal(&raw)
+        .map(Some)
+        .map_err(|err| StoreError::Backend(format!("invalid {field} '{raw}': {err}")))
+}
+
+fn new_transcript_feedback_params(item: &NewTranscriptFeedback) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.tenant_discord_guild_id.clone(),
+        item.tenant_id.clone(),
+        item.guild_id.clone(),
+        item.meeting_id.clone().unwrap_or_default(),
+        item.transcript_segment_id.clone().unwrap_or_default(),
+        item.feedback_type.as_str().to_owned(),
+        item.term_type
+            .map(|term_type| term_type.as_str().to_owned())
+            .unwrap_or_default(),
+        item.original_text.clone().unwrap_or_default(),
+        item.corrected_text.clone().unwrap_or_default(),
+        item.speaker_id.clone().unwrap_or_default(),
+        item.corrected_speaker_id.clone().unwrap_or_default(),
+        item.note.clone().unwrap_or_default(),
+        item.target_domain_knowledge_id.clone().unwrap_or_default(),
+        item.target_ai_memory_note_id.clone().unwrap_or_default(),
+        item.actor_user_id.clone(),
+    ]
+}
+
+fn update_transcript_feedback_status_params(item: &UpdateTranscriptFeedbackStatus) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.tenant_id.clone(),
+        item.guild_id.clone(),
+        item.status.as_str().to_owned(),
+        item.target_domain_knowledge_id.clone().unwrap_or_default(),
+        item.target_ai_memory_note_id.clone().unwrap_or_default(),
+        item.reviewed_actor_user_id.clone(),
+    ]
+}
+
+fn parse_transcript_feedback_row(row: &SqlRow) -> Result<TranscriptFeedback, StoreError> {
+    if row.len() < 20 {
+        return Err(StoreError::Backend(format!(
+            "invalid transcript feedback row length: {}",
+            row.len()
+        )));
+    }
+    let feedback_type_raw = require_store_column(row, 6, "feedback_type")?;
+    let feedback_type = TranscriptFeedbackType::parse_str(&feedback_type_raw).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "invalid transcript feedback feedback_type '{feedback_type_raw}'"
+        ))
+    })?;
+    let term_type = row
+        .get(7)
+        .and_then(|v| v.clone())
+        .map(|raw| {
+            TranscriptFeedbackTermType::parse_str(&raw).ok_or_else(|| {
+                StoreError::Backend(format!("invalid transcript feedback term_type '{raw}'"))
+            })
+        })
+        .transpose()?;
+    let status_raw = require_store_column(row, 16, "status")?;
+    let status = TranscriptFeedbackStatus::parse_str(&status_raw).ok_or_else(|| {
+        StoreError::Backend(format!("invalid transcript feedback status '{status_raw}'"))
+    })?;
+    Ok(TranscriptFeedback {
+        id: require_store_column(row, 0, "id")?,
+        tenant_discord_guild_id: require_store_column(row, 1, "tenant_discord_guild_id")?,
+        tenant_id: require_store_column(row, 2, "tenant_id")?,
+        guild_id: require_store_column(row, 3, "guild_id")?,
+        meeting_id: row.get(4).and_then(|v| v.clone()),
+        transcript_segment_id: row.get(5).and_then(|v| v.clone()),
+        feedback_type,
+        term_type,
+        original_text: row.get(8).and_then(|v| v.clone()),
+        corrected_text: row.get(9).and_then(|v| v.clone()),
+        speaker_id: row.get(10).and_then(|v| v.clone()),
+        corrected_speaker_id: row.get(11).and_then(|v| v.clone()),
+        note: row.get(12).and_then(|v| v.clone()),
+        target_domain_knowledge_id: row.get(13).and_then(|v| v.clone()),
+        target_ai_memory_note_id: row.get(14).and_then(|v| v.clone()),
+        actor_user_id: require_store_column(row, 15, "actor_user_id")?,
+        status,
+        created_at: parse_required_domain_knowledge_timestamp(
+            &require_store_column(row, 17, "created_at")?,
+            "created_at",
+        )?,
+        reviewed_at: parse_optional_domain_knowledge_timestamp(
+            row.get(18).and_then(|v| v.clone()),
+            "reviewed_at",
+        )?,
+        reviewed_actor_user_id: row.get(19).and_then(|v| v.clone()),
+    })
+}
+
+fn new_person_alias_params(item: &NewPersonAlias) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.tenant_discord_guild_id.clone(),
+        item.tenant_id.clone(),
+        item.guild_id.clone(),
+        item.canonical_name.clone(),
+        item.alias.clone(),
+        item.discord_user_id.clone().unwrap_or_default(),
+        item.source_type.as_str().to_owned(),
+        item.source_meeting_id.clone().unwrap_or_default(),
+        item.source_feedback_id.clone().unwrap_or_default(),
+        item.confidence
+            .map(ConfidencePermille::as_sql_decimal)
+            .unwrap_or_default(),
+        item.active.to_string(),
+        item.review_status.as_str().to_owned(),
+        item.actor_user_id.clone(),
+    ]
+}
+
+fn update_person_alias_params(item: &UpdatePersonAlias) -> Vec<String> {
+    vec![
+        item.id.clone(),
+        item.tenant_id.clone(),
+        item.guild_id.clone(),
+        item.canonical_name.clone(),
+        item.alias.clone(),
+        item.discord_user_id.clone().unwrap_or_default(),
+        item.confidence
+            .map(ConfidencePermille::as_sql_decimal)
+            .unwrap_or_default(),
+        item.active.to_string(),
+        item.review_status.as_str().to_owned(),
+        item.actor_user_id.clone(),
+    ]
+}
+
+fn parse_person_alias_row(row: &SqlRow) -> Result<PersonAlias, StoreError> {
+    if row.len() < 21 {
+        return Err(StoreError::Backend(format!(
+            "invalid person alias row length: {}",
+            row.len()
+        )));
+    }
+    let source_type_raw = require_store_column(row, 7, "source_type")?;
+    let source_type = PersonAliasSourceType::parse_str(&source_type_raw).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "invalid person alias source_type '{source_type_raw}'"
+        ))
+    })?;
+    let review_status_raw = require_store_column(row, 12, "review_status")?;
+    let review_status =
+        PersonAliasReviewStatus::parse_str(&review_status_raw).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "invalid person alias review_status '{review_status_raw}'"
+            ))
+        })?;
+    Ok(PersonAlias {
+        id: require_store_column(row, 0, "id")?,
+        tenant_discord_guild_id: require_store_column(row, 1, "tenant_discord_guild_id")?,
+        tenant_id: require_store_column(row, 2, "tenant_id")?,
+        guild_id: require_store_column(row, 3, "guild_id")?,
+        canonical_name: require_store_column(row, 4, "canonical_name")?,
+        alias: require_store_column(row, 5, "alias")?,
+        discord_user_id: row.get(6).and_then(|v| v.clone()),
+        source_type,
+        source_meeting_id: row.get(8).and_then(|v| v.clone()),
+        source_feedback_id: row.get(9).and_then(|v| v.clone()),
+        confidence: parse_optional_confidence(row.get(10).and_then(|v| v.clone()), "confidence")?,
+        active: required_bool_column(row, 11, "active")?,
+        review_status,
+        created_actor_user_id: require_store_column(row, 13, "created_actor_user_id")?,
+        updated_actor_user_id: require_store_column(row, 14, "updated_actor_user_id")?,
+        reviewed_at: parse_optional_domain_knowledge_timestamp(
+            row.get(15).and_then(|v| v.clone()),
+            "reviewed_at",
+        )?,
+        reviewed_actor_user_id: row.get(16).and_then(|v| v.clone()),
+        archived_at: parse_optional_domain_knowledge_timestamp(
+            row.get(17).and_then(|v| v.clone()),
+            "archived_at",
+        )?,
+        archived_actor_user_id: row.get(18).and_then(|v| v.clone()),
+        created_at: parse_required_domain_knowledge_timestamp(
+            &require_store_column(row, 19, "created_at")?,
+            "created_at",
+        )?,
+        updated_at: parse_required_domain_knowledge_timestamp(
+            &require_store_column(row, 20, "updated_at")?,
+            "updated_at",
+        )?,
+    })
 }
 
 fn new_summary_template_params(item: &NewSummaryTemplate) -> Vec<String> {

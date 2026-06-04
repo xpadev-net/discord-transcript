@@ -1132,6 +1132,483 @@ WITH active_tenant AS (
 SELECT * FROM updated
 "#;
 
+pub const RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL: &str = r#"
+WITH active_installations AS (
+    SELECT tg.id, tg.tenant_id, tg.guild_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+)
+SELECT id, tenant_id, guild_id
+FROM active_installations
+WHERE (SELECT COUNT(*) FROM active_installations) = 1
+"#;
+
+pub const AI_MEMORY_NOTE_COLUMNS_SQL: &str = r#"
+id,
+tenant_discord_guild_id,
+tenant_id,
+guild_id,
+title,
+body,
+tags,
+source_type,
+source_meeting_id,
+source_feedback_id,
+to_char(confidence, 'FM0.000') AS confidence,
+active,
+pinned,
+created_actor_user_id,
+updated_actor_user_id,
+to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+archived_actor_user_id
+"#;
+
+pub const LIST_AI_MEMORY_NOTES_SQL: &str = r#"
+SELECT id,
+       tenant_discord_guild_id,
+       tenant_id,
+       guild_id,
+       title,
+       body,
+       array_to_string(tags, ',') AS tags,
+       source_type,
+       source_meeting_id,
+       source_feedback_id,
+       to_char(confidence, 'FM0.000') AS confidence,
+       active,
+       pinned,
+       created_actor_user_id,
+       updated_actor_user_id,
+       to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id
+FROM ai_memory_notes
+WHERE tenant_id = $1
+  AND guild_id = $2
+  AND ($3::TEXT::BOOLEAN OR archived_at IS NULL)
+  AND (NULLIF($4, '') IS NULL OR source_type = $4)
+ORDER BY pinned DESC, updated_at DESC, id DESC
+"#;
+
+pub const GET_AI_MEMORY_NOTE_SQL: &str = r#"
+SELECT id,
+       tenant_discord_guild_id,
+       tenant_id,
+       guild_id,
+       title,
+       body,
+       array_to_string(tags, ',') AS tags,
+       source_type,
+       source_meeting_id,
+       source_feedback_id,
+       to_char(confidence, 'FM0.000') AS confidence,
+       active,
+       pinned,
+       created_actor_user_id,
+       updated_actor_user_id,
+       to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id
+FROM ai_memory_notes
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+"#;
+
+pub const INSERT_AI_MEMORY_NOTE_SQL: &str = r#"
+INSERT INTO ai_memory_notes (
+    id, tenant_discord_guild_id, tenant_id, guild_id, title, body, tags,
+    source_type, source_meeting_id, source_feedback_id, confidence, active,
+    pinned, created_actor_user_id, updated_actor_user_id, created_at, updated_at
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7::TEXT[], $8, NULLIF($9, ''),
+    NULLIF($10, ''), NULLIF($11, '')::TEXT::NUMERIC, $12::TEXT::BOOLEAN,
+    $13::TEXT::BOOLEAN, $14, $14, NOW(), NOW()
+)
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          title,
+          body,
+          array_to_string(tags, ',') AS tags,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          pinned,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id
+"#;
+
+pub const UPDATE_AI_MEMORY_NOTE_SQL: &str = r#"
+UPDATE ai_memory_notes
+SET title = $4,
+    body = $5,
+    tags = $6::TEXT[],
+    confidence = NULLIF($7, '')::TEXT::NUMERIC,
+    active = $8::TEXT::BOOLEAN,
+    pinned = $9::TEXT::BOOLEAN,
+    updated_actor_user_id = $10,
+    updated_at = NOW()
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+  AND archived_at IS NULL
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          title,
+          body,
+          array_to_string(tags, ',') AS tags,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          pinned,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id
+"#;
+
+pub const SET_AI_MEMORY_PINNED_SQL: &str = r#"
+UPDATE ai_memory_notes
+SET pinned = $4::TEXT::BOOLEAN,
+    updated_actor_user_id = $5,
+    updated_at = NOW()
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+  AND archived_at IS NULL
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          title,
+          body,
+          array_to_string(tags, ',') AS tags,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          pinned,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id
+"#;
+
+pub const ARCHIVE_AI_MEMORY_NOTE_SQL: &str = r#"
+UPDATE ai_memory_notes
+SET active = FALSE,
+    archived_at = COALESCE(archived_at, NOW()),
+    archived_actor_user_id = COALESCE(archived_actor_user_id, $4),
+    updated_actor_user_id = CASE WHEN archived_at IS NULL THEN $4 ELSE updated_actor_user_id END,
+    updated_at = CASE WHEN archived_at IS NULL THEN NOW() ELSE updated_at END
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          title,
+          body,
+          array_to_string(tags, ',') AS tags,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          pinned,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_used_at,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id
+"#;
+
+pub const LIST_TRANSCRIPT_FEEDBACK_SQL: &str = r#"
+SELECT id,
+       tenant_discord_guild_id,
+       tenant_id,
+       guild_id,
+       meeting_id,
+       transcript_segment_id,
+       feedback_type,
+       term_type,
+       original_text,
+       corrected_text,
+       speaker_id,
+       corrected_speaker_id,
+       note,
+       target_domain_knowledge_id,
+       target_ai_memory_note_id,
+       actor_user_id,
+       status,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+       reviewed_actor_user_id
+FROM transcript_feedback
+WHERE tenant_id = $1
+  AND guild_id = $2
+  AND (NULLIF($3, '') IS NULL OR status = $3)
+  AND (NULLIF($4, '') IS NULL OR feedback_type = $4)
+ORDER BY created_at DESC, id DESC
+"#;
+
+pub const INSERT_TRANSCRIPT_FEEDBACK_SQL: &str = r#"
+INSERT INTO transcript_feedback (
+    id, tenant_discord_guild_id, tenant_id, guild_id, meeting_id,
+    transcript_segment_id, feedback_type, term_type, original_text, corrected_text,
+    speaker_id, corrected_speaker_id, note, target_domain_knowledge_id,
+    target_ai_memory_note_id, actor_user_id, status, created_at
+)
+VALUES (
+    $1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, NULLIF($8, ''),
+    NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), NULLIF($12, ''),
+    NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''), $16, 'open', NOW()
+)
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          meeting_id,
+          transcript_segment_id,
+          feedback_type,
+          term_type,
+          original_text,
+          corrected_text,
+          speaker_id,
+          corrected_speaker_id,
+          note,
+          target_domain_knowledge_id,
+          target_ai_memory_note_id,
+          actor_user_id,
+          status,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id
+"#;
+
+pub const UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL: &str = r#"
+UPDATE transcript_feedback
+SET status = $4,
+    target_domain_knowledge_id = CASE
+        WHEN $4 = 'converted_to_domain_knowledge' THEN NULLIF($5, '')
+        WHEN $4 = 'converted_to_ai_memory' THEN NULL
+        ELSE target_domain_knowledge_id
+    END,
+    target_ai_memory_note_id = CASE
+        WHEN $4 = 'converted_to_ai_memory' THEN NULLIF($6, '')
+        WHEN $4 = 'converted_to_domain_knowledge' THEN NULL
+        ELSE target_ai_memory_note_id
+    END,
+    reviewed_at = NOW(),
+    reviewed_actor_user_id = $7
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+  AND status = 'open'
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          meeting_id,
+          transcript_segment_id,
+          feedback_type,
+          term_type,
+          original_text,
+          corrected_text,
+          speaker_id,
+          corrected_speaker_id,
+          note,
+          target_domain_knowledge_id,
+          target_ai_memory_note_id,
+          actor_user_id,
+          status,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id
+"#;
+
+pub const LIST_PERSON_ALIASES_SQL: &str = r#"
+SELECT id,
+       tenant_discord_guild_id,
+       tenant_id,
+       guild_id,
+       canonical_name,
+       alias,
+       discord_user_id,
+       source_type,
+       source_meeting_id,
+       source_feedback_id,
+       to_char(confidence, 'FM0.000') AS confidence,
+       active,
+       review_status,
+       created_actor_user_id,
+       updated_actor_user_id,
+       to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+       reviewed_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM person_aliases
+WHERE tenant_id = $1
+  AND guild_id = $2
+  AND ($3::TEXT::BOOLEAN OR archived_at IS NULL)
+  AND (NULLIF($4, '') IS NULL OR review_status = $4)
+ORDER BY active DESC, updated_at DESC, id DESC
+"#;
+
+pub const INSERT_PERSON_ALIAS_SQL: &str = r#"
+INSERT INTO person_aliases (
+    id, tenant_discord_guild_id, tenant_id, guild_id, canonical_name, alias,
+    discord_user_id, source_type, source_meeting_id, source_feedback_id, confidence,
+    active, review_status, created_actor_user_id, updated_actor_user_id, reviewed_at,
+    reviewed_actor_user_id, created_at, updated_at
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, NULLIF($9, ''),
+    NULLIF($10, ''), NULLIF($11, '')::TEXT::NUMERIC, $12::TEXT::BOOLEAN,
+    $13, $14, $14,
+    CASE WHEN $13 = 'unreviewed' THEN NULL ELSE NOW() END,
+    CASE WHEN $13 = 'unreviewed' THEN NULL ELSE $14 END,
+    NOW(), NOW()
+)
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          canonical_name,
+          alias,
+          discord_user_id,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          review_status,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const UPDATE_PERSON_ALIAS_SQL: &str = r#"
+UPDATE person_aliases
+SET canonical_name = $4,
+    alias = $5,
+    discord_user_id = NULLIF($6, ''),
+    confidence = NULLIF($7, '')::TEXT::NUMERIC,
+    active = $8::TEXT::BOOLEAN,
+    review_status = $9,
+    updated_actor_user_id = $10,
+    reviewed_at = CASE
+        WHEN $9 = 'unreviewed' THEN NULL
+        WHEN review_status IS DISTINCT FROM $9 OR reviewed_at IS NULL THEN NOW()
+        ELSE reviewed_at
+    END,
+    reviewed_actor_user_id = CASE
+        WHEN $9 = 'unreviewed' THEN NULL
+        WHEN review_status IS DISTINCT FROM $9 OR reviewed_actor_user_id IS NULL THEN $10
+        ELSE reviewed_actor_user_id
+    END,
+    updated_at = NOW()
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+  AND archived_at IS NULL
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          canonical_name,
+          alias,
+          discord_user_id,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          review_status,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const ARCHIVE_PERSON_ALIAS_SQL: &str = r#"
+UPDATE person_aliases
+SET active = FALSE,
+    archived_at = COALESCE(archived_at, NOW()),
+    archived_actor_user_id = COALESCE(archived_actor_user_id, $4),
+    updated_actor_user_id = CASE WHEN archived_at IS NULL THEN $4 ELSE updated_actor_user_id END,
+    updated_at = CASE WHEN archived_at IS NULL THEN NOW() ELSE updated_at END
+WHERE id = $1
+  AND tenant_id = $2
+  AND guild_id = $3
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          canonical_name,
+          alias,
+          discord_user_id,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          review_status,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
 pub const LIST_SUMMARY_TEMPLATES_SQL: &str = r#"
 WITH active_tenant AS (
     SELECT tg.tenant_id

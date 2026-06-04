@@ -131,3 +131,34 @@ pub struct TranscriptFeedback {
     pub reviewed_at: Option<DateTime<Utc>>,
     pub reviewed_actor_user_id: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTranscriptFeedback {
+    pub id: String,
+    pub tenant_discord_guild_id: String,
+    pub tenant_id: String,
+    pub guild_id: String,
+    pub meeting_id: Option<String>,
+    pub transcript_segment_id: Option<String>,
+    pub feedback_type: TranscriptFeedbackType,
+    pub term_type: Option<TranscriptFeedbackTermType>,
+    pub original_text: Option<String>,
+    pub corrected_text: Option<String>,
+    pub speaker_id: Option<String>,
+    pub corrected_speaker_id: Option<String>,
+    pub note: Option<String>,
+    pub target_domain_knowledge_id: Option<String>,
+    pub target_ai_memory_note_id: Option<String>,
+    pub actor_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTranscriptFeedbackStatus {
+    pub id: String,
+    pub tenant_id: String,
+    pub guild_id: String,
+    pub status: TranscriptFeedbackStatus,
+    pub target_domain_knowledge_id: Option<String>,
+    pub target_ai_memory_note_id: Option<String>,
+    pub reviewed_actor_user_id: String,
+}
