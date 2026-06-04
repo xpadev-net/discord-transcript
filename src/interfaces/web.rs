@@ -11,7 +11,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
@@ -40,9 +40,9 @@ use crate::infrastructure::sql::{
     ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL,
     GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
     INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    INSERT_USAGE_EVENT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETINGS_SQL,
-    LIST_SUMMARY_TEMPLATES_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
-    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
+    LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
+    UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -126,6 +126,9 @@ const TRANSCRIPT_SSE_MAX_PER_USER_MEETING: usize = 2;
 const TRANSCRIPT_SSE_BASE_POLL_SECS: u64 = 2;
 const TRANSCRIPT_SSE_MAX_POLL_SECS: u64 = 10;
 const TRANSCRIPT_SSE_MAX_IDLE_POLLS: u32 = 60;
+const USER_GUILDS_CACHE_TTL_SECS: u64 = 60;
+const OAUTH_ACCESS_TOKEN_DEFAULT_TTL_SECS: u64 = 3600;
+const OAUTH_ACCESS_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
 
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
@@ -133,6 +136,7 @@ type GuildCache = Arc<tokio::sync::RwLock<GuildCacheState>>;
 type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
 type OperationalMetricsCache = Arc<Mutex<Option<OperationalMetricsCacheEntry>>>;
 type TranscriptSseLimiter = Arc<std::sync::Mutex<HashMap<(String, String), usize>>>;
+type UserGuildsCache = Arc<tokio::sync::RwLock<HashMap<String, UserGuildsCacheEntry>>>;
 type MembershipCache =
     Arc<tokio::sync::RwLock<HashMap<String, (Result<bool, StatusCode>, Instant)>>>;
 type MembershipReverifyInflight = Arc<tokio::sync::Mutex<HashMap<String, MembershipInflightEntry>>>;
@@ -143,6 +147,14 @@ struct BotTokenCacheState {
     failure: Option<(StatusCode, Instant)>,
     revision: u64,
     refresh: Option<BotTokenRefreshEntry>,
+}
+
+#[derive(Clone)]
+struct UserGuildsCacheEntry {
+    bearer: String,
+    token_expires_at: Instant,
+    guilds: Vec<DiscordGuild>,
+    guilds_expires_at: Instant,
 }
 
 #[derive(Default)]
@@ -310,6 +322,8 @@ pub struct WebState {
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
     guild_cache: GuildCache,
+    /// Cache: current user's OAuth-visible guild list, populated at login.
+    user_guilds_cache: UserGuildsCache,
     /// Short-lived guild membership cache to bound Discord lookups during API bursts.
     membership_cache: MembershipCache,
     /// In-flight guild membership verification per user id
@@ -345,6 +359,7 @@ impl WebState {
             operational_metrics_cache: Arc::new(Mutex::new(None)),
             permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             guild_cache: Arc::new(tokio::sync::RwLock::new(GuildCacheState::default())),
+            user_guilds_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
@@ -498,6 +513,7 @@ pub fn create_router(state: WebState) -> Router {
 
     let protected = Router::new()
         .route("/api/me", get(api_me))
+        .route("/api/me/guilds", get(api_me_guilds))
         .route("/api/guild/meetings", get(api_guild_meetings))
         .route(
             "/api/guild/settings",
@@ -736,7 +752,7 @@ fn guild_member_status_indicates_membership(status: reqwest::StatusCode) -> bool
 fn allows_settings_token_recovery(path: &str) -> bool {
     matches!(
         path,
-        "/api/me" | "/api/guild/settings" | "/api/guild/settings/bot-token"
+        "/api/me" | "/api/me/guilds" | "/api/guild/settings" | "/api/guild/settings/bot-token"
     )
 }
 
@@ -1202,6 +1218,7 @@ struct CallbackParams {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    expires_in: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1209,9 +1226,18 @@ struct DiscordUserInfo {
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct DiscordGuild {
     id: String,
+    name: String,
+    icon: Option<String>,
+    #[serde(default)]
+    owner: bool,
+    #[serde(
+        default = "zero_permission_bits",
+        deserialize_with = "deserialize_permission_bits"
+    )]
+    permissions: u64,
 }
 
 async fn auth_callback(
@@ -1267,6 +1293,7 @@ async fn auth_callback(
         }
     };
 
+    let token_expires_at = oauth_access_token_expires_at(token.expires_in);
     let bearer = format!("Bearer {}", token.access_token);
 
     // Fetch user info and guilds in parallel
@@ -1330,6 +1357,14 @@ async fn auth_callback(
             auth.secure_cookie,
         );
     }
+    cache_user_discord_guilds(
+        &state.user_guilds_cache,
+        &user.id,
+        bearer,
+        guilds.clone(),
+        token_expires_at,
+    )
+    .await;
 
     // Create session cookie with user ID
     let redirect = sanitize_redirect(&redirect);
@@ -2611,6 +2646,16 @@ struct CurrentUserResponse {
     is_admin: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CurrentUserGuildResponse {
+    guild_id: String,
+    name: String,
+    icon: Option<String>,
+    is_member: bool,
+    is_admin: bool,
+    tenant_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct GuildMeetingsQuery {
     page: Option<u32>,
@@ -3602,6 +3647,183 @@ fn validate_authorized_guild_settings_update(
     validate_guild_settings_update(request)
 }
 
+fn oauth_access_token_expires_at(expires_in: Option<u64>) -> Instant {
+    let ttl = expires_in
+        .unwrap_or(OAUTH_ACCESS_TOKEN_DEFAULT_TTL_SECS)
+        .saturating_sub(OAUTH_ACCESS_TOKEN_CLOCK_SKEW_SECS)
+        .max(1);
+    Instant::now() + Duration::from_secs(ttl)
+}
+
+async fn cache_user_discord_guilds(
+    cache: &UserGuildsCache,
+    user_id: &str,
+    bearer: String,
+    guilds: Vec<DiscordGuild>,
+    token_expires_at: Instant,
+) {
+    let mut cache = cache.write().await;
+    cache.insert(
+        user_id.to_owned(),
+        UserGuildsCacheEntry {
+            bearer,
+            token_expires_at,
+            guilds,
+            guilds_expires_at: Instant::now() + Duration::from_secs(USER_GUILDS_CACHE_TTL_SECS),
+        },
+    );
+}
+
+enum UserGuildsCacheLookup {
+    Guilds(Vec<DiscordGuild>),
+    Bearer(String),
+    Missing,
+}
+
+async fn user_guilds_cache_lookup(cache: &UserGuildsCache, user_id: &str) -> UserGuildsCacheLookup {
+    let now = Instant::now();
+    let cache = cache.read().await;
+    let Some(entry) = cache.get(user_id) else {
+        return UserGuildsCacheLookup::Missing;
+    };
+    if now < entry.guilds_expires_at {
+        return UserGuildsCacheLookup::Guilds(entry.guilds.clone());
+    }
+    if now < entry.token_expires_at {
+        return UserGuildsCacheLookup::Bearer(entry.bearer.clone());
+    }
+    UserGuildsCacheLookup::Missing
+}
+
+async fn refresh_cached_user_discord_guilds(
+    cache: &UserGuildsCache,
+    user_id: &str,
+    guilds: Vec<DiscordGuild>,
+) {
+    let mut cache = cache.write().await;
+    let Some(entry) = cache.get_mut(user_id) else {
+        return;
+    };
+    entry.guilds = guilds;
+    entry.guilds_expires_at = Instant::now() + Duration::from_secs(USER_GUILDS_CACHE_TTL_SECS);
+}
+
+fn discord_user_guilds_api_status(status: reqwest::StatusCode) -> Result<(), StatusCode> {
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Err(StatusCode::BAD_GATEWAY)
+}
+
+async fn fetch_discord_user_guilds(
+    http_client: &reqwest::Client,
+    bearer: &str,
+) -> Result<Vec<DiscordGuild>, StatusCode> {
+    let response = http_client
+        .get("https://discord.com/api/users/@me/guilds")
+        .header("Authorization", bearer)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "discord current-user guilds request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let status = response.status();
+    discord_user_guilds_api_status(status)?;
+    let body = response.text().await.map_err(|err| {
+        warn!(error = %err, "discord current-user guilds response read failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    serde_json::from_str(&body).map_err(|err| {
+        warn!(
+            error = %err,
+            status = %status,
+            body_len = body.len(),
+            "discord current-user guilds response parse failed"
+        );
+        StatusCode::BAD_GATEWAY
+    })
+}
+
+async fn load_current_user_discord_guilds(
+    state: &WebState,
+    user_id: &str,
+) -> Result<Vec<DiscordGuild>, StatusCode> {
+    match user_guilds_cache_lookup(&state.user_guilds_cache, user_id).await {
+        UserGuildsCacheLookup::Guilds(guilds) => Ok(guilds),
+        UserGuildsCacheLookup::Bearer(bearer) => {
+            let guilds = fetch_discord_user_guilds(&state.http_client, &bearer).await?;
+            refresh_cached_user_discord_guilds(&state.user_guilds_cache, user_id, guilds.clone())
+                .await;
+            Ok(guilds)
+        }
+        UserGuildsCacheLookup::Missing => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn list_active_tenant_guilds_for_visible_ids(
+    state: &WebState,
+    guild_ids: &[String],
+) -> Result<HashMap<String, String>, StatusCode> {
+    if guild_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let guild_ids = guild_ids.to_vec();
+    let rows = state
+        .db
+        .query(LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, &[&guild_ids])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tenants = HashMap::new();
+    for row in rows {
+        tenants.insert(row.get("guild_id"), row.get("tenant_id"));
+    }
+    Ok(tenants)
+}
+
+fn discord_guild_is_admin(guild: &DiscordGuild) -> bool {
+    guild.owner || guild.permissions & ADMINISTRATOR != 0
+}
+
+fn current_user_guilds_response(
+    discord_guilds: &[DiscordGuild],
+    tenant_by_guild_id: &HashMap<String, String>,
+) -> Vec<CurrentUserGuildResponse> {
+    let mut seen = HashSet::new();
+    let mut guilds = Vec::new();
+    for guild in discord_guilds {
+        let guild_id = guild.id.trim();
+        let name = guild.name.trim();
+        if guild_id.is_empty() || name.is_empty() || !seen.insert(guild_id.to_owned()) {
+            continue;
+        }
+        guilds.push(CurrentUserGuildResponse {
+            guild_id: guild_id.to_owned(),
+            name: name.to_owned(),
+            icon: guild
+                .icon
+                .as_deref()
+                .map(str::trim)
+                .filter(|icon| !icon.is_empty())
+                .map(str::to_owned),
+            is_member: true,
+            is_admin: discord_guild_is_admin(guild),
+            tenant_id: tenant_by_guild_id.get(guild_id).cloned(),
+        });
+    }
+    guilds.sort_by(|a, b| {
+        b.tenant_id
+            .is_some()
+            .cmp(&a.tenant_id.is_some())
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.guild_id.cmp(&b.guild_id))
+    });
+    guilds
+}
+
 async fn api_me(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -3613,6 +3835,25 @@ async fn api_me(
         guild_id: auth.guild_id.clone(),
         is_admin,
     }))
+}
+
+async fn api_me_guilds(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<Vec<CurrentUserGuildResponse>>, StatusCode> {
+    let discord_guilds = load_current_user_discord_guilds(&state, &user_id).await?;
+    let visible_guild_ids = discord_guilds
+        .iter()
+        .map(|guild| guild.id.trim())
+        .filter(|guild_id| !guild_id.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let tenant_by_guild_id =
+        list_active_tenant_guilds_for_visible_ids(&state, &visible_guild_ids).await?;
+    Ok(Json(current_user_guilds_response(
+        &discord_guilds,
+        &tenant_by_guild_id,
+    )))
 }
 
 async fn api_guild_meetings(
@@ -6267,17 +6508,18 @@ mod operational_endpoint_tests {
 #[cfg(test)]
 mod guild_api_tests {
     use super::{
-        BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState, CachedChannelPermission,
-        DiscordBotTokenValidationError, DiscordBotTokenValidationStage, DiscordGuildFull,
-        DiscordRoleFull, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
-        GUILD_CACHE_REFRESH_INFLIGHT_SECS, GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP,
-        GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT, GUILD_MEETINGS_VISIBILITY_SCAN_MIN, GuildAdminCheck,
-        GuildBotTokenUpdateRequest, GuildCache, GuildCacheState, GuildMeetingsQuery,
-        GuildSettingsDefaults, GuildSettingsUpdateRequest,
-        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, StoredGuildSettings,
-        SummaryTemplateUpsertRequest, advance_bot_token_revision,
+        ADMINISTRATOR, BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState,
+        CachedChannelPermission, DiscordBotTokenValidationError, DiscordBotTokenValidationStage,
+        DiscordGuild, DiscordGuildFull, DiscordRoleFull, DomainKnowledgeListQuery,
+        DomainKnowledgeUpsertRequest, GUILD_CACHE_REFRESH_INFLIGHT_SECS,
+        GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP, GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT,
+        GUILD_MEETINGS_VISIBILITY_SCAN_MIN, GuildAdminCheck, GuildBotTokenUpdateRequest,
+        GuildCache, GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults,
+        GuildSettingsUpdateRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS,
+        StoredGuildSettings, SummaryTemplateUpsertRequest, advance_bot_token_revision,
         bot_auth_header_from_cache_with_resolver, can_scan_new_visibility_channel,
-        classify_discord_bot_token_validation_status, guild_admin_member_status_decision,
+        classify_discord_bot_token_validation_status, current_user_guilds_response,
+        discord_user_guilds_api_status, guild_admin_member_status_decision,
         guild_admin_required_result, guild_bot_token_delete_is_noop,
         guild_info_from_cache_with_resolver, guild_meetings_visibility_scan_limit,
         guild_settings_response, normalize_domain_knowledge_list_filter,
@@ -6288,6 +6530,7 @@ mod guild_api_tests {
         validate_guild_settings_update, validate_summary_template_id,
     };
     use axum::http::StatusCode;
+    use std::collections::HashMap;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -6315,6 +6558,105 @@ mod guild_api_tests {
             retention_transcript_ttl_days: 60,
             summary_enabled: true,
         }
+    }
+
+    fn visible_guild(id: &str, name: &str, permissions: u64) -> DiscordGuild {
+        DiscordGuild {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            icon: None,
+            owner: false,
+            permissions,
+        }
+    }
+
+    #[test]
+    fn me_guilds_reconciles_discord_visibility_with_active_tenants() {
+        let visible = vec![
+            visible_guild("guild-admin", "Admin Guild", ADMINISTRATOR),
+            visible_guild("guild-member", "Member Guild", 0),
+            visible_guild("guild-uninstalled", "Uninstalled Guild", ADMINISTRATOR),
+        ];
+        let tenant_by_guild_id = HashMap::from([
+            ("guild-admin".to_owned(), "tenant-admin".to_owned()),
+            ("guild-member".to_owned(), "tenant-member".to_owned()),
+            ("guild-lost".to_owned(), "tenant-lost".to_owned()),
+        ]);
+
+        let response = current_user_guilds_response(&visible, &tenant_by_guild_id);
+
+        assert_eq!(response.len(), 3);
+        let admin = response
+            .iter()
+            .find(|guild| guild.guild_id == "guild-admin")
+            .expect("admin guild should be listed");
+        assert!(admin.is_member);
+        assert!(admin.is_admin);
+        assert_eq!(admin.tenant_id.as_deref(), Some("tenant-admin"));
+
+        let member = response
+            .iter()
+            .find(|guild| guild.guild_id == "guild-member")
+            .expect("member guild should be listed");
+        assert!(member.is_member);
+        assert!(!member.is_admin);
+        assert_eq!(member.tenant_id.as_deref(), Some("tenant-member"));
+
+        let uninstalled = response
+            .iter()
+            .find(|guild| guild.guild_id == "guild-uninstalled")
+            .expect("visible bot-not-installed guild should be listed");
+        assert!(uninstalled.is_member);
+        assert!(uninstalled.is_admin);
+        assert_eq!(uninstalled.tenant_id, None);
+        assert!(
+            !response.iter().any(|guild| guild.guild_id == "guild-lost"),
+            "installed guilds missing from Discord visibility must fail closed"
+        );
+    }
+
+    #[test]
+    fn me_guilds_treats_guild_owner_as_admin_and_sanitizes_empty_rows() {
+        let mut owner = visible_guild("guild-owner", " Owner Guild ", 0);
+        owner.owner = true;
+        owner.icon = Some(" icon-hash ".to_owned());
+        let visible = vec![
+            visible_guild("", "No id", ADMINISTRATOR),
+            visible_guild("blank-name", "   ", ADMINISTRATOR),
+            owner,
+            visible_guild("guild-owner", "Duplicate Owner", 0),
+        ];
+        let tenant_by_guild_id =
+            HashMap::from([("guild-owner".to_owned(), "tenant-owner".to_owned())]);
+
+        let response = current_user_guilds_response(&visible, &tenant_by_guild_id);
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].guild_id, "guild-owner");
+        assert_eq!(response[0].name, "Owner Guild");
+        assert_eq!(response[0].icon.as_deref(), Some("icon-hash"));
+        assert!(response[0].is_admin);
+        assert_eq!(response[0].tenant_id.as_deref(), Some("tenant-owner"));
+    }
+
+    #[test]
+    fn me_guilds_upstream_statuses_fail_closed() {
+        assert_eq!(
+            discord_user_guilds_api_status(reqwest::StatusCode::OK),
+            Ok(())
+        );
+        assert_eq!(
+            discord_user_guilds_api_status(reqwest::StatusCode::UNAUTHORIZED),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            discord_user_guilds_api_status(reqwest::StatusCode::FORBIDDEN),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            discord_user_guilds_api_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Err(StatusCode::BAD_GATEWAY)
+        );
     }
 
     fn stored_settings_with_token(registered: bool) -> StoredGuildSettings {
@@ -7699,6 +8041,7 @@ mod session_reverify_tests {
     #[test]
     fn settings_token_recovery_paths_are_limited() {
         assert!(allows_settings_token_recovery("/api/me"));
+        assert!(allows_settings_token_recovery("/api/me/guilds"));
         assert!(allows_settings_token_recovery("/api/guild/settings"));
         assert!(allows_settings_token_recovery(
             "/api/guild/settings/bot-token"

@@ -114,6 +114,35 @@ function meetingsResponse() {
   };
 }
 
+function guildsResponse() {
+  return [
+    {
+      guild_id: "guild-1",
+      name: "Guild One",
+      icon: null,
+      is_member: true,
+      is_admin: true,
+      tenant_id: "tenant-1",
+    },
+    {
+      guild_id: "guild-2",
+      name: "Guild Two",
+      icon: null,
+      is_member: true,
+      is_admin: false,
+      tenant_id: "tenant-2",
+    },
+    {
+      guild_id: "guild-3",
+      name: "Guild Three",
+      icon: null,
+      is_member: true,
+      is_admin: true,
+      tenant_id: null,
+    },
+  ];
+}
+
 function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
   vi.stubGlobal("fetch", fetchMock);
   return render(
@@ -125,6 +154,7 @@ function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
 
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -729,6 +759,83 @@ describe("App access controls", () => {
       (await screen.findAllByText(emptyMeetingsText)).length,
     ).toBeGreaterThan(0);
     expect(screen.getByRole("table")).toBeTruthy();
+  });
+
+  it("renders the guild selector with installed guilds selectable", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guild/meetings")) {
+        return Promise.resolve(jsonResponse(meetingsResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    const selector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    expect(selector.value).toBe("guild-1");
+    expect(screen.getByRole("link", { name: settingsLinkName })).toBeTruthy();
+
+    const uninstalled = screen.getByRole("option", {
+      name: "Guild Three（未導入）",
+    }) as HTMLOptionElement;
+    expect(uninstalled.disabled).toBe(true);
+
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+
+    expect(selector.value).toBe("guild-2");
+    expect(window.localStorage.getItem("dt.selectedGuildId")).toBe("guild-2");
+    expect(screen.queryByRole("link", { name: settingsLinkName })).toBeNull();
+  });
+
+  it("falls back to the authenticated guild when guild selector data is unavailable", async () => {
+    window.localStorage.setItem("dt.selectedGuildId", "guild-2");
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(emptyResponse(503));
+      }
+      if (url.startsWith("/api/guild/meetings")) {
+        return Promise.resolve(jsonResponse(meetingsResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(
+      (await screen.findAllByText(emptyMeetingsText)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.queryByRole("combobox", { name: "\u30ae\u30eb\u30c9" }),
+    ).toBeNull();
+    await waitFor(() =>
+      expect(window.localStorage.getItem("dt.selectedGuildId")).toBe("guild-1"),
+    );
+    expect(screen.getByRole("link", { name: settingsLinkName })).toBeTruthy();
   });
 
   it("does not render dashboard table data when membership is denied", async () => {

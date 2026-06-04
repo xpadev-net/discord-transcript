@@ -798,6 +798,17 @@ pub const COUNT_GUILD_MEETINGS_SQL: &str = r#"
 SELECT count(*) FROM meetings WHERE guild_id = $1
 "#;
 
+pub const LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL: &str = r#"
+SELECT tg.guild_id,
+       tg.tenant_id
+FROM tenant_discord_guilds tg
+JOIN tenants t ON t.id = tg.tenant_id
+WHERE tg.guild_id = ANY($1::TEXT[])
+  AND tg.status = 'active'
+  AND t.status = 'active'
+ORDER BY lower(tg.guild_id), tg.guild_id
+"#;
+
 pub const RESOLVE_TENANT_BY_GUILD_SQL: &str = r#"
 SELECT t.id AS tenant_id,
        t.status AS tenant_status,

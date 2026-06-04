@@ -14,6 +14,15 @@ export interface MeResponse {
   is_admin: boolean;
 }
 
+export interface UserGuild {
+  guild_id: string;
+  name: string;
+  icon: string | null;
+  is_member: boolean;
+  is_admin: boolean;
+  tenant_id: string | null;
+}
+
 export interface MeetingListItem {
   id: string;
   title: string | null;
