@@ -143,6 +143,14 @@ function guildsResponse() {
   ];
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
   vi.stubGlobal("fetch", fetchMock);
   return render(
@@ -800,6 +808,352 @@ describe("App access controls", () => {
     expect(selector.value).toBe("guild-2");
     expect(window.localStorage.getItem("dt.selectedGuildId")).toBe("guild-2");
     expect(screen.queryByRole("link", { name: settingsLinkName })).toBeNull();
+  });
+
+  it("loads guild-targeted settings and displays the target guild name", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            ...guildsResponse().slice(0, 1),
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-2/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guilds/guild-2/settings",
+      expect.anything(),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/settings",
+      expect.anything(),
+    );
+  });
+
+  it("saves guild-targeted settings to the route guild", async () => {
+    let savedUrl: string | null = null;
+    let savedRequest: unknown = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            ...guildsResponse().slice(0, 1),
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-2/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings" && init?.method === "PUT") {
+        savedUrl = url;
+        savedRequest = JSON.parse(String(init.body));
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            auto_stop_grace_seconds: 240,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && init?.method === "PUT") {
+        throw new Error("stale current-guild save");
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    const autoStopInput = (await screen.findByLabelText(
+      "\u81ea\u52d5\u505c\u6b62\u307e\u3067\u306e\u79d2\u6570",
+    )) as HTMLInputElement;
+    fireEvent.change(autoStopInput, { target: { value: "240" } });
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    await waitFor(() => expect(savedUrl).toBe("/api/guilds/guild-2/settings"));
+    expect(savedRequest).toMatchObject({
+      auto_stop_grace_seconds: 240,
+    });
+  });
+
+  it("ignores stale save responses after switching target guilds", async () => {
+    const staleSave = deferred<Response>();
+    let guildTwoSaveRequest: unknown = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-1",
+              name: "Guild One",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-1",
+            },
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-1/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-1/settings" && init?.method === "PUT") {
+        return staleSave.promise;
+      }
+      if (url === "/api/guilds/guild-2/settings" && !init?.method) {
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            auto_stop_grace_seconds: 240,
+          }),
+        );
+      }
+      if (url === "/api/guilds/guild-2/settings" && init?.method === "PUT") {
+        guildTwoSaveRequest = JSON.parse(String(init.body));
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            auto_stop_grace_seconds: 240,
+          }),
+        );
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-1/settings", fetchMock);
+
+    const autoStopInput = (await screen.findByLabelText(
+      "\u81ea\u52d5\u505c\u6b62\u307e\u3067\u306e\u79d2\u6570",
+    )) as HTMLInputElement;
+    fireEvent.change(autoStopInput, { target: { value: "333" } });
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    const selector = screen.getByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    }) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    const guildTwoAutoStopInput = screen.getByLabelText(
+      "\u81ea\u52d5\u505c\u6b62\u307e\u3067\u306e\u79d2\u6570",
+    ) as HTMLInputElement;
+    await waitFor(() => expect(guildTwoAutoStopInput.value).toBe("240"));
+
+    staleSave.resolve(
+      jsonResponse({
+        ...settingsResponse(),
+        auto_stop_grace_seconds: 333,
+      }),
+    );
+
+    await waitFor(() => expect(guildTwoAutoStopInput.value).toBe("240"));
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    await waitFor(() =>
+      expect(guildTwoSaveRequest).toMatchObject({
+        auto_stop_grace_seconds: 240,
+      }),
+    );
+  });
+
+  it("moves an open settings page to the newly selected guild", async () => {
+    let savedUrl: string | null = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-1",
+              name: "Guild One",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-1",
+            },
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-1/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings" && init?.method === "PUT") {
+        savedUrl = url;
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-1/settings", fetchMock);
+
+    const selector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: saveButtonName }));
+
+    await waitFor(() => expect(savedUrl).toBe("/api/guilds/guild-2/settings"));
+  });
+
+  it("blocks a guild-targeted settings route for non-admin selected guilds", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guilds/guild-2/settings",
+      expect.anything(),
+    );
+  });
+
+  it("shows a no-selectable-guild state for guild-targeted settings", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-3",
+              name: "Guild Three",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: null,
+            },
+          ]),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-3/settings", fetchMock);
+
+    expect(
+      await screen.findByText("設定できるギルドがありません"),
+    ).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guilds/guild-3/settings",
+      expect.anything(),
+    );
   });
 
   it("falls back to the authenticated guild when guild selector data is unavailable", async () => {
