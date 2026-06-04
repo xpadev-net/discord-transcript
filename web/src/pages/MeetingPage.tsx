@@ -358,6 +358,7 @@ export function MeetingPage() {
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const feedbackSubmitControllerRef = useRef<AbortController | null>(null);
   const feedbackReturnFocusRef = useRef<HTMLElement | null>(null);
+  const feedbackSuccessTimeoutRef = useRef<number | null>(null);
 
   const {
     meeting,
@@ -430,18 +431,43 @@ export function MeetingPage() {
     return () => controller.abort();
   }, [meetingId, showAudioAndDebug]);
 
+  const clearFeedbackSuccessTimer = useCallback(() => {
+    if (feedbackSuccessTimeoutRef.current !== null) {
+      window.clearTimeout(feedbackSuccessTimeoutRef.current);
+      feedbackSuccessTimeoutRef.current = null;
+    }
+  }, []);
+
+  const showFeedbackSuccess = useCallback(
+    (message: string) => {
+      clearFeedbackSuccessTimer();
+      setFeedbackSuccess(message);
+      feedbackSuccessTimeoutRef.current = window.setTimeout(() => {
+        setFeedbackSuccess(null);
+        feedbackSuccessTimeoutRef.current = null;
+      }, 4000);
+    },
+    [clearFeedbackSuccessTimer],
+  );
+
   useEffect(() => {
     if (!meetingId) {
+      clearFeedbackSuccessTimer();
+      setFeedbackSuccess(null);
       return;
     }
     feedbackSubmitControllerRef.current?.abort();
+    clearFeedbackSuccessTimer();
     setFeedbackSegment(null);
     setFeedbackDraft(null);
     setFeedbackSubmitting(false);
     setFeedbackError(null);
     setFeedbackSuccess(null);
-    return () => feedbackSubmitControllerRef.current?.abort();
-  }, [meetingId]);
+    return () => {
+      feedbackSubmitControllerRef.current?.abort();
+      clearFeedbackSuccessTimer();
+    };
+  }, [meetingId, clearFeedbackSuccessTimer]);
 
   const openFeedback = useCallback(
     (segment: TranscriptSegment, returnFocusTo: HTMLElement) => {
@@ -449,9 +475,10 @@ export function MeetingPage() {
       setFeedbackSegment(segment);
       setFeedbackDraft(emptyFeedbackDraft(segment));
       setFeedbackError(null);
+      clearFeedbackSuccessTimer();
       setFeedbackSuccess(null);
     },
-    [],
+    [clearFeedbackSuccessTimer],
   );
 
   const restoreFeedbackFocus = useCallback(() => {
@@ -471,49 +498,58 @@ export function MeetingPage() {
     restoreFeedbackFocus();
   }, [feedbackSubmitting, restoreFeedbackFocus]);
 
-  const submitFeedback = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!meetingId || !feedbackSegment || !feedbackDraft) {
-      return;
-    }
-    const validationError = validateFeedbackDraft(feedbackDraft);
-    if (validationError) {
-      setFeedbackError(validationError);
-      return;
-    }
+  const submitFeedback = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!meetingId || !feedbackSegment || !feedbackDraft) {
+        return;
+      }
+      const validationError = validateFeedbackDraft(feedbackDraft);
+      if (validationError) {
+        setFeedbackError(validationError);
+        return;
+      }
 
-    setFeedbackSubmitting(true);
-    setFeedbackError(null);
-    feedbackSubmitControllerRef.current?.abort();
-    const controller = new AbortController();
-    feedbackSubmitControllerRef.current = controller;
-    createMeetingFeedback(
+      setFeedbackSubmitting(true);
+      setFeedbackError(null);
+      feedbackSubmitControllerRef.current?.abort();
+      const controller = new AbortController();
+      feedbackSubmitControllerRef.current = controller;
+      createMeetingFeedback(
+        meetingId,
+        buildFeedbackRequest(feedbackSegment, feedbackDraft),
+        controller.signal,
+      )
+        .then(() => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          showFeedbackSuccess("フィードバックを送信しました");
+          setFeedbackSegment(null);
+          setFeedbackDraft(null);
+          restoreFeedbackFocus();
+        })
+        .catch((err: unknown) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setFeedbackError(feedbackSubmitErrorMessage(err));
+        })
+        .finally(() => {
+          if (feedbackSubmitControllerRef.current === controller) {
+            feedbackSubmitControllerRef.current = null;
+            setFeedbackSubmitting(false);
+          }
+        });
+    },
+    [
+      feedbackDraft,
+      feedbackSegment,
       meetingId,
-      buildFeedbackRequest(feedbackSegment, feedbackDraft),
-      controller.signal,
-    )
-      .then(() => {
-        if (controller.signal.aborted) {
-          return;
-        }
-        setFeedbackSuccess("フィードバックを送信しました");
-        setFeedbackSegment(null);
-        setFeedbackDraft(null);
-        restoreFeedbackFocus();
-      })
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) {
-          return;
-        }
-        setFeedbackError(feedbackSubmitErrorMessage(err));
-      })
-      .finally(() => {
-        if (feedbackSubmitControllerRef.current === controller) {
-          feedbackSubmitControllerRef.current = null;
-          setFeedbackSubmitting(false);
-        }
-      });
-  };
+      restoreFeedbackFocus,
+      showFeedbackSuccess,
+    ],
+  );
 
   if (error) {
     return (
