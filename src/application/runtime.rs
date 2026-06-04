@@ -2857,6 +2857,46 @@ impl EventHandler for ScaffoldHandler {
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
+                                drop(states);
+                                let mut removed_session = {
+                                    let _voice_event_guard =
+                                        handler.voice_event_gate.write().await;
+                                    let mut sessions = handler.sessions.lock().await;
+                                    if sessions.get(&guild_for_task).is_some_and(|session| {
+                                        session.meeting_id == expected_meeting_id_ref
+                                    }) {
+                                        sessions.remove(&guild_for_task)
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(session) = removed_session.as_mut() {
+                                    flush_removed_session_after_stop(
+                                        session,
+                                        &guild_for_task,
+                                        "auto-stop missing timer state after flush failure",
+                                    );
+                                }
+                                let latest_tracker = {
+                                    let _voice_event_guard =
+                                        handler.voice_event_gate.write().await;
+                                    let tracker = handler.ssrc_tracker.lock().await;
+                                    tracker.clone()
+                                };
+                                if let Some(session) = &removed_session {
+                                    session.persist_ssrc_mapping(&latest_tracker);
+                                }
+                                {
+                                    let mut titles =
+                                        handler.live_transcription_titles.lock().await;
+                                    titles.remove(expected_meeting_id_ref);
+                                }
+                                let mut startups = handler.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                );
                                 return;
                             };
                             state.retry_after_failed_stop();
@@ -3558,8 +3598,10 @@ impl ScaffoldHandler {
                     error!(
                         meeting_id,
                         error = %err,
-                        "failed to mark meeting as failed after voice join error; retaining local recording state for retry"
+                        "failed to mark meeting as failed after voice join error; clearing startup reservation but retaining local recording state"
                     );
+                    let mut startups = self.recording_startups.lock().await;
+                    clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
                     return;
                 }
             }
@@ -5745,6 +5787,9 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             );
                                         }
                                         let latest_tracker = {
+                                            // lifecycle_permit is still held, so record-start
+                                            // cannot concurrently reset the tracker. Keep this
+                                            // path in command_gate -> voice_event_gate order.
                                             let _voice_event_guard =
                                                 runtime.voice_event_gate.write().await;
                                             let tracker = runtime.ssrc_tracker.lock().await;
