@@ -2618,6 +2618,7 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop cache-miss exhaustion; rescheduling"
                                         );
+                                        grace_cache_misses = 0;
                                         retry_teardown_without_auto_stop_state = true;
                                         continue;
                                     }
@@ -3510,6 +3511,15 @@ impl ScaffoldHandler {
                     status = ?meeting_status,
                     "recording was stopped before voice join verification completed"
                 );
+                // Keep the lifecycle gate held until this leave completes so a
+                // follow-up start cannot join and then be kicked by this cleanup.
+                leave_voice_with_timeout(
+                    manager,
+                    guild_id,
+                    meeting_id,
+                    "already-stopped record-start",
+                )
+                .await;
                 let mut startups = self.recording_startups.lock().await;
                 clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
                 return Ok(RecordingStartJoinVerification::AlreadyStopped);
@@ -3774,13 +3784,6 @@ impl ScaffoldHandler {
             .verify_recording_start_after_join(manager.as_ref(), guild_id, &guild_key, &meeting_id)
             .await?;
         if join_verification == RecordingStartJoinVerification::AlreadyStopped {
-            leave_voice_with_timeout(
-                manager.as_ref(),
-                guild_id,
-                &meeting_id,
-                "already-stopped record-start",
-            )
-            .await;
             return Ok(format!(
                 "{response}\n(参加完了前に停止処理が始まりました。停止処理の完了を待っています。)"
             ));
@@ -5548,6 +5551,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect cache-miss exhaustion; rescheduling"
                                                 );
+                                                grace_cache_misses = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
