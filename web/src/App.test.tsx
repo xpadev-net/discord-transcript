@@ -105,6 +105,83 @@ function summaryTemplate(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function aiMemoryNote(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "memory-1",
+    title: "Alpha naming",
+    body: "Use Alpha Team for the product group.",
+    tags: ["terminology"],
+    source_type: "manual",
+    source_meeting_id: null,
+    source_feedback_id: null,
+    confidence: 0.8,
+    active: true,
+    pinned: false,
+    last_used_at: null,
+    archived_at: null,
+    archived_actor_user_id: null,
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function feedbackQueueItem(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "feedback-1",
+    meeting_id: "meeting-1",
+    transcript_segment_id: "segment-1",
+    feedback_type: "term",
+    term_type: "general_term",
+    original_text: "Alpha term",
+    corrected_text: "Alpha Team",
+    speaker_id: null,
+    corrected_speaker_id: null,
+    note: "Prefer team name",
+    target_domain_knowledge_id: null,
+    target_ai_memory_note_id: null,
+    actor_user_id: "admin-1",
+    status: "open",
+    created_at: "2026-06-01T00:10:00.000Z",
+    reviewed_at: null,
+    reviewed_actor_user_id: null,
+    ...overrides,
+  };
+}
+
+function personAlias(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "alias-1",
+    canonical_name: "Alice Tanaka",
+    alias: "Alice",
+    discord_user_id: "user-1",
+    source_type: "manual",
+    source_meeting_id: null,
+    source_feedback_id: null,
+    confidence: 0.9,
+    active: true,
+    review_status: "accepted",
+    reviewed_at: null,
+    reviewed_actor_user_id: null,
+    archived_at: null,
+    archived_actor_user_id: null,
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function emptyCustomizationResponse(url: string): Response | null {
+  if (
+    url === "/api/guild/ai-memory?include_archived=true" ||
+    url === "/api/guild/feedback?status=open" ||
+    url === "/api/guild/person-aliases?include_archived=true"
+  ) {
+    return jsonResponse([]);
+  }
+  return null;
+}
+
 function meetingsResponse(
   guildId = "guild-1",
   meetings: unknown[] = [],
@@ -218,7 +295,20 @@ function deferred<T>() {
 }
 
 function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
-  vi.stubGlobal("fetch", fetchMock);
+  const callFetchMock = fetchMock as (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => Promise<Response>;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await callFetchMock(input, init);
+      if (!init?.method && response.status === 404) {
+        return emptyCustomizationResponse(input.toString()) ?? response;
+      }
+      return response;
+    }),
+  );
   return render(
     <MemoryRouter initialEntries={[route]}>
       <App />
@@ -570,6 +660,326 @@ describe("App access controls", () => {
       "/api/guild/summary-templates?include_archived=true",
       expect.anything(),
     );
+  });
+
+  it("renders AI memory, feedback queue, and person alias settings for admins", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([domainKnowledgeItem()]));
+      }
+      if (url === "/api/guild/ai-memory?include_archived=true") {
+        return Promise.resolve(jsonResponse([aiMemoryNote({ pinned: true })]));
+      }
+      if (url === "/api/guild/feedback?status=open") {
+        return Promise.resolve(jsonResponse([feedbackQueueItem()]));
+      }
+      if (url === "/api/guild/person-aliases?include_archived=true") {
+        return Promise.resolve(jsonResponse([personAlias()]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([summaryTemplate()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    expect(await screen.findByText("AIメモ")).toBeTruthy();
+    expect(screen.getByText("有効: 1件 / ピン留め: 1件")).toBeTruthy();
+    expect(screen.getByText("フィードバックキュー")).toBeTruthy();
+    expect(screen.getByText("未対応: 1件")).toBeTruthy();
+    expect(screen.getByText("人名別名")).toBeTruthy();
+    expect(screen.getByText("有効: 1件")).toBeTruthy();
+    expect(screen.getByDisplayValue("Alpha naming")).toBeTruthy();
+    expect(screen.getByDisplayValue("Alice Tanaka")).toBeTruthy();
+  });
+
+  it("saves edited AI memory drafts with trimmed fields", async () => {
+    let savedRequest: unknown = null;
+    let currentMemory = aiMemoryNote();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/ai-memory?include_archived=true") {
+        return Promise.resolve(jsonResponse([currentMemory]));
+      }
+      if (url === "/api/guild/feedback?status=open") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/person-aliases?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/ai-memory/memory-1" && init?.method === "PUT") {
+        savedRequest = JSON.parse(String(init.body));
+        currentMemory = aiMemoryNote({
+          title: "Beta naming",
+          body: "Use Beta Team.",
+          tags: ["terminology", "summary_hint"],
+          confidence: 0.75,
+          updated_at: "2026-06-02T00:00:00.000Z",
+        });
+        return Promise.resolve(jsonResponse(currentMemory));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("AIメモタイトル"), {
+      target: { value: "  Beta naming  " },
+    });
+    fireEvent.change(screen.getByLabelText("AIメモ本文"), {
+      target: { value: "  Use Beta Team.  " },
+    });
+    fireEvent.change(screen.getByLabelText("タグ"), {
+      target: { value: "terminology, summary_hint" },
+    });
+    fireEvent.change(screen.getAllByLabelText("信頼度")[0], {
+      target: { value: "0.75" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "AIメモを保存" }));
+
+    await waitFor(() =>
+      expect(savedRequest).toEqual({
+        title: "Beta naming",
+        body: "Use Beta Team.",
+        tags: ["terminology", "summary_hint"],
+        confidence: 0.75,
+        active: true,
+        pinned: false,
+      }),
+    );
+    expect(await screen.findByText("AIメモを保存しました")).toBeTruthy();
+  });
+
+  it("updates feedback queue status and refreshes open items", async () => {
+    let statusRequest: unknown = null;
+    let feedbackItems = [feedbackQueueItem()];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/ai-memory?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/feedback?status=open") {
+        return Promise.resolve(jsonResponse(feedbackItems));
+      }
+      if (url === "/api/guild/person-aliases?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (
+        url === "/api/guild/feedback/feedback-1/status" &&
+        init?.method === "PUT"
+      ) {
+        statusRequest = JSON.parse(String(init.body));
+        feedbackItems = [];
+        return Promise.resolve(
+          jsonResponse(feedbackQueueItem({ status: "accepted" })),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Alpha Team を採用" }),
+    );
+
+    await waitFor(() => expect(statusRequest).toEqual({ status: "accepted" }));
+    expect(
+      await screen.findByText("フィードバックを採用しました"),
+    ).toBeTruthy();
+    expect(screen.getByText("未対応のフィードバックはありません")).toBeTruthy();
+  });
+
+  it("saves person aliases and shows server errors inline", async () => {
+    let savedRequest: unknown = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/ai-memory?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/feedback?status=open") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/person-aliases?include_archived=true") {
+        return Promise.resolve(jsonResponse([personAlias()]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (
+        url === "/api/guild/person-aliases/alias-1" &&
+        init?.method === "PUT"
+      ) {
+        savedRequest = JSON.parse(String(init.body));
+        return Promise.resolve(emptyResponse(400));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("別名"), {
+      target: { value: "  Ally  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "人名別名を保存" }));
+
+    await waitFor(() =>
+      expect(savedRequest).toMatchObject({
+        canonical_name: "Alice Tanaka",
+        alias: "Ally",
+        discord_user_id: "user-1",
+        confidence: 0.9,
+        active: true,
+        review_status: "accepted",
+      }),
+    );
+    expect(
+      await screen.findByText("入力内容がサーバーの検証に通りませんでした"),
+    ).toBeTruthy();
+  });
+
+  it("ignores stale customization loads after switching target guilds", async () => {
+    const staleMemory = deferred<Response>();
+    let memoryCalls = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              guild_id: "guild-1",
+              name: "Guild One",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-1",
+            },
+            {
+              guild_id: "guild-2",
+              name: "Guild Two",
+              icon: null,
+              is_member: true,
+              is_admin: true,
+              tenant_id: "tenant-2",
+            },
+          ]),
+        );
+      }
+      if (url === "/api/guilds/guild-1/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/ai-memory?include_archived=true") {
+        memoryCalls += 1;
+        return memoryCalls === 1
+          ? staleMemory.promise
+          : Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/feedback?status=open") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/person-aliases?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-1/settings", fetchMock);
+
+    const selector = (await screen.findByRole("combobox", {
+      name: "\u30ae\u30eb\u30c9",
+    })) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "guild-2" } });
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    staleMemory.resolve(
+      jsonResponse([aiMemoryNote({ title: "Stale memory" })]),
+    );
+
+    await waitFor(() => expect(memoryCalls).toBe(1));
+    expect(screen.queryByDisplayValue("Stale memory")).toBeNull();
   });
 
   it("saves edited domain knowledge drafts with trimmed fields", async () => {

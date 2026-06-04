@@ -124,6 +124,60 @@ export interface SummaryTemplateUpsertRequest {
   active?: boolean;
 }
 
+export type AiMemorySourceType =
+  | "ai_meeting_extraction"
+  | "user_feedback"
+  | "manual"
+  | "vc_participant"
+  | "promotion_candidate";
+
+export type AiMemoryTag =
+  | "person"
+  | "alias"
+  | "project"
+  | "product"
+  | "terminology"
+  | "decision"
+  | "team_convention"
+  | "summary_hint"
+  | "transcription_hint"
+  | "uncertain";
+
+export interface AiMemoryNote {
+  id: string;
+  title: string;
+  body: string;
+  tags: AiMemoryTag[];
+  source_type: AiMemorySourceType;
+  source_meeting_id: string | null;
+  source_feedback_id: string | null;
+  confidence: number | null;
+  active: boolean;
+  pinned: boolean;
+  last_used_at: string | null;
+  archived_at: string | null;
+  archived_actor_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AiMemoryUpsertRequest {
+  id?: string;
+  title: string;
+  body: string;
+  tags?: AiMemoryTag[];
+  source_type?: AiMemorySourceType;
+  source_meeting_id?: string | null;
+  source_feedback_id?: string | null;
+  confidence?: number | null;
+  active?: boolean;
+  pinned?: boolean;
+}
+
+export interface AiMemoryPromoteRequest {
+  content_type: DomainKnowledgeContentType;
+}
+
 export interface SpeakerResponse {
   id: string;
   username: string | null;
@@ -157,7 +211,13 @@ export interface TranscriptStateResponse {
   updated_at: string | null;
 }
 
-export type TranscriptFeedbackType = "mistranscription" | "speaker" | "term";
+export type TranscriptFeedbackType =
+  | "mistranscription"
+  | "speaker"
+  | "term"
+  | "person_alias"
+  | "domain_knowledge"
+  | "ai_memory";
 
 export type TranscriptFeedbackTermType =
   | "general_term"
@@ -178,6 +238,8 @@ export interface TranscriptFeedbackRequest {
   speaker_id?: string;
   corrected_speaker_id?: string;
   note?: string;
+  target_domain_knowledge_id?: string;
+  target_ai_memory_note_id?: string;
 }
 
 export interface TranscriptFeedbackResponse {
@@ -191,11 +253,66 @@ export interface TranscriptFeedbackResponse {
   speaker_id: string | null;
   corrected_speaker_id: string | null;
   note: string | null;
+  target_domain_knowledge_id: string | null;
+  target_ai_memory_note_id: string | null;
   actor_user_id: string;
   status: string;
   created_at: string;
   reviewed_at: string | null;
   reviewed_actor_user_id: string | null;
+}
+
+export type TranscriptFeedbackStatus =
+  | "open"
+  | "accepted"
+  | "dismissed"
+  | "converted_to_domain_knowledge"
+  | "converted_to_ai_memory";
+
+export interface TranscriptFeedbackStatusRequest {
+  status: Exclude<TranscriptFeedbackStatus, "open">;
+  target_domain_knowledge_id?: string | null;
+  target_ai_memory_note_id?: string | null;
+}
+
+export type PersonAliasSourceType =
+  | "user_feedback"
+  | "ai_inference"
+  | "vc_participant"
+  | "manual";
+
+export type PersonAliasReviewStatus = "unreviewed" | "accepted" | "dismissed";
+
+export interface PersonAlias {
+  id: string;
+  canonical_name: string;
+  alias: string;
+  discord_user_id: string | null;
+  source_type: PersonAliasSourceType;
+  source_meeting_id: string | null;
+  source_feedback_id: string | null;
+  confidence: number | null;
+  active: boolean;
+  review_status: PersonAliasReviewStatus;
+  reviewed_at: string | null;
+  reviewed_actor_user_id: string | null;
+  archived_at: string | null;
+  archived_actor_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PersonAliasUpsertRequest {
+  id?: string;
+  canonical_name: string;
+  alias: string;
+  discord_user_id?: string | null;
+  source_type?: PersonAliasSourceType;
+  source_meeting_id?: string | null;
+  source_feedback_id?: string | null;
+  confidence?: number | null;
+  active?: boolean;
+  review_status?: PersonAliasReviewStatus;
 }
 
 export type TranscriptStreamState =
