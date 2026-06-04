@@ -168,9 +168,11 @@ export function DashboardPage({
           <p>
             {activeData
               ? headerDescription
-              : !loading && !selectedGuildId
-                ? emptyGuildMessage
-                : "\u6700\u65b0\u306e\u4f1a\u8b70\u3092\u8aad\u307f\u8fbc\u3093\u3067\u3044\u307e\u3059"}
+              : loading
+                ? "\u6700\u65b0\u306e\u4f1a\u8b70\u3092\u8aad\u307f\u8fbc\u3093\u3067\u3044\u307e\u3059"
+                : selectedGuildId
+                  ? meetingCountText
+                  : emptyGuildMessage}
           </p>
         </div>
         <button

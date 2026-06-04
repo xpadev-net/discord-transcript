@@ -3316,9 +3316,7 @@ fn guild_meetings_response_total(is_admin: bool, raw_total: i64, visible_count: 
 }
 
 fn user_can_access_target_guild(discord_guilds: &[DiscordGuild], guild_id: &str) -> bool {
-    discord_guilds
-        .iter()
-        .any(|guild| guild.id.trim() == guild_id)
+    discord_guilds.iter().any(|guild| guild.id == guild_id)
 }
 
 fn target_guild_has_active_installation(
@@ -7948,7 +7946,7 @@ mod guild_api_tests {
     fn target_guild_meetings_require_visible_installed_guild() {
         let visible = vec![
             visible_guild("guild-current", "Current", 0),
-            visible_guild(" guild-target ", "Target", 0),
+            visible_guild("guild-target", "Target", 0),
         ];
         let tenant_by_guild_id =
             HashMap::from([("guild-target".to_owned(), "tenant-target".to_owned())]);
