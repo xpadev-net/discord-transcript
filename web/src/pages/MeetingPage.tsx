@@ -1,4 +1,10 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useParams } from "react-router-dom";
 import { AudioPlayer } from "../components/AudioPlayer";
 import { DebugDownloads } from "../components/DebugDownloads";
@@ -44,6 +50,12 @@ const termTypeOptions: Array<{
   { value: "wording_rule", label: "表記ルール" },
   { value: "prohibited_item", label: "禁止語" },
 ];
+
+const FOCUSABLE_SELECTOR =
+  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
+
+const INITIAL_FEEDBACK_FOCUS_SELECTOR =
+  "select:not(:disabled), textarea:not(:disabled), input:not(:disabled)";
 
 interface FeedbackDraft {
   feedbackType: TranscriptFeedbackType;
@@ -141,12 +153,10 @@ function FeedbackDialog({
   onClose,
 }: FeedbackDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
-  const focusableSelector =
-    'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
 
   useEffect(() => {
     const firstField = dialogRef.current?.querySelector<HTMLElement>(
-      "select:not(:disabled), textarea:not(:disabled), input:not(:disabled)",
+      INITIAL_FEEDBACK_FOCUS_SELECTOR,
     );
     firstField?.focus();
   }, []);
@@ -167,7 +177,7 @@ function FeedbackDialog({
       }
 
       const focusable = Array.from(
-        dialogRef.current?.querySelectorAll<HTMLElement>(focusableSelector) ??
+        dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR) ??
           [],
       );
       if (focusable.length === 0) {
@@ -444,14 +454,14 @@ export function MeetingPage() {
     setFeedbackSuccess(null);
   };
 
-  const restoreFeedbackFocus = () => {
+  const restoreFeedbackFocus = useCallback(() => {
     window.setTimeout(() => {
       feedbackReturnFocusRef.current?.focus();
       feedbackReturnFocusRef.current = null;
     }, 0);
-  };
+  }, []);
 
-  const closeFeedback = () => {
+  const closeFeedback = useCallback(() => {
     if (feedbackSubmitting) {
       return;
     }
@@ -459,7 +469,7 @@ export function MeetingPage() {
     setFeedbackDraft(null);
     setFeedbackError(null);
     restoreFeedbackFocus();
-  };
+  }, [feedbackSubmitting, restoreFeedbackFocus]);
 
   const submitFeedback = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
