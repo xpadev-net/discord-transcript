@@ -88,6 +88,7 @@ const FINAL_FLUSH_MAX_RETRIES: u32 = 10;
 const AUTO_STOP_GRACE_MAX_RESCHEDULES: u32 = 10;
 const DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES: u32 = 10;
 const RECORDING_STOP_MAX_RETRIES: u32 = 10;
+const RECORDING_LOOKUP_MAX_RETRIES: u32 = 10;
 const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -510,6 +511,21 @@ fn recording_stop_terminal_error(
     ))
 }
 
+fn recording_lookup_terminal_error(
+    lookup_failures: &mut u32,
+    phase: &str,
+    err: &str,
+) -> Option<String> {
+    *lookup_failures = lookup_failures.saturating_add(1);
+    if *lookup_failures < RECORDING_LOOKUP_MAX_RETRIES {
+        return None;
+    }
+    Some(format!(
+        "recording state lookup failed after {} {phase} check(s): {err}",
+        *lookup_failures,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordingStartJoinVerification {
     Active,
@@ -707,6 +723,14 @@ struct RecordingStopTeardownRequest<'a> {
     expected_meeting_id: &'a str,
     reason: StopReason,
     phase: &'a str,
+}
+
+struct RecordingLookupFailureRequest<'a> {
+    guild_id: GuildId,
+    guild_key: &'a str,
+    expected_meeting_id: &'a str,
+    terminal_error: &'a str,
+    context: &'a str,
 }
 
 #[must_use]
@@ -2556,9 +2580,14 @@ impl EventHandler for ScaffoldHandler {
             .await;
         let (signal, timer_generation) = {
             let mut states = self.auto_stop_states.lock().await;
-            let state = states
-                .entry(guild_key.clone())
-                .or_insert_with(|| AutoStopState::new(grace));
+            let state = states.entry(guild_key.clone()).or_insert_with(|| {
+                AutoStopState::new_for_meeting(grace, active_meeting_id.clone())
+            });
+            if let Some(active_meeting_id) = active_meeting_id.as_deref()
+                && !state.belongs_to_meeting(active_meeting_id)
+            {
+                *state = AutoStopState::new_for_meeting(grace, Some(active_meeting_id.to_owned()));
+            }
             let signal = state.on_non_bot_member_count_changed(non_bot);
             (signal, state.timer_generation())
         };
@@ -2581,6 +2610,7 @@ impl EventHandler for ScaffoldHandler {
                 // AutoStopState and drives teardown directly.
                 let mut final_flush_failures = 0u32;
                 let mut grace_cache_misses = 0u32;
+                let mut lookup_failures = 0u32;
                 let mut stop_failures = 0u32;
                 let mut retry_teardown_without_auto_stop_state = false;
                 let stop_result = loop {
@@ -2605,15 +2635,57 @@ impl EventHandler for ScaffoldHandler {
                     let current_meeting_id = match handler.active_meeting_id_result().await {
                         Ok(current_meeting_id) => current_meeting_id,
                         Err(err) => {
+                            let lookup_error = err.to_string();
+                            let terminal_error = recording_lookup_terminal_error(
+                                &mut lookup_failures,
+                                "auto-stop grace",
+                                &lookup_error,
+                            );
                             warn!(
                                 guild_id = %guild_for_task,
                                 meeting_id = expected_meeting_id_ref,
                                 error = %err,
+                                attempts = lookup_failures,
                                 "failed to verify active meeting during auto-stop grace; rescheduling"
                             );
+                            if let Some(terminal_error) = terminal_error {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    attempts = lookup_failures,
+                                    "auto-stop active-meeting lookup retry limit reached; marking recording failed"
+                                );
+                                match handler
+                                    .fail_recording_after_lookup_exhaustion(
+                                        &lifecycle_permit,
+                                        &ctx_for_task,
+                                        ctx_for_task.http.as_ref(),
+                                        &RecordingLookupFailureRequest {
+                                            guild_id: handler.guild_id,
+                                            guild_key: &guild_for_task,
+                                            expected_meeting_id: expected_meeting_id_ref,
+                                            terminal_error: &terminal_error,
+                                            context: "auto-stop active-meeting lookup",
+                                        },
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => return,
+                                    Err(mark_err) => {
+                                        warn!(
+                                            guild_id = %guild_for_task,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %mark_err,
+                                            "failed to mark recording failed after auto-stop lookup exhaustion; rescheduling"
+                                        );
+                                        lookup_failures = 0;
+                                    }
+                                }
+                            }
                             continue;
                         }
                     };
+                    lookup_failures = 0;
                     if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
                         // Clear timer flag before returning.
                         let mut states = handler.auto_stop_states.lock().await;
@@ -3457,7 +3529,12 @@ impl ScaffoldHandler {
         };
         {
             let mut states = self.auto_stop_states.lock().await;
-            states.remove(request.guild_key);
+            let should_remove = states
+                .get(request.guild_key)
+                .is_none_or(|state| state.belongs_to_meeting(request.expected_meeting_id));
+            if should_remove {
+                states.remove(request.guild_key);
+            }
         }
         if let Some(session) = &removed_session {
             let mut titles = self.live_transcription_titles.lock().await;
@@ -3545,6 +3622,46 @@ impl ScaffoldHandler {
         }
         let mut startups = self.recording_startups.lock().await;
         clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
+    }
+
+    async fn fail_recording_after_lookup_exhaustion(
+        &self,
+        permit: &RecordingLifecycleWritePermit<'_>,
+        ctx: &Context,
+        http: &Http,
+        request: &RecordingLookupFailureRequest<'_>,
+    ) -> Result<(), String> {
+        self.fail_recording_after_teardown_exhaustion(
+            permit,
+            ctx,
+            request.guild_id,
+            request.guild_key,
+            request.expected_meeting_id,
+            request.terminal_error,
+        )
+        .await?;
+
+        if let Err(status_err) = self
+            .update_status_message(
+                http,
+                request.expected_meeting_id,
+                StatusMessageUpdate::Failed {
+                    phase: "Recording lookup",
+                    error: request.terminal_error,
+                },
+            )
+            .await
+        {
+            warn!(
+                guild_id = %request.guild_key,
+                meeting_id = request.expected_meeting_id,
+                error = %status_err,
+                context = request.context,
+                "failed to notify recording lookup exhaustion"
+            );
+        }
+
+        Ok(())
     }
 
     async fn fail_recording_after_teardown_exhaustion(
@@ -4070,15 +4187,13 @@ impl ScaffoldHandler {
                                     .map(|session| session.meeting_id.clone())
                             };
                             if current_session_meeting_id.as_deref() != Some(meeting_id.as_str()) {
-                                if current_session_meeting_id.is_none() {
-                                    leave_voice_with_timeout(
-                                        manager.as_ref(),
-                                        guild_id,
-                                        &meeting_id,
-                                        "record-start retry cleanup after stop",
-                                    )
-                                    .await;
-                                }
+                                leave_voice_with_timeout(
+                                    manager.as_ref(),
+                                    guild_id,
+                                    &meeting_id,
+                                    "record-start retry cleanup after stop",
+                                )
+                                .await;
                                 return Ok(format!(
                                     "{response}\n(参加再試行中に停止処理が始まりました。停止処理の完了を待っています。)"
                                 ));
@@ -5788,6 +5903,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         // if later voice cache checks would otherwise cancel.
                         let mut final_flush_failures = 0u32;
                         let mut grace_cache_misses = 0u32;
+                        let mut lookup_failures = 0u32;
                         let mut stop_failures = 0u32;
                         let mut retry_teardown_after_failed_terminal_cleanup = false;
                         let stop_result = loop {
@@ -5810,12 +5926,54 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             {
                                 Ok(current_meeting_id) => current_meeting_id,
                                 Err(err) => {
+                                    let lookup_error = err.to_string();
+                                    let terminal_error = recording_lookup_terminal_error(
+                                        &mut lookup_failures,
+                                        "driver-disconnect grace",
+                                        &lookup_error,
+                                    );
                                     warn!(
                                         guild_id = %guild_key,
                                         meeting_id = expected_meeting_id_ref,
                                         error = %err,
+                                        attempts = lookup_failures,
                                         "failed to verify active meeting during driver-disconnect grace; rescheduling"
                                     );
+                                    if let Some(terminal_error) = terminal_error {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            attempts = lookup_failures,
+                                            "driver-disconnect active-meeting lookup retry limit reached; marking recording failed"
+                                        );
+                                        match runtime
+                                            .fail_recording_after_lookup_exhaustion(
+                                                &lifecycle_permit,
+                                                &ctx_for_task,
+                                                http.as_ref(),
+                                                &RecordingLookupFailureRequest {
+                                                    guild_id: runtime.guild_id,
+                                                    guild_key: &guild_key,
+                                                    expected_meeting_id: expected_meeting_id_ref,
+                                                    terminal_error: &terminal_error,
+                                                    context:
+                                                        "driver-disconnect active-meeting lookup",
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => return,
+                                            Err(mark_err) => {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    meeting_id = expected_meeting_id_ref,
+                                                    error = %mark_err,
+                                                    "failed to mark recording failed after driver-disconnect lookup exhaustion; rescheduling"
+                                                );
+                                                lookup_failures = 0;
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                             };
@@ -5883,15 +6041,59 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         return;
                                     }
                                     Err(err) => {
+                                        let lookup_error = err.to_string();
+                                        let terminal_error = recording_lookup_terminal_error(
+                                            &mut lookup_failures,
+                                            "driver-disconnect voice-channel lookup",
+                                            &lookup_error,
+                                        );
                                         warn!(
                                             guild_id = %guild_key,
                                             meeting_id = expected_meeting_id_ref,
                                             error = %err,
+                                            attempts = lookup_failures,
                                             "failed to resolve active voice channel during driver-disconnect grace; rescheduling"
                                         );
+                                        if let Some(terminal_error) = terminal_error {
+                                            warn!(
+                                                guild_id = %guild_key,
+                                                meeting_id = expected_meeting_id_ref,
+                                                attempts = lookup_failures,
+                                                "driver-disconnect voice-channel lookup retry limit reached; marking recording failed"
+                                            );
+                                            match runtime
+                                                .fail_recording_after_lookup_exhaustion(
+                                                    &lifecycle_permit,
+                                                    &ctx_for_task,
+                                                    http.as_ref(),
+                                                    &RecordingLookupFailureRequest {
+                                                        guild_id: runtime.guild_id,
+                                                        guild_key: &guild_key,
+                                                        expected_meeting_id:
+                                                            expected_meeting_id_ref,
+                                                        terminal_error: &terminal_error,
+                                                        context:
+                                                            "driver-disconnect voice-channel lookup",
+                                                    },
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => return,
+                                                Err(mark_err) => {
+                                                    warn!(
+                                                        guild_id = %guild_key,
+                                                        meeting_id = expected_meeting_id_ref,
+                                                        error = %mark_err,
+                                                        "failed to mark recording failed after driver-disconnect voice-channel lookup exhaustion; rescheduling"
+                                                    );
+                                                    lookup_failures = 0;
+                                                }
+                                            }
+                                        }
                                         continue;
                                     }
                                 };
+                            lookup_failures = 0;
                             let reconnected = is_bot_connected_to_voice_channel(
                                 &ctx_for_task,
                                 runtime.guild_id,
@@ -7657,6 +7859,33 @@ mod status_message_tests {
         assert_eq!(stop_failures, RECORDING_STOP_MAX_RETRIES);
         assert!(error.contains("recording stop failed"));
         assert!(error.contains("queue down"));
+    }
+
+    #[test]
+    fn recording_lookup_retry_limit_returns_terminal_error() {
+        let mut lookup_failures = 0;
+
+        for expected in 1..RECORDING_LOOKUP_MAX_RETRIES {
+            assert_eq!(
+                recording_lookup_terminal_error(
+                    &mut lookup_failures,
+                    "auto-stop grace",
+                    "database down",
+                ),
+                None
+            );
+            assert_eq!(lookup_failures, expected);
+        }
+
+        let error = recording_lookup_terminal_error(
+            &mut lookup_failures,
+            "auto-stop grace",
+            "database down",
+        )
+        .expect("retry limit should terminalize");
+        assert_eq!(lookup_failures, RECORDING_LOOKUP_MAX_RETRIES);
+        assert!(error.contains("recording state lookup failed"));
+        assert!(error.contains("database down"));
     }
 
     #[test]

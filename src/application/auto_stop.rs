@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoStopState {
     grace_period: Duration,
+    meeting_id: Option<String>,
     empty_since: Option<Instant>,
     /// True while a grace-period timer task is in flight.
     /// Prevents spawning multiple concurrent timer tasks.
@@ -12,12 +13,27 @@ pub struct AutoStopState {
 
 impl AutoStopState {
     pub fn new(grace_period: Duration) -> Self {
+        Self::new_for_meeting(grace_period, None)
+    }
+
+    pub fn new_for_meeting(grace_period: Duration, meeting_id: Option<String>) -> Self {
         Self {
             grace_period,
+            meeting_id,
             empty_since: None,
             timer_active: false,
             timer_generation: 0,
         }
+    }
+
+    pub fn meeting_id(&self) -> Option<&str> {
+        self.meeting_id.as_deref()
+    }
+
+    pub fn belongs_to_meeting(&self, meeting_id: &str) -> bool {
+        self.meeting_id
+            .as_deref()
+            .is_none_or(|current| current == meeting_id)
     }
 
     /// Notify the state that the non-bot member count has changed.
