@@ -109,7 +109,14 @@ pub fn record_start<S: MeetingStore>(
     request: RecordStartRequest,
 ) -> Result<RecordStartResult, CommandError> {
     let preflight = validate_record_start_preconditions(store, &request)?;
+    record_start_after_preflight(store, request, preflight)
+}
 
+pub(crate) fn record_start_after_preflight<S: MeetingStore>(
+    store: &mut S,
+    request: RecordStartRequest,
+    preflight: RecordStartPreflight,
+) -> Result<RecordStartResult, CommandError> {
     store.create_meeting_as_recording(CreateMeetingRequest {
         id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),

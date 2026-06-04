@@ -3,7 +3,8 @@ use crate::application::bot::{
     BotCommandService, StartCommandInput, StopCommandInput, StopCommandResult,
 };
 use crate::application::command::{
-    CommandError, PermissionSet, RecordStartRequest, authorize_record_stop_for_meeting,
+    CommandError, PermissionSet, RecordStartPreflight, RecordStartRequest,
+    authorize_record_stop_for_meeting, record_start_after_preflight,
     validate_record_start_preconditions,
 };
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
@@ -84,7 +85,9 @@ use tracing::{debug, error, info, warn};
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
 const AUTO_STOP_FINAL_FLUSH_MAX_RETRIES: u32 = 10;
+const AUTO_STOP_GRACE_MAX_RESCHEDULES: u32 = 10;
 const DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES: u32 = 10;
+const RECORDING_STOP_MAX_RETRIES: u32 = 10;
 const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -186,13 +189,31 @@ where
 fn complete_record_start_after_runtime_setup<S>(
     service: &mut BotCommandService<S>,
     input: StartCommandInput,
+    preflight: RecordStartPreflight,
 ) -> Result<String, String>
 where
     S: MeetingStore,
 {
-    service
-        .handle_record_start(input)
-        .map_err(|err| err.to_string())
+    let result = record_start_after_preflight(
+        &mut service.store,
+        RecordStartRequest {
+            meeting_id: input.meeting_id,
+            guild_id: input.guild_id,
+            started_by_user_id: input.user_id,
+            command_channel_id: input.command_channel_id,
+            user_voice_channel_id: input.user_voice_channel_id,
+            permissions: input.permissions,
+            caller_role: input.caller_role,
+            effective_settings: input.effective_settings,
+        },
+        preflight,
+    )
+    .map_err(|err| err.to_string())?;
+
+    Ok(format!(
+        "録音を開始しました: meeting_id={}, vc={}, report_channel={}",
+        result.meeting_id, result.voice_channel_id, result.report_channel_id
+    ))
 }
 
 pub fn stop_and_enqueue_summary_job<S, Q>(
@@ -417,14 +438,49 @@ fn decide_driver_disconnect_grace_expiry(
     }
 }
 
-fn driver_disconnect_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String> {
+fn voice_state_cache_miss_terminal_error(
+    cache_misses: &mut u32,
+    max_reschedules: u32,
+    context: &str,
+) -> Option<String> {
     *cache_misses = cache_misses.saturating_add(1);
-    if *cache_misses < DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES {
+    if *cache_misses < max_reschedules {
         return None;
     }
     Some(format!(
-        "voice state cache remained unavailable after {} driver-disconnect stop check(s)",
-        *cache_misses
+        "voice state cache remained unavailable after {} {context} stop check(s)",
+        *cache_misses,
+    ))
+}
+
+fn driver_disconnect_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String> {
+    voice_state_cache_miss_terminal_error(
+        cache_misses,
+        DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES,
+        "driver-disconnect",
+    )
+}
+
+fn auto_stop_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String> {
+    voice_state_cache_miss_terminal_error(
+        cache_misses,
+        AUTO_STOP_GRACE_MAX_RESCHEDULES,
+        "auto-stop",
+    )
+}
+
+fn recording_stop_terminal_error(
+    stop_failures: &mut u32,
+    phase: &str,
+    err: &str,
+) -> Option<String> {
+    *stop_failures = stop_failures.saturating_add(1);
+    if *stop_failures < RECORDING_STOP_MAX_RETRIES {
+        return None;
+    }
+    Some(format!(
+        "recording stop failed after {} {phase} attempt(s): {err}",
+        *stop_failures,
     ))
 }
 
@@ -433,11 +489,21 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
     meeting_id: &str,
     error_message: &str,
 ) -> Result<(), StoreError> {
-    store.set_meeting_status(
+    match store.set_meeting_status(
         meeting_id,
         MeetingStatus::Failed,
         Some(MeetingStatus::Recording),
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(StoreError::CasConflict { .. }) => {
+            store.set_meeting_status(
+                meeting_id,
+                MeetingStatus::Failed,
+                Some(MeetingStatus::Stopping),
+            )?;
+        }
+        Err(err) => return Err(err),
+    }
     if let Err(err) = store.set_error_message(meeting_id, Some(error_message.to_owned())) {
         warn!(
             meeting_id,
@@ -469,6 +535,35 @@ fn clear_matching_recording_startup(
         .is_some_and(|current| current == meeting_id)
     {
         startups.remove(guild_key);
+    }
+}
+
+async fn leave_voice_with_timeout(
+    manager: &songbird::Songbird,
+    guild_id: GuildId,
+    meeting_id: &str,
+    phase: &str,
+) {
+    match timeout(SHUTDOWN_VOICE_LEAVE_TIMEOUT, manager.leave(guild_id)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            warn!(
+                guild_id = %guild_id.get(),
+                meeting_id,
+                error = %err,
+                phase,
+                "failed to leave voice channel during recording lifecycle teardown"
+            );
+        }
+        Err(_) => {
+            warn!(
+                guild_id = %guild_id.get(),
+                meeting_id,
+                phase,
+                timeout_ms = SHUTDOWN_VOICE_LEAVE_TIMEOUT.as_millis(),
+                "timed out leaving voice channel during recording lifecycle teardown"
+            );
+        }
     }
 }
 
@@ -1772,22 +1867,6 @@ impl ScaffoldHandler {
         }
     }
 
-    async fn resolve_effective_settings_for_guild(
-        &self,
-        guild_id: &str,
-    ) -> Result<EffectiveMeetingSettings, String> {
-        let defaults = self.meeting_settings_defaults();
-        let mut service = self.service.lock().await;
-        let guild_settings = service
-            .store
-            .get_guild_settings_for_meeting_snapshot(guild_id)
-            .map_err(|err| err.to_string())?;
-        Ok(EffectiveMeetingSettings::resolve(
-            &defaults,
-            guild_settings.as_ref(),
-        ))
-    }
-
     async fn effective_settings_for_meeting(
         &self,
         meeting_id: &str,
@@ -2330,6 +2409,8 @@ impl EventHandler for ScaffoldHandler {
             let target_channel_for_task = target_voice_channel_id;
             self.spawn_background(async move {
                 let mut final_flush_failures = 0u32;
+                let mut grace_cache_misses = 0u32;
+                let mut stop_failures = 0u32;
                 let stop_result = loop {
                     tokio::select! {
                         _ = sleep(grace_for_task) => {}
@@ -2369,11 +2450,62 @@ impl EventHandler for ScaffoldHandler {
                     );
                     match decide_auto_stop_grace_expiry(non_bot_at_fire) {
                         GraceExpiryDecision::Reschedule => {
+                            let terminal_error =
+                                auto_stop_cache_miss_terminal_error(&mut grace_cache_misses);
                             warn!(
                                 guild_id = %handler.guild_id,
                                 target_voice_channel_id = target_channel_for_task,
+                                cache_misses = grace_cache_misses,
                                 "voice state cache unavailable at auto-stop grace expiry; rescheduling stop check"
                             );
+                            if let Some(terminal_error) = terminal_error {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    cache_misses = grace_cache_misses,
+                                    "auto-stop cache-miss retry limit reached; marking recording failed"
+                                );
+                                match handler
+                                    .fail_recording_after_teardown_exhaustion(
+                                        &ctx_for_task,
+                                        handler.guild_id,
+                                        &guild_for_task,
+                                        expected_meeting_id_ref,
+                                        &terminal_error,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if let Err(status_err) = handler
+                                            .update_status_message(
+                                                &ctx_for_task.http,
+                                                expected_meeting_id_ref,
+                                                StatusMessageUpdate::Failed {
+                                                    phase: "Voice state cache",
+                                                    error: &terminal_error,
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                guild_id = %guild_for_task,
+                                                meeting_id = expected_meeting_id_ref,
+                                                error = %status_err,
+                                                "failed to notify auto-stop cache-miss exhaustion"
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    Err(mark_err) => {
+                                        warn!(
+                                            guild_id = %guild_for_task,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %mark_err,
+                                            "failed to mark recording failed after auto-stop cache-miss exhaustion; rescheduling"
+                                        );
+                                    }
+                                }
+                            }
                             let mut states = handler.auto_stop_states.lock().await;
                             if let Some(state) = states.get_mut(&guild_for_task) {
                                 state.retry_after_failed_stop();
@@ -2397,7 +2529,9 @@ impl EventHandler for ScaffoldHandler {
                             }
                             return;
                         }
-                        GraceExpiryDecision::Stop => {}
+                        GraceExpiryDecision::Stop => {
+                            grace_cache_misses = 0;
+                        }
                     }
                     let trigger = {
                         let mut states = handler.auto_stop_states.lock().await;
@@ -2488,12 +2622,63 @@ impl EventHandler for ScaffoldHandler {
                             continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
+                            let terminal_error =
+                                recording_stop_terminal_error(&mut stop_failures, "auto-stop", &err);
                             warn!(
                                 guild_id = %guild_for_task,
                                 meeting_id = expected_meeting_id_ref,
                                 error = %err,
+                                attempts = stop_failures,
                                 "auto stop failed; rescheduling"
                             );
+                            if let Some(terminal_error) = terminal_error {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    attempts = stop_failures,
+                                    "auto-stop stop retry limit reached; marking recording failed"
+                                );
+                                match handler
+                                    .fail_recording_after_teardown_exhaustion(
+                                        &ctx_for_task,
+                                        handler.guild_id,
+                                        &guild_for_task,
+                                        expected_meeting_id_ref,
+                                        &terminal_error,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if let Err(status_err) = handler
+                                            .update_status_message(
+                                                &ctx_for_task.http,
+                                                expected_meeting_id_ref,
+                                                StatusMessageUpdate::Failed {
+                                                    phase: "Recording stop",
+                                                    error: &terminal_error,
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                guild_id = %guild_for_task,
+                                                meeting_id = expected_meeting_id_ref,
+                                                error = %status_err,
+                                                "failed to notify auto-stop stop retry exhaustion"
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    Err(mark_err) => {
+                                        warn!(
+                                            guild_id = %guild_for_task,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %mark_err,
+                                            "failed to mark recording failed after auto-stop stop exhaustion; rescheduling"
+                                        );
+                                    }
+                                }
+                            }
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
                                 return;
@@ -2930,7 +3115,13 @@ impl ScaffoldHandler {
         };
 
         if let Some(manager) = songbird::get(request.ctx).await {
-            let _ = manager.leave(request.guild_id).await;
+            leave_voice_with_timeout(
+                manager.as_ref(),
+                request.guild_id,
+                request.expected_meeting_id,
+                request.phase,
+            )
+            .await;
         }
 
         // Re-read after voice teardown so late SpeakingStateUpdate events that
@@ -2987,7 +3178,13 @@ impl ScaffoldHandler {
         };
 
         if let Some(manager) = songbird::get(ctx).await {
-            let _ = manager.leave(guild_id).await;
+            leave_voice_with_timeout(
+                manager.as_ref(),
+                guild_id,
+                expected_meeting_id,
+                "teardown exhaustion",
+            )
+            .await;
         }
 
         let latest_tracker = {
@@ -3099,14 +3296,7 @@ impl ScaffoldHandler {
             return Ok(());
         }
 
-        if let Err(err) = manager.leave(guild_id).await {
-            warn!(
-                guild_id = %guild_id.get(),
-                meeting_id,
-                error = %err,
-                "failed to leave stale voice join after record-start setup race"
-            );
-        }
+        leave_voice_with_timeout(manager, guild_id, meeting_id, "record-start verification").await;
         let error_message = shutdown_error
             .or(lookup_error)
             .unwrap_or_else(|| "recording changed before voice join completed".to_owned());
@@ -3190,9 +3380,12 @@ impl ScaffoldHandler {
                 return Err(err.to_string());
             }
         }
-        {
+        let manager = songbird::get(ctx)
+            .await
+            .ok_or_else(|| "songbird not initialized".to_owned())?;
+        let (response, meeting_title) = {
             let mut service = self.service.lock().await;
-            validate_record_start_preconditions(
+            let preflight = validate_record_start_preconditions(
                 &mut service.store,
                 &RecordStartRequest {
                     meeting_id: meeting_id.clone(),
@@ -3206,48 +3399,51 @@ impl ScaffoldHandler {
                 },
             )
             .map_err(|err| err.to_string())?;
-        }
-        let effective_settings = self
-            .resolve_effective_settings_for_guild(&guild_key)
-            .await?;
-        let manager = songbird::get(ctx)
-            .await
-            .ok_or_else(|| "songbird not initialized".to_owned())?;
+            let defaults = self.meeting_settings_defaults();
+            let guild_settings = service
+                .store
+                .get_guild_settings_for_meeting_snapshot(&guild_key)
+                .map_err(|err| err.to_string())?;
+            let effective_settings =
+                EffectiveMeetingSettings::resolve(&defaults, guild_settings.as_ref());
+            let response = complete_record_start_after_runtime_setup(
+                &mut service,
+                StartCommandInput {
+                    meeting_id: meeting_id.clone(),
+                    guild_id: guild_key.clone(),
+                    user_id: command.user.id.get().to_string(),
+                    command_channel_id: command.channel_id.get().to_string(),
+                    user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
+                    permissions,
+                    caller_role,
+                    effective_settings: Some(effective_settings),
+                },
+                preflight,
+            )?;
+            let meeting_title = match service.store.get_meeting(&meeting_id) {
+                Ok(Some(meeting)) => meeting.title,
+                Ok(None) => None,
+                Err(err) => {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "failed to cache meeting title for live transcription prompt"
+                    );
+                    None
+                }
+            };
+            (response, meeting_title)
+        };
         let layout =
             crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
         let workspace =
             layout.for_meeting(&guild_key, &voice_channel_id_u64.to_string(), &meeting_id);
-        workspace
-            .ensure_base_dirs()
-            .map_err(|err| format!("failed to prepare workspace: {err}"))?;
-
-        let mut service = self.service.lock().await;
-        let response = complete_record_start_after_runtime_setup(
-            &mut service,
-            StartCommandInput {
-                meeting_id: meeting_id.clone(),
-                guild_id: guild_key.clone(),
-                user_id: command.user.id.get().to_string(),
-                command_channel_id: command.channel_id.get().to_string(),
-                user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
-                permissions,
-                caller_role,
-                effective_settings: Some(effective_settings),
-            },
-        )?;
-        let meeting_title = match service.store.get_meeting(&meeting_id) {
-            Ok(Some(meeting)) => meeting.title,
-            Ok(None) => None,
-            Err(err) => {
-                warn!(
-                    meeting_id = %meeting_id,
-                    error = %err,
-                    "failed to cache meeting title for live transcription prompt"
-                );
-                None
-            }
-        };
-        drop(service);
+        if let Err(err) = workspace.ensure_base_dirs() {
+            let err_msg = format!("failed to prepare workspace: {err}");
+            self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
+                .await;
+            return Err(err_msg);
+        }
         self.spawn_record_start_entitlement_observation(guild_key.clone());
 
         // Reset SSRC tracker so stale mappings from previous recordings
@@ -4988,6 +5184,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     self.runtime.spawn_background(async move {
                         let mut final_flush_failures = 0u32;
                         let mut grace_cache_misses = 0u32;
+                        let mut stop_failures = 0u32;
                         let stop_result = loop {
                             tokio::select! {
                                 _ = sleep(grace) => {}
@@ -5160,12 +5357,66 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     continue;
                                 }
                                 Err(RecordingTeardownError::Stop(err)) => {
+                                    let terminal_error = recording_stop_terminal_error(
+                                        &mut stop_failures,
+                                        "driver-disconnect",
+                                        &err,
+                                    );
                                     warn!(
                                         guild_id = %guild_key,
                                         meeting_id = expected_meeting_id_ref,
                                         error = %err,
+                                        attempts = stop_failures,
                                         "failed to stop recording on driver disconnect; rescheduling"
                                     );
+                                    if let Some(terminal_error) = terminal_error {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            attempts = stop_failures,
+                                            "driver-disconnect stop retry limit reached; marking recording failed"
+                                        );
+                                        match runtime
+                                            .fail_recording_after_teardown_exhaustion(
+                                                &ctx_for_task,
+                                                runtime.guild_id,
+                                                &guild_key,
+                                                expected_meeting_id_ref,
+                                                &terminal_error,
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                if let Err(status_err) = runtime
+                                                    .update_status_message(
+                                                        &http,
+                                                        expected_meeting_id_ref,
+                                                        StatusMessageUpdate::Failed {
+                                                            phase: "Recording stop",
+                                                            error: &terminal_error,
+                                                        },
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        guild_id = %guild_key,
+                                                        meeting_id = expected_meeting_id_ref,
+                                                        error = %status_err,
+                                                        "failed to notify driver-disconnect stop retry exhaustion"
+                                                    );
+                                                }
+                                                return;
+                                            }
+                                            Err(mark_err) => {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    meeting_id = expected_meeting_id_ref,
+                                                    error = %mark_err,
+                                                    "failed to mark recording failed after driver-disconnect stop exhaustion; rescheduling"
+                                                );
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -6578,6 +6829,21 @@ mod status_message_tests {
     }
 
     #[test]
+    fn auto_stop_cache_miss_retry_limit_returns_terminal_error() {
+        let mut cache_misses = 0;
+
+        for expected in 1..AUTO_STOP_GRACE_MAX_RESCHEDULES {
+            assert_eq!(auto_stop_cache_miss_terminal_error(&mut cache_misses), None);
+            assert_eq!(cache_misses, expected);
+        }
+
+        let error = auto_stop_cache_miss_terminal_error(&mut cache_misses)
+            .expect("retry limit should terminalize");
+        assert_eq!(cache_misses, AUTO_STOP_GRACE_MAX_RESCHEDULES);
+        assert!(error.contains("auto-stop stop check"));
+    }
+
+    #[test]
     fn driver_disconnect_cache_miss_reschedules_instead_of_stopping() {
         assert_eq!(
             decide_driver_disconnect_grace_expiry(None, Some(0)),
@@ -6620,6 +6886,25 @@ mod status_message_tests {
     }
 
     #[test]
+    fn recording_stop_retry_limit_returns_terminal_error() {
+        let mut stop_failures = 0;
+
+        for expected in 1..RECORDING_STOP_MAX_RETRIES {
+            assert_eq!(
+                recording_stop_terminal_error(&mut stop_failures, "auto-stop", "queue down"),
+                None
+            );
+            assert_eq!(stop_failures, expected);
+        }
+
+        let error = recording_stop_terminal_error(&mut stop_failures, "auto-stop", "queue down")
+            .expect("retry limit should terminalize");
+        assert_eq!(stop_failures, RECORDING_STOP_MAX_RETRIES);
+        assert!(error.contains("recording stop failed"));
+        assert!(error.contains("queue down"));
+    }
+
+    #[test]
     fn teardown_exhaustion_marks_recording_failed() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         store.insert(recording_meeting());
@@ -6640,10 +6925,32 @@ mod status_message_tests {
     }
 
     #[test]
-    fn teardown_exhaustion_does_not_terminalize_non_recording_meeting() {
+    fn teardown_exhaustion_marks_stopping_failed() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = recording_meeting();
         meeting.status = crate::domain::MeetingStatus::Stopping;
+        store.insert(meeting);
+
+        mark_recording_failed_after_teardown_exhaustion(
+            &mut store,
+            "m1",
+            "recording stop failed after retries",
+        )
+        .expect("stopping recording should become failed");
+
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("recording stop failed after retries")
+        );
+    }
+
+    #[test]
+    fn teardown_exhaustion_does_not_terminalize_non_recording_meeting() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = recording_meeting();
+        meeting.status = crate::domain::MeetingStatus::Posted;
         store.insert(meeting);
 
         let err = mark_recording_failed_after_teardown_exhaustion(
@@ -6658,7 +6965,7 @@ mod status_message_tests {
             crate::infrastructure::storage::StoreError::CasConflict { .. }
         ));
         let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
     }
 
     #[test]
@@ -6709,6 +7016,9 @@ mod status_message_tests {
         let result = complete_record_start_after_runtime_setup(
             &mut service,
             start_input_for_runtime_setup_test(),
+            RecordStartPreflight {
+                voice_channel_id: "vc1".to_owned(),
+            },
         )
         .expect("start should succeed after setup");
 
