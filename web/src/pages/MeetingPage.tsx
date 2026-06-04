@@ -230,26 +230,21 @@ function FeedbackDialog({
   }, [onClose]);
 
   return (
-    <div className="feedback-modal-backdrop" role="presentation">
+    // biome-ignore lint/a11y/noStaticElementInteractions: Pointer backdrop dismissal complements Escape, cancel, and close-button keyboard paths.
+    <div
+      className="feedback-modal-backdrop"
+      role="presentation"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
       <dialog
         ref={dialogRef}
         className="feedback-modal"
         aria-modal="true"
         aria-labelledby="feedback-dialog-title"
-        onClick={(event) => {
-          if (event.target !== event.currentTarget) {
-            return;
-          }
-          const rect = event.currentTarget.getBoundingClientRect();
-          const clickedBackdrop =
-            event.clientX < rect.left ||
-            event.clientX > rect.right ||
-            event.clientY < rect.top ||
-            event.clientY > rect.bottom;
-          if (clickedBackdrop) {
-            onClose();
-          }
-        }}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
