@@ -226,7 +226,9 @@ function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
   );
 }
 
-function meetingPageFetch(options: { feedbackStatus?: number } = {}) {
+function meetingPageFetch(
+  options: { feedbackStatus?: number; segments?: unknown[] } = {},
+) {
   let feedbackRequest: unknown = null;
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = input.toString();
@@ -246,7 +248,9 @@ function meetingPageFetch(options: { feedbackStatus?: number } = {}) {
       return Promise.resolve(jsonResponse(meetingResponse()));
     }
     if (url === "/api/meetings/meeting-1/transcript") {
-      return Promise.resolve(jsonResponse(transcriptResponse()));
+      return Promise.resolve(
+        jsonResponse(transcriptResponse(options.segments)),
+      );
     }
     if (url === "/api/meetings/meeting-1/summary") {
       return Promise.resolve(jsonResponse({ markdown: null }));
@@ -1893,6 +1897,18 @@ describe("App access controls", () => {
       await screen.findByText("フィードバックを送信しました"),
     ).toBeTruthy();
     expect(screen.queryByRole("dialog", { name: "フィードバック" })).toBeNull();
+  });
+
+  it("does not show feedback actions for transcript segments without IDs", async () => {
+    const { fetchMock } = meetingPageFetch({
+      segments: [transcriptSegment({ id: undefined })],
+    });
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    expect(await screen.findByText("Alpha term")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "00:05 のフィードバック" }),
+    ).toBeNull();
   });
 
   it("keeps feedback open and reports API validation errors", async () => {

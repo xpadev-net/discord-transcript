@@ -69,7 +69,7 @@ export function TranscriptSegmentRow({
         </span>
         <span className="segment-text">{segment.text}</span>
       </button>
-      {onFeedback ? (
+      {onFeedback && segment.id ? (
         <button
           type="button"
           className="segment-feedback-button"
