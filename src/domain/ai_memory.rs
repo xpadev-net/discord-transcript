@@ -104,3 +104,35 @@ pub struct AiMemoryNote {
     pub archived_at: Option<DateTime<Utc>>,
     pub archived_actor_user_id: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAiMemoryNote {
+    pub id: String,
+    pub tenant_discord_guild_id: String,
+    pub tenant_id: String,
+    pub guild_id: String,
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<AiMemoryTag>,
+    pub source_type: AiMemorySourceType,
+    pub source_meeting_id: Option<String>,
+    pub source_feedback_id: Option<String>,
+    pub confidence: Option<ConfidencePermille>,
+    pub active: bool,
+    pub pinned: bool,
+    pub actor_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAiMemoryNote {
+    pub id: String,
+    pub tenant_id: String,
+    pub guild_id: String,
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<AiMemoryTag>,
+    pub confidence: Option<ConfidencePermille>,
+    pub active: bool,
+    pub pinned: bool,
+    pub actor_user_id: String,
+}

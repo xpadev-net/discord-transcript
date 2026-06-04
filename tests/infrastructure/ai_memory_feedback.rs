@@ -1,13 +1,23 @@
 use chrono::{TimeZone, Utc};
-use discord_transcript::domain::ai_memory::{AiMemoryNote, AiMemorySourceType, AiMemoryTag};
+use discord_transcript::domain::ai_memory::{
+    AiMemoryNote, AiMemorySourceType, AiMemoryTag, NewAiMemoryNote, UpdateAiMemoryNote,
+};
 use discord_transcript::domain::confidence::ConfidencePermille;
 use discord_transcript::domain::feedback::{
-    TranscriptFeedback, TranscriptFeedbackStatus, TranscriptFeedbackTermType, TranscriptFeedbackType,
+    NewTranscriptFeedback, TranscriptFeedback, TranscriptFeedbackStatus, TranscriptFeedbackTermType,
+    TranscriptFeedbackType, UpdateTranscriptFeedbackStatus,
 };
 use discord_transcript::domain::person_alias::{
-    PersonAlias, PersonAliasReviewStatus, PersonAliasSourceType,
+    NewPersonAlias, PersonAlias, PersonAliasReviewStatus, PersonAliasSourceType, UpdatePersonAlias,
 };
-use discord_transcript::infrastructure::sql::{INCREMENTAL_MIGRATIONS_SQL, MIGRATIONS};
+use discord_transcript::infrastructure::sql::{
+    ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_PERSON_ALIAS_SQL, INCREMENTAL_MIGRATIONS_SQL,
+    INSERT_AI_MEMORY_NOTE_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_TRANSCRIPT_FEEDBACK_SQL,
+    LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, MIGRATIONS,
+    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL,
+    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+};
+use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, SqlMeetingStore};
 
 fn ai_memory_feedback_migration_sql() -> &'static str {
     MIGRATIONS
@@ -24,6 +34,98 @@ fn sql_between<'a>(sql: &'a str, start: &str, end: &str) -> &'a str {
         .split_once(end)
         .expect("end marker should be present")
         .0
+}
+
+fn ai_memory_row(id: &str, active: bool, pinned: bool, archived_at: Option<&str>) -> Vec<Option<String>> {
+    vec![
+        Some(id.to_owned()),
+        Some("tdg-1".to_owned()),
+        Some("tenant-1".to_owned()),
+        Some("guild-1".to_owned()),
+        Some("Team terms".to_owned()),
+        Some("Use project codenames.".to_owned()),
+        Some("terminology,summary_hint".to_owned()),
+        Some("manual".to_owned()),
+        None,
+        None,
+        Some("0.875".to_owned()),
+        Some(active.to_string()),
+        Some(pinned.to_string()),
+        Some("actor-1".to_owned()),
+        Some("actor-2".to_owned()),
+        None,
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        Some("2026-06-04T01:03:03.000Z".to_owned()),
+        archived_at.map(str::to_owned),
+        archived_at.map(|_| "actor-3".to_owned()),
+    ]
+}
+
+fn feedback_row(id: &str, status: &str) -> Vec<Option<String>> {
+    vec![
+        Some(id.to_owned()),
+        Some("tdg-1".to_owned()),
+        Some("tenant-1".to_owned()),
+        Some("guild-1".to_owned()),
+        Some("meeting-1".to_owned()),
+        Some("segment-1".to_owned()),
+        Some("term".to_owned()),
+        Some("person_name".to_owned()),
+        Some("x p a".to_owned()),
+        Some("xpa".to_owned()),
+        None,
+        None,
+        Some("note".to_owned()),
+        None,
+        Some("mem-1".to_owned()),
+        Some("actor-1".to_owned()),
+        Some(status.to_owned()),
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        if status == "open" {
+            None
+        } else {
+            Some("2026-06-04T01:04:03.000Z".to_owned())
+        },
+        if status == "open" {
+            None
+        } else {
+            Some("reviewer-1".to_owned())
+        },
+    ]
+}
+
+fn person_alias_row(id: &str, active: bool, review_status: &str, archived_at: Option<&str>) -> Vec<Option<String>> {
+    vec![
+        Some(id.to_owned()),
+        Some("tdg-1".to_owned()),
+        Some("tenant-1".to_owned()),
+        Some("guild-1".to_owned()),
+        Some("xpadev".to_owned()),
+        Some("xpa".to_owned()),
+        Some("123".to_owned()),
+        Some("manual".to_owned()),
+        None,
+        None,
+        Some("0.900".to_owned()),
+        Some(active.to_string()),
+        Some(review_status.to_owned()),
+        Some("actor-1".to_owned()),
+        Some("actor-2".to_owned()),
+        if review_status == "unreviewed" {
+            None
+        } else {
+            Some("2026-06-04T01:04:03.000Z".to_owned())
+        },
+        if review_status == "unreviewed" {
+            None
+        } else {
+            Some("reviewer-1".to_owned())
+        },
+        archived_at.map(str::to_owned),
+        archived_at.map(|_| "actor-3".to_owned()),
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        Some("2026-06-04T01:03:03.000Z".to_owned()),
+    ]
 }
 
 #[test]
@@ -412,4 +514,274 @@ fn domain_models_cover_schema_identity_source_confidence_and_lifecycle_fields() 
     assert_eq!(alias.created_actor_user_id, "actor-1");
     assert_eq!(alias.updated_actor_user_id, "actor-2");
     assert!(!alias.active);
+}
+
+#[test]
+fn api_sql_resolves_exactly_one_active_tenant_guild_before_new_resource_access() {
+    assert!(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL.contains("tg.status = 'active'"));
+    assert!(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL.contains("t.status = 'active'"));
+    assert!(
+        RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL
+            .contains("WHERE (SELECT COUNT(*) FROM active_installations) = 1")
+    );
+
+    for sql in [
+        LIST_AI_MEMORY_NOTES_SQL,
+        LIST_TRANSCRIPT_FEEDBACK_SQL,
+        LIST_PERSON_ALIASES_SQL,
+    ] {
+        assert!(sql.contains("WHERE tenant_id = $1"));
+        assert!(sql.contains("AND guild_id = $2"));
+        assert!(!sql.contains("tenant_id IS NULL"));
+    }
+}
+
+#[test]
+fn api_sql_mutations_scope_by_tenant_and_guild_and_preserve_review_state_machines() {
+    for sql in [
+        UPDATE_AI_MEMORY_NOTE_SQL,
+        SET_AI_MEMORY_PINNED_SQL,
+        ARCHIVE_AI_MEMORY_NOTE_SQL,
+        UPDATE_PERSON_ALIAS_SQL,
+        ARCHIVE_PERSON_ALIAS_SQL,
+        UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+    ] {
+        assert!(sql.contains("AND tenant_id = $2"));
+        assert!(sql.contains("AND guild_id = $3"));
+    }
+
+    assert!(INSERT_AI_MEMORY_NOTE_SQL.contains("tenant_discord_guild_id"));
+    assert!(INSERT_AI_MEMORY_NOTE_SQL.contains("created_actor_user_id, updated_actor_user_id"));
+    assert!(ARCHIVE_AI_MEMORY_NOTE_SQL.contains("SET active = FALSE"));
+    assert!(SET_AI_MEMORY_PINNED_SQL.contains("SET pinned = $4::TEXT::BOOLEAN"));
+
+    assert!(INSERT_TRANSCRIPT_FEEDBACK_SQL.contains("'open'"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("AND status = 'open'"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("WHEN $4 = 'converted_to_ai_memory' THEN NULL"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("WHEN $4 = 'converted_to_domain_knowledge' THEN NULL"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("reviewed_at = NOW()"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("reviewed_actor_user_id = $7"));
+
+    assert!(INSERT_PERSON_ALIAS_SQL.contains("CASE WHEN $13 = 'unreviewed' THEN NULL ELSE NOW() END"));
+    assert!(UPDATE_PERSON_ALIAS_SQL.contains("WHEN $9 = 'unreviewed' THEN NULL"));
+    assert!(ARCHIVE_PERSON_ALIAS_SQL.contains("SET active = FALSE"));
+}
+
+#[test]
+fn api_sql_returns_metadata_needed_for_redacted_audit_without_requiring_sensitive_text() {
+    for sql in [
+        INSERT_AI_MEMORY_NOTE_SQL,
+        UPDATE_AI_MEMORY_NOTE_SQL,
+        ARCHIVE_AI_MEMORY_NOTE_SQL,
+        INSERT_PERSON_ALIAS_SQL,
+        UPDATE_PERSON_ALIAS_SQL,
+        ARCHIVE_PERSON_ALIAS_SQL,
+        UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+    ] {
+        assert!(sql.contains("RETURNING id"));
+    }
+
+    assert!(LIST_AI_MEMORY_NOTES_SQL.contains("array_to_string(tags, ',') AS tags"));
+    assert!(INSERT_AI_MEMORY_NOTE_SQL.contains("source_type"));
+    assert!(INSERT_AI_MEMORY_NOTE_SQL.contains("source_meeting_id"));
+    assert!(INSERT_AI_MEMORY_NOTE_SQL.contains("source_feedback_id"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("feedback_type"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("meeting_id"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("target_domain_knowledge_id"));
+    assert!(UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL.contains("target_ai_memory_note_id"));
+}
+
+#[test]
+fn sql_store_helpers_cover_ai_memory_feedback_status_and_person_aliases() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        format!(
+            "{INSERT_AI_MEMORY_NOTE_SQL}|mem-1\u{1f}tdg-1\u{1f}tenant-1\u{1f}guild-1\u{1f}Team terms\u{1f}Use project codenames.\u{1f}{{\"terminology\",\"summary_hint\"}}\u{1f}manual\u{1f}\u{1f}\u{1f}0.875\u{1f}true\u{1f}false\u{1f}actor-1"
+        ),
+        vec![ai_memory_row("mem-1", true, false, None)],
+    );
+    executor.query_rows_result.insert(
+        format!(
+            "{UPDATE_AI_MEMORY_NOTE_SQL}|mem-1\u{1f}tenant-1\u{1f}guild-1\u{1f}Updated terms\u{1f}Updated body\u{1f}{{\"terminology\"}}\u{1f}0.900\u{1f}true\u{1f}true\u{1f}actor-2"
+        ),
+        vec![ai_memory_row("mem-1", true, true, None)],
+    );
+    executor.query_rows_result.insert(
+        format!("{SET_AI_MEMORY_PINNED_SQL}|mem-1\u{1f}tenant-1\u{1f}guild-1\u{1f}true\u{1f}actor-2"),
+        vec![ai_memory_row("mem-1", true, true, None)],
+    );
+    executor.query_rows_result.insert(
+        format!("{ARCHIVE_AI_MEMORY_NOTE_SQL}|mem-1\u{1f}tenant-1\u{1f}guild-1\u{1f}actor-3"),
+        vec![ai_memory_row(
+            "mem-1",
+            false,
+            true,
+            Some("2026-06-04T01:05:03.000Z"),
+        )],
+    );
+    executor.query_rows_result.insert(
+        format!(
+            "{INSERT_TRANSCRIPT_FEEDBACK_SQL}|fb-1\u{1f}tdg-1\u{1f}tenant-1\u{1f}guild-1\u{1f}meeting-1\u{1f}segment-1\u{1f}term\u{1f}person_name\u{1f}x p a\u{1f}xpa\u{1f}\u{1f}\u{1f}note\u{1f}\u{1f}mem-1\u{1f}actor-1"
+        ),
+        vec![feedback_row("fb-1", "open")],
+    );
+    executor.query_rows_result.insert(
+        format!(
+            "{UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL}|fb-1\u{1f}tenant-1\u{1f}guild-1\u{1f}converted_to_ai_memory\u{1f}\u{1f}mem-1\u{1f}reviewer-1"
+        ),
+        vec![feedback_row("fb-1", "converted_to_ai_memory")],
+    );
+    executor.query_rows_result.insert(
+        format!(
+            "{INSERT_PERSON_ALIAS_SQL}|alias-1\u{1f}tdg-1\u{1f}tenant-1\u{1f}guild-1\u{1f}xpadev\u{1f}xpa\u{1f}123\u{1f}manual\u{1f}\u{1f}\u{1f}0.900\u{1f}true\u{1f}accepted\u{1f}actor-1"
+        ),
+        vec![person_alias_row("alias-1", true, "accepted", None)],
+    );
+    executor.query_rows_result.insert(
+        format!(
+            "{UPDATE_PERSON_ALIAS_SQL}|alias-1\u{1f}tenant-1\u{1f}guild-1\u{1f}xpadev\u{1f}xpa-dev\u{1f}123\u{1f}0.900\u{1f}true\u{1f}accepted\u{1f}actor-2"
+        ),
+        vec![person_alias_row("alias-1", true, "accepted", None)],
+    );
+    executor.query_rows_result.insert(
+        format!("{ARCHIVE_PERSON_ALIAS_SQL}|alias-1\u{1f}tenant-1\u{1f}guild-1\u{1f}actor-3"),
+        vec![person_alias_row(
+            "alias-1",
+            false,
+            "accepted",
+            Some("2026-06-04T01:05:03.000Z"),
+        )],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    let created_memory = store
+        .create_ai_memory_note(&NewAiMemoryNote {
+            id: "mem-1".to_owned(),
+            tenant_discord_guild_id: "tdg-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            title: "Team terms".to_owned(),
+            body: "Use project codenames.".to_owned(),
+            tags: vec![AiMemoryTag::Terminology, AiMemoryTag::SummaryHint],
+            source_type: AiMemorySourceType::Manual,
+            source_meeting_id: None,
+            source_feedback_id: None,
+            confidence: Some(ConfidencePermille::new(875).unwrap()),
+            active: true,
+            pinned: false,
+            actor_user_id: "actor-1".to_owned(),
+        })
+        .expect("memory create should parse");
+    assert_eq!(created_memory.tags, vec![AiMemoryTag::Terminology, AiMemoryTag::SummaryHint]);
+
+    let updated_memory = store
+        .update_ai_memory_note(&UpdateAiMemoryNote {
+            id: "mem-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            title: "Updated terms".to_owned(),
+            body: "Updated body".to_owned(),
+            tags: vec![AiMemoryTag::Terminology],
+            confidence: Some(ConfidencePermille::new(900).unwrap()),
+            active: true,
+            pinned: true,
+            actor_user_id: "actor-2".to_owned(),
+        })
+        .expect("memory update should parse")
+        .expect("memory row should exist");
+    assert!(updated_memory.pinned);
+
+    let pinned = store
+        .set_ai_memory_pinned("tenant-1", "guild-1", "mem-1", true, "actor-2")
+        .expect("pin should parse")
+        .expect("pin row should exist");
+    assert!(pinned.pinned);
+
+    let archived = store
+        .archive_ai_memory_note("tenant-1", "guild-1", "mem-1", "actor-3")
+        .expect("archive should parse")
+        .expect("archive row should exist");
+    assert!(!archived.active);
+    assert!(archived.archived_at.is_some());
+
+    let created_feedback = store
+        .create_transcript_feedback(&NewTranscriptFeedback {
+            id: "fb-1".to_owned(),
+            tenant_discord_guild_id: "tdg-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            meeting_id: Some("meeting-1".to_owned()),
+            transcript_segment_id: Some("segment-1".to_owned()),
+            feedback_type: TranscriptFeedbackType::Term,
+            term_type: Some(TranscriptFeedbackTermType::PersonName),
+            original_text: Some("x p a".to_owned()),
+            corrected_text: Some("xpa".to_owned()),
+            speaker_id: None,
+            corrected_speaker_id: None,
+            note: Some("note".to_owned()),
+            target_domain_knowledge_id: None,
+            target_ai_memory_note_id: Some("mem-1".to_owned()),
+            actor_user_id: "actor-1".to_owned(),
+        })
+        .expect("feedback create should parse");
+    assert_eq!(created_feedback.status, TranscriptFeedbackStatus::Open);
+
+    let reviewed = store
+        .update_transcript_feedback_status(&UpdateTranscriptFeedbackStatus {
+            id: "fb-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            status: TranscriptFeedbackStatus::ConvertedToAiMemory,
+            target_domain_knowledge_id: None,
+            target_ai_memory_note_id: Some("mem-1".to_owned()),
+            reviewed_actor_user_id: "reviewer-1".to_owned(),
+        })
+        .expect("feedback review should parse")
+        .expect("feedback row should exist");
+    assert_eq!(reviewed.status, TranscriptFeedbackStatus::ConvertedToAiMemory);
+    assert!(reviewed.reviewed_at.is_some());
+
+    let created_alias = store
+        .create_person_alias(&NewPersonAlias {
+            id: "alias-1".to_owned(),
+            tenant_discord_guild_id: "tdg-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            canonical_name: "xpadev".to_owned(),
+            alias: "xpa".to_owned(),
+            discord_user_id: Some("123".to_owned()),
+            source_type: PersonAliasSourceType::Manual,
+            source_meeting_id: None,
+            source_feedback_id: None,
+            confidence: Some(ConfidencePermille::new(900).unwrap()),
+            active: true,
+            review_status: PersonAliasReviewStatus::Accepted,
+            actor_user_id: "actor-1".to_owned(),
+        })
+        .expect("alias create should parse");
+    assert_eq!(created_alias.review_status, PersonAliasReviewStatus::Accepted);
+
+    let updated_alias = store
+        .update_person_alias(&UpdatePersonAlias {
+            id: "alias-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            canonical_name: "xpadev".to_owned(),
+            alias: "xpa-dev".to_owned(),
+            discord_user_id: Some("123".to_owned()),
+            confidence: Some(ConfidencePermille::new(900).unwrap()),
+            active: true,
+            review_status: PersonAliasReviewStatus::Accepted,
+            actor_user_id: "actor-2".to_owned(),
+        })
+        .expect("alias update should parse")
+        .expect("alias row should exist");
+    assert!(updated_alias.active);
+
+    let archived_alias = store
+        .archive_person_alias("tenant-1", "guild-1", "alias-1", "actor-3")
+        .expect("alias archive should parse")
+        .expect("alias row should exist");
+    assert!(!archived_alias.active);
+    assert!(archived_alias.archived_at.is_some());
 }

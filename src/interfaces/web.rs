@@ -24,8 +24,14 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::bootstrap::config::is_iso639_1_format;
+use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
 use crate::domain::audit::AuditEvent;
+use crate::domain::confidence::ConfidencePermille;
 use crate::domain::domain_knowledge::DomainKnowledgeContentType;
+use crate::domain::feedback::{
+    TranscriptFeedbackStatus, TranscriptFeedbackTermType, TranscriptFeedbackType,
+};
+use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{summary_template_variables, validate_summary_template};
 use crate::domain::transcript::{
@@ -36,14 +42,18 @@ use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use crate::infrastructure::sql::{
-    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
-    ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL,
+    ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
+    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, GET_AI_MEMORY_NOTE_SQL,
     GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
-    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
-    LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
-    UPSERT_GUILD_SETTINGS_SQL,
+    INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL,
+    INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL, INSERT_TRANSCRIPT_FEEDBACK_SQL,
+    INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
+    LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -555,6 +565,51 @@ pub fn create_router(state: WebState) -> Router {
             post(api_archive_domain_knowledge),
         )
         .route(
+            "/api/guild/ai-memory",
+            get(api_list_ai_memory)
+                .post(api_create_ai_memory)
+                .put(api_update_ai_memory_by_body),
+        )
+        .route(
+            "/api/guild/ai-memory/{memory_id}",
+            put(api_update_ai_memory),
+        )
+        .route(
+            "/api/guild/ai-memory/{memory_id}/pin",
+            post(api_pin_ai_memory),
+        )
+        .route(
+            "/api/guild/ai-memory/{memory_id}/unpin",
+            post(api_unpin_ai_memory),
+        )
+        .route(
+            "/api/guild/ai-memory/{memory_id}/archive",
+            post(api_archive_ai_memory),
+        )
+        .route(
+            "/api/guild/ai-memory/{memory_id}/promote-to-domain-knowledge",
+            post(api_promote_ai_memory_to_domain_knowledge),
+        )
+        .route("/api/guild/feedback", get(api_list_feedback))
+        .route(
+            "/api/guild/feedback/{feedback_id}/status",
+            put(api_update_feedback_status),
+        )
+        .route(
+            "/api/guild/person-aliases",
+            get(api_list_person_aliases)
+                .post(api_create_person_alias)
+                .put(api_update_person_alias_by_body),
+        )
+        .route(
+            "/api/guild/person-aliases/{alias_id}",
+            put(api_update_person_alias),
+        )
+        .route(
+            "/api/guild/person-aliases/{alias_id}/archive",
+            post(api_archive_person_alias),
+        )
+        .route(
             "/api/guild/summary-templates",
             get(api_list_summary_templates).post(api_create_summary_template),
         )
@@ -571,6 +626,10 @@ pub fn create_router(state: WebState) -> Router {
             post(api_archive_summary_template),
         )
         .route("/api/meetings/{meeting_id}", get(api_meeting))
+        .route(
+            "/api/meetings/{meeting_id}/feedback",
+            post(api_create_meeting_feedback),
+        )
         .route("/api/meetings/{meeting_id}/transcript", get(api_transcript))
         .route(
             "/api/meetings/{meeting_id}/transcript/state",
@@ -2824,6 +2883,78 @@ struct DomainKnowledgeUpsertRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AiMemoryListQuery {
+    include_archived: Option<bool>,
+    source_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiMemoryUpsertRequest {
+    id: Option<String>,
+    title: String,
+    body: String,
+    tags: Option<Vec<String>>,
+    source_type: Option<String>,
+    source_meeting_id: Option<String>,
+    source_feedback_id: Option<String>,
+    confidence: Option<f64>,
+    active: Option<bool>,
+    pinned: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiMemoryPromoteRequest {
+    content_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedbackListQuery {
+    status: Option<String>,
+    feedback_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptFeedbackRequest {
+    transcript_segment_id: Option<String>,
+    feedback_type: String,
+    term_type: Option<String>,
+    original_text: Option<String>,
+    corrected_text: Option<String>,
+    speaker_id: Option<String>,
+    corrected_speaker_id: Option<String>,
+    note: Option<String>,
+    target_domain_knowledge_id: Option<String>,
+    target_ai_memory_note_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptFeedbackStatusRequest {
+    status: String,
+    target_domain_knowledge_id: Option<String>,
+    target_ai_memory_note_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonAliasListQuery {
+    include_archived: Option<bool>,
+    review_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonAliasUpsertRequest {
+    id: Option<String>,
+    canonical_name: String,
+    alias: String,
+    discord_user_id: Option<String>,
+    source_type: Option<String>,
+    source_meeting_id: Option<String>,
+    source_feedback_id: Option<String>,
+    confidence: Option<f64>,
+    active: Option<bool>,
+    review_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SummaryTemplateListQuery {
     include_archived: Option<bool>,
 }
@@ -2844,6 +2975,66 @@ struct DomainKnowledgeItemResponse {
     active: bool,
     version: i32,
     updated_actor_user_id: Option<String>,
+    archived_at: Option<String>,
+    archived_actor_user_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct AiMemoryNoteResponse {
+    id: String,
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    source_type: String,
+    source_meeting_id: Option<String>,
+    source_feedback_id: Option<String>,
+    confidence: Option<f64>,
+    active: bool,
+    pinned: bool,
+    last_used_at: Option<String>,
+    archived_at: Option<String>,
+    archived_actor_user_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TranscriptFeedbackResponse {
+    id: String,
+    meeting_id: Option<String>,
+    transcript_segment_id: Option<String>,
+    feedback_type: String,
+    term_type: Option<String>,
+    original_text: Option<String>,
+    corrected_text: Option<String>,
+    speaker_id: Option<String>,
+    corrected_speaker_id: Option<String>,
+    note: Option<String>,
+    target_domain_knowledge_id: Option<String>,
+    target_ai_memory_note_id: Option<String>,
+    actor_user_id: String,
+    status: String,
+    created_at: String,
+    reviewed_at: Option<String>,
+    reviewed_actor_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct PersonAliasResponse {
+    id: String,
+    canonical_name: String,
+    alias: String,
+    discord_user_id: Option<String>,
+    source_type: String,
+    source_meeting_id: Option<String>,
+    source_feedback_id: Option<String>,
+    confidence: Option<f64>,
+    active: bool,
+    review_status: String,
+    reviewed_at: Option<String>,
+    reviewed_actor_user_id: Option<String>,
     archived_at: Option<String>,
     archived_actor_user_id: Option<String>,
     created_at: String,
@@ -3400,6 +3591,60 @@ struct NormalizedDomainKnowledgeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveTenantGuild {
+    tenant_discord_guild_id: String,
+    tenant_id: String,
+    guild_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedAiMemoryRequest {
+    title: String,
+    body: String,
+    tags: Vec<AiMemoryTag>,
+    source_type: AiMemorySourceType,
+    source_meeting_id: Option<String>,
+    source_feedback_id: Option<String>,
+    confidence: Option<ConfidencePermille>,
+    active: bool,
+    pinned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedFeedbackRequest {
+    transcript_segment_id: Option<String>,
+    feedback_type: TranscriptFeedbackType,
+    term_type: Option<TranscriptFeedbackTermType>,
+    original_text: Option<String>,
+    corrected_text: Option<String>,
+    speaker_id: Option<String>,
+    corrected_speaker_id: Option<String>,
+    note: Option<String>,
+    target_domain_knowledge_id: Option<String>,
+    target_ai_memory_note_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedFeedbackStatusRequest {
+    status: TranscriptFeedbackStatus,
+    target_domain_knowledge_id: Option<String>,
+    target_ai_memory_note_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedPersonAliasRequest {
+    canonical_name: String,
+    alias: String,
+    discord_user_id: Option<String>,
+    source_type: PersonAliasSourceType,
+    source_meeting_id: Option<String>,
+    source_feedback_id: Option<String>,
+    confidence: Option<ConfidencePermille>,
+    active: bool,
+    review_status: PersonAliasReviewStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedSummaryTemplateRequest {
     name: String,
     template: String,
@@ -3408,17 +3653,22 @@ struct NormalizedSummaryTemplateRequest {
 }
 
 fn validate_domain_knowledge_item_id(id: &str) -> Result<(), StatusCode> {
-    if id.trim().is_empty() || id.len() > 128 {
+    validate_resource_id(id)
+}
+
+fn validate_resource_id(id: &str) -> Result<(), StatusCode> {
+    if id.trim().is_empty()
+        || id.len() > 128
+        || id.contains('/')
+        || id.chars().any(char::is_control)
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())
 }
 
 fn validate_summary_template_id(id: &str) -> Result<(), StatusCode> {
-    if id.trim().is_empty() || id.len() > 128 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    Ok(())
+    validate_resource_id(id)
 }
 
 fn parse_domain_knowledge_content_type(
@@ -3442,6 +3692,362 @@ fn normalize_domain_knowledge_request(
         body: body.to_owned(),
         active: request.active,
     })
+}
+
+fn trim_required_text(value: &str, max_len: usize) -> Result<String, StatusCode> {
+    trim_required_text_with_controls(value, max_len, false)
+}
+
+fn trim_required_text_with_controls(
+    value: &str,
+    max_len: usize,
+    allow_controls: bool,
+) -> Result<String, StatusCode> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > max_len
+        || (!allow_controls && trimmed.chars().any(char::is_control))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn trim_optional_text(
+    value: Option<&str>,
+    max_len: usize,
+    allow_controls: bool,
+) -> Result<Option<String>, StatusCode> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > max_len || (!allow_controls && trimmed.chars().any(char::is_control)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn normalize_optional_id(value: Option<&str>) -> Result<Option<String>, StatusCode> {
+    let Some(value) = trim_optional_text(value, 128, false)? else {
+        return Ok(None);
+    };
+    validate_resource_id(&value)?;
+    Ok(Some(value))
+}
+
+fn normalize_confidence(value: Option<f64>) -> Result<Option<ConfidencePermille>, StatusCode> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    ConfidencePermille::new((value * 1000.0).round() as u16)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn confidence_sql(value: Option<ConfidencePermille>) -> String {
+    value
+        .map(ConfidencePermille::as_sql_decimal)
+        .unwrap_or_default()
+}
+
+fn confidence_response(value: Option<String>) -> Result<Option<f64>, StatusCode> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let confidence = ConfidencePermille::parse_sql_decimal(&value)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Some(f64::from(confidence.as_permille()) / 1000.0))
+}
+
+fn normalize_ai_memory_tags(tags: Option<&[String]>) -> Result<Vec<AiMemoryTag>, StatusCode> {
+    let Some(tags) = tags else {
+        return Ok(Vec::new());
+    };
+    if tags.len() > 10 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut normalized = Vec::with_capacity(tags.len());
+    let mut seen = HashSet::new();
+    for tag in tags {
+        let trimmed = tag.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > 64
+            || trimmed.chars().any(char::is_control)
+            || !seen.insert(trimmed.to_owned())
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let tag = AiMemoryTag::parse_str(trimmed).ok_or(StatusCode::BAD_REQUEST)?;
+        normalized.push(tag);
+    }
+    Ok(normalized)
+}
+
+fn ai_memory_tag_strings(tags: &[AiMemoryTag]) -> Vec<String> {
+    tags.iter().map(|tag| tag.as_str().to_owned()).collect()
+}
+
+fn ai_memory_response_tags(raw: Option<String>) -> Result<Vec<String>, StatusCode> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|tag| {
+            AiMemoryTag::parse_str(tag)
+                .map(|tag| tag.as_str().to_owned())
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .collect()
+}
+
+fn normalize_ai_memory_request(
+    request: &AiMemoryUpsertRequest,
+    default_source_type: AiMemorySourceType,
+) -> Result<NormalizedAiMemoryRequest, StatusCode> {
+    let title = trim_required_text(&request.title, 200)?;
+    let body = trim_required_text_with_controls(&request.body, 20_000, true)?;
+    let tags = normalize_ai_memory_tags(request.tags.as_deref())?;
+    let source_type = request
+        .source_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|source_type| !source_type.is_empty())
+        .map(|source_type| {
+            AiMemorySourceType::parse_str(source_type).ok_or(StatusCode::BAD_REQUEST)
+        })
+        .transpose()?
+        .unwrap_or(default_source_type);
+    let source_meeting_id = normalize_optional_id(request.source_meeting_id.as_deref())?;
+    let source_feedback_id = normalize_optional_id(request.source_feedback_id.as_deref())?;
+    validate_ai_memory_source_refs(
+        source_type,
+        source_meeting_id.as_deref(),
+        source_feedback_id.as_deref(),
+    )?;
+    Ok(NormalizedAiMemoryRequest {
+        title,
+        body,
+        tags,
+        source_type,
+        source_meeting_id,
+        source_feedback_id,
+        confidence: normalize_confidence(request.confidence)?,
+        active: request.active.unwrap_or(true),
+        pinned: request.pinned.unwrap_or(false),
+    })
+}
+
+fn validate_ai_memory_source_refs(
+    source_type: AiMemorySourceType,
+    source_meeting_id: Option<&str>,
+    source_feedback_id: Option<&str>,
+) -> Result<(), StatusCode> {
+    let valid = match source_type {
+        AiMemorySourceType::AiMeetingExtraction | AiMemorySourceType::VcParticipant => {
+            source_feedback_id.is_none()
+        }
+        AiMemorySourceType::UserFeedback => source_meeting_id.is_none(),
+        AiMemorySourceType::Manual | AiMemorySourceType::PromotionCandidate => {
+            source_meeting_id.is_none() && source_feedback_id.is_none()
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
+fn normalize_feedback_request(
+    request: &TranscriptFeedbackRequest,
+) -> Result<NormalizedFeedbackRequest, StatusCode> {
+    let feedback_type = TranscriptFeedbackType::parse_str(request.feedback_type.trim())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let term_type = request
+        .term_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|term_type| !term_type.is_empty())
+        .map(|term_type| {
+            TranscriptFeedbackTermType::parse_str(term_type).ok_or(StatusCode::BAD_REQUEST)
+        })
+        .transpose()?;
+    let normalized = NormalizedFeedbackRequest {
+        transcript_segment_id: normalize_optional_id(request.transcript_segment_id.as_deref())?,
+        feedback_type,
+        term_type,
+        original_text: trim_optional_text(request.original_text.as_deref(), 2_000, true)?,
+        corrected_text: trim_optional_text(request.corrected_text.as_deref(), 2_000, true)?,
+        speaker_id: trim_optional_text(request.speaker_id.as_deref(), 128, false)?,
+        corrected_speaker_id: trim_optional_text(
+            request.corrected_speaker_id.as_deref(),
+            128,
+            false,
+        )?,
+        note: trim_optional_text(request.note.as_deref(), 5_000, true)?,
+        target_domain_knowledge_id: normalize_optional_id(
+            request.target_domain_knowledge_id.as_deref(),
+        )?,
+        target_ai_memory_note_id: normalize_optional_id(
+            request.target_ai_memory_note_id.as_deref(),
+        )?,
+    };
+    validate_feedback_shape(&normalized)?;
+    Ok(normalized)
+}
+
+fn validate_feedback_shape(request: &NormalizedFeedbackRequest) -> Result<(), StatusCode> {
+    if request.target_domain_knowledge_id.is_some() && request.target_ai_memory_note_id.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match request.feedback_type {
+        TranscriptFeedbackType::Mistranscription => {
+            if request.original_text.is_none() && request.corrected_text.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        TranscriptFeedbackType::Speaker => {
+            if request.speaker_id.is_none() && request.corrected_speaker_id.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        TranscriptFeedbackType::Term => {
+            if request.term_type.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        TranscriptFeedbackType::PersonAlias => {
+            if request.original_text.is_none()
+                && request.corrected_text.is_none()
+                && request.speaker_id.is_none()
+                && request.corrected_speaker_id.is_none()
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        TranscriptFeedbackType::DomainKnowledge => {
+            if request.target_domain_knowledge_id.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        TranscriptFeedbackType::AiMemory => {
+            if request.target_ai_memory_note_id.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_feedback_status_request(
+    request: &TranscriptFeedbackStatusRequest,
+) -> Result<NormalizedFeedbackStatusRequest, StatusCode> {
+    let status = TranscriptFeedbackStatus::parse_str(request.status.trim())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if status == TranscriptFeedbackStatus::Open {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let target_domain_knowledge_id =
+        normalize_optional_id(request.target_domain_knowledge_id.as_deref())?;
+    let target_ai_memory_note_id =
+        normalize_optional_id(request.target_ai_memory_note_id.as_deref())?;
+    if target_domain_knowledge_id.is_some() && target_ai_memory_note_id.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if status == TranscriptFeedbackStatus::ConvertedToDomainKnowledge
+        && target_domain_knowledge_id.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if status == TranscriptFeedbackStatus::ConvertedToAiMemory && target_ai_memory_note_id.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if matches!(
+        status,
+        TranscriptFeedbackStatus::Accepted | TranscriptFeedbackStatus::Dismissed
+    ) && (target_domain_knowledge_id.is_some() || target_ai_memory_note_id.is_some())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(NormalizedFeedbackStatusRequest {
+        status,
+        target_domain_knowledge_id,
+        target_ai_memory_note_id,
+    })
+}
+
+fn normalize_person_alias_request(
+    request: &PersonAliasUpsertRequest,
+    default_source_type: PersonAliasSourceType,
+) -> Result<NormalizedPersonAliasRequest, StatusCode> {
+    let canonical_name = trim_required_text(&request.canonical_name, 200)?;
+    let alias = trim_required_text(&request.alias, 200)?;
+    let source_type = request
+        .source_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|source_type| !source_type.is_empty())
+        .map(|source_type| {
+            PersonAliasSourceType::parse_str(source_type).ok_or(StatusCode::BAD_REQUEST)
+        })
+        .transpose()?
+        .unwrap_or(default_source_type);
+    let source_meeting_id = normalize_optional_id(request.source_meeting_id.as_deref())?;
+    let source_feedback_id = normalize_optional_id(request.source_feedback_id.as_deref())?;
+    validate_person_alias_source_refs(
+        source_type,
+        source_meeting_id.as_deref(),
+        source_feedback_id.as_deref(),
+    )?;
+    let review_status = request
+        .review_status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(|status| PersonAliasReviewStatus::parse_str(status).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()?
+        .unwrap_or(PersonAliasReviewStatus::Unreviewed);
+    Ok(NormalizedPersonAliasRequest {
+        canonical_name,
+        alias,
+        discord_user_id: trim_optional_text(request.discord_user_id.as_deref(), 128, false)?,
+        source_type,
+        source_meeting_id,
+        source_feedback_id,
+        confidence: normalize_confidence(request.confidence)?,
+        active: request.active.unwrap_or(true),
+        review_status,
+    })
+}
+
+fn validate_person_alias_source_refs(
+    source_type: PersonAliasSourceType,
+    source_meeting_id: Option<&str>,
+    source_feedback_id: Option<&str>,
+) -> Result<(), StatusCode> {
+    let valid = match source_type {
+        PersonAliasSourceType::UserFeedback => source_meeting_id.is_none(),
+        PersonAliasSourceType::VcParticipant => source_feedback_id.is_none(),
+        PersonAliasSourceType::Manual | PersonAliasSourceType::AiInference => {
+            source_meeting_id.is_none() && source_feedback_id.is_none()
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
 }
 
 fn normalize_domain_knowledge_list_filter(
@@ -3497,6 +4103,96 @@ fn domain_knowledge_response_from_row(row: &tokio_postgres::Row) -> DomainKnowle
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+fn active_tenant_guild_from_row(row: &tokio_postgres::Row) -> ActiveTenantGuild {
+    ActiveTenantGuild {
+        tenant_discord_guild_id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        guild_id: row.get("guild_id"),
+    }
+}
+
+async fn require_single_active_tenant_guild(
+    state: &WebState,
+    guild_id: &str,
+) -> Result<ActiveTenantGuild, StatusCode> {
+    let row = state
+        .db
+        .query_opt(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &[&guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    Ok(active_tenant_guild_from_row(&row))
+}
+
+fn ai_memory_response_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<AiMemoryNoteResponse, StatusCode> {
+    Ok(AiMemoryNoteResponse {
+        id: row.get("id"),
+        title: row.get("title"),
+        body: row.get("body"),
+        tags: ai_memory_response_tags(row.get("tags"))?,
+        source_type: row.get("source_type"),
+        source_meeting_id: row.get("source_meeting_id"),
+        source_feedback_id: row.get("source_feedback_id"),
+        confidence: confidence_response(row.get("confidence"))?,
+        active: row.get("active"),
+        pinned: row.get("pinned"),
+        last_used_at: row.get("last_used_at"),
+        archived_at: row.get("archived_at"),
+        archived_actor_user_id: row.get("archived_actor_user_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn feedback_response_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<TranscriptFeedbackResponse, StatusCode> {
+    Ok(TranscriptFeedbackResponse {
+        id: row.get("id"),
+        meeting_id: row.get("meeting_id"),
+        transcript_segment_id: row.get("transcript_segment_id"),
+        feedback_type: row.get("feedback_type"),
+        term_type: row.get("term_type"),
+        original_text: row.get("original_text"),
+        corrected_text: row.get("corrected_text"),
+        speaker_id: row.get("speaker_id"),
+        corrected_speaker_id: row.get("corrected_speaker_id"),
+        note: row.get("note"),
+        target_domain_knowledge_id: row.get("target_domain_knowledge_id"),
+        target_ai_memory_note_id: row.get("target_ai_memory_note_id"),
+        actor_user_id: row.get("actor_user_id"),
+        status: row.get("status"),
+        created_at: row.get("created_at"),
+        reviewed_at: row.get("reviewed_at"),
+        reviewed_actor_user_id: row.get("reviewed_actor_user_id"),
+    })
+}
+
+fn person_alias_response_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<PersonAliasResponse, StatusCode> {
+    Ok(PersonAliasResponse {
+        id: row.get("id"),
+        canonical_name: row.get("canonical_name"),
+        alias: row.get("alias"),
+        discord_user_id: row.get("discord_user_id"),
+        source_type: row.get("source_type"),
+        source_meeting_id: row.get("source_meeting_id"),
+        source_feedback_id: row.get("source_feedback_id"),
+        confidence: confidence_response(row.get("confidence"))?,
+        active: row.get("active"),
+        review_status: row.get("review_status"),
+        reviewed_at: row.get("reviewed_at"),
+        reviewed_actor_user_id: row.get("reviewed_actor_user_id"),
+        archived_at: row.get("archived_at"),
+        archived_actor_user_id: row.get("archived_actor_user_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 fn summary_template_response_from_row(row: &tokio_postgres::Row) -> SummaryTemplateResponse {
@@ -4624,6 +5320,764 @@ async fn api_archive_domain_knowledge(
                 "version": response.version,
                 "archived": response.archived_at.is_some(),
             }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_list_ai_memory(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Query(query): Query<AiMemoryListQuery>,
+) -> Result<Json<Vec<AiMemoryNoteResponse>>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let source_type = query
+        .source_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|source_type| !source_type.is_empty())
+        .map(|source_type| {
+            AiMemorySourceType::parse_str(source_type).ok_or(StatusCode::BAD_REQUEST)
+        })
+        .transpose()?
+        .map(|source_type| source_type.as_str().to_owned())
+        .unwrap_or_default();
+    let include_archived = query.include_archived.unwrap_or(false).to_string();
+    let rows = state
+        .db
+        .query(
+            LIST_AI_MEMORY_NOTES_SQL,
+            &[
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &include_archived,
+                &source_type,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    rows.iter()
+        .map(ai_memory_response_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn api_create_ai_memory(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+    Json(request): Json<AiMemoryUpsertRequest>,
+) -> Result<(StatusCode, Json<AiMemoryNoteResponse>), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let normalized = normalize_ai_memory_request(&request, AiMemorySourceType::Manual)?;
+    let id = Uuid::new_v4().to_string();
+    let tags = ai_memory_tag_strings(&normalized.tags);
+    let source_type = normalized.source_type.as_str().to_owned();
+    let source_meeting_id = normalized.source_meeting_id.unwrap_or_default();
+    let source_feedback_id = normalized.source_feedback_id.unwrap_or_default();
+    let confidence = confidence_sql(normalized.confidence);
+    let active = normalized.active.to_string();
+    let pinned = normalized.pinned.to_string();
+    let row = state
+        .db
+        .query_opt(
+            INSERT_AI_MEMORY_NOTE_SQL,
+            &[
+                &id,
+                &tenant.tenant_discord_guild_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &normalized.title,
+                &normalized.body,
+                &tags,
+                &source_type,
+                &source_meeting_id,
+                &source_feedback_id,
+                &confidence,
+                &active,
+                &pinned,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let response = ai_memory_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id.clone()),
+            "ai_memory.create",
+            "ai_memory",
+            Some(response.id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/guild/ai-memory"),
+            json!({
+                "source_type": response.source_type,
+                "tag_count": response.tags.len(),
+                "active": response.active,
+                "pinned": response.pinned,
+                "source_meeting_id": response.source_meeting_id,
+                "source_feedback_id": response.source_feedback_id,
+                "confidence_set": response.confidence.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn api_update_ai_memory_by_body(
+    State(state): State<WebState>,
+    Extension(user): Extension<AuthUserId>,
+    headers: HeaderMap,
+    Json(request): Json<AiMemoryUpsertRequest>,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    let id = request
+        .id
+        .as_deref()
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .to_owned();
+    api_update_ai_memory_inner(state, user, id, headers, request).await
+}
+
+async fn api_update_ai_memory(
+    State(state): State<WebState>,
+    Extension(user): Extension<AuthUserId>,
+    Path(memory_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<AiMemoryUpsertRequest>,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    api_update_ai_memory_inner(state, user, memory_id, headers, request).await
+}
+
+async fn api_update_ai_memory_inner(
+    state: WebState,
+    AuthUserId(user_id): AuthUserId,
+    memory_id: String,
+    headers: HeaderMap,
+    request: AiMemoryUpsertRequest,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    validate_resource_id(&memory_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let normalized = normalize_ai_memory_request(&request, AiMemorySourceType::Manual)?;
+    let tags = ai_memory_tag_strings(&normalized.tags);
+    let confidence = confidence_sql(normalized.confidence);
+    let active = normalized.active.to_string();
+    let pinned = normalized.pinned.to_string();
+    let row = state
+        .db
+        .query_opt(
+            UPDATE_AI_MEMORY_NOTE_SQL,
+            &[
+                &memory_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &normalized.title,
+                &normalized.body,
+                &tags,
+                &confidence,
+                &active,
+                &pinned,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = ai_memory_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id.clone()),
+            "ai_memory.update",
+            "ai_memory",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &format!("/api/guild/ai-memory/{memory_id}"),
+            ),
+            json!({
+                "tag_count": response.tags.len(),
+                "active": response.active,
+                "pinned": response.pinned,
+                "confidence_set": response.confidence.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn update_ai_memory_pin(
+    state: WebState,
+    user_id: String,
+    memory_id: String,
+    headers: HeaderMap,
+    pinned: bool,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    validate_resource_id(&memory_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let pinned_text = pinned.to_string();
+    let row = state
+        .db
+        .query_opt(
+            SET_AI_MEMORY_PINNED_SQL,
+            &[
+                &memory_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &pinned_text,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = ai_memory_response_from_row(&row)?;
+    let action = if pinned {
+        "ai_memory.pin"
+    } else {
+        "ai_memory.unpin"
+    };
+    let suffix = if pinned { "pin" } else { "unpin" };
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            action,
+            "ai_memory",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/ai-memory/{memory_id}/{suffix}"),
+            ),
+            json!({ "pinned": response.pinned }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_pin_ai_memory(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(memory_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    update_ai_memory_pin(state, user_id, memory_id, headers, true).await
+}
+
+async fn api_unpin_ai_memory(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(memory_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    update_ai_memory_pin(state, user_id, memory_id, headers, false).await
+}
+
+async fn api_archive_ai_memory(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(memory_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
+    validate_resource_id(&memory_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let row = state
+        .db
+        .query_opt(
+            ARCHIVE_AI_MEMORY_NOTE_SQL,
+            &[&memory_id, &tenant.tenant_id, &tenant.guild_id, &user_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = ai_memory_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            "ai_memory.archive",
+            "ai_memory",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/ai-memory/{memory_id}/archive"),
+            ),
+            json!({ "active": response.active, "archived": response.archived_at.is_some() }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_promote_ai_memory_to_domain_knowledge(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(memory_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<AiMemoryPromoteRequest>,
+) -> Result<(StatusCode, Json<DomainKnowledgeItemResponse>), StatusCode> {
+    validate_resource_id(&memory_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let content_type = parse_domain_knowledge_content_type(&request.content_type)?;
+    let memory_row = state
+        .db
+        .query_opt(
+            GET_AI_MEMORY_NOTE_SQL,
+            &[&memory_id, &tenant.tenant_id, &tenant.guild_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let memory = ai_memory_response_from_row(&memory_row)?;
+    if memory.archived_at.is_some() {
+        return Err(StatusCode::CONFLICT);
+    }
+    let id = Uuid::new_v4().to_string();
+    let content_type_text = content_type.as_str().to_owned();
+    let active = false.to_string();
+    let row = state
+        .db
+        .query_opt(
+            INSERT_DOMAIN_KNOWLEDGE_SQL,
+            &[
+                &id,
+                &tenant.guild_id,
+                &content_type_text,
+                &memory.title,
+                &memory.body,
+                &active,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let response = domain_knowledge_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            "ai_memory.promote_to_domain_knowledge",
+            "ai_memory",
+            Some(memory.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/ai-memory/{memory_id}/promote-to-domain-knowledge"),
+            ),
+            json!({
+                "domain_knowledge_id": response.id,
+                "content_type": response.content_type,
+                "domain_knowledge_active": response.active,
+            }),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn api_create_meeting_feedback(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+    Json(request): Json<TranscriptFeedbackRequest>,
+) -> Result<(StatusCode, Json<TranscriptFeedbackResponse>), StatusCode> {
+    validate_resource_id(&meeting_id)?;
+    let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &access.guild_id).await?;
+    let normalized = normalize_feedback_request(&request)?;
+    let id = Uuid::new_v4().to_string();
+    let transcript_segment_id = normalized.transcript_segment_id.unwrap_or_default();
+    let feedback_type = normalized.feedback_type.as_str().to_owned();
+    let term_type = normalized
+        .term_type
+        .map(|term_type| term_type.as_str().to_owned())
+        .unwrap_or_default();
+    let original_text = normalized.original_text.unwrap_or_default();
+    let corrected_text = normalized.corrected_text.unwrap_or_default();
+    let speaker_id = normalized.speaker_id.unwrap_or_default();
+    let corrected_speaker_id = normalized.corrected_speaker_id.unwrap_or_default();
+    let note = normalized.note.unwrap_or_default();
+    let target_domain_knowledge_id = normalized.target_domain_knowledge_id.unwrap_or_default();
+    let target_ai_memory_note_id = normalized.target_ai_memory_note_id.unwrap_or_default();
+    let row = state
+        .db
+        .query_opt(
+            INSERT_TRANSCRIPT_FEEDBACK_SQL,
+            &[
+                &id,
+                &tenant.tenant_discord_guild_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &meeting_id,
+                &transcript_segment_id,
+                &feedback_type,
+                &term_type,
+                &original_text,
+                &corrected_text,
+                &speaker_id,
+                &corrected_speaker_id,
+                &note,
+                &target_domain_knowledge_id,
+                &target_ai_memory_note_id,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    Ok((StatusCode::CREATED, Json(feedback_response_from_row(&row)?)))
+}
+
+async fn api_list_feedback(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Query(query): Query<FeedbackListQuery>,
+) -> Result<Json<Vec<TranscriptFeedbackResponse>>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(|status| TranscriptFeedbackStatus::parse_str(status).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()?
+        .map(|status| status.as_str().to_owned())
+        .unwrap_or_default();
+    let feedback_type = query
+        .feedback_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|feedback_type| !feedback_type.is_empty())
+        .map(|feedback_type| {
+            TranscriptFeedbackType::parse_str(feedback_type).ok_or(StatusCode::BAD_REQUEST)
+        })
+        .transpose()?
+        .map(|feedback_type| feedback_type.as_str().to_owned())
+        .unwrap_or_default();
+    let rows = state
+        .db
+        .query(
+            LIST_TRANSCRIPT_FEEDBACK_SQL,
+            &[&tenant.tenant_id, &tenant.guild_id, &status, &feedback_type],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    rows.iter()
+        .map(feedback_response_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn api_update_feedback_status(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(feedback_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<TranscriptFeedbackStatusRequest>,
+) -> Result<Json<TranscriptFeedbackResponse>, StatusCode> {
+    validate_resource_id(&feedback_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let normalized = normalize_feedback_status_request(&request)?;
+    let status = normalized.status.as_str().to_owned();
+    let target_domain_knowledge_id = normalized.target_domain_knowledge_id.unwrap_or_default();
+    let target_ai_memory_note_id = normalized.target_ai_memory_note_id.unwrap_or_default();
+    let row = state
+        .db
+        .query_opt(
+            UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+            &[
+                &feedback_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &status,
+                &target_domain_knowledge_id,
+                &target_ai_memory_note_id,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = feedback_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            "transcript_feedback.update_status",
+            "transcript_feedback",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &format!("/api/guild/feedback/{feedback_id}/status"),
+            ),
+            json!({
+                "status": response.status,
+                "feedback_type": response.feedback_type,
+                "meeting_id": response.meeting_id,
+                "target_domain_knowledge_id": response.target_domain_knowledge_id,
+                "target_ai_memory_note_id": response.target_ai_memory_note_id,
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_list_person_aliases(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Query(query): Query<PersonAliasListQuery>,
+) -> Result<Json<Vec<PersonAliasResponse>>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let include_archived = query.include_archived.unwrap_or(false).to_string();
+    let review_status = query
+        .review_status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(|status| PersonAliasReviewStatus::parse_str(status).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()?
+        .map(|status| status.as_str().to_owned())
+        .unwrap_or_default();
+    let rows = state
+        .db
+        .query(
+            LIST_PERSON_ALIASES_SQL,
+            &[
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &include_archived,
+                &review_status,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    rows.iter()
+        .map(person_alias_response_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn api_create_person_alias(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+    Json(request): Json<PersonAliasUpsertRequest>,
+) -> Result<(StatusCode, Json<PersonAliasResponse>), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let normalized = normalize_person_alias_request(&request, PersonAliasSourceType::Manual)?;
+    let id = Uuid::new_v4().to_string();
+    let discord_user_id = normalized.discord_user_id.unwrap_or_default();
+    let source_type = normalized.source_type.as_str().to_owned();
+    let source_meeting_id = normalized.source_meeting_id.unwrap_or_default();
+    let source_feedback_id = normalized.source_feedback_id.unwrap_or_default();
+    let confidence = confidence_sql(normalized.confidence);
+    let active = normalized.active.to_string();
+    let review_status = normalized.review_status.as_str().to_owned();
+    let row = state
+        .db
+        .query_opt(
+            INSERT_PERSON_ALIAS_SQL,
+            &[
+                &id,
+                &tenant.tenant_discord_guild_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &normalized.canonical_name,
+                &normalized.alias,
+                &discord_user_id,
+                &source_type,
+                &source_meeting_id,
+                &source_feedback_id,
+                &confidence,
+                &active,
+                &review_status,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let response = person_alias_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id.clone()),
+            "person_alias.create",
+            "person_alias",
+            Some(response.id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/guild/person-aliases"),
+            json!({
+                "source_type": response.source_type,
+                "review_status": response.review_status,
+                "active": response.active,
+                "discord_user_id_set": response.discord_user_id.is_some(),
+                "source_meeting_id": response.source_meeting_id,
+                "source_feedback_id": response.source_feedback_id,
+                "confidence_set": response.confidence.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn api_update_person_alias_by_body(
+    State(state): State<WebState>,
+    Extension(user): Extension<AuthUserId>,
+    headers: HeaderMap,
+    Json(request): Json<PersonAliasUpsertRequest>,
+) -> Result<Json<PersonAliasResponse>, StatusCode> {
+    let id = request
+        .id
+        .as_deref()
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .to_owned();
+    api_update_person_alias_inner(state, user, id, headers, request).await
+}
+
+async fn api_update_person_alias(
+    State(state): State<WebState>,
+    Extension(user): Extension<AuthUserId>,
+    Path(alias_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<PersonAliasUpsertRequest>,
+) -> Result<Json<PersonAliasResponse>, StatusCode> {
+    api_update_person_alias_inner(state, user, alias_id, headers, request).await
+}
+
+async fn api_update_person_alias_inner(
+    state: WebState,
+    AuthUserId(user_id): AuthUserId,
+    alias_id: String,
+    headers: HeaderMap,
+    request: PersonAliasUpsertRequest,
+) -> Result<Json<PersonAliasResponse>, StatusCode> {
+    validate_resource_id(&alias_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let normalized = normalize_person_alias_request(&request, PersonAliasSourceType::Manual)?;
+    let discord_user_id = normalized.discord_user_id.unwrap_or_default();
+    let confidence = confidence_sql(normalized.confidence);
+    let active = normalized.active.to_string();
+    let review_status = normalized.review_status.as_str().to_owned();
+    let row = state
+        .db
+        .query_opt(
+            UPDATE_PERSON_ALIAS_SQL,
+            &[
+                &alias_id,
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &normalized.canonical_name,
+                &normalized.alias,
+                &discord_user_id,
+                &confidence,
+                &active,
+                &review_status,
+                &user_id,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = person_alias_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            "person_alias.update",
+            "person_alias",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "PUT",
+                &format!("/api/guild/person-aliases/{alias_id}"),
+            ),
+            json!({
+                "review_status": response.review_status,
+                "active": response.active,
+                "discord_user_id_set": response.discord_user_id.is_some(),
+                "confidence_set": response.confidence.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_archive_person_alias(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(alias_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PersonAliasResponse>, StatusCode> {
+    validate_resource_id(&alias_id)?;
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
+    let row = state
+        .db
+        .query_opt(
+            ARCHIVE_PERSON_ALIAS_SQL,
+            &[&alias_id, &tenant.tenant_id, &tenant.guild_id, &user_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = person_alias_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            "person_alias.archive",
+            "person_alias",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/person-aliases/{alias_id}/archive"),
+            ),
+            json!({ "active": response.active, "archived": response.archived_at.is_some() }),
         ),
     )
     .await;
@@ -7030,31 +8484,36 @@ mod operational_endpoint_tests {
 #[cfg(test)]
 mod guild_api_tests {
     use super::{
-        ADMINISTRATOR, AuthConfig, BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS, BotTokenCacheState,
-        CachedChannelPermission, DiscordBotTokenValidationError, DiscordBotTokenValidationStage,
-        DiscordGuild, DiscordGuildFull, DiscordRoleFull, DomainKnowledgeListQuery,
-        DomainKnowledgeUpsertRequest, GUILD_CACHE_REFRESH_INFLIGHT_SECS,
+        ADMINISTRATOR, AiMemoryUpsertRequest, AuthConfig, BOT_TOKEN_CACHE_REFRESH_INFLIGHT_SECS,
+        BotTokenCacheState, CachedChannelPermission, DiscordBotTokenValidationError,
+        DiscordBotTokenValidationStage, DiscordGuild, DiscordGuildFull, DiscordRoleFull,
+        DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest, GUILD_CACHE_REFRESH_INFLIGHT_SECS,
         GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP, GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT,
         GUILD_MEETINGS_VISIBILITY_SCAN_MIN, GuildAdminCheck, GuildBotTokenUpdateRequest,
         GuildCache, GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults,
         GuildSettingsUpdateRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS,
-        StoredGuildSettings, SummaryTemplateUpsertRequest, advance_bot_token_revision,
+        PersonAliasUpsertRequest, StoredGuildSettings, SummaryTemplateUpsertRequest,
+        TranscriptFeedbackRequest, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
         bot_auth_header_from_cache_with_resolver, can_scan_new_visibility_channel,
         classify_discord_bot_token_validation_status, current_user_guilds_response,
         discord_user_guilds_api_status, guild_admin_member_status_decision,
         guild_admin_permission_cache_key, guild_admin_required_result,
         guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
-        guild_meetings_visibility_scan_limit, guild_settings_response,
+        guild_meetings_visibility_scan_limit, guild_settings_response, normalize_ai_memory_request,
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
+        normalize_feedback_request, normalize_feedback_status_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
-        normalize_guild_meetings_voice_channel_id, normalize_summary_template_request,
-        normalize_target_guild_id, permission_cache_ttl, target_auth_config,
-        target_guild_has_active_installation, target_guild_settings_path,
+        normalize_guild_meetings_voice_channel_id, normalize_person_alias_request,
+        normalize_summary_template_request, normalize_target_guild_id, permission_cache_ttl,
+        target_auth_config, target_guild_has_active_installation, target_guild_settings_path,
         user_can_access_target_guild, validate_authorized_guild_bot_token_update,
         validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
-        validate_domain_knowledge_item_id, validate_guild_settings_update,
+        validate_domain_knowledge_item_id, validate_guild_settings_update, validate_resource_id,
         validate_summary_template_id,
     };
+    use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
+    use crate::domain::feedback::{TranscriptFeedbackStatus, TranscriptFeedbackType};
+    use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
     use crate::infrastructure::sql::{
         COUNT_GUILD_MEETINGS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
     };
@@ -7508,6 +8967,190 @@ mod guild_api_tests {
         assert_eq!(
             validate_domain_knowledge_item_id(&"x".repeat(129)),
             Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(validate_resource_id("bad/id"), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            validate_resource_id("bad\nid"),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    fn ai_memory_request() -> AiMemoryUpsertRequest {
+        AiMemoryUpsertRequest {
+            id: None,
+            title: " Team terms ".to_owned(),
+            body: " Use project codenames. ".to_owned(),
+            tags: Some(vec!["terminology".to_owned(), "summary_hint".to_owned()]),
+            source_type: None,
+            source_meeting_id: None,
+            source_feedback_id: None,
+            confidence: Some(0.875),
+            active: Some(true),
+            pinned: Some(false),
+        }
+    }
+
+    #[test]
+    fn ai_memory_validation_trims_tags_confidence_and_rejects_bad_sources() {
+        let normalized =
+            normalize_ai_memory_request(&ai_memory_request(), AiMemorySourceType::Manual)
+                .expect("valid ai memory request");
+
+        assert_eq!(normalized.title, "Team terms");
+        assert_eq!(normalized.body, "Use project codenames.");
+        assert_eq!(
+            normalized.tags,
+            vec![AiMemoryTag::Terminology, AiMemoryTag::SummaryHint]
+        );
+        assert_eq!(normalized.confidence.unwrap().as_permille(), 875);
+
+        let mut bad = ai_memory_request();
+        bad.source_type = Some("manual".to_owned());
+        bad.source_meeting_id = Some("meeting-1".to_owned());
+        assert_eq!(
+            normalize_ai_memory_request(&bad, AiMemorySourceType::Manual),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let mut duplicate_tag = ai_memory_request();
+        duplicate_tag.tags = Some(vec!["person".to_owned(), "person".to_owned()]);
+        assert_eq!(
+            normalize_ai_memory_request(&duplicate_tag, AiMemorySourceType::Manual),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    fn feedback_request(feedback_type: &str) -> TranscriptFeedbackRequest {
+        TranscriptFeedbackRequest {
+            transcript_segment_id: Some("segment-1".to_owned()),
+            feedback_type: feedback_type.to_owned(),
+            term_type: None,
+            original_text: None,
+            corrected_text: None,
+            speaker_id: None,
+            corrected_speaker_id: None,
+            note: Some(" Helpful context ".to_owned()),
+            target_domain_knowledge_id: None,
+            target_ai_memory_note_id: None,
+        }
+    }
+
+    #[test]
+    fn feedback_validation_enforces_type_specific_required_fields_and_targets() {
+        let mut term = feedback_request("term");
+        term.term_type = Some("person_name".to_owned());
+        term.corrected_text = Some("xpadev".to_owned());
+        let normalized = normalize_feedback_request(&term).expect("term feedback should validate");
+        assert_eq!(normalized.feedback_type, TranscriptFeedbackType::Term);
+        assert_eq!(normalized.note.as_deref(), Some("Helpful context"));
+
+        assert_eq!(
+            normalize_feedback_request(&feedback_request("term")),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let mut domain = feedback_request("domain_knowledge");
+        domain.target_domain_knowledge_id = Some("dk-1".to_owned());
+        domain.target_ai_memory_note_id = Some("mem-1".to_owned());
+        assert_eq!(
+            normalize_feedback_request(&domain),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let converted = normalize_feedback_status_request(&TranscriptFeedbackStatusRequest {
+            status: "converted_to_ai_memory".to_owned(),
+            target_domain_knowledge_id: None,
+            target_ai_memory_note_id: Some("mem-1".to_owned()),
+        })
+        .expect("converted status should validate with target");
+        assert_eq!(
+            converted.status,
+            TranscriptFeedbackStatus::ConvertedToAiMemory
+        );
+        assert_eq!(
+            normalize_feedback_status_request(&TranscriptFeedbackStatusRequest {
+                status: "open".to_owned(),
+                target_domain_knowledge_id: None,
+                target_ai_memory_note_id: None,
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_feedback_status_request(&TranscriptFeedbackStatusRequest {
+                status: "accepted".to_owned(),
+                target_domain_knowledge_id: Some("dk-1".to_owned()),
+                target_ai_memory_note_id: None,
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    fn person_alias_request() -> PersonAliasUpsertRequest {
+        PersonAliasUpsertRequest {
+            id: None,
+            canonical_name: " xpadev ".to_owned(),
+            alias: " xpa ".to_owned(),
+            discord_user_id: Some("123".to_owned()),
+            source_type: None,
+            source_meeting_id: None,
+            source_feedback_id: None,
+            confidence: Some(1.0),
+            active: Some(true),
+            review_status: Some("accepted".to_owned()),
+        }
+    }
+
+    #[test]
+    fn person_alias_validation_rejects_controls_and_incompatible_sources() {
+        let normalized =
+            normalize_person_alias_request(&person_alias_request(), PersonAliasSourceType::Manual)
+                .expect("valid alias request");
+        assert_eq!(normalized.canonical_name, "xpadev");
+        assert_eq!(normalized.alias, "xpa");
+        assert_eq!(normalized.review_status, PersonAliasReviewStatus::Accepted);
+        assert_eq!(normalized.confidence.unwrap().as_permille(), 1000);
+
+        let mut bad_control = person_alias_request();
+        bad_control.alias = "xpa\nteam".to_owned();
+        assert_eq!(
+            normalize_person_alias_request(&bad_control, PersonAliasSourceType::Manual),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let mut bad_source = person_alias_request();
+        bad_source.source_type = Some("manual".to_owned());
+        bad_source.source_feedback_id = Some("feedback-1".to_owned());
+        assert_eq!(
+            normalize_person_alias_request(&bad_source, PersonAliasSourceType::Manual),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn admin_mutation_handlers_authorize_before_body_shape_validation() {
+        let source = include_str!("web.rs");
+        let promote = source
+            .split_once("async fn api_promote_ai_memory_to_domain_knowledge")
+            .expect("promote handler should exist")
+            .1
+            .split_once("async fn api_create_meeting_feedback")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            promote.find("require_current_user_is_guild_admin")
+                < promote.find("parse_domain_knowledge_content_type")
+        );
+
+        let feedback_status = source
+            .split_once("async fn api_update_feedback_status")
+            .expect("feedback status handler should exist")
+            .1
+            .split_once("async fn api_list_person_aliases")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            feedback_status.find("require_current_user_is_guild_admin")
+                < feedback_status.find("normalize_feedback_status_request")
         );
     }
 

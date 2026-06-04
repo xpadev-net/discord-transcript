@@ -81,3 +81,35 @@ pub struct PersonAlias {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPersonAlias {
+    pub id: String,
+    pub tenant_discord_guild_id: String,
+    pub tenant_id: String,
+    pub guild_id: String,
+    pub canonical_name: String,
+    pub alias: String,
+    pub discord_user_id: Option<String>,
+    pub source_type: PersonAliasSourceType,
+    pub source_meeting_id: Option<String>,
+    pub source_feedback_id: Option<String>,
+    pub confidence: Option<ConfidencePermille>,
+    pub active: bool,
+    pub review_status: PersonAliasReviewStatus,
+    pub actor_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePersonAlias {
+    pub id: String,
+    pub tenant_id: String,
+    pub guild_id: String,
+    pub canonical_name: String,
+    pub alias: String,
+    pub discord_user_id: Option<String>,
+    pub confidence: Option<ConfidencePermille>,
+    pub active: bool,
+    pub review_status: PersonAliasReviewStatus,
+    pub actor_user_id: String,
+}
