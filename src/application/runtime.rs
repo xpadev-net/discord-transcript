@@ -3152,13 +3152,38 @@ impl ScaffoldHandler {
     }
 
     async fn active_meeting_voice_channel_id(&self) -> Option<u64> {
+        match self.active_meeting_voice_channel_id_result().await {
+            Ok(voice_channel_id) => voice_channel_id,
+            Err(err) => {
+                warn!(
+                    guild_id = %self.guild_id,
+                    error = %err,
+                    "failed to resolve active meeting voice channel"
+                );
+                None
+            }
+        }
+    }
+
+    async fn active_meeting_voice_channel_id_result(&self) -> Result<Option<u64>, String> {
         let mut service = self.service.lock().await;
-        service
+        let Some(meeting) = service
             .store
             .find_active_meeting_by_guild(&self.guild_id.get().to_string())
-            .ok()
-            .flatten()
-            .and_then(|meeting| meeting.voice_channel_id.parse::<u64>().ok())
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(None);
+        };
+        meeting
+            .voice_channel_id
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|err| {
+                format!(
+                    "invalid active meeting voice channel id for meeting {}: {err}",
+                    meeting.id
+                )
+            })
     }
 
     async fn active_meeting_id(&self) -> Option<String> {
@@ -3554,8 +3579,8 @@ impl ScaffoldHandler {
                     error = %lookup_error.as_deref().unwrap_or("unknown store error"),
                     "could not verify active recording after voice join; keeping joined recording because session still matches"
                 );
-                let mut startups = self.recording_startups.lock().await;
-                clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+                // Keep the startup reservation while the DB cannot confirm
+                // the row. Stop/cleanup paths still use it as a local handle.
                 return Ok(RecordingStartJoinVerification::Active);
             }
             if shutdown_error.is_none()
@@ -3851,14 +3876,26 @@ impl ScaffoldHandler {
                         );
                         last_err = Some(err);
                         // Clean up partial gateway state before retrying
-                        if let Err(leave_err) = manager.leave(guild_id).await {
-                            warn!(
-                                attempt,
-                                guild_id = %guild_id.get(),
-                                meeting_id = %meeting_id,
-                                error = %leave_err,
-                                "failed to leave voice channel during retry cleanup"
-                            );
+                        {
+                            let _command_guard = self.command_gate.write().await;
+                            let session_matches = {
+                                let sessions = self.sessions.lock().await;
+                                sessions
+                                    .get(&guild_key)
+                                    .is_some_and(|session| session.meeting_id == meeting_id)
+                            };
+                            if !session_matches {
+                                return Ok(format!(
+                                    "{response}\n(参加再試行中に停止処理が始まりました。停止処理の完了を待っています。)"
+                                ));
+                            }
+                            leave_voice_with_timeout(
+                                manager.as_ref(),
+                                guild_id,
+                                &meeting_id,
+                                "record-start retry cleanup",
+                            )
+                            .await;
                         }
                         // Re-register after leave in case it cleared the Call's
                         // event handlers (defensive: Songbird docs say handlers
@@ -5585,33 +5622,47 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 );
                                 return;
                             }
-                            let Some(target_voice_channel_id) =
-                                runtime.active_meeting_voice_channel_id().await
-                            else {
-                                {
-                                    let mut sessions = runtime.sessions.lock().await;
-                                    if sessions.get(&guild_key).is_some_and(|session| {
-                                        session.meeting_id == expected_meeting_id_ref
-                                    }) {
-                                        sessions.remove(&guild_key);
+                            let target_voice_channel_id =
+                                match runtime.active_meeting_voice_channel_id_result().await {
+                                    Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
+                                    Ok(None) => {
+                                        {
+                                            let mut sessions = runtime.sessions.lock().await;
+                                            if sessions.get(&guild_key).is_some_and(|session| {
+                                                session.meeting_id == expected_meeting_id_ref
+                                            }) {
+                                                sessions.remove(&guild_key);
+                                            }
+                                        }
+                                        {
+                                            let mut states =
+                                                runtime.auto_stop_states.lock().await;
+                                            states.remove(&guild_key);
+                                        }
+                                        {
+                                            let mut titles =
+                                                runtime.live_transcription_titles.lock().await;
+                                            titles.remove(expected_meeting_id_ref);
+                                        }
+                                        let mut startups =
+                                            runtime.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_key,
+                                            expected_meeting_id_ref,
+                                        );
+                                        return;
                                     }
-                                }
-                                {
-                                    let mut states = runtime.auto_stop_states.lock().await;
-                                    states.remove(&guild_key);
-                                }
-                                {
-                                    let mut titles = runtime.live_transcription_titles.lock().await;
-                                    titles.remove(expected_meeting_id_ref);
-                                }
-                                let mut startups = runtime.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_key,
-                                    expected_meeting_id_ref,
-                                );
-                                return;
-                            };
+                                    Err(err) => {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %err,
+                                            "failed to resolve active voice channel during driver-disconnect grace; rescheduling"
+                                        );
+                                        continue;
+                                    }
+                                };
                             let reconnected = is_bot_connected_to_voice_channel(
                                 &ctx_for_task,
                                 runtime.guild_id,
