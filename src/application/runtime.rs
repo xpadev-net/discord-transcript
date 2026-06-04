@@ -84,7 +84,7 @@ use tracing::{debug, error, info, warn};
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
-const AUTO_STOP_FINAL_FLUSH_MAX_RETRIES: u32 = 10;
+const FINAL_FLUSH_MAX_RETRIES: u32 = 10;
 const AUTO_STOP_GRACE_MAX_RESCHEDULES: u32 = 10;
 const DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES: u32 = 10;
 const RECORDING_STOP_MAX_RETRIES: u32 = 10;
@@ -622,7 +622,11 @@ fn mark_recording_start_failed_after_setup_error<S: MeetingStore>(
             Ok(())
         }
         Err(StoreError::CasConflict { .. } | StoreError::NotFound { .. }) => {
-            mark_recording_failed_after_teardown_exhaustion(store, meeting_id, error_message)
+            debug!(
+                meeting_id,
+                "record-start setup cleanup found meeting already transitioned; skipping forced failure"
+            );
+            Ok(())
         }
         Err(err) => Err(err),
     }
@@ -2733,7 +2737,7 @@ impl EventHandler for ScaffoldHandler {
                         }
                         Err(RecordingTeardownError::FinalFlush(err)) => {
                             final_flush_failures += 1;
-                            if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
+                            if final_flush_failures >= FINAL_FLUSH_MAX_RETRIES {
                                 warn!(
                                     guild_id = %guild_for_task,
                                     attempts = final_flush_failures,
@@ -5659,7 +5663,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 }
                                 Err(RecordingTeardownError::FinalFlush(err)) => {
                                     final_flush_failures += 1;
-                                    if final_flush_failures >= AUTO_STOP_FINAL_FLUSH_MAX_RETRIES {
+                                    if final_flush_failures >= FINAL_FLUSH_MAX_RETRIES {
                                         warn!(
                                             guild_id = %guild_key,
                                             attempts = final_flush_failures,
@@ -7345,7 +7349,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn record_start_setup_cleanup_marks_concurrent_stop_failed() {
+    fn record_start_setup_cleanup_preserves_concurrent_stop() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = recording_meeting();
         meeting.status = crate::domain::MeetingStatus::Stopping;
@@ -7356,14 +7360,11 @@ mod status_message_tests {
             "m1",
             "voice join failed after stop started",
         )
-        .expect("stopping setup failures should become terminal");
+        .expect("concurrent stop should be treated as already handled");
 
         let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
-        assert_eq!(
-            meeting.error_message.as_deref(),
-            Some("voice join failed after stop started")
-        );
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
+        assert_eq!(meeting.error_message, None);
     }
 
     #[test]
