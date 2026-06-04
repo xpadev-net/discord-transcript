@@ -433,6 +433,7 @@ fn decide_driver_disconnect_grace_expiry(
 ) -> GraceExpiryDecision {
     match (reconnected, non_bot_member_count) {
         (Some(false), Some(0)) => GraceExpiryDecision::Stop,
+        (Some(true), _) => GraceExpiryDecision::Cancel,
         (Some(_), Some(_)) => GraceExpiryDecision::Cancel,
         _ => GraceExpiryDecision::Reschedule,
     }
@@ -7151,6 +7152,10 @@ mod status_message_tests {
         );
         assert_eq!(
             decide_driver_disconnect_grace_expiry(Some(true), Some(0)),
+            GraceExpiryDecision::Cancel
+        );
+        assert_eq!(
+            decide_driver_disconnect_grace_expiry(Some(true), None),
             GraceExpiryDecision::Cancel
         );
         assert_eq!(
