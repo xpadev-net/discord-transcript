@@ -496,11 +496,32 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
     ) {
         Ok(()) => {}
         Err(StoreError::CasConflict { .. }) => {
-            store.set_meeting_status(
+            match store.set_meeting_status(
                 meeting_id,
                 MeetingStatus::Failed,
                 Some(MeetingStatus::Stopping),
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(StoreError::CasConflict { .. }) => {
+                    if let Some(meeting) = store.get_meeting(meeting_id)?
+                        && !matches!(
+                            meeting.status,
+                            MeetingStatus::Recording | MeetingStatus::Stopping
+                        )
+                    {
+                        debug!(
+                            meeting_id,
+                            status = ?meeting.status,
+                            "teardown exhaustion reached meeting that is no longer recording or stopping"
+                        );
+                        return Ok(());
+                    }
+                    return Err(StoreError::CasConflict {
+                        meeting_id: meeting_id.to_owned(),
+                    });
+                }
+                Err(err) => return Err(err),
+            }
         }
         Err(err) => return Err(err),
     }
@@ -2437,6 +2458,12 @@ impl EventHandler for ScaffoldHandler {
                         if let Some(state) = states.get_mut(&guild_for_task) {
                             state.clear_timer_active_for_generation(timer_generation);
                         }
+                        let mut startups = handler.recording_startups.lock().await;
+                        clear_matching_recording_startup(
+                            &mut startups,
+                            &guild_for_task,
+                            expected_meeting_id_ref,
+                        );
                         return;
                     }
                     // Re-verify the voice channel state at fire time. A prior cache-miss
@@ -5214,11 +5241,23 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             };
                             let current_meeting_id = runtime.active_meeting_id().await;
                             if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
+                                let mut startups = runtime.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_key,
+                                    expected_meeting_id_ref,
+                                );
                                 return;
                             }
                             let Some(target_voice_channel_id) =
                                 runtime.active_meeting_voice_channel_id().await
                             else {
+                                let mut startups = runtime.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_key,
+                                    expected_meeting_id_ref,
+                                );
                                 return;
                             };
                             let reconnected = is_bot_connected_to_voice_channel(
@@ -6959,25 +6998,21 @@ mod status_message_tests {
     }
 
     #[test]
-    fn teardown_exhaustion_does_not_terminalize_non_recording_meeting() {
+    fn teardown_exhaustion_ignores_already_terminal_meeting() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = recording_meeting();
         meeting.status = crate::domain::MeetingStatus::Posted;
         store.insert(meeting);
 
-        let err = mark_recording_failed_after_teardown_exhaustion(
+        mark_recording_failed_after_teardown_exhaustion(
             &mut store,
             "m1",
             "final audio flush failed after retries",
         )
-        .expect_err("CAS should reject non-recording rows");
-
-        assert!(matches!(
-            err,
-            crate::infrastructure::storage::StoreError::CasConflict { .. }
-        ));
+        .expect("terminal rows should be treated as already handled");
         let meeting = store.get("m1").expect("meeting should remain");
         assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
     }
 
     #[test]
