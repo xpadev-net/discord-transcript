@@ -2863,6 +2863,7 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop stop exhaustion; rescheduling"
                                         );
+                                        stop_failures = 0;
                                         retry_teardown_without_auto_stop_state = true;
                                         continue;
                                     }
@@ -5790,6 +5791,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect stop exhaustion; rescheduling"
                                                 );
+                                                stop_failures = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
