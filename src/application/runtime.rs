@@ -2453,6 +2453,12 @@ impl EventHandler for ScaffoldHandler {
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
             self.spawn_background(async move {
+                // Keep these counters independent: cache misses decide grace
+                // rechecks, final-flush failures protect persisted audio, and
+                // stop failures protect the DB/job transition. If terminal
+                // cleanup removes the timer state but cannot yet mark the row
+                // terminal, retry_teardown_without_auto_stop_state bypasses
+                // AutoStopState and drives teardown directly.
                 let mut final_flush_failures = 0u32;
                 let mut grace_cache_misses = 0u32;
                 let mut stop_failures = 0u32;
@@ -5366,6 +5372,9 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         .auto_stop_grace_for_meeting(expected_meeting_id.as_deref())
                         .await;
                     self.runtime.spawn_background(async move {
+                        // Driver-disconnect has no timer state to consult after
+                        // grace expiry, so the counters below bound only their
+                        // own failure classes before terminal cleanup is tried.
                         let mut final_flush_failures = 0u32;
                         let mut grace_cache_misses = 0u32;
                         let mut stop_failures = 0u32;
