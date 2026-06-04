@@ -84,6 +84,7 @@ use tracing::{debug, error, info, warn};
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
 const AUTO_STOP_FINAL_FLUSH_MAX_RETRIES: u32 = 10;
+const DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES: u32 = 10;
 const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -414,6 +415,17 @@ fn decide_driver_disconnect_grace_expiry(
         (Some(_), Some(_)) => GraceExpiryDecision::Cancel,
         _ => GraceExpiryDecision::Reschedule,
     }
+}
+
+fn driver_disconnect_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String> {
+    *cache_misses = cache_misses.saturating_add(1);
+    if *cache_misses < DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES {
+        return None;
+    }
+    Some(format!(
+        "voice state cache remained unavailable after {} driver-disconnect stop check(s)",
+        *cache_misses
+    ))
 }
 
 fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
@@ -4975,6 +4987,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         .await;
                     self.runtime.spawn_background(async move {
                         let mut final_flush_failures = 0u32;
+                        let mut grace_cache_misses = 0u32;
                         let stop_result = loop {
                             tokio::select! {
                                 _ = sleep(grace) => {}
@@ -5011,15 +5024,69 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             );
                             match decide_driver_disconnect_grace_expiry(reconnected, non_bot) {
                                 GraceExpiryDecision::Reschedule => {
+                                    let terminal_error = driver_disconnect_cache_miss_terminal_error(
+                                        &mut grace_cache_misses,
+                                    );
                                     warn!(
                                         guild_id = %runtime.guild_id,
                                         target_voice_channel_id,
+                                        cache_misses = grace_cache_misses,
                                         "voice state cache unavailable on driver-disconnect grace expiry; rescheduling stop check"
                                     );
+                                    if let Some(terminal_error) = terminal_error {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            cache_misses = grace_cache_misses,
+                                            "driver-disconnect cache-miss retry limit reached; marking recording failed"
+                                        );
+                                        match runtime
+                                            .fail_recording_after_teardown_exhaustion(
+                                                &ctx_for_task,
+                                                runtime.guild_id,
+                                                &guild_key,
+                                                expected_meeting_id_ref,
+                                                &terminal_error,
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                if let Err(status_err) = runtime
+                                                    .update_status_message(
+                                                        &http,
+                                                        expected_meeting_id_ref,
+                                                        StatusMessageUpdate::Failed {
+                                                            phase: "Voice state cache",
+                                                            error: &terminal_error,
+                                                        },
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        guild_id = %guild_key,
+                                                        meeting_id = expected_meeting_id_ref,
+                                                        error = %status_err,
+                                                        "failed to notify driver-disconnect cache-miss exhaustion"
+                                                    );
+                                                }
+                                                return;
+                                            }
+                                            Err(mark_err) => {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    meeting_id = expected_meeting_id_ref,
+                                                    error = %mark_err,
+                                                    "failed to mark recording failed after driver-disconnect cache-miss exhaustion; rescheduling"
+                                                );
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                                 GraceExpiryDecision::Cancel => return,
-                                GraceExpiryDecision::Stop => {}
+                                GraceExpiryDecision::Stop => {
+                                    grace_cache_misses = 0;
+                                }
                             }
                             match runtime
                                 .finalize_recording_stop_after_teardown(
@@ -6532,6 +6599,24 @@ mod status_message_tests {
             decide_driver_disconnect_grace_expiry(Some(false), Some(0)),
             GraceExpiryDecision::Stop
         );
+    }
+
+    #[test]
+    fn driver_disconnect_cache_miss_retry_limit_returns_terminal_error() {
+        let mut cache_misses = 0;
+
+        for expected in 1..DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES {
+            assert_eq!(
+                driver_disconnect_cache_miss_terminal_error(&mut cache_misses),
+                None
+            );
+            assert_eq!(cache_misses, expected);
+        }
+
+        let error = driver_disconnect_cache_miss_terminal_error(&mut cache_misses)
+            .expect("retry limit should terminalize");
+        assert_eq!(cache_misses, DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES);
+        assert!(error.contains("voice state cache remained unavailable"));
     }
 
     #[test]
