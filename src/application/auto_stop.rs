@@ -31,9 +31,10 @@ impl AutoStopState {
     }
 
     pub fn belongs_to_meeting(&self, meeting_id: &str) -> bool {
-        self.meeting_id
-            .as_deref()
-            .is_none_or(|current| current == meeting_id)
+        match self.meeting_id.as_deref() {
+            None => true,
+            Some(current) => current == meeting_id,
+        }
     }
 
     /// Notify the state that the non-bot member count has changed.

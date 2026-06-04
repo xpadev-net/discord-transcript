@@ -3529,9 +3529,10 @@ impl ScaffoldHandler {
         };
         {
             let mut states = self.auto_stop_states.lock().await;
-            let should_remove = states
-                .get(request.guild_key)
-                .is_none_or(|state| state.belongs_to_meeting(request.expected_meeting_id));
+            let should_remove = match states.get(request.guild_key) {
+                None => true,
+                Some(state) => state.belongs_to_meeting(request.expected_meeting_id),
+            };
             if should_remove {
                 states.remove(request.guild_key);
             }
@@ -3598,6 +3599,9 @@ impl ScaffoldHandler {
                 None
             }
         };
+        if let Some(manager) = songbird::get(ctx).await {
+            leave_voice_with_timeout(manager.as_ref(), guild_id, expected_meeting_id, phase).await;
+        }
         if let Some(session) = removed_session.as_mut() {
             flush_removed_session_after_stop(session, guild_key, phase);
         }
@@ -3608,9 +3612,6 @@ impl ScaffoldHandler {
         };
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&latest_tracker);
-        }
-        if let Some(manager) = songbird::get(ctx).await {
-            leave_voice_with_timeout(manager.as_ref(), guild_id, expected_meeting_id, phase).await;
         }
         {
             let mut states = self.auto_stop_states.lock().await;
