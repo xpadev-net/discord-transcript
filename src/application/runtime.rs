@@ -3831,18 +3831,8 @@ impl ScaffoldHandler {
                 "{response}\n(参加準備中に停止処理が始まりました。停止処理の完了を待っています。)"
             ));
         }
-        let startup_matches = {
-            let startups = self.recording_startups.lock().await;
-            startups
-                .get(&guild_key)
-                .is_some_and(|startup_meeting_id| startup_meeting_id == &meeting_id)
-        };
-        if !startup_matches {
-            let err_msg = "recording startup reservation changed before audio setup".to_owned();
-            self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
-                .await;
-            return Err(err_msg);
-        }
+        // The startup reservation cannot change here: command_guard is held,
+        // and every clearer for this guild also takes command_gate.write().
         self.spawn_record_start_entitlement_observation(guild_key.clone());
 
         {
@@ -5645,13 +5635,33 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 match runtime.active_meeting_voice_channel_id_result().await {
                                     Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
                                     Ok(None) => {
-                                        {
+                                        let mut removed_session = {
+                                            let _voice_event_guard =
+                                                runtime.voice_event_gate.write().await;
                                             let mut sessions = runtime.sessions.lock().await;
                                             if sessions.get(&guild_key).is_some_and(|session| {
                                                 session.meeting_id == expected_meeting_id_ref
                                             }) {
-                                                sessions.remove(&guild_key);
+                                                sessions.remove(&guild_key)
+                                            } else {
+                                                None
                                             }
+                                        };
+                                        if let Some(session) = removed_session.as_mut() {
+                                            flush_removed_session_after_stop(
+                                                session,
+                                                &guild_key,
+                                                "driver disconnect inactive meeting",
+                                            );
+                                        }
+                                        let latest_tracker = {
+                                            let _voice_event_guard =
+                                                runtime.voice_event_gate.write().await;
+                                            let tracker = runtime.ssrc_tracker.lock().await;
+                                            tracker.clone()
+                                        };
+                                        if let Some(session) = &removed_session {
+                                            session.persist_ssrc_mapping(&latest_tracker);
                                         }
                                         {
                                             let mut states =
