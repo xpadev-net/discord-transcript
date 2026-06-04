@@ -9,26 +9,47 @@ import { ForbiddenState } from "../components/ForbiddenState";
 import {
   activateDomainKnowledgeItem,
   activateSummaryTemplate,
+  archiveAiMemoryNote,
   archiveDomainKnowledgeItem,
+  archivePersonAlias,
   archiveSummaryTemplate,
+  createAiMemoryNote,
   createDomainKnowledgeItem,
+  createPersonAlias,
   createSummaryTemplate,
   deleteGuildBotToken,
+  fetchAiMemoryNotes,
   fetchDomainKnowledgeItems,
   fetchGuildSettings,
+  fetchPersonAliases,
   fetchSummaryTemplates,
+  fetchTranscriptFeedbackQueue,
+  pinAiMemoryNote,
+  promoteAiMemoryToDomainKnowledge,
+  unpinAiMemoryNote,
+  updateAiMemoryNote,
   updateDomainKnowledgeItem,
   updateGuildBotToken,
   updateGuildSettings,
+  updatePersonAlias,
   updateSummaryTemplate,
+  updateTranscriptFeedbackStatus,
 } from "../lib/api";
 import type {
+  AiMemoryNote,
+  AiMemoryTag,
+  AiMemoryUpsertRequest,
   DomainKnowledgeContentType,
   DomainKnowledgeItem,
   DomainKnowledgeUpsertRequest,
   GuildSettingsResponse,
+  PersonAlias,
+  PersonAliasReviewStatus,
+  PersonAliasUpsertRequest,
   SummaryTemplate,
   SummaryTemplateUpsertRequest,
+  TranscriptFeedbackResponse,
+  TranscriptFeedbackStatusRequest,
   UpdateGuildSettingsRequest,
 } from "../lib/types";
 
@@ -49,6 +70,13 @@ type ActiveOperation =
   | "domain-save"
   | "domain-activate"
   | "domain-archive"
+  | "memory-save"
+  | "memory-pin"
+  | "memory-archive"
+  | "memory-promote"
+  | "feedback-status"
+  | "alias-save"
+  | "alias-archive"
   | "template-save"
   | "template-activate"
   | "template-archive";
@@ -68,6 +96,27 @@ interface SummaryTemplateDraft {
   active: boolean;
 }
 
+interface AiMemoryDraft {
+  id: string | null;
+  title: string;
+  body: string;
+  tagsText: string;
+  confidence: string;
+  active: boolean;
+  pinned: boolean;
+  promoteContentType: DomainKnowledgeContentType;
+}
+
+interface PersonAliasDraft {
+  id: string | null;
+  canonical_name: string;
+  alias: string;
+  discord_user_id: string;
+  confidence: string;
+  active: boolean;
+  review_status: PersonAliasReviewStatus;
+}
+
 const domainKnowledgeContentTypes: DomainKnowledgeContentType[] = [
   "glossary",
   "person_name",
@@ -82,6 +131,70 @@ const domainKnowledgeTypeLabels: Record<DomainKnowledgeContentType, string> = {
   project_context: "\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u60c5\u5831",
   wording_rule: "\u8868\u8a18\u30eb\u30fc\u30eb",
   prohibited_item: "\u7981\u6b62\u9805\u76ee",
+};
+
+const aiMemoryTags: AiMemoryTag[] = [
+  "person",
+  "alias",
+  "project",
+  "product",
+  "terminology",
+  "decision",
+  "team_convention",
+  "summary_hint",
+  "transcription_hint",
+  "uncertain",
+];
+
+const aiMemoryTagLabels: Record<AiMemoryTag, string> = {
+  person: "人",
+  alias: "別名",
+  project: "プロジェクト",
+  product: "プロダクト",
+  terminology: "用語",
+  decision: "決定事項",
+  team_convention: "チーム慣習",
+  summary_hint: "要約ヒント",
+  transcription_hint: "文字起こしヒント",
+  uncertain: "要確認",
+};
+
+const aiMemorySourceLabels: Record<string, string> = {
+  ai_meeting_extraction: "AI抽出",
+  user_feedback: "フィードバック",
+  manual: "手動",
+  vc_participant: "VC参加者",
+  promotion_candidate: "昇格候補",
+};
+
+const feedbackTypeLabels: Record<string, string> = {
+  mistranscription: "文字起こし",
+  speaker: "話者",
+  term: "用語",
+  person_alias: "人名別名",
+  domain_knowledge: "ドメイン知識",
+  ai_memory: "AIメモ",
+};
+
+const feedbackStatusLabels: Record<string, string> = {
+  open: "未対応",
+  accepted: "採用",
+  dismissed: "却下",
+  converted_to_domain_knowledge: "ドメイン知識化",
+  converted_to_ai_memory: "AIメモ化",
+};
+
+const personAliasReviewStatusLabels: Record<PersonAliasReviewStatus, string> = {
+  unreviewed: "未確認",
+  accepted: "採用",
+  dismissed: "却下",
+};
+
+const personAliasSourceLabels: Record<string, string> = {
+  user_feedback: "フィードバック",
+  ai_inference: "AI推定",
+  vc_participant: "VC参加者",
+  manual: "手動",
 };
 
 const allowedSummaryTemplateVariables = new Set([
@@ -116,6 +229,31 @@ function emptySummaryTemplateDraft(): SummaryTemplateDraft {
   };
 }
 
+function emptyAiMemoryDraft(): AiMemoryDraft {
+  return {
+    id: null,
+    title: "",
+    body: "",
+    tagsText: "",
+    confidence: "",
+    active: true,
+    pinned: false,
+    promoteContentType: "glossary",
+  };
+}
+
+function emptyPersonAliasDraft(): PersonAliasDraft {
+  return {
+    id: null,
+    canonical_name: "",
+    alias: "",
+    discord_user_id: "",
+    confidence: "",
+    active: true,
+    review_status: "unreviewed",
+  };
+}
+
 function domainKnowledgeDraftFromItem(
   item: DomainKnowledgeItem,
 ): DomainKnowledgeDraft {
@@ -136,6 +274,31 @@ function summaryTemplateDraftFromItem(
     name: item.name,
     template: item.template,
     active: item.active,
+  };
+}
+
+function aiMemoryDraftFromItem(item: AiMemoryNote): AiMemoryDraft {
+  return {
+    id: item.id,
+    title: item.title,
+    body: item.body,
+    tagsText: item.tags.join(", "),
+    confidence: item.confidence == null ? "" : String(item.confidence),
+    active: item.active,
+    pinned: item.pinned,
+    promoteContentType: "glossary",
+  };
+}
+
+function personAliasDraftFromItem(item: PersonAlias): PersonAliasDraft {
+  return {
+    id: item.id,
+    canonical_name: item.canonical_name,
+    alias: item.alias,
+    discord_user_id: item.discord_user_id ?? "",
+    confidence: item.confidence == null ? "" : String(item.confidence),
+    active: item.active,
+    review_status: item.review_status,
   };
 }
 
@@ -167,6 +330,36 @@ function chooseSummaryTemplateDraft(
     : emptySummaryTemplateDraft();
 }
 
+function chooseAiMemoryDraft(
+  items: AiMemoryNote[],
+  preferredId?: string | null,
+): AiMemoryDraft {
+  const selected =
+    (preferredId ? items.find((item) => item.id === preferredId) : null) ??
+    items.find((item) => item.pinned && item.archived_at == null) ??
+    items.find((item) => item.active && item.archived_at == null) ??
+    items.find((item) => item.archived_at == null) ??
+    items[0];
+  return selected ? aiMemoryDraftFromItem(selected) : emptyAiMemoryDraft();
+}
+
+function choosePersonAliasDraft(
+  items: PersonAlias[],
+  preferredId?: string | null,
+): PersonAliasDraft {
+  const selected =
+    (preferredId ? items.find((item) => item.id === preferredId) : null) ??
+    items.find(
+      (item) => item.review_status === "unreviewed" && item.archived_at == null,
+    ) ??
+    items.find((item) => item.active && item.archived_at == null) ??
+    items.find((item) => item.archived_at == null) ??
+    items[0];
+  return selected
+    ? personAliasDraftFromItem(selected)
+    : emptyPersonAliasDraft();
+}
+
 function domainKnowledgeRequestFromDraft(
   draft: DomainKnowledgeDraft,
 ): DomainKnowledgeUpsertRequest {
@@ -186,6 +379,41 @@ function summaryTemplateRequestFromDraft(
     template: draft.template.trim(),
     active: draft.active,
   };
+}
+
+function aiMemoryRequestFromDraft(draft: AiMemoryDraft): AiMemoryUpsertRequest {
+  const confidence = draft.confidence.trim();
+  return {
+    title: draft.title.trim(),
+    body: draft.body.trim(),
+    tags: parseAiMemoryTags(draft.tagsText),
+    confidence: confidence === "" ? null : Number(confidence),
+    active: draft.active,
+    pinned: draft.pinned,
+  };
+}
+
+function personAliasRequestFromDraft(
+  draft: PersonAliasDraft,
+): PersonAliasUpsertRequest {
+  const discordUserId = draft.discord_user_id.trim();
+  const confidence = draft.confidence.trim();
+  return {
+    canonical_name: draft.canonical_name.trim(),
+    alias: draft.alias.trim(),
+    discord_user_id: discordUserId === "" ? null : discordUserId,
+    confidence: confidence === "" ? null : Number(confidence),
+    active: draft.active,
+    review_status: draft.review_status,
+  };
+}
+
+function parseAiMemoryTags(value: string): AiMemoryTag[] {
+  const tags = value
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+  return Array.from(new Set(tags)) as AiMemoryTag[];
 }
 
 function formFromSettings(settings: GuildSettingsResponse): SettingsForm {
@@ -279,6 +507,72 @@ function validateDomainKnowledgeDraft(
   return null;
 }
 
+function validateAiMemoryDraft(draft: AiMemoryDraft): string | null {
+  const title = draft.title.trim();
+  const body = draft.body.trim();
+  if (!title) {
+    return "AIメモのタイトルを入力してください";
+  }
+  if (utf8ByteLength(title) > 200) {
+    return "AIメモのタイトルはUTF-8で200バイト以内で入力してください";
+  }
+  if (!body) {
+    return "AIメモの本文を入力してください";
+  }
+  if (utf8ByteLength(body) > 20_000) {
+    return "AIメモの本文はUTF-8で20000バイト以内で入力してください";
+  }
+  const tags = draft.tagsText
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+  if (tags.length > 10) {
+    return "AIメモのタグは10個以内で入力してください";
+  }
+  const invalidTag = tags.find(
+    (tag): tag is string => !aiMemoryTags.includes(tag as AiMemoryTag),
+  );
+  if (invalidTag) {
+    return `使用できないAIメモタグです: ${invalidTag}`;
+  }
+  const confidence = draft.confidence.trim();
+  if (confidence !== "") {
+    const parsed = Number(confidence);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      return "AIメモの信頼度は0から1で入力してください";
+    }
+  }
+  return null;
+}
+
+function validatePersonAliasDraft(draft: PersonAliasDraft): string | null {
+  const canonicalName = draft.canonical_name.trim();
+  const alias = draft.alias.trim();
+  if (!canonicalName) {
+    return "正式名を入力してください";
+  }
+  if (utf8ByteLength(canonicalName) > 200) {
+    return "正式名はUTF-8で200バイト以内で入力してください";
+  }
+  if (!alias) {
+    return "別名を入力してください";
+  }
+  if (utf8ByteLength(alias) > 200) {
+    return "別名はUTF-8で200バイト以内で入力してください";
+  }
+  if (utf8ByteLength(draft.discord_user_id.trim()) > 128) {
+    return "DiscordユーザーIDはUTF-8で128バイト以内で入力してください";
+  }
+  const confidence = draft.confidence.trim();
+  if (confidence !== "") {
+    const parsed = Number(confidence);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      return "人名別名の信頼度は0から1で入力してください";
+    }
+  }
+  return null;
+}
+
 function validateSummaryTemplateDraft(
   draft: SummaryTemplateDraft,
 ): string | null {
@@ -341,6 +635,40 @@ function customizationErrorMessage(err: unknown, fallback: string): string {
   return fallback;
 }
 
+function labelFromRecord(
+  record: Record<string, string>,
+  value: string,
+): string {
+  return record[value] ?? value;
+}
+
+function feedbackText(item: TranscriptFeedbackResponse): string {
+  const parts = [
+    item.original_text ? `元: ${item.original_text}` : null,
+    item.corrected_text ? `修正: ${item.corrected_text}` : null,
+    item.note ? `メモ: ${item.note}` : null,
+    item.speaker_id ? `話者: ${item.speaker_id}` : null,
+    item.corrected_speaker_id ? `修正話者: ${item.corrected_speaker_id}` : null,
+    item.term_type ? `用語種別: ${item.term_type}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : "詳細はありません";
+}
+
+function feedbackStatusRequest(
+  status: TranscriptFeedbackStatusRequest["status"],
+): TranscriptFeedbackStatusRequest {
+  return { status };
+}
+
+function feedbackActionLabel(
+  item: TranscriptFeedbackResponse,
+  action: string,
+): string {
+  return `${
+    item.corrected_text ?? item.original_text ?? item.note ?? item.id
+  } を${action}`;
+}
+
 function guildSettingsErrorMessage(err: unknown, fallback: string): string {
   if (!(err instanceof Error)) {
     return fallback;
@@ -379,11 +707,21 @@ export function SettingsPage({
   const [domainKnowledgeItems, setDomainKnowledgeItems] = useState<
     DomainKnowledgeItem[]
   >([]);
+  const [aiMemoryNotes, setAiMemoryNotes] = useState<AiMemoryNote[]>([]);
+  const [feedbackItems, setFeedbackItems] = useState<
+    TranscriptFeedbackResponse[]
+  >([]);
+  const [personAliases, setPersonAliases] = useState<PersonAlias[]>([]);
   const [summaryTemplates, setSummaryTemplates] = useState<SummaryTemplate[]>(
     [],
   );
   const [domainKnowledgeDraft, setDomainKnowledgeDraft] =
     useState<DomainKnowledgeDraft>(emptyDomainKnowledgeDraft);
+  const [aiMemoryDraft, setAiMemoryDraft] =
+    useState<AiMemoryDraft>(emptyAiMemoryDraft);
+  const [personAliasDraft, setPersonAliasDraft] = useState<PersonAliasDraft>(
+    emptyPersonAliasDraft,
+  );
   const [summaryTemplateDraft, setSummaryTemplateDraft] =
     useState<SummaryTemplateDraft>(emptySummaryTemplateDraft);
   const [botTokenValue, setBotTokenValue] = useState("");
@@ -408,20 +746,30 @@ export function SettingsPage({
     async (
       signal?: AbortSignal,
       preferredDomainKnowledgeId?: string | null,
+      preferredAiMemoryId?: string | null,
+      preferredPersonAliasId?: string | null,
       preferredSummaryTemplateId?: string | null,
     ) => {
       setCustomizationLoading(true);
       setCustomizationError(null);
+      const requestGuildKey = currentGuildKeyRef.current;
 
       try {
-        const [domainItems, templates] = await Promise.all([
-          fetchDomainKnowledgeItems({ includeArchived: true }, signal),
-          fetchSummaryTemplates({ includeArchived: true }, signal),
-        ]);
-        if (signal?.aborted) {
+        const [domainItems, memoryNotes, feedbackQueue, aliases, templates] =
+          await Promise.all([
+            fetchDomainKnowledgeItems({ includeArchived: true }, signal),
+            fetchAiMemoryNotes({ includeArchived: true }, signal),
+            fetchTranscriptFeedbackQueue({ status: "open" }, signal),
+            fetchPersonAliases({ includeArchived: true }, signal),
+            fetchSummaryTemplates({ includeArchived: true }, signal),
+          ]);
+        if (signal?.aborted || currentGuildKeyRef.current !== requestGuildKey) {
           return;
         }
         setDomainKnowledgeItems(domainItems);
+        setAiMemoryNotes(memoryNotes);
+        setFeedbackItems(feedbackQueue);
+        setPersonAliases(aliases);
         setSummaryTemplates(templates);
         setDomainKnowledgeDraft((current) =>
           chooseDomainKnowledgeDraft(
@@ -429,6 +777,22 @@ export function SettingsPage({
             preferredDomainKnowledgeId === undefined
               ? current.id
               : preferredDomainKnowledgeId,
+          ),
+        );
+        setAiMemoryDraft((current) =>
+          chooseAiMemoryDraft(
+            memoryNotes,
+            preferredAiMemoryId === undefined
+              ? current.id
+              : preferredAiMemoryId,
+          ),
+        );
+        setPersonAliasDraft((current) =>
+          choosePersonAliasDraft(
+            aliases,
+            preferredPersonAliasId === undefined
+              ? current.id
+              : preferredPersonAliasId,
           ),
         );
         setSummaryTemplateDraft((current) =>
@@ -440,17 +804,20 @@ export function SettingsPage({
           ),
         );
       } catch (err) {
-        if (signal?.aborted) {
+        if (signal?.aborted || currentGuildKeyRef.current !== requestGuildKey) {
           return;
         }
         setCustomizationError(
           customizationErrorMessage(
             err,
-            "\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58\u3068\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+            "AIカスタマイズの読み込みに失敗しました",
           ),
         );
       } finally {
-        if (!signal?.aborted) {
+        if (
+          !signal?.aborted &&
+          currentGuildKeyRef.current === requestGuildKey
+        ) {
           setCustomizationLoading(false);
         }
       }
@@ -472,8 +839,13 @@ export function SettingsPage({
     setTokenDeleteConfirmPending(false);
     if (!showCustomizations) {
       setDomainKnowledgeItems([]);
+      setAiMemoryNotes([]);
+      setFeedbackItems([]);
+      setPersonAliases([]);
       setSummaryTemplates([]);
       setDomainKnowledgeDraft(emptyDomainKnowledgeDraft());
+      setAiMemoryDraft(emptyAiMemoryDraft());
+      setPersonAliasDraft(emptyPersonAliasDraft());
       setSummaryTemplateDraft(emptySummaryTemplateDraft());
     }
 
@@ -524,7 +896,22 @@ export function SettingsPage({
     ? (summaryTemplates.find((item) => item.id === summaryTemplateDraft.id) ??
       null)
     : null;
+  const selectedAiMemoryNote = aiMemoryDraft.id
+    ? (aiMemoryNotes.find((item) => item.id === aiMemoryDraft.id) ?? null)
+    : null;
+  const selectedPersonAlias = personAliasDraft.id
+    ? (personAliases.find((item) => item.id === personAliasDraft.id) ?? null)
+    : null;
   const activeDomainKnowledgeItems = domainKnowledgeItems.filter(
+    (item) => item.active && item.archived_at == null,
+  );
+  const activeAiMemoryNotes = aiMemoryNotes.filter(
+    (item) => item.active && item.archived_at == null,
+  );
+  const pinnedAiMemoryNotes = aiMemoryNotes.filter(
+    (item) => item.pinned && item.archived_at == null,
+  );
+  const activePersonAliases = personAliases.filter(
     (item) => item.active && item.archived_at == null,
   );
   const activeSummaryTemplate = summaryTemplates.find(
@@ -542,6 +929,18 @@ export function SettingsPage({
 
   function updateDomainKnowledgeDraft(update: Partial<DomainKnowledgeDraft>) {
     setDomainKnowledgeDraft((current) => ({ ...current, ...update }));
+    setCustomizationError(null);
+    setMessage(null);
+  }
+
+  function updateAiMemoryDraft(update: Partial<AiMemoryDraft>) {
+    setAiMemoryDraft((current) => ({ ...current, ...update }));
+    setCustomizationError(null);
+    setMessage(null);
+  }
+
+  function updatePersonAliasDraft(update: Partial<PersonAliasDraft>) {
+    setPersonAliasDraft((current) => ({ ...current, ...update }));
     setCustomizationError(null);
     setMessage(null);
   }
@@ -569,6 +968,24 @@ export function SettingsPage({
       selected
         ? summaryTemplateDraftFromItem(selected)
         : emptySummaryTemplateDraft(),
+    );
+    setCustomizationError(null);
+    setMessage(null);
+  }
+
+  function handleAiMemorySelect(memoryId: string) {
+    const selected = aiMemoryNotes.find((item) => item.id === memoryId);
+    setAiMemoryDraft(
+      selected ? aiMemoryDraftFromItem(selected) : emptyAiMemoryDraft(),
+    );
+    setCustomizationError(null);
+    setMessage(null);
+  }
+
+  function handlePersonAliasSelect(aliasId: string) {
+    const selected = personAliases.find((item) => item.id === aliasId);
+    setPersonAliasDraft(
+      selected ? personAliasDraftFromItem(selected) : emptyPersonAliasDraft(),
     );
     setCustomizationError(null);
     setMessage(null);
@@ -749,6 +1166,8 @@ export function SettingsPage({
       await refreshCustomizations(
         undefined,
         updated.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
         summaryTemplateDraft.id,
       );
       setMessage(
@@ -786,6 +1205,8 @@ export function SettingsPage({
       await refreshCustomizations(
         undefined,
         updated.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
         summaryTemplateDraft.id,
       );
       setMessage(
@@ -824,6 +1245,8 @@ export function SettingsPage({
       await refreshCustomizations(
         undefined,
         updated.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
         summaryTemplateDraft.id,
       );
       setMessage(
@@ -872,6 +1295,8 @@ export function SettingsPage({
       await refreshCustomizations(
         undefined,
         domainKnowledgeDraft.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
         updated.id,
       );
       setMessage(
@@ -903,6 +1328,8 @@ export function SettingsPage({
       await refreshCustomizations(
         undefined,
         domainKnowledgeDraft.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
         updated.id,
       );
       setMessage(
@@ -939,6 +1366,8 @@ export function SettingsPage({
       await refreshCustomizations(
         undefined,
         domainKnowledgeDraft.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
         updated.id,
       );
       setMessage(
@@ -953,6 +1382,321 @@ export function SettingsPage({
       );
     } finally {
       setActiveOperation(null);
+    }
+  }
+
+  async function handleAiMemorySave(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!canEdit || customizationControlsDisabled) {
+      return;
+    }
+    const validationError = validateAiMemoryDraft(aiMemoryDraft);
+    if (validationError) {
+      setCustomizationError(validationError);
+      setMessage(null);
+      return;
+    }
+    if (selectedAiMemoryNote?.archived_at) {
+      setCustomizationError("アーカイブ済みのAIメモは保存できません");
+      setMessage(null);
+      return;
+    }
+
+    setActiveOperation("memory-save");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      const request = aiMemoryRequestFromDraft(aiMemoryDraft);
+      const updated = aiMemoryDraft.id
+        ? await updateAiMemoryNote(aiMemoryDraft.id, request)
+        : await createAiMemoryNote(request);
+      await refreshCustomizations(
+        undefined,
+        domainKnowledgeDraft.id,
+        updated.id,
+        personAliasDraft.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage("AIメモを保存しました");
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(err, "AIメモの保存に失敗しました"),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleAiMemoryPinToggle() {
+    if (!canEdit || customizationControlsDisabled || !selectedAiMemoryNote) {
+      return;
+    }
+
+    setActiveOperation("memory-pin");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      const updated = selectedAiMemoryNote.pinned
+        ? await unpinAiMemoryNote(selectedAiMemoryNote.id)
+        : await pinAiMemoryNote(selectedAiMemoryNote.id);
+      await refreshCustomizations(
+        undefined,
+        domainKnowledgeDraft.id,
+        updated.id,
+        personAliasDraft.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage(
+          updated.pinned
+            ? "AIメモをピン留めしました"
+            : "AIメモのピン留めを解除しました",
+        );
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(err, "AIメモのピン操作に失敗しました"),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleAiMemoryArchive() {
+    if (
+      !canEdit ||
+      customizationControlsDisabled ||
+      !selectedAiMemoryNote ||
+      selectedAiMemoryNote.archived_at
+    ) {
+      return;
+    }
+
+    setActiveOperation("memory-archive");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      const updated = await archiveAiMemoryNote(selectedAiMemoryNote.id);
+      await refreshCustomizations(
+        undefined,
+        domainKnowledgeDraft.id,
+        updated.id,
+        personAliasDraft.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage("AIメモをアーカイブしました");
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(err, "AIメモのアーカイブに失敗しました"),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleAiMemoryPromote() {
+    if (
+      !canEdit ||
+      customizationControlsDisabled ||
+      !selectedAiMemoryNote ||
+      selectedAiMemoryNote.archived_at
+    ) {
+      return;
+    }
+
+    setActiveOperation("memory-promote");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      const promoted = await promoteAiMemoryToDomainKnowledge(
+        selectedAiMemoryNote.id,
+        { content_type: aiMemoryDraft.promoteContentType },
+      );
+      await refreshCustomizations(
+        undefined,
+        promoted.id,
+        selectedAiMemoryNote.id,
+        personAliasDraft.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage("AIメモをドメイン知識へ昇格しました");
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(
+            err,
+            "AIメモのドメイン知識化に失敗しました",
+          ),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleFeedbackStatus(
+    item: TranscriptFeedbackResponse,
+    status: TranscriptFeedbackStatusRequest["status"],
+  ) {
+    if (!canEdit || customizationControlsDisabled) {
+      return;
+    }
+
+    setActiveOperation("feedback-status");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      await updateTranscriptFeedbackStatus(
+        item.id,
+        feedbackStatusRequest(status),
+      );
+      await refreshCustomizations(
+        undefined,
+        domainKnowledgeDraft.id,
+        aiMemoryDraft.id,
+        personAliasDraft.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage(
+          status === "accepted"
+            ? "フィードバックを採用しました"
+            : "フィードバックを却下しました",
+        );
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(
+            err,
+            "フィードバックのステータス更新に失敗しました",
+          ),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handlePersonAliasSave(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!canEdit || customizationControlsDisabled) {
+      return;
+    }
+    const validationError = validatePersonAliasDraft(personAliasDraft);
+    if (validationError) {
+      setCustomizationError(validationError);
+      setMessage(null);
+      return;
+    }
+    if (selectedPersonAlias?.archived_at) {
+      setCustomizationError("アーカイブ済みの人名別名は保存できません");
+      setMessage(null);
+      return;
+    }
+
+    setActiveOperation("alias-save");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      const request = personAliasRequestFromDraft(personAliasDraft);
+      const updated = personAliasDraft.id
+        ? await updatePersonAlias(personAliasDraft.id, request)
+        : await createPersonAlias(request);
+      await refreshCustomizations(
+        undefined,
+        domainKnowledgeDraft.id,
+        aiMemoryDraft.id,
+        updated.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage("人名別名を保存しました");
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(err, "人名別名の保存に失敗しました"),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handlePersonAliasArchive() {
+    if (
+      !canEdit ||
+      customizationControlsDisabled ||
+      !selectedPersonAlias ||
+      selectedPersonAlias.archived_at
+    ) {
+      return;
+    }
+
+    setActiveOperation("alias-archive");
+    setCustomizationError(null);
+    setMessage(null);
+    const requestGuildKey = currentGuildKeyRef.current;
+
+    try {
+      const updated = await archivePersonAlias(selectedPersonAlias.id);
+      await refreshCustomizations(
+        undefined,
+        domainKnowledgeDraft.id,
+        aiMemoryDraft.id,
+        updated.id,
+        summaryTemplateDraft.id,
+      );
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setMessage("人名別名をアーカイブしました");
+      }
+    } catch (err) {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setCustomizationError(
+          customizationErrorMessage(err, "人名別名のアーカイブに失敗しました"),
+        );
+      }
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
     }
   }
 
@@ -1152,7 +1896,7 @@ export function SettingsPage({
               <h2>{"AI \u30ab\u30b9\u30bf\u30de\u30a4\u30ba"}</h2>
               <p>
                 {
-                  "\u8981\u7d04\u306b\u4f7f\u3046\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58\u3068\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u3092\u7ba1\u7406\u3057\u307e\u3059"
+                  "要約に使うドメイン知識、AIメモ、フィードバック、人名別名、要約テンプレートを管理します"
                 }
               </p>
             </div>
@@ -1164,6 +1908,8 @@ export function SettingsPage({
                 void refreshCustomizations(
                   undefined,
                   domainKnowledgeDraft.id,
+                  aiMemoryDraft.id,
+                  personAliasDraft.id,
                   summaryTemplateDraft.id,
                 )
               }
@@ -1367,6 +2113,525 @@ export function SettingsPage({
                   {activeOperation === "domain-archive"
                     ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u4e2d"
                     : "\u30a2\u30fc\u30ab\u30a4\u30d6"}
+                </button>
+              </div>
+            </form>
+
+            <form
+              className="settings-customization-panel"
+              onSubmit={handleAiMemorySave}
+            >
+              <div className="settings-customization-header">
+                <div>
+                  <h3>{"AIメモ"}</h3>
+                  <p>
+                    {activeAiMemoryNotes.length > 0
+                      ? `有効: ${activeAiMemoryNotes.length}件 / ピン留め: ${pinnedAiMemoryNotes.length}件`
+                      : "有効なAIメモはありません"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={customizationControlsDisabled}
+                  onClick={() => handleAiMemorySelect("")}
+                >
+                  {"新規"}
+                </button>
+              </div>
+
+              <label className="settings-field">
+                <span>{"メモ"}</span>
+                <select
+                  value={aiMemoryDraft.id ?? ""}
+                  disabled={
+                    customizationControlsDisabled || aiMemoryNotes.length === 0
+                  }
+                  onChange={(event) => handleAiMemorySelect(event.target.value)}
+                >
+                  <option value="">{"新規AIメモ"}</option>
+                  {aiMemoryNotes.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {`${item.pinned ? "★ " : ""}${item.title} / ${labelFromRecord(
+                        aiMemorySourceLabels,
+                        item.source_type,
+                      )}${
+                        item.archived_at
+                          ? " / アーカイブ済み"
+                          : item.active
+                            ? " / 有効"
+                            : " / 無効"
+                      }`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="settings-field">
+                <span>{"AIメモタイトル"}</span>
+                <input
+                  type="text"
+                  value={aiMemoryDraft.title}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updateAiMemoryDraft({ title: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="settings-field">
+                <span>{"AIメモ本文"}</span>
+                <textarea
+                  rows={6}
+                  value={aiMemoryDraft.body}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updateAiMemoryDraft({ body: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="settings-field">
+                <span>{"タグ"}</span>
+                <input
+                  type="text"
+                  list="ai-memory-tags"
+                  placeholder="terminology, summary_hint"
+                  value={aiMemoryDraft.tagsText}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updateAiMemoryDraft({ tagsText: event.target.value })
+                  }
+                />
+              </label>
+              <datalist id="ai-memory-tags">
+                {aiMemoryTags.map((tag) => (
+                  <option key={tag} value={tag}>
+                    {aiMemoryTagLabels[tag]}
+                  </option>
+                ))}
+              </datalist>
+
+              <label className="settings-field">
+                <span>{"信頼度"}</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.001}
+                  placeholder="0.8"
+                  value={aiMemoryDraft.confidence}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updateAiMemoryDraft({ confidence: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="settings-checkbox">
+                <input
+                  type="checkbox"
+                  checked={aiMemoryDraft.active}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updateAiMemoryDraft({ active: event.target.checked })
+                  }
+                />
+                <span>{"有効にする"}</span>
+              </label>
+
+              <label className="settings-checkbox">
+                <input
+                  type="checkbox"
+                  checked={aiMemoryDraft.pinned}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updateAiMemoryDraft({ pinned: event.target.checked })
+                  }
+                />
+                <span>{"保存時にピン留めする"}</span>
+              </label>
+
+              {selectedAiMemoryNote ? (
+                <p className="settings-version-meta">
+                  {`${selectedAiMemoryNote.archived_at ? "アーカイブ済み" : selectedAiMemoryNote.active ? "有効" : "無効"} / ${
+                    selectedAiMemoryNote.pinned ? "ピン留め" : "通常"
+                  } / 更新: ${selectedAiMemoryNote.updated_at}`}
+                </p>
+              ) : null}
+
+              <div className="settings-token-actions">
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedAiMemoryNote?.archived_at != null
+                  }
+                >
+                  {activeOperation === "memory-save"
+                    ? "保存中"
+                    : "AIメモを保存"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={
+                    customizationControlsDisabled ||
+                    !selectedAiMemoryNote ||
+                    selectedAiMemoryNote.archived_at != null
+                  }
+                  onClick={handleAiMemoryPinToggle}
+                >
+                  {activeOperation === "memory-pin"
+                    ? "更新中"
+                    : selectedAiMemoryNote?.pinned
+                      ? "ピン解除"
+                      : "ピン留め"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={
+                    customizationControlsDisabled ||
+                    !selectedAiMemoryNote ||
+                    selectedAiMemoryNote.archived_at != null
+                  }
+                  onClick={handleAiMemoryArchive}
+                >
+                  {activeOperation === "memory-archive"
+                    ? "アーカイブ中"
+                    : "アーカイブ"}
+                </button>
+              </div>
+
+              <div className="settings-promote-row">
+                <label className="settings-field">
+                  <span>{"昇格先"}</span>
+                  <select
+                    value={aiMemoryDraft.promoteContentType}
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedAiMemoryNote ||
+                      selectedAiMemoryNote.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({
+                        promoteContentType: event.target
+                          .value as DomainKnowledgeContentType,
+                      })
+                    }
+                  >
+                    {domainKnowledgeContentTypes.map((contentType) => (
+                      <option key={contentType} value={contentType}>
+                        {domainKnowledgeTypeLabels[contentType]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={
+                    customizationControlsDisabled ||
+                    !selectedAiMemoryNote ||
+                    selectedAiMemoryNote.archived_at != null
+                  }
+                  onClick={handleAiMemoryPromote}
+                >
+                  {activeOperation === "memory-promote"
+                    ? "昇格中"
+                    : "ドメイン知識へ昇格"}
+                </button>
+              </div>
+            </form>
+
+            <div className="settings-customization-panel">
+              <div className="settings-customization-header">
+                <div>
+                  <h3>{"フィードバックキュー"}</h3>
+                  <p>
+                    {feedbackItems.length > 0
+                      ? `未対応: ${feedbackItems.length}件`
+                      : "未対応のフィードバックはありません"}
+                  </p>
+                </div>
+              </div>
+
+              {feedbackItems.length > 0 ? (
+                <ul className="settings-review-list">
+                  {feedbackItems.map((item) => (
+                    <li key={item.id} className="settings-review-item">
+                      <div>
+                        <div className="settings-review-title">
+                          {labelFromRecord(
+                            feedbackTypeLabels,
+                            item.feedback_type,
+                          )}
+                          <span className="settings-review-meta">
+                            {labelFromRecord(feedbackStatusLabels, item.status)}
+                          </span>
+                        </div>
+                        <p>{feedbackText(item)}</p>
+                        <p className="settings-review-meta">
+                          {`作成: ${item.created_at}${
+                            item.meeting_id ? ` / 会議: ${item.meeting_id}` : ""
+                          }`}
+                        </p>
+                      </div>
+                      <div className="settings-token-actions">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          aria-label={feedbackActionLabel(item, "採用")}
+                          disabled={customizationControlsDisabled}
+                          onClick={() =>
+                            void handleFeedbackStatus(item, "accepted")
+                          }
+                        >
+                          {"採用"}
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          aria-label={feedbackActionLabel(item, "却下")}
+                          disabled={customizationControlsDisabled}
+                          onClick={() =>
+                            void handleFeedbackStatus(item, "dismissed")
+                          }
+                        >
+                          {"却下"}
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="settings-version-meta">
+                  {"会議ページから送信されたフィードバックがここに表示されます"}
+                </p>
+              )}
+            </div>
+
+            <form
+              className="settings-customization-panel"
+              onSubmit={handlePersonAliasSave}
+            >
+              <div className="settings-customization-header">
+                <div>
+                  <h3>{"人名別名"}</h3>
+                  <p>
+                    {activePersonAliases.length > 0
+                      ? `有効: ${activePersonAliases.length}件`
+                      : "有効な人名別名はありません"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={customizationControlsDisabled}
+                  onClick={() => handlePersonAliasSelect("")}
+                >
+                  {"新規"}
+                </button>
+              </div>
+
+              <label className="settings-field">
+                <span>{"別名レコード"}</span>
+                <select
+                  value={personAliasDraft.id ?? ""}
+                  disabled={
+                    customizationControlsDisabled || personAliases.length === 0
+                  }
+                  onChange={(event) =>
+                    handlePersonAliasSelect(event.target.value)
+                  }
+                >
+                  <option value="">{"新規人名別名"}</option>
+                  {personAliases.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {`${item.canonical_name} / ${item.alias} / ${
+                        personAliasReviewStatusLabels[item.review_status]
+                      }${
+                        item.archived_at
+                          ? " / アーカイブ済み"
+                          : item.active
+                            ? " / 有効"
+                            : " / 無効"
+                      }`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="settings-field">
+                <span>{"正式名"}</span>
+                <input
+                  type="text"
+                  value={personAliasDraft.canonical_name}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updatePersonAliasDraft({
+                      canonical_name: event.target.value,
+                    })
+                  }
+                />
+              </label>
+
+              <label className="settings-field">
+                <span>{"別名"}</span>
+                <input
+                  type="text"
+                  value={personAliasDraft.alias}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updatePersonAliasDraft({ alias: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="settings-field">
+                <span>{"DiscordユーザーID"}</span>
+                <input
+                  type="text"
+                  value={personAliasDraft.discord_user_id}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updatePersonAliasDraft({
+                      discord_user_id: event.target.value,
+                    })
+                  }
+                />
+              </label>
+
+              <label className="settings-field">
+                <span>{"信頼度"}</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.001}
+                  value={personAliasDraft.confidence}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updatePersonAliasDraft({ confidence: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="settings-field">
+                <span>{"レビュー状態"}</span>
+                <select
+                  value={personAliasDraft.review_status}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updatePersonAliasDraft({
+                      review_status: event.target
+                        .value as PersonAliasReviewStatus,
+                    })
+                  }
+                >
+                  {(
+                    Object.keys(
+                      personAliasReviewStatusLabels,
+                    ) as PersonAliasReviewStatus[]
+                  ).map((status) => (
+                    <option key={status} value={status}>
+                      {personAliasReviewStatusLabels[status]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="settings-checkbox">
+                <input
+                  type="checkbox"
+                  checked={personAliasDraft.active}
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                  onChange={(event) =>
+                    updatePersonAliasDraft({ active: event.target.checked })
+                  }
+                />
+                <span>{"有効にする"}</span>
+              </label>
+
+              {selectedPersonAlias ? (
+                <p className="settings-version-meta">
+                  {`${labelFromRecord(
+                    personAliasSourceLabels,
+                    selectedPersonAlias.source_type,
+                  )} / ${
+                    selectedPersonAlias.archived_at
+                      ? "アーカイブ済み"
+                      : selectedPersonAlias.active
+                        ? "有効"
+                        : "無効"
+                  } / 更新: ${selectedPersonAlias.updated_at}`}
+                </p>
+              ) : null}
+
+              <div className="settings-token-actions">
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={
+                    customizationControlsDisabled ||
+                    selectedPersonAlias?.archived_at != null
+                  }
+                >
+                  {activeOperation === "alias-save"
+                    ? "保存中"
+                    : "人名別名を保存"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={
+                    customizationControlsDisabled ||
+                    !selectedPersonAlias ||
+                    selectedPersonAlias.archived_at != null
+                  }
+                  onClick={handlePersonAliasArchive}
+                >
+                  {activeOperation === "alias-archive"
+                    ? "アーカイブ中"
+                    : "アーカイブ"}
                 </button>
               </div>
             </form>

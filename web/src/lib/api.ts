@@ -1,4 +1,8 @@
 import type {
+  AiMemoryNote,
+  AiMemoryPromoteRequest,
+  AiMemorySourceType,
+  AiMemoryUpsertRequest,
   DebugArtifact,
   DomainKnowledgeContentType,
   DomainKnowledgeItem,
@@ -7,12 +11,17 @@ import type {
   MeetingListResponse,
   MeetingResponse,
   MeResponse,
+  PersonAlias,
+  PersonAliasReviewStatus,
+  PersonAliasUpsertRequest,
   SpeakerAudioInfo,
   SummaryResponse,
   SummaryTemplate,
   SummaryTemplateUpsertRequest,
   TranscriptFeedbackRequest,
   TranscriptFeedbackResponse,
+  TranscriptFeedbackStatus,
+  TranscriptFeedbackStatusRequest,
   TranscriptResponse,
   TranscriptSegment,
   TranscriptStateResponse,
@@ -28,6 +37,21 @@ function basePath(meetingId: string): string {
 function domainKnowledgePath(itemId?: string): string {
   const base = "/api/guild/domain-knowledge";
   return itemId ? `${base}/${encodeURIComponent(itemId)}` : base;
+}
+
+function aiMemoryPath(memoryId?: string): string {
+  const base = "/api/guild/ai-memory";
+  return memoryId ? `${base}/${encodeURIComponent(memoryId)}` : base;
+}
+
+function feedbackPath(feedbackId?: string): string {
+  const base = "/api/guild/feedback";
+  return feedbackId ? `${base}/${encodeURIComponent(feedbackId)}` : base;
+}
+
+function personAliasesPath(aliasId?: string): string {
+  const base = "/api/guild/person-aliases";
+  return aliasId ? `${base}/${encodeURIComponent(aliasId)}` : base;
 }
 
 function summaryTemplatePath(templateId?: string): string {
@@ -269,6 +293,193 @@ export function archiveDomainKnowledgeItem(
     method: "POST",
     signal,
   }).then(handleResponse<DomainKnowledgeItem>);
+}
+
+export function fetchAiMemoryNotes(
+  options: {
+    includeArchived?: boolean;
+    sourceType?: AiMemorySourceType;
+  } = {},
+  signal?: AbortSignal,
+): Promise<AiMemoryNote[]> {
+  const params = new URLSearchParams();
+  if (options.includeArchived !== undefined) {
+    params.set("include_archived", String(options.includeArchived));
+  }
+  if (options.sourceType) {
+    params.set("source_type", options.sourceType);
+  }
+  const query = params.toString();
+  const path = query ? `${aiMemoryPath()}?${query}` : aiMemoryPath();
+  return fetch(path, { signal }).then(handleResponse<AiMemoryNote[]>);
+}
+
+export function createAiMemoryNote(
+  request: AiMemoryUpsertRequest,
+  signal?: AbortSignal,
+): Promise<AiMemoryNote> {
+  return fetch(aiMemoryPath(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<AiMemoryNote>);
+}
+
+export function updateAiMemoryNote(
+  memoryId: string,
+  request: AiMemoryUpsertRequest,
+  signal?: AbortSignal,
+): Promise<AiMemoryNote> {
+  return fetch(aiMemoryPath(memoryId), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<AiMemoryNote>);
+}
+
+export function pinAiMemoryNote(
+  memoryId: string,
+  signal?: AbortSignal,
+): Promise<AiMemoryNote> {
+  return fetch(`${aiMemoryPath(memoryId)}/pin`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<AiMemoryNote>);
+}
+
+export function unpinAiMemoryNote(
+  memoryId: string,
+  signal?: AbortSignal,
+): Promise<AiMemoryNote> {
+  return fetch(`${aiMemoryPath(memoryId)}/unpin`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<AiMemoryNote>);
+}
+
+export function archiveAiMemoryNote(
+  memoryId: string,
+  signal?: AbortSignal,
+): Promise<AiMemoryNote> {
+  return fetch(`${aiMemoryPath(memoryId)}/archive`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<AiMemoryNote>);
+}
+
+export function promoteAiMemoryToDomainKnowledge(
+  memoryId: string,
+  request: AiMemoryPromoteRequest,
+  signal?: AbortSignal,
+): Promise<DomainKnowledgeItem> {
+  return fetch(`${aiMemoryPath(memoryId)}/promote-to-domain-knowledge`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<DomainKnowledgeItem>);
+}
+
+export function fetchTranscriptFeedbackQueue(
+  options: {
+    status?: TranscriptFeedbackStatus;
+    feedbackType?: string;
+  } = {},
+  signal?: AbortSignal,
+): Promise<TranscriptFeedbackResponse[]> {
+  const params = new URLSearchParams();
+  if (options.status) {
+    params.set("status", options.status);
+  }
+  if (options.feedbackType) {
+    params.set("feedback_type", options.feedbackType);
+  }
+  const query = params.toString();
+  const path = query ? `${feedbackPath()}?${query}` : feedbackPath();
+  return fetch(path, { signal }).then(
+    handleResponse<TranscriptFeedbackResponse[]>,
+  );
+}
+
+export function updateTranscriptFeedbackStatus(
+  feedbackId: string,
+  request: TranscriptFeedbackStatusRequest,
+  signal?: AbortSignal,
+): Promise<TranscriptFeedbackResponse> {
+  return fetch(`${feedbackPath(feedbackId)}/status`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<TranscriptFeedbackResponse>);
+}
+
+export function fetchPersonAliases(
+  options: {
+    includeArchived?: boolean;
+    reviewStatus?: PersonAliasReviewStatus;
+  } = {},
+  signal?: AbortSignal,
+): Promise<PersonAlias[]> {
+  const params = new URLSearchParams();
+  if (options.includeArchived !== undefined) {
+    params.set("include_archived", String(options.includeArchived));
+  }
+  if (options.reviewStatus) {
+    params.set("review_status", options.reviewStatus);
+  }
+  const query = params.toString();
+  const path = query ? `${personAliasesPath()}?${query}` : personAliasesPath();
+  return fetch(path, { signal }).then(handleResponse<PersonAlias[]>);
+}
+
+export function createPersonAlias(
+  request: PersonAliasUpsertRequest,
+  signal?: AbortSignal,
+): Promise<PersonAlias> {
+  return fetch(personAliasesPath(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<PersonAlias>);
+}
+
+export function updatePersonAlias(
+  aliasId: string,
+  request: PersonAliasUpsertRequest,
+  signal?: AbortSignal,
+): Promise<PersonAlias> {
+  return fetch(personAliasesPath(aliasId), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<PersonAlias>);
+}
+
+export function archivePersonAlias(
+  aliasId: string,
+  signal?: AbortSignal,
+): Promise<PersonAlias> {
+  return fetch(`${personAliasesPath(aliasId)}/archive`, {
+    method: "POST",
+    signal,
+  }).then(handleResponse<PersonAlias>);
 }
 
 export function fetchSummaryTemplates(
