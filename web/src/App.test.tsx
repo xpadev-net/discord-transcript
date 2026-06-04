@@ -1860,6 +1860,14 @@ describe("App access controls", () => {
         name: "00:05 のフィードバック",
       }),
     );
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+
+    expect(
+      await screen.findByText(
+        "修正後の文字起こしを元のテキストから変更してください",
+      ),
+    ).toBeTruthy();
+
     fireEvent.change(screen.getByLabelText("修正後の文字起こし"), {
       target: { value: "Alpha team" },
     });
@@ -1896,6 +1904,9 @@ describe("App access controls", () => {
         name: "00:05 のフィードバック",
       }),
     );
+    fireEvent.change(screen.getByLabelText("修正後の文字起こし"), {
+      target: { value: "Alpha team" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "送信" }));
 
     expect(
@@ -1934,7 +1945,9 @@ describe("App access controls", () => {
     const submitButton = screen.getByRole("button", { name: "送信" });
     submitButton.focus();
     fireEvent.keyDown(document, { key: "Tab" });
-    expect(screen.getByLabelText("種類")).toBe(document.activeElement);
+    expect(screen.getByRole("button", { name: "フィードバックを閉じる" })).toBe(
+      document.activeElement,
+    );
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() =>

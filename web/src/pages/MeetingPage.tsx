@@ -51,11 +51,11 @@ const termTypeOptions: Array<{
   { value: "prohibited_item", label: "禁止語" },
 ];
 
-const FOCUSABLE_SELECTOR =
-  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
-
 const INITIAL_FEEDBACK_FOCUS_SELECTOR =
   "select:not(:disabled), textarea:not(:disabled), input:not(:disabled)";
+
+const FEEDBACK_ACTION_SELECTOR = ".feedback-actions button:not(:disabled)";
+const FEEDBACK_CLOSE_SELECTOR = ".feedback-close-button:not(:disabled)";
 
 interface FeedbackDraft {
   feedbackType: TranscriptFeedbackType;
@@ -110,12 +110,31 @@ function buildFeedbackRequest(
   return request;
 }
 
-function validateFeedbackDraft(draft: FeedbackDraft): string | null {
-  if (
-    draft.feedbackType === "mistranscription" &&
-    !draft.correctedText.trim()
-  ) {
-    return "修正後の文字起こしを入力してください";
+function feedbackFocusableElements(dialog: HTMLElement): HTMLElement[] {
+  return [
+    ...Array.from(
+      dialog.querySelectorAll<HTMLElement>(INITIAL_FEEDBACK_FOCUS_SELECTOR),
+    ),
+    ...Array.from(
+      dialog.querySelectorAll<HTMLElement>(FEEDBACK_ACTION_SELECTOR),
+    ),
+    ...Array.from(
+      dialog.querySelectorAll<HTMLElement>(FEEDBACK_CLOSE_SELECTOR),
+    ),
+  ];
+}
+
+function validateFeedbackDraft(
+  segment: TranscriptSegment,
+  draft: FeedbackDraft,
+): string | null {
+  if (draft.feedbackType === "mistranscription") {
+    if (!draft.correctedText.trim()) {
+      return "修正後の文字起こしを入力してください";
+    }
+    if (draft.correctedText.trim() === segment.text.trim()) {
+      return "修正後の文字起こしを元のテキストから変更してください";
+    }
   }
   if (draft.feedbackType === "speaker" && !draft.correctedSpeakerId.trim()) {
     return "正しい話者IDまたは名前を入力してください";
@@ -176,10 +195,9 @@ function FeedbackDialog({
         return;
       }
 
-      const focusable = Array.from(
-        dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR) ??
-          [],
-      );
+      const focusable = dialogRef.current
+        ? feedbackFocusableElements(dialogRef.current)
+        : [];
       if (focusable.length === 0) {
         event.preventDefault();
         return;
@@ -504,7 +522,10 @@ export function MeetingPage() {
       if (!meetingId || !feedbackSegment || !feedbackDraft) {
         return;
       }
-      const validationError = validateFeedbackDraft(feedbackDraft);
+      const validationError = validateFeedbackDraft(
+        feedbackSegment,
+        feedbackDraft,
+      );
       if (validationError) {
         setFeedbackError(validationError);
         return;
