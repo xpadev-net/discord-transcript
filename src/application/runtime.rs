@@ -3098,6 +3098,9 @@ impl ScaffoldHandler {
                 {
                     let flush_result =
                         flush_session_for_teardown(session, request.guild_key, request.phase);
+                    // The write voice_event_gate held for this block keeps
+                    // SpeakingStateUpdate from changing the tracker while a
+                    // retryable flush error is propagated.
                     session.persist_ssrc_mapping(&tracker);
                     flush_result.map_err(RecordingTeardownError::FinalFlush)?;
                 }
@@ -3330,6 +3333,17 @@ impl ScaffoldHandler {
         };
 
         if shutdown_error.is_none() && active_matches && session_matches {
+            let mut startups = self.recording_startups.lock().await;
+            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+            return Ok(());
+        }
+        if shutdown_error.is_none() && lookup_error.is_some() && session_matches {
+            warn!(
+                guild_id = %guild_key,
+                meeting_id,
+                error = %lookup_error.as_deref().unwrap_or("unknown store error"),
+                "could not verify active recording after voice join; keeping joined recording because session still matches"
+            );
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
             return Ok(());
