@@ -1722,6 +1722,7 @@ pub async fn run_bot(
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         command_gate: Arc::new(RwLock::new(())),
         voice_event_gate: Arc::new(RwLock::new(())),
+        ssrc_tracker_reset_gate: Arc::new(Mutex::new(())),
         background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -1854,6 +1855,7 @@ struct ScaffoldHandler {
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     command_gate: Arc<RwLock<()>>,
     voice_event_gate: Arc<RwLock<()>>,
+    ssrc_tracker_reset_gate: Arc<Mutex<()>>,
     background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -2616,7 +2618,9 @@ impl EventHandler for ScaffoldHandler {
                         .prepare_recording_stop_after_teardown(&teardown_request)
                         .await
                     {
-                        Ok((result, removed_session, final_tracker)) => {
+                        Ok((result, removed_session)) => {
+                            let reset_guard =
+                                Arc::clone(&handler.ssrc_tracker_reset_gate).lock_owned().await;
                             drop(command_guard);
                             handler
                                 .leave_after_recording_stop(
@@ -2625,7 +2629,7 @@ impl EventHandler for ScaffoldHandler {
                                     expected_meeting_id_ref,
                                     "auto-stop",
                                     &removed_session,
-                                    &final_tracker,
+                                    reset_guard,
                                 )
                                 .await;
                             break result;
@@ -3139,7 +3143,6 @@ impl ScaffoldHandler {
         (
             StopCommandResult,
             Option<RecordingSession<LocalChunkStorage>>,
-            SsrcTracker,
         ),
         RecordingTeardownError,
     > {
@@ -3207,12 +3210,7 @@ impl ScaffoldHandler {
                 request.expected_meeting_id,
             );
         }
-        let final_tracker = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let tracker = self.ssrc_tracker.lock().await;
-            tracker.clone()
-        };
-        Ok((stop_result, removed_session, final_tracker))
+        Ok((stop_result, removed_session))
     }
 
     async fn leave_after_recording_stop(
@@ -3222,14 +3220,19 @@ impl ScaffoldHandler {
         meeting_id: &str,
         phase: &str,
         removed_session: &Option<RecordingSession<LocalChunkStorage>>,
-        final_tracker: &SsrcTracker,
+        _reset_guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
         if let Some(manager) = songbird::get(ctx).await {
             leave_voice_with_timeout(manager.as_ref(), guild_id, meeting_id, phase).await;
         }
 
+        let final_tracker = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let tracker = self.ssrc_tracker.lock().await;
+            tracker.clone()
+        };
         if let Some(session) = &removed_session {
-            session.persist_ssrc_mapping(final_tracker);
+            session.persist_ssrc_mapping(&final_tracker);
         }
     }
 
@@ -3241,6 +3244,7 @@ impl ScaffoldHandler {
         expected_meeting_id: &str,
         error_message: &str,
     ) -> Result<(), String> {
+        let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
         let (removed_session, mark_result) = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mark_result = {
@@ -3288,6 +3292,7 @@ impl ScaffoldHandler {
         }
 
         let latest_tracker = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
             let tracker = self.ssrc_tracker.lock().await;
             tracker.clone()
         };
@@ -3373,73 +3378,78 @@ impl ScaffoldHandler {
         guild_key: &str,
         meeting_id: &str,
     ) -> Result<RecordingStartJoinVerification, String> {
-        let _command_guard = self.command_gate.write().await;
-        let shutdown_error = self.reject_if_shutting_down().err();
-        let (active_matches, meeting_status, lookup_error) = {
-            let mut service = self.service.lock().await;
-            let (active_matches, mut lookup_error) =
-                match service.store.find_active_meeting_by_guild(guild_key) {
-                    Ok(active) => (
-                        active.is_some_and(|meeting| {
-                            meeting.id == meeting_id && meeting.status == MeetingStatus::Recording
-                        }),
-                        None,
-                    ),
-                    Err(err) => (false, Some(err.to_string())),
-                };
-            let meeting_status = match service.store.get_meeting(meeting_id) {
-                Ok(meeting) => meeting.map(|meeting| meeting.status),
-                Err(err) => {
-                    if lookup_error.is_none() {
-                        lookup_error = Some(err.to_string());
+        let error_message = {
+            let _command_guard = self.command_gate.write().await;
+            let shutdown_error = self.reject_if_shutting_down().err();
+            let (active_matches, meeting_status, lookup_error) = {
+                let mut service = self.service.lock().await;
+                let (active_matches, mut lookup_error) =
+                    match service.store.find_active_meeting_by_guild(guild_key) {
+                        Ok(active) => (
+                            active.is_some_and(|meeting| {
+                                meeting.id == meeting_id
+                                    && meeting.status == MeetingStatus::Recording
+                            }),
+                            None,
+                        ),
+                        Err(err) => (false, Some(err.to_string())),
+                    };
+                let meeting_status = match service.store.get_meeting(meeting_id) {
+                    Ok(meeting) => meeting.map(|meeting| meeting.status),
+                    Err(err) => {
+                        if lookup_error.is_none() {
+                            lookup_error = Some(err.to_string());
+                        }
+                        None
                     }
-                    None
-                }
+                };
+                (active_matches, meeting_status, lookup_error)
             };
-            (active_matches, meeting_status, lookup_error)
-        };
-        let session_matches = {
-            let sessions = self.sessions.lock().await;
-            sessions
-                .get(guild_key)
-                .is_some_and(|session| session.meeting_id == meeting_id)
-        };
+            let session_matches = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(guild_key)
+                    .is_some_and(|session| session.meeting_id == meeting_id)
+            };
 
-        if shutdown_error.is_none() && active_matches && session_matches {
-            let mut startups = self.recording_startups.lock().await;
-            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-            return Ok(RecordingStartJoinVerification::Active);
-        }
-        if shutdown_error.is_none() && lookup_error.is_some() && session_matches {
-            warn!(
-                guild_id = %guild_key,
-                meeting_id,
-                error = %lookup_error.as_deref().unwrap_or("unknown store error"),
-                "could not verify active recording after voice join; keeping joined recording because session still matches"
-            );
-            let mut startups = self.recording_startups.lock().await;
-            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-            return Ok(RecordingStartJoinVerification::Active);
-        }
-        if shutdown_error.is_none()
-            && !session_matches
-            && meeting_status.is_some_and(recording_start_join_completed_after_stop)
-        {
-            info!(
-                guild_id = %guild_key,
-                meeting_id,
-                status = ?meeting_status,
-                "recording was stopped before voice join verification completed"
-            );
-            let mut startups = self.recording_startups.lock().await;
-            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-            return Ok(RecordingStartJoinVerification::AlreadyStopped);
-        }
+            if shutdown_error.is_none() && active_matches && session_matches {
+                let mut startups = self.recording_startups.lock().await;
+                clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+                return Ok(RecordingStartJoinVerification::Active);
+            }
+            if shutdown_error.is_none() && lookup_error.is_some() && session_matches {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id,
+                    error = %lookup_error.as_deref().unwrap_or("unknown store error"),
+                    "could not verify active recording after voice join; keeping joined recording because session still matches"
+                );
+                let mut startups = self.recording_startups.lock().await;
+                clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+                return Ok(RecordingStartJoinVerification::Active);
+            }
+            if shutdown_error.is_none()
+                && !session_matches
+                && meeting_status.is_some_and(recording_start_join_completed_after_stop)
+            {
+                info!(
+                    guild_id = %guild_key,
+                    meeting_id,
+                    status = ?meeting_status,
+                    "recording was stopped before voice join verification completed"
+                );
+                let mut startups = self.recording_startups.lock().await;
+                clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+                return Ok(RecordingStartJoinVerification::AlreadyStopped);
+            }
+
+            shutdown_error
+                .or(lookup_error)
+                .unwrap_or_else(|| "recording changed before voice join completed".to_owned())
+        };
 
         leave_voice_with_timeout(manager, guild_id, meeting_id, "record-start verification").await;
-        let error_message = shutdown_error
-            .or(lookup_error)
-            .unwrap_or_else(|| "recording changed before voice join completed".to_owned());
+        let _command_guard = self.command_gate.write().await;
         self.cleanup_failed_recording_start_locked(guild_key, meeting_id, &error_message)
             .await;
         Err(error_message)
@@ -3589,6 +3599,8 @@ impl ScaffoldHandler {
         // Reset SSRC tracker so stale mappings from previous recordings
         // cannot mis-attribute audio when Discord reuses an SSRC value.
         {
+            let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
+            let _voice_event_guard = self.voice_event_gate.write().await;
             let mut tracker = self.ssrc_tracker.lock().await;
             *tracker = SsrcTracker::new();
         }
@@ -3743,7 +3755,7 @@ impl ScaffoldHandler {
         );
         let caller_user_id = command.user.id.get().to_string();
 
-        let (stop_result, removed_session, authorized_meeting_id, final_tracker) = {
+        let (stop_result, removed_session, authorized_meeting_id, reset_guard) = {
             let _command_guard = self.command_gate.write().await;
             self.reject_if_shutting_down()?;
             let mut service = self.service.lock().await;
@@ -3765,15 +3777,16 @@ impl ScaffoldHandler {
                 reason: StopReason::Manual,
                 phase: "manual stop",
             };
-            let (stop_result, removed_session, final_tracker) = self
+            let (stop_result, removed_session) = self
                 .prepare_recording_stop_after_teardown(&request)
                 .await
                 .map_err(|err| err.to_string())?;
+            let reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
             (
                 stop_result,
                 removed_session,
                 authorized_meeting_id,
-                final_tracker,
+                reset_guard,
             )
         };
         self.leave_after_recording_stop(
@@ -3782,7 +3795,7 @@ impl ScaffoldHandler {
             &authorized_meeting_id,
             "manual stop",
             &removed_session,
-            &final_tracker,
+            reset_guard,
         )
         .await;
 
@@ -5470,7 +5483,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 .prepare_recording_stop_after_teardown(&teardown_request)
                                 .await
                             {
-                                Ok((result, removed_session, final_tracker)) => {
+                                Ok((result, removed_session)) => {
+                                    let reset_guard =
+                                        Arc::clone(&runtime.ssrc_tracker_reset_gate)
+                                            .lock_owned()
+                                            .await;
                                     drop(command_guard);
                                     runtime
                                         .leave_after_recording_stop(
@@ -5479,7 +5496,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             expected_meeting_id_ref,
                                             "driver disconnect",
                                             &removed_session,
-                                            &final_tracker,
+                                            reset_guard,
                                         )
                                         .await;
                                     break result;
