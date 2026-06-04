@@ -907,12 +907,15 @@ audio::-webkit-media-controls-panel {
 }
 
 .feedback-modal {
+  position: relative;
   width: min(640px, 100%);
   max-height: calc(100vh - 48px);
+  margin: 0;
   overflow-y: auto;
   border: 1px solid var(--border-light);
   border-radius: 8px;
   background: var(--bg-secondary);
+  color: var(--text-primary);
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
 }
 

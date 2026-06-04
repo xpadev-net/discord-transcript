@@ -1923,11 +1923,14 @@ describe("App access controls", () => {
     fireEvent.change(screen.getByLabelText("修正後の文字起こし"), {
       target: { value: "Alpha team" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+    const submitButton = screen.getByRole("button", { name: "送信" });
+    submitButton.focus();
+    fireEvent.click(submitButton);
 
     expect(
       await screen.findByText("入力内容がサーバーの検証に通りませんでした"),
     ).toBeTruthy();
+    await waitFor(() => expect(submitButton).toBe(document.activeElement));
     expect(screen.getByRole("dialog", { name: "フィードバック" })).toBeTruthy();
   });
 
@@ -1940,7 +1943,7 @@ describe("App access controls", () => {
     });
     fireEvent.click(feedbackButton);
     const dialog = screen.getByRole("dialog", { name: "フィードバック" });
-    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.tagName).toBe("DIALOG");
     expect(screen.getByLabelText("種類")).toBe(document.activeElement);
 
     fireEvent.change(screen.getByLabelText("種類"), {
@@ -1957,6 +1960,12 @@ describe("App access controls", () => {
       target: { value: "term" },
     });
     expect(screen.getByLabelText("用語タイプ")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+    expect(
+      await screen.findByText(
+        "修正後の文字起こしを元のテキストから変更してください",
+      ),
+    ).toBeTruthy();
 
     const submitButton = screen.getByRole("button", { name: "送信" });
     submitButton.focus();

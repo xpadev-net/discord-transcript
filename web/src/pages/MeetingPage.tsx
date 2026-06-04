@@ -128,7 +128,10 @@ function validateFeedbackDraft(
   segment: TranscriptSegment,
   draft: FeedbackDraft,
 ): string | null {
-  if (draft.feedbackType === "mistranscription") {
+  if (
+    draft.feedbackType === "mistranscription" ||
+    draft.feedbackType === "term"
+  ) {
     if (!draft.correctedText.trim()) {
       return "修正後の文字起こしを入力してください";
     }
@@ -171,7 +174,7 @@ function FeedbackDialog({
   onSubmit,
   onClose,
 }: FeedbackDialogProps) {
-  const dialogRef = useRef<HTMLElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
     const firstField = dialogRef.current?.querySelector<HTMLElement>(
@@ -222,11 +225,10 @@ function FeedbackDialog({
 
   return (
     <div className="feedback-modal-backdrop" role="presentation">
-      <section
+      <dialog
         ref={dialogRef}
+        open
         className="feedback-modal"
-        role="dialog"
-        aria-modal="true"
         aria-labelledby="feedback-dialog-title"
       >
         <div className="feedback-modal-header">
@@ -349,7 +351,7 @@ function FeedbackDialog({
             </button>
           </div>
         </form>
-      </section>
+      </dialog>
     </div>
   );
 }
@@ -376,6 +378,7 @@ export function MeetingPage() {
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const feedbackSubmitControllerRef = useRef<AbortController | null>(null);
   const feedbackReturnFocusRef = useRef<HTMLElement | null>(null);
+  const feedbackSubmitFocusRef = useRef<HTMLElement | null>(null);
   const feedbackSuccessTimeoutRef = useRef<number | null>(null);
 
   const {
@@ -531,6 +534,10 @@ export function MeetingPage() {
         return;
       }
 
+      feedbackSubmitFocusRef.current =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
       setFeedbackSubmitting(true);
       setFeedbackError(null);
       feedbackSubmitControllerRef.current?.abort();
@@ -555,6 +562,10 @@ export function MeetingPage() {
             return;
           }
           setFeedbackError(feedbackSubmitErrorMessage(err));
+          window.setTimeout(() => {
+            feedbackSubmitFocusRef.current?.focus();
+            feedbackSubmitFocusRef.current = null;
+          }, 0);
         })
         .finally(() => {
           if (feedbackSubmitControllerRef.current === controller) {
