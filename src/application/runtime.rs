@@ -2573,6 +2573,7 @@ impl EventHandler for ScaffoldHandler {
                                 );
                                 match handler
                                     .fail_recording_after_teardown_exhaustion(
+                                        &lifecycle_permit,
                                         &ctx_for_task,
                                         handler.guild_id,
                                         &guild_for_task,
@@ -2652,6 +2653,9 @@ impl EventHandler for ScaffoldHandler {
                             return;
                         }
                         GraceExpiryDecision::Stop => {
+                            // Reset only the cache-miss counter; flush/stop
+                            // failure counters keep enforcing their own limits
+                            // across rescheduled Stop-path iterations.
                             grace_cache_misses = 0;
                         }
                     }
@@ -2716,6 +2720,7 @@ impl EventHandler for ScaffoldHandler {
                                 );
                                 match handler
                                     .fail_recording_after_teardown_exhaustion(
+                                        &lifecycle_permit,
                                         &ctx_for_task,
                                         handler.guild_id,
                                         &guild_for_task,
@@ -2787,6 +2792,7 @@ impl EventHandler for ScaffoldHandler {
                                 );
                                 match handler
                                     .fail_recording_after_teardown_exhaustion(
+                                        &lifecycle_permit,
                                         &ctx_for_task,
                                         handler.guild_id,
                                         &guild_for_task,
@@ -3314,6 +3320,7 @@ impl ScaffoldHandler {
 
     async fn fail_recording_after_teardown_exhaustion(
         &self,
+        _permit: &RecordingLifecycleWritePermit<'_>,
         ctx: &Context,
         guild_id: GuildId,
         guild_key: &str,
@@ -5505,6 +5512,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         );
                                         match runtime
                                             .fail_recording_after_teardown_exhaustion(
+                                                &lifecycle_permit,
                                                 &ctx_for_task,
                                                 runtime.guild_id,
                                                 &guild_key,
@@ -5559,6 +5567,9 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 }
                                 GraceExpiryDecision::Cancel => return,
                                 GraceExpiryDecision::Stop => {
+                                    // Reset only the cache-miss counter; flush/stop
+                                    // failure counters keep enforcing their own limits
+                                    // across rescheduled Stop-path iterations.
                                     grace_cache_misses = 0;
                                 }
                             }
@@ -5609,6 +5620,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         );
                                         match runtime
                                             .fail_recording_after_teardown_exhaustion(
+                                                &lifecycle_permit,
                                                 &ctx_for_task,
                                                 runtime.guild_id,
                                                 &guild_key,
@@ -5674,6 +5686,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         );
                                         match runtime
                                             .fail_recording_after_teardown_exhaustion(
+                                                &lifecycle_permit,
                                                 &ctx_for_task,
                                                 runtime.guild_id,
                                                 &guild_key,
