@@ -3855,15 +3855,6 @@ impl ScaffoldHandler {
             return Err(err_msg);
         }
 
-        // Reset SSRC tracker so stale mappings from previous recordings
-        // cannot mis-attribute audio when Discord reuses an SSRC value.
-        {
-            let _reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let mut tracker = self.ssrc_tracker.lock().await;
-            *tracker = SsrcTracker::new();
-        }
-
         let command_guard = self.command_gate.write().await;
         if let Err(err_msg) = self.reject_if_shutting_down() {
             self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
@@ -3895,6 +3886,15 @@ impl ScaffoldHandler {
         }
         // The startup reservation cannot change here: command_guard is held,
         // and every clearer for this guild also takes command_gate.write().
+
+        // Reset SSRC tracker so stale mappings from previous recordings
+        // cannot mis-attribute audio when Discord reuses an SSRC value.
+        {
+            let _reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let mut tracker = self.ssrc_tracker.lock().await;
+            *tracker = SsrcTracker::new();
+        }
         self.spawn_record_start_entitlement_observation(guild_key.clone());
 
         {
