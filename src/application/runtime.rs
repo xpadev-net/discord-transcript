@@ -3748,10 +3748,66 @@ impl ScaffoldHandler {
         }
         self.spawn_record_start_entitlement_observation(guild_key.clone());
 
+        let (command_guard, reset_guard) = match Arc::clone(&self.ssrc_tracker_reset_gate)
+            .try_lock_owned()
+        {
+            Ok(reset_guard) => (command_guard, reset_guard),
+            Err(_) => {
+                drop(command_guard);
+                let reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
+                let command_guard = self.command_gate.write().await;
+                self.reject_if_shutting_down()?;
+                let setup_still_recording = {
+                    let mut service = self.service.lock().await;
+                    match service.store.find_active_meeting_by_guild(&guild_key) {
+                        Ok(Some(meeting)) => {
+                            meeting.id == meeting_id && meeting.status == MeetingStatus::Recording
+                        }
+                        Ok(None) => false,
+                        Err(err) => {
+                            drop(reset_guard);
+                            let err_msg =
+                                format!("failed to verify recording after SSRC reset wait: {err}");
+                            self.cleanup_failed_recording_start_locked(
+                                &guild_key,
+                                &meeting_id,
+                                &err_msg,
+                            )
+                            .await;
+                            return Err(err_msg);
+                        }
+                    }
+                };
+                if !setup_still_recording {
+                    drop(reset_guard);
+                    let mut startups = self.recording_startups.lock().await;
+                    clear_matching_recording_startup(&mut startups, &guild_key, &meeting_id);
+                    return Ok(format!(
+                        "{response}\n(参加準備中に停止処理が始まりました。停止処理の完了を待っています。)"
+                    ));
+                }
+                let startup_matches = {
+                    let startups = self.recording_startups.lock().await;
+                    startups
+                        .get(&guild_key)
+                        .is_some_and(|startup_meeting_id| startup_meeting_id == &meeting_id)
+                };
+                if !startup_matches {
+                    drop(reset_guard);
+                    let err_msg =
+                        "recording startup reservation changed before audio setup".to_owned();
+                    self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
+                        .await;
+                    return Err(err_msg);
+                }
+                (command_guard, reset_guard)
+            }
+        };
+
         // Reset SSRC tracker so stale mappings from previous recordings
         // cannot mis-attribute audio when Discord reuses an SSRC value.
         {
-            let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
+            let _reset_guard = reset_guard;
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mut tracker = self.ssrc_tracker.lock().await;
             *tracker = SsrcTracker::new();
@@ -5543,6 +5599,22 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             let Some(target_voice_channel_id) =
                                 runtime.active_meeting_voice_channel_id().await
                             else {
+                                {
+                                    let mut sessions = runtime.sessions.lock().await;
+                                    if sessions.get(&guild_key).is_some_and(|session| {
+                                        session.meeting_id == expected_meeting_id_ref
+                                    }) {
+                                        sessions.remove(&guild_key);
+                                    }
+                                }
+                                {
+                                    let mut states = runtime.auto_stop_states.lock().await;
+                                    states.remove(&guild_key);
+                                }
+                                {
+                                    let mut titles = runtime.live_transcription_titles.lock().await;
+                                    titles.remove(expected_meeting_id_ref);
+                                }
                                 let mut startups = runtime.recording_startups.lock().await;
                                 clear_matching_recording_startup(
                                     &mut startups,
