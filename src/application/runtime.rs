@@ -2916,6 +2916,8 @@ impl EventHandler for ScaffoldHandler {
                                 );
                                 handler
                                     .clear_local_recording_state_after_terminal_absence(
+                                        &ctx_for_task,
+                                        handler.guild_id,
                                         &guild_for_task,
                                         expected_meeting_id_ref,
                                         "auto-stop terminal cleanup retry",
@@ -3501,6 +3503,8 @@ impl ScaffoldHandler {
 
     async fn clear_local_recording_state_after_terminal_absence(
         &self,
+        ctx: &Context,
+        guild_id: GuildId,
         guild_key: &str,
         expected_meeting_id: &str,
         phase: &str,
@@ -3527,6 +3531,9 @@ impl ScaffoldHandler {
         };
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&latest_tracker);
+        }
+        if let Some(manager) = songbird::get(ctx).await {
+            leave_voice_with_timeout(manager.as_ref(), guild_id, expected_meeting_id, phase).await;
         }
         {
             let mut states = self.auto_stop_states.lock().await;
@@ -6089,6 +6096,8 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         );
                                         runtime
                                             .clear_local_recording_state_after_terminal_absence(
+                                                &ctx_for_task,
+                                                runtime.guild_id,
                                                 &guild_key,
                                                 expected_meeting_id_ref,
                                                 "driver-disconnect terminal cleanup retry",
