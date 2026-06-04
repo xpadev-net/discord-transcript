@@ -660,8 +660,9 @@ fn clear_matching_recording_startup(
     }
 }
 
-fn is_no_active_meeting_error(err: &str) -> bool {
+fn is_terminal_stop_target_absent_error(err: &str) -> bool {
     err == CommandError::NoActiveMeeting.to_string()
+        || err.starts_with("active meeting changed before stop:")
 }
 
 async fn leave_voice_with_timeout(
@@ -2905,7 +2906,7 @@ impl EventHandler for ScaffoldHandler {
                         Err(RecordingTeardownError::Stop(err)) => {
                             final_flush_failures = 0;
                             if retry_teardown_without_auto_stop_state
-                                && is_no_active_meeting_error(&err)
+                                && is_terminal_stop_target_absent_error(&err)
                             {
                                 warn!(
                                     guild_id = %guild_for_task,
@@ -4055,13 +4056,22 @@ impl ScaffoldHandler {
                         // Clean up partial gateway state before retrying
                         {
                             let _command_guard = self.command_gate.write().await;
-                            let session_matches = {
+                            let current_session_meeting_id = {
                                 let sessions = self.sessions.lock().await;
                                 sessions
                                     .get(&guild_key)
-                                    .is_some_and(|session| session.meeting_id == meeting_id)
+                                    .map(|session| session.meeting_id.clone())
                             };
-                            if !session_matches {
+                            if current_session_meeting_id.as_deref() != Some(meeting_id.as_str()) {
+                                if current_session_meeting_id.is_none() {
+                                    leave_voice_with_timeout(
+                                        manager.as_ref(),
+                                        guild_id,
+                                        &meeting_id,
+                                        "record-start retry cleanup after stop",
+                                    )
+                                    .await;
+                                }
                                 return Ok(format!(
                                     "{response}\n(参加再試行中に停止処理が始まりました。停止処理の完了を待っています。)"
                                 ));
@@ -6069,7 +6079,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 Err(RecordingTeardownError::Stop(err)) => {
                                     final_flush_failures = 0;
                                     if retry_teardown_after_failed_terminal_cleanup
-                                        && is_no_active_meeting_error(&err)
+                                        && is_terminal_stop_target_absent_error(&err)
                                     {
                                         warn!(
                                             guild_id = %guild_key,
@@ -7641,11 +7651,16 @@ mod status_message_tests {
     }
 
     #[test]
-    fn no_active_meeting_error_matches_command_contract() {
-        assert!(is_no_active_meeting_error(
+    fn terminal_stop_target_absent_error_matches_stop_contract() {
+        assert!(is_terminal_stop_target_absent_error(
             &CommandError::NoActiveMeeting.to_string()
         ));
-        assert!(!is_no_active_meeting_error("database unavailable"));
+        assert!(is_terminal_stop_target_absent_error(
+            "active meeting changed before stop: expected=old, actual=new"
+        ));
+        assert!(!is_terminal_stop_target_absent_error(
+            "database unavailable"
+        ));
     }
 
     #[test]
