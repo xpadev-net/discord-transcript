@@ -456,7 +456,10 @@ fn decide_driver_disconnect_grace_expiry(
     match (reconnected, non_bot_member_count) {
         (Some(false), Some(0)) => GraceExpiryDecision::Stop,
         (Some(true), _) => GraceExpiryDecision::Cancel,
-        (Some(_), Some(_)) => GraceExpiryDecision::Cancel,
+        // Bot is still disconnected after grace, but members are present. Do
+        // not auto-stop an occupied recording; a later empty-channel grace or
+        // manual stop can end it.
+        (Some(false), Some(_)) => GraceExpiryDecision::Cancel,
         _ => GraceExpiryDecision::Reschedule,
     }
 }
@@ -488,7 +491,7 @@ fn auto_stop_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String>
     voice_state_cache_miss_terminal_error(
         cache_misses,
         AUTO_STOP_GRACE_MAX_RESCHEDULES,
-        "auto-stop",
+        "auto-stop grace",
     )
 }
 
@@ -2779,6 +2782,7 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop final flush exhaustion; rescheduling"
                                         );
+                                        final_flush_failures = 0;
                                         retry_teardown_without_auto_stop_state = true;
                                         continue;
                                     }
@@ -5692,6 +5696,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect final flush exhaustion; rescheduling"
                                                 );
+                                                final_flush_failures = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
@@ -7185,7 +7190,7 @@ mod status_message_tests {
         let error = auto_stop_cache_miss_terminal_error(&mut cache_misses)
             .expect("retry limit should terminalize");
         assert_eq!(cache_misses, AUTO_STOP_GRACE_MAX_RESCHEDULES);
-        assert!(error.contains("auto-stop stop check"));
+        assert!(error.contains("auto-stop grace stop check"));
     }
 
     #[test]
