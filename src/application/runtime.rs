@@ -3524,15 +3524,20 @@ impl ScaffoldHandler {
                 return Ok(RecordingStartJoinVerification::AlreadyStopped);
             }
 
-            shutdown_error
+            let error_message = shutdown_error
                 .or(lookup_error)
-                .unwrap_or_else(|| "recording changed before voice join completed".to_owned())
+                .unwrap_or_else(|| "recording changed before voice join completed".to_owned());
+
+            // Keep the lifecycle gate held until this leave and cleanup
+            // complete so a follow-up start cannot join and then be kicked by
+            // this cleanup.
+            leave_voice_with_timeout(manager, guild_id, meeting_id, "record-start verification")
+                .await;
+            self.cleanup_failed_recording_start_locked(guild_key, meeting_id, &error_message)
+                .await;
+            error_message
         };
 
-        leave_voice_with_timeout(manager, guild_id, meeting_id, "record-start verification").await;
-        let _command_guard = self.command_gate.write().await;
-        self.cleanup_failed_recording_start_locked(guild_key, meeting_id, &error_message)
-            .await;
         Err(error_message)
     }
 
