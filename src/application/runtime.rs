@@ -2913,6 +2913,13 @@ impl EventHandler for ScaffoldHandler {
                                     error = %err,
                                     "auto-stop terminal cleanup retry found no active meeting; treating as already handled"
                                 );
+                                handler
+                                    .clear_local_recording_state_after_terminal_absence(
+                                        &guild_for_task,
+                                        expected_meeting_id_ref,
+                                        "auto-stop terminal cleanup retry",
+                                    )
+                                    .await;
                                 return;
                             }
                             let terminal_error =
@@ -3489,6 +3496,47 @@ impl ScaffoldHandler {
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&final_tracker);
         }
+    }
+
+    async fn clear_local_recording_state_after_terminal_absence(
+        &self,
+        guild_key: &str,
+        expected_meeting_id: &str,
+        phase: &str,
+    ) {
+        let mut removed_session = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(guild_key)
+                .is_some_and(|session| session.meeting_id == expected_meeting_id)
+            {
+                sessions.remove(guild_key)
+            } else {
+                None
+            }
+        };
+        if let Some(session) = removed_session.as_mut() {
+            flush_removed_session_after_stop(session, guild_key, phase);
+        }
+        let latest_tracker = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let tracker = self.ssrc_tracker.lock().await;
+            tracker.clone()
+        };
+        if let Some(session) = &removed_session {
+            session.persist_ssrc_mapping(&latest_tracker);
+        }
+        {
+            let mut states = self.auto_stop_states.lock().await;
+            states.remove(guild_key);
+        }
+        {
+            let mut titles = self.live_transcription_titles.lock().await;
+            titles.remove(expected_meeting_id);
+        }
+        let mut startups = self.recording_startups.lock().await;
+        clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
     }
 
     async fn fail_recording_after_teardown_exhaustion(
@@ -6029,6 +6077,13 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             error = %err,
                                             "driver-disconnect terminal cleanup retry found no active meeting; treating as already handled"
                                         );
+                                        runtime
+                                            .clear_local_recording_state_after_terminal_absence(
+                                                &guild_key,
+                                                expected_meeting_id_ref,
+                                                "driver-disconnect terminal cleanup retry",
+                                            )
+                                            .await;
                                         return;
                                     }
                                     let terminal_error = recording_stop_terminal_error(
