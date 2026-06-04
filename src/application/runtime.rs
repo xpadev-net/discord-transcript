@@ -2697,6 +2697,13 @@ impl EventHandler for ScaffoldHandler {
                     } else {
                         let mut states = handler.auto_stop_states.lock().await;
                         let Some(state) = states.get_mut(&guild_for_task) else {
+                            drop(states);
+                            let mut startups = handler.recording_startups.lock().await;
+                            clear_matching_recording_startup(
+                                &mut startups,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                            );
                             return;
                         };
                         state.tick() == AutoStopSignal::Trigger
