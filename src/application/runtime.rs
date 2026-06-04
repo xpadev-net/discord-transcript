@@ -2496,10 +2496,43 @@ impl EventHandler for ScaffoldHandler {
             return;
         }
         let guild_key = self.guild_id.get().to_string();
-        let Some(target_voice_channel_id) = self.active_meeting_voice_channel_id().await else {
-            let mut states = self.auto_stop_states.lock().await;
-            states.remove(&guild_key);
-            return;
+        let target_voice_channel_id = match self.active_meeting_voice_channel_id_result().await {
+            Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
+            Ok(None) => {
+                let _lifecycle_permit = self.recording_lifecycle_write_permit().await;
+                match self.active_meeting_voice_channel_id_result().await {
+                    Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
+                    Ok(None) => {
+                        {
+                            let mut states = self.auto_stop_states.lock().await;
+                            states.remove(&guild_key);
+                        }
+                        {
+                            let mut startups = self.recording_startups.lock().await;
+                            // A valid reservation must have an active meeting row; the
+                            // lifecycle gate prevents racing a fresh /record-start here.
+                            startups.remove(&guild_key);
+                        }
+                        return;
+                    }
+                    Err(err) => {
+                        warn!(
+                            guild_id = %self.guild_id,
+                            error = %err,
+                            "failed to resolve active meeting voice channel"
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    guild_id = %self.guild_id,
+                    error = %err,
+                    "failed to resolve active meeting voice channel"
+                );
+                return;
+            }
         };
         let Some(non_bot) =
             count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id)
@@ -3149,20 +3182,6 @@ impl ScaffoldHandler {
             }
         }
         Ok(())
-    }
-
-    async fn active_meeting_voice_channel_id(&self) -> Option<u64> {
-        match self.active_meeting_voice_channel_id_result().await {
-            Ok(voice_channel_id) => voice_channel_id,
-            Err(err) => {
-                warn!(
-                    guild_id = %self.guild_id,
-                    error = %err,
-                    "failed to resolve active meeting voice channel"
-                );
-                None
-            }
-        }
     }
 
     async fn active_meeting_voice_channel_id_result(&self) -> Result<Option<u64>, String> {
