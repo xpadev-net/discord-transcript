@@ -484,10 +484,6 @@ fn recording_stop_terminal_error(
     ))
 }
 
-fn reset_final_flush_failures_after_successful_flush(final_flush_failures: &mut u32) {
-    *final_flush_failures = 0;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordingStartJoinVerification {
     Active,
@@ -675,13 +671,7 @@ struct RecordingStopTeardownRequest<'a> {
 }
 
 struct RecordingLifecycleWritePermit<'a> {
-    guard: RwLockWriteGuard<'a, ()>,
-}
-
-impl RecordingLifecycleWritePermit<'_> {
-    fn assert_held(&self) {
-        let _ = &self.guard;
-    }
+    _guard: RwLockWriteGuard<'a, ()>,
 }
 
 impl Display for RecordingTeardownError {
@@ -2777,9 +2767,7 @@ impl EventHandler for ScaffoldHandler {
                             continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
-                            reset_final_flush_failures_after_successful_flush(
-                                &mut final_flush_failures,
-                            );
+                            final_flush_failures = 0;
                             let terminal_error =
                                 recording_stop_terminal_error(&mut stop_failures, "auto-stop", &err);
                             warn!(
@@ -3218,13 +3206,13 @@ impl ScaffoldHandler {
 
     async fn recording_lifecycle_write_permit(&self) -> RecordingLifecycleWritePermit<'_> {
         RecordingLifecycleWritePermit {
-            guard: self.command_gate.write().await,
+            _guard: self.command_gate.write().await,
         }
     }
 
     async fn prepare_recording_stop_after_teardown(
         &self,
-        permit: &RecordingLifecycleWritePermit<'_>,
+        _permit: &RecordingLifecycleWritePermit<'_>,
         request: &RecordingStopTeardownRequest<'_>,
     ) -> Result<
         (
@@ -3233,7 +3221,6 @@ impl ScaffoldHandler {
         ),
         RecordingTeardownError,
     > {
-        permit.assert_held();
         {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let tracker = {
@@ -3666,12 +3653,18 @@ impl ScaffoldHandler {
             };
             (response, meeting_title)
         };
+        {
+            let mut startups = self.recording_startups.lock().await;
+            startups.insert(guild_key.clone(), meeting_id.clone());
+        }
         let layout =
             crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
         let workspace =
             layout.for_meeting(&guild_key, &voice_channel_id_u64.to_string(), &meeting_id);
         if let Err(err) = workspace.ensure_base_dirs() {
             let err_msg = format!("failed to prepare workspace: {err}");
+            // Only the DB row and startup reservation exist here; cleanup
+            // terminalizes the row and clears that reservation.
             self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
                 .await;
             return Err(err_msg);
@@ -3712,10 +3705,6 @@ impl ScaffoldHandler {
         // mappings (SpeakingStateUpdate for users already speaking).
         self.register_voice_handlers(manager.as_ref(), ctx, guild_id)
             .await;
-        {
-            let mut startups = self.recording_startups.lock().await;
-            startups.insert(guild_key.clone(), meeting_id.clone());
-        }
         drop(command_guard);
 
         let _call = {
@@ -5662,9 +5651,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     continue;
                                 }
                                 Err(RecordingTeardownError::Stop(err)) => {
-                                    reset_final_flush_failures_after_successful_flush(
-                                        &mut final_flush_failures,
-                                    );
+                                    final_flush_failures = 0;
                                     let terminal_error = recording_stop_terminal_error(
                                         &mut stop_failures,
                                         "driver-disconnect",
@@ -7211,15 +7198,6 @@ mod status_message_tests {
         assert_eq!(stop_failures, RECORDING_STOP_MAX_RETRIES);
         assert!(error.contains("recording stop failed"));
         assert!(error.contains("queue down"));
-    }
-
-    #[test]
-    fn successful_flush_before_stop_resets_final_flush_failure_budget() {
-        let mut final_flush_failures = AUTO_STOP_FINAL_FLUSH_MAX_RETRIES - 1;
-
-        reset_final_flush_failures_after_successful_flush(&mut final_flush_failures);
-
-        assert_eq!(final_flush_failures, 0);
     }
 
     #[test]
