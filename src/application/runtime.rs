@@ -2446,6 +2446,7 @@ impl EventHandler for ScaffoldHandler {
                 let mut final_flush_failures = 0u32;
                 let mut grace_cache_misses = 0u32;
                 let mut stop_failures = 0u32;
+                let mut retry_teardown_without_auto_stop_state = false;
                 let stop_result = loop {
                     tokio::select! {
                         _ = sleep(grace_for_task) => {}
@@ -2544,9 +2545,13 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop cache-miss exhaustion; rescheduling"
                                         );
+                                        retry_teardown_without_auto_stop_state = true;
                                         continue;
                                     }
                                 }
+                            }
+                            if retry_teardown_without_auto_stop_state {
+                                continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             if let Some(state) = states.get_mut(&guild_for_task) {
@@ -2556,6 +2561,13 @@ impl EventHandler for ScaffoldHandler {
                             return;
                         }
                         GraceExpiryDecision::Cancel => {
+                            if retry_teardown_without_auto_stop_state {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    "auto-stop teardown retry has no timer state; continuing cleanup despite recovered member count"
+                                );
+                            } else {
                             let Some(non_bot) = non_bot_at_fire else {
                                 unreachable!("Cancel decision requires a known non-bot count")
                             };
@@ -2570,12 +2582,15 @@ impl EventHandler for ScaffoldHandler {
                                 let _ = state.on_non_bot_member_count_changed(non_bot);
                             }
                             return;
+                            }
                         }
                         GraceExpiryDecision::Stop => {
                             grace_cache_misses = 0;
                         }
                     }
-                    let trigger = {
+                    let trigger = if retry_teardown_without_auto_stop_state {
+                        true
+                    } else {
                         let mut states = handler.auto_stop_states.lock().await;
                         let Some(state) = states.get_mut(&guild_for_task) else {
                             return;
@@ -2665,9 +2680,13 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop final flush exhaustion; rescheduling"
                                         );
+                                        retry_teardown_without_auto_stop_state = true;
                                         continue;
                                     }
                                 }
+                            }
+                            if retry_teardown_without_auto_stop_state {
+                                continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
@@ -2731,9 +2750,13 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop stop exhaustion; rescheduling"
                                         );
+                                        retry_teardown_without_auto_stop_state = true;
                                         continue;
                                     }
                                 }
+                            }
+                            if retry_teardown_without_auto_stop_state {
+                                continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
