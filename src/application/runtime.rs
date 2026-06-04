@@ -660,6 +660,10 @@ fn clear_matching_recording_startup(
     }
 }
 
+fn is_no_active_meeting_error(err: &str) -> bool {
+    err == CommandError::NoActiveMeeting.to_string()
+}
+
 async fn leave_voice_with_timeout(
     manager: &songbird::Songbird,
     guild_id: GuildId,
@@ -704,6 +708,7 @@ struct RecordingStopTeardownRequest<'a> {
     phase: &'a str,
 }
 
+#[must_use]
 struct RecordingLifecycleWritePermit<'a> {
     _guard: RwLockWriteGuard<'a, ()>,
 }
@@ -2859,6 +2864,17 @@ impl EventHandler for ScaffoldHandler {
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
                             final_flush_failures = 0;
+                            if retry_teardown_without_auto_stop_state
+                                && is_no_active_meeting_error(&err)
+                            {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    error = %err,
+                                    "auto-stop terminal cleanup retry found no active meeting; treating as already handled"
+                                );
+                                return;
+                            }
                             let terminal_error =
                                 recording_stop_terminal_error(&mut stop_failures, "auto-stop", &err);
                             warn!(
@@ -5959,6 +5975,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 }
                                 Err(RecordingTeardownError::Stop(err)) => {
                                     final_flush_failures = 0;
+                                    if retry_teardown_after_failed_terminal_cleanup
+                                        && is_no_active_meeting_error(&err)
+                                    {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %err,
+                                            "driver-disconnect terminal cleanup retry found no active meeting; treating as already handled"
+                                        );
+                                        return;
+                                    }
                                     let terminal_error = recording_stop_terminal_error(
                                         &mut stop_failures,
                                         "driver-disconnect",
@@ -7511,6 +7538,14 @@ mod status_message_tests {
         assert_eq!(stop_failures, RECORDING_STOP_MAX_RETRIES);
         assert!(error.contains("recording stop failed"));
         assert!(error.contains("queue down"));
+    }
+
+    #[test]
+    fn no_active_meeting_error_matches_command_contract() {
+        assert!(is_no_active_meeting_error(
+            &CommandError::NoActiveMeeting.to_string()
+        ));
+        assert!(!is_no_active_meeting_error("database unavailable"));
     }
 
     #[test]
