@@ -41,8 +41,9 @@ use crate::infrastructure::sql::{
     GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
     INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
     INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
-    LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
-    UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
+    UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -67,8 +68,9 @@ SELECT id,
        voice_channel_id
 FROM meetings
 WHERE guild_id = $1
+  AND ($2::TEXT IS NULL OR voice_channel_id = $2)
 ORDER BY started_at DESC
-LIMIT $2
+LIMIT $3
 "#;
 const OPERATIONAL_SCHEMA_READY_SQL: &str = r#"
 SELECT
@@ -2740,10 +2742,11 @@ struct CurrentUserGuildResponse {
     tenant_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GuildMeetingsQuery {
     page: Option<u32>,
     limit: Option<u32>,
+    voice_channel_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2755,12 +2758,20 @@ struct GuildMeetingEntryResponse {
     stopped_at: Option<String>,
     duration_seconds: Option<i32>,
     stop_reason: Option<String>,
+    voice_channel_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildMeetingVoiceChannelResponse {
+    id: String,
+    label: String,
 }
 
 #[derive(Serialize)]
 struct GuildMeetingsResponse {
     guild_id: String,
     meetings: Vec<GuildMeetingEntryResponse>,
+    voice_channels: Vec<GuildMeetingVoiceChannelResponse>,
     page: u32,
     limit: u32,
     total: i64,
@@ -3285,10 +3296,19 @@ async fn load_operational_counters(
     })
 }
 
-fn normalize_guild_meetings_pagination(query: GuildMeetingsQuery) -> (u32, u32) {
+fn normalize_guild_meetings_pagination(query: &GuildMeetingsQuery) -> (u32, u32) {
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     (page, limit)
+}
+
+fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Option<String> {
+    query
+        .voice_channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|voice_channel_id| !voice_channel_id.is_empty())
+        .map(str::to_owned)
 }
 
 fn guild_meetings_visibility_scan_limit(page: u32, limit: u32) -> i64 {
@@ -3360,6 +3380,14 @@ fn guild_meeting_entry_from_row(row: &tokio_postgres::Row) -> GuildMeetingEntryR
         stopped_at: row.get("stopped_at"),
         duration_seconds: row.get("meeting_duration_seconds"),
         stop_reason: row.get("stop_reason"),
+        voice_channel_id: row.get("voice_channel_id"),
+    }
+}
+
+fn guild_meeting_voice_channel_response(id: String) -> GuildMeetingVoiceChannelResponse {
+    GuildMeetingVoiceChannelResponse {
+        label: format!("VC ID: {id}"),
+        id,
     }
 }
 
@@ -3992,15 +4020,21 @@ async fn list_guild_meetings_for_auth(
     auth: &AuthConfig,
     query: GuildMeetingsQuery,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
-    let (page, limit) = normalize_guild_meetings_pagination(query);
+    let (page, limit) = normalize_guild_meetings_pagination(&query);
+    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
     let is_admin = check_guild_admin_permission(state, auth, user_id).await?;
+    let (voice_channels, mut channel_visibility) =
+        list_guild_meeting_voice_channels(state, auth, user_id, is_admin).await?;
 
     if is_admin {
         let count_row = state
             .db
-            .query_one(COUNT_GUILD_MEETINGS_SQL, &[&auth.guild_id])
+            .query_one(
+                COUNT_GUILD_MEETINGS_SQL,
+                &[&auth.guild_id, &voice_channel_filter],
+            )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let total: i64 = count_row.get(0);
@@ -4009,7 +4043,7 @@ async fn list_guild_meetings_for_auth(
             .db
             .query(
                 LIST_GUILD_MEETINGS_SQL,
-                &[&auth.guild_id, &limit_i64, &offset],
+                &[&auth.guild_id, &voice_channel_filter, &limit_i64, &offset],
             )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -4018,6 +4052,7 @@ async fn list_guild_meetings_for_auth(
         return Ok(Json(GuildMeetingsResponse {
             guild_id: auth.guild_id.clone(),
             meetings,
+            voice_channels,
             page,
             limit,
             total,
@@ -4029,31 +4064,36 @@ async fn list_guild_meetings_for_auth(
         .db
         .query(
             LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL,
-            &[&auth.guild_id, &visibility_scan_limit],
+            &[
+                &auth.guild_id,
+                &voice_channel_filter,
+                &visibility_scan_limit,
+            ],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut visible_meetings = Vec::new();
-    let mut channel_visibility: HashMap<String, bool> = HashMap::new();
 
     for row in &rows {
-        let voice_channel_id: String = row.get("voice_channel_id");
-        let visible = if let Some(visible) = channel_visibility.get(&voice_channel_id) {
+        let row_voice_channel_id: String = row.get("voice_channel_id");
+        let visible = if let Some(visible) = channel_visibility.get(&row_voice_channel_id) {
             *visible
         } else {
-            if !can_scan_new_visibility_channel(channel_visibility.len()) {
+            let filter_targets_row =
+                voice_channel_filter.as_deref() == Some(row_voice_channel_id.as_str());
+            if !filter_targets_row && !can_scan_new_visibility_channel(channel_visibility.len()) {
                 continue;
             }
             let visible = guild_meeting_channel_visible_after_row(
                 auth.guild_id.clone(),
-                voice_channel_id.clone(),
+                row_voice_channel_id.clone(),
                 &auth.guild_id,
                 user_id,
                 &state.permission_cache,
-                resolve_channel_permission_flags(state, auth, &voice_channel_id, user_id),
+                resolve_channel_permission_flags(state, auth, &row_voice_channel_id, user_id),
             )
             .await?;
-            channel_visibility.insert(voice_channel_id.clone(), visible);
+            channel_visibility.insert(row_voice_channel_id.clone(), visible);
             visible
         };
 
@@ -4076,10 +4116,56 @@ async fn list_guild_meetings_for_auth(
     Ok(Json(GuildMeetingsResponse {
         guild_id: auth.guild_id.clone(),
         meetings,
+        voice_channels,
         page,
         limit,
         total,
     }))
+}
+
+async fn list_guild_meeting_voice_channels(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(Vec<GuildMeetingVoiceChannelResponse>, HashMap<String, bool>), StatusCode> {
+    let channel_limit = i64::try_from(GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP).unwrap_or(i64::MAX);
+    let rows = state
+        .db
+        .query(
+            LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
+            &[&auth.guild_id, &channel_limit],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut voice_channels = Vec::new();
+    let mut channel_visibility = HashMap::new();
+
+    for row in rows {
+        let voice_channel_id: String = row.get("voice_channel_id");
+        if is_admin {
+            channel_visibility.insert(voice_channel_id.clone(), true);
+            voice_channels.push(guild_meeting_voice_channel_response(voice_channel_id));
+            continue;
+        }
+
+        let visible = guild_meeting_channel_visible_after_row(
+            auth.guild_id.clone(),
+            voice_channel_id.clone(),
+            &auth.guild_id,
+            user_id,
+            &state.permission_cache,
+            resolve_channel_permission_flags(state, auth, &voice_channel_id, user_id),
+        )
+        .await?;
+        channel_visibility.insert(voice_channel_id.clone(), visible);
+        if visible {
+            voice_channels.push(guild_meeting_voice_channel_response(voice_channel_id));
+        }
+    }
+
+    Ok((voice_channels, channel_visibility))
 }
 
 async fn load_guild_settings(
@@ -6961,14 +7047,17 @@ mod guild_api_tests {
         guild_meetings_visibility_scan_limit, guild_settings_response,
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
-        normalize_summary_template_request, normalize_target_guild_id, permission_cache_ttl,
-        target_auth_config, target_guild_has_active_installation, target_guild_settings_path,
+        normalize_guild_meetings_voice_channel_id, normalize_summary_template_request,
+        normalize_target_guild_id, permission_cache_ttl, target_auth_config,
+        target_guild_has_active_installation, target_guild_settings_path,
         user_can_access_target_guild, validate_authorized_guild_bot_token_update,
         validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
         validate_domain_knowledge_item_id, validate_guild_settings_update,
         validate_summary_template_id,
     };
-    use crate::infrastructure::sql::{COUNT_GUILD_MEETINGS_SQL, LIST_GUILD_MEETINGS_SQL};
+    use crate::infrastructure::sql::{
+        COUNT_GUILD_MEETINGS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
+    };
     use axum::http::StatusCode;
     use std::collections::HashMap;
     use std::sync::{
@@ -7920,25 +8009,56 @@ mod guild_api_tests {
     #[test]
     fn guild_meetings_pagination_is_bounded() {
         assert_eq!(
-            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+            normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: None,
-                limit: None
+                limit: None,
+                voice_channel_id: None
             }),
             (1, 20)
         );
         assert_eq!(
-            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+            normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: Some(0),
-                limit: Some(0)
+                limit: Some(0),
+                voice_channel_id: None
             }),
             (1, 1)
         );
         assert_eq!(
-            normalize_guild_meetings_pagination(GuildMeetingsQuery {
+            normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: Some(2),
-                limit: Some(250)
+                limit: Some(250),
+                voice_channel_id: None
             }),
             (2, 100)
+        );
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_ignores_blank_values() {
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: None,
+            }),
+            None
+        );
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some("  ".to_owned()),
+            }),
+            None
+        );
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some(" vc-2 ".to_owned()),
+            }),
+            Some("vc-2".to_owned())
         );
     }
 
@@ -7968,21 +8088,31 @@ mod guild_api_tests {
         let list_sql = LIST_GUILD_MEETINGS_SQL.to_ascii_uppercase();
         let count_sql = COUNT_GUILD_MEETINGS_SQL.to_ascii_uppercase();
         let visibility_sql = super::LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL.to_ascii_uppercase();
+        let channel_sql = LIST_GUILD_MEETING_VOICE_CHANNELS_SQL.to_ascii_uppercase();
 
         let list_where = list_sql.find("WHERE GUILD_ID = $1").unwrap();
+        let list_voice = list_sql.find("VOICE_CHANNEL_ID = $2").unwrap();
         let list_order = list_sql.find("ORDER BY").unwrap();
-        let list_limit = list_sql.find("LIMIT $2").unwrap();
-        let list_offset = list_sql.find("OFFSET $3").unwrap();
+        let list_limit = list_sql.find("LIMIT $3").unwrap();
+        let list_offset = list_sql.find("OFFSET $4").unwrap();
         assert!(list_where < list_order);
+        assert!(list_where < list_voice);
+        assert!(list_voice < list_order);
         assert!(list_where < list_limit);
         assert!(list_where < list_offset);
 
         let visibility_where = visibility_sql.find("WHERE GUILD_ID = $1").unwrap();
-        let visibility_limit = visibility_sql.find("LIMIT $2").unwrap();
+        let visibility_voice = visibility_sql.find("VOICE_CHANNEL_ID = $2").unwrap();
+        let visibility_limit = visibility_sql.find("LIMIT $3").unwrap();
+        assert!(visibility_where < visibility_voice);
+        assert!(visibility_voice < visibility_limit);
         assert!(visibility_where < visibility_limit);
         assert!(!visibility_sql.contains("OFFSET"));
 
         assert!(count_sql.contains("WHERE GUILD_ID = $1"));
+        assert!(count_sql.contains("VOICE_CHANNEL_ID = $2"));
+        assert!(channel_sql.contains("WHERE GUILD_ID = $1"));
+        assert!(!channel_sql.contains("VOICE_CHANNEL_ID = $2"));
     }
 
     #[test]
