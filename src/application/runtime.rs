@@ -4112,9 +4112,9 @@ impl ScaffoldHandler {
         if !setup_still_recording {
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, &guild_key, &meeting_id);
-            return Ok(format!(
-                "{response}\n(参加準備中に停止処理が始まりました。停止処理の完了を待っています。)"
-            ));
+            return Ok(
+                "参加準備中に停止処理が始まりました。停止処理の完了を待っています。".to_owned(),
+            );
         }
         // The startup reservation cannot change here: command_guard is held,
         // and every clearer for this guild also takes command_gate.write().
@@ -4195,9 +4195,10 @@ impl ScaffoldHandler {
                                     "record-start retry cleanup after stop",
                                 )
                                 .await;
-                                return Ok(format!(
-                                    "{response}\n(参加再試行中に停止処理が始まりました。停止処理の完了を待っています。)"
-                                ));
+                                return Ok(
+                                "参加再試行中に停止処理が始まりました。停止処理の完了を待っています。"
+                                    .to_owned(),
+                            );
                             }
                             leave_voice_with_timeout(
                                 manager.as_ref(),
@@ -4242,9 +4243,9 @@ impl ScaffoldHandler {
             .verify_recording_start_after_join(manager.as_ref(), guild_id, &guild_key, &meeting_id)
             .await?;
         if join_verification == RecordingStartJoinVerification::AlreadyStopped {
-            return Ok(format!(
-                "{response}\n(参加完了前に停止処理が始まりました。停止処理の完了を待っています。)"
-            ));
+            return Ok(
+                "参加完了前に停止処理が始まりました。停止処理の完了を待っています。".to_owned(),
+            );
         }
 
         info!(
