@@ -484,6 +484,22 @@ fn recording_stop_terminal_error(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingStartJoinVerification {
+    Active,
+    AlreadyStopped,
+}
+
+fn recording_start_join_completed_after_stop(status: MeetingStatus) -> bool {
+    matches!(
+        status,
+        MeetingStatus::Stopping
+            | MeetingStatus::Transcribing
+            | MeetingStatus::Summarizing
+            | MeetingStatus::Posted
+    )
+}
+
 fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
     store: &mut S,
     meeting_id: &str,
@@ -3099,12 +3115,12 @@ impl ScaffoldHandler {
         ),
         RecordingTeardownError,
     > {
-        let _voice_event_guard = self.voice_event_gate.write().await;
-        let tracker = {
-            let tracker = self.ssrc_tracker.lock().await;
-            tracker.clone()
-        };
         {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let tracker = {
+                let tracker = self.ssrc_tracker.lock().await;
+                tracker.clone()
+            };
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions
                 .get_mut(request.guild_key)
@@ -3324,20 +3340,31 @@ impl ScaffoldHandler {
         guild_id: GuildId,
         guild_key: &str,
         meeting_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<RecordingStartJoinVerification, String> {
         let _command_guard = self.command_gate.write().await;
         let shutdown_error = self.reject_if_shutting_down().err();
-        let (active_matches, lookup_error) = {
+        let (active_matches, meeting_status, lookup_error) = {
             let mut service = self.service.lock().await;
-            match service.store.find_active_meeting_by_guild(guild_key) {
-                Ok(active) => (
-                    active.is_some_and(|meeting| {
-                        meeting.id == meeting_id && meeting.status == MeetingStatus::Recording
-                    }),
-                    None,
-                ),
-                Err(err) => (false, Some(err.to_string())),
-            }
+            let (active_matches, mut lookup_error) =
+                match service.store.find_active_meeting_by_guild(guild_key) {
+                    Ok(active) => (
+                        active.is_some_and(|meeting| {
+                            meeting.id == meeting_id && meeting.status == MeetingStatus::Recording
+                        }),
+                        None,
+                    ),
+                    Err(err) => (false, Some(err.to_string())),
+                };
+            let meeting_status = match service.store.get_meeting(meeting_id) {
+                Ok(meeting) => meeting.map(|meeting| meeting.status),
+                Err(err) => {
+                    if lookup_error.is_none() {
+                        lookup_error = Some(err.to_string());
+                    }
+                    None
+                }
+            };
+            (active_matches, meeting_status, lookup_error)
         };
         let session_matches = {
             let sessions = self.sessions.lock().await;
@@ -3349,7 +3376,7 @@ impl ScaffoldHandler {
         if shutdown_error.is_none() && active_matches && session_matches {
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-            return Ok(());
+            return Ok(RecordingStartJoinVerification::Active);
         }
         if shutdown_error.is_none() && lookup_error.is_some() && session_matches {
             warn!(
@@ -3360,7 +3387,21 @@ impl ScaffoldHandler {
             );
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-            return Ok(());
+            return Ok(RecordingStartJoinVerification::Active);
+        }
+        if shutdown_error.is_none()
+            && !session_matches
+            && meeting_status.is_some_and(recording_start_join_completed_after_stop)
+        {
+            info!(
+                guild_id = %guild_key,
+                meeting_id,
+                status = ?meeting_status,
+                "recording was stopped before voice join verification completed"
+            );
+            let mut startups = self.recording_startups.lock().await;
+            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+            return Ok(RecordingStartJoinVerification::AlreadyStopped);
         }
 
         leave_voice_with_timeout(manager, guild_id, meeting_id, "record-start verification").await;
@@ -3613,8 +3654,14 @@ impl ScaffoldHandler {
                 }
             }
         };
-        self.verify_recording_start_after_join(manager.as_ref(), guild_id, &guild_key, &meeting_id)
+        let join_verification = self
+            .verify_recording_start_after_join(manager.as_ref(), guild_id, &guild_key, &meeting_id)
             .await?;
+        if join_verification == RecordingStartJoinVerification::AlreadyStopped {
+            return Ok(format!(
+                "{response}\n(参加完了前に停止処理が始まりました。停止処理の完了を待っています。)"
+            ));
+        }
 
         info!(
             guild_id = %guild_id.get(),
@@ -7083,6 +7130,32 @@ mod status_message_tests {
 
         clear_matching_recording_startup(&mut startups, "g1", "newer");
         assert!(!startups.contains_key("g1"));
+    }
+
+    #[test]
+    fn recording_start_join_completed_after_stop_accepts_only_downstream_stop_statuses() {
+        assert!(recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Stopping
+        ));
+        assert!(recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Transcribing
+        ));
+        assert!(recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Summarizing
+        ));
+        assert!(recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Posted
+        ));
+
+        assert!(!recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Recording
+        ));
+        assert!(!recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Failed
+        ));
+        assert!(!recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Aborted
+        ));
     }
 
     fn start_input_for_runtime_setup_test() -> StartCommandInput {
