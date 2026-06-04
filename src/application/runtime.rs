@@ -5411,9 +5411,13 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         // Driver-disconnect has no timer state to consult after
                         // grace expiry, so the counters below bound only their
                         // own failure classes before terminal cleanup is tried.
+                        // If terminal cleanup removes local state but cannot
+                        // mark the row terminal, keep driving DB teardown even
+                        // if later voice cache checks would otherwise cancel.
                         let mut final_flush_failures = 0u32;
                         let mut grace_cache_misses = 0u32;
                         let mut stop_failures = 0u32;
+                        let mut retry_teardown_after_failed_terminal_cleanup = false;
                         let stop_result = loop {
                             tokio::select! {
                                 _ = sleep(grace) => {}
@@ -5516,10 +5520,20 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect cache-miss exhaustion; rescheduling"
                                                 );
+                                                retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
                                     }
                                     continue;
+                                }
+                                GraceExpiryDecision::Cancel
+                                    if retry_teardown_after_failed_terminal_cleanup =>
+                                {
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = expected_meeting_id_ref,
+                                        "driver-disconnect teardown retry has no local state; continuing cleanup despite recovered voice state"
+                                    );
                                 }
                                 GraceExpiryDecision::Cancel => return,
                                 GraceExpiryDecision::Stop => {
@@ -5609,6 +5623,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect final flush exhaustion; rescheduling"
                                                 );
+                                                retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
                                     }
@@ -5672,6 +5687,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect stop exhaustion; rescheduling"
                                                 );
+                                                retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
                                     }
