@@ -2941,7 +2941,10 @@ impl EventHandler for ScaffoldHandler {
                                 "members rejoined during grace period; cancelling auto-stop"
                             );
                             let mut states = handler.auto_stop_states.lock().await;
-                            if let Some(state) = states.get_mut(&guild_for_task) {
+                            if let Some(state) = states
+                                .get_mut(&guild_for_task)
+                                .filter(|state| state.belongs_to_meeting(expected_meeting_id_ref))
+                            {
                                 let _ = state.on_non_bot_member_count_changed(non_bot);
                             }
                             return;
@@ -2958,7 +2961,18 @@ impl EventHandler for ScaffoldHandler {
                     } else {
                         let mut states = handler.auto_stop_states.lock().await;
                         match states.get_mut(&guild_for_task) {
-                            Some(state) => state.tick() == AutoStopSignal::Trigger,
+                            Some(state) if state.belongs_to_meeting(expected_meeting_id_ref) => {
+                                state.tick() == AutoStopSignal::Trigger
+                            }
+                            Some(state) => {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    current_meeting_id = ?state.meeting_id(),
+                                    "auto-stop timer state belongs to another meeting; dropping stale timer"
+                                );
+                                false
+                            }
                             None => {
                                 warn!(
                                     guild_id = %guild_for_task,
@@ -4394,7 +4408,11 @@ impl ScaffoldHandler {
         drop(command_guard);
         if let Err(err) = workspace.ensure_base_dirs() {
             let _command_guard = self.command_gate.write().await;
-            self.reject_if_shutting_down()?;
+            if let Err(err_msg) = self.reject_if_shutting_down() {
+                self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
+                    .await;
+                return Err(err_msg);
+            }
             let err_msg = format!("failed to prepare workspace: {err}");
             // Only the DB row and startup reservation exist here; cleanup
             // terminalizes the row and clears that reservation.
