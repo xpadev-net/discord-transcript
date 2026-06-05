@@ -577,6 +577,12 @@ enum VoiceJoinRetryCleanup {
     StopAfterSessionReplaced,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedRecordingStartLocalCleanup {
+    StartupOnly,
+    FullRuntimeState,
+}
+
 fn classify_voice_join_retry_cleanup(
     current_session_meeting_id: Option<&str>,
     expected_meeting_id: &str,
@@ -744,6 +750,17 @@ fn remove_auto_stop_state_for_meeting(
         .is_some_and(|state| state.should_remove_for_meeting_cleanup(meeting_id))
     {
         states.remove(guild_key);
+    }
+}
+
+fn remove_auto_stop_state_for_failed_recording_start_cleanup(
+    states: &mut HashMap<String, AutoStopState>,
+    guild_key: &str,
+    meeting_id: &str,
+    cleanup_scope: FailedRecordingStartLocalCleanup,
+) {
+    if cleanup_scope == FailedRecordingStartLocalCleanup::FullRuntimeState {
+        remove_auto_stop_state_for_meeting(states, guild_key, meeting_id);
     }
 }
 
@@ -4225,8 +4242,44 @@ impl ScaffoldHandler {
         meeting_id: &str,
         error_message: &str,
     ) {
+        self.cleanup_failed_recording_start_locked_with_scope(
+            guild_key,
+            meeting_id,
+            error_message,
+            FailedRecordingStartLocalCleanup::FullRuntimeState,
+        )
+        .await;
+    }
+
+    async fn cleanup_failed_recording_start_before_session_locked(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+    ) {
+        self.cleanup_failed_recording_start_locked_with_scope(
+            guild_key,
+            meeting_id,
+            error_message,
+            FailedRecordingStartLocalCleanup::StartupOnly,
+        )
+        .await;
+    }
+
+    async fn cleanup_failed_recording_start_locked_with_scope(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+        cleanup_scope: FailedRecordingStartLocalCleanup,
+    ) {
         if !self
-            .try_cleanup_failed_recording_start_locked(guild_key, meeting_id, error_message)
+            .try_cleanup_failed_recording_start_locked(
+                guild_key,
+                meeting_id,
+                error_message,
+                cleanup_scope,
+            )
             .await
         {
             if self.shutting_down.load(Ordering::Acquire) {
@@ -4234,6 +4287,7 @@ impl ScaffoldHandler {
                     guild_key,
                     meeting_id,
                     error_message,
+                    cleanup_scope,
                 )
                 .await;
             } else {
@@ -4241,6 +4295,7 @@ impl ScaffoldHandler {
                     guild_key.to_owned(),
                     meeting_id.to_owned(),
                     error_message.to_owned(),
+                    cleanup_scope,
                 );
             }
         }
@@ -4251,6 +4306,7 @@ impl ScaffoldHandler {
         guild_key: &str,
         meeting_id: &str,
         error_message: &str,
+        cleanup_scope: FailedRecordingStartLocalCleanup,
     ) -> bool {
         {
             let mut service = self.service.lock().await;
@@ -4272,7 +4328,7 @@ impl ScaffoldHandler {
                 }
             }
         }
-        self.clear_failed_recording_start_local_state(guild_key, meeting_id)
+        self.clear_failed_recording_start_local_state(guild_key, meeting_id, cleanup_scope)
             .await;
         true
     }
@@ -4282,6 +4338,7 @@ impl ScaffoldHandler {
         guild_key: String,
         meeting_id: String,
         error_message: String,
+        cleanup_scope: FailedRecordingStartLocalCleanup,
     ) {
         let retry_key = format!("{guild_key}:{meeting_id}");
         {
@@ -4310,6 +4367,7 @@ impl ScaffoldHandler {
                         &guild_key,
                         &meeting_id,
                         &error_message,
+                        cleanup_scope,
                     )
                     .await
                 {
@@ -4330,6 +4388,10 @@ impl ScaffoldHandler {
                 attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
                 "record-start setup failure cleanup retries exhausted; preserving local recording setup state"
             );
+            let _command_guard = handler.command_gate.write().await;
+            handler
+                .clear_failed_recording_startup_locked(&guild_key, &meeting_id)
+                .await;
             handler.clear_recording_start_cleanup_retry(&retry_key);
         });
     }
@@ -4339,11 +4401,17 @@ impl ScaffoldHandler {
         guild_key: &str,
         meeting_id: &str,
         error_message: &str,
+        cleanup_scope: FailedRecordingStartLocalCleanup,
     ) {
         for attempt in 1..=RECORDING_START_CLEANUP_MAX_RETRIES {
             sleep(RECORDING_START_CLEANUP_RETRY_DELAY).await;
             if self
-                .try_cleanup_failed_recording_start_locked(guild_key, meeting_id, error_message)
+                .try_cleanup_failed_recording_start_locked(
+                    guild_key,
+                    meeting_id,
+                    error_message,
+                    cleanup_scope,
+                )
                 .await
             {
                 info!(
@@ -4362,6 +4430,8 @@ impl ScaffoldHandler {
             attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
             "record-start setup failure cleanup retries exhausted during shutdown; preserving local recording setup state"
         );
+        self.clear_failed_recording_startup_locked(guild_key, meeting_id)
+            .await;
     }
 
     fn clear_recording_start_cleanup_retry(&self, retry_key: &str) {
@@ -4372,11 +4442,14 @@ impl ScaffoldHandler {
         retries.remove(retry_key);
     }
 
-    async fn clear_failed_recording_start_local_state(&self, guild_key: &str, meeting_id: &str) {
-        {
-            let mut startups = self.recording_startups.lock().await;
-            clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
-        }
+    async fn clear_failed_recording_start_local_state(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        cleanup_scope: FailedRecordingStartLocalCleanup,
+    ) {
+        self.clear_failed_recording_startup_locked(guild_key, meeting_id)
+            .await;
         {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mut sessions = self.sessions.lock().await;
@@ -4384,12 +4457,22 @@ impl ScaffoldHandler {
         }
         {
             let mut states = self.auto_stop_states.lock().await;
-            remove_auto_stop_state_for_meeting(&mut states, guild_key, meeting_id);
+            remove_auto_stop_state_for_failed_recording_start_cleanup(
+                &mut states,
+                guild_key,
+                meeting_id,
+                cleanup_scope,
+            );
         }
         {
             let mut titles = self.live_transcription_titles.lock().await;
             titles.remove(meeting_id);
         }
+    }
+
+    async fn clear_failed_recording_startup_locked(&self, guild_key: &str, meeting_id: &str) {
+        let mut startups = self.recording_startups.lock().await;
+        clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
     }
 
     async fn cleanup_voice_join_retry_after_failed_attempt(
@@ -4711,15 +4794,23 @@ impl ScaffoldHandler {
         if let Err(err) = workspace.ensure_base_dirs() {
             let _command_guard = self.command_gate.write().await;
             if let Err(err_msg) = self.reject_if_shutting_down() {
-                self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
-                    .await;
+                self.cleanup_failed_recording_start_before_session_locked(
+                    &guild_key,
+                    &meeting_id,
+                    &err_msg,
+                )
+                .await;
                 return Err(err_msg);
             }
             let err_msg = format!("failed to prepare workspace: {err}");
             // Only the DB row and startup reservation exist here; cleanup
             // terminalizes the row and clears that reservation.
-            self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
-                .await;
+            self.cleanup_failed_recording_start_before_session_locked(
+                &guild_key,
+                &meeting_id,
+                &err_msg,
+            )
+            .await;
             return Err(err_msg);
         }
 
@@ -4741,8 +4832,12 @@ impl ScaffoldHandler {
 
         let command_guard = self.command_gate.write().await;
         if let Err(err_msg) = self.reject_if_shutting_down() {
-            self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
-                .await;
+            self.cleanup_failed_recording_start_before_session_locked(
+                &guild_key,
+                &meeting_id,
+                &err_msg,
+            )
+            .await;
             return Err(err_msg);
         }
         let setup_still_recording = {
@@ -4755,14 +4850,18 @@ impl ScaffoldHandler {
                 Err(err) => {
                     let err_msg =
                         format!("failed to verify recording after audio setup wait: {err}");
-                    self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
-                        .await;
+                    self.cleanup_failed_recording_start_before_session_locked(
+                        &guild_key,
+                        &meeting_id,
+                        &err_msg,
+                    )
+                    .await;
                     return Err(err_msg);
                 }
             }
         };
         if !setup_still_recording {
-            self.cleanup_failed_recording_start_locked(
+            self.cleanup_failed_recording_start_before_session_locked(
                 &guild_key,
                 &meeting_id,
                 "recording no longer active after audio setup",
@@ -9708,6 +9807,49 @@ mod status_message_tests {
             meeting.error_message.as_deref(),
             Some("voice join failed after setup")
         );
+    }
+
+    #[test]
+    fn pre_session_start_cleanup_preserves_legacy_unscoped_auto_stop_state() {
+        let mut states = HashMap::from([(
+            "g1".to_owned(),
+            AutoStopState::new_for_meeting(Duration::from_secs(5), None),
+        )]);
+
+        remove_auto_stop_state_for_failed_recording_start_cleanup(
+            &mut states,
+            "g1",
+            "m1",
+            FailedRecordingStartLocalCleanup::StartupOnly,
+        );
+
+        assert!(states.contains_key("g1"));
+    }
+
+    #[test]
+    fn full_start_cleanup_removes_matching_auto_stop_state() {
+        let mut states = HashMap::from([(
+            "g1".to_owned(),
+            AutoStopState::new_for_meeting(Duration::from_secs(5), Some("m1".to_owned())),
+        )]);
+
+        remove_auto_stop_state_for_failed_recording_start_cleanup(
+            &mut states,
+            "g1",
+            "m1",
+            FailedRecordingStartLocalCleanup::FullRuntimeState,
+        );
+
+        assert!(!states.contains_key("g1"));
+    }
+
+    #[test]
+    fn exhausted_start_cleanup_retry_can_release_startup_reservation() {
+        let mut startups = HashMap::from([("g1".to_owned(), "m1".to_owned())]);
+
+        clear_matching_recording_startup(&mut startups, "g1", "m1");
+
+        assert!(!startups.contains_key("g1"));
     }
 
     #[test]
