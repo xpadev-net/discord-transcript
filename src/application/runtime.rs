@@ -558,6 +558,10 @@ fn recording_lookup_terminal_error(
     ))
 }
 
+fn reset_recording_lookup_failures_after_success(lookup_failures: &mut u32) {
+    *lookup_failures = 0;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordingStartJoinVerification {
     Active,
@@ -2918,7 +2922,7 @@ impl EventHandler for ScaffoldHandler {
                             continue;
                         }
                     };
-                    lookup_failures = 0;
+                    reset_recording_lookup_failures_after_success(&mut lookup_failures);
                     if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
                         // Clear timer flag before returning, but only for the
                         // meeting this timer was started for. A later meeting
@@ -3347,13 +3351,21 @@ impl EventHandler for ScaffoldHandler {
                                     retry_teardown_without_auto_stop_state,
                                     "auto-stop found no active meeting; treating as already handled"
                                 );
+                                let removed_session = handler
+                                    .remove_local_recording_state_after_terminal_absence(
+                                        &guild_for_task,
+                                        expected_meeting_id_ref,
+                                    )
+                                    .await;
+                                drop(lifecycle_permit);
                                 handler
-                                    .clear_local_recording_state_after_terminal_absence(
+                                    .finish_terminal_absence_cleanup(
                                         &ctx_for_task,
                                         handler.guild_id,
                                         &guild_for_task,
                                         expected_meeting_id_ref,
                                         "auto-stop terminal cleanup retry",
+                                        removed_session,
                                     )
                                     .await;
                                 return;
@@ -3970,28 +3982,6 @@ impl ScaffoldHandler {
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&final_tracker);
         }
-    }
-
-    async fn clear_local_recording_state_after_terminal_absence(
-        &self,
-        ctx: &Context,
-        guild_id: GuildId,
-        guild_key: &str,
-        expected_meeting_id: &str,
-        phase: &str,
-    ) {
-        let removed_session = self
-            .remove_local_recording_state_after_terminal_absence(guild_key, expected_meeting_id)
-            .await;
-        self.finish_terminal_absence_cleanup(
-            ctx,
-            guild_id,
-            guild_key,
-            expected_meeting_id,
-            phase,
-            removed_session,
-        )
-        .await;
     }
 
     async fn remove_local_recording_state_after_terminal_absence(
@@ -6861,7 +6851,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         continue;
                                     }
                                 };
-                            lookup_failures = 0;
+                            reset_recording_lookup_failures_after_success(&mut lookup_failures);
                             let reconnected = is_bot_connected_to_voice_channel(
                                 &ctx_for_task,
                                 runtime.guild_id,
@@ -7155,17 +7145,21 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             error = %err,
                                             "driver-disconnect terminal cleanup retry found no active meeting; treating as already handled"
                                         );
-                                        // Keep the lifecycle permit held here: this branch only
-                                        // observes that the stop target is already absent. The
-                                        // Cleared branches drop the permit first because they have
-                                        // removed local session state and only need voice cleanup.
+                                        let removed_session = runtime
+                                            .remove_local_recording_state_after_terminal_absence(
+                                                &guild_key,
+                                                expected_meeting_id_ref,
+                                            )
+                                            .await;
+                                        drop(lifecycle_permit);
                                         runtime
-                                            .clear_local_recording_state_after_terminal_absence(
+                                            .finish_terminal_absence_cleanup(
                                                 &ctx_for_task,
                                                 runtime.guild_id,
                                                 &guild_key,
                                                 expected_meeting_id_ref,
                                                 "driver-disconnect terminal cleanup retry",
+                                                removed_session,
                                             )
                                             .await;
                                         return;
@@ -9064,6 +9058,26 @@ mod status_message_tests {
         assert_eq!(lookup_failures, RECORDING_LOOKUP_MAX_RETRIES);
         assert!(error.contains("recording state lookup failed"));
         assert!(error.contains("database down"));
+    }
+
+    #[test]
+    fn recording_lookup_success_resets_retry_counter() {
+        let mut lookup_failures = 0;
+
+        assert_eq!(
+            recording_lookup_terminal_error(&mut lookup_failures, "auto-stop grace", "db hiccup"),
+            None
+        );
+        assert_eq!(lookup_failures, 1);
+
+        reset_recording_lookup_failures_after_success(&mut lookup_failures);
+        assert_eq!(lookup_failures, 0);
+
+        assert_eq!(
+            recording_lookup_terminal_error(&mut lookup_failures, "auto-stop grace", "db hiccup"),
+            None
+        );
+        assert_eq!(lookup_failures, 1);
     }
 
     #[tokio::test]
