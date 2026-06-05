@@ -44,7 +44,8 @@ use crate::infrastructure::sql::{
     SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
     UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
-    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, migration_transaction_sql,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+    migration_transaction_sql,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -670,6 +671,23 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             ));
         };
         parse_person_alias_row(&row)
+    }
+
+    pub fn upsert_vc_participant_person_alias_candidate(
+        &mut self,
+        item: &NewPersonAlias,
+    ) -> Result<Option<PersonAlias>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+                &new_person_alias_params(item),
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        parse_person_alias_row(&row).map(Some)
     }
 
     pub fn update_person_alias(
