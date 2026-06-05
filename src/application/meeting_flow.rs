@@ -1,3 +1,4 @@
+use crate::application::ai_memory_extraction::AiMemoryExtractionStore;
 use crate::application::recovery_runner::{RecoveryEffect, RecoveryRunnerError, run_recovery};
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::{
@@ -110,7 +111,7 @@ pub fn run_meeting_flow<S, C, W, FS>(
     input: MeetingFlowInput<'_, W, C>,
 ) -> Result<MeetingFlowOutput, MeetingFlowError>
 where
-    S: MeetingStore,
+    S: MeetingStore + AiMemoryExtractionStore,
     C: ClaudeSummaryClient,
     W: WhisperClient,
     FS: ChunkStorage,

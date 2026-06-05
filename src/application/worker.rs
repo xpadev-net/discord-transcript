@@ -1,3 +1,6 @@
+use crate::application::ai_memory_extraction::{
+    AiMemoryExtractionStore, run_post_meeting_ai_memory_extraction,
+};
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
@@ -476,7 +479,7 @@ pub fn process_meeting_summary<S, W, C>(
     input: &ProcessMeetingInput,
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
-    S: MeetingStore,
+    S: MeetingStore + AiMemoryExtractionStore,
     W: WhisperClient,
     C: ClaudeSummaryClient,
 {
@@ -618,6 +621,20 @@ where
             return Err(WorkerError::from(err));
         }
     };
+    if let Err(err) = run_post_meeting_ai_memory_extraction(
+        store,
+        claude,
+        &request,
+        &transcription.transcript_for_summary,
+        &markdown,
+        &context_manifest,
+    ) {
+        warn!(
+            meeting_id = %input.meeting_id,
+            error = %err,
+            "AI memory extraction failed; keeping summary completion successful"
+        );
+    }
 
     let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
     info!(
@@ -692,7 +709,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
     options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
-    S: MeetingStore + SummaryContextStore,
+    S: MeetingStore + SummaryContextStore + AiMemoryExtractionStore,
     Q: JobQueue,
     W: WhisperClient,
     C: ClaudeSummaryClient,

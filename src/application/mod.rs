@@ -1,3 +1,4 @@
+pub mod ai_memory_extraction;
 pub mod auto_stop;
 pub mod bot;
 pub mod command;

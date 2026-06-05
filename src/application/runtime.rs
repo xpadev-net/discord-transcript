@@ -1,3 +1,6 @@
+use crate::application::ai_memory_extraction::{
+    AiMemoryExtractionStore, extract_ai_memory_candidates,
+};
 use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{
     BotCommandService, StartCommandInput, StopCommandInput, StopCommandResult,
@@ -6908,6 +6911,45 @@ impl ScaffoldHandler {
                     "failed to persist summary"
                 );
             }
+        }
+
+        match tokio::task::block_in_place(|| {
+            extract_ai_memory_candidates(
+                &summary_client,
+                &request,
+                &transcription_for_summary.transcript_for_summary,
+                &markdown,
+                &context_manifest,
+            )
+        }) {
+            Ok(candidates) => {
+                let persist_result = {
+                    let mut service = self.service.lock().await;
+                    service.store.persist_ai_memory_extraction_candidates(
+                        &claimed_job.meeting_id,
+                        &meeting.guild_id,
+                        &candidates,
+                    )
+                };
+                match persist_result {
+                    Ok(saved) => info!(
+                        meeting_id = %claimed_job.meeting_id,
+                        proposed = candidates.len(),
+                        saved,
+                        "AI memory extraction completed"
+                    ),
+                    Err(err) => warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %err,
+                        "failed to persist AI memory extraction candidates; keeping summary completion successful"
+                    ),
+                }
+            }
+            Err(err) => warn!(
+                meeting_id = %claimed_job.meeting_id,
+                error = %err,
+                "AI memory extraction failed; keeping summary completion successful"
+            ),
         }
 
         let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
