@@ -505,7 +505,7 @@ fn voice_state_cache_miss_terminal_error(
     context: &str,
 ) -> Option<String> {
     *cache_misses = cache_misses.saturating_add(1);
-    if *cache_misses < max_reschedules {
+    if *cache_misses <= max_reschedules {
         return None;
     }
     Some(format!(
@@ -9696,14 +9696,14 @@ mod status_message_tests {
     fn auto_stop_cache_miss_retry_limit_returns_terminal_error() {
         let mut cache_misses = 0;
 
-        for expected in 1..AUTO_STOP_GRACE_MAX_RESCHEDULES {
+        for expected in 1..=AUTO_STOP_GRACE_MAX_RESCHEDULES {
             assert_eq!(auto_stop_cache_miss_terminal_error(&mut cache_misses), None);
             assert_eq!(cache_misses, expected);
         }
 
         let error = auto_stop_cache_miss_terminal_error(&mut cache_misses)
             .expect("retry limit should terminalize");
-        assert_eq!(cache_misses, AUTO_STOP_GRACE_MAX_RESCHEDULES);
+        assert_eq!(cache_misses, AUTO_STOP_GRACE_MAX_RESCHEDULES + 1);
         assert!(error.contains("auto-stop grace stop check"));
     }
 
@@ -9739,7 +9739,7 @@ mod status_message_tests {
     fn driver_disconnect_cache_miss_retry_limit_returns_terminal_error() {
         let mut cache_misses = 0;
 
-        for expected in 1..DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES {
+        for expected in 1..=DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES {
             assert_eq!(
                 driver_disconnect_cache_miss_terminal_error(&mut cache_misses),
                 None
@@ -9749,7 +9749,7 @@ mod status_message_tests {
 
         let error = driver_disconnect_cache_miss_terminal_error(&mut cache_misses)
             .expect("retry limit should terminalize");
-        assert_eq!(cache_misses, DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES);
+        assert_eq!(cache_misses, DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES + 1);
         assert!(error.contains("voice state cache remained unavailable"));
     }
 
@@ -10692,7 +10692,7 @@ mod status_message_tests {
             let mut local_state = RecordingLocalState::with_matching_session(0);
             let mut cache_misses = 0;
 
-            for expected_misses in 1..max_reschedules {
+            for expected_misses in 1..=max_reschedules {
                 let terminal_error = terminal_error_for_attempt(&mut cache_misses);
                 assert_eq!(terminal_error, None, "{context} should reschedule");
                 assert_eq!(cache_misses, expected_misses);

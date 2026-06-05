@@ -123,6 +123,11 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     request: RecordStartRequest,
     preflight: RecordStartPreflight,
 ) -> Result<RecordStartResult, CommandError> {
+    debug_assert_eq!(
+        request.user_voice_channel_id.as_deref(),
+        Some(preflight.voice_channel_id()),
+        "record-start preflight must come from the same request voice channel"
+    );
     let voice_channel_id = preflight.voice_channel_id().to_owned();
     store.create_meeting_as_recording(CreateMeetingRequest {
         id: request.meeting_id.clone(),
