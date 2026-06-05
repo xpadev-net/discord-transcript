@@ -558,7 +558,7 @@ fn recording_lookup_terminal_error(
     ))
 }
 
-fn reset_recording_lookup_failures_after_success(lookup_failures: &mut u32) {
+fn reset_recording_lookup_failures(lookup_failures: &mut u32) {
     *lookup_failures = 0;
 }
 
@@ -756,7 +756,6 @@ fn remove_matching_recording_session_for_meeting<S: ChunkStorage>(
     }
 }
 
-#[cfg(test)]
 fn clear_local_recording_state_maps_after_terminal_absence(
     auto_stop_states: &mut HashMap<String, AutoStopState>,
     live_transcription_titles: &mut HashMap<String, Option<String>>,
@@ -785,6 +784,10 @@ fn clear_auto_stop_timer_generation_for_meeting(
 fn terminal_cleanup_retry_reached_limit(terminal_cleanup_failures: &mut u32) -> bool {
     *terminal_cleanup_failures = (*terminal_cleanup_failures).saturating_add(1);
     *terminal_cleanup_failures >= RECORDING_TERMINAL_CLEANUP_MAX_RETRIES
+}
+
+fn reset_terminal_cleanup_failures_after_persistence_failure(terminal_cleanup_failures: &mut u32) {
+    *terminal_cleanup_failures = 0;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2904,17 +2907,20 @@ impl EventHandler for ScaffoldHandler {
                                                     expected_meeting_id_ref,
                                                     "auto-stop active-meeting lookup",
                                                     *removed_session,
-                                                )
-                                                .await;
+                                            )
+                                            .await;
                                             return;
                                         }
+                                        reset_recording_lookup_failures(
+                                            &mut lookup_failures,
+                                        );
                                     }
                                 }
                             }
                             continue;
                         }
                     };
-                    reset_recording_lookup_failures_after_success(&mut lookup_failures);
+                    reset_recording_lookup_failures(&mut lookup_failures);
                     if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
                         // Clear timer flag before returning, but only for the
                         // meeting this timer was started for. A later meeting
@@ -3945,14 +3951,16 @@ impl ScaffoldHandler {
         };
         {
             let mut states = self.auto_stop_states.lock().await;
-            remove_auto_stop_state_for_meeting(&mut states, guild_key, expected_meeting_id);
-        }
-        {
             let mut titles = self.live_transcription_titles.lock().await;
-            titles.remove(expected_meeting_id);
+            let mut startups = self.recording_startups.lock().await;
+            clear_local_recording_state_maps_after_terminal_absence(
+                &mut states,
+                &mut titles,
+                &mut startups,
+                guild_key,
+                expected_meeting_id,
+            );
         }
-        let mut startups = self.recording_startups.lock().await;
-        clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
         removed_session
     }
 
@@ -4029,6 +4037,9 @@ impl ScaffoldHandler {
                     phase = request.phase,
                     error = %err,
                     "terminal cleanup status update failed; preserving local state for retry"
+                );
+                reset_terminal_cleanup_failures_after_persistence_failure(
+                    terminal_cleanup_failures,
                 );
                 return TerminalCleanupRetryDecision::Reschedule;
             }
@@ -4611,7 +4622,10 @@ impl ScaffoldHandler {
         // Keep the SSRC reset gate scoped to the tracker reset only. Handler
         // registration awaits Songbird work and should not hold the reset
         // gate across that I/O; command_guard continues to serialize the
-        // recording lifecycle until session/handler setup is complete.
+        // recording lifecycle until session/handler setup is complete. This
+        // intentionally blocks concurrent stop/teardown while the local session
+        // is becoming visible, but it can also wait behind Songbird's Call mutex
+        // if a voice event is in flight.
         // Register handlers BEFORE voice WS connects to capture initial SSRC
         // mappings (SpeakingStateUpdate for users already speaking).
         self.register_voice_handlers(manager.as_ref(), ctx, guild_id)
@@ -6513,12 +6527,92 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                         if terminal_error.is_none() {
                                             continue;
                                         }
+                                        let terminal_error = terminal_error
+                                            .expect("checked terminal error presence above");
                                         warn!(
                                             guild_id = %guild_key,
                                             disconnected_channel_id,
                                             attempts = lookup_failures,
-                                            "driver-disconnect target lookup retry limit reached; abandoning teardown without local-session fallback"
+                                            "driver-disconnect target lookup retry limit reached; resolving active meeting for terminal cleanup"
                                         );
+                                        match runtime.active_meeting_id_result().await {
+                                            Ok(Some(active_meeting_id)) => {
+                                                match runtime
+                                                    .fail_recording_after_lookup_exhaustion(
+                                                        &lifecycle_permit,
+                                                        &ctx_for_task,
+                                                        http.as_ref(),
+                                                        &RecordingLookupFailureRequest {
+                                                            guild_id: runtime.guild_id,
+                                                            guild_key: &guild_key,
+                                                            expected_meeting_id: &active_meeting_id,
+                                                            terminal_error: &terminal_error,
+                                                            context:
+                                                                "driver-disconnect initial target",
+                                                        },
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(()) => return,
+                                                    Err(mark_err) => {
+                                                        warn!(
+                                                            guild_id = %guild_key,
+                                                            meeting_id = %active_meeting_id,
+                                                            error = %mark_err,
+                                                            "failed to mark recording failed after driver-disconnect initial target exhaustion; rescheduling"
+                                                        );
+                                                        if let TerminalCleanupRetryDecision::Cleared {
+                                                            removed_session,
+                                                        } = runtime
+                                                            .handle_terminal_cleanup_retry_failure(
+                                                                TerminalCleanupRetryFailureRequest {
+                                                                    guild_key: &guild_key,
+                                                                    expected_meeting_id:
+                                                                        &active_meeting_id,
+                                                                    phase:
+                                                                        "driver-disconnect initial target",
+                                                                    err: &mark_err,
+                                                                },
+                                                                &mut terminal_cleanup_failures,
+                                                            )
+                                                            .await
+                                                        {
+                                                            drop(lifecycle_permit);
+                                                            runtime
+                                                                .finish_terminal_absence_cleanup(
+                                                                    &ctx_for_task,
+                                                                    runtime.guild_id,
+                                                                    &guild_key,
+                                                                    &active_meeting_id,
+                                                                    "driver-disconnect initial target",
+                                                                    *removed_session,
+                                                                )
+                                                                .await;
+                                                            return;
+                                                        }
+                                                        reset_recording_lookup_failures(
+                                                            &mut lookup_failures,
+                                                        );
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    disconnected_channel_id,
+                                                    "driver-disconnect initial target retry limit reached with no active meeting"
+                                                );
+                                            }
+                                            Err(err) => {
+                                                warn!(
+                                                    guild_id = %guild_key,
+                                                    disconnected_channel_id,
+                                                    error = %err,
+                                                    "failed to resolve active meeting after driver-disconnect initial target retry limit"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 return;
@@ -6599,10 +6693,13 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                             expected_meeting_id_ref,
                                                             "driver-disconnect active-meeting lookup",
                                                             *removed_session,
-                                                        )
-                                                        .await;
+                                                    )
+                                                    .await;
                                                     return;
                                                 }
+                                                reset_recording_lookup_failures(
+                                                    &mut lookup_failures,
+                                                );
                                             }
                                         }
                                     }
@@ -6775,17 +6872,20 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                                 expected_meeting_id_ref,
                                                                 "driver-disconnect voice-channel lookup",
                                                                 *removed_session,
-                                                            )
-                                                            .await;
+                                                        )
+                                                        .await;
                                                         return;
                                                     }
+                                                    reset_recording_lookup_failures(
+                                                        &mut lookup_failures,
+                                                    );
                                                 }
                                             }
                                         }
                                         continue;
                                     }
                                 };
-                            reset_recording_lookup_failures_after_success(&mut lookup_failures);
+                            reset_recording_lookup_failures(&mut lookup_failures);
                             let reconnected = is_bot_connected_to_voice_channel(
                                 &ctx_for_task,
                                 runtime.guild_id,
@@ -8944,7 +9044,7 @@ mod status_message_tests {
         );
         assert_eq!(lookup_failures, 1);
 
-        reset_recording_lookup_failures_after_success(&mut lookup_failures);
+        reset_recording_lookup_failures(&mut lookup_failures);
         assert_eq!(lookup_failures, 0);
 
         assert_eq!(
@@ -9149,6 +9249,29 @@ mod status_message_tests {
             crate::domain::MeetingStatus::Recording,
             "DB outage is not hidden by local cleanup"
         );
+    }
+
+    #[test]
+    fn terminal_cleanup_persistence_failure_resets_retry_window() {
+        let mut terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
+
+        let outcome = record_terminal_cleanup_retry_failure(
+            &mut terminal_cleanup_failures,
+            "auto-stop stop exhaustion",
+            "status update unavailable",
+        );
+        assert!(outcome.terminal_error.is_some());
+
+        reset_terminal_cleanup_failures_after_persistence_failure(&mut terminal_cleanup_failures);
+        assert_eq!(terminal_cleanup_failures, 0);
+
+        let outcome = record_terminal_cleanup_retry_failure(
+            &mut terminal_cleanup_failures,
+            "auto-stop stop exhaustion",
+            "status update unavailable",
+        );
+        assert_eq!(outcome.attempts, 1);
+        assert_eq!(outcome.terminal_error, None);
     }
 
     #[test]
