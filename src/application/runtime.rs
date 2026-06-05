@@ -3586,11 +3586,11 @@ impl EventHandler for ScaffoldHandler {
                             grace_cache_misses = 0;
                         }
                     }
-                    let trigger = {
+                    let (trigger, clear_stale_local_state) = {
                         let mut states = handler.auto_stop_states.lock().await;
                         match states.get_mut(&guild_for_task) {
                             Some(state) if state.belongs_to_meeting(expected_meeting_id_ref) => {
-                                state.tick() == AutoStopSignal::Trigger
+                                (state.tick() == AutoStopSignal::Trigger, false)
                             }
                             Some(state) => {
                                 warn!(
@@ -3599,7 +3599,7 @@ impl EventHandler for ScaffoldHandler {
                                     current_meeting_id = ?state.meeting_id(),
                                     "auto-stop timer state belongs to another meeting; dropping stale timer"
                                 );
-                                false
+                                (false, true)
                             }
                             None => {
                                 warn!(
@@ -3607,18 +3607,32 @@ impl EventHandler for ScaffoldHandler {
                                     meeting_id = expected_meeting_id_ref,
                                     "auto-stop timer state missing at grace expiry; continuing teardown"
                                 );
-                                true
+                                (true, false)
                             }
                         }
                     };
                     if !trigger {
-                        let mut states = handler.auto_stop_states.lock().await;
-                        clear_auto_stop_timer_generation_for_meeting(
-                            &mut states,
-                            &guild_for_task,
-                            expected_meeting_id_ref,
-                            timer_generation,
-                        );
+                        if clear_stale_local_state {
+                            let local = handler.lifecycle_local_state();
+                            clear_failed_recording_start_local_state_with_dependencies(
+                                &local,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                                FailedRecordingStartLocalCleanup::FullRuntimeState,
+                                |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                                    session.persist_ssrc_mapping(tracker);
+                                },
+                            )
+                            .await;
+                        } else {
+                            let mut states = handler.auto_stop_states.lock().await;
+                            clear_auto_stop_timer_generation_for_meeting(
+                                &mut states,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                                timer_generation,
+                            );
+                        }
                         return;
                     }
                     let teardown_request = RecordingStopTeardownRequest {
@@ -4864,13 +4878,8 @@ impl ScaffoldHandler {
                 .await;
             }
             VoiceJoinRetryCleanup::StopAfterSessionReplaced => {
-                leave_voice_with_timeout(
-                    manager,
-                    guild_id,
-                    meeting_id,
-                    "record-start retry cleanup after session replacement",
-                )
-                .await;
+                // A later recording owns the guild session slot now; a guild-level
+                // leave here could disconnect that successor's in-flight join.
                 self.cleanup_failed_recording_start_locked(
                     guild_key,
                     meeting_id,
@@ -10478,6 +10487,66 @@ mod status_message_tests {
         assert_eq!(
             service.store.meeting().error_message.as_deref(),
             Some("voice join cleanup retries exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_stale_auto_stop_timer_clears_old_local_state_without_touching_successor_timer() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting();
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let mut local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        local_state.auto_stop_states = HashMap::from([(
+            "g1".to_owned(),
+            AutoStopState::new_for_meeting(Duration::from_secs(0), Some("m2".to_owned())),
+        )]);
+        let harness = async_lifecycle_harness(store, local_state);
+        let local = harness.local_state();
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        clear_failed_recording_start_local_state_with_dependencies(
+            &local,
+            "g1",
+            "m1",
+            FailedRecordingStartLocalCleanup::FullRuntimeState,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            1,
+            "stale auto-stop cleanup should flush tail audio from the old session"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            1,
+            "stale auto-stop cleanup should persist final SSRC mappings"
+        );
+        assert!(!harness.sessions.lock().await.contains_key("g1"));
+        assert!(!harness.recording_startups.lock().await.contains_key("g1"));
+        assert!(
+            !harness
+                .live_transcription_titles
+                .lock()
+                .await
+                .contains_key("m1")
+        );
+        assert!(
+            harness
+                .auto_stop_states
+                .lock()
+                .await
+                .get("g1")
+                .is_some_and(|state| state.belongs_to_meeting("m2")),
+            "successor auto-stop state must survive stale timer cleanup"
         );
     }
 
