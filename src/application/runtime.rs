@@ -807,6 +807,33 @@ fn clear_local_recording_state_maps_after_terminal_absence(
     clear_matching_recording_startup(recording_startups, guild_key, expected_meeting_id);
 }
 
+async fn remove_local_recording_state_after_terminal_absence_with_dependencies<
+    C: ChunkStorage + Send,
+>(
+    local: &RecordingLifecycleLocalState<'_, C>,
+    guild_key: &str,
+    expected_meeting_id: &str,
+) -> Option<RecordingSession<C>> {
+    let removed_session = {
+        let _voice_event_guard = local.voice_event_gate.write().await;
+        let mut sessions = local.sessions.lock().await;
+        remove_matching_recording_session_for_meeting(&mut sessions, guild_key, expected_meeting_id)
+    };
+    {
+        let mut states = local.auto_stop_states.lock().await;
+        let mut titles = local.live_transcription_titles.lock().await;
+        let mut startups = local.recording_startups.lock().await;
+        clear_local_recording_state_maps_after_terminal_absence(
+            &mut states,
+            &mut titles,
+            &mut startups,
+            guild_key,
+            expected_meeting_id,
+        );
+    }
+    removed_session
+}
+
 fn clear_auto_stop_timer_generation_for_meeting(
     states: &mut HashMap<String, AutoStopState>,
     guild_key: &str,
@@ -862,14 +889,85 @@ fn persist_terminal_cleanup_retry_exhaustion<S: MeetingStore>(
     mark_recording_failed_after_teardown_exhaustion(store, expected_meeting_id, terminal_error)
 }
 
-async fn leave_voice_with_timeout(
-    manager: &songbird::Songbird,
+#[async_trait]
+trait RecordingVoiceGateway {
+    async fn leave_recording_voice(&self, guild_id: GuildId) -> Result<(), String>;
+}
+
+#[async_trait]
+impl RecordingVoiceGateway for songbird::Songbird {
+    async fn leave_recording_voice(&self, guild_id: GuildId) -> Result<(), String> {
+        self.leave(guild_id).await.map_err(|err| err.to_string())
+    }
+}
+
+#[async_trait]
+trait RecordingVoiceLeaveDependency {
+    async fn leave_recording_voice_with_timeout(
+        &self,
+        guild_id: GuildId,
+        meeting_id: &str,
+        phase: &str,
+    ) -> Option<RecordingVoiceLeaveOutcome>;
+}
+
+struct ContextRecordingVoiceLeave<'a> {
+    ctx: &'a Context,
+}
+
+#[async_trait]
+impl RecordingVoiceLeaveDependency for ContextRecordingVoiceLeave<'_> {
+    async fn leave_recording_voice_with_timeout(
+        &self,
+        guild_id: GuildId,
+        meeting_id: &str,
+        phase: &str,
+    ) -> Option<RecordingVoiceLeaveOutcome> {
+        let manager = songbird::get(self.ctx).await?;
+        Some(leave_voice_with_timeout(manager.as_ref(), guild_id, meeting_id, phase).await)
+    }
+}
+
+#[async_trait]
+impl<V> RecordingVoiceLeaveDependency for Option<&V>
+where
+    V: RecordingVoiceGateway + Sync + ?Sized,
+{
+    async fn leave_recording_voice_with_timeout(
+        &self,
+        guild_id: GuildId,
+        meeting_id: &str,
+        phase: &str,
+    ) -> Option<RecordingVoiceLeaveOutcome> {
+        match self {
+            Some(voice) => {
+                Some(leave_voice_with_timeout(*voice, guild_id, meeting_id, phase).await)
+            }
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingVoiceLeaveOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+async fn leave_voice_with_timeout<V: RecordingVoiceGateway + Sync + ?Sized>(
+    manager: &V,
     guild_id: GuildId,
     meeting_id: &str,
     phase: &str,
-) {
-    match timeout(SHUTDOWN_VOICE_LEAVE_TIMEOUT, manager.leave(guild_id)).await {
-        Ok(Ok(())) => {}
+) -> RecordingVoiceLeaveOutcome {
+    match timeout(
+        SHUTDOWN_VOICE_LEAVE_TIMEOUT,
+        manager.leave_recording_voice(guild_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => RecordingVoiceLeaveOutcome::Succeeded,
         Ok(Err(err)) => {
             warn!(
                 guild_id = %guild_id.get(),
@@ -878,6 +976,7 @@ async fn leave_voice_with_timeout(
                 phase,
                 "failed to leave voice channel during recording lifecycle teardown"
             );
+            RecordingVoiceLeaveOutcome::Failed
         }
         Err(_) => {
             warn!(
@@ -887,6 +986,7 @@ async fn leave_voice_with_timeout(
                 timeout_ms = SHUTDOWN_VOICE_LEAVE_TIMEOUT.as_millis(),
                 "timed out leaving voice channel during recording lifecycle teardown"
             );
+            RecordingVoiceLeaveOutcome::TimedOut
         }
     }
 }
@@ -921,10 +1021,27 @@ struct TerminalCleanupRetryFailureRequest<'a> {
     err: &'a str,
 }
 
-enum TerminalCleanupRetryDecision {
+struct TerminalAbsenceCleanupRequest<'a> {
+    guild_id: GuildId,
+    guild_key: &'a str,
+    expected_meeting_id: &'a str,
+    phase: &'a str,
+}
+
+struct RecordingLifecycleLocalState<'a, C: ChunkStorage> {
+    sessions: &'a Arc<Mutex<HashMap<String, RecordingSession<C>>>>,
+    auto_stop_states: &'a Arc<Mutex<HashMap<String, AutoStopState>>>,
+    live_transcription_titles: &'a Arc<Mutex<HashMap<String, Option<String>>>>,
+    recording_startups: &'a Arc<Mutex<HashMap<String, String>>>,
+    voice_event_gate: &'a Arc<RwLock<()>>,
+    ssrc_tracker: &'a Arc<Mutex<SsrcTracker>>,
+    ssrc_tracker_reset_gate: &'a Arc<Mutex<()>>,
+}
+
+enum TerminalCleanupRetryDecision<C: ChunkStorage> {
     Reschedule,
     Cleared {
-        removed_session: Box<Option<RecordingSession<LocalChunkStorage>>>,
+        removed_session: Box<Option<RecordingSession<C>>>,
     },
 }
 
@@ -974,6 +1091,292 @@ impl Display for RecordingTeardownError {
             Self::Stop(err) => write!(f, "{err}"),
         }
     }
+}
+
+async fn finish_terminal_absence_cleanup_with_dependencies<
+    C: ChunkStorage + Send,
+    L: RecordingVoiceLeaveDependency + Sync,
+    P: Fn(&RecordingSession<C>, &SsrcTracker) + Send + Sync,
+>(
+    local: &RecordingLifecycleLocalState<'_, C>,
+    voice_leave: &L,
+    request: TerminalAbsenceCleanupRequest<'_>,
+    mut removed_session: Option<RecordingSession<C>>,
+    persist_ssrc_mapping: P,
+) -> Option<RecordingVoiceLeaveOutcome> {
+    let _reset_guard = local.ssrc_tracker_reset_gate.lock().await;
+    let leave_outcome = if removed_session.is_some() {
+        voice_leave
+            .leave_recording_voice_with_timeout(
+                request.guild_id,
+                request.expected_meeting_id,
+                request.phase,
+            )
+            .await
+    } else {
+        None
+    };
+    if let Some(session) = removed_session.as_mut() {
+        flush_removed_session_after_stop(session, request.guild_key, request.phase);
+    }
+    let latest_tracker = {
+        let _voice_event_guard = local.voice_event_gate.write().await;
+        let tracker = local.ssrc_tracker.lock().await;
+        tracker.clone()
+    };
+    if let Some(session) = &removed_session {
+        persist_ssrc_mapping(session, &latest_tracker);
+    }
+    leave_outcome
+}
+
+async fn clear_failed_recording_start_local_state_with_dependencies<
+    C: ChunkStorage + Send,
+    P: Fn(&RecordingSession<C>, &SsrcTracker) + Send + Sync,
+>(
+    local: &RecordingLifecycleLocalState<'_, C>,
+    guild_key: &str,
+    meeting_id: &str,
+    cleanup_scope: FailedRecordingStartLocalCleanup,
+    persist_ssrc_mapping: P,
+) {
+    {
+        let mut startups = local.recording_startups.lock().await;
+        clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
+    }
+    if cleanup_scope == FailedRecordingStartLocalCleanup::StartupOnly {
+        return;
+    }
+
+    let mut removed_session = {
+        let _voice_event_guard = local.voice_event_gate.write().await;
+        let mut sessions = local.sessions.lock().await;
+        remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id)
+    };
+    if let Some(session) = removed_session.as_mut() {
+        flush_removed_session_after_stop(session, guild_key, "record-start failure cleanup");
+    }
+    let latest_tracker = {
+        let _voice_event_guard = local.voice_event_gate.write().await;
+        let tracker = local.ssrc_tracker.lock().await;
+        tracker.clone()
+    };
+    if let Some(session) = &removed_session {
+        persist_ssrc_mapping(session, &latest_tracker);
+    }
+
+    {
+        let mut states = local.auto_stop_states.lock().await;
+        remove_auto_stop_state_for_failed_recording_start_cleanup(
+            &mut states,
+            guild_key,
+            meeting_id,
+            cleanup_scope,
+        );
+    }
+    {
+        let mut titles = local.live_transcription_titles.lock().await;
+        titles.remove(meeting_id);
+    }
+}
+
+async fn try_cleanup_failed_recording_start_with_dependencies<S, C, P>(
+    service: &Arc<Mutex<BotCommandService<S>>>,
+    local: &RecordingLifecycleLocalState<'_, C>,
+    guild_key: &str,
+    meeting_id: &str,
+    error_message: &str,
+    cleanup_scope: FailedRecordingStartLocalCleanup,
+    persist_ssrc_mapping: P,
+) -> bool
+where
+    S: MeetingStore + Send,
+    C: ChunkStorage + Send,
+    P: Fn(&RecordingSession<C>, &SsrcTracker) + Send + Sync,
+{
+    {
+        let mut service = service.lock().await;
+        match mark_recording_start_failed_after_setup_error(
+            &mut service.store,
+            meeting_id,
+            error_message,
+        ) {
+            Ok(()) => {
+                debug!(meeting_id, "record-start setup failure cleanup completed");
+            }
+            Err(err) => {
+                error!(
+                    meeting_id,
+                    error = %err,
+                    "failed to mark meeting as failed after voice join error; preserving local recording setup state for retry"
+                );
+                return false;
+            }
+        }
+    }
+    clear_failed_recording_start_local_state_with_dependencies(
+        local,
+        guild_key,
+        meeting_id,
+        cleanup_scope,
+        persist_ssrc_mapping,
+    )
+    .await;
+    true
+}
+
+async fn handle_terminal_cleanup_retry_failure_with_dependencies<S, C>(
+    service: &Arc<Mutex<BotCommandService<S>>>,
+    local: &RecordingLifecycleLocalState<'_, C>,
+    request: TerminalCleanupRetryFailureRequest<'_>,
+    terminal_cleanup_failures: &mut u32,
+) -> TerminalCleanupRetryDecision<C>
+where
+    S: MeetingStore + Send,
+    C: ChunkStorage + Send,
+{
+    let outcome = record_terminal_cleanup_retry_failure(
+        terminal_cleanup_failures,
+        request.phase,
+        request.err,
+    );
+    warn!(
+        guild_id = %request.guild_key,
+        meeting_id = request.expected_meeting_id,
+        phase = request.phase,
+        error = %request.err,
+        attempts = outcome.attempts,
+        max_attempts = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES,
+        "terminal recording cleanup failed; rescheduling"
+    );
+
+    let Some(terminal_error) = outcome.terminal_error else {
+        return TerminalCleanupRetryDecision::Reschedule;
+    };
+
+    error!(
+        guild_id = %request.guild_key,
+        meeting_id = request.expected_meeting_id,
+        phase = request.phase,
+        error = %request.err,
+        attempts = outcome.attempts,
+        "terminal recording cleanup retry limit reached; marking recording failed before local cleanup"
+    );
+    {
+        let mut service = service.lock().await;
+        if let Err(err) = persist_terminal_cleanup_retry_exhaustion(
+            &mut service.store,
+            request.expected_meeting_id,
+            &terminal_error,
+        ) {
+            warn!(
+                guild_id = %request.guild_key,
+                meeting_id = request.expected_meeting_id,
+                phase = request.phase,
+                error = %err,
+                "terminal cleanup status update failed; preserving local state for retry"
+            );
+            reset_terminal_cleanup_failures_after_persistence_failure(terminal_cleanup_failures);
+            return TerminalCleanupRetryDecision::Reschedule;
+        }
+    }
+    let removed_session = remove_local_recording_state_after_terminal_absence_with_dependencies(
+        local,
+        request.guild_key,
+        request.expected_meeting_id,
+    )
+    .await;
+    TerminalCleanupRetryDecision::Cleared {
+        removed_session: Box::new(removed_session),
+    }
+}
+
+async fn fail_recording_after_teardown_exhaustion_with_dependencies<
+    S,
+    C,
+    L: RecordingVoiceLeaveDependency + Sync,
+    P: Fn(&RecordingSession<C>, &SsrcTracker) + Send + Sync,
+>(
+    service: &Arc<Mutex<BotCommandService<S>>>,
+    local: &RecordingLifecycleLocalState<'_, C>,
+    voice_leave: &L,
+    request: TerminalAbsenceCleanupRequest<'_>,
+    error_message: &str,
+    persist_ssrc_mapping: P,
+) -> Result<Option<RecordingVoiceLeaveOutcome>, String>
+where
+    S: MeetingStore + Send,
+    C: ChunkStorage + Send,
+{
+    let _reset_guard = local.ssrc_tracker_reset_gate.lock().await;
+    {
+        let mut service = service.lock().await;
+        mark_recording_failed_after_teardown_exhaustion(
+            &mut service.store,
+            request.expected_meeting_id,
+            error_message,
+        )
+        .map_err(|err| err.to_string())?;
+    }
+
+    // Local runtime cleanup is intentionally idempotent and happens only
+    // after the terminal DB transition is known handled. If the store is
+    // unavailable, callers retry with the session/startup handles intact.
+    let mut removed_session = {
+        let _voice_event_guard = local.voice_event_gate.write().await;
+        let removed_session = {
+            let mut sessions = local.sessions.lock().await;
+            remove_matching_recording_session_for_meeting(
+                &mut sessions,
+                request.guild_key,
+                request.expected_meeting_id,
+            )
+        };
+        {
+            let mut states = local.auto_stop_states.lock().await;
+            remove_auto_stop_state_for_meeting(
+                &mut states,
+                request.guild_key,
+                request.expected_meeting_id,
+            );
+        }
+        if let Some(session) = &removed_session {
+            let mut titles = local.live_transcription_titles.lock().await;
+            titles.remove(&session.meeting_id);
+        }
+        {
+            let mut startups = local.recording_startups.lock().await;
+            clear_matching_recording_startup(
+                &mut startups,
+                request.guild_key,
+                request.expected_meeting_id,
+            );
+        }
+        removed_session
+    };
+
+    let leave_outcome = voice_leave
+        .leave_recording_voice_with_timeout(
+            request.guild_id,
+            request.expected_meeting_id,
+            request.phase,
+        )
+        .await;
+
+    if let Some(session) = removed_session.as_mut() {
+        flush_removed_session_after_stop(session, request.guild_key, request.phase);
+    }
+
+    let latest_tracker = {
+        let _voice_event_guard = local.voice_event_gate.write().await;
+        let tracker = local.ssrc_tracker.lock().await;
+        tracker.clone()
+    };
+    if let Some(session) = &removed_session {
+        persist_ssrc_mapping(session, &latest_tracker);
+    }
+
+    Ok(leave_outcome)
 }
 
 fn flush_sessions_for_shutdown<S: ChunkStorage>(
@@ -3876,6 +4279,18 @@ impl ScaffoldHandler {
         recording_lifecycle_write_permit_for_gate(&self.command_gate).await
     }
 
+    fn lifecycle_local_state(&self) -> RecordingLifecycleLocalState<'_, LocalChunkStorage> {
+        RecordingLifecycleLocalState {
+            sessions: &self.sessions,
+            auto_stop_states: &self.auto_stop_states,
+            live_transcription_titles: &self.live_transcription_titles,
+            recording_startups: &self.recording_startups,
+            voice_event_gate: &self.voice_event_gate,
+            ssrc_tracker: &self.ssrc_tracker,
+            ssrc_tracker_reset_gate: &self.ssrc_tracker_reset_gate,
+        }
+    }
+
     async fn prepare_recording_stop_after_teardown(
         &self,
         _permit: &RecordingLifecycleWritePermit<'_>,
@@ -3993,28 +4408,13 @@ impl ScaffoldHandler {
         guild_key: &str,
         expected_meeting_id: &str,
     ) -> Option<RecordingSession<LocalChunkStorage>> {
-        let removed_session = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let mut sessions = self.sessions.lock().await;
-            remove_matching_recording_session_for_meeting(
-                &mut sessions,
-                guild_key,
-                expected_meeting_id,
-            )
-        };
-        {
-            let mut states = self.auto_stop_states.lock().await;
-            let mut titles = self.live_transcription_titles.lock().await;
-            let mut startups = self.recording_startups.lock().await;
-            clear_local_recording_state_maps_after_terminal_absence(
-                &mut states,
-                &mut titles,
-                &mut startups,
-                guild_key,
-                expected_meeting_id,
-            );
-        }
-        removed_session
+        let local = self.lifecycle_local_state();
+        remove_local_recording_state_after_terminal_absence_with_dependencies(
+            &local,
+            guild_key,
+            expected_meeting_id,
+        )
+        .await
     }
 
     async fn finish_terminal_absence_cleanup(
@@ -4024,88 +4424,40 @@ impl ScaffoldHandler {
         guild_key: &str,
         expected_meeting_id: &str,
         phase: &str,
-        mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
+        removed_session: Option<RecordingSession<LocalChunkStorage>>,
     ) {
-        let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
-        if removed_session.is_some()
-            && let Some(manager) = songbird::get(ctx).await
-        {
-            leave_voice_with_timeout(manager.as_ref(), guild_id, expected_meeting_id, phase).await;
-        }
-        if let Some(session) = removed_session.as_mut() {
-            flush_removed_session_after_stop(session, guild_key, phase);
-        }
-        let latest_tracker = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let tracker = self.ssrc_tracker.lock().await;
-            tracker.clone()
-        };
-        if let Some(session) = &removed_session {
-            session.persist_ssrc_mapping(&latest_tracker);
-        }
+        let local = self.lifecycle_local_state();
+        let voice_leave = ContextRecordingVoiceLeave { ctx };
+        finish_terminal_absence_cleanup_with_dependencies(
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id,
+                guild_key,
+                expected_meeting_id,
+                phase,
+            },
+            removed_session,
+            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                session.persist_ssrc_mapping(tracker);
+            },
+        )
+        .await;
     }
 
     async fn handle_terminal_cleanup_retry_failure(
         &self,
         request: TerminalCleanupRetryFailureRequest<'_>,
         terminal_cleanup_failures: &mut u32,
-    ) -> TerminalCleanupRetryDecision {
-        let outcome = record_terminal_cleanup_retry_failure(
+    ) -> TerminalCleanupRetryDecision<LocalChunkStorage> {
+        let local = self.lifecycle_local_state();
+        handle_terminal_cleanup_retry_failure_with_dependencies(
+            &self.service,
+            &local,
+            request,
             terminal_cleanup_failures,
-            request.phase,
-            request.err,
-        );
-        warn!(
-            guild_id = %request.guild_key,
-            meeting_id = request.expected_meeting_id,
-            phase = request.phase,
-            error = %request.err,
-            attempts = outcome.attempts,
-            max_attempts = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES,
-            "terminal recording cleanup failed; rescheduling"
-        );
-
-        let Some(terminal_error) = outcome.terminal_error else {
-            return TerminalCleanupRetryDecision::Reschedule;
-        };
-
-        error!(
-            guild_id = %request.guild_key,
-            meeting_id = request.expected_meeting_id,
-            phase = request.phase,
-            error = %request.err,
-            attempts = outcome.attempts,
-            "terminal recording cleanup retry limit reached; marking recording failed before local cleanup"
-        );
-        {
-            let mut service = self.service.lock().await;
-            if let Err(err) = persist_terminal_cleanup_retry_exhaustion(
-                &mut service.store,
-                request.expected_meeting_id,
-                &terminal_error,
-            ) {
-                warn!(
-                    guild_id = %request.guild_key,
-                    meeting_id = request.expected_meeting_id,
-                    phase = request.phase,
-                    error = %err,
-                    "terminal cleanup status update failed; preserving local state for retry"
-                );
-                reset_terminal_cleanup_failures_after_persistence_failure(
-                    terminal_cleanup_failures,
-                );
-                return TerminalCleanupRetryDecision::Reschedule;
-            }
-        }
-        let removed_session = self
-            .remove_local_recording_state_after_terminal_absence(
-                request.guild_key,
-                request.expected_meeting_id,
-            )
-            .await;
-        TerminalCleanupRetryDecision::Cleared {
-            removed_session: Box::new(removed_session),
-        }
+        )
+        .await
     }
 
     async fn fail_recording_after_lookup_exhaustion(
@@ -4157,68 +4509,24 @@ impl ScaffoldHandler {
         expected_meeting_id: &str,
         error_message: &str,
     ) -> Result<(), String> {
-        let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
-        {
-            let mut service = self.service.lock().await;
-            mark_recording_failed_after_teardown_exhaustion(
-                &mut service.store,
-                expected_meeting_id,
-                error_message,
-            )
-            .map_err(|err| err.to_string())?;
-        }
-
-        // Local runtime cleanup is intentionally idempotent and happens only
-        // after the terminal DB transition is known handled. If the store is
-        // unavailable, callers retry with the session/startup handles intact.
-        let mut removed_session = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let removed_session = {
-                let mut sessions = self.sessions.lock().await;
-                remove_matching_recording_session_for_meeting(
-                    &mut sessions,
-                    guild_key,
-                    expected_meeting_id,
-                )
-            };
-            {
-                let mut states = self.auto_stop_states.lock().await;
-                remove_auto_stop_state_for_meeting(&mut states, guild_key, expected_meeting_id);
-            }
-            if let Some(session) = &removed_session {
-                let mut titles = self.live_transcription_titles.lock().await;
-                titles.remove(&session.meeting_id);
-            }
-            {
-                let mut startups = self.recording_startups.lock().await;
-                clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
-            }
-            removed_session
-        };
-
-        if let Some(manager) = songbird::get(ctx).await {
-            leave_voice_with_timeout(
-                manager.as_ref(),
+        let local = self.lifecycle_local_state();
+        let voice_leave = ContextRecordingVoiceLeave { ctx };
+        fail_recording_after_teardown_exhaustion_with_dependencies(
+            &self.service,
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
                 guild_id,
+                guild_key,
                 expected_meeting_id,
-                "teardown exhaustion",
-            )
-            .await;
-        }
-
-        if let Some(session) = removed_session.as_mut() {
-            flush_removed_session_after_stop(session, guild_key, "teardown exhaustion");
-        }
-
-        let latest_tracker = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let tracker = self.ssrc_tracker.lock().await;
-            tracker.clone()
-        };
-        if let Some(session) = &removed_session {
-            session.persist_ssrc_mapping(&latest_tracker);
-        }
-
+                phase: "teardown exhaustion",
+            },
+            error_message,
+            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                session.persist_ssrc_mapping(tracker);
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -4305,29 +4613,19 @@ impl ScaffoldHandler {
         error_message: &str,
         cleanup_scope: FailedRecordingStartLocalCleanup,
     ) -> bool {
-        {
-            let mut service = self.service.lock().await;
-            match mark_recording_start_failed_after_setup_error(
-                &mut service.store,
-                meeting_id,
-                error_message,
-            ) {
-                Ok(()) => {
-                    debug!(meeting_id, "record-start setup failure cleanup completed");
-                }
-                Err(err) => {
-                    error!(
-                        meeting_id,
-                        error = %err,
-                        "failed to mark meeting as failed after voice join error; preserving local recording setup state for retry"
-                    );
-                    return false;
-                }
-            }
-        }
-        self.clear_failed_recording_start_local_state(guild_key, meeting_id, cleanup_scope)
-            .await;
-        true
+        let local = self.lifecycle_local_state();
+        try_cleanup_failed_recording_start_with_dependencies(
+            &self.service,
+            &local,
+            guild_key,
+            meeting_id,
+            error_message,
+            cleanup_scope,
+            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                session.persist_ssrc_mapping(tracker);
+            },
+        )
+        .await
     }
 
     fn spawn_failed_recording_start_cleanup_retry(
@@ -4436,50 +4734,6 @@ impl ScaffoldHandler {
             .lock()
             .expect("recording start cleanup retry set poisoned");
         retries.remove(retry_key);
-    }
-
-    async fn clear_failed_recording_start_local_state(
-        &self,
-        guild_key: &str,
-        meeting_id: &str,
-        cleanup_scope: FailedRecordingStartLocalCleanup,
-    ) {
-        self.clear_failed_recording_startup_locked(guild_key, meeting_id)
-            .await;
-        if cleanup_scope == FailedRecordingStartLocalCleanup::StartupOnly {
-            return;
-        }
-
-        let mut removed_session = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let mut sessions = self.sessions.lock().await;
-            remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id)
-        };
-        if let Some(session) = removed_session.as_mut() {
-            flush_removed_session_after_stop(session, guild_key, "record-start failure cleanup");
-        }
-        let latest_tracker = {
-            let _voice_event_guard = self.voice_event_gate.write().await;
-            let tracker = self.ssrc_tracker.lock().await;
-            tracker.clone()
-        };
-        if let Some(session) = &removed_session {
-            session.persist_ssrc_mapping(&latest_tracker);
-        }
-
-        {
-            let mut states = self.auto_stop_states.lock().await;
-            remove_auto_stop_state_for_failed_recording_start_cleanup(
-                &mut states,
-                guild_key,
-                meeting_id,
-                cleanup_scope,
-            );
-        }
-        {
-            let mut titles = self.live_transcription_titles.lock().await;
-            titles.remove(meeting_id);
-        }
     }
 
     async fn clear_failed_recording_startup_locked(&self, guild_key: &str, meeting_id: &str) {
@@ -8227,6 +8481,13 @@ mod status_message_tests {
 
     impl RecordingLocalState<RuntimeFlakyChunkStorage> {
         fn with_matching_session(failures: usize) -> Self {
+            Self::with_matching_session_and_saved_counter(failures, Arc::new(AtomicUsize::new(0)))
+        }
+
+        fn with_matching_session_and_saved_counter(
+            failures: usize,
+            saved_chunks: Arc<AtomicUsize>,
+        ) -> Self {
             let mut auto_stop_state =
                 AutoStopState::new_for_meeting(Duration::from_secs(0), Some("m1".to_owned()));
             assert_eq!(
@@ -8234,7 +8495,7 @@ mod status_message_tests {
                 AutoStopSignal::StartTimer
             );
             auto_stop_state.set_empty_since_elapsed_for_test(Duration::from_secs(1));
-            let mut session = session_with_one_flaky_chunk(failures);
+            let mut session = session_with_one_flaky_chunk_and_counter(failures, saved_chunks);
             session.meeting_id = "m1".to_owned();
 
             Self {
@@ -8244,6 +8505,15 @@ mod status_message_tests {
                     "m1".to_owned(),
                     Some("title".to_owned()),
                 )]),
+                recording_startups: HashMap::from([("g1".to_owned(), "m1".to_owned())]),
+            }
+        }
+
+        fn with_startup_only() -> Self {
+            Self {
+                sessions: HashMap::new(),
+                auto_stop_states: HashMap::new(),
+                live_transcription_titles: HashMap::new(),
                 recording_startups: HashMap::from([("g1".to_owned(), "m1".to_owned())]),
             }
         }
@@ -8504,6 +8774,139 @@ mod status_message_tests {
         > {
             self.inner.get_effective_meeting_settings(meeting_id)
         }
+    }
+
+    struct AsyncLifecycleHarness<S: crate::infrastructure::storage::MeetingStore, C: ChunkStorage> {
+        service: Arc<tokio::sync::Mutex<BotCommandService<S>>>,
+        sessions: Arc<tokio::sync::Mutex<HashMap<String, RecordingSession<C>>>>,
+        auto_stop_states: Arc<tokio::sync::Mutex<HashMap<String, AutoStopState>>>,
+        live_transcription_titles: Arc<tokio::sync::Mutex<HashMap<String, Option<String>>>>,
+        recording_startups: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+        voice_event_gate: Arc<RwLock<()>>,
+        ssrc_tracker: Arc<tokio::sync::Mutex<SsrcTracker>>,
+        ssrc_tracker_reset_gate: Arc<tokio::sync::Mutex<()>>,
+    }
+
+    fn async_lifecycle_harness<S: crate::infrastructure::storage::MeetingStore, C: ChunkStorage>(
+        store: S,
+        local_state: RecordingLocalState<C>,
+    ) -> AsyncLifecycleHarness<S, C> {
+        AsyncLifecycleHarness {
+            service: Arc::new(tokio::sync::Mutex::new(BotCommandService::new(store))),
+            sessions: Arc::new(tokio::sync::Mutex::new(local_state.sessions)),
+            auto_stop_states: Arc::new(tokio::sync::Mutex::new(local_state.auto_stop_states)),
+            live_transcription_titles: Arc::new(tokio::sync::Mutex::new(
+                local_state.live_transcription_titles,
+            )),
+            recording_startups: Arc::new(tokio::sync::Mutex::new(local_state.recording_startups)),
+            voice_event_gate: Arc::new(RwLock::new(())),
+            ssrc_tracker: Arc::new(tokio::sync::Mutex::new(SsrcTracker::new())),
+            ssrc_tracker_reset_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    impl<S, C> AsyncLifecycleHarness<S, C>
+    where
+        S: crate::infrastructure::storage::MeetingStore,
+        C: ChunkStorage,
+    {
+        fn local_state(&self) -> RecordingLifecycleLocalState<'_, C> {
+            RecordingLifecycleLocalState {
+                sessions: &self.sessions,
+                auto_stop_states: &self.auto_stop_states,
+                live_transcription_titles: &self.live_transcription_titles,
+                recording_startups: &self.recording_startups,
+                voice_event_gate: &self.voice_event_gate,
+                ssrc_tracker: &self.ssrc_tracker,
+                ssrc_tracker_reset_gate: &self.ssrc_tracker_reset_gate,
+            }
+        }
+
+        async fn assert_matching_state_present(&self) {
+            assert!(
+                self.sessions
+                    .lock()
+                    .await
+                    .get("g1")
+                    .is_some_and(|session| session.meeting_id == "m1"),
+                "matching recording session should remain retryable"
+            );
+            assert!(
+                self.auto_stop_states
+                    .lock()
+                    .await
+                    .get("g1")
+                    .is_some_and(|state| state.belongs_to_meeting("m1")),
+                "auto-stop state should remain scoped to the retrying meeting"
+            );
+            assert!(
+                self.live_transcription_titles
+                    .lock()
+                    .await
+                    .contains_key("m1"),
+                "live title cache should remain until terminal cleanup succeeds"
+            );
+            assert_eq!(
+                self.recording_startups
+                    .lock()
+                    .await
+                    .get("g1")
+                    .map(String::as_str),
+                Some("m1"),
+                "startup reservation should remain while cleanup can retry"
+            );
+        }
+
+        async fn assert_matching_state_cleared(&self) {
+            assert!(!self.sessions.lock().await.contains_key("g1"));
+            assert!(!self.auto_stop_states.lock().await.contains_key("g1"));
+            assert!(
+                !self
+                    .live_transcription_titles
+                    .lock()
+                    .await
+                    .contains_key("m1")
+            );
+            assert!(!self.recording_startups.lock().await.contains_key("g1"));
+        }
+    }
+
+    #[derive(Default)]
+    struct StubVoiceGateway {
+        failures_remaining: AtomicUsize,
+        leaves: AtomicUsize,
+    }
+
+    impl StubVoiceGateway {
+        fn failing_once() -> Self {
+            Self {
+                failures_remaining: AtomicUsize::new(1),
+                leaves: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RecordingVoiceGateway for StubVoiceGateway {
+        async fn leave_recording_voice(&self, _guild_id: GuildId) -> Result<(), String> {
+            self.leaves.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    if value > 0 { Some(value - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err("voice leave unavailable".to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    fn ignore_ssrc_mapping_persistence<C: ChunkStorage>(
+        _session: &RecordingSession<C>,
+        _tracker: &SsrcTracker,
+    ) {
     }
 
     fn summarizing_meeting() -> crate::infrastructure::storage::StoredMeeting {
@@ -9562,6 +9965,498 @@ mod status_message_tests {
         assert!(removed.is_some());
         local_state.assert_matching_state_cleared();
         assert_eq!(store.meeting().status, crate::domain::MeetingStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn async_terminal_cleanup_retry_preserves_state_until_store_recovers() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let local_state = RecordingLocalState::with_matching_session(0);
+        let harness = async_lifecycle_harness(store, local_state);
+        let mut terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
+        let local = harness.local_state();
+
+        let decision = handle_terminal_cleanup_retry_failure_with_dependencies(
+            &harness.service,
+            &local,
+            TerminalCleanupRetryFailureRequest {
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "auto-stop stop exhaustion",
+                err: "status update unavailable",
+            },
+            &mut terminal_cleanup_failures,
+        )
+        .await;
+
+        assert!(matches!(decision, TerminalCleanupRetryDecision::Reschedule));
+        assert_eq!(
+            terminal_cleanup_failures, 0,
+            "persistence failures reset the retry window instead of clearing local state"
+        );
+        harness.assert_matching_state_present().await;
+        {
+            let service = harness.service.lock().await;
+            assert_eq!(
+                service.store.meeting().status,
+                crate::domain::MeetingStatus::Recording
+            );
+        }
+
+        terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
+        let decision = handle_terminal_cleanup_retry_failure_with_dependencies(
+            &harness.service,
+            &local,
+            TerminalCleanupRetryFailureRequest {
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "auto-stop stop exhaustion",
+                err: "status update unavailable",
+            },
+            &mut terminal_cleanup_failures,
+        )
+        .await;
+
+        match decision {
+            TerminalCleanupRetryDecision::Cleared { removed_session } => {
+                assert!(removed_session.is_some());
+            }
+            TerminalCleanupRetryDecision::Reschedule => {
+                panic!("terminal cleanup should clear once the store recovers")
+            }
+        }
+        harness.assert_matching_state_cleared().await;
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn async_teardown_exhaustion_store_failure_keeps_state_and_skips_voice_leave() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        let harness = async_lifecycle_harness(store, local_state);
+        let voice = StubVoiceGateway::default();
+        let local = harness.local_state();
+        let voice_leave = Some(&voice);
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        let err = fail_recording_after_teardown_exhaustion_with_dependencies(
+            &harness.service,
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id: GuildId::new(1),
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "teardown exhaustion",
+            },
+            "recording stop failed after retries",
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .expect_err("store failure should be surfaced before local cleanup");
+
+        assert!(err.contains("status update unavailable"));
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            0,
+            "store failure must not flush tail audio before terminal DB state is durable"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            0,
+            "store failure must not persist SSRC mappings before terminal DB state is durable"
+        );
+        harness.assert_matching_state_present().await;
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Recording
+        );
+    }
+
+    #[tokio::test]
+    async fn async_teardown_exhaustion_tolerates_voice_leave_failure_after_terminalizing() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting();
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        let harness = async_lifecycle_harness(store, local_state);
+        let voice = StubVoiceGateway::failing_once();
+        let local = harness.local_state();
+        let voice_leave = Some(&voice);
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        let leave_outcome = fail_recording_after_teardown_exhaustion_with_dependencies(
+            &harness.service,
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id: GuildId::new(1),
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "teardown exhaustion",
+            },
+            "recording stop failed after retries",
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .expect("voice leave failure should not undo terminal cleanup");
+
+        assert_eq!(leave_outcome, Some(RecordingVoiceLeaveOutcome::Failed));
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            1,
+            "teardown exhaustion must flush tail audio after terminalizing even when leave fails"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            1,
+            "teardown exhaustion must persist final SSRC mappings after terminalizing"
+        );
+        harness.assert_matching_state_cleared().await;
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+        assert_eq!(
+            service.store.meeting().error_message.as_deref(),
+            Some("recording stop failed after retries")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_failed_start_cleanup_retries_store_failure_before_clearing_startup() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        let harness = async_lifecycle_harness(store, local_state);
+        let local = harness.local_state();
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        let cleaned = try_cleanup_failed_recording_start_with_dependencies(
+            &harness.service,
+            &local,
+            "g1",
+            "m1",
+            "voice join failed after setup",
+            FailedRecordingStartLocalCleanup::FullRuntimeState,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            !cleaned,
+            "failed-start cleanup must retry while the store write is unavailable"
+        );
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            0,
+            "store failure must not flush failed-start tail audio before DB failure is durable"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            0,
+            "store failure must not persist failed-start SSRC mappings before DB failure is durable"
+        );
+        harness.assert_matching_state_present().await;
+        {
+            let service = harness.service.lock().await;
+            assert_eq!(
+                service.store.meeting().status,
+                crate::domain::MeetingStatus::Recording
+            );
+        }
+
+        let cleaned = try_cleanup_failed_recording_start_with_dependencies(
+            &harness.service,
+            &local,
+            "g1",
+            "m1",
+            "voice join failed after setup",
+            FailedRecordingStartLocalCleanup::FullRuntimeState,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert!(cleaned);
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            1,
+            "successful failed-start cleanup must flush tail audio from the removed session"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            1,
+            "successful failed-start cleanup must persist final SSRC mappings"
+        );
+        harness.assert_matching_state_cleared().await;
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+        assert_eq!(
+            service.store.meeting().error_message.as_deref(),
+            Some("voice join failed after setup")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_failed_start_startup_only_retries_store_before_clearing_reservation() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let local_state = RecordingLocalState::with_startup_only();
+        let harness = async_lifecycle_harness(store, local_state);
+        let local = harness.local_state();
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        let cleaned = try_cleanup_failed_recording_start_with_dependencies(
+            &harness.service,
+            &local,
+            "g1",
+            "m1",
+            "voice join failed before session setup",
+            FailedRecordingStartLocalCleanup::StartupOnly,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert!(!cleaned);
+        assert!(
+            harness.sessions.lock().await.is_empty(),
+            "pre-session cleanup starts before any recording session exists"
+        );
+        assert!(
+            harness.auto_stop_states.lock().await.is_empty(),
+            "pre-session cleanup starts before auto-stop state exists"
+        );
+        assert!(
+            harness.live_transcription_titles.lock().await.is_empty(),
+            "pre-session cleanup starts before title cache insertion"
+        );
+        assert_eq!(
+            harness
+                .recording_startups
+                .lock()
+                .await
+                .get("g1")
+                .map(String::as_str),
+            Some("m1"),
+            "startup reservation should remain retryable while the store write is unavailable"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            0,
+            "StartupOnly cleanup must not persist SSRC mappings while the store write fails"
+        );
+
+        let cleaned = try_cleanup_failed_recording_start_with_dependencies(
+            &harness.service,
+            &local,
+            "g1",
+            "m1",
+            "voice join failed before session setup",
+            FailedRecordingStartLocalCleanup::StartupOnly,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert!(cleaned);
+        assert!(
+            harness.sessions.lock().await.is_empty(),
+            "pre-session cleanup scope runs before any recording session exists"
+        );
+        assert!(
+            harness.auto_stop_states.lock().await.is_empty(),
+            "pre-session cleanup scope runs before auto-stop state exists"
+        );
+        assert!(
+            harness.live_transcription_titles.lock().await.is_empty(),
+            "pre-session cleanup scope runs before title cache insertion"
+        );
+        assert!(!harness.recording_startups.lock().await.contains_key("g1"));
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            0,
+            "StartupOnly cleanup must not persist SSRC mappings"
+        );
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+        assert_eq!(
+            service.store.meeting().error_message.as_deref(),
+            Some("voice join failed before session setup")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_terminal_absence_cleanup_does_not_leave_successor_recording() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting();
+        let local_state = RecordingLocalState::with_newer_session_on_same_guild();
+        let harness = async_lifecycle_harness(store, local_state);
+        let voice = StubVoiceGateway::default();
+        let local = harness.local_state();
+        let voice_leave = Some(&voice);
+
+        let removed_session =
+            remove_local_recording_state_after_terminal_absence_with_dependencies(
+                &local, "g1", "m1",
+            )
+            .await;
+
+        assert!(
+            removed_session.is_none(),
+            "stale terminal cleanup must not remove a successor session"
+        );
+        let leave_outcome = finish_terminal_absence_cleanup_with_dependencies(
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id: GuildId::new(1),
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "terminal absence",
+            },
+            removed_session,
+            ignore_ssrc_mapping_persistence,
+        )
+        .await;
+
+        assert_eq!(leave_outcome, None);
+        assert_eq!(
+            voice.leaves.load(Ordering::SeqCst),
+            0,
+            "successor recordings must not be disconnected by stale cleanup"
+        );
+        assert!(
+            harness
+                .sessions
+                .lock()
+                .await
+                .get("g1")
+                .is_some_and(|session| session.meeting_id == "m2")
+        );
+        assert!(
+            harness
+                .auto_stop_states
+                .lock()
+                .await
+                .get("g1")
+                .is_some_and(|state| state.belongs_to_meeting("m2"))
+        );
+        assert_eq!(
+            harness
+                .recording_startups
+                .lock()
+                .await
+                .get("g1")
+                .map(String::as_str),
+            Some("m2")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_terminal_absence_cleanup_leaves_flushes_and_persists_removed_session() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting();
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        let harness = async_lifecycle_harness(store, local_state);
+        let voice = StubVoiceGateway::default();
+        let local = harness.local_state();
+        let voice_leave = Some(&voice);
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        let removed_session =
+            remove_local_recording_state_after_terminal_absence_with_dependencies(
+                &local, "g1", "m1",
+            )
+            .await;
+
+        assert!(
+            removed_session.is_some(),
+            "matching target-absent cleanup should remove the stale session"
+        );
+        let leave_outcome = finish_terminal_absence_cleanup_with_dependencies(
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id: GuildId::new(1),
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "terminal absence",
+            },
+            removed_session,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(leave_outcome, Some(RecordingVoiceLeaveOutcome::Succeeded));
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            1,
+            "target-absent cleanup must flush tail audio from the removed session"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            1,
+            "target-absent cleanup must persist final SSRC mapping after flush"
+        );
+        harness.assert_matching_state_cleared().await;
     }
 
     #[test]
