@@ -1529,6 +1529,55 @@ RETURNING id,
           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
 "#;
 
+pub const UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL: &str = r#"
+INSERT INTO person_aliases (
+    id, tenant_discord_guild_id, tenant_id, guild_id, canonical_name, alias,
+    discord_user_id, source_type, source_meeting_id, source_feedback_id, confidence,
+    active, review_status, created_actor_user_id, updated_actor_user_id, reviewed_at,
+    reviewed_actor_user_id, created_at, updated_at
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, NULLIF($9, ''),
+    NULLIF($10, ''), NULLIF($11, '')::TEXT::NUMERIC, $12::TEXT::BOOLEAN,
+    $13, $14, $14, NULL, NULL, NOW(), NOW()
+)
+ON CONFLICT (tenant_id, guild_id, lower(canonical_name), lower(alias)) WHERE active
+DO UPDATE SET
+    discord_user_id = COALESCE(person_aliases.discord_user_id, EXCLUDED.discord_user_id),
+    source_meeting_id = EXCLUDED.source_meeting_id,
+    confidence = EXCLUDED.confidence,
+    updated_actor_user_id = EXCLUDED.updated_actor_user_id,
+    updated_at = NOW()
+WHERE person_aliases.source_type = 'vc_participant'
+  AND person_aliases.review_status = 'unreviewed'
+  AND person_aliases.archived_at IS NULL
+  AND (
+      person_aliases.confidence IS NULL
+      OR person_aliases.confidence <= EXCLUDED.confidence
+  )
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          canonical_name,
+          alias,
+          discord_user_id,
+          source_type,
+          source_meeting_id,
+          source_feedback_id,
+          to_char(confidence, 'FM0.000') AS confidence,
+          active,
+          review_status,
+          created_actor_user_id,
+          updated_actor_user_id,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id,
+          to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+          archived_actor_user_id,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
 pub const UPDATE_PERSON_ALIAS_SQL: &str = r#"
 UPDATE person_aliases
 SET canonical_name = $4,

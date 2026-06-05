@@ -7,8 +7,11 @@ use crate::application::summary::{
     persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
+use crate::domain::confidence::ConfidencePermille;
 use crate::domain::feedback::TranscriptFeedbackStatus;
-use crate::domain::person_alias::PersonAliasReviewStatus;
+use crate::domain::person_alias::{
+    NewPersonAlias, PersonAlias, PersonAliasReviewStatus, PersonAliasSourceType,
+};
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::SummaryTemplate;
 use crate::domain::usage::{
@@ -25,11 +28,13 @@ use crate::infrastructure::storage::{
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMeetingInput {
@@ -95,12 +100,27 @@ impl From<SummaryError> for WorkerError {
 }
 
 pub trait SummaryContextStore {
+    /// Loads context used by summary generation.
+    ///
+    /// SQL-backed stores may also materialize low-confidence VC participant
+    /// alias candidates from the meeting speaker snapshot as part of this
+    /// summary-preparation step.
     fn load_summary_context(
         &mut self,
         meeting_id: &str,
         guild_id: &str,
         effective_settings: Option<&EffectiveMeetingSettings>,
     ) -> Result<SummaryContextInput, StoreError>;
+}
+
+pub const LOAD_MEETING_SPEAKERS_SQL: &str = "SELECT speaker_id, username, nickname, display_name \
+             FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliasCandidateTenantGuild {
+    tenant_discord_guild_id: String,
+    tenant_id: String,
+    guild_id: String,
 }
 
 impl SummaryContextStore for InMemoryMeetingStore {
@@ -130,6 +150,16 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         let speakers = load_meeting_speakers(self, meeting_id)?;
         let domain_knowledge = self.list_domain_knowledge(guild_id, false, None)?;
         let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
+        if let Err(err) =
+            upsert_vc_participant_alias_candidates_for_guild(self, meeting_id, guild_id, &speakers)
+        {
+            warn!(
+                meeting_id = %meeting_id,
+                guild_id = %guild_id,
+                error = %err,
+                "failed to upsert VC participant alias candidates"
+            );
+        }
         let tenant = self.resolve_tenant_by_guild(guild_id)?;
         let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
             (
@@ -166,17 +196,201 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
     }
 }
 
+pub(crate) fn upsert_vc_participant_alias_candidates_for_guild<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
+    meeting_id: &str,
+    guild_id: &str,
+    speakers: &[SpeakerProfile],
+) -> Result<Vec<PersonAlias>, StoreError> {
+    if speakers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(tenant_guild) = resolve_alias_candidate_tenant_guild(store, guild_id)? else {
+        warn!(
+            meeting_id = %meeting_id,
+            guild_id = %guild_id,
+            "skipping VC participant alias candidates because tenant/guild ownership is unavailable"
+        );
+        return Ok(Vec::new());
+    };
+    let mut speakers = speakers.to_vec();
+    speakers.sort_by(|left, right| left.speaker_id.cmp(&right.speaker_id));
+    let candidates = build_vc_participant_alias_candidates(&tenant_guild, meeting_id, &speakers);
+    let mut upserted = Vec::new();
+    for candidate in candidates {
+        match store.upsert_vc_participant_person_alias_candidate(&candidate) {
+            Ok(Some(alias)) => upserted.push(alias),
+            Ok(None) => {
+                debug!(
+                    meeting_id = %meeting_id,
+                    guild_id = %guild_id,
+                    canonical_name = %candidate.canonical_name,
+                    alias = %candidate.alias,
+                    "skipped VC participant alias candidate because existing alias was not eligible for automatic update"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    guild_id = %guild_id,
+                    canonical_name = %candidate.canonical_name,
+                    alias = %candidate.alias,
+                    error = %err,
+                    "failed to upsert VC participant alias candidate"
+                );
+            }
+        }
+    }
+    Ok(upserted)
+}
+
+fn resolve_alias_candidate_tenant_guild<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
+    guild_id: &str,
+) -> Result<Option<AliasCandidateTenantGuild>, StoreError> {
+    let rows = store
+        .executor
+        .query_rows(
+            crate::infrastructure::sql::RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL,
+            &[guild_id.to_owned()],
+        )
+        .map_err(StoreError::Backend)?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    if row.len() < 3 {
+        return Err(StoreError::Backend(format!(
+            "invalid tenant guild row length for alias candidates: {}",
+            row.len()
+        )));
+    }
+    let tenant_discord_guild_id = row
+        .first()
+        .and_then(|value| value.clone())
+        .ok_or_else(|| StoreError::Backend("tenant_discord_guild_id is NULL".to_owned()))?;
+    let tenant_id = row
+        .get(1)
+        .and_then(|value| value.clone())
+        .ok_or_else(|| StoreError::Backend("tenant_id is NULL".to_owned()))?;
+    let guild_id = row
+        .get(2)
+        .and_then(|value| value.clone())
+        .ok_or_else(|| StoreError::Backend("guild_id is NULL".to_owned()))?;
+    Ok(Some(AliasCandidateTenantGuild {
+        tenant_discord_guild_id,
+        tenant_id,
+        guild_id,
+    }))
+}
+
+fn build_vc_participant_alias_candidates(
+    tenant_guild: &AliasCandidateTenantGuild,
+    meeting_id: &str,
+    speakers: &[SpeakerProfile],
+) -> Vec<NewPersonAlias> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for speaker in speakers {
+        if speaker.speaker_id.parse::<u64>().is_err() {
+            continue;
+        }
+        let Some(canonical_name) = normalize_person_alias_candidate_text(&speaker.display_label())
+        else {
+            continue;
+        };
+        for alias in [
+            speaker.nickname.as_deref(),
+            speaker.display_name.as_deref(),
+            speaker.username.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(alias) = normalize_person_alias_candidate_text(alias) else {
+                continue;
+            };
+            if alias.eq_ignore_ascii_case(&canonical_name) {
+                continue;
+            }
+            let identity_key = (canonical_name.to_lowercase(), alias.to_lowercase());
+            if !seen.insert(identity_key) {
+                continue;
+            }
+            candidates.push(NewPersonAlias {
+                id: vc_participant_alias_candidate_id(
+                    &tenant_guild.tenant_id,
+                    &tenant_guild.guild_id,
+                    &canonical_name,
+                    &alias,
+                ),
+                tenant_discord_guild_id: tenant_guild.tenant_discord_guild_id.clone(),
+                tenant_id: tenant_guild.tenant_id.clone(),
+                guild_id: tenant_guild.guild_id.clone(),
+                canonical_name: canonical_name.clone(),
+                alias,
+                discord_user_id: Some(speaker.speaker_id.clone()),
+                source_type: PersonAliasSourceType::VcParticipant,
+                source_meeting_id: Some(meeting_id.to_owned()),
+                source_feedback_id: None,
+                confidence: Some(vc_participant_alias_confidence()),
+                active: true,
+                review_status: PersonAliasReviewStatus::Unreviewed,
+                actor_user_id: "system:vc_participant".to_owned(),
+            });
+        }
+    }
+    candidates
+}
+
+fn normalize_person_alias_candidate_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 200
+        || trimmed.chars().any(char::is_control)
+        || trimmed.parse::<u64>().is_ok()
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn vc_participant_alias_candidate_id(
+    tenant_id: &str,
+    guild_id: &str,
+    canonical_name: &str,
+    alias: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "vc_participant",
+        tenant_id,
+        guild_id,
+        &canonical_name.to_lowercase(),
+        &alias.to_lowercase(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let suffix = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("vc-participant-{suffix}")
+}
+
+fn vc_participant_alias_confidence() -> ConfidencePermille {
+    ConfidencePermille::new(650).expect("static VC participant confidence is valid")
+}
+
 fn load_meeting_speakers<E: SqlExecutor>(
     store: &mut SqlMeetingStore<E>,
     meeting_id: &str,
 ) -> Result<Vec<SpeakerProfile>, StoreError> {
     let rows = store
         .executor
-        .query_rows(
-            "SELECT speaker_id, username, nickname, display_name \
-             FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id",
-            &[meeting_id.to_owned()],
-        )
+        .query_rows(LOAD_MEETING_SPEAKERS_SQL, &[meeting_id.to_owned()])
         .map_err(StoreError::Backend)?;
     let mut speakers = Vec::with_capacity(rows.len());
     for row in rows {

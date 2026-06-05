@@ -6,19 +6,27 @@ use discord_transcript::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, StubClaudeSummaryClient, SummaryContextInput,
     SummaryError,
 };
-use discord_transcript::application::worker::{ProcessMeetingInput, process_meeting_summary};
+use discord_transcript::application::worker::{
+    LOAD_MEETING_SPEAKERS_SQL, ProcessMeetingInput, SummaryContextStore, process_meeting_summary,
+};
 use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
 use discord_transcript::domain::usage::UsageMetric;
 use discord_transcript::infrastructure::asr::StubWhisperClient;
+use discord_transcript::infrastructure::sql::{
+    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+};
+use discord_transcript::infrastructure::sql_store::{
+    FakeSqlExecutor, SqlMeetingStore, SqlRow,
+};
 use discord_transcript::infrastructure::storage::{
     InMemoryMeetingStore, StoredMeeting, UsageEventStore,
 };
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -77,6 +85,246 @@ fn base_env() -> HashMap<String, String> {
 
 fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value should be nonzero")
+}
+
+fn sql_query_key(sql: &str, params: &[&str]) -> String {
+    format!("{}|{}", sql, params.join("\u{1f}"))
+}
+
+fn sql_row_opt(values: &[Option<&str>]) -> SqlRow {
+    values
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
+}
+
+fn sql_row(values: &[&str]) -> SqlRow {
+    values.iter().map(|value| Some((*value).to_owned())).collect()
+}
+
+fn tenant_guild_row() -> SqlRow {
+    sql_row_opt(&[Some("tdg-1"), Some("tenant-1"), Some("g1")])
+}
+
+fn vc_participant_alias_upsert_params_from_dry_run(speaker_rows: Vec<SqlRow>) -> Vec<Vec<String>> {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        speaker_rows,
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("dry run summary context should load");
+    store
+        .executor
+        .executed
+        .into_iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect()
+}
+
+#[test]
+fn sql_summary_context_upserts_vc_participant_alias_candidates() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![sql_row(&["123", "alice_dev", "Alice", "Alice Example"])],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    let context = store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should load");
+
+    assert_eq!(context.speakers.len(), 1);
+    // One speaker yields two alias candidates here: display_name and username.
+    let upserts = store
+        .executor
+        .executed
+        .iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 2);
+    for params in &upserts {
+        assert_eq!(params[1], "tdg-1");
+        assert_eq!(params[2], "tenant-1");
+        assert_eq!(params[3], "g1");
+        assert_eq!(params[4], "Alice");
+        assert_eq!(params[6], "123");
+        assert_eq!(params[7], "vc_participant");
+        assert_eq!(params[8], "m1");
+        assert_eq!(params[9], "");
+        assert_eq!(params[10], "0.650");
+        assert_eq!(params[11], "true");
+        assert_eq!(params[12], "unreviewed");
+        assert_eq!(params[13], "system:vc_participant");
+    }
+    assert!(upserts.iter().any(|params| params[5] == "Alice Example"));
+    assert!(upserts.iter().any(|params| params[5] == "alice_dev"));
+}
+
+#[test]
+fn sql_summary_context_continues_vc_participant_alias_candidates_after_one_upsert_error() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![sql_row(&["123", "alice_dev", "Alice", "Alice Example"])],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let dry_run_params =
+        vc_participant_alias_upsert_params_from_dry_run(vec![sql_row(&[
+            "123",
+            "alice_dev",
+            "Alice",
+            "Alice Example",
+        ])]);
+    let failing_params = dry_run_params
+        .into_iter()
+        .find(|params| params[5] == "Alice Example")
+        .expect("dry run should include display_name alias params");
+    let failing_param_refs = failing_params.iter().map(String::as_str).collect::<Vec<_>>();
+    executor.query_rows_error.insert(
+        sql_query_key(
+            UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+            &failing_param_refs,
+        ),
+        "UNIQUE_VIOLATION: duplicate key value violates unique constraint person_aliases_pkey"
+            .to_owned(),
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should continue after candidate upsert error");
+
+    let upserts = store
+        .executor
+        .executed
+        .iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 2);
+    assert!(upserts.iter().any(|params| params[5] == "alice_dev"));
+}
+
+#[test]
+fn sql_summary_context_deduplicates_vc_participant_alias_candidates_by_identity() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![
+            sql_row(&["456", "alice_dev", "Alice", "Alice Example"]),
+            sql_row(&["123", "alice_dev", "Alice", "Alice Example"]),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should load");
+
+    let upserts = store
+        .executor
+        .executed
+        .iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 2);
+    assert_eq!(
+        upserts
+            .iter()
+            .filter(|params| params[5] == "Alice Example")
+            .count(),
+        1
+    );
+    assert_eq!(
+        upserts
+            .iter()
+            .filter(|params| params[5] == "alice_dev")
+            .count(),
+        1
+    );
+    assert!(upserts.iter().all(|params| params[6] == "123"));
+}
+
+#[test]
+fn sql_summary_context_skips_numeric_vc_participant_alias_candidates() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![sql_row(&["123", "987654321", "Alice", "456789"])],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should load");
+
+    assert!(
+        store
+            .executor
+            .executed
+            .iter()
+            .all(|(sql, _)| sql != UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+    );
+}
+
+#[test]
+fn sql_summary_context_skips_vc_participant_alias_candidates_without_tenant_guild() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![sql_row(&["123", "alice_dev", "Alice", "Alice Example"])],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should still load");
+
+    assert!(
+        store
+            .executor
+            .executed
+            .iter()
+            .all(|(sql, _)| sql != UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+    );
+}
+
+#[test]
+fn vc_participant_alias_upsert_sql_preserves_reviewed_and_higher_confidence_aliases() {
+    let sql = UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL;
+
+    assert!(sql.contains("person_aliases.source_type = 'vc_participant'"));
+    assert!(sql.contains("person_aliases.review_status = 'unreviewed'"));
+    assert!(sql.contains("person_aliases.archived_at IS NULL"));
+    assert!(sql.contains("person_aliases.confidence <= EXCLUDED.confidence"));
+    assert!(!sql.contains("reviewed_at ="));
+    assert!(!sql.contains("review_status = EXCLUDED.review_status"));
 }
 
 struct SummaryOnlyClient {

@@ -2648,6 +2648,7 @@ fn load_runtime_summary_context(
     meeting_id: &str,
     guild_id: &str,
     effective_settings: &EffectiveMeetingSettings,
+    speakers: &[SpeakerProfile],
 ) -> Result<
     crate::application::summary::SummaryContextInput,
     crate::application::summary::SummaryError,
@@ -2664,6 +2665,16 @@ fn load_runtime_summary_context(
             "failed to resolve active tenant for meeting {meeting_id}: {err}"
         ))
     })?;
+    if let Err(err) = crate::application::worker::upsert_vc_participant_alias_candidates_for_guild(
+        store, meeting_id, guild_id, speakers,
+    ) {
+        warn!(
+            meeting_id = %meeting_id,
+            guild_id = %guild_id,
+            error = %err,
+            "failed to upsert VC participant alias candidates"
+        );
+    }
     let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
         (
             store
@@ -6622,11 +6633,16 @@ impl ScaffoldHandler {
         );
         let summary_context = tokio::task::block_in_place(|| {
             let mut service = self.service.blocking_lock();
+            let speakers = summary_context_speakers
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
             load_runtime_summary_context(
                 &mut service.store,
                 &claimed_job.meeting_id,
                 &meeting.guild_id,
                 &effective_settings,
+                &speakers,
             )
         });
         let context_manifest = match summary_context.and_then(|mut summary_context| {
