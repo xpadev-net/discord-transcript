@@ -85,8 +85,8 @@ use tracing::{debug, error, info, warn};
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
 const FINAL_FLUSH_MAX_RETRIES: u32 = 10;
-const AUTO_STOP_GRACE_MAX_RESCHEDULES: u32 = 10;
-const DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES: u32 = 10;
+const AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS: u32 = 10;
+const DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS: u32 = 10;
 const RECORDING_STOP_MAX_RETRIES: u32 = 10;
 const RECORDING_LOOKUP_MAX_RETRIES: u32 = 10;
 const RECORDING_TERMINAL_CLEANUP_MAX_RETRIES: u32 = 3;
@@ -501,11 +501,11 @@ fn decide_driver_disconnect_grace_expiry(
 
 fn voice_state_cache_miss_terminal_error(
     cache_misses: &mut u32,
-    max_reschedules: u32,
+    max_cache_miss_checks: u32,
     context: &str,
 ) -> Option<String> {
     *cache_misses = cache_misses.saturating_add(1);
-    if *cache_misses <= max_reschedules {
+    if *cache_misses < max_cache_miss_checks {
         return None;
     }
     Some(format!(
@@ -517,7 +517,7 @@ fn voice_state_cache_miss_terminal_error(
 fn driver_disconnect_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String> {
     voice_state_cache_miss_terminal_error(
         cache_misses,
-        DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES,
+        DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS,
         "driver-disconnect",
     )
 }
@@ -525,7 +525,7 @@ fn driver_disconnect_cache_miss_terminal_error(cache_misses: &mut u32) -> Option
 fn auto_stop_cache_miss_terminal_error(cache_misses: &mut u32) -> Option<String> {
     voice_state_cache_miss_terminal_error(
         cache_misses,
-        AUTO_STOP_GRACE_MAX_RESCHEDULES,
+        AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS,
         "auto-stop grace",
     )
 }
@@ -9697,14 +9697,14 @@ mod status_message_tests {
     fn auto_stop_cache_miss_retry_limit_returns_terminal_error() {
         let mut cache_misses = 0;
 
-        for expected in 1..=AUTO_STOP_GRACE_MAX_RESCHEDULES {
+        for expected in 1..AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS {
             assert_eq!(auto_stop_cache_miss_terminal_error(&mut cache_misses), None);
             assert_eq!(cache_misses, expected);
         }
 
         let error = auto_stop_cache_miss_terminal_error(&mut cache_misses)
             .expect("retry limit should terminalize");
-        assert_eq!(cache_misses, AUTO_STOP_GRACE_MAX_RESCHEDULES + 1);
+        assert_eq!(cache_misses, AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS);
         assert!(error.contains("auto-stop grace stop check"));
     }
 
@@ -9740,7 +9740,7 @@ mod status_message_tests {
     fn driver_disconnect_cache_miss_retry_limit_returns_terminal_error() {
         let mut cache_misses = 0;
 
-        for expected in 1..=DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES {
+        for expected in 1..DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS {
             assert_eq!(
                 driver_disconnect_cache_miss_terminal_error(&mut cache_misses),
                 None
@@ -9750,7 +9750,7 @@ mod status_message_tests {
 
         let error = driver_disconnect_cache_miss_terminal_error(&mut cache_misses)
             .expect("retry limit should terminalize");
-        assert_eq!(cache_misses, DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES + 1);
+        assert_eq!(cache_misses, DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS);
         assert!(error.contains("voice state cache remained unavailable"));
     }
 
@@ -10677,15 +10677,15 @@ mod status_message_tests {
 
     #[test]
     fn auto_stop_and_driver_disconnect_cache_misses_keep_state_until_terminal_error() {
-        for (context, max_reschedules, terminal_error_for_attempt) in [
+        for (context, max_cache_miss_checks, terminal_error_for_attempt) in [
             (
                 "auto-stop",
-                AUTO_STOP_GRACE_MAX_RESCHEDULES,
+                AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS,
                 auto_stop_cache_miss_terminal_error as fn(&mut u32) -> Option<String>,
             ),
             (
                 "driver-disconnect",
-                DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES,
+                DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS,
                 driver_disconnect_cache_miss_terminal_error as fn(&mut u32) -> Option<String>,
             ),
         ] {
@@ -10693,7 +10693,7 @@ mod status_message_tests {
             let mut local_state = RecordingLocalState::with_matching_session(0);
             let mut cache_misses = 0;
 
-            for expected_misses in 1..=max_reschedules {
+            for expected_misses in 1..max_cache_miss_checks {
                 let terminal_error = terminal_error_for_attempt(&mut cache_misses);
                 assert_eq!(terminal_error, None, "{context} should reschedule");
                 assert_eq!(cache_misses, expected_misses);
