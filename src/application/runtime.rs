@@ -3285,11 +3285,20 @@ impl EventHandler for ScaffoldHandler {
                                 }
                                 return;
                             }
-                            rearm_auto_stop_state_for_retry(
+                            if !rearm_auto_stop_state_for_retry(
                                 &mut states,
                                 &guild_for_task,
                                 expected_meeting_id_ref,
-                            );
+                            ) {
+                                drop(states);
+                                let mut startups = handler.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                );
+                                return;
+                            }
                             continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
@@ -3411,7 +3420,11 @@ impl EventHandler for ScaffoldHandler {
                                 }
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            if !states.contains_key(&guild_for_task) {
+                            if !rearm_auto_stop_state_for_retry(
+                                &mut states,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                            ) {
                                 drop(states);
                                 let mut startups = handler.recording_startups.lock().await;
                                 clear_matching_recording_startup(
@@ -3421,11 +3434,6 @@ impl EventHandler for ScaffoldHandler {
                                 );
                                 return;
                             }
-                            rearm_auto_stop_state_for_retry(
-                                &mut states,
-                                &guild_for_task,
-                                expected_meeting_id_ref,
-                            );
                             continue;
                         }
                     }
