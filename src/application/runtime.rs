@@ -4734,8 +4734,30 @@ impl ScaffoldHandler {
         self.spawn_lifecycle_cleanup_retry(async move {
             let retry_key = retry_key;
             for attempt in 1..=RECORDING_START_CLEANUP_MAX_RETRIES {
-                sleep(RECORDING_START_CLEANUP_RETRY_DELAY).await;
-                let _command_guard = handler.command_gate.write().await;
+                tokio::select! {
+                    _ = handler.shutdown_token.cancelled() => {
+                        debug!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            "record-start setup failure cleanup retry cancelled during shutdown"
+                        );
+                        handler.clear_recording_start_cleanup_retry(&retry_key);
+                        return;
+                    }
+                    _ = sleep(RECORDING_START_CLEANUP_RETRY_DELAY) => {}
+                }
+                let _command_guard = tokio::select! {
+                    guard = handler.command_gate.write() => guard,
+                    _ = handler.shutdown_token.cancelled() => {
+                        debug!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            "record-start setup failure cleanup retry skipped command gate during shutdown"
+                        );
+                        handler.clear_recording_start_cleanup_retry(&retry_key);
+                        return;
+                    }
+                };
                 if handler
                     .try_cleanup_failed_recording_start_locked(
                         &guild_key,
@@ -4762,7 +4784,18 @@ impl ScaffoldHandler {
                 attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
                 "record-start setup failure cleanup retries exhausted; force-marking failed before releasing startup reservation"
             );
-            let _command_guard = handler.command_gate.write().await;
+            let _command_guard = tokio::select! {
+                guard = handler.command_gate.write() => guard,
+                _ = handler.shutdown_token.cancelled() => {
+                    debug!(
+                        guild_id = %guild_key,
+                        meeting_id = %meeting_id,
+                        "record-start setup failure cleanup exhaustion skipped command gate during shutdown"
+                    );
+                    handler.clear_recording_start_cleanup_retry(&retry_key);
+                    return;
+                }
+            };
             let local = handler.lifecycle_local_state();
             finish_failed_recording_start_cleanup_retry_exhaustion_with_dependencies(
                 &handler.service,

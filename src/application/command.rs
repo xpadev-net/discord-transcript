@@ -125,6 +125,9 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     request: RecordStartRequest,
     preflight: RecordStartPreflight,
 ) -> Result<RecordStartResult, CommandError> {
+    // Production derives both values from the same resolved voice channel. This
+    // protects direct callers, tests, and future call sites from mixing a
+    // request with a preflight token created for a different channel.
     if request.user_voice_channel_id.as_deref() != Some(preflight.voice_channel_id()) {
         return Err(CommandError::PreflightMismatch);
     }
