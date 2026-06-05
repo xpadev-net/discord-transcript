@@ -734,6 +734,12 @@ struct RecordingLookupFailureRequest<'a> {
     context: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveMeetingVoiceChannel {
+    meeting_id: String,
+    voice_channel_id: u64,
+}
+
 struct TerminalCleanupRetryFailureRequest<'a> {
     guild_key: &'a str,
     expected_meeting_id: &'a str,
@@ -2549,12 +2555,12 @@ impl EventHandler for ScaffoldHandler {
             return;
         }
         let guild_key = self.guild_id.get().to_string();
-        let target_voice_channel_id = match self.active_meeting_voice_channel_id_result().await {
-            Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
+        let active_voice_channel = match self.active_meeting_voice_channel_result().await {
+            Ok(Some(active_voice_channel)) => active_voice_channel,
             Ok(None) => {
                 let _lifecycle_permit = self.recording_lifecycle_write_permit().await;
-                match self.active_meeting_voice_channel_id_result().await {
-                    Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
+                match self.active_meeting_voice_channel_result().await {
+                    Ok(Some(active_voice_channel)) => active_voice_channel,
                     Ok(None) => {
                         let session_meeting_id = {
                             let sessions = self.sessions.lock().await;
@@ -2606,6 +2612,7 @@ impl EventHandler for ScaffoldHandler {
                 return;
             }
         };
+        let target_voice_channel_id = active_voice_channel.voice_channel_id;
         let Some(non_bot) =
             count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id)
         else {
@@ -2616,18 +2623,16 @@ impl EventHandler for ScaffoldHandler {
             );
             return;
         };
-        let active_meeting_id = self.active_meeting_id().await;
+        let active_meeting_id = active_voice_channel.meeting_id;
         let grace = self
-            .auto_stop_grace_for_meeting(active_meeting_id.as_deref())
+            .auto_stop_grace_for_meeting(Some(&active_meeting_id))
             .await;
         let (signal, timer_generation) = {
             let mut states = self.auto_stop_states.lock().await;
             let state = states.entry(guild_key.clone()).or_insert_with(|| {
-                AutoStopState::new_for_meeting(grace, active_meeting_id.clone())
+                AutoStopState::new_for_meeting(grace, Some(active_meeting_id.clone()))
             });
-            if let Some(active_meeting_id) = active_meeting_id.as_deref() {
-                state.refresh_for_meeting(grace, active_meeting_id);
-            }
+            state.refresh_for_meeting(grace, &active_meeting_id);
             let signal = state.on_non_bot_member_count_changed(non_bot);
             (signal, state.timer_generation())
         };
@@ -2638,7 +2643,7 @@ impl EventHandler for ScaffoldHandler {
             let handler = self.clone();
             let ctx_for_task = ctx.clone();
             let guild_for_task = guild_key;
-            let expected_meeting_id = active_meeting_id;
+            let expected_meeting_id = Some(active_meeting_id);
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
             self.spawn_background(async move {
@@ -3548,7 +3553,9 @@ impl ScaffoldHandler {
         Ok(())
     }
 
-    async fn active_meeting_voice_channel_id_result(&self) -> Result<Option<u64>, String> {
+    async fn active_meeting_voice_channel_result(
+        &self,
+    ) -> Result<Option<ActiveMeetingVoiceChannel>, String> {
         let mut service = self.service.lock().await;
         let Some(meeting) = service
             .store
@@ -3557,30 +3564,14 @@ impl ScaffoldHandler {
         else {
             return Ok(None);
         };
-        meeting
-            .voice_channel_id
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|err| {
-                format!(
-                    "invalid active meeting voice channel id for meeting {}: {err}",
-                    meeting.id
-                )
-            })
-    }
-
-    async fn active_meeting_id(&self) -> Option<String> {
-        match self.active_meeting_id_result().await {
-            Ok(meeting_id) => meeting_id,
-            Err(err) => {
-                warn!(
-                    guild_id = %self.guild_id,
-                    error = %err,
-                    "failed to resolve active meeting id"
-                );
-                None
-            }
-        }
+        let meeting_id = meeting.id;
+        let voice_channel_id = meeting.voice_channel_id.parse::<u64>().map_err(|err| {
+            format!("invalid active meeting voice channel id for meeting {meeting_id}: {err}")
+        })?;
+        Ok(Some(ActiveMeetingVoiceChannel {
+            meeting_id,
+            voice_channel_id,
+        }))
     }
 
     async fn active_meeting_id_result(&self) -> Result<Option<String>, String> {
@@ -3853,6 +3844,7 @@ impl ScaffoldHandler {
         phase: &str,
         mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
     ) {
+        let _reset_guard = self.ssrc_tracker_reset_gate.lock().await;
         if removed_session.is_some()
             && let Some(manager) = songbird::get(ctx).await
         {
@@ -6180,7 +6172,20 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let guild_key = self.guild_id.clone();
                     let http = Arc::clone(&self.http);
                     let ctx_for_task = self.ctx.clone();
-                    let expected_meeting_id = runtime.active_meeting_id().await;
+                    let expected_meeting_id = match runtime.active_meeting_id_result().await {
+                        Ok(expected_meeting_id) => expected_meeting_id,
+                        Err(err) => {
+                            warn!(
+                                guild_id = %self.guild_id,
+                                error = %err,
+                                "failed to resolve active meeting id for driver disconnect; falling back to local recording session"
+                            );
+                            let sessions = runtime.sessions.lock().await;
+                            sessions
+                                .get(&guild_key)
+                                .map(|session| session.meeting_id.clone())
+                        }
+                    };
                     let grace = runtime
                         .auto_stop_grace_for_meeting(expected_meeting_id.as_deref())
                         .await;
@@ -6314,8 +6319,28 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 return;
                             }
                             let target_voice_channel_id =
-                                match runtime.active_meeting_voice_channel_id_result().await {
-                                    Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
+                                match runtime.active_meeting_voice_channel_result().await {
+                                    Ok(Some(active_voice_channel))
+                                        if active_voice_channel.meeting_id
+                                            == expected_meeting_id_ref =>
+                                    {
+                                        active_voice_channel.voice_channel_id
+                                    }
+                                    Ok(Some(active_voice_channel)) => {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            actual_meeting_id = %active_voice_channel.meeting_id,
+                                            "driver-disconnect voice-channel lookup found a different active meeting"
+                                        );
+                                        let mut startups = runtime.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_key,
+                                            expected_meeting_id_ref,
+                                        );
+                                        return;
+                                    }
                                     Ok(None) => {
                                         let terminal_error = "active recording voice channel disappeared during driver-disconnect grace";
                                         warn!(

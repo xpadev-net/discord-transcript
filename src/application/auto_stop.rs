@@ -132,3 +132,35 @@ pub enum AutoStopSignal {
     /// The grace period has elapsed — trigger auto-stop.
     Trigger,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_meeting_state_is_scoped() {
+        let state = AutoStopState::new_for_meeting(Duration::from_secs(30), Some("m1".to_owned()));
+
+        assert_eq!(state.meeting_id(), Some("m1"));
+        assert!(state.belongs_to_meeting("m1"));
+        assert!(!state.belongs_to_meeting("m2"));
+    }
+
+    #[test]
+    fn unscoped_state_refreshes_to_known_meeting_before_timer_reuse() {
+        let mut state = AutoStopState::new(Duration::from_secs(30));
+        assert_eq!(
+            state.on_non_bot_member_count_changed(0),
+            AutoStopSignal::StartTimer
+        );
+
+        assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
+        assert_eq!(state.meeting_id(), Some("m1"));
+        assert!(state.belongs_to_meeting("m1"));
+        assert_eq!(state.timer_generation(), 0);
+        assert_eq!(
+            state.on_non_bot_member_count_changed(0),
+            AutoStopSignal::StartTimer
+        );
+    }
+}
