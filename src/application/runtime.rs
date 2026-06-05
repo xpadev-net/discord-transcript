@@ -3896,6 +3896,26 @@ impl ScaffoldHandler {
             attempts = *terminal_cleanup_failures,
             "terminal recording cleanup retry limit reached; clearing local runtime state"
         );
+        let terminal_error = format!(
+            "terminal recording cleanup failed after {} attempt(s) during {}: {}",
+            *terminal_cleanup_failures, request.phase, request.err
+        );
+        {
+            let mut service = self.service.lock().await;
+            if let Err(err) = mark_recording_failed_after_teardown_exhaustion(
+                &mut service.store,
+                request.expected_meeting_id,
+                &terminal_error,
+            ) {
+                warn!(
+                    guild_id = %request.guild_key,
+                    meeting_id = request.expected_meeting_id,
+                    phase = request.phase,
+                    error = %err,
+                    "best-effort terminal cleanup status update failed before local state eviction"
+                );
+            }
+        }
         let removed_session = self
             .remove_local_recording_state_after_terminal_absence(
                 request.guild_key,
