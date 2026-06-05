@@ -7,7 +7,7 @@ use discord_transcript::application::summary::{
     SummaryError,
 };
 use discord_transcript::application::worker::{
-    ProcessMeetingInput, SummaryContextStore, process_meeting_summary,
+    LOAD_MEETING_SPEAKERS_SQL, ProcessMeetingInput, SummaryContextStore, process_meeting_summary,
 };
 use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
@@ -86,8 +86,6 @@ fn base_env() -> HashMap<String, String> {
 fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value should be nonzero")
 }
-
-const LOAD_MEETING_SPEAKERS_SQL: &str = "SELECT speaker_id, username, nickname, display_name FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id";
 
 fn sql_query_key(sql: &str, params: &[&str]) -> String {
     format!("{}|{}", sql, params.join("\u{1f}"))
@@ -230,8 +228,8 @@ fn sql_summary_context_deduplicates_vc_participant_alias_candidates_by_identity(
     executor.query_rows_result.insert(
         sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
         vec![
-            sql_row(&["123", "alice_dev", "Alice", "Alice Example"]),
             sql_row(&["456", "alice_dev", "Alice", "Alice Example"]),
+            sql_row(&["123", "alice_dev", "Alice", "Alice Example"]),
         ],
     );
     executor.query_rows_result.insert(
@@ -266,6 +264,7 @@ fn sql_summary_context_deduplicates_vc_participant_alias_candidates_by_identity(
             .count(),
         1
     );
+    assert!(upserts.iter().all(|params| params[6] == "123"));
 }
 
 #[test]

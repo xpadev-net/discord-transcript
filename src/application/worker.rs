@@ -113,6 +113,9 @@ pub trait SummaryContextStore {
     ) -> Result<SummaryContextInput, StoreError>;
 }
 
+pub const LOAD_MEETING_SPEAKERS_SQL: &str = "SELECT speaker_id, username, nickname, display_name \
+             FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AliasCandidateTenantGuild {
     tenant_discord_guild_id: String,
@@ -210,7 +213,9 @@ pub(crate) fn upsert_vc_participant_alias_candidates_for_guild<E: SqlExecutor>(
         );
         return Ok(Vec::new());
     };
-    let candidates = build_vc_participant_alias_candidates(&tenant_guild, meeting_id, speakers);
+    let mut speakers = speakers.to_vec();
+    speakers.sort_by(|left, right| left.speaker_id.cmp(&right.speaker_id));
+    let candidates = build_vc_participant_alias_candidates(&tenant_guild, meeting_id, &speakers);
     let mut upserted = Vec::new();
     for candidate in candidates {
         match store.upsert_vc_participant_person_alias_candidate(&candidate) {
@@ -385,11 +390,7 @@ fn load_meeting_speakers<E: SqlExecutor>(
 ) -> Result<Vec<SpeakerProfile>, StoreError> {
     let rows = store
         .executor
-        .query_rows(
-            "SELECT speaker_id, username, nickname, display_name \
-             FROM meeting_speakers WHERE meeting_id=$1 ORDER BY speaker_id",
-            &[meeting_id.to_owned()],
-        )
+        .query_rows(LOAD_MEETING_SPEAKERS_SQL, &[meeting_id.to_owned()])
         .map_err(StoreError::Backend)?;
     let mut speakers = Vec::with_capacity(rows.len());
     for row in rows {
