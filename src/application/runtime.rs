@@ -596,10 +596,10 @@ fn classify_voice_join_retry_cleanup(
     }
 }
 
-// Join completion can race with a stop command after the DB row/session were
-// created but before Songbird reports success. Only statuses reached by the
-// normal stop pipeline are accepted as benign here; terminal failure statuses
-// still force failed-start cleanup so setup errors remain visible.
+// Join completion can race with stop or teardown exhaustion after the DB
+// row/session were created but before Songbird reports success. Treat those
+// downstream terminal states as benign so cleanup stays conditional on local
+// session ownership instead of falling through to the generic failed-start path.
 fn recording_start_join_completed_after_stop(status: MeetingStatus) -> bool {
     matches!(
         status,
@@ -607,6 +607,7 @@ fn recording_start_join_completed_after_stop(status: MeetingStatus) -> bool {
             | MeetingStatus::Transcribing
             | MeetingStatus::Summarizing
             | MeetingStatus::Posted
+            | MeetingStatus::Failed
     )
 }
 
@@ -11041,7 +11042,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn recording_start_join_completed_after_stop_accepts_only_downstream_stop_statuses() {
+    fn recording_start_join_completed_after_stop_accepts_downstream_terminal_statuses() {
         assert!(recording_start_join_completed_after_stop(
             crate::domain::MeetingStatus::Stopping
         ));
@@ -11054,12 +11055,12 @@ mod status_message_tests {
         assert!(recording_start_join_completed_after_stop(
             crate::domain::MeetingStatus::Posted
         ));
+        assert!(recording_start_join_completed_after_stop(
+            crate::domain::MeetingStatus::Failed
+        ));
 
         assert!(!recording_start_join_completed_after_stop(
             crate::domain::MeetingStatus::Recording
-        ));
-        assert!(!recording_start_join_completed_after_stop(
-            crate::domain::MeetingStatus::Failed
         ));
         assert!(!recording_start_join_completed_after_stop(
             crate::domain::MeetingStatus::Aborted
