@@ -3437,22 +3437,17 @@ impl EventHandler for ScaffoldHandler {
                     };
                     reset_recording_lookup_failures(&mut lookup_failures);
                     if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
-                        // Clear timer flag before returning, but only for the
-                        // meeting this timer was started for. A later meeting
-                        // on the same guild can reuse the same generation.
-                        let mut states = handler.auto_stop_states.lock().await;
-                        clear_auto_stop_timer_generation_for_meeting(
-                            &mut states,
+                        let local = handler.lifecycle_local_state();
+                        clear_failed_recording_start_local_state_with_dependencies(
+                            &local,
                             &guild_for_task,
                             expected_meeting_id_ref,
-                            timer_generation,
-                        );
-                        let mut startups = handler.recording_startups.lock().await;
-                        clear_matching_recording_startup(
-                            &mut startups,
-                            &guild_for_task,
-                            expected_meeting_id_ref,
-                        );
+                            FailedRecordingStartLocalCleanup::FullRuntimeState,
+                            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                                session.persist_ssrc_mapping(tracker);
+                            },
+                        )
+                        .await;
                         return;
                     }
                     // Re-verify the voice channel state at fire time. A prior cache-miss
@@ -7373,12 +7368,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             actual_meeting_id = %active_voice_channel.meeting_id,
                                             "driver-disconnect voice-channel lookup found a different active meeting"
                                         );
-                                        let mut startups = runtime.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
+                                        let local = runtime.lifecycle_local_state();
+                                        clear_failed_recording_start_local_state_with_dependencies(
+                                            &local,
                                             &guild_key,
                                             expected_meeting_id_ref,
-                                        );
+                                            FailedRecordingStartLocalCleanup::FullRuntimeState,
+                                            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                                                session.persist_ssrc_mapping(tracker);
+                                            },
+                                        )
+                                        .await;
                                         return;
                                     }
                                     Ok(None) => {
