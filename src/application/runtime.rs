@@ -2533,21 +2533,31 @@ impl EventHandler for ScaffoldHandler {
                 match self.active_meeting_voice_channel_id_result().await {
                     Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
                     Ok(None) => {
-                        {
+                        let orphan_meeting_id = {
+                            let sessions = self.sessions.lock().await;
+                            sessions
+                                .get(&guild_key)
+                                .map(|session| session.meeting_id.clone())
+                        };
+                        let orphan_meeting_id = match orphan_meeting_id {
+                            Some(meeting_id) => Some(meeting_id),
+                            None => {
+                                let startups = self.recording_startups.lock().await;
+                                startups.get(&guild_key).cloned()
+                            }
+                        };
+                        if let Some(meeting_id) = orphan_meeting_id {
+                            self.clear_local_recording_state_after_terminal_absence(
+                                &ctx,
+                                self.guild_id,
+                                &guild_key,
+                                &meeting_id,
+                                "voice-state inactive meeting cleanup",
+                            )
+                            .await;
+                        } else {
                             let mut states = self.auto_stop_states.lock().await;
                             states.remove(&guild_key);
-                        }
-                        {
-                            let mut startups = self.recording_startups.lock().await;
-                            // A valid reservation must have an active meeting row; the
-                            // lifecycle gate prevents racing a fresh /record-start here.
-                            if let Some(meeting_id) = startups.get(&guild_key).cloned() {
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_key,
-                                    &meeting_id,
-                                );
-                            }
                         }
                         return;
                     }
@@ -2824,17 +2834,17 @@ impl EventHandler for ScaffoldHandler {
                         true
                     } else {
                         let mut states = handler.auto_stop_states.lock().await;
-                        let Some(state) = states.get_mut(&guild_for_task) else {
-                            drop(states);
-                            let mut startups = handler.recording_startups.lock().await;
-                            clear_matching_recording_startup(
-                                &mut startups,
-                                &guild_for_task,
-                                expected_meeting_id_ref,
-                            );
-                            return;
-                        };
-                        state.tick() == AutoStopSignal::Trigger
+                        match states.get_mut(&guild_for_task) {
+                            Some(state) => state.tick() == AutoStopSignal::Trigger,
+                            None => {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    "auto-stop timer state missing at grace expiry; continuing teardown"
+                                );
+                                true
+                            }
+                        }
                     };
                     if !trigger {
                         let mut states = handler.auto_stop_states.lock().await;
