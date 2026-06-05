@@ -4285,16 +4285,6 @@ impl ScaffoldHandler {
                     status = ?meeting_status,
                     "recording was stopped before voice join verification completed"
                 );
-                // Keep the lifecycle gate held until this leave completes so a
-                // follow-up start cannot join and then be kicked by this cleanup.
-                leave_voice_with_timeout(
-                    manager,
-                    guild_id,
-                    meeting_id,
-                    "already-stopped record-start",
-                )
-                .await;
-
                 let mut removed_session = {
                     let _voice_event_guard = self.voice_event_gate.write().await;
                     let mut sessions = self.sessions.lock().await;
@@ -4307,6 +4297,19 @@ impl ScaffoldHandler {
                         None
                     }
                 };
+                // Only leave if this startup still owned the local session. If
+                // the stop path already removed it and issued its own leave, a
+                // second leave could disconnect a successor recording that joined
+                // while this startup was in the join retry loop.
+                if removed_session.is_some() {
+                    leave_voice_with_timeout(
+                        manager,
+                        guild_id,
+                        meeting_id,
+                        "already-stopped record-start",
+                    )
+                    .await;
+                }
                 if let Some(session) = removed_session.as_mut() {
                     flush_removed_session_after_stop(
                         session,
