@@ -92,6 +92,7 @@ const RECORDING_LOOKUP_MAX_RETRIES: u32 = 10;
 const RECORDING_TERMINAL_CLEANUP_MAX_RETRIES: u32 = 3;
 const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
+const RECORDING_VOICE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandSpec {
@@ -4521,12 +4522,18 @@ impl ScaffoldHandler {
             let mut last_err = None;
             let mut result = None;
             for attempt in 1..=3u32 {
-                match manager.join(guild_id, channel_id).await {
-                    Ok(call) => {
+                match timeout(
+                    RECORDING_VOICE_JOIN_TIMEOUT,
+                    manager.join(guild_id, channel_id),
+                )
+                .await
+                {
+                    Ok(Ok(call)) => {
                         result = Some(call);
                         break;
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
+                        let err_msg = format!("{err}");
                         warn!(
                             attempt,
                             guild_id = %guild_id.get(),
@@ -4535,7 +4542,7 @@ impl ScaffoldHandler {
                             error_debug = ?err,
                             "voice join attempt failed"
                         );
-                        last_err = Some(err);
+                        last_err = Some(err_msg);
                         // Clean up partial gateway state before retrying
                         {
                             let _command_guard = self.command_gate.write().await;
@@ -4559,10 +4566,65 @@ impl ScaffoldHandler {
                                     "recording session changed during voice join retry cleanup",
                                 )
                                 .await;
-                                return Ok(
-                                "参加再試行中に停止処理が始まりました。停止処理の完了を待っています。"
-                                    .to_owned(),
-                            );
+                                return Ok("参加再試行中に停止処理が始まりました。停止処理の完了を待っています。"
+                                    .to_owned());
+                            }
+                            leave_voice_with_timeout(
+                                manager.as_ref(),
+                                guild_id,
+                                &meeting_id,
+                                "record-start retry cleanup",
+                            )
+                            .await;
+                        }
+                        // Re-register after leave in case it cleared the Call's
+                        // event handlers (defensive: Songbird docs say handlers
+                        // survive leave(), but guard against implementation drift).
+                        self.register_voice_handlers(manager.as_ref(), ctx, guild_id)
+                            .await;
+                        if attempt < 3 {
+                            sleep(join_delay).await;
+                            join_delay *= 2;
+                        }
+                    }
+                    Err(_) => {
+                        let err_msg = format!(
+                            "timed out joining voice channel after {}ms",
+                            RECORDING_VOICE_JOIN_TIMEOUT.as_millis()
+                        );
+                        warn!(
+                            attempt,
+                            guild_id = %guild_id.get(),
+                            meeting_id = %meeting_id,
+                            timeout_ms = RECORDING_VOICE_JOIN_TIMEOUT.as_millis(),
+                            "voice join attempt timed out"
+                        );
+                        last_err = Some(err_msg);
+                        // Clean up partial gateway state before retrying
+                        {
+                            let _command_guard = self.command_gate.write().await;
+                            let current_session_meeting_id = {
+                                let sessions = self.sessions.lock().await;
+                                sessions
+                                    .get(&guild_key)
+                                    .map(|session| session.meeting_id.clone())
+                            };
+                            if current_session_meeting_id.as_deref() != Some(meeting_id.as_str()) {
+                                leave_voice_with_timeout(
+                                    manager.as_ref(),
+                                    guild_id,
+                                    &meeting_id,
+                                    "record-start retry cleanup after stop",
+                                )
+                                .await;
+                                self.cleanup_failed_recording_start_locked(
+                                    &guild_key,
+                                    &meeting_id,
+                                    "recording session changed during voice join retry cleanup",
+                                )
+                                .await;
+                                return Ok("参加再試行中に停止処理が始まりました。停止処理の完了を待っています。"
+                                    .to_owned());
                             }
                             leave_voice_with_timeout(
                                 manager.as_ref(),
@@ -4587,13 +4649,11 @@ impl ScaffoldHandler {
             match result {
                 Some(call) => call,
                 None => {
-                    let err = last_err.expect("last_err must be set when all attempts fail");
-                    let err_msg = format!("{err}");
+                    let err_msg = last_err.expect("last_err must be set when all attempts fail");
                     error!(
                         guild_id = %guild_id.get(),
                         meeting_id = %meeting_id,
-                        error = %err,
-                        error_debug = ?err,
+                        error = %err_msg,
                         "failed to join voice channel after 3 attempts"
                     );
                     // manager.leave() already called in the retry loop above
