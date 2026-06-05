@@ -1,12 +1,14 @@
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
-    TranscriptionOutput, build_correction_prompt, build_summary_prompt_with_context,
-    correct_transcript_with_prompt, materialize_or_load_summary_context,
+    TranscriptionOutput, build_correction_prompt_with_context, build_summary_prompt_with_context,
+    correct_transcript_with_prompt_and_workdir, materialize_or_load_summary_context,
     persist_correction_prompt_debug_artifact, persist_pre_correction_transcript_debug_artifact,
     persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
+use crate::domain::feedback::TranscriptFeedbackStatus;
+use crate::domain::person_alias::PersonAliasReviewStatus;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::SummaryTemplate;
 use crate::domain::usage::{
@@ -128,10 +130,33 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         let speakers = load_meeting_speakers(self, meeting_id)?;
         let domain_knowledge = self.list_domain_knowledge(guild_id, false, None)?;
         let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
+        let tenant = self.resolve_tenant_by_guild(guild_id)?;
+        let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+            (
+                self.list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)?,
+                self.list_transcript_feedback(
+                    &tenant.tenant_id,
+                    guild_id,
+                    Some(TranscriptFeedbackStatus::Accepted),
+                    None,
+                )?,
+                self.list_person_aliases(
+                    &tenant.tenant_id,
+                    guild_id,
+                    false,
+                    Some(PersonAliasReviewStatus::Accepted),
+                )?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         Ok(SummaryContextInput {
             speakers,
             domain_knowledge,
+            ai_memory,
+            user_feedback,
+            person_aliases,
             summary_template,
             effective_summary_template_id: effective_settings
                 .and_then(|settings| settings.summary_template_id.clone()),
@@ -301,6 +326,22 @@ where
         &request.workspace,
         &transcription.transcript_for_summary,
     );
+    store.set_meeting_status(
+        &input.meeting_id,
+        MeetingStatus::Summarizing,
+        Some(MeetingStatus::Transcribing),
+    )?;
+    let context_manifest = match materialize_or_load_summary_context(
+        &request,
+        &input.summary_context,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            error!(meeting_id = %input.meeting_id, error = %err, "summary context materialization failed");
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
+            return Err(WorkerError::from(err));
+        }
+    };
 
     // Apply LLM-based error correction to the transcript before summarization.
     let transcription = if !claude.supports_transcript_correction() {
@@ -318,18 +359,21 @@ where
             &request.workspace,
             &transcription.transcript_for_summary,
             request.language.as_deref(),
+            Some(&context_manifest),
         )
         .unwrap_or_else(|| {
-            build_correction_prompt(
+            build_correction_prompt_with_context(
                 &transcription.transcript_for_summary,
                 request.language.as_deref(),
+                Some(&context_manifest),
             )
         });
 
-        match correct_transcript_with_prompt(
+        match correct_transcript_with_prompt_and_workdir(
             claude,
             &transcription.transcript_for_summary,
             &correction_prompt,
+            Some(request.workspace.root()),
         ) {
             Ok(corrected) => TranscriptionOutput {
                 transcript_for_summary: corrected,
@@ -342,26 +386,10 @@ where
         }
     };
 
-    store.set_meeting_status(
-        &input.meeting_id,
-        MeetingStatus::Summarizing,
-        Some(MeetingStatus::Transcribing),
-    )?;
     let manifest = match write_transcript_files(&request, &transcription) {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "transcript materialization failed");
-            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
-            return Err(WorkerError::from(err));
-        }
-    };
-    let context_manifest = match materialize_or_load_summary_context(
-        &request,
-        &input.summary_context,
-    ) {
-        Ok(value) => value,
-        Err(err) => {
-            error!(meeting_id = %input.meeting_id, error = %err, "summary context materialization failed");
             revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
             return Err(WorkerError::from(err));
         }

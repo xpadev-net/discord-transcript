@@ -77,12 +77,27 @@ fn debug_paths_are_under_workspace_root() {
     );
     assert!(
         workspace
-            .context_speakers_path()
+            .context_speaker_roster_path()
             .starts_with(workspace.context_dir())
     );
     assert!(
         workspace
             .context_domain_knowledge_path()
+            .starts_with(workspace.context_dir())
+    );
+    assert!(
+        workspace
+            .context_ai_memory_path()
+            .starts_with(workspace.context_dir())
+    );
+    assert!(
+        workspace
+            .context_person_aliases_path()
+            .starts_with(workspace.context_dir())
+    );
+    assert!(
+        workspace
+            .context_user_feedback_path()
             .starts_with(workspace.context_dir())
     );
     assert!(

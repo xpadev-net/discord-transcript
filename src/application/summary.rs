@@ -1,4 +1,7 @@
+use crate::domain::ai_memory::AiMemoryNote;
 use crate::domain::domain_knowledge::DomainKnowledgeItem;
+use crate::domain::feedback::{TranscriptFeedback, TranscriptFeedbackStatus};
+use crate::domain::person_alias::{PersonAlias, PersonAliasReviewStatus};
 use crate::domain::privacy::{MaskingStats, mask_pii};
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{
@@ -10,7 +13,7 @@ use crate::domain::transcript::{
 };
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
 use crate::infrastructure::workspace::{
-    CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME, CONTEXT_SPEAKERS_FILENAME,
+    CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME, CONTEXT_SPEAKER_ROSTER_FILENAME,
     MASKED_TRANSCRIPT_FILENAME, MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
 };
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
@@ -40,6 +43,15 @@ pub struct SummaryContextInput {
     /// Raw domain knowledge candidates. [`materialize_summary_context`] is
     /// responsible for selecting active, non-archived items.
     pub domain_knowledge: Vec<DomainKnowledgeItem>,
+    /// Raw AI memory candidates. Materialized notes are non-authoritative
+    /// hints and may be stale, incomplete, or uncertain.
+    pub ai_memory: Vec<AiMemoryNote>,
+    /// Raw transcript feedback candidates. Only accepted feedback is
+    /// materialized into the prompt context.
+    pub user_feedback: Vec<TranscriptFeedback>,
+    /// Raw person alias candidates. Materialized aliases are non-authoritative
+    /// hints and may be stale, incomplete, or uncertain.
+    pub person_aliases: Vec<PersonAlias>,
     /// Raw summary template candidate. [`materialize_summary_context`] is
     /// responsible for selecting active, non-archived templates.
     pub summary_template: Option<SummaryTemplate>,
@@ -140,6 +152,24 @@ pub struct SummaryContextManifest {
     pub domain_knowledge_path: String,
     pub domain_knowledge_count: usize,
     pub domain_knowledge_items: Vec<DomainKnowledgeContextMetadata>,
+    #[serde(default)]
+    pub ai_memory_path: String,
+    #[serde(default)]
+    pub ai_memory_count: usize,
+    #[serde(default)]
+    pub ai_memory_items: Vec<AiMemoryContextMetadata>,
+    #[serde(default)]
+    pub person_aliases_path: String,
+    #[serde(default, alias = "person_alias_count")]
+    pub person_aliases_count: usize,
+    #[serde(default, alias = "person_aliases")]
+    pub person_alias_items: Vec<PersonAliasContextMetadata>,
+    #[serde(default)]
+    pub user_feedback_path: String,
+    #[serde(default)]
+    pub user_feedback_count: usize,
+    #[serde(default)]
+    pub user_feedback_items: Vec<UserFeedbackContextMetadata>,
     pub effective_domain_knowledge_version_id: Option<String>,
     pub summary_template_path: Option<String>,
     pub summary_template: Option<SummaryTemplateContextMetadata>,
@@ -153,6 +183,37 @@ pub struct DomainKnowledgeContextMetadata {
     pub version: u32,
     pub active: bool,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AiMemoryContextMetadata {
+    pub id: String,
+    pub source_type: String,
+    pub tags: Vec<String>,
+    pub confidence_permille: Option<u16>,
+    pub active: bool,
+    pub pinned: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PersonAliasContextMetadata {
+    pub id: String,
+    pub source_type: String,
+    pub review_status: String,
+    pub confidence_permille: Option<u16>,
+    pub active: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UserFeedbackContextMetadata {
+    pub id: String,
+    pub feedback_type: String,
+    pub term_type: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub reviewed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -298,11 +359,12 @@ pub fn persist_correction_prompt_debug_artifact(
     workspace: &MeetingWorkspacePaths,
     pre_correction_transcript: &str,
     language: Option<&str>,
+    context: Option<&SummaryContextManifest>,
 ) -> Option<String> {
     if pre_correction_transcript.trim().is_empty() {
         return None;
     }
-    let prompt = build_correction_prompt(pre_correction_transcript, language);
+    let prompt = build_correction_prompt_with_context(pre_correction_transcript, language, context);
     persist_debug_text(&workspace.correction_prompt_path(), &prompt);
     Some(prompt)
 }
@@ -411,8 +473,17 @@ pub fn materialize_summary_context(
             display_name: speaker.display_name.clone(),
         })
         .collect::<Vec<_>>();
-    let speaker_path = request.workspace.context_speakers_path();
-    write_json_file(&speaker_path, &speaker_entries, "speaker roster")?;
+    let speaker_path = request.workspace.context_speaker_roster_path();
+    fs::write(
+        &speaker_path,
+        render_speaker_roster_context(&speaker_entries),
+    )
+    .map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to write speaker roster context {}: {err}",
+            speaker_path.display()
+        ))
+    })?;
 
     let mut domain_knowledge = context
         .domain_knowledge
@@ -436,6 +507,80 @@ pub fn materialize_summary_context(
         SummaryError::SummaryEngine(format!(
             "failed to write domain knowledge context {}: {err}",
             domain_path.display()
+        ))
+    })?;
+
+    let mut ai_memory = context
+        .ai_memory
+        .iter()
+        .filter(|note| note.active && note.archived_at.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    ai_memory.sort_by(|left, right| {
+        right
+            .pinned
+            .cmp(&left.pinned)
+            .then(right.updated_at.cmp(&left.updated_at))
+            .then(left.title.cmp(&right.title))
+            .then(left.id.cmp(&right.id))
+    });
+    let ai_memory_path = request.workspace.context_ai_memory_path();
+    fs::write(&ai_memory_path, render_ai_memory_context(&ai_memory)).map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to write AI memory context {}: {err}",
+            ai_memory_path.display()
+        ))
+    })?;
+
+    let mut person_aliases = context
+        .person_aliases
+        .iter()
+        .filter(|alias| {
+            alias.active
+                && alias.archived_at.is_none()
+                && alias.review_status == PersonAliasReviewStatus::Accepted
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    person_aliases.sort_by(|left, right| {
+        left.canonical_name
+            .cmp(&right.canonical_name)
+            .then(left.alias.cmp(&right.alias))
+            .then(left.id.cmp(&right.id))
+    });
+    let person_aliases_path = request.workspace.context_person_aliases_path();
+    fs::write(
+        &person_aliases_path,
+        render_person_aliases_context(&person_aliases),
+    )
+    .map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to write person aliases context {}: {err}",
+            person_aliases_path.display()
+        ))
+    })?;
+
+    let mut user_feedback = context
+        .user_feedback
+        .iter()
+        .filter(|feedback| feedback.status == TranscriptFeedbackStatus::Accepted)
+        .cloned()
+        .collect::<Vec<_>>();
+    user_feedback.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then(left.id.cmp(&right.id))
+    });
+    let user_feedback_path = request.workspace.context_user_feedback_path();
+    fs::write(
+        &user_feedback_path,
+        render_user_feedback_context(&user_feedback),
+    )
+    .map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to write user feedback context {}: {err}",
+            user_feedback_path.display()
         ))
     })?;
 
@@ -489,6 +634,56 @@ pub fn materialize_summary_context(
                 version: item.version,
                 active: item.active,
                 updated_at: item.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            })
+            .collect(),
+        ai_memory_path: relative_workspace_path(&request.workspace, &ai_memory_path)?,
+        ai_memory_count: ai_memory.len(),
+        ai_memory_items: ai_memory
+            .iter()
+            .map(|note| AiMemoryContextMetadata {
+                id: note.id.clone(),
+                source_type: note.source_type.as_str().to_owned(),
+                tags: note
+                    .tags
+                    .iter()
+                    .map(|tag| tag.as_str().to_owned())
+                    .collect(),
+                confidence_permille: note.confidence.map(|confidence| confidence.as_permille()),
+                active: note.active,
+                pinned: note.pinned,
+                updated_at: note.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            })
+            .collect(),
+        person_aliases_path: relative_workspace_path(&request.workspace, &person_aliases_path)?,
+        person_aliases_count: person_aliases.len(),
+        person_alias_items: person_aliases
+            .iter()
+            .map(|alias| PersonAliasContextMetadata {
+                id: alias.id.clone(),
+                source_type: alias.source_type.as_str().to_owned(),
+                review_status: alias.review_status.as_str().to_owned(),
+                confidence_permille: alias.confidence.map(|confidence| confidence.as_permille()),
+                active: alias.active,
+                updated_at: alias.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            })
+            .collect(),
+        user_feedback_path: relative_workspace_path(&request.workspace, &user_feedback_path)?,
+        user_feedback_count: user_feedback.len(),
+        user_feedback_items: user_feedback
+            .iter()
+            .map(|feedback| UserFeedbackContextMetadata {
+                id: feedback.id.clone(),
+                feedback_type: feedback.feedback_type.as_str().to_owned(),
+                term_type: feedback
+                    .term_type
+                    .map(|term_type| term_type.as_str().to_owned()),
+                status: feedback.status.as_str().to_owned(),
+                created_at: feedback
+                    .created_at
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+                reviewed_at: feedback
+                    .reviewed_at
+                    .map(|reviewed_at| reviewed_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
             })
             .collect(),
         effective_domain_knowledge_version_id: context
@@ -573,12 +768,39 @@ fn relative_workspace_path(
         .map(|path| path.to_string_lossy().to_string())
 }
 
+fn render_speaker_roster_context(speakers: &[SpeakerRosterEntry]) -> String {
+    if speakers.is_empty() {
+        return "# Speaker Roster\n\nNo speaker roster was materialized for this meeting.\n"
+            .to_owned();
+    }
+
+    let mut rendered = String::from(
+        "# Speaker Roster\n\nThis roster is authoritative for speaker labels in the current transcript.\n",
+    );
+    for speaker in speakers {
+        rendered.push_str(&format!(
+            "\n## {}\n\n- speaker_id: {}\n",
+            speaker.display_label, speaker.speaker_id
+        ));
+        push_optional_metadata_line(&mut rendered, "username", speaker.username.as_deref());
+        push_optional_metadata_line(&mut rendered, "nickname", speaker.nickname.as_deref());
+        push_optional_metadata_line(
+            &mut rendered,
+            "display_name",
+            speaker.display_name.as_deref(),
+        );
+    }
+    rendered
+}
+
 fn render_domain_knowledge_context(items: &[DomainKnowledgeItem]) -> String {
     if items.is_empty() {
         return "# Domain Knowledge\n\nNo active domain knowledge was materialized.\n".to_owned();
     }
 
-    let mut rendered = String::from("# Domain Knowledge\n");
+    let mut rendered = String::from(
+        "# Domain Knowledge\n\nCurated active domain knowledge is higher priority than accepted user feedback, AI memory, person aliases, and general knowledge.\n",
+    );
     for item in items {
         rendered.push_str(&format!(
             "\n## {}\n\n- id: {}\n- content_type: {}\n- version: {}\n\n{}\n",
@@ -590,6 +812,174 @@ fn render_domain_knowledge_context(items: &[DomainKnowledgeItem]) -> String {
         ));
     }
     rendered
+}
+
+fn render_ai_memory_context(notes: &[AiMemoryNote]) -> String {
+    if notes.is_empty() {
+        return "# AI Memory\n\nNo active AI memory notes were materialized.\n".to_owned();
+    }
+
+    let mut rendered = String::from(
+        "# AI Memory\n\nAI memory notes are non-authoritative hints. They may be stale, incomplete, or uncertain; prefer the current transcript, speaker roster, domain knowledge, and accepted user feedback when they conflict.\n",
+    );
+    for note in notes {
+        rendered.push_str(&format!(
+            "\n## {}\n\n- id: {}\n- source_type: {}\n- confidence: {}\n- pinned: {}\n- updated_at: {}\n",
+            note.title,
+            note.id,
+            note.source_type.as_str(),
+            confidence_label(note.confidence),
+            note.pinned,
+            note.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ));
+        let tags = note
+            .tags
+            .iter()
+            .map(|tag| tag.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_optional_metadata_line(&mut rendered, "tags", Some(&tags));
+        push_optional_metadata_line(
+            &mut rendered,
+            "source_meeting_id",
+            note.source_meeting_id.as_deref(),
+        );
+        push_optional_metadata_line(
+            &mut rendered,
+            "source_feedback_id",
+            note.source_feedback_id.as_deref(),
+        );
+        rendered.push_str(&format!("\n{}\n", note.body));
+    }
+    rendered
+}
+
+fn render_person_aliases_context(aliases: &[PersonAlias]) -> String {
+    if aliases.is_empty() {
+        return "# Person Aliases\n\nNo accepted active person aliases were materialized.\n"
+            .to_owned();
+    }
+
+    let mut rendered = String::from(
+        "# Person Aliases\n\nPerson aliases are non-authoritative hints. They may be stale, incomplete, or uncertain; prefer the current transcript, speaker roster, domain knowledge, and accepted user feedback when they conflict.\n",
+    );
+    for alias in aliases {
+        rendered.push_str(&format!(
+            "\n## {}\n\n- id: {}\n- alias: {}\n- source_type: {}\n- review_status: {}\n- confidence: {}\n- updated_at: {}\n",
+            alias.canonical_name,
+            alias.id,
+            alias.alias,
+            alias.source_type.as_str(),
+            alias.review_status.as_str(),
+            confidence_label(alias.confidence),
+            alias.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ));
+        push_optional_metadata_line(
+            &mut rendered,
+            "discord_user_id",
+            alias.discord_user_id.as_deref(),
+        );
+        push_optional_metadata_line(
+            &mut rendered,
+            "source_meeting_id",
+            alias.source_meeting_id.as_deref(),
+        );
+        push_optional_metadata_line(
+            &mut rendered,
+            "source_feedback_id",
+            alias.source_feedback_id.as_deref(),
+        );
+    }
+    rendered
+}
+
+fn render_user_feedback_context(feedback_items: &[TranscriptFeedback]) -> String {
+    if feedback_items.is_empty() {
+        return "# Accepted User Feedback\n\nNo accepted user feedback was materialized.\n"
+            .to_owned();
+    }
+
+    let mut rendered = String::from(
+        "# Accepted User Feedback\n\nAccepted user feedback is user-reviewed context. It is lower priority than the current transcript, speaker roster, and domain knowledge, but higher priority than AI memory, person aliases, and general knowledge.\n",
+    );
+    for feedback in feedback_items {
+        rendered.push_str(&format!(
+            "\n## {} ({})\n\n- id: {}\n- feedback_type: {}\n- status: {}\n- created_at: {}\n",
+            feedback.feedback_type.as_str(),
+            feedback.id,
+            feedback.id,
+            feedback.feedback_type.as_str(),
+            feedback.status.as_str(),
+            feedback
+                .created_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        ));
+        if let Some(term_type) = feedback.term_type {
+            rendered.push_str(&format!("- term_type: {}\n", term_type.as_str()));
+        }
+        if let Some(reviewed_at) = feedback.reviewed_at {
+            rendered.push_str(&format!(
+                "- reviewed_at: {}\n",
+                reviewed_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+            ));
+        }
+        push_optional_metadata_line(&mut rendered, "meeting_id", feedback.meeting_id.as_deref());
+        push_optional_metadata_line(
+            &mut rendered,
+            "transcript_segment_id",
+            feedback.transcript_segment_id.as_deref(),
+        );
+        push_optional_metadata_line(&mut rendered, "speaker_id", feedback.speaker_id.as_deref());
+        push_optional_metadata_line(
+            &mut rendered,
+            "corrected_speaker_id",
+            feedback.corrected_speaker_id.as_deref(),
+        );
+        push_optional_metadata_line(
+            &mut rendered,
+            "target_domain_knowledge_id",
+            feedback.target_domain_knowledge_id.as_deref(),
+        );
+        push_optional_metadata_line(
+            &mut rendered,
+            "target_ai_memory_note_id",
+            feedback.target_ai_memory_note_id.as_deref(),
+        );
+        push_optional_section(
+            &mut rendered,
+            "Original Text",
+            feedback.original_text.as_deref(),
+        );
+        push_optional_section(
+            &mut rendered,
+            "Corrected Text",
+            feedback.corrected_text.as_deref(),
+        );
+        push_optional_section(&mut rendered, "Note", feedback.note.as_deref());
+    }
+    rendered
+}
+
+fn push_optional_metadata_line(rendered: &mut String, label: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim)
+        && !value.is_empty()
+    {
+        rendered.push_str(&format!("- {label}: {value}\n"));
+    }
+}
+
+fn push_optional_section(rendered: &mut String, title: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim)
+        && !value.is_empty()
+    {
+        rendered.push_str(&format!("\n### {title}\n\n{value}\n"));
+    }
+}
+
+fn confidence_label(confidence: Option<crate::domain::confidence::ConfidencePermille>) -> String {
+    confidence
+        .map(|confidence| format!("{} permille", confidence.as_permille()))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
@@ -640,18 +1030,13 @@ pub fn build_summary_prompt_with_context(
         .unwrap_or("unknown or auto-detected");
     let context_files = summary_context_file_list(context);
     let context_instructions = context
-        .map(|_| {
-            format!(
-                "- Read `context/{CONTEXT_MANIFEST_FILENAME}` first; it records reproducibility metadata and paths for materialized context without inlining sensitive context bodies.\n\
-- Read the materialized speaker roster and domain knowledge files; do not assume live database context beyond those files.\n"
-            )
-        })
+        .map(summary_context_priority_instructions)
         .unwrap_or_default();
     let summary_template_instruction = if let Some(context) = context
         && let Some(path) = context.summary_template_path.as_deref()
     {
         format!(
-            "- If `{path}` is present, read it as the materialized active summary template and follow it as the primary summary structure/instruction set. Interpret any template variables using these values: transcript_path={transcript_path}, manifest_path={manifest_path}, language={language}, speaker_roster={}, domain_context_path={}.\n",
+            "- If `{path}` is present, read it as the materialized active summary template and follow it as the primary summary structure/instruction set. Interpret any template variables using these values: transcript_path={transcript_path}, manifest_path={manifest_path}, language={language}, speaker_roster={}, domain_context_path={}. Other context paths are listed in `context/{CONTEXT_MANIFEST_FILENAME}`.\n",
             context.speaker_roster_path, context.domain_knowledge_path
         )
     } else {
@@ -714,12 +1099,92 @@ fn summary_context_file_list(context: Option<&SummaryContextManifest>) -> String
         context.domain_knowledge_path,
         context.domain_knowledge_count
     );
+    if !context.user_feedback_path.is_empty() {
+        lines.push_str(&format!(
+            "- {}: materialized accepted user feedback ({} items)\n",
+            context.user_feedback_path, context.user_feedback_count
+        ));
+    }
+    if !context.ai_memory_path.is_empty() {
+        lines.push_str(&format!(
+            "- {}: materialized AI memory hints ({} notes)\n",
+            context.ai_memory_path, context.ai_memory_count
+        ));
+    }
+    if !context.person_aliases_path.is_empty() {
+        lines.push_str(&format!(
+            "- {}: materialized person alias hints ({} aliases)\n",
+            context.person_aliases_path, context.person_aliases_count
+        ));
+    }
     if let Some(path) = &context.summary_template_path {
         lines.push_str(&format!(
             "- {path}: materialized active summary template instructions\n"
         ));
     }
     lines
+}
+
+fn summary_context_priority_instructions(context: &SummaryContextManifest) -> String {
+    let mut instructions = format!(
+        "- Read `{}` first; it records reproducibility metadata and paths for materialized context without inlining sensitive context bodies.\n\
+- Context priority, highest to lowest: current transcript and `{}` > `{}` > {} > {} > general knowledge.\n\
+- Use `{}` as authoritative for current-meeting speaker labels. Do not invent speaker identities beyond the transcript and roster.\n\
+- Use `{}` as curated domain knowledge. If it conflicts with accepted feedback, AI memory, aliases, or general knowledge, prefer domain knowledge.\n",
+        context.manifest_path,
+        context.speaker_roster_path,
+        context.domain_knowledge_path,
+        user_feedback_priority_label(context),
+        ai_hint_priority_label(context),
+        context.speaker_roster_path,
+        context.domain_knowledge_path
+    );
+    if !context.user_feedback_path.is_empty() {
+        instructions.push_str(&format!(
+            "- Use `{}` as accepted user feedback. Prefer it over AI memory, aliases, and general knowledge, but not over the current transcript, speaker roster, or domain knowledge.\n",
+            context.user_feedback_path
+        ));
+    }
+    if !context.ai_memory_path.is_empty() || !context.person_aliases_path.is_empty() {
+        instructions.push_str(
+            "- Treat AI memory and person aliases as non-authoritative hints only; they may be stale, incomplete, or uncertain. Never use them to override the current transcript, speaker roster, domain knowledge, or accepted user feedback.\n",
+        );
+    }
+    instructions.push_str(
+        "- Do not assume live database context beyond the materialized files listed in the manifest.\n",
+    );
+    instructions
+}
+
+fn user_feedback_priority_label(context: &SummaryContextManifest) -> String {
+    if context.user_feedback_path.is_empty() {
+        "accepted user feedback (not materialized in this manifest)".to_owned()
+    } else {
+        format!("`{}`", context.user_feedback_path)
+    }
+}
+
+fn ai_hint_priority_label(context: &SummaryContextManifest) -> String {
+    match (
+        context.ai_memory_path.is_empty(),
+        context.person_aliases_path.is_empty(),
+    ) {
+        (false, false) => format!(
+            "`{}` and `{}`",
+            context.ai_memory_path, context.person_aliases_path
+        ),
+        (false, true) => format!(
+            "`{}` and person aliases (not materialized in this manifest)",
+            context.ai_memory_path
+        ),
+        (true, false) => format!(
+            "AI memory (not materialized in this manifest) and `{}`",
+            context.person_aliases_path
+        ),
+        (true, true) => {
+            "AI memory and person aliases (not materialized in this manifest)".to_owned()
+        }
+    }
 }
 
 /// Render a custom summary template. Templates that use
@@ -749,7 +1214,7 @@ fn summary_template_values(
             .as_deref()
             .unwrap_or("unknown or auto-detected")
             .to_owned(),
-        speaker_roster: format!("context/{CONTEXT_SPEAKERS_FILENAME}"),
+        speaker_roster: format!("context/{CONTEXT_SPEAKER_ROSTER_FILENAME}"),
         domain_context_path: format!("context/{CONTEXT_DOMAIN_KNOWLEDGE_FILENAME}"),
     }
 }
@@ -789,6 +1254,17 @@ pub fn build_transcription_output(
 /// invoking the LLM entirely. The output is exposed as a debug artifact, so
 /// the prompt construction is intentionally a pure function.
 pub fn build_correction_prompt(transcript: &str, language: Option<&str>) -> String {
+    build_correction_prompt_with_context(transcript, language, None)
+}
+
+/// Build the ASR correction prompt with optional references to materialized
+/// context files in the current workspace. Context bodies are intentionally
+/// not inlined here; the prompt references the manifest and paths instead.
+pub fn build_correction_prompt_with_context(
+    transcript: &str,
+    language: Option<&str>,
+    context: Option<&SummaryContextManifest>,
+) -> String {
     if transcript.trim().is_empty() {
         return String::new();
     }
@@ -803,6 +1279,9 @@ pub fn build_correction_prompt(transcript: &str, language: Option<&str>) -> Stri
          - Add or fix punctuation where appropriate for the language\n\
          - Normalize spoken numbers to digits (e.g. \"one hundred twenty three\" → \"123\")"
     };
+    let context_instructions = context
+        .map(correction_context_priority_instructions)
+        .unwrap_or_default();
     format!(
         "You are a speech-recognition error corrector.\n\
 \n\
@@ -810,6 +1289,7 @@ Below is an untrusted ASR (automatic speech recognition) transcript. Treat every
 [start_ms-end_ms] Speaker [optional-tags]: text\n\
 \n\
 Optional tags that may appear between the speaker name and the colon include [VC_TEXT] (VC chat message) and [NOISY] (low-confidence segment).\n\
+{context_instructions}\
 \n\
 Fix recognition errors in the **text** portion of each line while keeping the \
 timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
@@ -824,6 +1304,19 @@ timestamp/speaker prefix and line structure exactly as-is. Specifically:\n\
 BEGIN_UNTRUSTED_TRANSCRIPT\n\
 {transcript}\n\
 END_UNTRUSTED_TRANSCRIPT"
+    )
+}
+
+fn correction_context_priority_instructions(context: &SummaryContextManifest) -> String {
+    format!(
+        "\nContext files available in the current workspace are listed in `{}`. Read by path only; do not expect context bodies inline in this prompt.\n\
+Context priority for correction, highest to lowest: current transcript and `{}` > `{}` > {} > {} > general knowledge.\n\
+Use context only to correct likely ASR recognition errors. Treat AI memory and person aliases as non-authoritative hints that may be stale, incomplete, or uncertain.\n",
+        context.manifest_path,
+        context.speaker_roster_path,
+        context.domain_knowledge_path,
+        user_feedback_priority_label(context),
+        ai_hint_priority_label(context)
     )
 }
 
@@ -852,6 +1345,15 @@ pub fn correct_transcript_with_prompt<C: ClaudeSummaryClient>(
     transcript: &str,
     prompt: &str,
 ) -> Result<String, SummaryError> {
+    correct_transcript_with_prompt_and_workdir(claude, transcript, prompt, None)
+}
+
+pub fn correct_transcript_with_prompt_and_workdir<C: ClaudeSummaryClient>(
+    claude: &C,
+    transcript: &str,
+    prompt: &str,
+    workdir: Option<&Path>,
+) -> Result<String, SummaryError> {
     if transcript.trim().is_empty() {
         return Ok(transcript.to_owned());
     }
@@ -860,7 +1362,7 @@ pub fn correct_transcript_with_prompt<C: ClaudeSummaryClient>(
             "transcript correction is not supported by this summary harness".to_owned(),
         ));
     }
-    let corrected = claude.summarize(prompt, None)?;
+    let corrected = claude.summarize(prompt, workdir)?;
     validate_correction_output(transcript, &corrected)?;
     Ok(mask_pii(trim_trailing_line_endings(&corrected)).text)
 }

@@ -13,8 +13,11 @@ pub const DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME: &str = "transcript_pre_corre
 pub const DEBUG_CORRECTION_PROMPT_FILENAME: &str = "correction_prompt.txt";
 pub const DEBUG_SUMMARY_PROMPT_FILENAME: &str = "summary_prompt.txt";
 pub const CONTEXT_MANIFEST_FILENAME: &str = "manifest.json";
-pub const CONTEXT_SPEAKERS_FILENAME: &str = "speakers.json";
+pub const CONTEXT_SPEAKER_ROSTER_FILENAME: &str = "speaker_roster.md";
 pub const CONTEXT_DOMAIN_KNOWLEDGE_FILENAME: &str = "domain_knowledge.md";
+pub const CONTEXT_AI_MEMORY_FILENAME: &str = "ai_memory.md";
+pub const CONTEXT_PERSON_ALIASES_FILENAME: &str = "person_aliases.md";
+pub const CONTEXT_USER_FEEDBACK_FILENAME: &str = "user_feedback.md";
 pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,12 +152,24 @@ impl MeetingWorkspacePaths {
         self.context_dir().join(CONTEXT_MANIFEST_FILENAME)
     }
 
-    pub fn context_speakers_path(&self) -> PathBuf {
-        self.context_dir().join(CONTEXT_SPEAKERS_FILENAME)
+    pub fn context_speaker_roster_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_SPEAKER_ROSTER_FILENAME)
     }
 
     pub fn context_domain_knowledge_path(&self) -> PathBuf {
         self.context_dir().join(CONTEXT_DOMAIN_KNOWLEDGE_FILENAME)
+    }
+
+    pub fn context_ai_memory_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_AI_MEMORY_FILENAME)
+    }
+
+    pub fn context_person_aliases_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_PERSON_ALIASES_FILENAME)
+    }
+
+    pub fn context_user_feedback_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_USER_FEEDBACK_FILENAME)
     }
 
     pub fn context_summary_template_path(&self) -> PathBuf {
