@@ -2556,26 +2556,29 @@ impl EventHandler for ScaffoldHandler {
                 match self.active_meeting_voice_channel_id_result().await {
                     Ok(Some(target_voice_channel_id)) => target_voice_channel_id,
                     Ok(None) => {
-                        let orphan_meeting_id = {
+                        let session_meeting_id = {
                             let sessions = self.sessions.lock().await;
                             sessions
                                 .get(&guild_key)
                                 .map(|session| session.meeting_id.clone())
                         };
-                        let orphan_meeting_id = match orphan_meeting_id {
-                            Some(meeting_id) => Some(meeting_id),
-                            None => {
-                                let startups = self.recording_startups.lock().await;
-                                startups.get(&guild_key).cloned()
-                            }
-                        };
-                        if let Some(meeting_id) = orphan_meeting_id {
+                        if let Some(meeting_id) = session_meeting_id {
                             self.clear_local_recording_state_after_terminal_absence(
                                 &ctx,
                                 self.guild_id,
                                 &guild_key,
                                 &meeting_id,
                                 "voice-state inactive meeting cleanup",
+                            )
+                            .await;
+                        } else if let Some(meeting_id) = {
+                            let startups = self.recording_startups.lock().await;
+                            startups.get(&guild_key).cloned()
+                        } {
+                            self.cleanup_failed_recording_start_locked(
+                                &guild_key,
+                                &meeting_id,
+                                "active meeting disappeared before recording setup completed",
                             )
                             .await;
                         } else {
@@ -3076,45 +3079,72 @@ impl EventHandler for ScaffoldHandler {
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
                                 drop(states);
-                                let mut removed_session = {
-                                    let _voice_event_guard =
-                                        handler.voice_event_gate.write().await;
-                                    let mut sessions = handler.sessions.lock().await;
-                                    if sessions.get(&guild_for_task).is_some_and(|session| {
-                                        session.meeting_id == expected_meeting_id_ref
-                                    }) {
-                                        sessions.remove(&guild_for_task)
-                                    } else {
-                                        None
-                                    }
-                                };
-                                if let Some(session) = removed_session.as_mut() {
-                                    flush_removed_session_after_stop(
-                                        session,
-                                        &guild_for_task,
-                                        "auto-stop missing timer state after flush failure",
-                                    );
-                                }
-                                let latest_tracker = {
-                                    let _voice_event_guard =
-                                        handler.voice_event_gate.write().await;
-                                    let tracker = handler.ssrc_tracker.lock().await;
-                                    tracker.clone()
-                                };
-                                if let Some(session) = &removed_session {
-                                    session.persist_ssrc_mapping(&latest_tracker);
-                                }
-                                {
-                                    let mut titles =
-                                        handler.live_transcription_titles.lock().await;
-                                    titles.remove(expected_meeting_id_ref);
-                                }
-                                let mut startups = handler.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
+                                let terminal_error = format!(
+                                    "auto-stop timer state disappeared after final flush failure: {err}"
                                 );
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    error = %err,
+                                    "auto-stop timer state missing after final flush failure; marking recording failed"
+                                );
+                                match handler
+                                    .fail_recording_after_teardown_exhaustion(
+                                        &lifecycle_permit,
+                                        &ctx_for_task,
+                                        handler.guild_id,
+                                        &guild_for_task,
+                                        expected_meeting_id_ref,
+                                        &terminal_error,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if let Err(status_err) = handler
+                                            .update_status_message(
+                                                &ctx_for_task.http,
+                                                expected_meeting_id_ref,
+                                                StatusMessageUpdate::Failed {
+                                                    phase: "Recording persist",
+                                                    error: &terminal_error,
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                guild_id = %guild_for_task,
+                                                meeting_id = expected_meeting_id_ref,
+                                                error = %status_err,
+                                                "failed to notify auto-stop missing timer state"
+                                            );
+                                        }
+                                    }
+                                    Err(mark_err) => {
+                                        warn!(
+                                            guild_id = %guild_for_task,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %mark_err,
+                                            "failed to mark recording failed after auto-stop timer state disappeared; clearing local state"
+                                        );
+                                        let removed_session = handler
+                                            .remove_local_recording_state_after_terminal_absence(
+                                                &guild_for_task,
+                                                expected_meeting_id_ref,
+                                            )
+                                            .await;
+                                        drop(lifecycle_permit);
+                                        handler
+                                            .finish_terminal_absence_cleanup(
+                                                &ctx_for_task,
+                                                handler.guild_id,
+                                                &guild_for_task,
+                                                expected_meeting_id_ref,
+                                                "auto-stop missing timer state after flush failure",
+                                                removed_session,
+                                            )
+                                            .await;
+                                    }
+                                }
                                 return;
                             };
                             state.retry_after_failed_stop();
@@ -6446,10 +6476,31 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 GraceExpiryDecision::Reschedule
                                     if retry_teardown_after_failed_terminal_cleanup =>
                                 {
+                                    let terminal_error =
+                                        driver_disconnect_cache_miss_terminal_error(
+                                            &mut grace_cache_misses,
+                                        );
                                     warn!(
                                         guild_id = %guild_key,
                                         meeting_id = expected_meeting_id_ref,
-                                        "driver-disconnect teardown retry has no local state; continuing cleanup despite unavailable voice state cache"
+                                        cache_misses = grace_cache_misses,
+                                        "driver-disconnect teardown retry has no local state and voice cache is unavailable; rescheduling before forced cleanup"
+                                    );
+                                    if terminal_error.is_none() {
+                                        let mut startups =
+                                            runtime.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_key,
+                                            expected_meeting_id_ref,
+                                        );
+                                        continue;
+                                    }
+                                    warn!(
+                                        guild_id = %guild_key,
+                                        meeting_id = expected_meeting_id_ref,
+                                        cache_misses = grace_cache_misses,
+                                        "driver-disconnect teardown retry cache-miss limit reached; continuing forced cleanup"
                                     );
                                 }
                                 GraceExpiryDecision::Reschedule => {
