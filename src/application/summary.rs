@@ -160,10 +160,10 @@ pub struct SummaryContextManifest {
     pub ai_memory_items: Vec<AiMemoryContextMetadata>,
     #[serde(default)]
     pub person_aliases_path: String,
-    #[serde(default)]
-    pub person_alias_count: usize,
-    #[serde(default)]
-    pub person_aliases: Vec<PersonAliasContextMetadata>,
+    #[serde(default, alias = "person_alias_count")]
+    pub person_aliases_count: usize,
+    #[serde(default, alias = "person_aliases")]
+    pub person_alias_items: Vec<PersonAliasContextMetadata>,
     #[serde(default)]
     pub user_feedback_path: String,
     #[serde(default)]
@@ -655,8 +655,8 @@ pub fn materialize_summary_context(
             })
             .collect(),
         person_aliases_path: relative_workspace_path(&request.workspace, &person_aliases_path)?,
-        person_alias_count: person_aliases.len(),
-        person_aliases: person_aliases
+        person_aliases_count: person_aliases.len(),
+        person_alias_items: person_aliases
             .iter()
             .map(|alias| PersonAliasContextMetadata {
                 id: alias.id.clone(),
@@ -1112,7 +1112,7 @@ fn summary_context_file_list(context: Option<&SummaryContextManifest>) -> String
     if !context.person_aliases_path.is_empty() {
         lines.push_str(&format!(
             "- {}: materialized person alias hints ({} aliases)\n",
-            context.person_aliases_path, context.person_alias_count
+            context.person_aliases_path, context.person_aliases_count
         ));
     }
     if let Some(path) = &context.summary_template_path {
