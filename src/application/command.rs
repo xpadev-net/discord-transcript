@@ -33,7 +33,7 @@ pub struct RecordStartResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordStartPreflight {
+pub(crate) struct RecordStartPreflight {
     voice_channel_id: String,
 }
 
@@ -143,7 +143,7 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     })
 }
 
-pub fn validate_record_start_preconditions<S: MeetingStore>(
+pub(crate) fn validate_record_start_preconditions<S: MeetingStore>(
     store: &mut S,
     request: &RecordStartRequest,
 ) -> Result<RecordStartPreflight, CommandError> {

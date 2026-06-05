@@ -879,8 +879,10 @@ fn terminal_cleanup_retry_reached_limit(terminal_cleanup_failures: &mut u32) -> 
     *terminal_cleanup_failures >= RECORDING_TERMINAL_CLEANUP_MAX_RETRIES
 }
 
-fn reset_terminal_cleanup_failures_after_persistence_failure(terminal_cleanup_failures: &mut u32) {
-    *terminal_cleanup_failures = 0;
+fn retain_terminal_cleanup_retry_limit_after_persistence_failure(
+    terminal_cleanup_failures: &mut u32,
+) {
+    *terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES.saturating_sub(1);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1334,7 +1336,9 @@ where
                 error = %err,
                 "terminal cleanup status update failed; preserving local state for retry"
             );
-            reset_terminal_cleanup_failures_after_persistence_failure(terminal_cleanup_failures);
+            retain_terminal_cleanup_retry_limit_after_persistence_failure(
+                terminal_cleanup_failures,
+            );
             return TerminalCleanupRetryDecision::Reschedule;
         }
     }
@@ -10004,7 +10008,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn terminal_cleanup_persistence_failure_resets_retry_window() {
+    fn terminal_cleanup_persistence_failure_retains_retry_limit() {
         let mut terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
 
         let outcome = record_terminal_cleanup_retry_failure(
@@ -10014,16 +10018,24 @@ mod status_message_tests {
         );
         assert!(outcome.terminal_error.is_some());
 
-        reset_terminal_cleanup_failures_after_persistence_failure(&mut terminal_cleanup_failures);
-        assert_eq!(terminal_cleanup_failures, 0);
+        retain_terminal_cleanup_retry_limit_after_persistence_failure(
+            &mut terminal_cleanup_failures,
+        );
+        assert_eq!(
+            terminal_cleanup_failures,
+            RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1
+        );
 
         let outcome = record_terminal_cleanup_retry_failure(
             &mut terminal_cleanup_failures,
             "auto-stop stop exhaustion",
             "status update unavailable",
         );
-        assert_eq!(outcome.attempts, 1);
-        assert_eq!(outcome.terminal_error, None);
+        assert_eq!(outcome.attempts, RECORDING_TERMINAL_CLEANUP_MAX_RETRIES);
+        assert!(
+            outcome.terminal_error.is_some(),
+            "the next retry should attempt terminal persistence again instead of restarting the full window"
+        );
     }
 
     #[test]
@@ -10073,8 +10085,9 @@ mod status_message_tests {
 
         assert!(matches!(decision, TerminalCleanupRetryDecision::Reschedule));
         assert_eq!(
-            terminal_cleanup_failures, 0,
-            "persistence failures reset the retry window instead of clearing local state"
+            terminal_cleanup_failures,
+            RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1,
+            "persistence failures should preserve the terminal retry threshold without clearing local state"
         );
         harness.assert_matching_state_present().await;
         {

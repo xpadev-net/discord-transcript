@@ -1,7 +1,6 @@
 use discord_transcript::application::auto_stop::{AutoStopSignal, AutoStopState};
 use discord_transcript::application::command::{
     CommandError, PermissionSet, RecordStartRequest, RecordStopRequest, record_start, record_stop,
-    validate_record_start_preconditions,
 };
 use discord_transcript::application::stop::StopOutcome;
 use discord_transcript::domain::MeetingStatus;
@@ -130,8 +129,7 @@ fn record_start_preflight_rejects_plain_member_without_creating_meeting() {
         effective_settings: None,
     };
 
-    let error =
-        validate_record_start_preconditions(&mut store, &request).expect_err("must fail");
+    let error = record_start(&mut store, request).expect_err("must fail");
     assert_eq!(error, CommandError::Unauthorized("start recording"));
     assert!(store.get("m1").is_none(), "preflight must not create rows");
 }
@@ -165,8 +163,7 @@ fn record_start_preflight_rejects_active_meeting_without_creating_requested_meet
         effective_settings: None,
     };
 
-    let error =
-        validate_record_start_preconditions(&mut store, &request).expect_err("must fail");
+    let error = record_start(&mut store, request).expect_err("must fail");
     assert_eq!(
         error,
         CommandError::ActiveMeetingExists {
