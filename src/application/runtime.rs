@@ -449,24 +449,26 @@ fn flush_session_for_teardown<S: ChunkStorage>(
 
 fn flush_removed_session_after_stop<S: ChunkStorage>(
     session: &mut RecordingSession<S>,
-    guild_id: &str,
-    phase: &str,
-) {
+    _guild_id: &str,
+    _phase: &str,
+) -> Result<(), String> {
     match session.flush_all() {
-        Ok(result) if result.failed.is_empty() => {}
-        Ok(result) => warn!(
-            guild_id = %guild_id,
-            failed = result.failed.len(),
-            phase,
-            "tail audio chunks failed to persist after recording stop; dropping removed session"
-        ),
-        Err(err) => warn!(
+        Ok(result) if result.failed.is_empty() => Ok(()),
+        Ok(result) => Err(format!(
+            "failed to persist {} tail audio chunk(s)",
+            result.failed.len()
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn warn_removed_session_flush_failure(guild_id: &str, phase: &str, err: &str) {
+    warn!(
             guild_id = %guild_id,
             error = %err,
             phase,
             "failed to flush tail audio after recording stop; dropping removed session"
-        ),
-    }
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,10 +882,10 @@ fn terminal_cleanup_retry_reached_limit(terminal_cleanup_failures: &mut u32) -> 
     *terminal_cleanup_failures >= RECORDING_TERMINAL_CLEANUP_MAX_RETRIES
 }
 
-fn retain_terminal_cleanup_retry_limit_after_persistence_failure(
+fn restart_terminal_cleanup_retry_window_after_persistence_failure(
     terminal_cleanup_failures: &mut u32,
 ) {
-    *terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES.saturating_sub(1);
+    *terminal_cleanup_failures = 0;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1146,8 +1148,11 @@ async fn finish_terminal_absence_cleanup_with_dependencies<
     } else {
         None
     };
-    if let Some(session) = removed_session.as_mut() {
-        flush_removed_session_after_stop(session, request.guild_key, request.phase);
+    if let Some(session) = removed_session.as_mut()
+        && let Err(err) =
+            flush_removed_session_after_stop(session, request.guild_key, request.phase)
+    {
+        warn_removed_session_flush_failure(request.guild_key, request.phase, &err);
     }
     let latest_tracker = {
         let _voice_event_guard = local.voice_event_gate.write().await;
@@ -1178,18 +1183,20 @@ async fn clear_failed_recording_start_local_state_with_dependencies<
         return;
     }
 
-    let mut removed_session = {
+    let (removed_session, latest_tracker) = {
         let _voice_event_guard = local.voice_event_gate.write().await;
-        let mut sessions = local.sessions.lock().await;
-        remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id)
-    };
-    if let Some(session) = removed_session.as_mut() {
-        flush_removed_session_after_stop(session, guild_key, "record-start failure cleanup");
-    }
-    let latest_tracker = {
-        let _voice_event_guard = local.voice_event_gate.write().await;
+        let mut removed_session = {
+            let mut sessions = local.sessions.lock().await;
+            remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id)
+        };
+        if let Some(session) = removed_session.as_mut()
+            && let Err(err) =
+                flush_removed_session_after_stop(session, guild_key, "record-start failure cleanup")
+        {
+            warn_removed_session_flush_failure(guild_key, "record-start failure cleanup", &err);
+        }
         let tracker = local.ssrc_tracker.lock().await;
-        tracker.clone()
+        (removed_session, tracker.clone())
     };
     if let Some(session) = &removed_session {
         persist_ssrc_mapping(session, &latest_tracker);
@@ -1337,7 +1344,7 @@ where
                 error = %err,
                 "terminal cleanup status update failed; preserving local state for retry"
             );
-            retain_terminal_cleanup_retry_limit_after_persistence_failure(
+            restart_terminal_cleanup_retry_window_after_persistence_failure(
                 terminal_cleanup_failures,
             );
             return TerminalCleanupRetryDecision::Reschedule;
@@ -1426,8 +1433,11 @@ where
         )
         .await;
 
-    if let Some(session) = removed_session.as_mut() {
-        flush_removed_session_after_stop(session, request.guild_key, request.phase);
+    if let Some(session) = removed_session.as_mut()
+        && let Err(err) =
+            flush_removed_session_after_stop(session, request.guild_key, request.phase)
+    {
+        warn_removed_session_flush_failure(request.guild_key, request.phase, &err);
     }
 
     let latest_tracker = {
@@ -4463,8 +4473,10 @@ impl ScaffoldHandler {
             leave_voice_with_timeout(manager.as_ref(), self.guild_id, meeting_id, phase).await;
         }
 
-        if let Some(session) = removed_session.as_mut() {
-            flush_removed_session_after_stop(session, guild_key, phase);
+        if let Some(session) = removed_session.as_mut()
+            && let Err(err) = flush_removed_session_after_stop(session, guild_key, phase)
+        {
+            warn_removed_session_flush_failure(guild_key, phase, &err);
         }
 
         let final_tracker = {
@@ -5001,11 +5013,17 @@ impl ScaffoldHandler {
                     )
                     .await;
                 }
-                if let Some(session) = removed_session.as_mut() {
-                    flush_removed_session_after_stop(
+                if let Some(session) = removed_session.as_mut()
+                    && let Err(err) = flush_removed_session_after_stop(
                         session,
                         guild_key,
                         "already-stopped record-start",
+                    )
+                {
+                    warn_removed_session_flush_failure(
+                        guild_key,
+                        "already-stopped record-start",
+                        &err,
                     );
                 }
                 let latest_tracker = {
@@ -8283,9 +8301,21 @@ mod status_message_tests {
         let saved_chunks = Arc::new(AtomicUsize::new(0));
         let mut session = session_with_one_flaky_chunk_and_counter(0, Arc::clone(&saved_chunks));
 
-        flush_removed_session_after_stop(&mut session, "g1", "record-start failure cleanup");
+        flush_removed_session_after_stop(&mut session, "g1", "record-start failure cleanup")
+            .expect("tail flush should succeed");
 
         assert_eq!(saved_chunks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_start_cleanup_reports_removed_session_flush_failure() {
+        let mut session = session_with_one_flaky_chunk(1);
+
+        let err =
+            flush_removed_session_after_stop(&mut session, "g1", "record-start failure cleanup")
+                .expect_err("tail flush failures should be surfaced to callers");
+
+        assert!(err.contains("failed to persist 1 tail audio chunk"));
     }
 
     #[test]
@@ -10051,7 +10081,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn terminal_cleanup_persistence_failure_retains_retry_limit() {
+    fn terminal_cleanup_persistence_failure_restarts_retry_window() {
         let mut terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
 
         let outcome = record_terminal_cleanup_retry_failure(
@@ -10061,23 +10091,20 @@ mod status_message_tests {
         );
         assert!(outcome.terminal_error.is_some());
 
-        retain_terminal_cleanup_retry_limit_after_persistence_failure(
+        restart_terminal_cleanup_retry_window_after_persistence_failure(
             &mut terminal_cleanup_failures,
         );
-        assert_eq!(
-            terminal_cleanup_failures,
-            RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1
-        );
+        assert_eq!(terminal_cleanup_failures, 0);
 
         let outcome = record_terminal_cleanup_retry_failure(
             &mut terminal_cleanup_failures,
             "auto-stop stop exhaustion",
             "status update unavailable",
         );
-        assert_eq!(outcome.attempts, RECORDING_TERMINAL_CLEANUP_MAX_RETRIES);
+        assert_eq!(outcome.attempts, 1);
         assert!(
-            outcome.terminal_error.is_some(),
-            "the next retry should attempt terminal persistence again instead of restarting the full window"
+            outcome.terminal_error.is_none(),
+            "the next retry should wait for the cleanup window before terminal persistence"
         );
     }
 
@@ -10128,9 +10155,8 @@ mod status_message_tests {
 
         assert!(matches!(decision, TerminalCleanupRetryDecision::Reschedule));
         assert_eq!(
-            terminal_cleanup_failures,
-            RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1,
-            "persistence failures should preserve the terminal retry threshold without clearing local state"
+            terminal_cleanup_failures, 0,
+            "persistence failures should preserve local state while restarting the retry window"
         );
         harness.assert_matching_state_present().await;
         {

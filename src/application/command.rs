@@ -128,7 +128,10 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     // Production derives both values from the same resolved voice channel. This
     // protects direct callers, tests, and future call sites from mixing a
     // request with a preflight token created for a different channel.
-    if request.user_voice_channel_id.as_deref() != Some(preflight.voice_channel_id()) {
+    let Some(request_voice_channel_id) = request.user_voice_channel_id.as_deref() else {
+        return Err(CommandError::UserNotInVoice);
+    };
+    if request_voice_channel_id != preflight.voice_channel_id() {
         return Err(CommandError::PreflightMismatch);
     }
     let voice_channel_id = preflight.voice_channel_id().to_owned();
@@ -279,6 +282,25 @@ mod tests {
         assert!(
             store.get("m1").is_none(),
             "mismatched preflight must not create a meeting"
+        );
+    }
+
+    #[test]
+    fn record_start_after_preflight_preserves_missing_voice_error() {
+        let mut store = InMemoryMeetingStore::new();
+        let mut request = default_start_request();
+        request.user_voice_channel_id = None;
+        let preflight = RecordStartPreflight {
+            voice_channel_id: "vc-1".to_owned(),
+        };
+
+        let error = record_start_after_preflight(&mut store, request, preflight)
+            .expect_err("missing voice channel should use the preflight user error");
+
+        assert_eq!(error, CommandError::UserNotInVoice);
+        assert!(
+            store.get("m1").is_none(),
+            "missing voice channel must not create a meeting"
         );
     }
 }
