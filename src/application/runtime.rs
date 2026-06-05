@@ -2820,16 +2820,12 @@ impl EventHandler for ScaffoldHandler {
             self.spawn_background(async move {
                 // Keep these counters independent: cache misses decide grace
                 // rechecks, final-flush failures protect persisted audio, and
-                // stop failures protect the DB/job transition. If terminal
-                // cleanup removes the timer state but cannot yet mark the row
-                // terminal, retry_teardown_without_auto_stop_state bypasses
-                // AutoStopState and drives teardown directly.
+                // stop failures protect the DB/job transition.
                 let mut final_flush_failures = 0u32;
                 let mut grace_cache_misses = 0u32;
                 let mut lookup_failures = 0u32;
                 let mut stop_failures = 0u32;
                 let mut terminal_cleanup_failures = 0u32;
-                let mut retry_teardown_without_auto_stop_state = false;
                 let stop_result = loop {
                     tokio::select! {
                         _ = sleep(grace_for_task) => {}
@@ -3034,45 +3030,15 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        retry_teardown_without_auto_stop_state = true;
-                                        let mut startups =
-                                            handler.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_for_task,
-                                            expected_meeting_id_ref,
-                                        );
                                         continue;
                                     }
                                 }
-                            }
-                            if retry_teardown_without_auto_stop_state {
-                                // Terminal cleanup already removed the timer state. Keep
-                                // rescheduling on cache misses until the cache-miss counter
-                                // reaches its own terminal path or the cache becomes usable.
-                                let mut startups = handler.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
-                                );
-                                continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             if rearm_auto_stop_state_for_retry(&mut states, &guild_for_task) {
                                 continue;
                             }
                             return;
-                        }
-                        GraceExpiryDecision::Cancel if retry_teardown_without_auto_stop_state => {
-                            // A previous terminal cleanup attempt already removed local
-                            // session/timer state and attempted voice leave; continue DB
-                            // teardown instead of reviving an orphaned recording.
-                            warn!(
-                                guild_id = %guild_for_task,
-                                meeting_id = expected_meeting_id_ref,
-                                "auto-stop teardown retry has no timer state; continuing cleanup despite recovered member count"
-                            );
                         }
                         GraceExpiryDecision::Cancel => {
                             let Some(non_bot) = non_bot_at_fire else {
@@ -3100,9 +3066,7 @@ impl EventHandler for ScaffoldHandler {
                             grace_cache_misses = 0;
                         }
                     }
-                    let trigger = if retry_teardown_without_auto_stop_state {
-                        true
-                    } else {
+                    let trigger = {
                         let mut states = handler.auto_stop_states.lock().await;
                         match states.get_mut(&guild_for_task) {
                             Some(state) if state.belongs_to_meeting(expected_meeting_id_ref) => {
@@ -3246,26 +3210,9 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        retry_teardown_without_auto_stop_state = true;
-                                        let mut startups =
-                                            handler.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_for_task,
-                                            expected_meeting_id_ref,
-                                        );
                                         continue;
                                     }
                                 }
-                            }
-                            if retry_teardown_without_auto_stop_state {
-                                let mut startups = handler.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
-                                );
-                                continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             if !states.contains_key(&guild_for_task) {
@@ -3348,7 +3295,6 @@ impl EventHandler for ScaffoldHandler {
                                     guild_id = %guild_for_task,
                                     meeting_id = expected_meeting_id_ref,
                                     error = %err,
-                                    retry_teardown_without_auto_stop_state,
                                     "auto-stop found no active meeting; treating as already handled"
                                 );
                                 let removed_session = handler
@@ -3456,26 +3402,9 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        retry_teardown_without_auto_stop_state = true;
-                                        let mut startups =
-                                            handler.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_for_task,
-                                            expected_meeting_id_ref,
-                                        );
                                         continue;
                                     }
                                 }
-                            }
-                            if retry_teardown_without_auto_stop_state {
-                                let mut startups = handler.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
-                                );
-                                continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             if !states.contains_key(&guild_for_task) {
@@ -4069,7 +3998,7 @@ impl ScaffoldHandler {
             phase = request.phase,
             error = %request.err,
             attempts = outcome.attempts,
-            "terminal recording cleanup retry limit reached; clearing local runtime state"
+            "terminal recording cleanup retry limit reached; marking recording failed before local cleanup"
         );
         {
             let mut service = self.service.lock().await;
@@ -4083,8 +4012,9 @@ impl ScaffoldHandler {
                     meeting_id = request.expected_meeting_id,
                     phase = request.phase,
                     error = %err,
-                    "best-effort terminal cleanup status update failed before local state eviction"
+                    "terminal cleanup status update failed; preserving local state for retry"
                 );
+                return TerminalCleanupRetryDecision::Reschedule;
             }
         }
         let removed_session = self
@@ -6510,15 +6440,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         // Driver-disconnect has no timer state to consult after
                         // grace expiry, so the counters below bound only their
                         // own failure classes before terminal cleanup is tried.
-                        // If terminal cleanup removes local state but cannot
-                        // mark the row terminal, keep driving DB teardown even
-                        // if later voice cache checks would otherwise cancel.
                         let mut final_flush_failures = 0u32;
                         let mut grace_cache_misses = 0u32;
                         let mut lookup_failures = 0u32;
                         let mut stop_failures = 0u32;
                         let mut terminal_cleanup_failures = 0u32;
-                        let mut retry_teardown_after_failed_terminal_cleanup = false;
                         let stop_result = loop {
                             tokio::select! {
                                 _ = sleep(grace) => {}
@@ -6663,14 +6589,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                 }
                                             }
                                         }
-                                    }
-                                    if retry_teardown_after_failed_terminal_cleanup {
-                                        let mut startups = runtime.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_key,
-                                            expected_meeting_id_ref,
-                                        );
                                     }
                                     continue;
                                 }
@@ -6863,36 +6781,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 target_voice_channel_id,
                             );
                             match decide_driver_disconnect_grace_expiry(reconnected, non_bot) {
-                                GraceExpiryDecision::Reschedule
-                                    if retry_teardown_after_failed_terminal_cleanup =>
-                                {
-                                    let terminal_error =
-                                        driver_disconnect_cache_miss_terminal_error(
-                                            &mut grace_cache_misses,
-                                        );
-                                    warn!(
-                                        guild_id = %guild_key,
-                                        meeting_id = expected_meeting_id_ref,
-                                        cache_misses = grace_cache_misses,
-                                        "driver-disconnect teardown retry has no local state and voice cache is unavailable; rescheduling before forced cleanup"
-                                    );
-                                    if terminal_error.is_none() {
-                                        let mut startups =
-                                            runtime.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_key,
-                                            expected_meeting_id_ref,
-                                        );
-                                        continue;
-                                    }
-                                    warn!(
-                                        guild_id = %guild_key,
-                                        meeting_id = expected_meeting_id_ref,
-                                        cache_misses = grace_cache_misses,
-                                        "driver-disconnect teardown retry cache-miss limit reached; continuing forced cleanup"
-                                    );
-                                }
                                 GraceExpiryDecision::Reschedule => {
                                     let terminal_error = driver_disconnect_cache_miss_terminal_error(
                                         &mut grace_cache_misses,
@@ -6977,28 +6865,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
                                     }
-                                    if retry_teardown_after_failed_terminal_cleanup {
-                                        let mut startups = runtime.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_key,
-                                            expected_meeting_id_ref,
-                                        );
-                                    }
                                     continue;
-                                }
-                                GraceExpiryDecision::Cancel
-                                    if retry_teardown_after_failed_terminal_cleanup =>
-                                {
-                                    warn!(
-                                        guild_id = %guild_key,
-                                        meeting_id = expected_meeting_id_ref,
-                                        "driver-disconnect teardown retry has no local state; continuing cleanup despite recovered voice state"
-                                    );
                                 }
                                 GraceExpiryDecision::Cancel => return,
                                 GraceExpiryDecision::Stop => {
@@ -7120,25 +6990,14 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
-                                    }
-                                    if retry_teardown_after_failed_terminal_cleanup {
-                                        let mut startups = runtime.recording_startups.lock().await;
-                                        clear_matching_recording_startup(
-                                            &mut startups,
-                                            &guild_key,
-                                            expected_meeting_id_ref,
-                                        );
                                     }
                                     continue;
                                 }
                                 Err(RecordingTeardownError::Stop(err)) => {
                                     final_flush_failures = 0;
-                                    if retry_teardown_after_failed_terminal_cleanup
-                                        && err.is_target_absent()
-                                    {
+                                    if err.is_target_absent() {
                                         warn!(
                                             guild_id = %guild_key,
                                             meeting_id = expected_meeting_id_ref,
@@ -7250,7 +7109,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
                                     }
@@ -9238,10 +9096,10 @@ mod status_message_tests {
     }
 
     #[test]
-    fn terminal_cleanup_retry_exhaustion_clears_local_state_after_bounded_db_failures() {
+    fn terminal_cleanup_retry_exhaustion_preserves_local_state_when_db_update_fails() {
         let mut store =
             FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(usize::MAX);
-        let mut local_state = RecordingLocalState::with_matching_session(0);
+        let local_state = RecordingLocalState::with_matching_session(0);
         let mut terminal_cleanup_failures = 0;
 
         for expected_attempts in 1..RECORDING_TERMINAL_CLEANUP_MAX_RETRIES {
@@ -9264,19 +9122,41 @@ mod status_message_tests {
             .terminal_error
             .as_deref()
             .expect("retry limit should request local cleanup");
-        let _ = persist_terminal_cleanup_retry_exhaustion(&mut store, "m1", terminal_error);
-        let removed = local_state.clear_expected_meeting();
 
-        assert!(
-            removed.is_some(),
-            "terminal cleanup retry limit should evict local state even when best-effort DB write fails"
-        );
-        local_state.assert_matching_state_cleared();
+        let err = persist_terminal_cleanup_retry_exhaustion(&mut store, "m1", terminal_error)
+            .expect_err("DB outage should preserve local state for retry");
+
+        assert!(err.to_string().contains("status update unavailable"));
+        local_state.assert_matching_state_present();
         assert_eq!(
             store.meeting().status,
             crate::domain::MeetingStatus::Recording,
-            "DB outage is not hidden by local cleanup exhaustion"
+            "DB outage is not hidden by local cleanup"
         );
+    }
+
+    #[test]
+    fn terminal_cleanup_retry_exhaustion_clears_local_state_after_db_terminalizes() {
+        let mut store = FaultInjectedMeetingStore::with_recording_meeting();
+        let mut local_state = RecordingLocalState::with_matching_session(0);
+        let mut terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
+
+        let outcome = record_terminal_cleanup_retry_failure(
+            &mut terminal_cleanup_failures,
+            "auto-stop stop exhaustion",
+            "status update unavailable",
+        );
+        let terminal_error = outcome
+            .terminal_error
+            .as_deref()
+            .expect("retry limit should request local cleanup");
+        persist_terminal_cleanup_retry_exhaustion(&mut store, "m1", terminal_error)
+            .expect("terminal DB update must succeed before local cleanup");
+        let removed = local_state.clear_expected_meeting();
+
+        assert!(removed.is_some());
+        local_state.assert_matching_state_cleared();
+        assert_eq!(store.meeting().status, crate::domain::MeetingStatus::Failed);
     }
 
     #[test]
