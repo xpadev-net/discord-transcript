@@ -25,8 +25,9 @@ use discord_transcript::infrastructure::storage::{
     InMemoryMeetingStore, StoredMeeting, UsageEventStore,
 };
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -93,15 +94,64 @@ fn sql_query_key(sql: &str, params: &[&str]) -> String {
     format!("{}|{}", sql, params.join("\u{1f}"))
 }
 
-fn sql_row(values: &[&str]) -> SqlRow {
+fn sql_row_opt(values: &[Option<&str>]) -> SqlRow {
     values
         .iter()
-        .map(|value| Some((*value).to_owned()))
+        .map(|value| value.map(str::to_owned))
         .collect()
 }
 
+fn sql_row(values: &[&str]) -> SqlRow {
+    values.iter().map(|value| Some((*value).to_owned())).collect()
+}
+
 fn tenant_guild_row() -> SqlRow {
-    sql_row(&["tdg-1", "tenant-1", "g1"])
+    sql_row_opt(&[Some("tdg-1"), Some("tenant-1"), Some("g1")])
+}
+
+fn vc_participant_alias_candidate_id(
+    tenant_id: &str,
+    guild_id: &str,
+    canonical_name: &str,
+    alias: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "vc_participant",
+        tenant_id,
+        guild_id,
+        &canonical_name.to_lowercase(),
+        &alias.to_lowercase(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let suffix = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("vc-participant-{suffix}")
+}
+
+fn vc_participant_alias_upsert_params(alias: &str) -> Vec<String> {
+    vec![
+        vc_participant_alias_candidate_id("tenant-1", "g1", "Alice", alias),
+        "tdg-1".to_owned(),
+        "tenant-1".to_owned(),
+        "g1".to_owned(),
+        "Alice".to_owned(),
+        alias.to_owned(),
+        "123".to_owned(),
+        "vc_participant".to_owned(),
+        "m1".to_owned(),
+        String::new(),
+        "0.650".to_owned(),
+        "true".to_owned(),
+        "unreviewed".to_owned(),
+        "system:vc_participant".to_owned(),
+    ]
 }
 
 #[test]
@@ -122,6 +172,7 @@ fn sql_summary_context_upserts_vc_participant_alias_candidates() {
         .expect("summary context should load");
 
     assert_eq!(context.speakers.len(), 1);
+    // One speaker yields two alias candidates here: display_name and username.
     let upserts = store
         .executor
         .executed
@@ -145,6 +196,44 @@ fn sql_summary_context_upserts_vc_participant_alias_candidates() {
         assert_eq!(params[13], "system:vc_participant");
     }
     assert!(upserts.iter().any(|params| params[5] == "Alice Example"));
+    assert!(upserts.iter().any(|params| params[5] == "alice_dev"));
+}
+
+#[test]
+fn sql_summary_context_continues_vc_participant_alias_candidates_after_one_upsert_error() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![sql_row(&["123", "alice_dev", "Alice", "Alice Example"])],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let failing_params = vc_participant_alias_upsert_params("Alice Example");
+    let failing_param_refs = failing_params.iter().map(String::as_str).collect::<Vec<_>>();
+    executor.query_rows_error.insert(
+        sql_query_key(
+            UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+            &failing_param_refs,
+        ),
+        "UNIQUE_VIOLATION: duplicate key value violates unique constraint person_aliases_pkey"
+            .to_owned(),
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should continue after candidate upsert error");
+
+    let upserts = store
+        .executor
+        .executed
+        .iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 2);
     assert!(upserts.iter().any(|params| params[5] == "alice_dev"));
 }
 

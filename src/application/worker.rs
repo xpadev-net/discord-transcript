@@ -34,7 +34,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMeetingInput {
@@ -208,8 +208,27 @@ pub(crate) fn upsert_vc_participant_alias_candidates_for_guild<E: SqlExecutor>(
     let candidates = build_vc_participant_alias_candidates(&tenant_guild, meeting_id, speakers);
     let mut upserted = Vec::new();
     for candidate in candidates {
-        if let Some(alias) = store.upsert_vc_participant_person_alias_candidate(&candidate)? {
-            upserted.push(alias);
+        match store.upsert_vc_participant_person_alias_candidate(&candidate) {
+            Ok(Some(alias)) => upserted.push(alias),
+            Ok(None) => {
+                debug!(
+                    meeting_id = %meeting_id,
+                    guild_id = %guild_id,
+                    canonical_name = %candidate.canonical_name,
+                    alias = %candidate.alias,
+                    "skipped VC participant alias candidate because existing alias was not eligible for automatic update"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    guild_id = %guild_id,
+                    canonical_name = %candidate.canonical_name,
+                    alias = %candidate.alias,
+                    error = %err,
+                    "failed to upsert VC participant alias candidate"
+                );
+            }
         }
     }
     Ok(upserted)
