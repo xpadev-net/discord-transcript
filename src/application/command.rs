@@ -69,6 +69,7 @@ pub enum CommandError {
     AlreadyExists {
         meeting_id: String,
     },
+    PreflightMismatch,
     NoActiveMeeting,
     Store(String),
     Stop(String),
@@ -86,6 +87,7 @@ impl Display for CommandError {
             Self::AlreadyExists { meeting_id } => {
                 write!(f, "meeting already exists: {meeting_id}")
             }
+            Self::PreflightMismatch => write!(f, "record-start preflight does not match request"),
             Self::NoActiveMeeting => write!(f, "no active meeting found"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Stop(err) => write!(f, "{err}"),
@@ -123,11 +125,9 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     request: RecordStartRequest,
     preflight: RecordStartPreflight,
 ) -> Result<RecordStartResult, CommandError> {
-    assert_eq!(
-        request.user_voice_channel_id.as_deref(),
-        Some(preflight.voice_channel_id()),
-        "record-start preflight must come from the same request voice channel"
-    );
+    if request.user_voice_channel_id.as_deref() != Some(preflight.voice_channel_id()) {
+        return Err(CommandError::PreflightMismatch);
+    }
     let voice_channel_id = preflight.voice_channel_id().to_owned();
     store.create_meeting_as_recording(CreateMeetingRequest {
         id: request.meeting_id.clone(),
@@ -237,5 +237,45 @@ pub fn authorize_record_stop_for_meeting(
         Ok(())
     } else {
         Err(CommandError::Unauthorized("stop recording"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::storage::InMemoryMeetingStore;
+
+    fn default_start_request() -> RecordStartRequest {
+        RecordStartRequest {
+            meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            started_by_user_id: "u1".to_owned(),
+            command_channel_id: "report-chan".to_owned(),
+            user_voice_channel_id: Some("vc-1".to_owned()),
+            permissions: PermissionSet {
+                can_connect_voice: true,
+                can_send_messages: true,
+            },
+            caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
+        }
+    }
+
+    #[test]
+    fn record_start_after_preflight_rejects_mismatched_voice_channel() {
+        let mut store = InMemoryMeetingStore::new();
+        let request = default_start_request();
+        let preflight = RecordStartPreflight {
+            voice_channel_id: "vc-2".to_owned(),
+        };
+
+        let error = record_start_after_preflight(&mut store, request, preflight)
+            .expect_err("mismatched preflight should be rejected");
+
+        assert_eq!(error, CommandError::PreflightMismatch);
+        assert!(
+            store.get("m1").is_none(),
+            "mismatched preflight must not create a meeting"
+        );
     }
 }
