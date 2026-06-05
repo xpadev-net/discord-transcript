@@ -654,6 +654,14 @@ fn mark_recording_start_failed_after_setup_error<S: MeetingStore>(
     }
 }
 
+fn mark_recording_start_failed_before_local_cleanup<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    error_message: &str,
+) -> Result<(), StoreError> {
+    mark_recording_start_failed_after_setup_error(store, meeting_id, error_message)
+}
+
 fn recording_startup_conflict(
     startups: &HashMap<String, String>,
     guild_key: &str,
@@ -2663,7 +2671,7 @@ impl EventHandler for ScaffoldHandler {
         let active_voice_channel = match self.active_meeting_voice_channel_result().await {
             Ok(Some(active_voice_channel)) => active_voice_channel,
             Ok(None) => {
-                let _lifecycle_permit = self.recording_lifecycle_write_permit().await;
+                let lifecycle_permit = self.recording_lifecycle_write_permit().await;
                 match self.active_meeting_voice_channel_result().await {
                     Ok(Some(active_voice_channel)) => active_voice_channel,
                     Ok(None) => {
@@ -2674,19 +2682,28 @@ impl EventHandler for ScaffoldHandler {
                                 .map(|session| session.meeting_id.clone())
                         };
                         if let Some(meeting_id) = session_meeting_id {
-                            self.clear_local_recording_state_after_terminal_absence(
+                            let removed_session = self
+                                .remove_local_recording_state_after_terminal_absence(
+                                    &guild_key,
+                                    &meeting_id,
+                                )
+                                .await;
+                            drop(lifecycle_permit);
+                            self.finish_terminal_absence_cleanup(
                                 &ctx,
                                 self.guild_id,
                                 &guild_key,
                                 &meeting_id,
                                 "voice-state inactive meeting cleanup",
+                                removed_session,
                             )
                             .await;
                         } else if let Some(meeting_id) = {
                             let startups = self.recording_startups.lock().await;
                             startups.get(&guild_key).cloned()
                         } {
-                            self.cleanup_failed_recording_start_locked(
+                            drop(lifecycle_permit);
+                            self.cleanup_failed_recording_start_after_inactive_voice_state(
                                 &guild_key,
                                 &meeting_id,
                                 "active meeting disappeared before recording setup completed",
@@ -3277,14 +3294,13 @@ impl EventHandler for ScaffoldHandler {
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
                             final_flush_failures = 0;
-                            if retry_teardown_without_auto_stop_state
-                                && is_terminal_stop_target_absent_error(&err)
-                            {
+                            if is_terminal_stop_target_absent_error(&err) {
                                 warn!(
                                     guild_id = %guild_for_task,
                                     meeting_id = expected_meeting_id_ref,
                                     error = %err,
-                                    "auto-stop terminal cleanup retry found no active meeting; treating as already handled"
+                                    retry_teardown_without_auto_stop_state,
+                                    "auto-stop found no active meeting; treating as already handled"
                                 );
                                 handler
                                     .clear_local_recording_state_after_terminal_absence(
@@ -4168,7 +4184,7 @@ impl ScaffoldHandler {
             .await;
     }
 
-    async fn cleanup_failed_recording_start_locked(
+    async fn cleanup_failed_recording_start_after_inactive_voice_state(
         &self,
         guild_key: &str,
         meeting_id: &str,
@@ -4176,7 +4192,7 @@ impl ScaffoldHandler {
     ) {
         {
             let mut service = self.service.lock().await;
-            match mark_recording_start_failed_after_setup_error(
+            match mark_recording_start_failed_before_local_cleanup(
                 &mut service.store,
                 meeting_id,
                 error_message,
@@ -4188,11 +4204,49 @@ impl ScaffoldHandler {
                     error!(
                         meeting_id,
                         error = %err,
-                        "failed to mark meeting as failed after voice join error; clearing local recording setup state"
+                        "failed to mark meeting as failed after inactive voice-state cleanup; preserving local recording setup state for retry"
                     );
+                    return;
                 }
             }
         }
+
+        let _command_guard = self.command_gate.write().await;
+        self.clear_failed_recording_start_local_state(guild_key, meeting_id)
+            .await;
+    }
+
+    async fn cleanup_failed_recording_start_locked(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+    ) {
+        {
+            let mut service = self.service.lock().await;
+            match mark_recording_start_failed_before_local_cleanup(
+                &mut service.store,
+                meeting_id,
+                error_message,
+            ) {
+                Ok(()) => {
+                    debug!(meeting_id, "record-start setup failure cleanup completed");
+                }
+                Err(err) => {
+                    error!(
+                        meeting_id,
+                        error = %err,
+                        "failed to mark meeting as failed after voice join error; preserving local recording setup state for retry"
+                    );
+                    return;
+                }
+            }
+        }
+        self.clear_failed_recording_start_local_state(guild_key, meeting_id)
+            .await;
+    }
+
+    async fn clear_failed_recording_start_local_state(&self, guild_key: &str, meeting_id: &str) {
         {
             let mut startups = self.recording_startups.lock().await;
             clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
@@ -4200,12 +4254,7 @@ impl ScaffoldHandler {
         {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mut sessions = self.sessions.lock().await;
-            if sessions
-                .get(guild_key)
-                .is_some_and(|session| session.meeting_id == meeting_id)
-            {
-                sessions.remove(guild_key);
-            }
+            remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id);
         }
         {
             let mut states = self.auto_stop_states.lock().await;
@@ -9349,6 +9398,43 @@ mod status_message_tests {
         let meeting = store.get("m1").expect("meeting should remain");
         assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
         assert_eq!(meeting.error_message, None);
+    }
+
+    #[test]
+    fn record_start_setup_cleanup_db_failure_preserves_local_state() {
+        let mut store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let mut local_state = RecordingLocalState::with_matching_session(0);
+
+        let err = mark_recording_start_failed_before_local_cleanup(
+            &mut store,
+            "m1",
+            "voice join failed after setup",
+        )
+        .expect_err("backend failure should stop local cleanup");
+
+        assert!(err.to_string().contains("status update unavailable"));
+        assert_eq!(
+            store.meeting().status,
+            crate::domain::MeetingStatus::Recording
+        );
+        local_state.assert_matching_state_present();
+
+        mark_recording_start_failed_before_local_cleanup(
+            &mut store,
+            "m1",
+            "voice join failed after setup",
+        )
+        .expect("retry should mark failed once store recovers");
+        let removed = local_state.clear_expected_meeting();
+
+        assert!(removed.is_some());
+        local_state.assert_matching_state_cleared();
+        let meeting = store.meeting();
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("voice join failed after setup")
+        );
     }
 
     #[test]
