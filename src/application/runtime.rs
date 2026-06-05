@@ -735,12 +735,17 @@ struct RecordingLookupFailureRequest<'a> {
 }
 
 struct TerminalCleanupRetryFailureRequest<'a> {
-    ctx: &'a Context,
-    guild_id: GuildId,
     guild_key: &'a str,
     expected_meeting_id: &'a str,
     phase: &'a str,
     err: &'a str,
+}
+
+enum TerminalCleanupRetryDecision {
+    Reschedule,
+    Cleared {
+        removed_session: Box<Option<RecordingSession<LocalChunkStorage>>>,
+    },
 }
 
 #[must_use]
@@ -2711,11 +2716,11 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop lookup exhaustion; rescheduling"
                                         );
-                                        if handler
+                                        if let TerminalCleanupRetryDecision::Cleared {
+                                            removed_session,
+                                        } = handler
                                             .handle_terminal_cleanup_retry_failure(
                                                 TerminalCleanupRetryFailureRequest {
-                                                    ctx: &ctx_for_task,
-                                                    guild_id: handler.guild_id,
                                                     guild_key: &guild_for_task,
                                                     expected_meeting_id: expected_meeting_id_ref,
                                                     phase: "auto-stop active-meeting lookup",
@@ -2725,6 +2730,17 @@ impl EventHandler for ScaffoldHandler {
                                             )
                                             .await
                                         {
+                                            drop(lifecycle_permit);
+                                            handler
+                                                .finish_terminal_absence_cleanup(
+                                                    &ctx_for_task,
+                                                    handler.guild_id,
+                                                    &guild_for_task,
+                                                    expected_meeting_id_ref,
+                                                    "auto-stop active-meeting lookup",
+                                                    *removed_session,
+                                                )
+                                                .await;
                                             return;
                                         }
                                         lookup_failures = 0;
@@ -2814,11 +2830,11 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop cache-miss exhaustion; rescheduling"
                                         );
-                                        if handler
+                                        if let TerminalCleanupRetryDecision::Cleared {
+                                            removed_session,
+                                        } = handler
                                             .handle_terminal_cleanup_retry_failure(
                                                 TerminalCleanupRetryFailureRequest {
-                                                    ctx: &ctx_for_task,
-                                                    guild_id: handler.guild_id,
                                                     guild_key: &guild_for_task,
                                                     expected_meeting_id: expected_meeting_id_ref,
                                                     phase: "auto-stop cache-miss exhaustion",
@@ -2828,15 +2844,39 @@ impl EventHandler for ScaffoldHandler {
                                             )
                                             .await
                                         {
+                                            drop(lifecycle_permit);
+                                            handler
+                                                .finish_terminal_absence_cleanup(
+                                                    &ctx_for_task,
+                                                    handler.guild_id,
+                                                    &guild_for_task,
+                                                    expected_meeting_id_ref,
+                                                    "auto-stop cache-miss exhaustion",
+                                                    *removed_session,
+                                                )
+                                                .await;
                                             return;
                                         }
                                         grace_cache_misses = 0;
                                         retry_teardown_without_auto_stop_state = true;
+                                        let mut startups =
+                                            handler.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_for_task,
+                                            expected_meeting_id_ref,
+                                        );
                                         continue;
                                     }
                                 }
                             }
                             if retry_teardown_without_auto_stop_state {
+                                let mut startups = handler.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                );
                                 continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
@@ -2984,11 +3024,11 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop final flush exhaustion; rescheduling"
                                         );
-                                        if handler
+                                        if let TerminalCleanupRetryDecision::Cleared {
+                                            removed_session,
+                                        } = handler
                                             .handle_terminal_cleanup_retry_failure(
                                                 TerminalCleanupRetryFailureRequest {
-                                                    ctx: &ctx_for_task,
-                                                    guild_id: handler.guild_id,
                                                     guild_key: &guild_for_task,
                                                     expected_meeting_id: expected_meeting_id_ref,
                                                     phase: "auto-stop final flush exhaustion",
@@ -2998,15 +3038,39 @@ impl EventHandler for ScaffoldHandler {
                                             )
                                             .await
                                         {
+                                            drop(lifecycle_permit);
+                                            handler
+                                                .finish_terminal_absence_cleanup(
+                                                    &ctx_for_task,
+                                                    handler.guild_id,
+                                                    &guild_for_task,
+                                                    expected_meeting_id_ref,
+                                                    "auto-stop final flush exhaustion",
+                                                    *removed_session,
+                                                )
+                                                .await;
                                             return;
                                         }
                                         final_flush_failures = 0;
                                         retry_teardown_without_auto_stop_state = true;
+                                        let mut startups =
+                                            handler.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_for_task,
+                                            expected_meeting_id_ref,
+                                        );
                                         continue;
                                     }
                                 }
                             }
                             if retry_teardown_without_auto_stop_state {
+                                let mut startups = handler.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                );
                                 continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
@@ -3133,11 +3197,11 @@ impl EventHandler for ScaffoldHandler {
                                             error = %mark_err,
                                             "failed to mark recording failed after auto-stop stop exhaustion; rescheduling"
                                         );
-                                        if handler
+                                        if let TerminalCleanupRetryDecision::Cleared {
+                                            removed_session,
+                                        } = handler
                                             .handle_terminal_cleanup_retry_failure(
                                                 TerminalCleanupRetryFailureRequest {
-                                                    ctx: &ctx_for_task,
-                                                    guild_id: handler.guild_id,
                                                     guild_key: &guild_for_task,
                                                     expected_meeting_id: expected_meeting_id_ref,
                                                     phase: "auto-stop stop exhaustion",
@@ -3147,15 +3211,39 @@ impl EventHandler for ScaffoldHandler {
                                             )
                                             .await
                                         {
+                                            drop(lifecycle_permit);
+                                            handler
+                                                .finish_terminal_absence_cleanup(
+                                                    &ctx_for_task,
+                                                    handler.guild_id,
+                                                    &guild_for_task,
+                                                    expected_meeting_id_ref,
+                                                    "auto-stop stop exhaustion",
+                                                    *removed_session,
+                                                )
+                                                .await;
                                             return;
                                         }
                                         stop_failures = 0;
                                         retry_teardown_without_auto_stop_state = true;
+                                        let mut startups =
+                                            handler.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_for_task,
+                                            expected_meeting_id_ref,
+                                        );
                                         continue;
                                     }
                                 }
                             }
                             if retry_teardown_without_auto_stop_state {
+                                let mut startups = handler.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                );
                                 continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
@@ -3682,7 +3770,26 @@ impl ScaffoldHandler {
         expected_meeting_id: &str,
         phase: &str,
     ) {
-        let mut removed_session = {
+        let removed_session = self
+            .remove_local_recording_state_after_terminal_absence(guild_key, expected_meeting_id)
+            .await;
+        self.finish_terminal_absence_cleanup(
+            ctx,
+            guild_id,
+            guild_key,
+            expected_meeting_id,
+            phase,
+            removed_session,
+        )
+        .await;
+    }
+
+    async fn remove_local_recording_state_after_terminal_absence(
+        &self,
+        guild_key: &str,
+        expected_meeting_id: &str,
+    ) -> Option<RecordingSession<LocalChunkStorage>> {
+        let removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mut sessions = self.sessions.lock().await;
             if sessions
@@ -3694,6 +3801,28 @@ impl ScaffoldHandler {
                 None
             }
         };
+        {
+            let mut states = self.auto_stop_states.lock().await;
+            states.remove(guild_key);
+        }
+        {
+            let mut titles = self.live_transcription_titles.lock().await;
+            titles.remove(expected_meeting_id);
+        }
+        let mut startups = self.recording_startups.lock().await;
+        clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
+        removed_session
+    }
+
+    async fn finish_terminal_absence_cleanup(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+        guild_key: &str,
+        expected_meeting_id: &str,
+        phase: &str,
+        mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
+    ) {
         if removed_session.is_some()
             && let Some(manager) = songbird::get(ctx).await
         {
@@ -3710,23 +3839,13 @@ impl ScaffoldHandler {
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&latest_tracker);
         }
-        {
-            let mut states = self.auto_stop_states.lock().await;
-            states.remove(guild_key);
-        }
-        {
-            let mut titles = self.live_transcription_titles.lock().await;
-            titles.remove(expected_meeting_id);
-        }
-        let mut startups = self.recording_startups.lock().await;
-        clear_matching_recording_startup(&mut startups, guild_key, expected_meeting_id);
     }
 
     async fn handle_terminal_cleanup_retry_failure(
         &self,
         request: TerminalCleanupRetryFailureRequest<'_>,
         terminal_cleanup_failures: &mut u32,
-    ) -> bool {
+    ) -> TerminalCleanupRetryDecision {
         *terminal_cleanup_failures = (*terminal_cleanup_failures).saturating_add(1);
         warn!(
             guild_id = %request.guild_key,
@@ -3739,7 +3858,7 @@ impl ScaffoldHandler {
         );
 
         if *terminal_cleanup_failures < RECORDING_TERMINAL_CLEANUP_MAX_RETRIES {
-            return false;
+            return TerminalCleanupRetryDecision::Reschedule;
         }
 
         error!(
@@ -3750,15 +3869,15 @@ impl ScaffoldHandler {
             attempts = *terminal_cleanup_failures,
             "terminal recording cleanup retry limit reached; clearing local runtime state"
         );
-        self.clear_local_recording_state_after_terminal_absence(
-            request.ctx,
-            request.guild_id,
-            request.guild_key,
-            request.expected_meeting_id,
-            request.phase,
-        )
-        .await;
-        true
+        let removed_session = self
+            .remove_local_recording_state_after_terminal_absence(
+                request.guild_key,
+                request.expected_meeting_id,
+            )
+            .await;
+        TerminalCleanupRetryDecision::Cleared {
+            removed_session: Box::new(removed_session),
+        }
     }
 
     async fn fail_recording_after_lookup_exhaustion(
@@ -6112,11 +6231,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect lookup exhaustion; rescheduling"
                                                 );
-                                                if runtime
+                                                if let TerminalCleanupRetryDecision::Cleared {
+                                                    removed_session,
+                                                } = runtime
                                                     .handle_terminal_cleanup_retry_failure(
                                                         TerminalCleanupRetryFailureRequest {
-                                                            ctx: &ctx_for_task,
-                                                            guild_id: runtime.guild_id,
                                                             guild_key: &guild_key,
                                                             expected_meeting_id:
                                                                 expected_meeting_id_ref,
@@ -6127,11 +6246,30 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     )
                                                     .await
                                                 {
+                                                    drop(lifecycle_permit);
+                                                    runtime
+                                                        .finish_terminal_absence_cleanup(
+                                                            &ctx_for_task,
+                                                            runtime.guild_id,
+                                                            &guild_key,
+                                                            expected_meeting_id_ref,
+                                                            "driver-disconnect active-meeting lookup",
+                                                            *removed_session,
+                                                        )
+                                                        .await;
                                                     return;
                                                 }
                                                 lookup_failures = 0;
                                             }
                                         }
+                                    }
+                                    if retry_teardown_after_failed_terminal_cleanup {
+                                        let mut startups = runtime.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_key,
+                                            expected_meeting_id_ref,
+                                        );
                                     }
                                     continue;
                                 }
@@ -6180,11 +6318,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect voice-channel absence; rescheduling"
                                                 );
-                                                if runtime
+                                                if let TerminalCleanupRetryDecision::Cleared {
+                                                    removed_session,
+                                                } = runtime
                                                     .handle_terminal_cleanup_retry_failure(
                                                         TerminalCleanupRetryFailureRequest {
-                                                            ctx: &ctx_for_task,
-                                                            guild_id: runtime.guild_id,
                                                             guild_key: &guild_key,
                                                             expected_meeting_id:
                                                                 expected_meeting_id_ref,
@@ -6195,6 +6333,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     )
                                                     .await
                                                 {
+                                                    drop(lifecycle_permit);
+                                                    runtime
+                                                        .finish_terminal_absence_cleanup(
+                                                            &ctx_for_task,
+                                                            runtime.guild_id,
+                                                            &guild_key,
+                                                            expected_meeting_id_ref,
+                                                            "driver-disconnect voice-channel absence",
+                                                            *removed_session,
+                                                        )
+                                                        .await;
                                                     return;
                                                 }
                                                 continue;
@@ -6247,11 +6396,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         error = %mark_err,
                                                         "failed to mark recording failed after driver-disconnect voice-channel lookup exhaustion; rescheduling"
                                                     );
-                                                    if runtime
+                                                    if let TerminalCleanupRetryDecision::Cleared {
+                                                        removed_session,
+                                                    } = runtime
                                                         .handle_terminal_cleanup_retry_failure(
                                                             TerminalCleanupRetryFailureRequest {
-                                                                ctx: &ctx_for_task,
-                                                                guild_id: runtime.guild_id,
                                                                 guild_key: &guild_key,
                                                                 expected_meeting_id:
                                                                     expected_meeting_id_ref,
@@ -6262,6 +6411,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         )
                                                         .await
                                                     {
+                                                        drop(lifecycle_permit);
+                                                        runtime
+                                                            .finish_terminal_absence_cleanup(
+                                                                &ctx_for_task,
+                                                                runtime.guild_id,
+                                                                &guild_key,
+                                                                expected_meeting_id_ref,
+                                                                "driver-disconnect voice-channel lookup",
+                                                                *removed_session,
+                                                            )
+                                                            .await;
                                                         return;
                                                     }
                                                     lookup_failures = 0;
@@ -6348,11 +6508,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect cache-miss exhaustion; rescheduling"
                                                 );
-                                                if runtime
+                                                if let TerminalCleanupRetryDecision::Cleared {
+                                                    removed_session,
+                                                } = runtime
                                                     .handle_terminal_cleanup_retry_failure(
                                                         TerminalCleanupRetryFailureRequest {
-                                                            ctx: &ctx_for_task,
-                                                            guild_id: runtime.guild_id,
                                                             guild_key: &guild_key,
                                                             expected_meeting_id:
                                                                 expected_meeting_id_ref,
@@ -6363,12 +6523,31 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     )
                                                     .await
                                                 {
+                                                    drop(lifecycle_permit);
+                                                    runtime
+                                                        .finish_terminal_absence_cleanup(
+                                                            &ctx_for_task,
+                                                            runtime.guild_id,
+                                                            &guild_key,
+                                                            expected_meeting_id_ref,
+                                                            "driver-disconnect cache-miss exhaustion",
+                                                            *removed_session,
+                                                        )
+                                                        .await;
                                                     return;
                                                 }
                                                 grace_cache_misses = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
+                                    }
+                                    if retry_teardown_after_failed_terminal_cleanup {
+                                        let mut startups = runtime.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_key,
+                                            expected_meeting_id_ref,
+                                        );
                                     }
                                     continue;
                                 }
@@ -6473,11 +6652,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect final flush exhaustion; rescheduling"
                                                 );
-                                                if runtime
+                                                if let TerminalCleanupRetryDecision::Cleared {
+                                                    removed_session,
+                                                } = runtime
                                                     .handle_terminal_cleanup_retry_failure(
                                                         TerminalCleanupRetryFailureRequest {
-                                                            ctx: &ctx_for_task,
-                                                            guild_id: runtime.guild_id,
                                                             guild_key: &guild_key,
                                                             expected_meeting_id:
                                                                 expected_meeting_id_ref,
@@ -6488,12 +6667,31 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     )
                                                     .await
                                                 {
+                                                    drop(lifecycle_permit);
+                                                    runtime
+                                                        .finish_terminal_absence_cleanup(
+                                                            &ctx_for_task,
+                                                            runtime.guild_id,
+                                                            &guild_key,
+                                                            expected_meeting_id_ref,
+                                                            "driver-disconnect final flush exhaustion",
+                                                            *removed_session,
+                                                        )
+                                                        .await;
                                                     return;
                                                 }
                                                 final_flush_failures = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
+                                    }
+                                    if retry_teardown_after_failed_terminal_cleanup {
+                                        let mut startups = runtime.recording_startups.lock().await;
+                                        clear_matching_recording_startup(
+                                            &mut startups,
+                                            &guild_key,
+                                            expected_meeting_id_ref,
+                                        );
                                     }
                                     continue;
                                 }
@@ -6577,11 +6775,11 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     error = %mark_err,
                                                     "failed to mark recording failed after driver-disconnect stop exhaustion; rescheduling"
                                                 );
-                                                if runtime
+                                                if let TerminalCleanupRetryDecision::Cleared {
+                                                    removed_session,
+                                                } = runtime
                                                     .handle_terminal_cleanup_retry_failure(
                                                         TerminalCleanupRetryFailureRequest {
-                                                            ctx: &ctx_for_task,
-                                                            guild_id: runtime.guild_id,
                                                             guild_key: &guild_key,
                                                             expected_meeting_id:
                                                                 expected_meeting_id_ref,
@@ -6592,6 +6790,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     )
                                                     .await
                                                 {
+                                                    drop(lifecycle_permit);
+                                                    runtime
+                                                        .finish_terminal_absence_cleanup(
+                                                            &ctx_for_task,
+                                                            runtime.guild_id,
+                                                            &guild_key,
+                                                            expected_meeting_id_ref,
+                                                            "driver-disconnect stop exhaustion",
+                                                            *removed_session,
+                                                        )
+                                                        .await;
                                                     return;
                                                 }
                                                 stop_failures = 0;
