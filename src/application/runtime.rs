@@ -24,6 +24,8 @@ use crate::audio::recording_session::{PersistedChunk, RecordingSession};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
 use crate::bootstrap::config::{AppConfig, SummaryHarness};
 use crate::domain::authz::UserRole;
+use crate::domain::feedback::TranscriptFeedbackStatus;
+use crate::domain::person_alias::PersonAliasReviewStatus;
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::transcript::{
@@ -2012,13 +2014,14 @@ where
     }
 }
 
-fn retry_summary_job_after_transcript_persist_failure<S, Q>(
+fn retry_summary_job_after_transcribing_phase_failure<S, Q>(
     store: &mut S,
     queue: &mut Q,
     meeting_id: &str,
     job_id: &str,
     error_message: String,
     max_retries: u32,
+    phase: &str,
 ) -> Result<bool, String>
 where
     S: MeetingStore,
@@ -2032,22 +2035,23 @@ where
         warn!(
             meeting_id,
             job_id,
+            phase,
             error = %err,
-            "transcript persist retry cannot restore meeting to retryable state; marking job failed"
+            "summary job retry cannot restore meeting to retryable state; marking job failed"
         );
         let _ = queue.mark_failed(job_id, error_message.clone());
         store
             .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
             .map_err(|store_err| {
                 format!(
-                    "transcript persist retry status restore failed ({err}) and meeting failure update failed: {store_err}"
+                    "{phase} retry status restore failed ({err}) and meeting failure update failed: {store_err}"
                 )
             })?;
         store
             .set_error_message(meeting_id, Some(error_message))
             .map_err(|store_err| {
                 format!(
-                    "transcript persist retry status restore failed ({err}) and error message update failed: {store_err}"
+                    "{phase} retry status restore failed ({err}) and error message update failed: {store_err}"
                 )
             })?;
         return Ok(true);
@@ -2059,8 +2063,9 @@ where
                 warn!(
                     meeting_id,
                     job_id,
+                    phase,
                     error = %err,
-                    "transcript persist retry queued but error message update failed"
+                    "summary job retry queued but error message update failed"
                 );
             }
             Ok(false)
@@ -2069,16 +2074,12 @@ where
             store
                 .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
                 .map_err(|err| {
-                    format!(
-                        "transcript persist retry exhausted but meeting failure update failed: {err}"
-                    )
+                    format!("{phase} retry exhausted but meeting failure update failed: {err}")
                 })?;
             store
                 .set_error_message(meeting_id, Some(error_message))
                 .map_err(|err| {
-                    format!(
-                        "transcript persist retry exhausted but error message update failed: {err}"
-                    )
+                    format!("{phase} retry exhausted but error message update failed: {err}")
                 })?;
             Ok(true)
         }
@@ -2086,21 +2087,22 @@ where
             warn!(
                 meeting_id,
                 job_id,
+                phase,
                 status = %status.as_str(),
-                "unexpected transcript persist retry status; marking meeting failed"
+                "unexpected summary job retry status; marking meeting failed"
             );
             store
                 .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
                 .map_err(|err| {
                     format!(
-                        "transcript persist retry returned unexpected status {status:?} and meeting failure update failed: {err}"
+                        "{phase} retry returned unexpected status {status:?} and meeting failure update failed: {err}"
                     )
                 })?;
             store
                 .set_error_message(meeting_id, Some(error_message))
                 .map_err(|err| {
                     format!(
-                        "transcript persist retry returned unexpected status {status:?} and error message update failed: {err}"
+                        "{phase} retry returned unexpected status {status:?} and error message update failed: {err}"
                     )
                 })?;
             Ok(true)
@@ -2109,8 +2111,9 @@ where
             warn!(
                 meeting_id,
                 job_id,
+                phase,
                 error = %err,
-                "failed to durably retry transcript persist failure; leaving meeting status unchanged"
+                "failed to durably retry summary job failure; leaving meeting status unchanged"
             );
             if let Err(status_err) = store.set_meeting_status(
                 meeting_id,
@@ -2120,8 +2123,9 @@ where
                 warn!(
                     meeting_id,
                     job_id,
+                    phase,
                     error = %status_err,
-                    "failed to restore meeting status after transcript persist retry backend error"
+                    "failed to restore meeting status after retry backend error"
                 );
             }
             let _ = store.set_error_message(meeting_id, Some(error_message));
@@ -2131,21 +2135,22 @@ where
             warn!(
                 meeting_id,
                 job_id,
+                phase,
                 error = %err,
-                "transcript persist retry cannot be durably scheduled"
+                "summary job retry cannot be durably scheduled"
             );
             store
                 .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
                 .map_err(|store_err| {
                     format!(
-                        "transcript persist retry failed ({err}) and meeting failure update failed: {store_err}"
+                        "{phase} retry failed ({err}) and meeting failure update failed: {store_err}"
                     )
                 })?;
             store
                 .set_error_message(meeting_id, Some(error_message))
                 .map_err(|store_err| {
                     format!(
-                        "transcript persist retry failed ({err}) and error message update failed: {store_err}"
+                        "{phase} retry failed ({err}) and error message update failed: {store_err}"
                     )
                 })?;
             Ok(true)
@@ -2654,6 +2659,48 @@ fn load_runtime_summary_context(
                 "failed to load domain knowledge for meeting {meeting_id}: {err}"
             ))
         })?;
+    let tenant = store.resolve_tenant_by_guild(guild_id).map_err(|err| {
+        crate::application::summary::SummaryError::SummaryEngine(format!(
+            "failed to resolve active tenant for meeting {meeting_id}: {err}"
+        ))
+    })?;
+    let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+        (
+            store
+                .list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)
+                .map_err(|err| {
+                    crate::application::summary::SummaryError::SummaryEngine(format!(
+                        "failed to load AI memory for meeting {meeting_id}: {err}"
+                    ))
+                })?,
+            store
+                .list_transcript_feedback(
+                    &tenant.tenant_id,
+                    guild_id,
+                    Some(TranscriptFeedbackStatus::Accepted),
+                    None,
+                )
+                .map_err(|err| {
+                    crate::application::summary::SummaryError::SummaryEngine(format!(
+                        "failed to load accepted user feedback for meeting {meeting_id}: {err}"
+                    ))
+                })?,
+            store
+                .list_person_aliases(
+                    &tenant.tenant_id,
+                    guild_id,
+                    false,
+                    Some(PersonAliasReviewStatus::Accepted),
+                )
+                .map_err(|err| {
+                    crate::application::summary::SummaryError::SummaryEngine(format!(
+                        "failed to load person aliases for meeting {meeting_id}: {err}"
+                    ))
+                })?,
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
 
     let summary_template = crate::application::worker::load_effective_summary_template(
         store,
@@ -2669,6 +2716,9 @@ fn load_runtime_summary_context(
     Ok(crate::application::summary::SummaryContextInput {
         speakers: Vec::new(),
         domain_knowledge,
+        ai_memory,
+        user_feedback,
+        person_aliases,
         summary_template,
         effective_summary_template_id: effective_settings.summary_template_id.clone(),
         effective_domain_knowledge_version_id: effective_settings
@@ -6492,13 +6542,14 @@ impl ScaffoldHandler {
             let retry_result = {
                 let mut service = self.service.lock().await;
                 let mut queue = self.queue.lock().await;
-                retry_summary_job_after_transcript_persist_failure(
+                retry_summary_job_after_transcribing_phase_failure(
                     &mut service.store,
                     &mut *queue,
                     &claimed_job.meeting_id,
                     &claimed_job.id,
                     err.clone(),
                     self.summary_max_retries,
+                    "transcript_persist",
                 )
             };
             let exhausted = match retry_result {
@@ -6569,6 +6620,79 @@ impl ScaffoldHandler {
             &request.workspace,
             &summary_transcript,
         );
+        let summary_context = tokio::task::block_in_place(|| {
+            let mut service = self.service.blocking_lock();
+            load_runtime_summary_context(
+                &mut service.store,
+                &claimed_job.meeting_id,
+                &meeting.guild_id,
+                &effective_settings,
+            )
+        });
+        let context_manifest = match summary_context.and_then(|mut summary_context| {
+            summary_context.speakers = summary_context_speakers
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            tokio::task::block_in_place(|| {
+                crate::application::summary::materialize_or_load_summary_context(
+                    &request,
+                    &summary_context,
+                )
+            })
+        }) {
+            Ok(value) => value,
+            Err(err) => {
+                let err = err.to_string();
+                warn!(meeting_id = %claimed_job.meeting_id, error = %err, "summary context materialization failed");
+                let retry_result = {
+                    let mut service = self.service.lock().await;
+                    let mut queue = self.queue.lock().await;
+                    retry_summary_job_after_transcribing_phase_failure(
+                        &mut service.store,
+                        &mut *queue,
+                        &claimed_job.meeting_id,
+                        &claimed_job.id,
+                        err.clone(),
+                        self.summary_max_retries,
+                        "summary_context",
+                    )
+                };
+                let exhausted = match retry_result {
+                    Ok(exhausted) => exhausted,
+                    Err(retry_err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %retry_err,
+                            "failed to update summary context retry state"
+                        );
+                        true
+                    }
+                };
+                if exhausted
+                    && let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "summary_context",
+                                error: &err,
+                            },
+                        )
+                        .await
+                {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %status_err,
+                        "failed to update status message after summary context failure"
+                    );
+                }
+                if exhausted {
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(err));
+                }
+                return Err(SummaryJobRunError::RetryScheduled(err));
+            }
+        };
 
         // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
         // argv-based OpenCode / Cursor would pass the full transcript on the command line.
@@ -6589,18 +6713,21 @@ impl ScaffoldHandler {
                     &request.workspace,
                     &summary_transcript,
                     effective_settings.whisper_language.as_deref(),
+                    Some(&context_manifest),
                 )
                 .unwrap_or_else(|| {
-                    crate::application::summary::build_correction_prompt(
+                    crate::application::summary::build_correction_prompt_with_context(
                         &summary_transcript,
                         effective_settings.whisper_language.as_deref(),
+                        Some(&context_manifest),
                     )
                 });
             match tokio::task::block_in_place(|| {
-                crate::application::summary::correct_transcript_with_prompt(
+                crate::application::summary::correct_transcript_with_prompt_and_workdir(
                     &summary_client,
                     &summary_transcript,
                     &correction_prompt,
+                    Some(request.workspace.root()),
                 )
             }) {
                 Ok(corrected) => corrected,
@@ -6654,24 +6781,6 @@ impl ScaffoldHandler {
                 &request,
                 &transcription_for_summary,
             )?;
-            let mut summary_context = {
-                let mut service = self.service.blocking_lock();
-                load_runtime_summary_context(
-                    &mut service.store,
-                    &claimed_job.meeting_id,
-                    &meeting.guild_id,
-                    &effective_settings,
-                )?
-            };
-            summary_context.speakers = summary_context_speakers
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            let context_manifest =
-                crate::application::summary::materialize_or_load_summary_context(
-                    &request,
-                    &summary_context,
-                )?;
             let prompt = crate::application::summary::build_summary_prompt_with_context(
                 &request,
                 &manifest,
@@ -9408,13 +9517,14 @@ mod status_message_tests {
         let job = running_summary_job();
         queue.enqueue(job.clone()).expect("enqueue should succeed");
 
-        let exhausted = retry_summary_job_after_transcript_persist_failure(
+        let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
             "m1",
             &job.id,
             "failed to persist transcript segments: integer out of range".to_owned(),
             2,
+            "transcript_persist",
         )
         .expect("retry should update meeting");
 
@@ -9438,13 +9548,14 @@ mod status_message_tests {
         let job = running_summary_job();
         queue.enqueue(job.clone()).expect("enqueue should succeed");
 
-        let exhausted = retry_summary_job_after_transcript_persist_failure(
+        let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
             "m1",
             &job.id,
             "failed to persist transcript segments: integer out of range".to_owned(),
             0,
+            "transcript_persist",
         )
         .expect("retry exhaustion should update meeting");
 
@@ -9470,13 +9581,14 @@ mod status_message_tests {
         let job = running_summary_job();
         queue.enqueue(job.clone()).expect("enqueue should succeed");
 
-        let exhausted = retry_summary_job_after_transcript_persist_failure(
+        let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
             "m1",
             &job.id,
             "failed to persist transcript segments: database unavailable".to_owned(),
             2,
+            "transcript_persist",
         )
         .expect("status restore failure should be terminalized");
 
@@ -9553,13 +9665,14 @@ mod status_message_tests {
         store.insert(transcribing_meeting());
         let mut queue = UnexpectedRetryStatusQueue;
 
-        let exhausted = retry_summary_job_after_transcript_persist_failure(
+        let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
             "m1",
             "summary-m1",
             "failed to persist transcript segments: database unavailable".to_owned(),
             2,
+            "transcript_persist",
         )
         .expect("unexpected retry status should be terminalized");
 
