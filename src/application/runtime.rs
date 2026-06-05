@@ -2963,9 +2963,6 @@ impl EventHandler for ScaffoldHandler {
                                             .await;
                                             return;
                                         }
-                                        reset_recording_lookup_failures(
-                                            &mut lookup_failures,
-                                        );
                                     }
                                 }
                             }
@@ -6858,9 +6855,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                                 .await;
                                                             return;
                                                         }
-                                                        reset_recording_lookup_failures(
-                                                            &mut lookup_failures,
-                                                        );
                                                         continue;
                                                     }
                                                 }
@@ -6965,9 +6959,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                     .await;
                                                     return;
                                                 }
-                                                reset_recording_lookup_failures(
-                                                    &mut lookup_failures,
-                                                );
                                             }
                                         }
                                     }
@@ -7144,9 +7135,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                         return;
                                                     }
-                                                    reset_recording_lookup_failures(
-                                                        &mut lookup_failures,
-                                                    );
                                                 }
                                             }
                                         }
