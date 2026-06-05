@@ -31,6 +31,9 @@ impl AutoStopState {
         self.meeting_id.as_deref()
     }
 
+    /// Returns true only for a state that is explicitly scoped to `meeting_id`.
+    /// An unscoped state is legacy/unknown local state, not a wildcard match;
+    /// cleanup paths use `should_remove_for_meeting_cleanup` for that case.
     pub fn belongs_to_meeting(&self, meeting_id: &str) -> bool {
         match self.meeting_id.as_deref() {
             None => false,

@@ -4394,6 +4394,7 @@ impl ScaffoldHandler {
         drop(command_guard);
         if let Err(err) = workspace.ensure_base_dirs() {
             let _command_guard = self.command_gate.write().await;
+            self.reject_if_shutting_down()?;
             let err_msg = format!("failed to prepare workspace: {err}");
             // Only the DB row and startup reservation exist here; cleanup
             // terminalizes the row and clears that reservation.
@@ -6237,18 +6238,35 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let guild_key = self.guild_id.clone();
                     let http = Arc::clone(&self.http);
                     let ctx_for_task = self.ctx.clone();
-                    let expected_meeting_id = match runtime.active_meeting_id_result().await {
-                        Ok(expected_meeting_id) => expected_meeting_id,
+                    let disconnected_channel_id = data.channel_id.0.get();
+                    let expected_meeting_id = match runtime
+                        .active_meeting_voice_channel_result()
+                        .await
+                    {
+                        Ok(Some(active_voice_channel))
+                            if active_voice_channel.voice_channel_id == disconnected_channel_id =>
+                        {
+                            Some(active_voice_channel.meeting_id)
+                        }
+                        Ok(Some(active_voice_channel)) => {
+                            warn!(
+                                guild_id = %self.guild_id,
+                                active_meeting_id = %active_voice_channel.meeting_id,
+                                active_voice_channel_id = active_voice_channel.voice_channel_id,
+                                disconnected_channel_id,
+                                "driver-disconnect channel no longer matches the active recording; skipping targeted teardown"
+                            );
+                            None
+                        }
+                        Ok(None) => None,
                         Err(err) => {
                             warn!(
                                 guild_id = %self.guild_id,
                                 error = %err,
-                                "failed to resolve active meeting id for driver disconnect; falling back to local recording session"
+                                disconnected_channel_id,
+                                "failed to resolve active meeting for driver disconnect; will retry without local-session fallback"
                             );
-                            let sessions = runtime.sessions.lock().await;
-                            sessions
-                                .get(&guild_key)
-                                .map(|session| session.meeting_id.clone())
+                            None
                         }
                     };
                     let grace = runtime
@@ -6277,6 +6295,56 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             let lifecycle_permit =
                                 runtime.recording_lifecycle_write_permit().await;
                             if runtime.shutting_down.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if expected_meeting_id.is_none() {
+                                match runtime.active_meeting_voice_channel_result().await {
+                                    Ok(Some(active_voice_channel))
+                                        if active_voice_channel.voice_channel_id
+                                            == disconnected_channel_id =>
+                                    {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = %active_voice_channel.meeting_id,
+                                            disconnected_channel_id,
+                                            "driver-disconnect target was unavailable at disconnect time; skipping teardown to avoid stopping a later recording"
+                                        );
+                                    }
+                                    Ok(Some(active_voice_channel)) => {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            active_meeting_id = %active_voice_channel.meeting_id,
+                                            active_voice_channel_id = active_voice_channel.voice_channel_id,
+                                            disconnected_channel_id,
+                                            "driver-disconnect retry found a different active voice channel; skipping teardown"
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        let lookup_error = err.to_string();
+                                        let terminal_error = recording_lookup_terminal_error(
+                                            &mut lookup_failures,
+                                            "driver-disconnect initial target",
+                                            &lookup_error,
+                                        );
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            disconnected_channel_id,
+                                            error = %err,
+                                            attempts = lookup_failures,
+                                            "failed to resolve driver-disconnect target after grace; rescheduling"
+                                        );
+                                        if terminal_error.is_none() {
+                                            continue;
+                                        }
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            disconnected_channel_id,
+                                            attempts = lookup_failures,
+                                            "driver-disconnect target lookup retry limit reached; abandoning teardown without local-session fallback"
+                                        );
+                                    }
+                                }
                                 return;
                             }
                             let Some(expected_meeting_id_ref) = expected_meeting_id.as_deref()
@@ -6843,6 +6911,10 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             error = %err,
                                             "driver-disconnect terminal cleanup retry found no active meeting; treating as already handled"
                                         );
+                                        // Keep the lifecycle permit held here: this branch only
+                                        // observes that the stop target is already absent. The
+                                        // Cleared branches drop the permit first because they have
+                                        // removed local session state and only need voice cleanup.
                                         runtime
                                             .clear_local_recording_state_after_terminal_absence(
                                                 &ctx_for_task,
