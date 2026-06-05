@@ -3307,6 +3307,13 @@ impl EventHandler for ScaffoldHandler {
                             }
                             let mut states = handler.auto_stop_states.lock().await;
                             let Some(state) = states.get_mut(&guild_for_task) else {
+                                drop(states);
+                                let mut startups = handler.recording_startups.lock().await;
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                );
                                 return;
                             };
                             state.retry_after_failed_stop();
@@ -4514,6 +4521,12 @@ impl ScaffoldHandler {
                                     guild_id,
                                     &meeting_id,
                                     "record-start retry cleanup after stop",
+                                )
+                                .await;
+                                self.cleanup_failed_recording_start_locked(
+                                    &guild_key,
+                                    &meeting_id,
+                                    "recording session changed during voice join retry cleanup",
                                 )
                                 .await;
                                 return Ok(
