@@ -824,19 +824,21 @@ fn render_ai_memory_context(notes: &[AiMemoryNote]) -> String {
     );
     for note in notes {
         rendered.push_str(&format!(
-            "\n## {}\n\n- id: {}\n- source_type: {}\n- tags: {}\n- confidence: {}\n- pinned: {}\n- updated_at: {}\n",
+            "\n## {}\n\n- id: {}\n- source_type: {}\n- confidence: {}\n- pinned: {}\n- updated_at: {}\n",
             note.title,
             note.id,
             note.source_type.as_str(),
-            note.tags
-                .iter()
-                .map(|tag| tag.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
             confidence_label(note.confidence),
             note.pinned,
             note.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true)
         ));
+        let tags = note
+            .tags
+            .iter()
+            .map(|tag| tag.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_optional_metadata_line(&mut rendered, "tags", Some(&tags));
         push_optional_metadata_line(
             &mut rendered,
             "source_meeting_id",
