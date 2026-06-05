@@ -688,14 +688,6 @@ fn mark_recording_start_failed_after_setup_error<S: MeetingStore>(
     }
 }
 
-fn mark_recording_start_failed_before_local_cleanup<S: MeetingStore>(
-    store: &mut S,
-    meeting_id: &str,
-    error_message: &str,
-) -> Result<(), StoreError> {
-    mark_recording_start_failed_after_setup_error(store, meeting_id, error_message)
-}
-
 fn recording_startup_conflict(
     startups: &HashMap<String, String>,
     guild_key: &str,
@@ -736,8 +728,12 @@ fn remove_auto_stop_state_for_meeting(
 fn rearm_auto_stop_state_for_retry(
     states: &mut HashMap<String, AutoStopState>,
     guild_key: &str,
+    expected_meeting_id: &str,
 ) -> bool {
-    if let Some(state) = states.get_mut(guild_key) {
+    if let Some(state) = states
+        .get_mut(guild_key)
+        .filter(|state| state.belongs_to_meeting(expected_meeting_id))
+    {
         state.retry_after_failed_stop();
         true
     } else {
@@ -3035,7 +3031,11 @@ impl EventHandler for ScaffoldHandler {
                                 }
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            if rearm_auto_stop_state_for_retry(&mut states, &guild_for_task) {
+                            if rearm_auto_stop_state_for_retry(
+                                &mut states,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                            ) {
                                 continue;
                             }
                             return;
@@ -3285,7 +3285,11 @@ impl EventHandler for ScaffoldHandler {
                                 }
                                 return;
                             }
-                            rearm_auto_stop_state_for_retry(&mut states, &guild_for_task);
+                            rearm_auto_stop_state_for_retry(
+                                &mut states,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                            );
                             continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
@@ -3417,7 +3421,11 @@ impl EventHandler for ScaffoldHandler {
                                 );
                                 return;
                             }
-                            rearm_auto_stop_state_for_retry(&mut states, &guild_for_task);
+                            rearm_auto_stop_state_for_retry(
+                                &mut states,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                            );
                             continue;
                         }
                     }
@@ -4161,7 +4169,7 @@ impl ScaffoldHandler {
     ) {
         {
             let mut service = self.service.lock().await;
-            match mark_recording_start_failed_before_local_cleanup(
+            match mark_recording_start_failed_after_setup_error(
                 &mut service.store,
                 meeting_id,
                 error_message,
@@ -4193,7 +4201,7 @@ impl ScaffoldHandler {
     ) {
         {
             let mut service = self.service.lock().await;
-            match mark_recording_start_failed_before_local_cleanup(
+            match mark_recording_start_failed_after_setup_error(
                 &mut service.store,
                 meeting_id,
                 error_message,
@@ -9183,7 +9191,8 @@ mod status_message_tests {
                 assert_eq!(cache_misses, expected_misses);
                 assert!(rearm_auto_stop_state_for_retry(
                     &mut local_state.auto_stop_states,
-                    "g1"
+                    "g1",
+                    "m1"
                 ));
                 local_state.assert_matching_state_present();
             }
@@ -9316,6 +9325,23 @@ mod status_message_tests {
     }
 
     #[test]
+    fn auto_stop_rearm_does_not_mutate_newer_meeting_state() {
+        let mut states = HashMap::new();
+        states.insert(
+            "g1".to_owned(),
+            AutoStopState::new_for_meeting(Duration::from_secs(5), Some("m2".to_owned())),
+        );
+
+        assert!(!rearm_auto_stop_state_for_retry(&mut states, "g1", "m1"));
+        assert!(
+            states
+                .get("g1")
+                .expect("newer meeting state should remain")
+                .belongs_to_meeting("m2")
+        );
+    }
+
+    #[test]
     fn teardown_exhaustion_ignores_already_terminal_meeting() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = recording_meeting();
@@ -9371,7 +9397,7 @@ mod status_message_tests {
         let mut store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
         let mut local_state = RecordingLocalState::with_matching_session(0);
 
-        let err = mark_recording_start_failed_before_local_cleanup(
+        let err = mark_recording_start_failed_after_setup_error(
             &mut store,
             "m1",
             "voice join failed after setup",
@@ -9385,7 +9411,7 @@ mod status_message_tests {
         );
         local_state.assert_matching_state_present();
 
-        mark_recording_start_failed_before_local_cleanup(
+        mark_recording_start_failed_after_setup_error(
             &mut store,
             "m1",
             "voice join failed after setup",
