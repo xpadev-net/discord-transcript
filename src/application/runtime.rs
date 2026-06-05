@@ -2758,7 +2758,6 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        lookup_failures = 0;
                                     }
                                 }
                             }
@@ -2872,7 +2871,6 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        grace_cache_misses = 0;
                                         retry_teardown_without_auto_stop_state = true;
                                         let mut startups =
                                             handler.recording_startups.lock().await;
@@ -3066,7 +3064,6 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        final_flush_failures = 0;
                                         retry_teardown_without_auto_stop_state = true;
                                         let mut startups =
                                             handler.recording_startups.lock().await;
@@ -3266,7 +3263,6 @@ impl EventHandler for ScaffoldHandler {
                                                 .await;
                                             return;
                                         }
-                                        stop_failures = 0;
                                         retry_teardown_without_auto_stop_state = true;
                                         let mut startups =
                                             handler.recording_startups.lock().await;
@@ -4074,9 +4070,8 @@ impl ScaffoldHandler {
                     error!(
                         meeting_id,
                         error = %err,
-                        "failed to mark meeting as failed after voice join error; retaining startup reservation and local recording state"
+                        "failed to mark meeting as failed after voice join error; clearing local recording setup state"
                     );
-                    return;
                 }
             }
         }
@@ -6319,7 +6314,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                lookup_failures = 0;
                                             }
                                         }
                                     }
@@ -6504,7 +6498,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                             .await;
                                                         return;
                                                     }
-                                                    lookup_failures = 0;
                                                 }
                                             }
                                         }
@@ -6637,7 +6630,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                grace_cache_misses = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
@@ -6781,7 +6773,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                final_flush_failures = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
@@ -6904,7 +6895,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                                         .await;
                                                     return;
                                                 }
-                                                stop_failures = 0;
                                                 retry_teardown_after_failed_terminal_cleanup = true;
                                             }
                                         }
