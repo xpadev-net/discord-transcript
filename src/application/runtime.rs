@@ -2599,10 +2599,8 @@ impl EventHandler for ScaffoldHandler {
             let state = states.entry(guild_key.clone()).or_insert_with(|| {
                 AutoStopState::new_for_meeting(grace, active_meeting_id.clone())
             });
-            if let Some(active_meeting_id) = active_meeting_id.as_deref()
-                && state.meeting_id() != Some(active_meeting_id)
-            {
-                *state = AutoStopState::new_for_meeting(grace, Some(active_meeting_id.to_owned()));
+            if let Some(active_meeting_id) = active_meeting_id.as_deref() {
+                state.refresh_for_meeting(grace, active_meeting_id);
             }
             let signal = state.on_non_bot_member_count_changed(non_bot);
             (signal, state.timer_generation())

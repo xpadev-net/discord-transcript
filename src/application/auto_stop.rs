@@ -37,6 +37,15 @@ impl AutoStopState {
         }
     }
 
+    pub fn refresh_for_meeting(&mut self, grace_period: Duration, meeting_id: &str) -> bool {
+        if self.meeting_id.as_deref() == Some(meeting_id) {
+            return false;
+        }
+
+        *self = Self::new_for_meeting(grace_period, Some(meeting_id.to_owned()));
+        true
+    }
+
     /// Notify the state that the non-bot member count has changed.
     ///
     /// Returns [`AutoStopSignal::StartTimer`] exactly once per empty-channel
