@@ -123,7 +123,7 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     request: RecordStartRequest,
     preflight: RecordStartPreflight,
 ) -> Result<RecordStartResult, CommandError> {
-    debug_assert_eq!(
+    assert_eq!(
         request.user_voice_channel_id.as_deref(),
         Some(preflight.voice_channel_id()),
         "record-start preflight must come from the same request voice channel"
