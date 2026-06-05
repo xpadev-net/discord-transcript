@@ -238,6 +238,50 @@ fn sql_summary_context_continues_vc_participant_alias_candidates_after_one_upser
 }
 
 #[test]
+fn sql_summary_context_deduplicates_vc_participant_alias_candidates_by_identity() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![
+            sql_row(&["123", "alice_dev", "Alice", "Alice Example"]),
+            sql_row(&["456", "alice_dev", "Alice", "Alice Example"]),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should load");
+
+    let upserts = store
+        .executor
+        .executed
+        .iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 2);
+    assert_eq!(
+        upserts
+            .iter()
+            .filter(|params| params[5] == "Alice Example")
+            .count(),
+        1
+    );
+    assert_eq!(
+        upserts
+            .iter()
+            .filter(|params| params[5] == "alice_dev")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn sql_summary_context_skips_vc_participant_alias_candidates_without_tenant_guild() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(

@@ -302,11 +302,7 @@ fn build_vc_participant_alias_candidates(
             if alias.eq_ignore_ascii_case(&canonical_name) || alias == speaker.speaker_id {
                 continue;
             }
-            let identity_key = (
-                canonical_name.to_lowercase(),
-                alias.to_lowercase(),
-                speaker.speaker_id.clone(),
-            );
+            let identity_key = (canonical_name.to_lowercase(), alias.to_lowercase());
             if !seen.insert(identity_key) {
                 continue;
             }
