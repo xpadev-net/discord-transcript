@@ -100,6 +100,11 @@ impl From<SummaryError> for WorkerError {
 }
 
 pub trait SummaryContextStore {
+    /// Loads context used by summary generation.
+    ///
+    /// SQL-backed stores may also materialize low-confidence VC participant
+    /// alias candidates from the meeting speaker snapshot as part of this
+    /// summary-preparation step.
     fn load_summary_context(
         &mut self,
         meeting_id: &str,
@@ -299,7 +304,7 @@ fn build_vc_participant_alias_candidates(
             let Some(alias) = normalize_person_alias_candidate_text(alias) else {
                 continue;
             };
-            if alias.eq_ignore_ascii_case(&canonical_name) || alias == speaker.speaker_id {
+            if alias.eq_ignore_ascii_case(&canonical_name) {
                 continue;
             }
             let identity_key = (canonical_name.to_lowercase(), alias.to_lowercase());
