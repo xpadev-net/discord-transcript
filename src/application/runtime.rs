@@ -677,6 +677,19 @@ fn clear_matching_recording_startup(
     }
 }
 
+fn remove_auto_stop_state_for_meeting(
+    states: &mut HashMap<String, AutoStopState>,
+    guild_key: &str,
+    meeting_id: &str,
+) {
+    if states
+        .get(guild_key)
+        .is_some_and(|state| state.should_remove_for_meeting_cleanup(meeting_id))
+    {
+        states.remove(guild_key);
+    }
+}
+
 fn is_terminal_stop_target_absent_error(err: &str) -> bool {
     err == CommandError::NoActiveMeeting.to_string()
         || err.starts_with("active meeting changed before stop:")
@@ -3727,13 +3740,11 @@ impl ScaffoldHandler {
         };
         {
             let mut states = self.auto_stop_states.lock().await;
-            let should_remove = match states.get(request.guild_key) {
-                None => true,
-                Some(state) => state.belongs_to_meeting(request.expected_meeting_id),
-            };
-            if should_remove {
-                states.remove(request.guild_key);
-            }
+            remove_auto_stop_state_for_meeting(
+                &mut states,
+                request.guild_key,
+                request.expected_meeting_id,
+            );
         }
         if let Some(session) = &removed_session {
             let mut titles = self.live_transcription_titles.lock().await;
@@ -3818,7 +3829,7 @@ impl ScaffoldHandler {
         };
         {
             let mut states = self.auto_stop_states.lock().await;
-            states.remove(guild_key);
+            remove_auto_stop_state_for_meeting(&mut states, guild_key, expected_meeting_id);
         }
         {
             let mut titles = self.live_transcription_titles.lock().await;
@@ -3973,7 +3984,7 @@ impl ScaffoldHandler {
             };
             {
                 let mut states = self.auto_stop_states.lock().await;
-                states.remove(guild_key);
+                remove_auto_stop_state_for_meeting(&mut states, guild_key, expected_meeting_id);
             }
             if let Some(session) = &removed_session {
                 let mut titles = self.live_transcription_titles.lock().await;
@@ -4065,7 +4076,7 @@ impl ScaffoldHandler {
         }
         {
             let mut states = self.auto_stop_states.lock().await;
-            states.remove(guild_key);
+            remove_auto_stop_state_for_meeting(&mut states, guild_key, meeting_id);
         }
         {
             let mut titles = self.live_transcription_titles.lock().await;
@@ -4167,7 +4178,7 @@ impl ScaffoldHandler {
                 }
                 {
                     let mut states = self.auto_stop_states.lock().await;
-                    states.remove(guild_key);
+                    remove_auto_stop_state_for_meeting(&mut states, guild_key, meeting_id);
                 }
                 {
                     let mut titles = self.live_transcription_titles.lock().await;

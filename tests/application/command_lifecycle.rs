@@ -424,11 +424,14 @@ fn auto_stop_state_tracks_optional_meeting_id() {
     let unscoped = AutoStopState::new(Duration::from_secs(60));
     assert_eq!(unscoped.meeting_id(), None);
     assert!(!unscoped.belongs_to_meeting("m2"));
+    assert!(unscoped.should_remove_for_meeting_cleanup("m2"));
 
     let scoped = AutoStopState::new_for_meeting(Duration::from_secs(60), Some("m1".to_owned()));
     assert_eq!(scoped.meeting_id(), Some("m1"));
     assert!(scoped.belongs_to_meeting("m1"));
     assert!(!scoped.belongs_to_meeting("m2"));
+    assert!(scoped.should_remove_for_meeting_cleanup("m1"));
+    assert!(!scoped.should_remove_for_meeting_cleanup("m2"));
 }
 
 #[test]

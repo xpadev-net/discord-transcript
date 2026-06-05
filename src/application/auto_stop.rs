@@ -37,6 +37,13 @@ impl AutoStopState {
         }
     }
 
+    pub fn should_remove_for_meeting_cleanup(&self, meeting_id: &str) -> bool {
+        match self.meeting_id.as_deref() {
+            None => true,
+            Some(current) => current == meeting_id,
+        }
+    }
+
     pub fn refresh_for_meeting(&mut self, grace_period: Duration, meeting_id: &str) -> bool {
         if self.meeting_id.as_deref() == Some(meeting_id) {
             return false;
@@ -157,7 +164,9 @@ mod tests {
         assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
         assert_eq!(state.meeting_id(), Some("m1"));
         assert!(state.belongs_to_meeting("m1"));
-        assert!(!AutoStopState::new(Duration::from_secs(60)).belongs_to_meeting("m1"));
+        let unscoped = AutoStopState::new(Duration::from_secs(60));
+        assert!(!unscoped.belongs_to_meeting("m1"));
+        assert!(unscoped.should_remove_for_meeting_cleanup("m1"));
         assert_eq!(state.timer_generation(), 0);
         assert_eq!(
             state.on_non_bot_member_count_changed(0),
