@@ -1252,6 +1252,37 @@ where
     true
 }
 
+async fn finish_failed_recording_start_cleanup_retry_exhaustion_with_dependencies<S, C, P>(
+    service: &Arc<Mutex<BotCommandService<S>>>,
+    local: &RecordingLifecycleLocalState<'_, C>,
+    guild_key: &str,
+    meeting_id: &str,
+    error_message: &str,
+    cleanup_scope: FailedRecordingStartLocalCleanup,
+    persist_ssrc_mapping: P,
+) where
+    S: MeetingStore + Send,
+    C: ChunkStorage + Send,
+    P: Fn(&RecordingSession<C>, &SsrcTracker) + Send + Sync,
+{
+    {
+        let mut service = service.lock().await;
+        best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion(
+            &mut service.store,
+            meeting_id,
+            error_message,
+        );
+    }
+    clear_failed_recording_start_local_state_with_dependencies(
+        local,
+        guild_key,
+        meeting_id,
+        cleanup_scope,
+        persist_ssrc_mapping,
+    )
+    .await;
+}
+
 async fn handle_terminal_cleanup_retry_failure_with_dependencies<S, C>(
     service: &Arc<Mutex<BotCommandService<S>>>,
     local: &RecordingLifecycleLocalState<'_, C>,
@@ -4713,17 +4744,19 @@ impl ScaffoldHandler {
                 "record-start setup failure cleanup retries exhausted; force-marking failed before releasing startup reservation"
             );
             let _command_guard = handler.command_gate.write().await;
-            {
-                let mut service = handler.service.lock().await;
-                best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion(
-                    &mut service.store,
-                    &meeting_id,
-                    &error_message,
-                );
-            }
-            handler
-                .clear_failed_recording_startup_locked(&guild_key, &meeting_id)
-                .await;
+            let local = handler.lifecycle_local_state();
+            finish_failed_recording_start_cleanup_retry_exhaustion_with_dependencies(
+                &handler.service,
+                &local,
+                &guild_key,
+                &meeting_id,
+                &error_message,
+                cleanup_scope,
+                |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                    session.persist_ssrc_mapping(tracker);
+                },
+            )
+            .await;
             handler.clear_recording_start_cleanup_retry(&retry_key);
         });
     }
@@ -4761,16 +4794,19 @@ impl ScaffoldHandler {
             attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
             "record-start setup failure cleanup retries exhausted during shutdown; force-marking failed before releasing startup reservation"
         );
-        {
-            let mut service = self.service.lock().await;
-            best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion(
-                &mut service.store,
-                meeting_id,
-                error_message,
-            );
-        }
-        self.clear_failed_recording_startup_locked(guild_key, meeting_id)
-            .await;
+        let local = self.lifecycle_local_state();
+        finish_failed_recording_start_cleanup_retry_exhaustion_with_dependencies(
+            &self.service,
+            &local,
+            guild_key,
+            meeting_id,
+            error_message,
+            cleanup_scope,
+            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                session.persist_ssrc_mapping(tracker);
+            },
+        )
+        .await;
     }
 
     fn clear_recording_start_cleanup_retry(&self, retry_key: &str) {
@@ -4779,11 +4815,6 @@ impl ScaffoldHandler {
             .lock()
             .expect("recording start cleanup retry set poisoned");
         retries.remove(retry_key);
-    }
-
-    async fn clear_failed_recording_startup_locked(&self, guild_key: &str, meeting_id: &str) {
-        let mut startups = self.recording_startups.lock().await;
-        clear_matching_recording_startup(&mut startups, guild_key, meeting_id);
     }
 
     async fn cleanup_voice_join_retry_after_failed_attempt(
@@ -4829,6 +4860,13 @@ impl ScaffoldHandler {
                 .await;
             }
             VoiceJoinRetryCleanup::StopAfterSessionReplaced => {
+                leave_voice_with_timeout(
+                    manager,
+                    guild_id,
+                    meeting_id,
+                    "record-start retry cleanup after session replacement",
+                )
+                .await;
                 self.cleanup_failed_recording_start_locked(
                     guild_key,
                     meeting_id,
@@ -10377,6 +10415,56 @@ mod status_message_tests {
         assert_eq!(
             service.store.meeting().error_message.as_deref(),
             Some("voice join failed before session setup")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_failed_start_retry_exhaustion_force_marks_failed_and_clears_full_state() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting();
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        let harness = async_lifecycle_harness(store, local_state);
+        let local = harness.local_state();
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+
+        finish_failed_recording_start_cleanup_retry_exhaustion_with_dependencies(
+            &harness.service,
+            &local,
+            "g1",
+            "m1",
+            "voice join cleanup retries exhausted",
+            FailedRecordingStartLocalCleanup::FullRuntimeState,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            1,
+            "cleanup retry exhaustion must flush tail audio before clearing the session"
+        );
+        assert_eq!(
+            persisted_mappings.load(Ordering::SeqCst),
+            1,
+            "cleanup retry exhaustion must persist final SSRC mappings"
+        );
+        harness.assert_matching_state_cleared().await;
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+        assert_eq!(
+            service.store.meeting().error_message.as_deref(),
+            Some("voice join cleanup retries exhausted")
         );
     }
 
