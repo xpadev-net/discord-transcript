@@ -690,6 +690,19 @@ fn remove_auto_stop_state_for_meeting(
     }
 }
 
+fn clear_auto_stop_timer_generation_for_meeting(
+    states: &mut HashMap<String, AutoStopState>,
+    guild_key: &str,
+    meeting_id: &str,
+    timer_generation: u64,
+) {
+    if let Some(state) = states.get_mut(guild_key)
+        && state.belongs_to_meeting(meeting_id)
+    {
+        state.clear_timer_active_for_generation(timer_generation);
+    }
+}
+
 fn is_terminal_stop_target_absent_error(err: &str) -> bool {
     err == CommandError::NoActiveMeeting.to_string()
         || err.starts_with("active meeting changed before stop:")
@@ -2766,11 +2779,16 @@ impl EventHandler for ScaffoldHandler {
                     };
                     lookup_failures = 0;
                     if current_meeting_id.as_deref() != Some(expected_meeting_id_ref) {
-                        // Clear timer flag before returning.
+                        // Clear timer flag before returning, but only for the
+                        // meeting this timer was started for. A later meeting
+                        // on the same guild can reuse the same generation.
                         let mut states = handler.auto_stop_states.lock().await;
-                        if let Some(state) = states.get_mut(&guild_for_task) {
-                            state.clear_timer_active_for_generation(timer_generation);
-                        }
+                        clear_auto_stop_timer_generation_for_meeting(
+                            &mut states,
+                            &guild_for_task,
+                            expected_meeting_id_ref,
+                            timer_generation,
+                        );
                         let mut startups = handler.recording_startups.lock().await;
                         clear_matching_recording_startup(
                             &mut startups,
@@ -2950,9 +2968,12 @@ impl EventHandler for ScaffoldHandler {
                     };
                     if !trigger {
                         let mut states = handler.auto_stop_states.lock().await;
-                        if let Some(state) = states.get_mut(&guild_for_task) {
-                            state.clear_timer_active_for_generation(timer_generation);
-                        }
+                        clear_auto_stop_timer_generation_for_meeting(
+                            &mut states,
+                            &guild_for_task,
+                            expected_meeting_id_ref,
+                            timer_generation,
+                        );
                         return;
                     }
                     let teardown_request = RecordingStopTeardownRequest {
