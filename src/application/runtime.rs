@@ -4859,20 +4859,24 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             match service.store.find_active_meeting_by_guild(&guild_key) {
                 Ok(Some(meeting)) => {
-                    meeting.id == meeting_id && meeting.status == MeetingStatus::Recording
+                    Ok(meeting.id == meeting_id && meeting.status == MeetingStatus::Recording)
                 }
-                Ok(None) => false,
-                Err(err) => {
-                    let err_msg =
-                        format!("failed to verify recording after audio setup wait: {err}");
-                    self.cleanup_failed_recording_start_before_session_locked(
-                        &guild_key,
-                        &meeting_id,
-                        &err_msg,
-                    )
-                    .await;
-                    return Err(err_msg);
-                }
+                Ok(None) => Ok(false),
+                Err(err) => Err(format!(
+                    "failed to verify recording after audio setup wait: {err}"
+                )),
+            }
+        };
+        let setup_still_recording = match setup_still_recording {
+            Ok(setup_still_recording) => setup_still_recording,
+            Err(err_msg) => {
+                self.cleanup_failed_recording_start_before_session_locked(
+                    &guild_key,
+                    &meeting_id,
+                    &err_msg,
+                )
+                .await;
+                return Err(err_msg);
             }
         };
         if !setup_still_recording {
