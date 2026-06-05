@@ -32,7 +32,7 @@ impl AutoStopState {
 
     pub fn belongs_to_meeting(&self, meeting_id: &str) -> bool {
         match self.meeting_id.as_deref() {
-            None => true,
+            None => false,
             Some(current) => current == meeting_id,
         }
     }
@@ -157,6 +157,7 @@ mod tests {
         assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
         assert_eq!(state.meeting_id(), Some("m1"));
         assert!(state.belongs_to_meeting("m1"));
+        assert!(!AutoStopState::new(Duration::from_secs(60)).belongs_to_meeting("m1"));
         assert_eq!(state.timer_generation(), 0);
         assert_eq!(
             state.on_non_bot_member_count_changed(0),

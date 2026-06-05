@@ -2643,7 +2643,7 @@ impl EventHandler for ScaffoldHandler {
             let handler = self.clone();
             let ctx_for_task = ctx.clone();
             let guild_for_task = guild_key;
-            let expected_meeting_id = Some(active_meeting_id);
+            let expected_meeting_id = active_meeting_id;
             let grace_for_task = grace;
             let target_channel_for_task = target_voice_channel_id;
             self.spawn_background(async move {
@@ -2670,13 +2670,7 @@ impl EventHandler for ScaffoldHandler {
                     if handler.shutting_down.load(Ordering::Acquire) {
                         return;
                     }
-                    let Some(expected_meeting_id_ref) = expected_meeting_id.as_deref() else {
-                        let mut states = handler.auto_stop_states.lock().await;
-                        if let Some(state) = states.get_mut(&guild_for_task) {
-                            state.clear_timer_active_for_generation(timer_generation);
-                        }
-                        return;
-                    };
+                    let expected_meeting_id_ref = expected_meeting_id.as_str();
                     // Verify the same meeting is still active (not a new recording)
                     let current_meeting_id = match handler.active_meeting_id_result().await {
                         Ok(current_meeting_id) => current_meeting_id,
