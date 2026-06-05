@@ -2751,7 +2751,7 @@ impl EventHandler for ScaffoldHandler {
                             startups.get(&guild_key).cloned()
                         } {
                             drop(lifecycle_permit);
-                            self.cleanup_failed_recording_start_after_inactive_voice_state(
+                            self.cleanup_failed_recording_start(
                                 &guild_key,
                                 &meeting_id,
                                 "active meeting disappeared before recording setup completed",
@@ -4177,38 +4177,6 @@ impl ScaffoldHandler {
     ) {
         let _command_guard = self.command_gate.write().await;
         self.cleanup_failed_recording_start_locked(guild_key, meeting_id, error_message)
-            .await;
-    }
-
-    async fn cleanup_failed_recording_start_after_inactive_voice_state(
-        &self,
-        guild_key: &str,
-        meeting_id: &str,
-        error_message: &str,
-    ) {
-        {
-            let mut service = self.service.lock().await;
-            match mark_recording_start_failed_after_setup_error(
-                &mut service.store,
-                meeting_id,
-                error_message,
-            ) {
-                Ok(()) => {
-                    debug!(meeting_id, "record-start setup failure cleanup completed");
-                }
-                Err(err) => {
-                    error!(
-                        meeting_id,
-                        error = %err,
-                        "failed to mark meeting as failed after inactive voice-state cleanup; preserving local recording setup state for retry"
-                    );
-                    return;
-                }
-            }
-        }
-
-        let _command_guard = self.command_gate.write().await;
-        self.clear_failed_recording_start_local_state(guild_key, meeting_id)
             .await;
     }
 
