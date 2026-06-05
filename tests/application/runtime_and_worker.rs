@@ -25,7 +25,6 @@ use discord_transcript::infrastructure::storage::{
     InMemoryMeetingStore, StoredMeeting, UsageEventStore,
 };
 use discord_transcript::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
-use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -109,49 +108,27 @@ fn tenant_guild_row() -> SqlRow {
     sql_row_opt(&[Some("tdg-1"), Some("tenant-1"), Some("g1")])
 }
 
-fn vc_participant_alias_candidate_id(
-    tenant_id: &str,
-    guild_id: &str,
-    canonical_name: &str,
-    alias: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    for part in [
-        "vc_participant",
-        tenant_id,
-        guild_id,
-        &canonical_name.to_lowercase(),
-        &alias.to_lowercase(),
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update([0]);
-    }
-    let digest = hasher.finalize();
-    let suffix = digest
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("vc-participant-{suffix}")
-}
-
-fn vc_participant_alias_upsert_params(alias: &str) -> Vec<String> {
-    vec![
-        vc_participant_alias_candidate_id("tenant-1", "g1", "Alice", alias),
-        "tdg-1".to_owned(),
-        "tenant-1".to_owned(),
-        "g1".to_owned(),
-        "Alice".to_owned(),
-        alias.to_owned(),
-        "123".to_owned(),
-        "vc_participant".to_owned(),
-        "m1".to_owned(),
-        String::new(),
-        "0.650".to_owned(),
-        "true".to_owned(),
-        "unreviewed".to_owned(),
-        "system:vc_participant".to_owned(),
-    ]
+fn vc_participant_alias_upsert_params_from_dry_run(speaker_rows: Vec<SqlRow>) -> Vec<Vec<String>> {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        speaker_rows,
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("dry run summary context should load");
+    store
+        .executor
+        .executed
+        .into_iter()
+        .filter(|(sql, _)| sql == UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
+        .map(|(_, params)| params)
+        .collect()
 }
 
 #[test]
@@ -210,7 +187,17 @@ fn sql_summary_context_continues_vc_participant_alias_candidates_after_one_upser
         sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
         vec![tenant_guild_row()],
     );
-    let failing_params = vc_participant_alias_upsert_params("Alice Example");
+    let dry_run_params =
+        vc_participant_alias_upsert_params_from_dry_run(vec![sql_row(&[
+            "123",
+            "alice_dev",
+            "Alice",
+            "Alice Example",
+        ])]);
+    let failing_params = dry_run_params
+        .into_iter()
+        .find(|params| params[5] == "Alice Example")
+        .expect("dry run should include display_name alias params");
     let failing_param_refs = failing_params.iter().map(String::as_str).collect::<Vec<_>>();
     executor.query_rows_error.insert(
         sql_query_key(
@@ -278,6 +265,32 @@ fn sql_summary_context_deduplicates_vc_participant_alias_candidates_by_identity(
             .filter(|params| params[5] == "alice_dev")
             .count(),
         1
+    );
+}
+
+#[test]
+fn sql_summary_context_skips_numeric_vc_participant_alias_candidates() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        sql_query_key(LOAD_MEETING_SPEAKERS_SQL, &["m1"]),
+        vec![sql_row(&["123", "987654321", "Alice", "456789"])],
+    );
+    executor.query_rows_result.insert(
+        sql_query_key(RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, &["g1"]),
+        vec![tenant_guild_row()],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .load_summary_context("m1", "g1", None)
+        .expect("summary context should load");
+
+    assert!(
+        store
+            .executor
+            .executed
+            .iter()
+            .all(|(sql, _)| sql != UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL)
     );
 }
 

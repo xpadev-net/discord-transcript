@@ -334,7 +334,11 @@ fn build_vc_participant_alias_candidates(
 
 fn normalize_person_alias_candidate_text(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 200 || trimmed.chars().any(char::is_control) {
+    if trimmed.is_empty()
+        || trimmed.len() > 200
+        || trimmed.chars().any(char::is_control)
+        || trimmed.parse::<u64>().is_ok()
+    {
         return None;
     }
     Some(trimmed.to_owned())
