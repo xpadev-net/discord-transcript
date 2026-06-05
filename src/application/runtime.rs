@@ -691,6 +691,46 @@ fn remove_auto_stop_state_for_meeting(
     }
 }
 
+fn rearm_auto_stop_state_for_retry(
+    states: &mut HashMap<String, AutoStopState>,
+    guild_key: &str,
+) -> bool {
+    if let Some(state) = states.get_mut(guild_key) {
+        state.retry_after_failed_stop();
+        true
+    } else {
+        false
+    }
+}
+
+fn remove_matching_recording_session_for_meeting<S: ChunkStorage>(
+    sessions: &mut HashMap<String, RecordingSession<S>>,
+    guild_key: &str,
+    expected_meeting_id: &str,
+) -> Option<RecordingSession<S>> {
+    if sessions
+        .get(guild_key)
+        .is_some_and(|session| session.meeting_id == expected_meeting_id)
+    {
+        sessions.remove(guild_key)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn clear_local_recording_state_maps_after_terminal_absence(
+    auto_stop_states: &mut HashMap<String, AutoStopState>,
+    live_transcription_titles: &mut HashMap<String, Option<String>>,
+    recording_startups: &mut HashMap<String, String>,
+    guild_key: &str,
+    expected_meeting_id: &str,
+) {
+    remove_auto_stop_state_for_meeting(auto_stop_states, guild_key, expected_meeting_id);
+    live_transcription_titles.remove(expected_meeting_id);
+    clear_matching_recording_startup(recording_startups, guild_key, expected_meeting_id);
+}
+
 fn clear_auto_stop_timer_generation_for_meeting(
     states: &mut HashMap<String, AutoStopState>,
     guild_key: &str,
@@ -702,6 +742,44 @@ fn clear_auto_stop_timer_generation_for_meeting(
     {
         state.clear_timer_active_for_generation(timer_generation);
     }
+}
+
+fn terminal_cleanup_retry_reached_limit(terminal_cleanup_failures: &mut u32) -> bool {
+    *terminal_cleanup_failures = (*terminal_cleanup_failures).saturating_add(1);
+    *terminal_cleanup_failures >= RECORDING_TERMINAL_CLEANUP_MAX_RETRIES
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalCleanupRetryOutcome {
+    attempts: u32,
+    terminal_error: Option<String>,
+}
+
+fn record_terminal_cleanup_retry_failure(
+    terminal_cleanup_failures: &mut u32,
+    phase: &str,
+    err: &str,
+) -> TerminalCleanupRetryOutcome {
+    let reached_limit = terminal_cleanup_retry_reached_limit(terminal_cleanup_failures);
+    let terminal_error = reached_limit.then(|| {
+        format!(
+            "terminal recording cleanup failed after {} attempt(s) during {}: {}",
+            *terminal_cleanup_failures, phase, err
+        )
+    });
+
+    TerminalCleanupRetryOutcome {
+        attempts: *terminal_cleanup_failures,
+        terminal_error,
+    }
+}
+
+fn persist_terminal_cleanup_retry_exhaustion<S: MeetingStore>(
+    store: &mut S,
+    expected_meeting_id: &str,
+    terminal_error: &str,
+) -> Result<(), StoreError> {
+    mark_recording_failed_after_teardown_exhaustion(store, expected_meeting_id, terminal_error)
 }
 
 fn is_terminal_stop_target_absent_error(err: &str) -> bool {
@@ -2915,8 +2993,7 @@ impl EventHandler for ScaffoldHandler {
                                 continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            if let Some(state) = states.get_mut(&guild_for_task) {
-                                state.retry_after_failed_stop();
+                            if rearm_auto_stop_state_for_retry(&mut states, &guild_for_task) {
                                 continue;
                             }
                             return;
@@ -3125,7 +3202,7 @@ impl EventHandler for ScaffoldHandler {
                                 continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            let Some(state) = states.get_mut(&guild_for_task) else {
+                            if !states.contains_key(&guild_for_task) {
                                 drop(states);
                                 let terminal_error = format!(
                                     "auto-stop timer state disappeared after final flush failure: {err}"
@@ -3194,8 +3271,8 @@ impl EventHandler for ScaffoldHandler {
                                     }
                                 }
                                 return;
-                            };
-                            state.retry_after_failed_stop();
+                            }
+                            rearm_auto_stop_state_for_retry(&mut states, &guild_for_task);
                             continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
@@ -3324,7 +3401,7 @@ impl EventHandler for ScaffoldHandler {
                                 continue;
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            let Some(state) = states.get_mut(&guild_for_task) else {
+                            if !states.contains_key(&guild_for_task) {
                                 drop(states);
                                 let mut startups = handler.recording_startups.lock().await;
                                 clear_matching_recording_startup(
@@ -3333,8 +3410,8 @@ impl EventHandler for ScaffoldHandler {
                                     expected_meeting_id_ref,
                                 );
                                 return;
-                            };
-                            state.retry_after_failed_stop();
+                            }
+                            rearm_auto_stop_state_for_retry(&mut states, &guild_for_task);
                             continue;
                         }
                     }
@@ -3770,15 +3847,11 @@ impl ScaffoldHandler {
 
         let removed_session = {
             let mut sessions = self.sessions.lock().await;
-            match sessions
-                .get(request.guild_key)
-                .map(|session| session.meeting_id.as_str())
-            {
-                Some(current) if current == request.expected_meeting_id => {
-                    sessions.remove(request.guild_key)
-                }
-                _ => None,
-            }
+            remove_matching_recording_session_for_meeting(
+                &mut sessions,
+                request.guild_key,
+                request.expected_meeting_id,
+            )
         };
         {
             let mut states = self.auto_stop_states.lock().await;
@@ -3864,14 +3937,11 @@ impl ScaffoldHandler {
         let removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mut sessions = self.sessions.lock().await;
-            if sessions
-                .get(guild_key)
-                .is_some_and(|session| session.meeting_id == expected_meeting_id)
-            {
-                sessions.remove(guild_key)
-            } else {
-                None
-            }
+            remove_matching_recording_session_for_meeting(
+                &mut sessions,
+                guild_key,
+                expected_meeting_id,
+            )
         };
         {
             let mut states = self.auto_stop_states.lock().await;
@@ -3919,36 +3989,36 @@ impl ScaffoldHandler {
         request: TerminalCleanupRetryFailureRequest<'_>,
         terminal_cleanup_failures: &mut u32,
     ) -> TerminalCleanupRetryDecision {
-        *terminal_cleanup_failures = (*terminal_cleanup_failures).saturating_add(1);
+        let outcome = record_terminal_cleanup_retry_failure(
+            terminal_cleanup_failures,
+            request.phase,
+            request.err,
+        );
         warn!(
             guild_id = %request.guild_key,
             meeting_id = request.expected_meeting_id,
             phase = request.phase,
             error = %request.err,
-            attempts = *terminal_cleanup_failures,
+            attempts = outcome.attempts,
             max_attempts = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES,
             "terminal recording cleanup failed; rescheduling"
         );
 
-        if *terminal_cleanup_failures < RECORDING_TERMINAL_CLEANUP_MAX_RETRIES {
+        let Some(terminal_error) = outcome.terminal_error else {
             return TerminalCleanupRetryDecision::Reschedule;
-        }
+        };
 
         error!(
             guild_id = %request.guild_key,
             meeting_id = request.expected_meeting_id,
             phase = request.phase,
             error = %request.err,
-            attempts = *terminal_cleanup_failures,
+            attempts = outcome.attempts,
             "terminal recording cleanup retry limit reached; clearing local runtime state"
-        );
-        let terminal_error = format!(
-            "terminal recording cleanup failed after {} attempt(s) during {}: {}",
-            *terminal_cleanup_failures, request.phase, request.err
         );
         {
             let mut service = self.service.lock().await;
-            if let Err(err) = mark_recording_failed_after_teardown_exhaustion(
+            if let Err(err) = persist_terminal_cleanup_retry_exhaustion(
                 &mut service.store,
                 request.expected_meeting_id,
                 &terminal_error,
@@ -4040,13 +4110,11 @@ impl ScaffoldHandler {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let removed_session = {
                 let mut sessions = self.sessions.lock().await;
-                match sessions
-                    .get(guild_key)
-                    .map(|session| session.meeting_id.as_str())
-                {
-                    Some(current) if current == expected_meeting_id => sessions.remove(guild_key),
-                    _ => None,
-                }
+                remove_matching_recording_session_for_meeting(
+                    &mut sessions,
+                    guild_key,
+                    expected_meeting_id,
+                )
             };
             {
                 let mut states = self.auto_stop_states.lock().await;
@@ -7818,6 +7886,294 @@ mod status_message_tests {
         }
     }
 
+    struct RecordingLocalState<S: ChunkStorage> {
+        sessions: HashMap<String, RecordingSession<S>>,
+        auto_stop_states: HashMap<String, AutoStopState>,
+        live_transcription_titles: HashMap<String, Option<String>>,
+        recording_startups: HashMap<String, String>,
+    }
+
+    impl RecordingLocalState<RuntimeFlakyChunkStorage> {
+        fn with_matching_session(failures: usize) -> Self {
+            let mut auto_stop_state =
+                AutoStopState::new_for_meeting(Duration::from_secs(0), Some("m1".to_owned()));
+            assert_eq!(
+                auto_stop_state.on_non_bot_member_count_changed(0),
+                AutoStopSignal::StartTimer
+            );
+            auto_stop_state.set_empty_since_elapsed_for_test(Duration::from_secs(1));
+            let mut session = session_with_one_flaky_chunk(failures);
+            session.meeting_id = "m1".to_owned();
+
+            Self {
+                sessions: HashMap::from([("g1".to_owned(), session)]),
+                auto_stop_states: HashMap::from([("g1".to_owned(), auto_stop_state)]),
+                live_transcription_titles: HashMap::from([(
+                    "m1".to_owned(),
+                    Some("title".to_owned()),
+                )]),
+                recording_startups: HashMap::from([("g1".to_owned(), "m1".to_owned())]),
+            }
+        }
+
+        fn with_newer_session_on_same_guild() -> Self {
+            let mut session = session_with_one_flaky_chunk(0);
+            session.meeting_id = "m2".to_owned();
+            Self {
+                sessions: HashMap::from([("g1".to_owned(), session)]),
+                auto_stop_states: HashMap::from([(
+                    "g1".to_owned(),
+                    AutoStopState::new_for_meeting(Duration::from_secs(0), Some("m2".to_owned())),
+                )]),
+                live_transcription_titles: HashMap::from([(
+                    "m2".to_owned(),
+                    Some("newer".to_owned()),
+                )]),
+                recording_startups: HashMap::from([("g1".to_owned(), "m2".to_owned())]),
+            }
+        }
+    }
+
+    impl<S: ChunkStorage> RecordingLocalState<S> {
+        fn clear_expected_meeting(&mut self) -> Option<RecordingSession<S>> {
+            let removed =
+                remove_matching_recording_session_for_meeting(&mut self.sessions, "g1", "m1");
+            clear_local_recording_state_maps_after_terminal_absence(
+                &mut self.auto_stop_states,
+                &mut self.live_transcription_titles,
+                &mut self.recording_startups,
+                "g1",
+                "m1",
+            );
+            removed
+        }
+
+        fn assert_matching_state_present(&self) {
+            assert!(
+                self.sessions
+                    .get("g1")
+                    .is_some_and(|session| session.meeting_id == "m1"),
+                "matching recording session should remain retryable"
+            );
+            assert!(
+                self.auto_stop_states
+                    .get("g1")
+                    .is_some_and(|state| state.belongs_to_meeting("m1")),
+                "auto-stop state should remain scoped to the retrying meeting"
+            );
+            assert!(
+                self.live_transcription_titles.contains_key("m1"),
+                "live title cache should remain until terminal cleanup succeeds"
+            );
+            assert_eq!(
+                self.recording_startups.get("g1").map(String::as_str),
+                Some("m1"),
+                "startup reservation should remain while teardown can retry"
+            );
+        }
+
+        fn assert_matching_state_cleared(&self) {
+            assert!(!self.sessions.contains_key("g1"));
+            assert!(!self.auto_stop_states.contains_key("g1"));
+            assert!(!self.live_transcription_titles.contains_key("m1"));
+            assert!(!self.recording_startups.contains_key("g1"));
+        }
+    }
+
+    struct FaultInjectedMeetingStore {
+        inner: crate::infrastructure::storage::InMemoryMeetingStore,
+        set_status_failures_remaining: usize,
+        set_error_message_failures_remaining: usize,
+        find_active_failures_remaining: usize,
+    }
+
+    impl FaultInjectedMeetingStore {
+        fn with_recording_meeting() -> Self {
+            let mut inner = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            inner.insert(recording_meeting());
+            Self {
+                inner,
+                set_status_failures_remaining: 0,
+                set_error_message_failures_remaining: 0,
+                find_active_failures_remaining: 0,
+            }
+        }
+
+        fn meeting(&self) -> &crate::infrastructure::storage::StoredMeeting {
+            self.inner.get("m1").expect("meeting should exist")
+        }
+
+        fn fail_status_updates(mut self, failures: usize) -> Self {
+            self.set_status_failures_remaining = failures;
+            self
+        }
+
+        fn fail_error_message_updates(mut self, failures: usize) -> Self {
+            self.set_error_message_failures_remaining = failures;
+            self
+        }
+
+        fn fail_active_meeting_lookups(mut self, failures: usize) -> Self {
+            self.find_active_failures_remaining = failures;
+            self
+        }
+    }
+
+    impl crate::infrastructure::storage::UsageEventStore for FaultInjectedMeetingStore {
+        fn append_usage_event(
+            &mut self,
+            event: &crate::domain::usage::NewUsageEvent,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner.append_usage_event(event)
+        }
+
+        fn list_recent_usage_events(
+            &mut self,
+            tenant_id: Option<&str>,
+            guild_id: Option<&str>,
+            limit: u32,
+        ) -> Result<Vec<crate::domain::usage::UsageEvent>, crate::infrastructure::storage::StoreError>
+        {
+            self.inner
+                .list_recent_usage_events(tenant_id, guild_id, limit)
+        }
+
+        fn aggregate_recent_usage(
+            &mut self,
+            tenant_id: Option<&str>,
+            guild_id: Option<&str>,
+            window_seconds: u64,
+        ) -> Result<
+            Vec<crate::domain::usage::UsageAggregate>,
+            crate::infrastructure::storage::StoreError,
+        > {
+            self.inner
+                .aggregate_recent_usage(tenant_id, guild_id, window_seconds)
+        }
+    }
+
+    impl crate::infrastructure::storage::MeetingStore for FaultInjectedMeetingStore {
+        fn mark_stopping_if_recording(
+            &mut self,
+            meeting_id: &str,
+            reason: StopReason,
+        ) -> Result<
+            crate::infrastructure::storage::StopTransition,
+            crate::infrastructure::storage::StoreError,
+        > {
+            self.inner.mark_stopping_if_recording(meeting_id, reason)
+        }
+
+        fn find_active_meeting_by_guild(
+            &mut self,
+            guild_id: &str,
+        ) -> Result<
+            Option<crate::infrastructure::storage::StoredMeeting>,
+            crate::infrastructure::storage::StoreError,
+        > {
+            if self.find_active_failures_remaining > 0 {
+                self.find_active_failures_remaining -= 1;
+                return Err(crate::infrastructure::storage::StoreError::Backend(
+                    "active meeting lookup unavailable".to_owned(),
+                ));
+            }
+            self.inner.find_active_meeting_by_guild(guild_id)
+        }
+
+        fn get_meeting(
+            &mut self,
+            meeting_id: &str,
+        ) -> Result<
+            Option<crate::infrastructure::storage::StoredMeeting>,
+            crate::infrastructure::storage::StoreError,
+        > {
+            self.inner.get_meeting(meeting_id)
+        }
+
+        fn create_scheduled_meeting(
+            &mut self,
+            request: crate::infrastructure::storage::CreateMeetingRequest,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner.create_scheduled_meeting(request)
+        }
+
+        fn create_meeting_as_recording(
+            &mut self,
+            request: crate::infrastructure::storage::CreateMeetingRequest,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner.create_meeting_as_recording(request)
+        }
+
+        fn set_meeting_status(
+            &mut self,
+            meeting_id: &str,
+            status: crate::domain::MeetingStatus,
+            expected_current: Option<crate::domain::MeetingStatus>,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            if self.set_status_failures_remaining > 0 {
+                self.set_status_failures_remaining -= 1;
+                return Err(crate::infrastructure::storage::StoreError::Backend(
+                    "status update unavailable".to_owned(),
+                ));
+            }
+            self.inner
+                .set_meeting_status(meeting_id, status, expected_current)
+        }
+
+        fn set_error_message(
+            &mut self,
+            meeting_id: &str,
+            error_message: Option<String>,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            if self.set_error_message_failures_remaining > 0 {
+                self.set_error_message_failures_remaining -= 1;
+                return Err(crate::infrastructure::storage::StoreError::Backend(
+                    "error message update unavailable".to_owned(),
+                ));
+            }
+            self.inner.set_error_message(meeting_id, error_message)
+        }
+
+        fn get_status_message_metadata(
+            &mut self,
+            meeting_id: &str,
+        ) -> Result<
+            crate::infrastructure::storage::StatusMessageMetadata,
+            crate::infrastructure::storage::StoreError,
+        > {
+            self.inner.get_status_message_metadata(meeting_id)
+        }
+
+        fn set_status_message(
+            &mut self,
+            meeting_id: &str,
+            channel_id: String,
+            message_id: String,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner
+                .set_status_message(meeting_id, channel_id, message_id)
+        }
+
+        fn upsert_effective_meeting_settings(
+            &mut self,
+            meeting_id: &str,
+            settings: crate::infrastructure::storage::EffectiveMeetingSettings,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner
+                .upsert_effective_meeting_settings(meeting_id, settings)
+        }
+
+        fn get_effective_meeting_settings(
+            &mut self,
+            meeting_id: &str,
+        ) -> Result<
+            Option<crate::infrastructure::storage::EffectiveMeetingSettings>,
+            crate::infrastructure::storage::StoreError,
+        > {
+            self.inner.get_effective_meeting_settings(meeting_id)
+        }
+    }
+
     fn summarizing_meeting() -> crate::infrastructure::storage::StoredMeeting {
         crate::infrastructure::storage::StoredMeeting {
             id: "m1".to_owned(),
@@ -8659,6 +9015,247 @@ mod status_message_tests {
         assert!(!is_terminal_stop_target_absent_error(
             "database unavailable"
         ));
+    }
+
+    #[test]
+    fn final_flush_exhaustion_retains_session_until_terminal_cleanup_succeeds() {
+        let mut store = FaultInjectedMeetingStore::with_recording_meeting();
+        let mut local_state =
+            RecordingLocalState::with_matching_session(FINAL_FLUSH_MAX_RETRIES as usize);
+
+        for _ in 0..FINAL_FLUSH_MAX_RETRIES {
+            let session = local_state
+                .sessions
+                .get_mut("g1")
+                .expect("session should remain through flush retry attempts");
+            let err = flush_session_for_teardown(session, "g1", "auto-stop")
+                .expect_err("injected chunk persistence should fail");
+            assert!(err.contains("failed to persist"));
+            local_state.assert_matching_state_present();
+        }
+
+        mark_recording_failed_after_teardown_exhaustion(
+            &mut store,
+            "m1",
+            "final audio flush failed after 10 auto-stop attempt(s): injected failure",
+        )
+        .expect("terminal status write should succeed after flush retry exhaustion");
+        let removed = local_state.clear_expected_meeting();
+
+        assert!(
+            removed.is_some(),
+            "terminal cleanup should evict the exhausted local session"
+        );
+        local_state.assert_matching_state_cleared();
+        let meeting = store.meeting();
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert!(
+            meeting
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("final audio flush failed"))
+        );
+    }
+
+    #[test]
+    fn teardown_exhaustion_status_update_failure_preserves_retryable_local_state() {
+        let mut store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let local_state = RecordingLocalState::with_matching_session(0);
+
+        let err = mark_recording_failed_after_teardown_exhaustion(
+            &mut store,
+            "m1",
+            "recording stop failed after retries",
+        )
+        .expect_err("backend write failure should be surfaced for retry");
+
+        assert!(err.to_string().contains("status update unavailable"));
+        assert_eq!(
+            store.meeting().status,
+            crate::domain::MeetingStatus::Recording
+        );
+        assert_eq!(store.meeting().error_message, None);
+        local_state.assert_matching_state_present();
+    }
+
+    #[test]
+    fn teardown_exhaustion_error_message_failure_still_terminalizes_recording() {
+        let mut store =
+            FaultInjectedMeetingStore::with_recording_meeting().fail_error_message_updates(1);
+        let mut local_state = RecordingLocalState::with_matching_session(0);
+
+        mark_recording_failed_after_teardown_exhaustion(
+            &mut store,
+            "m1",
+            "recording stop failed after retries",
+        )
+        .expect("status update should win even if error text persistence fails");
+        let removed = local_state.clear_expected_meeting();
+
+        assert!(removed.is_some());
+        local_state.assert_matching_state_cleared();
+        let meeting = store.meeting();
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message, None,
+            "error-message write failure is logged but does not revive recording state"
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_retry_exhaustion_clears_local_state_after_bounded_db_failures() {
+        let mut store =
+            FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(usize::MAX);
+        let mut local_state = RecordingLocalState::with_matching_session(0);
+        let mut terminal_cleanup_failures = 0;
+
+        for expected_attempts in 1..RECORDING_TERMINAL_CLEANUP_MAX_RETRIES {
+            let outcome = record_terminal_cleanup_retry_failure(
+                &mut terminal_cleanup_failures,
+                "auto-stop stop exhaustion",
+                "status update unavailable",
+            );
+            assert_eq!(outcome.attempts, expected_attempts);
+            assert_eq!(outcome.terminal_error, None);
+            local_state.assert_matching_state_present();
+        }
+
+        let outcome = record_terminal_cleanup_retry_failure(
+            &mut terminal_cleanup_failures,
+            "auto-stop stop exhaustion",
+            "status update unavailable",
+        );
+        let terminal_error = outcome
+            .terminal_error
+            .as_deref()
+            .expect("retry limit should request local cleanup");
+        let _ = persist_terminal_cleanup_retry_exhaustion(&mut store, "m1", terminal_error);
+        let removed = local_state.clear_expected_meeting();
+
+        assert!(
+            removed.is_some(),
+            "terminal cleanup retry limit should evict local state even when best-effort DB write fails"
+        );
+        local_state.assert_matching_state_cleared();
+        assert_eq!(
+            store.meeting().status,
+            crate::domain::MeetingStatus::Recording,
+            "DB outage is not hidden by local cleanup exhaustion"
+        );
+    }
+
+    #[test]
+    fn auto_stop_and_driver_disconnect_cache_misses_keep_state_until_terminal_error() {
+        for (context, max_reschedules, terminal_error_for_attempt) in [
+            (
+                "auto-stop",
+                AUTO_STOP_GRACE_MAX_RESCHEDULES,
+                auto_stop_cache_miss_terminal_error as fn(&mut u32) -> Option<String>,
+            ),
+            (
+                "driver-disconnect",
+                DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES,
+                driver_disconnect_cache_miss_terminal_error as fn(&mut u32) -> Option<String>,
+            ),
+        ] {
+            let mut store = FaultInjectedMeetingStore::with_recording_meeting();
+            let mut local_state = RecordingLocalState::with_matching_session(0);
+            let mut cache_misses = 0;
+
+            for expected_misses in 1..max_reschedules {
+                let terminal_error = terminal_error_for_attempt(&mut cache_misses);
+                assert_eq!(terminal_error, None, "{context} should reschedule");
+                assert_eq!(cache_misses, expected_misses);
+                assert!(rearm_auto_stop_state_for_retry(
+                    &mut local_state.auto_stop_states,
+                    "g1"
+                ));
+                local_state.assert_matching_state_present();
+            }
+
+            let terminal_error = terminal_error_for_attempt(&mut cache_misses);
+            let terminal_error =
+                terminal_error.expect("cache-miss retry limit should become terminal");
+            mark_recording_failed_after_teardown_exhaustion(&mut store, "m1", &terminal_error)
+                .expect("terminal cache-miss cleanup should mark recording failed");
+            let removed = local_state.clear_expected_meeting();
+
+            assert!(
+                removed.is_some(),
+                "{context} terminal cleanup should remove session"
+            );
+            local_state.assert_matching_state_cleared();
+            assert_eq!(store.meeting().status, crate::domain::MeetingStatus::Failed);
+            assert!(
+                store
+                    .meeting()
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("voice state cache")),
+                "{context} should persist the cache-miss terminal reason"
+            );
+        }
+    }
+
+    #[test]
+    fn active_meeting_lookup_failures_terminalize_after_bounded_reschedules() {
+        let mut store = FaultInjectedMeetingStore::with_recording_meeting()
+            .fail_active_meeting_lookups(RECORDING_LOOKUP_MAX_RETRIES as usize);
+        let mut lookup_failures = 0;
+
+        for expected_attempts in 1..RECORDING_LOOKUP_MAX_RETRIES {
+            let err = store
+                .find_active_meeting_by_guild("g1")
+                .expect_err("lookup should be fault-injected")
+                .to_string();
+            let terminal_error =
+                recording_lookup_terminal_error(&mut lookup_failures, "auto-stop grace", &err);
+            assert_eq!(terminal_error, None);
+            assert_eq!(lookup_failures, expected_attempts);
+        }
+
+        let err = store
+            .find_active_meeting_by_guild("g1")
+            .expect_err("lookup should fail through terminal attempt")
+            .to_string();
+        let terminal_error =
+            recording_lookup_terminal_error(&mut lookup_failures, "auto-stop grace", &err);
+        let terminal_error = terminal_error.expect("lookup retry limit should terminalize");
+
+        assert_eq!(lookup_failures, RECORDING_LOOKUP_MAX_RETRIES);
+        assert!(terminal_error.contains("recording state lookup failed"));
+        mark_recording_failed_after_teardown_exhaustion(&mut store, "m1", &terminal_error)
+            .expect("lookup exhaustion should mark recording failed");
+        assert_eq!(store.meeting().status, crate::domain::MeetingStatus::Failed);
+    }
+
+    #[test]
+    fn stale_terminal_cleanup_preserves_newer_recording_state_on_same_guild() {
+        let mut local_state = RecordingLocalState::with_newer_session_on_same_guild();
+
+        let removed = local_state.clear_expected_meeting();
+
+        assert!(
+            removed.is_none(),
+            "stale cleanup for m1 must not evict the newer m2 session"
+        );
+        assert!(
+            local_state
+                .sessions
+                .get("g1")
+                .is_some_and(|session| session.meeting_id == "m2")
+        );
+        assert!(
+            local_state
+                .auto_stop_states
+                .get("g1")
+                .is_some_and(|state| state.belongs_to_meeting("m2"))
+        );
+        assert_eq!(
+            local_state.recording_startups.get("g1").map(String::as_str),
+            Some("m2")
+        );
+        assert!(local_state.live_transcription_titles.contains_key("m2"));
     }
 
     #[test]
