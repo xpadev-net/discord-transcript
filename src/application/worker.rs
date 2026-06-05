@@ -326,6 +326,11 @@ where
         &request.workspace,
         &transcription.transcript_for_summary,
     );
+    store.set_meeting_status(
+        &input.meeting_id,
+        MeetingStatus::Summarizing,
+        Some(MeetingStatus::Transcribing),
+    )?;
     let context_manifest = match materialize_or_load_summary_context(
         &request,
         &input.summary_context,
@@ -333,7 +338,7 @@ where
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summary context materialization failed");
-            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Transcribing);
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
             return Err(WorkerError::from(err));
         }
     };
@@ -381,11 +386,6 @@ where
         }
     };
 
-    store.set_meeting_status(
-        &input.meeting_id,
-        MeetingStatus::Summarizing,
-        Some(MeetingStatus::Transcribing),
-    )?;
     let manifest = match write_transcript_files(&request, &transcription) {
         Ok(value) => value,
         Err(err) => {

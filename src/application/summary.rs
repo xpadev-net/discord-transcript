@@ -779,8 +779,8 @@ fn render_speaker_roster_context(speakers: &[SpeakerRosterEntry]) -> String {
     );
     for speaker in speakers {
         rendered.push_str(&format!(
-            "\n## {}\n\n- speaker_id: {}\n- display_label: {}\n",
-            speaker.display_label, speaker.speaker_id, speaker.display_label
+            "\n## {}\n\n- speaker_id: {}\n",
+            speaker.display_label, speaker.speaker_id
         ));
         push_optional_metadata_line(&mut rendered, "username", speaker.username.as_deref());
         push_optional_metadata_line(&mut rendered, "nickname", speaker.nickname.as_deref());
@@ -902,7 +902,8 @@ fn render_user_feedback_context(feedback_items: &[TranscriptFeedback]) -> String
     );
     for feedback in feedback_items {
         rendered.push_str(&format!(
-            "\n## {}\n\n- id: {}\n- feedback_type: {}\n- status: {}\n- created_at: {}\n",
+            "\n## {} ({})\n\n- id: {}\n- feedback_type: {}\n- status: {}\n- created_at: {}\n",
+            feedback.feedback_type.as_str(),
             feedback.id,
             feedback.id,
             feedback.feedback_type.as_str(),

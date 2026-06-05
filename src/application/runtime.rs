@@ -6630,10 +6630,12 @@ impl ScaffoldHandler {
             )
         });
         let context_manifest = match summary_context.and_then(|mut summary_context| {
-            summary_context.speakers = summary_context_speakers
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut speaker_ids = summary_context_speakers.keys().collect::<Vec<_>>();
+            speaker_ids.sort();
+            summary_context.speakers = speaker_ids
+                .into_iter()
+                .filter_map(|speaker_id| summary_context_speakers.get(speaker_id).cloned())
+                .collect();
             tokio::task::block_in_place(|| {
                 crate::application::summary::materialize_or_load_summary_context(
                     &request,
