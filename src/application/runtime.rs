@@ -2902,6 +2902,9 @@ impl EventHandler for ScaffoldHandler {
                                 }
                             }
                             if retry_teardown_without_auto_stop_state {
+                                // Terminal cleanup already removed the timer state. Keep
+                                // rescheduling on cache misses until the cache-miss counter
+                                // reaches its own terminal path or the cache becomes usable.
                                 let mut startups = handler.recording_startups.lock().await;
                                 clear_matching_recording_startup(
                                     &mut startups,
@@ -3794,6 +3797,10 @@ impl ScaffoldHandler {
         mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
         _reset_guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
+        // Stop has already won the DB transition, so leave voice even if
+        // another cleanup path removed the local session first. Terminal
+        // absence cleanup only leaves when it removed the matching session,
+        // which avoids disturbing a later recording after local state drift.
         if let Some(manager) = songbird::get(ctx).await {
             leave_voice_with_timeout(manager.as_ref(), self.guild_id, meeting_id, phase).await;
         }
@@ -4479,6 +4486,10 @@ impl ScaffoldHandler {
             titles.insert(meeting_id.clone(), meeting_title);
         }
 
+        // Keep the SSRC reset gate scoped to the tracker reset only. Handler
+        // registration awaits Songbird work and should not hold the reset
+        // gate across that I/O; command_guard continues to serialize the
+        // recording lifecycle until session/handler setup is complete.
         // Register handlers BEFORE voice WS connects to capture initial SSRC
         // mappings (SpeakingStateUpdate for users already speaking).
         self.register_voice_handlers(manager.as_ref(), ctx, guild_id)

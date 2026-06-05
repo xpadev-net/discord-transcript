@@ -340,7 +340,7 @@ fn record_stop_rejects_started_meeting_role_without_matching_user() {
 
 #[test]
 fn auto_stop_triggers_after_grace_period_and_can_cancel() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -369,7 +369,7 @@ fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
     // voice_state_update to skip cancelling the timer. At fire time the runtime
     // re-checks member count, sees members returned, feeds that back into the
     // state machine, and must allow a fresh timer for a subsequent empty episode.
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -389,7 +389,7 @@ fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
 
 #[test]
 fn auto_stop_rearms_after_failed_stop_attempt() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -410,7 +410,7 @@ fn auto_stop_rearms_after_failed_stop_attempt() {
 
 #[test]
 fn auto_stop_grace_uses_monotonic_elapsed_not_wall_clock_ms() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -421,7 +421,7 @@ fn auto_stop_grace_uses_monotonic_elapsed_not_wall_clock_ms() {
 
 #[test]
 fn auto_stop_state_tracks_optional_meeting_id() {
-    let unscoped = AutoStopState::new(Duration::from_secs(60));
+    let unscoped = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(unscoped.meeting_id(), None);
     assert!(!unscoped.belongs_to_meeting("m2"));
     assert!(unscoped.should_remove_for_meeting_cleanup("m2"));
@@ -436,7 +436,7 @@ fn auto_stop_state_tracks_optional_meeting_id() {
 
 #[test]
 fn auto_stop_unscoped_state_refreshes_for_known_meeting() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer

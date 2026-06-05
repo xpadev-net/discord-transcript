@@ -12,7 +12,8 @@ pub struct AutoStopState {
 }
 
 impl AutoStopState {
-    pub fn new(grace_period: Duration) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(grace_period: Duration) -> Self {
         Self::new_for_meeting(grace_period, None)
     }
 
