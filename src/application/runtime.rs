@@ -568,6 +568,26 @@ enum RecordingStartJoinVerification {
     AlreadyStopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceJoinRetryCleanup {
+    RetryCurrentSession,
+    StopAfterSessionRemoved,
+    StopAfterSessionReplaced,
+}
+
+fn classify_voice_join_retry_cleanup(
+    current_session_meeting_id: Option<&str>,
+    expected_meeting_id: &str,
+) -> VoiceJoinRetryCleanup {
+    match current_session_meeting_id {
+        Some(current) if current == expected_meeting_id => {
+            VoiceJoinRetryCleanup::RetryCurrentSession
+        }
+        Some(_) => VoiceJoinRetryCleanup::StopAfterSessionReplaced,
+        None => VoiceJoinRetryCleanup::StopAfterSessionRemoved,
+    }
+}
+
 // Join completion can race with a stop command after the DB row/session were
 // created but before Songbird reports success. Only statuses reached by the
 // normal stop pipeline are accepted as benign here; terminal failure statuses
@@ -4234,6 +4254,61 @@ impl ScaffoldHandler {
         }
     }
 
+    async fn cleanup_voice_join_retry_after_failed_attempt(
+        &self,
+        manager: &songbird::Songbird,
+        guild_id: GuildId,
+        guild_key: &str,
+        meeting_id: &str,
+    ) -> VoiceJoinRetryCleanup {
+        let _command_guard = self.command_gate.write().await;
+        let current_session_meeting_id = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(guild_key)
+                .map(|session| session.meeting_id.clone())
+        };
+        let cleanup =
+            classify_voice_join_retry_cleanup(current_session_meeting_id.as_deref(), meeting_id);
+
+        match cleanup {
+            VoiceJoinRetryCleanup::RetryCurrentSession => {
+                leave_voice_with_timeout(
+                    manager,
+                    guild_id,
+                    meeting_id,
+                    "record-start retry cleanup",
+                )
+                .await;
+            }
+            VoiceJoinRetryCleanup::StopAfterSessionRemoved => {
+                leave_voice_with_timeout(
+                    manager,
+                    guild_id,
+                    meeting_id,
+                    "record-start retry cleanup after stop",
+                )
+                .await;
+                self.cleanup_failed_recording_start_locked(
+                    guild_key,
+                    meeting_id,
+                    "recording session changed during voice join retry cleanup",
+                )
+                .await;
+            }
+            VoiceJoinRetryCleanup::StopAfterSessionReplaced => {
+                self.cleanup_failed_recording_start_locked(
+                    guild_key,
+                    meeting_id,
+                    "recording session changed during voice join retry cleanup",
+                )
+                .await;
+            }
+        }
+
+        cleanup
+    }
+
     async fn verify_recording_start_after_join(
         &self,
         manager: &songbird::Songbird,
@@ -4634,39 +4709,20 @@ impl ScaffoldHandler {
                             "voice join attempt failed"
                         );
                         last_err = Some(err_msg);
-                        // Clean up partial gateway state before retrying
-                        {
-                            let _command_guard = self.command_gate.write().await;
-                            let current_session_meeting_id = {
-                                let sessions = self.sessions.lock().await;
-                                sessions
-                                    .get(&guild_key)
-                                    .map(|session| session.meeting_id.clone())
-                            };
-                            if current_session_meeting_id.as_deref() != Some(meeting_id.as_str()) {
-                                leave_voice_with_timeout(
-                                    manager.as_ref(),
-                                    guild_id,
-                                    &meeting_id,
-                                    "record-start retry cleanup after stop",
-                                )
-                                .await;
-                                self.cleanup_failed_recording_start_locked(
-                                    &guild_key,
-                                    &meeting_id,
-                                    "recording session changed during voice join retry cleanup",
-                                )
-                                .await;
-                                return Ok("参加再試行中に停止処理が始まりました。停止処理の完了を待っています。"
-                                    .to_owned());
-                            }
-                            leave_voice_with_timeout(
+                        // Clean up partial gateway state before retrying.
+                        if self
+                            .cleanup_voice_join_retry_after_failed_attempt(
                                 manager.as_ref(),
                                 guild_id,
+                                &guild_key,
                                 &meeting_id,
-                                "record-start retry cleanup",
                             )
-                            .await;
+                            .await
+                            != VoiceJoinRetryCleanup::RetryCurrentSession
+                        {
+                            return Ok(
+                                "参加再試行中に停止処理が始まりました。停止処理の完了を待っています。".to_owned(),
+                            );
                         }
                         // Re-register after leave in case it cleared the Call's
                         // event handlers (defensive: Songbird docs say handlers
@@ -4691,39 +4747,20 @@ impl ScaffoldHandler {
                             "voice join attempt timed out"
                         );
                         last_err = Some(err_msg);
-                        // Clean up partial gateway state before retrying
-                        {
-                            let _command_guard = self.command_gate.write().await;
-                            let current_session_meeting_id = {
-                                let sessions = self.sessions.lock().await;
-                                sessions
-                                    .get(&guild_key)
-                                    .map(|session| session.meeting_id.clone())
-                            };
-                            if current_session_meeting_id.as_deref() != Some(meeting_id.as_str()) {
-                                leave_voice_with_timeout(
-                                    manager.as_ref(),
-                                    guild_id,
-                                    &meeting_id,
-                                    "record-start retry cleanup after stop",
-                                )
-                                .await;
-                                self.cleanup_failed_recording_start_locked(
-                                    &guild_key,
-                                    &meeting_id,
-                                    "recording session changed during voice join retry cleanup",
-                                )
-                                .await;
-                                return Ok("参加再試行中に停止処理が始まりました。停止処理の完了を待っています。"
-                                    .to_owned());
-                            }
-                            leave_voice_with_timeout(
+                        // Clean up partial gateway state before retrying.
+                        if self
+                            .cleanup_voice_join_retry_after_failed_attempt(
                                 manager.as_ref(),
                                 guild_id,
+                                &guild_key,
                                 &meeting_id,
-                                "record-start retry cleanup",
                             )
-                            .await;
+                            .await
+                            != VoiceJoinRetryCleanup::RetryCurrentSession
+                        {
+                            return Ok(
+                                "参加再試行中に停止処理が始まりました。停止処理の完了を待っています。".to_owned(),
+                            );
                         }
                         // Re-register after leave in case it cleared the Call's
                         // event handlers (defensive: Songbird docs say handlers
@@ -9532,6 +9569,22 @@ mod status_message_tests {
         assert_eq!(
             meeting.error_message.as_deref(),
             Some("voice join failed after setup")
+        );
+    }
+
+    #[test]
+    fn voice_join_retry_cleanup_distinguishes_removed_and_successor_sessions() {
+        assert_eq!(
+            classify_voice_join_retry_cleanup(Some("m1"), "m1"),
+            VoiceJoinRetryCleanup::RetryCurrentSession
+        );
+        assert_eq!(
+            classify_voice_join_retry_cleanup(None, "m1"),
+            VoiceJoinRetryCleanup::StopAfterSessionRemoved
+        );
+        assert_eq!(
+            classify_voice_join_retry_cleanup(Some("successor"), "m1"),
+            VoiceJoinRetryCleanup::StopAfterSessionReplaced
         );
     }
 
