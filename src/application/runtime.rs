@@ -4057,6 +4057,21 @@ impl ScaffoldHandler {
             let mut startups = self.recording_startups.lock().await;
             startups.insert(guild_key.clone(), meeting_id.clone());
         }
+        let layout =
+            crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
+        let workspace =
+            layout.for_meeting(&guild_key, &voice_channel_id_u64.to_string(), &meeting_id);
+        drop(command_guard);
+        if let Err(err) = workspace.ensure_base_dirs() {
+            let _command_guard = self.command_gate.write().await;
+            let err_msg = format!("failed to prepare workspace: {err}");
+            // Only the DB row and startup reservation exist here; cleanup
+            // terminalizes the row and clears that reservation.
+            self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
+                .await;
+            return Err(err_msg);
+        }
+
         let meeting_title = {
             let mut service = self.service.lock().await;
             match service.store.get_meeting(&meeting_id) {
@@ -4072,20 +4087,6 @@ impl ScaffoldHandler {
                 }
             }
         };
-        let layout =
-            crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&self.chunk_storage_dir);
-        let workspace =
-            layout.for_meeting(&guild_key, &voice_channel_id_u64.to_string(), &meeting_id);
-        drop(command_guard);
-        if let Err(err) = workspace.ensure_base_dirs() {
-            let _command_guard = self.command_gate.write().await;
-            let err_msg = format!("failed to prepare workspace: {err}");
-            // Only the DB row and startup reservation exist here; cleanup
-            // terminalizes the row and clears that reservation.
-            self.cleanup_failed_recording_start_locked(&guild_key, &meeting_id, &err_msg)
-                .await;
-            return Err(err_msg);
-        }
 
         let command_guard = self.command_gate.write().await;
         if let Err(err_msg) = self.reject_if_shutting_down() {
@@ -8066,15 +8067,24 @@ mod status_message_tests {
     fn runtime_setup_completion_creates_recording_row() {
         let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut service = BotCommandService::new(store);
-
-        let result = complete_record_start_after_runtime_setup(
-            &mut service,
-            start_input_for_runtime_setup_test(),
-            RecordStartPreflight {
-                voice_channel_id: "vc1".to_owned(),
+        let input = start_input_for_runtime_setup_test();
+        let preflight = validate_record_start_preconditions(
+            &mut service.store,
+            &RecordStartRequest {
+                meeting_id: input.meeting_id.clone(),
+                guild_id: input.guild_id.clone(),
+                started_by_user_id: input.user_id.clone(),
+                command_channel_id: input.command_channel_id.clone(),
+                user_voice_channel_id: input.user_voice_channel_id.clone(),
+                permissions: input.permissions,
+                caller_role: input.caller_role,
+                effective_settings: input.effective_settings.clone(),
             },
         )
-        .expect("start should succeed after setup");
+        .expect("preflight should succeed");
+
+        let result = complete_record_start_after_runtime_setup(&mut service, input, preflight)
+            .expect("start should succeed after setup");
 
         assert!(result.contains("meeting_id=m1"));
         let meeting = service

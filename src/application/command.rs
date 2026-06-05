@@ -34,7 +34,13 @@ pub struct RecordStartResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordStartPreflight {
-    pub voice_channel_id: String,
+    voice_channel_id: String,
+}
+
+impl RecordStartPreflight {
+    pub(crate) fn voice_channel_id(&self) -> &str {
+        &self.voice_channel_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,10 +123,11 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     request: RecordStartRequest,
     preflight: RecordStartPreflight,
 ) -> Result<RecordStartResult, CommandError> {
+    let voice_channel_id = preflight.voice_channel_id().to_owned();
     store.create_meeting_as_recording(CreateMeetingRequest {
         id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),
-        voice_channel_id: preflight.voice_channel_id.clone(),
+        voice_channel_id: voice_channel_id.clone(),
         report_channel_id: request.command_channel_id.clone(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -131,7 +138,7 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
     Ok(RecordStartResult {
         meeting_id: request.meeting_id,
         guild_id: request.guild_id,
-        voice_channel_id: preflight.voice_channel_id,
+        voice_channel_id,
         report_channel_id: request.command_channel_id,
     })
 }
