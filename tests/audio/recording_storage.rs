@@ -465,3 +465,46 @@ fn recording_session_persists_ssrc_mapping_for_rekeyed_pending_failed_chunks() {
 
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn recording_session_overwrites_ssrc_mapping_on_retry_snapshot() {
+    let base = unique_temp_dir("recording_session_mapping_overwrite");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let meeting_dir = layout.for_meeting("g1", "vc1", "meeting-mapping-overwrite");
+    let storage = LocalChunkStorage::new(meeting_dir.clone(), "meeting-mapping-overwrite");
+
+    let mut session = RecordingSession::new(
+        "meeting-mapping-overwrite".to_owned(),
+        storage,
+        ReceiverConfig {
+            chunk_duration: Duration::from_secs(20),
+            silence_flush_duration: Duration::from_secs(30),
+        },
+        48_000,
+    );
+    session.ingest_frame(
+        "12345",
+        BufferedFrame {
+            timestamp_ms: 1_000,
+            pcm_16le_bytes: vec![0, 0, 1, 0],
+        },
+    );
+    let flushed = session.flush_all().expect("flush should succeed");
+    assert_eq!(flushed.failed.len(), 0);
+
+    let mut stale_tracker = SsrcTracker::new();
+    stale_tracker.update_mapping(100, 12345);
+    session.persist_ssrc_mapping(&stale_tracker);
+
+    let mut latest_tracker = SsrcTracker::new();
+    latest_tracker.update_mapping(200, 12345);
+    session.persist_ssrc_mapping(&latest_tracker);
+
+    let mapping_path = meeting_dir.audio_dir().join(SSRC_MAPPING_FILENAME);
+    let mapping_data = std::fs::read(&mapping_path).expect("mapping file should be written");
+    let parsed: SsrcTracker = serde_json::from_slice(&mapping_data).expect("mapping should parse");
+    assert_eq!(parsed.resolve_user(100), None);
+    assert_eq!(parsed.resolve_user(200), Some("12345"));
+
+    let _ = std::fs::remove_dir_all(base);
+}

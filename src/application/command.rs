@@ -33,6 +33,17 @@ pub struct RecordStartResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordStartPreflight {
+    voice_channel_id: String,
+}
+
+impl RecordStartPreflight {
+    pub(crate) fn voice_channel_id(&self) -> &str {
+        &self.voice_channel_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordStopRequest {
     pub guild_id: String,
     pub caller_user_id: String,
@@ -58,6 +69,7 @@ pub enum CommandError {
     AlreadyExists {
         meeting_id: String,
     },
+    PreflightMismatch,
     NoActiveMeeting,
     Store(String),
     Stop(String),
@@ -75,6 +87,7 @@ impl Display for CommandError {
             Self::AlreadyExists { meeting_id } => {
                 write!(f, "meeting already exists: {meeting_id}")
             }
+            Self::PreflightMismatch => write!(f, "record-start preflight does not match request"),
             Self::NoActiveMeeting => write!(f, "no active meeting found"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Stop(err) => write!(f, "{err}"),
@@ -103,8 +116,53 @@ pub fn record_start<S: MeetingStore>(
     store: &mut S,
     request: RecordStartRequest,
 ) -> Result<RecordStartResult, CommandError> {
+    let preflight = validate_record_start_preconditions(store, &request)?;
+    record_start_after_preflight(store, request, preflight)
+}
+
+pub(crate) fn record_start_after_preflight<S: MeetingStore>(
+    store: &mut S,
+    request: RecordStartRequest,
+    preflight: RecordStartPreflight,
+) -> Result<RecordStartResult, CommandError> {
+    // Production derives both values from the same resolved voice channel. This
+    // protects direct callers, tests, and future call sites from mixing a
+    // request with a preflight token created for a different channel.
+    let Some(request_voice_channel_id) = request.user_voice_channel_id.as_deref() else {
+        return Err(CommandError::UserNotInVoice);
+    };
+    if request_voice_channel_id != preflight.voice_channel_id() {
+        return Err(CommandError::PreflightMismatch);
+    }
+    let voice_channel_id = preflight.voice_channel_id().to_owned();
+    store.create_meeting_as_recording(CreateMeetingRequest {
+        id: request.meeting_id.clone(),
+        guild_id: request.guild_id.clone(),
+        voice_channel_id: voice_channel_id.clone(),
+        report_channel_id: request.command_channel_id.clone(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: request.started_by_user_id,
+        effective_settings: request.effective_settings,
+    })?;
+
+    Ok(RecordStartResult {
+        meeting_id: request.meeting_id,
+        guild_id: request.guild_id,
+        voice_channel_id,
+        report_channel_id: request.command_channel_id,
+    })
+}
+
+pub(crate) fn validate_record_start_preconditions<S: MeetingStore>(
+    store: &mut S,
+    request: &RecordStartRequest,
+) -> Result<RecordStartPreflight, CommandError> {
+    // The production handler checks this before building the request; keep the
+    // guard here for direct tests and future callers of the preflight helper.
     let voice_channel_id = request
         .user_voice_channel_id
+        .clone()
         .ok_or(CommandError::UserNotInVoice)?;
 
     if !request.permissions.can_connect_voice {
@@ -132,23 +190,7 @@ pub fn record_start<S: MeetingStore>(
         }
     }
 
-    store.create_meeting_as_recording(CreateMeetingRequest {
-        id: request.meeting_id.clone(),
-        guild_id: request.guild_id.clone(),
-        voice_channel_id: voice_channel_id.clone(),
-        report_channel_id: request.command_channel_id.clone(),
-        status_message_channel_id: None,
-        status_message_id: None,
-        started_by_user_id: request.started_by_user_id,
-        effective_settings: request.effective_settings,
-    })?;
-
-    Ok(RecordStartResult {
-        meeting_id: request.meeting_id,
-        guild_id: request.guild_id,
-        voice_channel_id,
-        report_channel_id: request.command_channel_id,
-    })
+    Ok(RecordStartPreflight { voice_channel_id })
 }
 
 pub fn record_stop<S: MeetingStore>(
@@ -201,5 +243,64 @@ pub fn authorize_record_stop_for_meeting(
         Ok(())
     } else {
         Err(CommandError::Unauthorized("stop recording"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::storage::InMemoryMeetingStore;
+
+    fn default_start_request() -> RecordStartRequest {
+        RecordStartRequest {
+            meeting_id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            started_by_user_id: "u1".to_owned(),
+            command_channel_id: "report-chan".to_owned(),
+            user_voice_channel_id: Some("vc-1".to_owned()),
+            permissions: PermissionSet {
+                can_connect_voice: true,
+                can_send_messages: true,
+            },
+            caller_role: UserRole::GuildAdmin,
+            effective_settings: None,
+        }
+    }
+
+    #[test]
+    fn record_start_after_preflight_rejects_mismatched_voice_channel() {
+        let mut store = InMemoryMeetingStore::new();
+        let request = default_start_request();
+        let preflight = RecordStartPreflight {
+            voice_channel_id: "vc-2".to_owned(),
+        };
+
+        let error = record_start_after_preflight(&mut store, request, preflight)
+            .expect_err("mismatched preflight should be rejected");
+
+        assert_eq!(error, CommandError::PreflightMismatch);
+        assert!(
+            store.get("m1").is_none(),
+            "mismatched preflight must not create a meeting"
+        );
+    }
+
+    #[test]
+    fn record_start_after_preflight_preserves_missing_voice_error() {
+        let mut store = InMemoryMeetingStore::new();
+        let mut request = default_start_request();
+        request.user_voice_channel_id = None;
+        let preflight = RecordStartPreflight {
+            voice_channel_id: "vc-1".to_owned(),
+        };
+
+        let error = record_start_after_preflight(&mut store, request, preflight)
+            .expect_err("missing voice channel should use the preflight user error");
+
+        assert_eq!(error, CommandError::UserNotInVoice);
+        assert!(
+            store.get("m1").is_none(),
+            "missing voice channel must not create a meeting"
+        );
     }
 }

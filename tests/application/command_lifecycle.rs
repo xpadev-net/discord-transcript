@@ -116,6 +116,67 @@ fn record_start_rejects_plain_member() {
 }
 
 #[test]
+fn record_start_preflight_rejects_plain_member_without_creating_meeting() {
+    let mut store = InMemoryMeetingStore::new();
+    let request = RecordStartRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        started_by_user_id: "u1".to_owned(),
+        command_channel_id: "report-chan".to_owned(),
+        user_voice_channel_id: Some("vc-1".to_owned()),
+        permissions: default_permissions(),
+        caller_role: UserRole::Member,
+        effective_settings: None,
+    };
+
+    let error = record_start(&mut store, request).expect_err("must fail");
+    assert_eq!(error, CommandError::Unauthorized("start recording"));
+    assert!(store.get("m1").is_none(), "preflight must not create rows");
+}
+
+#[test]
+fn record_start_preflight_rejects_active_meeting_without_creating_requested_meeting() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "existing".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-1".to_owned(),
+        report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Recording,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+    let request = RecordStartRequest {
+        meeting_id: "new".to_owned(),
+        guild_id: "g1".to_owned(),
+        started_by_user_id: "u2".to_owned(),
+        command_channel_id: "report-chan".to_owned(),
+        user_voice_channel_id: Some("vc-2".to_owned()),
+        permissions: default_permissions(),
+        caller_role: UserRole::GuildAdmin,
+        effective_settings: None,
+    };
+
+    let error = record_start(&mut store, request).expect_err("must fail");
+    assert_eq!(
+        error,
+        CommandError::ActiveMeetingExists {
+            meeting_id: "existing".to_owned()
+        }
+    );
+    assert!(
+        store.get("new").is_none(),
+        "preflight must not create the requested row"
+    );
+}
+
+#[test]
 fn record_start_allows_when_previous_meeting_is_stopping() {
     // A meeting in Stopping state (summary processing in progress) should NOT block
     // a new recording, since the voice channel is no longer occupied.
@@ -276,7 +337,7 @@ fn record_stop_rejects_started_meeting_role_without_matching_user() {
 
 #[test]
 fn auto_stop_triggers_after_grace_period_and_can_cancel() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -305,7 +366,7 @@ fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
     // voice_state_update to skip cancelling the timer. At fire time the runtime
     // re-checks member count, sees members returned, feeds that back into the
     // state machine, and must allow a fresh timer for a subsequent empty episode.
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -325,7 +386,7 @@ fn auto_stop_allows_new_timer_after_members_return_at_fire_time() {
 
 #[test]
 fn auto_stop_rearms_after_failed_stop_attempt() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
@@ -346,11 +407,78 @@ fn auto_stop_rearms_after_failed_stop_attempt() {
 
 #[test]
 fn auto_stop_grace_uses_monotonic_elapsed_not_wall_clock_ms() {
-    let mut state = AutoStopState::new(Duration::from_secs(60));
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
     state.set_empty_since_elapsed_for_test(Duration::from_secs(60));
     assert_eq!(state.tick(), AutoStopSignal::Trigger);
+}
+
+#[test]
+fn auto_stop_state_tracks_optional_meeting_id() {
+    let unscoped = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
+    assert_eq!(unscoped.meeting_id(), None);
+    assert!(!unscoped.belongs_to_meeting("m2"));
+    assert!(unscoped.should_remove_for_meeting_cleanup("m2"));
+
+    let scoped = AutoStopState::new_for_meeting(Duration::from_secs(60), Some("m1".to_owned()));
+    assert_eq!(scoped.meeting_id(), Some("m1"));
+    assert!(scoped.belongs_to_meeting("m1"));
+    assert!(!scoped.belongs_to_meeting("m2"));
+    assert!(scoped.should_remove_for_meeting_cleanup("m1"));
+    assert!(!scoped.should_remove_for_meeting_cleanup("m2"));
+}
+
+#[test]
+fn auto_stop_unscoped_state_refreshes_for_known_meeting() {
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    assert_eq!(state.timer_generation(), 1);
+    assert_eq!(state.meeting_id(), None);
+
+    assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
+
+    assert_eq!(state.meeting_id(), Some("m1"));
+    assert_eq!(state.timer_generation(), 1);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    assert_eq!(state.timer_generation(), 2);
+
+    assert!(!state.refresh_for_meeting(Duration::from_secs(60), "m1"));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::AlreadyWaiting
+    );
+    assert_eq!(state.timer_generation(), 2);
+}
+
+#[test]
+fn auto_stop_refresh_does_not_reuse_in_flight_timer_generation() {
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    let stale_generation = state.timer_generation();
+
+    assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    assert_ne!(state.timer_generation(), stale_generation);
+
+    state.clear_timer_active_for_generation(stale_generation);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::AlreadyWaiting,
+        "stale timer cleanup must not clear the active timer for refreshed meeting state"
+    );
 }
