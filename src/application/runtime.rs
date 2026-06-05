@@ -2600,7 +2600,7 @@ impl EventHandler for ScaffoldHandler {
                 AutoStopState::new_for_meeting(grace, active_meeting_id.clone())
             });
             if let Some(active_meeting_id) = active_meeting_id.as_deref()
-                && !state.belongs_to_meeting(active_meeting_id)
+                && state.meeting_id() != Some(active_meeting_id)
             {
                 *state = AutoStopState::new_for_meeting(grace, Some(active_meeting_id.to_owned()));
             }
@@ -3615,7 +3615,9 @@ impl ScaffoldHandler {
                 None
             }
         };
-        if let Some(manager) = songbird::get(ctx).await {
+        if removed_session.is_some()
+            && let Some(manager) = songbird::get(ctx).await
+        {
             leave_voice_with_timeout(manager.as_ref(), guild_id, expected_meeting_id, phase).await;
         }
         if let Some(session) = removed_session.as_mut() {
@@ -4127,8 +4129,12 @@ impl ScaffoldHandler {
             }
         };
         if !setup_still_recording {
-            let mut startups = self.recording_startups.lock().await;
-            clear_matching_recording_startup(&mut startups, &guild_key, &meeting_id);
+            self.cleanup_failed_recording_start_locked(
+                &guild_key,
+                &meeting_id,
+                "recording no longer active after audio setup",
+            )
+            .await;
             return Ok(
                 "参加準備中に停止処理が始まりました。停止処理の完了を待っています。".to_owned(),
             );

@@ -430,3 +430,23 @@ fn auto_stop_state_tracks_optional_meeting_id() {
     assert!(scoped.belongs_to_meeting("m1"));
     assert!(!scoped.belongs_to_meeting("m2"));
 }
+
+#[test]
+fn auto_stop_unscoped_state_refreshes_for_known_meeting() {
+    let mut state = AutoStopState::new(Duration::from_secs(60));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    assert_eq!(state.meeting_id(), None);
+
+    if state.meeting_id() != Some("m1") {
+        state = AutoStopState::new_for_meeting(Duration::from_secs(60), Some("m1".to_owned()));
+    }
+
+    assert_eq!(state.meeting_id(), Some("m1"));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+}
