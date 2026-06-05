@@ -90,6 +90,8 @@ const DRIVER_DISCONNECT_GRACE_MAX_RESCHEDULES: u32 = 10;
 const RECORDING_STOP_MAX_RETRIES: u32 = 10;
 const RECORDING_LOOKUP_MAX_RETRIES: u32 = 10;
 const RECORDING_TERMINAL_CLEANUP_MAX_RETRIES: u32 = 3;
+const RECORDING_START_CLEANUP_MAX_RETRIES: u32 = 3;
+const RECORDING_START_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECORDING_VOICE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2045,6 +2047,7 @@ pub async fn run_bot(
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         recording_startups: Arc::new(Mutex::new(HashMap::new())),
+        recording_start_cleanup_retries: Arc::new(StdMutex::new(HashSet::new())),
         live_transcription_bases: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_titles: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_gate: Arc::new(Semaphore::new(1)),
@@ -2178,6 +2181,7 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
     recording_startups: Arc<Mutex<HashMap<String, String>>>,
+    recording_start_cleanup_retries: Arc<StdMutex<HashSet<String>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
     live_transcription_titles: Arc<Mutex<HashMap<String, Option<String>>>>,
     live_transcription_gate: Arc<Semaphore>,
@@ -2273,6 +2277,17 @@ impl ScaffoldHandler {
             debug!("spawn_background: shutdown in progress, dropping background task");
             return;
         }
+        self.task_tracker.spawn(future);
+    }
+
+    fn spawn_lifecycle_cleanup_retry<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let _spawn_guard = self
+            .background_spawn_gate
+            .lock()
+            .expect("background spawn gate poisoned");
         self.task_tracker.spawn(future);
     }
 
@@ -4210,6 +4225,33 @@ impl ScaffoldHandler {
         meeting_id: &str,
         error_message: &str,
     ) {
+        if !self
+            .try_cleanup_failed_recording_start_locked(guild_key, meeting_id, error_message)
+            .await
+        {
+            if self.shutting_down.load(Ordering::Acquire) {
+                self.retry_failed_recording_start_cleanup_locked_inline(
+                    guild_key,
+                    meeting_id,
+                    error_message,
+                )
+                .await;
+            } else {
+                self.spawn_failed_recording_start_cleanup_retry(
+                    guild_key.to_owned(),
+                    meeting_id.to_owned(),
+                    error_message.to_owned(),
+                );
+            }
+        }
+    }
+
+    async fn try_cleanup_failed_recording_start_locked(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+    ) -> bool {
         {
             let mut service = self.service.lock().await;
             match mark_recording_start_failed_after_setup_error(
@@ -4226,12 +4268,108 @@ impl ScaffoldHandler {
                         error = %err,
                         "failed to mark meeting as failed after voice join error; preserving local recording setup state for retry"
                     );
-                    return;
+                    return false;
                 }
             }
         }
         self.clear_failed_recording_start_local_state(guild_key, meeting_id)
             .await;
+        true
+    }
+
+    fn spawn_failed_recording_start_cleanup_retry(
+        &self,
+        guild_key: String,
+        meeting_id: String,
+        error_message: String,
+    ) {
+        let retry_key = format!("{guild_key}:{meeting_id}");
+        {
+            let mut retries = self
+                .recording_start_cleanup_retries
+                .lock()
+                .expect("recording start cleanup retry set poisoned");
+            if !retries.insert(retry_key.clone()) {
+                debug!(
+                    guild_id = %guild_key,
+                    meeting_id = %meeting_id,
+                    "record-start setup failure cleanup retry already scheduled"
+                );
+                return;
+            }
+        }
+
+        let handler = self.clone();
+        self.spawn_lifecycle_cleanup_retry(async move {
+            let retry_key = retry_key;
+            for attempt in 1..=RECORDING_START_CLEANUP_MAX_RETRIES {
+                sleep(RECORDING_START_CLEANUP_RETRY_DELAY).await;
+                let _command_guard = handler.command_gate.write().await;
+                if handler
+                    .try_cleanup_failed_recording_start_locked(
+                        &guild_key,
+                        &meeting_id,
+                        &error_message,
+                    )
+                    .await
+                {
+                    info!(
+                        guild_id = %guild_key,
+                        meeting_id = %meeting_id,
+                        attempt,
+                        "record-start setup failure cleanup retry completed"
+                    );
+                    handler.clear_recording_start_cleanup_retry(&retry_key);
+                    return;
+                }
+            }
+
+            error!(
+                guild_id = %guild_key,
+                meeting_id = %meeting_id,
+                attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
+                "record-start setup failure cleanup retries exhausted; preserving local recording setup state"
+            );
+            handler.clear_recording_start_cleanup_retry(&retry_key);
+        });
+    }
+
+    async fn retry_failed_recording_start_cleanup_locked_inline(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        error_message: &str,
+    ) {
+        for attempt in 1..=RECORDING_START_CLEANUP_MAX_RETRIES {
+            sleep(RECORDING_START_CLEANUP_RETRY_DELAY).await;
+            if self
+                .try_cleanup_failed_recording_start_locked(guild_key, meeting_id, error_message)
+                .await
+            {
+                info!(
+                    guild_id = %guild_key,
+                    meeting_id = %meeting_id,
+                    attempt,
+                    "record-start setup failure cleanup retry completed during shutdown"
+                );
+                return;
+            }
+        }
+
+        error!(
+            guild_id = %guild_key,
+            meeting_id = %meeting_id,
+            attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
+            "record-start setup failure cleanup retries exhausted during shutdown; preserving local recording setup state"
+        );
+    }
+
+    fn clear_recording_start_cleanup_retry(&self, retry_key: &str) {
+        let mut retries = self
+            .recording_start_cleanup_retries
+            .lock()
+            .expect("recording start cleanup retry set poisoned");
+        retries.remove(retry_key);
     }
 
     async fn clear_failed_recording_start_local_state(&self, guild_key: &str, meeting_id: &str) {
