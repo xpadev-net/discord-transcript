@@ -598,6 +598,16 @@ fn classify_voice_join_retry_cleanup(
     }
 }
 
+fn voice_join_retry_cleanup_leave_phase(cleanup: VoiceJoinRetryCleanup) -> Option<&'static str> {
+    match cleanup {
+        VoiceJoinRetryCleanup::RetryCurrentSession => Some("record-start retry cleanup"),
+        VoiceJoinRetryCleanup::StopAfterSessionRemoved => {
+            Some("record-start retry cleanup after stop")
+        }
+        VoiceJoinRetryCleanup::StopAfterSessionReplaced => None,
+    }
+}
+
 // Join completion can race with stop or teardown exhaustion after the DB
 // row/session were created but before Songbird reports success. Treat those
 // downstream terminal states as benign so cleanup stays conditional on local
@@ -1046,6 +1056,7 @@ struct ActiveMeetingVoiceChannel {
     voice_channel_id: u64,
 }
 
+#[derive(Clone, Copy)]
 struct TerminalCleanupRetryFailureRequest<'a> {
     guild_key: &'a str,
     expected_meeting_id: &'a str,
@@ -4893,41 +4904,20 @@ impl ScaffoldHandler {
         let cleanup =
             classify_voice_join_retry_cleanup(current_session_meeting_id.as_deref(), meeting_id);
 
-        match cleanup {
-            VoiceJoinRetryCleanup::RetryCurrentSession => {
-                leave_voice_with_timeout(
-                    manager,
-                    guild_id,
-                    meeting_id,
-                    "record-start retry cleanup",
-                )
-                .await;
-            }
-            VoiceJoinRetryCleanup::StopAfterSessionRemoved => {
-                leave_voice_with_timeout(
-                    manager,
-                    guild_id,
-                    meeting_id,
-                    "record-start retry cleanup after stop",
-                )
-                .await;
-                self.cleanup_failed_recording_start_locked(
-                    guild_key,
-                    meeting_id,
-                    "recording session changed during voice join retry cleanup",
-                )
-                .await;
-            }
-            VoiceJoinRetryCleanup::StopAfterSessionReplaced => {
-                // A later recording owns the guild session slot now; a guild-level
-                // leave here could disconnect that successor's in-flight join.
-                self.cleanup_failed_recording_start_locked(
-                    guild_key,
-                    meeting_id,
-                    "recording session changed during voice join retry cleanup",
-                )
-                .await;
-            }
+        if let Some(phase) = voice_join_retry_cleanup_leave_phase(cleanup) {
+            leave_voice_with_timeout(manager, guild_id, meeting_id, phase).await;
+        }
+        if matches!(
+            cleanup,
+            VoiceJoinRetryCleanup::StopAfterSessionRemoved
+                | VoiceJoinRetryCleanup::StopAfterSessionReplaced
+        ) {
+            self.cleanup_failed_recording_start_locked(
+                guild_key,
+                meeting_id,
+                "recording session changed during voice join retry cleanup",
+            )
+            .await;
         }
 
         cleanup
@@ -8747,6 +8737,7 @@ mod status_message_tests {
         set_status_failures_remaining: usize,
         set_error_message_failures_remaining: usize,
         find_active_failures_remaining: usize,
+        set_status_attempts: usize,
     }
 
     impl FaultInjectedMeetingStore {
@@ -8758,6 +8749,7 @@ mod status_message_tests {
                 set_status_failures_remaining: 0,
                 set_error_message_failures_remaining: 0,
                 find_active_failures_remaining: 0,
+                set_status_attempts: 0,
             }
         }
 
@@ -8778,6 +8770,10 @@ mod status_message_tests {
         fn fail_active_meeting_lookups(mut self, failures: usize) -> Self {
             self.find_active_failures_remaining = failures;
             self
+        }
+
+        fn status_update_attempts(&self) -> usize {
+            self.set_status_attempts
         }
     }
 
@@ -8872,6 +8868,7 @@ mod status_message_tests {
             status: crate::domain::MeetingStatus,
             expected_current: Option<crate::domain::MeetingStatus>,
         ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.set_status_attempts += 1;
             if self.set_status_failures_remaining > 0 {
                 self.set_status_failures_remaining -= 1;
                 return Err(crate::infrastructure::storage::StoreError::Backend(
@@ -10198,6 +10195,83 @@ mod status_message_tests {
     }
 
     #[tokio::test]
+    async fn async_terminal_cleanup_retry_waits_full_window_after_store_failure() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let local_state = RecordingLocalState::with_matching_session(0);
+        let harness = async_lifecycle_harness(store, local_state);
+        let mut terminal_cleanup_failures = RECORDING_TERMINAL_CLEANUP_MAX_RETRIES - 1;
+        let local = harness.local_state();
+        let request = TerminalCleanupRetryFailureRequest {
+            guild_key: "g1",
+            expected_meeting_id: "m1",
+            phase: "auto-stop stop exhaustion",
+            err: "status update unavailable",
+        };
+
+        let decision = handle_terminal_cleanup_retry_failure_with_dependencies(
+            &harness.service,
+            &local,
+            request,
+            &mut terminal_cleanup_failures,
+        )
+        .await;
+        assert!(matches!(decision, TerminalCleanupRetryDecision::Reschedule));
+        assert_eq!(terminal_cleanup_failures, 0);
+        {
+            let service = harness.service.lock().await;
+            assert_eq!(service.store.status_update_attempts(), 1);
+        }
+
+        for expected_attempts in 1..RECORDING_TERMINAL_CLEANUP_MAX_RETRIES {
+            let decision = handle_terminal_cleanup_retry_failure_with_dependencies(
+                &harness.service,
+                &local,
+                request,
+                &mut terminal_cleanup_failures,
+            )
+            .await;
+
+            assert!(matches!(decision, TerminalCleanupRetryDecision::Reschedule));
+            assert_eq!(terminal_cleanup_failures, expected_attempts);
+            harness.assert_matching_state_present().await;
+            let service = harness.service.lock().await;
+            assert_eq!(
+                service.store.status_update_attempts(),
+                1,
+                "store terminalization must wait for the full retry window"
+            );
+            assert_eq!(
+                service.store.meeting().status,
+                crate::domain::MeetingStatus::Recording
+            );
+        }
+
+        let decision = handle_terminal_cleanup_retry_failure_with_dependencies(
+            &harness.service,
+            &local,
+            request,
+            &mut terminal_cleanup_failures,
+        )
+        .await;
+
+        match decision {
+            TerminalCleanupRetryDecision::Cleared { removed_session } => {
+                assert!(removed_session.is_some());
+            }
+            TerminalCleanupRetryDecision::Reschedule => {
+                panic!("terminal cleanup should clear once the retry window elapses")
+            }
+        }
+        harness.assert_matching_state_cleared().await;
+        let service = harness.service.lock().await;
+        assert_eq!(service.store.status_update_attempts(), 2);
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+    }
+
+    #[tokio::test]
     async fn async_teardown_exhaustion_store_failure_keeps_state_and_skips_voice_leave() {
         let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
         let saved_chunks = Arc::new(AtomicUsize::new(0));
@@ -11073,6 +11147,19 @@ mod status_message_tests {
         assert_eq!(
             classify_voice_join_retry_cleanup(Some("successor"), "m1"),
             VoiceJoinRetryCleanup::StopAfterSessionReplaced
+        );
+        assert_eq!(
+            voice_join_retry_cleanup_leave_phase(VoiceJoinRetryCleanup::RetryCurrentSession),
+            Some("record-start retry cleanup")
+        );
+        assert_eq!(
+            voice_join_retry_cleanup_leave_phase(VoiceJoinRetryCleanup::StopAfterSessionRemoved),
+            Some("record-start retry cleanup after stop")
+        );
+        assert_eq!(
+            voice_join_retry_cleanup_leave_phase(VoiceJoinRetryCleanup::StopAfterSessionReplaced),
+            None,
+            "successor session owns the guild voice state, so stale cleanup must not leave"
         );
     }
 
