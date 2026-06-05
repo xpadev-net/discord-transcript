@@ -4404,7 +4404,6 @@ impl ScaffoldHandler {
         cleanup_scope: FailedRecordingStartLocalCleanup,
     ) {
         for attempt in 1..=RECORDING_START_CLEANUP_MAX_RETRIES {
-            sleep(RECORDING_START_CLEANUP_RETRY_DELAY).await;
             if self
                 .try_cleanup_failed_recording_start_locked(
                     guild_key,
@@ -4450,11 +4449,27 @@ impl ScaffoldHandler {
     ) {
         self.clear_failed_recording_startup_locked(guild_key, meeting_id)
             .await;
-        {
+        if cleanup_scope == FailedRecordingStartLocalCleanup::StartupOnly {
+            return;
+        }
+
+        let mut removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let mut sessions = self.sessions.lock().await;
-            remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id);
+            remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id)
+        };
+        if let Some(session) = removed_session.as_mut() {
+            flush_removed_session_after_stop(session, guild_key, "record-start failure cleanup");
         }
+        let latest_tracker = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            let tracker = self.ssrc_tracker.lock().await;
+            tracker.clone()
+        };
+        if let Some(session) = &removed_session {
+            session.persist_ssrc_mapping(&latest_tracker);
+        }
+
         {
             let mut states = self.auto_stop_states.lock().await;
             remove_auto_stop_state_for_failed_recording_start_cleanup(
@@ -7884,6 +7899,16 @@ mod status_message_tests {
         let mut sessions = HashMap::from([("g1".to_owned(), session)]);
 
         assert_eq!(flush_sessions_for_shutdown(&mut sessions), 1);
+        assert_eq!(saved_chunks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_start_cleanup_flushes_removed_session_chunks() {
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let mut session = session_with_one_flaky_chunk_and_counter(0, Arc::clone(&saved_chunks));
+
+        flush_removed_session_after_stop(&mut session, "g1", "record-start failure cleanup");
+
         assert_eq!(saved_chunks.load(Ordering::SeqCst), 1);
     }
 
