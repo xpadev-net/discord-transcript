@@ -2541,7 +2541,13 @@ impl EventHandler for ScaffoldHandler {
                             let mut startups = self.recording_startups.lock().await;
                             // A valid reservation must have an active meeting row; the
                             // lifecycle gate prevents racing a fresh /record-start here.
-                            startups.remove(&guild_key);
+                            if let Some(meeting_id) = startups.get(&guild_key).cloned() {
+                                clear_matching_recording_startup(
+                                    &mut startups,
+                                    &guild_key,
+                                    &meeting_id,
+                                );
+                            }
                         }
                         return;
                     }
