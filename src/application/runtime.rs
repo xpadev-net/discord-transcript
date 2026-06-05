@@ -232,17 +232,44 @@ where
     S: MeetingStore,
     Q: crate::infrastructure::queue::JobQueue,
 {
+    stop_and_enqueue_summary_job_for_teardown(
+        service,
+        queue,
+        guild_id,
+        user_id,
+        caller_role,
+        expected_meeting_id,
+        reason,
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn stop_and_enqueue_summary_job_for_teardown<S, Q>(
+    service: &mut BotCommandService<S>,
+    queue: &mut Q,
+    guild_id: &str,
+    user_id: &str,
+    caller_role: UserRole,
+    expected_meeting_id: Option<&str>,
+    reason: StopReason,
+) -> Result<crate::application::bot::StopCommandResult, TeardownStopError>
+where
+    S: MeetingStore,
+    Q: crate::infrastructure::queue::JobQueue,
+{
     if let Some(expected_meeting_id) = expected_meeting_id {
         let active = service
             .store
             .find_active_meeting_by_guild(guild_id)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
+            .map_err(|err| TeardownStopError::Other(err.to_string()))?
+            .ok_or_else(|| {
+                TeardownStopError::TargetAbsent(CommandError::NoActiveMeeting.to_string())
+            })?;
         if active.id != expected_meeting_id {
-            return Err(format!(
+            return Err(TeardownStopError::TargetAbsent(format!(
                 "active meeting changed before stop: expected={expected_meeting_id}, actual={}",
                 active.id
-            ));
+            )));
         }
     }
 
@@ -253,7 +280,10 @@ where
             caller_role,
             reason,
         })
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| match err {
+            CommandError::NoActiveMeeting => TeardownStopError::TargetAbsent(err.to_string()),
+            err => TeardownStopError::Other(err.to_string()),
+        })?;
 
     if stop_result.outcome == StopOutcome::Owner {
         record_recording_duration_usage(&mut service.store, &stop_result.meeting_id);
@@ -264,7 +294,7 @@ where
         StopOutcome::AlreadyHandled => service
             .store
             .get_meeting(&stop_result.meeting_id)
-            .map_err(|err| err.to_string())?
+            .map_err(|err| TeardownStopError::Other(err.to_string()))?
             .is_some_and(|meeting| meeting.status == MeetingStatus::Stopping),
     };
 
@@ -272,7 +302,7 @@ where
         if service
             .store
             .get_effective_meeting_settings(&stop_result.meeting_id)
-            .map_err(|err| err.to_string())?
+            .map_err(|err| TeardownStopError::Other(err.to_string()))?
             .is_some_and(|settings| !settings.summary_enabled)
         {
             info!(
@@ -297,7 +327,7 @@ where
                     "summary job already exists after stop"
                 );
             }
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(TeardownStopError::Other(err.to_string())),
         }
     }
 
@@ -790,11 +820,6 @@ fn persist_terminal_cleanup_retry_exhaustion<S: MeetingStore>(
     mark_recording_failed_after_teardown_exhaustion(store, expected_meeting_id, terminal_error)
 }
 
-fn is_terminal_stop_target_absent_error(err: &str) -> bool {
-    err == CommandError::NoActiveMeeting.to_string()
-        || err.starts_with("active meeting changed before stop:")
-}
-
 async fn leave_voice_with_timeout(
     manager: &songbird::Songbird,
     guild_id: GuildId,
@@ -822,12 +847,6 @@ async fn leave_voice_with_timeout(
             );
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RecordingTeardownError {
-    FinalFlush(String),
-    Stop(String),
 }
 
 struct RecordingStopTeardownRequest<'a> {
@@ -872,11 +891,37 @@ struct RecordingLifecycleWritePermit<'a> {
     _guard: RwLockWriteGuard<'a, ()>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TeardownStopError {
+    TargetAbsent(String),
+    Other(String),
+}
+
+impl TeardownStopError {
+    fn is_target_absent(&self) -> bool {
+        matches!(self, Self::TargetAbsent(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordingTeardownError {
+    FinalFlush(String),
+    Stop(TeardownStopError),
+}
+
 async fn recording_lifecycle_write_permit_for_gate(
     command_gate: &RwLock<()>,
 ) -> RecordingLifecycleWritePermit<'_> {
     RecordingLifecycleWritePermit {
         _guard: command_gate.write().await,
+    }
+}
+
+impl Display for TeardownStopError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TargetAbsent(err) | Self::Other(err) => write!(f, "{err}"),
+        }
     }
 }
 
@@ -3294,7 +3339,7 @@ impl EventHandler for ScaffoldHandler {
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
                             final_flush_failures = 0;
-                            if is_terminal_stop_target_absent_error(&err) {
+                            if err.is_target_absent() {
                                 warn!(
                                     guild_id = %guild_for_task,
                                     meeting_id = expected_meeting_id_ref,
@@ -3314,7 +3359,11 @@ impl EventHandler for ScaffoldHandler {
                                 return;
                             }
                             let terminal_error =
-                                recording_stop_terminal_error(&mut stop_failures, "auto-stop", &err);
+                                recording_stop_terminal_error(
+                                    &mut stop_failures,
+                                    "auto-stop",
+                                    &err.to_string(),
+                                );
                             warn!(
                                 guild_id = %guild_for_task,
                                 meeting_id = expected_meeting_id_ref,
@@ -3849,7 +3898,7 @@ impl ScaffoldHandler {
         let stop_result = {
             let mut service = self.service.lock().await;
             let mut queue = self.queue.lock().await;
-            stop_and_enqueue_summary_job(
+            stop_and_enqueue_summary_job_for_teardown(
                 &mut service,
                 &mut *queue,
                 request.guild_key,
@@ -7098,7 +7147,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 Err(RecordingTeardownError::Stop(err)) => {
                                     final_flush_failures = 0;
                                     if retry_teardown_after_failed_terminal_cleanup
-                                        && is_terminal_stop_target_absent_error(&err)
+                                        && err.is_target_absent()
                                     {
                                         warn!(
                                             guild_id = %guild_key,
@@ -7124,7 +7173,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     let terminal_error = recording_stop_terminal_error(
                                         &mut stop_failures,
                                         "driver-disconnect",
-                                        &err,
+                                        &err.to_string(),
                                     );
                                     warn!(
                                         guild_id = %guild_key,
@@ -9054,16 +9103,39 @@ mod status_message_tests {
     }
 
     #[test]
-    fn terminal_stop_target_absent_error_matches_stop_contract() {
-        assert!(is_terminal_stop_target_absent_error(
-            &CommandError::NoActiveMeeting.to_string()
-        ));
-        assert!(is_terminal_stop_target_absent_error(
-            "active meeting changed before stop: expected=old, actual=new"
-        ));
-        assert!(!is_terminal_stop_target_absent_error(
-            "database unavailable"
-        ));
+    fn teardown_stop_error_classifies_terminal_absence_without_string_matching() {
+        assert!(
+            TeardownStopError::TargetAbsent(CommandError::NoActiveMeeting.to_string())
+                .is_target_absent()
+        );
+        assert!(
+            TeardownStopError::TargetAbsent(
+                "active meeting changed before stop: expected=old, actual=new".to_owned(),
+            )
+            .is_target_absent()
+        );
+        assert!(!TeardownStopError::Other("database unavailable".to_owned()).is_target_absent());
+    }
+
+    #[test]
+    fn teardown_stop_helper_returns_typed_target_absence() {
+        let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut service = BotCommandService::new(store);
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+
+        let err = stop_and_enqueue_summary_job_for_teardown(
+            &mut service,
+            &mut queue,
+            "g1",
+            "u1",
+            UserRole::BotAdmin,
+            Some("m1"),
+            StopReason::AutoEmpty,
+        )
+        .expect_err("missing active meeting should be typed as target absence");
+
+        assert!(err.is_target_absent());
+        assert_eq!(err.to_string(), CommandError::NoActiveMeeting.to_string());
     }
 
     #[test]
