@@ -147,6 +147,8 @@ pub fn validate_record_start_preconditions<S: MeetingStore>(
     store: &mut S,
     request: &RecordStartRequest,
 ) -> Result<RecordStartPreflight, CommandError> {
+    // The production handler checks this before building the request; keep the
+    // guard here for direct tests and future callers of the preflight helper.
     let voice_channel_id = request
         .user_voice_channel_id
         .clone()

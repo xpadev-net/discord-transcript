@@ -716,6 +716,33 @@ fn mark_recording_start_failed_after_setup_error<S: MeetingStore>(
     }
 }
 
+fn best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    error_message: &str,
+) -> bool {
+    match store.set_meeting_status(meeting_id, MeetingStatus::Failed, None) {
+        Ok(()) => {
+            if let Err(err) = store.set_error_message(meeting_id, Some(error_message.to_owned())) {
+                warn!(
+                    meeting_id,
+                    error = %err,
+                    "failed to persist record-start cleanup exhaustion error message"
+                );
+            }
+            true
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                error = %err,
+                "failed to force record-start cleanup exhaustion status"
+            );
+            false
+        }
+    }
+}
+
 fn recording_startup_conflict(
     startups: &HashMap<String, String>,
     guild_key: &str,
@@ -4385,6 +4412,8 @@ impl ScaffoldHandler {
         // another cleanup path removed the local session first. Terminal
         // absence cleanup only leaves when it removed the matching session,
         // which avoids disturbing a later recording after local state drift.
+        // The held reset guard also keeps a successor start from resetting
+        // SSRCs and joining voice until this leave attempt has returned.
         if let Some(manager) = songbird::get(ctx).await {
             leave_voice_with_timeout(manager.as_ref(), self.guild_id, meeting_id, phase).await;
         }
@@ -4681,9 +4710,17 @@ impl ScaffoldHandler {
                 guild_id = %guild_key,
                 meeting_id = %meeting_id,
                 attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
-                "record-start setup failure cleanup retries exhausted; preserving local recording setup state"
+                "record-start setup failure cleanup retries exhausted; force-marking failed before releasing startup reservation"
             );
             let _command_guard = handler.command_gate.write().await;
+            {
+                let mut service = handler.service.lock().await;
+                best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion(
+                    &mut service.store,
+                    &meeting_id,
+                    &error_message,
+                );
+            }
             handler
                 .clear_failed_recording_startup_locked(&guild_key, &meeting_id)
                 .await;
@@ -4722,8 +4759,16 @@ impl ScaffoldHandler {
             guild_id = %guild_key,
             meeting_id = %meeting_id,
             attempts = RECORDING_START_CLEANUP_MAX_RETRIES,
-            "record-start setup failure cleanup retries exhausted during shutdown; preserving local recording setup state"
+            "record-start setup failure cleanup retries exhausted during shutdown; force-marking failed before releasing startup reservation"
         );
+        {
+            let mut service = self.service.lock().await;
+            best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion(
+                &mut service.store,
+                meeting_id,
+                error_message,
+            );
+        }
         self.clear_failed_recording_startup_locked(guild_key, meeting_id)
             .await;
     }
@@ -10718,6 +10763,27 @@ mod status_message_tests {
         assert_eq!(
             meeting.error_message.as_deref(),
             Some("voice join failed after setup")
+        );
+    }
+
+    #[test]
+    fn exhausted_start_cleanup_retry_force_marks_recording_failed() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(recording_meeting());
+
+        assert!(
+            best_effort_mark_recording_start_failed_after_cleanup_retry_exhaustion(
+                &mut store,
+                "m1",
+                "voice join failed before session setup",
+            )
+        );
+
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some("voice join failed before session setup")
         );
     }
 
