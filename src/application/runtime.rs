@@ -3221,16 +3221,23 @@ impl EventHandler for ScaffoldHandler {
                                 }
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            if !states.contains_key(&guild_for_task) {
+                            if rearm_auto_stop_state_for_retry(
+                                &mut states,
+                                &guild_for_task,
+                                expected_meeting_id_ref,
+                            ) {
+                                continue;
+                            }
+                            {
                                 drop(states);
                                 let terminal_error = format!(
-                                    "auto-stop timer state disappeared after final flush failure: {err}"
+                                    "auto-stop timer state unavailable after final flush failure: {err}"
                                 );
                                 warn!(
                                     guild_id = %guild_for_task,
                                     meeting_id = expected_meeting_id_ref,
                                     error = %err,
-                                    "auto-stop timer state missing after final flush failure; marking recording failed"
+                                    "auto-stop timer state missing or changed after final flush failure; marking recording failed"
                                 );
                                 match handler
                                     .fail_recording_after_teardown_exhaustion(
@@ -3268,44 +3275,41 @@ impl EventHandler for ScaffoldHandler {
                                             guild_id = %guild_for_task,
                                             meeting_id = expected_meeting_id_ref,
                                             error = %mark_err,
-                                            "failed to mark recording failed after auto-stop timer state disappeared; clearing local state"
+                                            "failed to mark recording failed after auto-stop timer state disappeared; rescheduling"
                                         );
-                                        let removed_session = handler
-                                            .remove_local_recording_state_after_terminal_absence(
-                                                &guild_for_task,
-                                                expected_meeting_id_ref,
+                                        if let TerminalCleanupRetryDecision::Cleared {
+                                            removed_session,
+                                        } = handler
+                                            .handle_terminal_cleanup_retry_failure(
+                                                TerminalCleanupRetryFailureRequest {
+                                                    guild_key: &guild_for_task,
+                                                    expected_meeting_id: expected_meeting_id_ref,
+                                                    phase:
+                                                        "auto-stop missing timer state after flush failure",
+                                                    err: &mark_err,
+                                                },
+                                                &mut terminal_cleanup_failures,
                                             )
-                                            .await;
-                                        drop(lifecycle_permit);
-                                        handler
-                                            .finish_terminal_absence_cleanup(
-                                                &ctx_for_task,
-                                                handler.guild_id,
-                                                &guild_for_task,
-                                                expected_meeting_id_ref,
-                                                "auto-stop missing timer state after flush failure",
-                                                removed_session,
-                                            )
-                                            .await;
+                                            .await
+                                        {
+                                            drop(lifecycle_permit);
+                                            handler
+                                                .finish_terminal_absence_cleanup(
+                                                    &ctx_for_task,
+                                                    handler.guild_id,
+                                                    &guild_for_task,
+                                                    expected_meeting_id_ref,
+                                                    "auto-stop missing timer state after flush failure",
+                                                    *removed_session,
+                                                )
+                                                .await;
+                                            return;
+                                        }
+                                        continue;
                                     }
                                 }
                                 return;
                             }
-                            if !rearm_auto_stop_state_for_retry(
-                                &mut states,
-                                &guild_for_task,
-                                expected_meeting_id_ref,
-                            ) {
-                                drop(states);
-                                let mut startups = handler.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
-                                );
-                                return;
-                            }
-                            continue;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
                             final_flush_failures = 0;
