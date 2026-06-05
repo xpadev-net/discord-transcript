@@ -444,17 +444,41 @@ fn auto_stop_unscoped_state_refreshes_for_known_meeting() {
     assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
 
     assert_eq!(state.meeting_id(), Some("m1"));
-    assert_eq!(state.timer_generation(), 0);
+    assert_eq!(state.timer_generation(), 1);
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::StartTimer
     );
-    assert_eq!(state.timer_generation(), 1);
+    assert_eq!(state.timer_generation(), 2);
 
     assert!(!state.refresh_for_meeting(Duration::from_secs(60), "m1"));
     assert_eq!(
         state.on_non_bot_member_count_changed(0),
         AutoStopSignal::AlreadyWaiting
     );
-    assert_eq!(state.timer_generation(), 1);
+    assert_eq!(state.timer_generation(), 2);
+}
+
+#[test]
+fn auto_stop_refresh_does_not_reuse_in_flight_timer_generation() {
+    let mut state = AutoStopState::new_for_meeting(Duration::from_secs(60), None);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    let stale_generation = state.timer_generation();
+
+    assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::StartTimer
+    );
+    assert_ne!(state.timer_generation(), stale_generation);
+
+    state.clear_timer_active_for_generation(stale_generation);
+    assert_eq!(
+        state.on_non_bot_member_count_changed(0),
+        AutoStopSignal::AlreadyWaiting,
+        "stale timer cleanup must not clear the active timer for refreshed meeting state"
+    );
 }

@@ -53,7 +53,9 @@ impl AutoStopState {
             return false;
         }
 
+        let previous_generation = self.timer_generation;
         *self = Self::new_for_meeting(grace_period, Some(meeting_id.to_owned()));
+        self.timer_generation = previous_generation;
         true
     }
 
@@ -171,10 +173,35 @@ mod tests {
         let unscoped = AutoStopState::new(Duration::from_secs(60));
         assert!(!unscoped.belongs_to_meeting("m1"));
         assert!(unscoped.should_remove_for_meeting_cleanup("m1"));
-        assert_eq!(state.timer_generation(), 0);
+        assert_eq!(state.timer_generation(), 1);
         assert_eq!(
             state.on_non_bot_member_count_changed(0),
             AutoStopSignal::StartTimer
+        );
+        assert_eq!(state.timer_generation(), 2);
+    }
+
+    #[test]
+    fn refresh_for_meeting_preserves_generation_to_avoid_stale_timer_collision() {
+        let mut state = AutoStopState::new(Duration::from_secs(30));
+        assert_eq!(
+            state.on_non_bot_member_count_changed(0),
+            AutoStopSignal::StartTimer
+        );
+        let stale_generation = state.timer_generation();
+
+        assert!(state.refresh_for_meeting(Duration::from_secs(60), "m1"));
+        assert_eq!(
+            state.on_non_bot_member_count_changed(0),
+            AutoStopSignal::StartTimer
+        );
+        assert_ne!(state.timer_generation(), stale_generation);
+
+        state.clear_timer_active_for_generation(stale_generation);
+        assert_eq!(
+            state.on_non_bot_member_count_changed(0),
+            AutoStopSignal::AlreadyWaiting,
+            "a stale timer must not clear the replacement timer reservation"
         );
     }
 }
