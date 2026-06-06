@@ -5704,6 +5704,7 @@ async fn api_create_meeting_feedback(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<TranscriptFeedbackRequest>,
 ) -> Result<(StatusCode, Json<TranscriptFeedbackResponse>), StatusCode> {
     validate_resource_id(&meeting_id)?;
@@ -5750,7 +5751,37 @@ async fn api_create_meeting_feedback(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::FORBIDDEN)?;
-    Ok((StatusCode::CREATED, Json(feedback_response_from_row(&row)?)))
+    let response = feedback_response_from_row(&row)?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(tenant.guild_id.clone()),
+            Some(user_id),
+            "transcript_feedback.create",
+            "transcript_feedback",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/meetings/{meeting_id}/feedback"),
+            ),
+            json!({
+                "feedback_type": response.feedback_type,
+                "term_type": response.term_type,
+                "meeting_id": response.meeting_id,
+                "transcript_segment_id": response.transcript_segment_id,
+                "target_domain_knowledge_id": response.target_domain_knowledge_id,
+                "target_ai_memory_note_id": response.target_ai_memory_note_id,
+                "has_original_text": response.original_text.is_some(),
+                "has_corrected_text": response.corrected_text.is_some(),
+                "has_speaker_id": response.speaker_id.is_some(),
+                "has_corrected_speaker_id": response.corrected_speaker_id.is_some(),
+                "has_note": response.note.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn api_list_feedback(
@@ -9152,6 +9183,36 @@ mod guild_api_tests {
             feedback_status.find("require_current_user_is_guild_admin")
                 < feedback_status.find("normalize_feedback_status_request")
         );
+    }
+
+    #[test]
+    fn meeting_feedback_creation_records_redacted_audit_metadata() {
+        let source = include_str!("web.rs");
+        let handler = source
+            .split_once("async fn api_create_meeting_feedback")
+            .expect("meeting feedback handler should exist")
+            .1
+            .split_once("async fn api_list_feedback")
+            .expect("next handler should exist")
+            .0;
+
+        assert!(handler.contains("verify_meeting_access"));
+        assert!(handler.contains("record_audit_event"));
+        assert!(handler.contains("\"transcript_feedback.create\""));
+        assert!(handler.contains("\"has_original_text\""));
+        assert!(handler.contains("\"has_corrected_text\""));
+        assert!(handler.contains("\"has_note\""));
+
+        let audit_detail = handler
+            .split_once("json!({")
+            .expect("audit detail should be json")
+            .1
+            .split_once("}),")
+            .expect("audit detail should end before event close")
+            .0;
+        assert!(!audit_detail.contains("\"original_text\""));
+        assert!(!audit_detail.contains("\"corrected_text\""));
+        assert!(!audit_detail.contains("\"note\""));
     }
 
     #[test]
