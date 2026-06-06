@@ -4172,6 +4172,22 @@ fn feedback_response_from_row(
     })
 }
 
+fn meeting_feedback_create_audit_detail(response: &TranscriptFeedbackResponse) -> Value {
+    json!({
+        "feedback_type": response.feedback_type.clone(),
+        "term_type": response.term_type.clone(),
+        "meeting_id": response.meeting_id.clone(),
+        "transcript_segment_id": response.transcript_segment_id.clone(),
+        "target_domain_knowledge_id": response.target_domain_knowledge_id.clone(),
+        "target_ai_memory_note_id": response.target_ai_memory_note_id.clone(),
+        "has_original_text": response.original_text.is_some(),
+        "has_corrected_text": response.corrected_text.is_some(),
+        "has_speaker_id": response.speaker_id.is_some(),
+        "has_corrected_speaker_id": response.corrected_speaker_id.is_some(),
+        "has_note": response.note.is_some(),
+    })
+}
+
 fn person_alias_response_from_row(
     row: &tokio_postgres::Row,
 ) -> Result<PersonAliasResponse, StatusCode> {
@@ -5765,19 +5781,7 @@ async fn api_create_meeting_feedback(
                 "POST",
                 &format!("/api/meetings/{meeting_id}/feedback"),
             ),
-            json!({
-                "feedback_type": response.feedback_type,
-                "term_type": response.term_type,
-                "meeting_id": response.meeting_id,
-                "transcript_segment_id": response.transcript_segment_id,
-                "target_domain_knowledge_id": response.target_domain_knowledge_id,
-                "target_ai_memory_note_id": response.target_ai_memory_note_id,
-                "has_original_text": response.original_text.is_some(),
-                "has_corrected_text": response.corrected_text.is_some(),
-                "has_speaker_id": response.speaker_id.is_some(),
-                "has_corrected_speaker_id": response.corrected_speaker_id.is_some(),
-                "has_note": response.note.is_some(),
-            }),
+            meeting_feedback_create_audit_detail(&response),
         ),
     )
     .await;
@@ -8524,13 +8528,14 @@ mod guild_api_tests {
         GuildCache, GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults,
         GuildSettingsUpdateRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS,
         PersonAliasUpsertRequest, StoredGuildSettings, SummaryTemplateUpsertRequest,
-        TranscriptFeedbackRequest, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
-        bot_auth_header_from_cache_with_resolver, can_scan_new_visibility_channel,
-        classify_discord_bot_token_validation_status, current_user_guilds_response,
-        discord_user_guilds_api_status, guild_admin_member_status_decision,
-        guild_admin_permission_cache_key, guild_admin_required_result,
-        guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
-        guild_meetings_visibility_scan_limit, guild_settings_response, normalize_ai_memory_request,
+        TranscriptFeedbackRequest, TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest,
+        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
+        can_scan_new_visibility_channel, classify_discord_bot_token_validation_status,
+        current_user_guilds_response, discord_user_guilds_api_status,
+        guild_admin_member_status_decision, guild_admin_permission_cache_key,
+        guild_admin_required_result, guild_bot_token_delete_is_noop,
+        guild_info_from_cache_with_resolver, guild_meetings_visibility_scan_limit,
+        guild_settings_response, meeting_feedback_create_audit_detail, normalize_ai_memory_request,
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
         normalize_feedback_request, normalize_feedback_status_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
@@ -9199,20 +9204,43 @@ mod guild_api_tests {
         assert!(handler.contains("verify_meeting_access"));
         assert!(handler.contains("record_audit_event"));
         assert!(handler.contains("\"transcript_feedback.create\""));
-        assert!(handler.contains("\"has_original_text\""));
-        assert!(handler.contains("\"has_corrected_text\""));
-        assert!(handler.contains("\"has_note\""));
+        assert!(handler.contains("meeting_feedback_create_audit_detail(&response)"));
 
-        let audit_detail = handler
-            .split_once("json!({")
-            .expect("audit detail should be json")
-            .1
-            .split_once("}),")
-            .expect("audit detail should end before event close")
-            .0;
-        assert!(!audit_detail.contains("\"original_text\""));
-        assert!(!audit_detail.contains("\"corrected_text\""));
-        assert!(!audit_detail.contains("\"note\""));
+        let detail = meeting_feedback_create_audit_detail(&TranscriptFeedbackResponse {
+            id: "feedback-1".to_owned(),
+            meeting_id: Some("meeting-1".to_owned()),
+            transcript_segment_id: Some("segment-1".to_owned()),
+            feedback_type: "term".to_owned(),
+            term_type: Some("person_name".to_owned()),
+            original_text: Some("sensitive original".to_owned()),
+            corrected_text: Some("sensitive corrected".to_owned()),
+            speaker_id: Some("speaker-1".to_owned()),
+            corrected_speaker_id: None,
+            note: Some("sensitive note".to_owned()),
+            target_domain_knowledge_id: None,
+            target_ai_memory_note_id: Some("memory-1".to_owned()),
+            actor_user_id: "actor-1".to_owned(),
+            status: "open".to_owned(),
+            created_at: "2026-06-04T01:02:03.000Z".to_owned(),
+            reviewed_at: None,
+            reviewed_actor_user_id: None,
+        });
+
+        assert_eq!(detail["feedback_type"], "term");
+        assert_eq!(detail["term_type"], "person_name");
+        assert_eq!(detail["meeting_id"], "meeting-1");
+        assert_eq!(detail["transcript_segment_id"], "segment-1");
+        assert_eq!(detail["target_ai_memory_note_id"], "memory-1");
+        assert_eq!(detail["has_original_text"], true);
+        assert_eq!(detail["has_corrected_text"], true);
+        assert_eq!(detail["has_speaker_id"], true);
+        assert_eq!(detail["has_corrected_speaker_id"], false);
+        assert_eq!(detail["has_note"], true);
+
+        let serialized = detail.to_string();
+        assert!(!serialized.contains("sensitive original"));
+        assert!(!serialized.contains("sensitive corrected"));
+        assert!(!serialized.contains("sensitive note"));
     }
 
     #[test]
