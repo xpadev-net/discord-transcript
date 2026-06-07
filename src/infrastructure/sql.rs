@@ -107,6 +107,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0022_forward_fixups_for_0020_0021",
         sql: include_str!("../../migrations/0022_forward_fixups_for_0020_0021.sql"),
     },
+    Migration {
+        version: "0023_feedback_idempotency_quota",
+        sql: include_str!("../../migrations/0023_feedback_idempotency_quota.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -165,6 +169,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0021_ai_memory_feedback.sql"),
     "\n",
     include_str!("../../migrations/0022_forward_fixups_for_0020_0021.sql"),
+    "\n",
+    include_str!("../../migrations/0023_feedback_idempotency_quota.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1436,6 +1442,40 @@ VALUES (
     $1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, NULLIF($8, ''),
     NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), NULLIF($12, ''),
     NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''), $16, 'open', NOW()
+)
+RETURNING id,
+          tenant_discord_guild_id,
+          tenant_id,
+          guild_id,
+          meeting_id,
+          transcript_segment_id,
+          feedback_type,
+          term_type,
+          original_text,
+          corrected_text,
+          speaker_id,
+          corrected_speaker_id,
+          note,
+          target_domain_knowledge_id,
+          target_ai_memory_note_id,
+          actor_user_id,
+          status,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+          reviewed_actor_user_id
+"#;
+
+pub const INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL: &str = r#"
+INSERT INTO transcript_feedback (
+    id, tenant_discord_guild_id, tenant_id, guild_id, meeting_id,
+    transcript_segment_id, feedback_type, term_type, original_text, corrected_text,
+    speaker_id, corrected_speaker_id, note, target_domain_knowledge_id,
+    target_ai_memory_note_id, actor_user_id, idempotency_key, status, created_at
+)
+VALUES (
+    $1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, NULLIF($8, ''),
+    NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), NULLIF($12, ''),
+    NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''), $16, $17, 'open', NOW()
 )
 RETURNING id,
           tenant_discord_guild_id,

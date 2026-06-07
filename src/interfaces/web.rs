@@ -47,8 +47,8 @@ use crate::infrastructure::sql::{
     CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL,
     GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
     GET_SUMMARY_TEMPLATE_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL,
+    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL,
+    INSERT_SUMMARY_TEMPLATE_SQL, INSERT_USAGE_EVENT_SQL,
     LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
     LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
@@ -118,6 +118,7 @@ const OPERATIONAL_METRICS_CACHE_TTL_SECS: u64 = 15;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
 const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
+const TRANSCRIPT_FEEDBACK_DAILY_QUOTA_CONSTRAINT: &str = "transcript_feedback_daily_quota_check";
 const GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP: usize = 32;
 const TRANSCRIPT_SSE_MAX_PER_USER_MEETING: usize = 2;
 const TRANSCRIPT_SSE_BASE_POLL_SECS: u64 = 2;
@@ -4326,6 +4327,30 @@ fn summary_template_mutation_status(err: &tokio_postgres::Error) -> StatusCode {
     }
 }
 
+fn transcript_feedback_insert_status(err: &tokio_postgres::Error) -> StatusCode {
+    if err.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+        StatusCode::CONFLICT
+    } else if err.code() == Some(&SqlState::CHECK_VIOLATION)
+        && err.as_db_error().and_then(|db_error| db_error.constraint())
+            == Some(TRANSCRIPT_FEEDBACK_DAILY_QUOTA_CONSTRAINT)
+    {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn meeting_feedback_idempotency_key(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(part.as_bytes());
+        hasher.update(b";");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn validate_guild_settings_update(request: &GuildSettingsUpdateRequest) -> Result<(), StatusCode> {
     if let Some(language) = request.whisper_language.as_deref()
         && !is_iso639_1_format(language)
@@ -5844,10 +5869,22 @@ async fn api_create_meeting_feedback(
     let note = normalized.note.unwrap_or_default();
     let target_domain_knowledge_id = normalized.target_domain_knowledge_id.unwrap_or_default();
     let target_ai_memory_note_id = normalized.target_ai_memory_note_id.unwrap_or_default();
+    let idempotency_key = meeting_feedback_idempotency_key(&[
+        &feedback_type,
+        &transcript_segment_id,
+        &term_type,
+        &original_text,
+        &corrected_text,
+        &speaker_id,
+        &corrected_speaker_id,
+        &note,
+        &target_domain_knowledge_id,
+        &target_ai_memory_note_id,
+    ]);
     let row = state
         .db
         .query_opt(
-            INSERT_TRANSCRIPT_FEEDBACK_SQL,
+            INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL,
             &[
                 &id,
                 &tenant.tenant_discord_guild_id,
@@ -5865,11 +5902,12 @@ async fn api_create_meeting_feedback(
                 &target_domain_knowledge_id,
                 &target_ai_memory_note_id,
                 &user_id,
+                &idempotency_key,
             ],
         )
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::FORBIDDEN)?;
+        .map_err(|err| transcript_feedback_insert_status(&err))?
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     let response = feedback_response_from_row(&row)?;
     record_audit_event(
         &state,
@@ -8636,13 +8674,14 @@ mod guild_api_tests {
         guild_admin_member_status_decision, guild_admin_permission_cache_key,
         guild_admin_required_result, guild_bot_token_delete_is_noop,
         guild_info_from_cache_with_resolver, guild_settings_response,
-        meeting_feedback_create_audit_detail, normalize_ai_memory_request,
-        normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
-        normalize_feedback_request, normalize_feedback_status_request,
-        normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
-        normalize_guild_meetings_voice_channel_id, normalize_person_alias_request,
-        normalize_summary_template_request, normalize_target_guild_id, permission_cache_ttl,
-        target_auth_config, target_guild_has_active_installation, target_guild_settings_path,
+        meeting_feedback_create_audit_detail, meeting_feedback_idempotency_key,
+        normalize_ai_memory_request, normalize_domain_knowledge_list_filter,
+        normalize_domain_knowledge_request, normalize_feedback_request,
+        normalize_feedback_status_request, normalize_guild_bot_token_update,
+        normalize_guild_meetings_pagination, normalize_guild_meetings_voice_channel_id,
+        normalize_person_alias_request, normalize_summary_template_request,
+        normalize_target_guild_id, permission_cache_ttl, target_auth_config,
+        target_guild_has_active_installation, target_guild_settings_path,
         user_can_access_target_guild, validate_authorized_guild_bot_token_update,
         validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
         validate_domain_knowledge_item_id, validate_guild_settings_update, validate_resource_id,
@@ -9237,6 +9276,17 @@ mod guild_api_tests {
         );
     }
 
+    #[test]
+    fn meeting_feedback_idempotency_key_is_stable_and_field_bound() {
+        let first = meeting_feedback_idempotency_key(&["ab", "c"]);
+        let repeat = meeting_feedback_idempotency_key(&["ab", "c"]);
+        let adjacent_fields = meeting_feedback_idempotency_key(&["a", "bc"]);
+
+        assert_eq!(first, repeat);
+        assert_ne!(first, adjacent_fields);
+        assert_eq!(first.len(), 64);
+    }
+
     fn person_alias_request() -> PersonAliasUpsertRequest {
         PersonAliasUpsertRequest {
             id: None,
@@ -9318,6 +9368,12 @@ mod guild_api_tests {
             .0;
 
         assert!(handler.contains("verify_meeting_access"));
+        assert!(handler.contains("INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL"));
+        assert!(handler.contains("meeting_feedback_idempotency_key"));
+        assert!(handler.contains("transcript_feedback_insert_status"));
+        assert!(source.contains("StatusCode::CONFLICT"));
+        assert!(source.contains("StatusCode::TOO_MANY_REQUESTS"));
+        assert!(source.contains("TRANSCRIPT_FEEDBACK_DAILY_QUOTA_CONSTRAINT"));
         assert!(handler.contains("record_audit_event"));
         assert!(handler.contains("\"transcript_feedback.create\""));
         assert!(handler.contains("meeting_feedback_create_audit_detail(&response)"));
