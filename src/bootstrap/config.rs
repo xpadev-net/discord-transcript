@@ -349,11 +349,12 @@ fn validate_unsafe_agent_harness_opt_in(
             key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE",
         });
     };
-    match profile.trim().to_ascii_lowercase().as_str() {
+    let normalized = profile.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "local" | "local-dev" | "dev" | "development" | "test" | "testing" => Ok(()),
         _ => Err(ConfigError::InvalidEnv {
             key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE",
-            value: profile,
+            value: profile.trim().to_owned(),
         }),
     }
 }

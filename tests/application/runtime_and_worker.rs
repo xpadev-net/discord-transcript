@@ -1091,6 +1091,30 @@ fn app_config_rejects_prompt_like_unsafe_agent_profile() {
 }
 
 #[test]
+fn app_config_accepts_all_dev_test_unsafe_agent_profiles() {
+    for profile in ["local", "local-dev", "dev", "development", "test", "testing"] {
+        let mut values = required_env_values();
+        values.insert(
+            "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
+            "true".to_owned(),
+        );
+        values.insert(
+            "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE".to_owned(),
+            profile.to_owned(),
+        );
+
+        let config = AppConfig::from_map(&values).expect("config should load");
+
+        assert_eq!(
+            config.summary_harness,
+            SummaryHarness::Claude,
+            "profile {profile} should be accepted"
+        );
+        assert!(config.summary_allow_unsafe_agent_harness);
+    }
+}
+
+#[test]
 fn app_config_loads_operational_metrics_bearer_token() {
     let mut values = base_env();
     values.insert(
