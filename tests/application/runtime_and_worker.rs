@@ -812,6 +812,8 @@ fn ai_memory_agent_workspace_uses_candidate_output_permission() {
     std::fs::write(workspace.masked_transcript_path(), "transcript").expect("masked transcript");
     std::fs::write(workspace.transcript_manifest_path(), "{}").expect("transcript manifest");
     std::fs::write(workspace.context_manifest_path(), "{}").expect("context manifest");
+    std::fs::write(workspace.context_summary_template_path(), "summary template")
+        .expect("summary template");
     let request = SummaryRequest {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
@@ -842,6 +844,8 @@ fn ai_memory_agent_workspace_uses_candidate_output_permission() {
     assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
     assert!(cursor_config.contains("Read(input/summary/summary.md)"));
     assert!(cursor_config.contains("Write(output/ai_memory_candidates.json)"));
+    assert!(!cursor_config.contains("summary_template.txt"));
+    assert!(!agent_root.join("input/context/summary_template.txt").exists());
     assert!(!agent_root.join("debug").exists());
     assert!(!agent_root.join("audio").exists());
 }

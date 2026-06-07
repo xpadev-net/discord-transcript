@@ -10,8 +10,7 @@ use crate::infrastructure::workspace::{
     AGENT_OUTPUT_DIR, AgentWorkspace, AgentWorkspaceBuilder, AgentWorkspaceError,
     CONTEXT_AI_MEMORY_FILENAME, CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME,
     CONTEXT_PERSON_ALIASES_FILENAME, CONTEXT_SPEAKER_ROSTER_FILENAME,
-    CONTEXT_SUMMARY_TEMPLATE_FILENAME, CONTEXT_USER_FEEDBACK_FILENAME, MASKED_TRANSCRIPT_FILENAME,
-    TRANSCRIPT_MANIFEST_FILENAME,
+    CONTEXT_USER_FEEDBACK_FILENAME, MASKED_TRANSCRIPT_FILENAME, TRANSCRIPT_MANIFEST_FILENAME,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -246,7 +245,7 @@ where
 
 pub fn build_ai_memory_extraction_prompt(
     request: &SummaryRequest,
-    _context: &SummaryContextManifest,
+    context: &SummaryContextManifest,
 ) -> String {
     let transcript_path = format!("input/transcript/{MASKED_TRANSCRIPT_FILENAME}");
     let transcript_manifest_path = format!("input/transcript/{TRANSCRIPT_MANIFEST_FILENAME}");
@@ -291,12 +290,24 @@ Current meeting metadata:\n\
 - guild_id: {}\n\
 - voice_channel_id: {}\n\
 - title_json: {}\n\
+\n\
+Materialized context inventory:\n\
+- speaker_count: {}\n\
+- domain_knowledge_count: {}\n\
+- ai_memory_count: {}\n\
+- user_feedback_count: {}\n\
+- person_aliases_count: {}\n\
 \n",
         request.meeting_id,
         request.meeting_id,
         request.guild_id,
         request.voice_channel_id,
-        title_json
+        title_json,
+        context.speaker_count,
+        context.domain_knowledge_count,
+        context.ai_memory_count,
+        context.user_feedback_count,
+        context.person_aliases_count
     )
 }
 
@@ -344,10 +355,6 @@ pub fn materialize_ai_memory_agent_workspace(
         (
             request.workspace.context_user_feedback_path(),
             format!("input/context/{CONTEXT_USER_FEEDBACK_FILENAME}"),
-        ),
-        (
-            request.workspace.context_summary_template_path(),
-            format!("input/context/{CONTEXT_SUMMARY_TEMPLATE_FILENAME}"),
         ),
     ] {
         if source.exists() {
