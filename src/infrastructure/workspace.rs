@@ -29,6 +29,9 @@ pub const AGENT_CURSOR_DIR: &str = ".cursor";
 pub const AGENT_CURSOR_CONFIG_FILENAME: &str = "cli.json";
 pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
 
+#[cfg(unix)]
+const AGENT_CLEANUP_MARKER_FILENAME: &str = ".cleanup-token";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspaceLayout {
     base_dir: PathBuf,
@@ -66,6 +69,7 @@ struct AgentWorkspaceInput {
 struct AgentWorkspaceRootIdentity {
     dev: u64,
     ino: u64,
+    cleanup_marker: String,
 }
 
 #[cfg(not(unix))]
@@ -390,6 +394,7 @@ impl AgentWorkspaceBuilder {
         }
         let agent_root =
             canonicalize_agent_root(&self.agent_root, &meeting_root, &expected_agent_parent)?;
+        initialize_cleanup_marker(&self.agent_root)?;
         let root_identity = root_identity(&self.agent_root)?;
 
         let cleanup_root = self.agent_root.clone();
@@ -413,7 +418,7 @@ impl AgentWorkspaceBuilder {
 
         create_agent_dir(&input_dir)?;
         create_agent_dir(&output_dir)?;
-        create_agent_dir(&cursor_dir)?;
+        prepare_cursor_dir_for_config(&agent_root, &cursor_dir)?;
 
         let mut allowed_reads = Vec::new();
         let mut destinations = HashSet::new();
@@ -594,6 +599,7 @@ fn root_identity(path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorkspa
     Ok(AgentWorkspaceRootIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
+        cleanup_marker: read_cleanup_marker(path)?,
     })
 }
 
@@ -607,14 +613,13 @@ fn validate_root_identity(
     path: &Path,
     expected: &AgentWorkspaceRootIdentity,
 ) -> Result<(), AgentWorkspaceError> {
-    let actual = root_identity(path)?;
-    if &actual != expected {
-        return Err(AgentWorkspaceError::InvalidPath {
+    match root_identity(path) {
+        Ok(actual) if &actual == expected => Ok(()),
+        Ok(_) | Err(_) => Err(AgentWorkspaceError::InvalidPath {
             path: path.to_path_buf(),
             reason: "agent workspace root identity changed before cleanup",
-        });
+        }),
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -649,6 +654,77 @@ fn cleanup_agent_workspace_root(
             source: err,
         }),
     }
+}
+
+#[cfg(unix)]
+fn cleanup_marker_relative_path() -> PathBuf {
+    Path::new(AGENT_CURSOR_DIR).join(AGENT_CLEANUP_MARKER_FILENAME)
+}
+
+#[cfg(unix)]
+fn initialize_cleanup_marker(agent_root: &Path) -> Result<(), AgentWorkspaceError> {
+    create_agent_dir(&agent_root.join(AGENT_CURSOR_DIR))?;
+    let marker = uuid::Uuid::new_v4().to_string();
+    write_new_file_no_symlink(
+        agent_root,
+        &cleanup_marker_relative_path(),
+        marker.as_bytes(),
+    )
+}
+
+#[cfg(not(unix))]
+fn initialize_cleanup_marker(_agent_root: &Path) -> Result<(), AgentWorkspaceError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_cursor_dir_for_config(
+    canonical_agent_root: &Path,
+    cursor_dir: &Path,
+) -> Result<(), AgentWorkspaceError> {
+    validate_agent_dir(canonical_agent_root, cursor_dir)
+}
+
+#[cfg(not(unix))]
+fn prepare_cursor_dir_for_config(
+    _canonical_agent_root: &Path,
+    cursor_dir: &Path,
+) -> Result<(), AgentWorkspaceError> {
+    create_agent_dir(cursor_dir)
+}
+
+#[cfg(unix)]
+fn read_cleanup_marker(agent_root: &Path) -> Result<String, AgentWorkspaceError> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let marker_path = agent_root.join(cleanup_marker_relative_path());
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&marker_path)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: marker_path.clone(),
+            source: err,
+        })?;
+    let metadata = file.metadata().map_err(|err| AgentWorkspaceError::Io {
+        path: marker_path.clone(),
+        source: err,
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: marker_path,
+            reason: "agent workspace cleanup marker must be a real file",
+        });
+    }
+    let mut marker = String::new();
+    file.read_to_string(&mut marker)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: marker_path,
+            source: err,
+        })?;
+    Ok(marker)
 }
 
 fn canonicalize_existing(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
@@ -1008,6 +1084,7 @@ fn write_cursor_config(
             allow,
             deny: vec![
                 "Read(.env)".to_owned(),
+                "Read(.cursor/.cleanup-token)".to_owned(),
                 "Read(debug/**)".to_owned(),
                 "Read(../**)".to_owned(),
                 "Write(input/**)".to_owned(),

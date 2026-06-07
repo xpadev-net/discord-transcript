@@ -263,6 +263,7 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
     assert_eq!(
         top_level_entries,
         vec![
+            ".cursor/.cleanup-token",
             ".cursor/cli.json",
             "input/context/manifest.json",
             "input/context/speaker_roster.md",
@@ -278,6 +279,7 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
     assert!(cursor_config.contains("Read(input/context/manifest.json)"));
     assert!(cursor_config.contains("Write(output/summary.md)"));
     assert!(cursor_config.contains("Read(.env)"));
+    assert!(cursor_config.contains("Read(.cursor/.cleanup-token)"));
     assert!(cursor_config.contains("Read(debug/**)"));
     assert!(cursor_config.contains("Read(../**)"));
     assert!(cursor_config.contains("Write(input/**)"));
