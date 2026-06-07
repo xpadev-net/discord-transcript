@@ -2161,6 +2161,57 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryCleanupFailureDisposition {
+    RetryScheduled,
+    TerminalStatusUpdated,
+}
+
+fn summary_cleanup_failure_user_message(_err: impl Display) -> String {
+    "summary agent workspace cleanup failed after summary persistence; cleanup will be retried and retained agent workspaces are covered by retention cleanup".to_owned()
+}
+
+fn handle_summary_cleanup_failure<S, Q>(
+    store: &mut S,
+    queue: &mut Q,
+    claimed_job: &Job,
+    err_string: String,
+    summary_max_retries: u32,
+) -> SummaryCleanupFailureDisposition
+where
+    S: MeetingStore,
+    Q: JobQueue,
+{
+    let reverted = store
+        .set_meeting_status(
+            &claimed_job.meeting_id,
+            MeetingStatus::Stopping,
+            Some(MeetingStatus::Summarizing),
+        )
+        .is_ok();
+    if reverted {
+        let exhausted = retry_claimed_summary_job(
+            queue,
+            claimed_job,
+            err_string.clone(),
+            summary_max_retries,
+            "summary_cleanup",
+        );
+        if exhausted {
+            let _ = store.set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+            let _ = store.set_error_message(&claimed_job.meeting_id, Some(err_string));
+            SummaryCleanupFailureDisposition::TerminalStatusUpdated
+        } else {
+            SummaryCleanupFailureDisposition::RetryScheduled
+        }
+    } else {
+        let _ = queue.mark_failed(&claimed_job.id, err_string.clone());
+        let _ = store.set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
+        let _ = store.set_error_message(&claimed_job.meeting_id, Some(err_string));
+        SummaryCleanupFailureDisposition::TerminalStatusUpdated
+    }
+}
+
 fn recover_summary_job_for_startup<E: SqlExecutor>(
     queue: &mut SqlJobQueue<E>,
     job_id: &str,
@@ -6797,7 +6848,7 @@ impl ScaffoldHandler {
             return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
-        let markdown = tokio::task::block_in_place(|| {
+        let summary_result = tokio::task::block_in_place(|| {
             let manifest = crate::application::summary::write_transcript_files(
                 &request,
                 &transcription_for_summary,
@@ -6813,10 +6864,22 @@ impl ScaffoldHandler {
             );
             let agent_workspace =
                 crate::application::summary::materialize_new_summary_agent_workspace(&request)?;
-            summary_client.summarize(&prompt, Some(agent_workspace.root()))
+            match summary_client.summarize(&prompt, Some(agent_workspace.root())) {
+                Ok(markdown) => Ok((markdown, agent_workspace)),
+                Err(err) => {
+                    if let Err(cleanup_err) = agent_workspace.cleanup_once() {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %cleanup_err,
+                            "failed to clean summary agent workspace after summary failure"
+                        );
+                    }
+                    Err(err)
+                }
+            }
         });
-        let markdown = match markdown {
-            Ok(m) => m,
+        let (markdown, agent_workspace) = match summary_result {
+            Ok(result) => result,
             Err(err) => {
                 let err_string = err.to_string();
                 // Revert to Stopping so the next retry attempt starts from a consistent state.
@@ -6899,7 +6962,9 @@ impl ScaffoldHandler {
             }
         };
 
-        // Persist summary markdown to DB (best-effort)
+        // Persist summary markdown to DB (best-effort), then remove the
+        // per-run agent workspace. The validated markdown is held in memory for
+        // AI-memory extraction and Discord posting after the workspace is gone.
         {
             let summary_id = format!("{}-s-1", claimed_job.meeting_id);
             let mut service = self.service.lock().await;
@@ -6913,6 +6978,50 @@ impl ScaffoldHandler {
                     "failed to persist summary"
                 );
             }
+        }
+        if let Err(err) = agent_workspace.cleanup_once() {
+            let err_string = summary_cleanup_failure_user_message(&err);
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                error = %err,
+                "failed to clean summary agent workspace after summary persistence"
+            );
+            let disposition = {
+                let mut service = self.service.lock().await;
+                let mut queue = self.queue.lock().await;
+                handle_summary_cleanup_failure(
+                    &mut service.store,
+                    &mut *queue,
+                    &claimed_job,
+                    err_string.clone(),
+                    self.summary_max_retries,
+                )
+            };
+            return match disposition {
+                SummaryCleanupFailureDisposition::RetryScheduled => {
+                    Err(SummaryJobRunError::RetryScheduled(err_string))
+                }
+                SummaryCleanupFailureDisposition::TerminalStatusUpdated => {
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "summary_cleanup",
+                                error: &err_string,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %status_err,
+                            "failed to update status message after summary cleanup failure"
+                        );
+                    }
+                    Err(SummaryJobRunError::TerminalStatusUpdated(err_string))
+                }
+            };
         }
 
         let ai_memory_extraction_supported = {
@@ -9574,6 +9683,77 @@ mod status_message_tests {
         assert_eq!(
             meeting.error_message.as_deref(),
             Some("summary posting failed: discord 500")
+        );
+    }
+
+    #[test]
+    fn summary_cleanup_error_requeues_job_and_reverts_meeting_before_exhaustion() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(summarizing_meeting());
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+        let raw_error =
+            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
+        let user_message = summary_cleanup_failure_user_message(raw_error);
+
+        let disposition =
+            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 2);
+
+        assert_ne!(user_message, raw_error);
+        assert!(!user_message.contains("/tmp/private"));
+        assert!(!user_message.contains("summary.md"));
+        assert!(user_message.len() < 200);
+        assert_eq!(
+            disposition,
+            SummaryCleanupFailureDisposition::RetryScheduled
+        );
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
+        assert_eq!(updated.retry_count, 1);
+        assert_eq!(
+            updated.error_message.as_deref(),
+            Some(user_message.as_str())
+        );
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
+        assert_eq!(meeting.error_message, None);
+    }
+
+    #[test]
+    fn summary_cleanup_error_marks_job_and_meeting_failed_after_exhaustion() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(summarizing_meeting());
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+        let raw_error =
+            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
+        let user_message = summary_cleanup_failure_user_message(raw_error);
+
+        let disposition =
+            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 0);
+
+        assert_ne!(user_message, raw_error);
+        assert!(!user_message.contains("/tmp/private"));
+        assert!(!user_message.contains("summary.md"));
+        assert!(user_message.len() < 200);
+        assert_eq!(
+            disposition,
+            SummaryCleanupFailureDisposition::TerminalStatusUpdated
+        );
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+        assert_eq!(updated.retry_count, 1);
+        assert_eq!(
+            updated.error_message.as_deref(),
+            Some(user_message.as_str())
+        );
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+        assert_eq!(
+            meeting.error_message.as_deref(),
+            Some(user_message.as_str())
         );
     }
 

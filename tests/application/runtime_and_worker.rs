@@ -397,6 +397,33 @@ impl ClaudeSummaryClient for FileContractSummaryClient {
     }
 }
 
+struct FailingFileContractSummaryClient {
+    workdirs: RefCell<Vec<PathBuf>>,
+}
+
+impl ClaudeSummaryClient for FailingFileContractSummaryClient {
+    fn supports_transcript_correction(&self) -> bool {
+        false
+    }
+
+    fn summarize(
+        &self,
+        _prompt: &str,
+        workdir: Option<&std::path::Path>,
+    ) -> Result<String, SummaryError> {
+        let workdir = workdir.expect("summary workdir should be provided");
+        self.workdirs.borrow_mut().push(workdir.to_path_buf());
+        let output_path = workdir.join("output/summary.md");
+        std::fs::create_dir_all(output_path.parent().expect("output parent"))
+            .expect("output dir should be created");
+        std::fs::write(&output_path, "## Summary\nmust be removed")
+            .expect("summary output should be written");
+        Err(SummaryError::SummaryEngine(
+            "injected summary failure".to_owned(),
+        ))
+    }
+}
+
 /// ExtractingInMemoryStore deliberately returns true from
 /// supports_ai_memory_extraction while keeping the default no-op
 /// persist_ai_memory_extraction_candidates implementation, so worker tests can
@@ -1707,10 +1734,73 @@ fn worker_summary_uses_generated_agent_workspace_output_contract() {
     let workdirs = client.workdirs.borrow();
     assert_eq!(workdirs.len(), 1);
     assert!(workdirs[0].starts_with(workspace.root().join("agent")));
-    assert_eq!(
-        std::fs::read_to_string(workdirs[0].join("output/summary.md"))
-            .expect("summary output file should exist"),
-        output.markdown
+    assert!(
+        !workdirs[0].exists(),
+        "successful summary agent workspace should be cleaned after validated output is returned"
+    );
+}
+
+#[test]
+fn worker_summary_cleans_agent_workspace_after_summary_failure() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc".to_owned(),
+        report_channel_id: "c1".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Stopping,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let client = FailingFileContractSummaryClient {
+        workdirs: RefCell::new(Vec::new()),
+    };
+    let temp = temp_workspace("m1_summary_failure_cleanup");
+    let workspace = temp.workspace().clone();
+
+    let err = process_meeting_summary(
+        &mut store,
+        &whisper,
+        &client,
+        &ProcessMeetingInput {
+            meeting_id: "m1".to_owned(),
+            job_id: None,
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc".to_owned(),
+            title: None,
+            audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+            speaker_audio: vec![SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "audio.wav".to_owned(),
+                offset_ms: 0,
+            }],
+            language: None,
+            workspace: workspace.clone(),
+            summary_context: SummaryContextInput::default(),
+        },
+    )
+    .expect_err("injected summary failure should fail the worker");
+
+    assert!(err.to_string().contains("injected summary failure"));
+    let workdirs = client.workdirs.borrow();
+    assert_eq!(workdirs.len(), 1);
+    assert!(workdirs[0].starts_with(workspace.root().join("agent")));
+    assert!(
+        !workdirs[0].exists(),
+        "failed summary agent workspace should be cleaned after the run fails"
     );
 }
 

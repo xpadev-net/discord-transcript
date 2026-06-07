@@ -16,6 +16,7 @@ pub const DEBUG_MIXDOWN_WHISPER_FILENAME: &str = "mixdown.json";
 pub const DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME: &str = "transcript_pre_correction.md";
 pub const DEBUG_CORRECTION_PROMPT_FILENAME: &str = "correction_prompt.txt";
 pub const DEBUG_SUMMARY_PROMPT_FILENAME: &str = "summary_prompt.txt";
+pub const DEBUG_AGENT_RUNS_DIR: &str = "agent-runs";
 pub const CONTEXT_MANIFEST_FILENAME: &str = "manifest.json";
 pub const CONTEXT_SPEAKER_ROSTER_FILENAME: &str = "speaker_roster.md";
 pub const CONTEXT_DOMAIN_KNOWLEDGE_FILENAME: &str = "domain_knowledge.md";
@@ -26,6 +27,7 @@ pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
 pub const AGENT_INPUT_DIR: &str = "input";
 pub const AGENT_OUTPUT_DIR: &str = "output";
 pub const AGENT_CURSOR_DIR: &str = ".cursor";
+pub const AGENT_WORKSPACE_PARENT_DIR: &str = "agent";
 pub const AGENT_CURSOR_CONFIG_FILENAME: &str = "cli.json";
 pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
 
@@ -48,6 +50,7 @@ pub struct AgentWorkspace {
     expected_output_path: PathBuf,
     cursor_config_path: PathBuf,
     root_identity: AgentWorkspaceRootIdentity,
+    cleanup_on_drop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +270,14 @@ impl MeetingWorkspacePaths {
         self.debug_dir().join(DEBUG_SUMMARY_PROMPT_FILENAME)
     }
 
+    pub fn agent_runs_debug_dir(&self) -> PathBuf {
+        self.debug_dir().join(DEBUG_AGENT_RUNS_DIR)
+    }
+
+    pub fn agent_workspace_parent_dir(&self) -> PathBuf {
+        self.root.join(AGENT_WORKSPACE_PARENT_DIR)
+    }
+
     pub fn context_manifest_path(&self) -> PathBuf {
         self.context_dir().join(CONTEXT_MANIFEST_FILENAME)
     }
@@ -334,6 +345,19 @@ impl AgentWorkspace {
 
     pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
         cleanup_agent_workspace_root(&self.root, &self.root_identity)
+    }
+
+    pub fn cleanup_once(mut self) -> Result<(), AgentWorkspaceError> {
+        self.cleanup_on_drop = false;
+        cleanup_agent_workspace_root(&self.root, &self.root_identity)
+    }
+}
+
+impl Drop for AgentWorkspace {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = self.cleanup();
+        }
     }
 }
 
@@ -463,6 +487,7 @@ impl AgentWorkspaceBuilder {
             expected_output_path: self.expected_output_path,
             cursor_config_path,
             root_identity,
+            cleanup_on_drop: true,
         })
     }
 }
