@@ -72,7 +72,7 @@ use songbird::{
     Config as SongbirdConfig, CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
     SerenityInit,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::future::Future;
@@ -81,7 +81,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, RwLockWriteGuard, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, RwLock, RwLockWriteGuard, Semaphore, watch};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -105,6 +105,50 @@ const RECORDING_VOICE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct SlashCommandSpec {
     pub name: &'static str,
     pub description: &'static str,
+}
+
+#[derive(Clone)]
+pub struct SummaryJobWakeups {
+    inner: Arc<SummaryJobWakeupsInner>,
+}
+
+struct SummaryJobWakeupsInner {
+    pending: Mutex<VecDeque<String>>,
+    notify: Notify,
+}
+
+impl SummaryJobWakeups {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(SummaryJobWakeupsInner {
+                pending: Mutex::new(VecDeque::new()),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    pub async fn enqueue(&self, meeting_id: String) {
+        self.inner.pending.lock().await.push_back(meeting_id);
+        self.inner.notify.notify_one();
+    }
+
+    async fn next(&self, shutdown_token: &CancellationToken) -> Option<String> {
+        loop {
+            if let Some(meeting_id) = self.inner.pending.lock().await.pop_front() {
+                return Some(meeting_id);
+            }
+            tokio::select! {
+                _ = self.inner.notify.notified() => {}
+                _ = shutdown_token.cancelled() => return None,
+            }
+        }
+    }
+}
+
+impl Default for SummaryJobWakeups {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn slash_command_specs() -> Vec<SlashCommandSpec> {
@@ -2639,6 +2683,7 @@ impl std::error::Error for RuntimeError {}
 pub async fn run_bot(
     config: &AppConfig,
     mut bot_token_revision: watch::Receiver<u64>,
+    summary_job_wakeups: SummaryJobWakeups,
 ) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
@@ -2723,6 +2768,7 @@ pub async fn run_bot(
         .await
         .map_err(|err| RuntimeError::ClientInit(err.to_string()))?;
     let shard_manager = Arc::clone(&client.shard_manager);
+    handler.spawn_summary_job_wakeup_listener(Arc::clone(&client.http), summary_job_wakeups);
 
     tokio::select! {
         result = client.start() => {
@@ -2994,6 +3040,20 @@ impl ScaffoldHandler {
         next_run_at: DateTime<Utc>,
     ) {
         self.spawn_summary_retry_after(http, meeting_id, duration_until_utc(next_run_at));
+    }
+
+    fn spawn_summary_job_wakeup_listener(
+        &self,
+        http: Arc<Http>,
+        summary_job_wakeups: SummaryJobWakeups,
+    ) {
+        let handler = self.clone();
+        let shutdown_token = handler.shutdown_token.clone();
+        self.spawn_background(async move {
+            while let Some(meeting_id) = summary_job_wakeups.next(&shutdown_token).await {
+                handler.spawn_summary_retry_after(Arc::clone(&http), meeting_id, Duration::ZERO);
+            }
+        });
     }
 
     fn spawn_lifecycle_cleanup_retry<F>(&self, future: F)

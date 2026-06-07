@@ -24,6 +24,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::application::runtime::SummaryJobWakeups;
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
 use crate::domain::audit::AuditEvent;
@@ -305,6 +306,7 @@ pub struct GuildBotTokenRuntimeConfig {
     pub cipher: Option<Arc<BotTokenCipher>>,
     pub revision_tx: Option<watch::Sender<u64>>,
     pub operational_metrics_bearer_token: Option<String>,
+    pub summary_job_wakeups: Option<SummaryJobWakeups>,
 }
 
 #[derive(Clone)]
@@ -334,6 +336,7 @@ pub struct WebState {
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
     pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
+    summary_job_wakeups: Option<SummaryJobWakeups>,
 }
 
 impl WebState {
@@ -346,6 +349,7 @@ impl WebState {
         static_files_dir: String,
         guild_settings_defaults: GuildSettingsDefaults,
     ) -> Self {
+        let summary_job_wakeups = guild_bot_token.summary_job_wakeups;
         Self {
             db,
             chunk_storage_dir,
@@ -367,6 +371,7 @@ impl WebState {
             transcript_sse_limiter: Arc::new(std::sync::Mutex::new(HashMap::new())),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
+            summary_job_wakeups,
         }
     }
 }
@@ -5032,6 +5037,11 @@ async fn api_retry_job(
         return Err(StatusCode::CONFLICT);
     };
     let response = job_response_from_row(&row);
+    if let Some(summary_job_wakeups) = &state.summary_job_wakeups {
+        summary_job_wakeups
+            .enqueue(response.meeting_id.clone())
+            .await;
+    }
     record_audit_event(
         &state,
         web_audit_event(
