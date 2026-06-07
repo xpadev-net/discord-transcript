@@ -79,6 +79,12 @@ fn sql_store_clamps_usage_aggregate_window_before_querying() {
 }
 
 #[test]
+fn aggregate_recent_usage_sql_casts_string_bound_interval_param() {
+    assert!(AGGREGATE_RECENT_USAGE_SQL.contains("make_interval(secs => $3::TEXT::BIGINT)"));
+    assert!(!AGGREGATE_RECENT_USAGE_SQL.contains("make_interval(secs => $3::BIGINT)"));
+}
+
+#[test]
 fn sql_store_appends_lists_and_aggregates_usage_events() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
