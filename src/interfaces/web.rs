@@ -3600,6 +3600,13 @@ fn authorize_operational_metrics_request(
     expected_token: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
+    authorize_bearer_request(expected_token, headers)
+}
+
+fn authorize_bearer_request(
+    expected_token: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), StatusCode> {
     let Some(expected) = expected_token else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
@@ -3614,10 +3621,18 @@ fn authorize_operational_metrics_request(
 }
 
 fn authorize_system_admin_request(
-    expected_token: Option<&str>,
+    auth: Option<&AuthConfig>,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
-    authorize_operational_metrics_request(expected_token, headers)
+    let Some(auth) = auth else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let expected = system_admin_bearer_token(auth);
+    authorize_bearer_request(Some(&expected), headers)
+}
+
+fn system_admin_bearer_token(auth: &AuthConfig) -> String {
+    hmac_hex(&auth.session_secret, "system-admin:v1")
 }
 
 async fn require_system_admin_request(
@@ -3625,7 +3640,7 @@ async fn require_system_admin_request(
     headers: &HeaderMap,
     user_id: &str,
 ) -> Result<(), StatusCode> {
-    authorize_system_admin_request(state.operational_metrics_bearer_token.as_deref(), headers)?;
+    authorize_system_admin_request(state.auth.as_deref(), headers)?;
     require_current_user_is_guild_admin(state, user_id).await
 }
 
@@ -5683,6 +5698,7 @@ async fn api_admin_list_plan_quotas(
 ) -> Result<Json<Vec<AdminPlanQuotaResponse>>, StatusCode> {
     require_system_admin_request(&state, &headers, &user_id).await?;
     validate_admin_plan_id(&plan_id)?;
+    load_admin_plan_by_id(&state, &plan_id).await?;
     let rows = state
         .db
         .query(LIST_ADMIN_PLAN_QUOTAS_SQL, &[&plan_id])
@@ -5873,7 +5889,6 @@ async fn api_admin_list_guild_plan_assignments(
     require_system_admin_request(&state, &headers, &user_id).await?;
     let query = parse_admin_guild_plan_assignment_list_query(raw_query.as_deref())?;
     let normalized = normalize_admin_guild_plan_assignment_list_query(&query)?;
-    let include_archived = normalized.include_archived.to_string();
     let rows = state
         .db
         .query(
@@ -5881,7 +5896,7 @@ async fn api_admin_list_guild_plan_assignments(
             &[
                 &normalized.guild_id,
                 &normalized.tenant_id,
-                &include_archived,
+                &normalized.include_archived,
                 &normalized.limit,
             ],
         )
@@ -10071,11 +10086,11 @@ mod guild_api_tests {
         normalize_summary_template_request, normalize_target_guild_id,
         parse_admin_guild_plan_assignment_list_query, parse_job_cancel_request_body,
         parse_job_list_query, parse_job_retry_request_body, permission_cache_ttl,
-        target_auth_config, target_guild_has_active_installation, target_guild_settings_path,
-        user_can_access_target_guild, validate_authorized_guild_bot_token_update,
-        validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
-        validate_domain_knowledge_item_id, validate_guild_settings_update, validate_resource_id,
-        validate_summary_template_id,
+        system_admin_bearer_token, target_auth_config, target_guild_has_active_installation,
+        target_guild_settings_path, user_can_access_target_guild,
+        validate_authorized_guild_bot_token_update, validate_authorized_guild_settings_update,
+        validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
+        validate_guild_settings_update, validate_resource_id, validate_summary_template_id,
     };
     use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
     use crate::domain::feedback::{TranscriptFeedbackStatus, TranscriptFeedbackType};
@@ -10083,9 +10098,9 @@ mod guild_api_tests {
     use crate::infrastructure::sql::{
         ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, COUNT_GUILD_MEETINGS_SQL,
         COUNT_VISIBLE_GUILD_MEETINGS_SQL, INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL,
-        LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
-        LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
-        UPDATE_ADMIN_PLAN_SQL,
+        LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
+        LIST_GUILD_MEETINGS_SQL, LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL,
+        LIST_VISIBLE_GUILD_MEETINGS_SQL, UPDATE_ADMIN_PLAN_SQL,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use std::collections::HashMap;
@@ -10822,9 +10837,19 @@ mod guild_api_tests {
 
     #[test]
     fn system_admin_request_authorization_uses_bearer_boundary() {
+        let auth = AuthConfig {
+            client_id: "client".to_owned(),
+            client_secret: "client-secret".to_owned(),
+            session_secret: "session-secret".to_owned(),
+            redirect_uri: "https://example.test/auth/callback".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            bot_token: "bot-token".to_owned(),
+            secure_cookie: true,
+        };
+        let admin_token = system_admin_bearer_token(&auth);
         let empty_headers = HeaderMap::new();
         assert_eq!(
-            authorize_system_admin_request(Some("expected-token"), &empty_headers),
+            authorize_system_admin_request(Some(&auth), &empty_headers),
             Err(StatusCode::UNAUTHORIZED)
         );
         assert_eq!(
@@ -10835,18 +10860,19 @@ mod guild_api_tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer wrong-token"),
+            HeaderValue::from_static("Bearer operational-metrics-token"),
         );
         assert_eq!(
-            authorize_system_admin_request(Some("expected-token"), &headers),
+            authorize_system_admin_request(Some(&auth), &headers),
             Err(StatusCode::UNAUTHORIZED)
         );
         headers.insert(
             header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer expected-token"),
+            HeaderValue::from_str(&format!("Bearer {admin_token}"))
+                .expect("derived admin token should be a valid header"),
         );
         assert_eq!(
-            authorize_system_admin_request(Some("expected-token"), &headers),
+            authorize_system_admin_request(Some(&auth), &headers),
             Ok(())
         );
     }
@@ -11055,6 +11081,40 @@ mod guild_api_tests {
         assert!(source.contains("StatusCode::CONFLICT"));
         assert!(source.contains("\"name\": response.name.clone()"));
         assert!(source.contains("\"assigned_by_user_id\": response.assigned_by_user_id.clone()"));
+        assert!(!LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL.contains("TEXT::BOOLEAN"));
+        assert!(
+            LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL.contains("AND ($3 OR gpa.status = 'active')")
+        );
+        let list_assignments = source
+            .split_once("async fn api_admin_list_guild_plan_assignments")
+            .expect("assignment list handler should exist")
+            .1
+            .split_once("async fn api_admin_get_guild_plan_assignment")
+            .expect("next handler should exist")
+            .0;
+        assert!(list_assignments.contains("&normalized.include_archived"));
+    }
+
+    #[test]
+    fn admin_list_plan_quotas_checks_plan_exists_before_listing() {
+        let source = include_str!("web.rs");
+        let list_quotas = source
+            .split_once("async fn api_admin_list_plan_quotas")
+            .expect("plan quota list handler should exist")
+            .1
+            .split_once("async fn api_admin_get_plan_quota")
+            .expect("next handler should exist")
+            .0;
+        let existence_check_position = list_quotas
+            .find("load_admin_plan_by_id")
+            .expect("quota list handler should load the parent plan first");
+        let list_query_position = list_quotas
+            .find("LIST_ADMIN_PLAN_QUOTAS_SQL")
+            .expect("quota list handler should run the quota list query");
+        assert!(
+            existence_check_position < list_query_position,
+            "quota list should return 404 for a missing parent plan before returning rows"
+        );
     }
 
     #[test]

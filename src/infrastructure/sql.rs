@@ -586,7 +586,7 @@ FROM guild_plan_assignments gpa
 JOIN plans p ON p.id = gpa.plan_id
 WHERE (NULLIF($1, '') IS NULL OR gpa.guild_id = NULLIF($1, ''))
   AND (NULLIF($2, '') IS NULL OR gpa.tenant_id = NULLIF($2, ''))
-  AND ($3::TEXT::BOOLEAN OR gpa.status = 'active')
+  AND ($3 OR gpa.status = 'active')
 ORDER BY gpa.valid_from DESC, gpa.created_at DESC, gpa.id DESC
 LIMIT $4::INTEGER
 "#;
