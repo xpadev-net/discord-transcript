@@ -2839,7 +2839,7 @@ struct CurrentUserGuildResponse {
     icon: Option<String>,
     is_member: bool,
     is_admin: bool,
-    tenant_id: Option<String>,
+    installed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4696,13 +4696,12 @@ fn current_user_guilds_response(
                 .map(str::to_owned),
             is_member: true,
             is_admin: discord_guild_is_admin(guild),
-            tenant_id: tenant_by_guild_id.get(guild_id).cloned(),
+            installed: tenant_by_guild_id.contains_key(guild_id),
         });
     }
     guilds.sort_by(|a, b| {
-        b.tenant_id
-            .is_some()
-            .cmp(&a.tenant_id.is_some())
+        b.installed
+            .cmp(&a.installed)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.guild_id.cmp(&b.guild_id))
     });
@@ -8657,7 +8656,7 @@ mod guild_api_tests {
             .expect("admin guild should be listed");
         assert!(admin.is_member);
         assert!(admin.is_admin);
-        assert_eq!(admin.tenant_id.as_deref(), Some("tenant-admin"));
+        assert!(admin.installed);
 
         let member = response
             .iter()
@@ -8665,7 +8664,7 @@ mod guild_api_tests {
             .expect("member guild should be listed");
         assert!(member.is_member);
         assert!(!member.is_admin);
-        assert_eq!(member.tenant_id.as_deref(), Some("tenant-member"));
+        assert!(member.installed);
 
         let uninstalled = response
             .iter()
@@ -8673,10 +8672,23 @@ mod guild_api_tests {
             .expect("visible bot-not-installed guild should be listed");
         assert!(uninstalled.is_member);
         assert!(uninstalled.is_admin);
-        assert_eq!(uninstalled.tenant_id, None);
+        assert!(!uninstalled.installed);
         assert!(
             !response.iter().any(|guild| guild.guild_id == "guild-lost"),
             "installed guilds missing from Discord visibility must fail closed"
+        );
+
+        let serialized = serde_json::to_value(&response).expect("response should serialize");
+        let guild = serialized
+            .as_array()
+            .expect("guild response should be an array")
+            .iter()
+            .find(|guild| guild["guild_id"] == "guild-admin")
+            .expect("admin guild should be serialized");
+        assert_eq!(guild["installed"], true);
+        assert!(
+            guild.get("tenant_id").is_none(),
+            "guild selector response must not expose internal tenant IDs"
         );
     }
 
@@ -8701,7 +8713,7 @@ mod guild_api_tests {
         assert_eq!(response[0].name, "Owner Guild");
         assert_eq!(response[0].icon.as_deref(), Some("icon-hash"));
         assert!(response[0].is_admin);
-        assert_eq!(response[0].tenant_id.as_deref(), Some("tenant-owner"));
+        assert!(response[0].installed);
     }
 
     #[test]

@@ -265,7 +265,7 @@ function guildsResponse() {
       icon: null,
       is_member: true,
       is_admin: true,
-      tenant_id: "tenant-1",
+      installed: true,
     },
     {
       guild_id: "guild-2",
@@ -273,7 +273,7 @@ function guildsResponse() {
       icon: null,
       is_member: true,
       is_admin: false,
-      tenant_id: "tenant-2",
+      installed: true,
     },
     {
       guild_id: "guild-3",
@@ -281,7 +281,7 @@ function guildsResponse() {
       icon: null,
       is_member: true,
       is_admin: true,
-      tenant_id: null,
+      installed: false,
     },
   ];
 }
@@ -926,7 +926,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-1",
+              installed: true,
             },
             {
               guild_id: "guild-2",
@@ -934,7 +934,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-2",
+              installed: true,
             },
           ]),
         );
@@ -1735,7 +1735,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-2",
+              installed: true,
             },
           ]),
         );
@@ -1785,7 +1785,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-2",
+              installed: true,
             },
           ]),
         );
@@ -1846,7 +1846,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-1",
+              installed: true,
             },
             {
               guild_id: "guild-2",
@@ -1854,7 +1854,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-2",
+              installed: true,
             },
           ]),
         );
@@ -1949,7 +1949,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-1",
+              installed: true,
             },
             {
               guild_id: "guild-2",
@@ -1957,7 +1957,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: "tenant-2",
+              installed: true,
             },
           ]),
         );
@@ -2042,7 +2042,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: null,
+              installed: false,
             },
           ]),
         );
@@ -2196,7 +2196,7 @@ describe("App access controls", () => {
               icon: null,
               is_member: true,
               is_admin: true,
-              tenant_id: null,
+              installed: false,
             },
           ]),
         );
