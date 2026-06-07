@@ -983,7 +983,7 @@ mod tests {
             ),
             (
                 "oversized",
-                "#!/bin/sh\nmkdir -p output\nperl -e 'print \"x\" x 1048577' > output/summary.md\n",
+                "#!/bin/sh\nmkdir -p output\npython3 -c 'import sys; sys.stdout.buffer.write(b\"x\" * 1048577)' > output/summary.md\n",
                 "oversized summary output file output/summary.md",
             ),
             (
