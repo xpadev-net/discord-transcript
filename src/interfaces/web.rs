@@ -1377,8 +1377,8 @@ async fn auth_callback(
     let redirect = match verify_oauth_callback_preexchange(&params, &headers, &auth.session_secret)
     {
         Ok(redirect) => redirect,
-        Err((status, message)) => {
-            return oauth_callback_failure_response(status, message, auth.secure_cookie);
+        Err(failure) => {
+            return oauth_callback_failure_response(failure, auth.secure_cookie);
         }
     };
 
@@ -1403,16 +1403,17 @@ async fn auth_callback(
             Ok(t) => t,
             Err(_) => {
                 return oauth_callback_failure_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid token response",
+                    OAuthCallbackFailure::verified(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid token response",
+                    ),
                     auth.secure_cookie,
                 );
             }
         },
         _ => {
             return oauth_callback_failure_response(
-                StatusCode::BAD_GATEWAY,
-                "token exchange failed",
+                OAuthCallbackFailure::verified(StatusCode::BAD_GATEWAY, "token exchange failed"),
                 auth.secure_cookie,
             );
         }
@@ -1440,16 +1441,17 @@ async fn auth_callback(
             Ok(u) => u,
             Err(_) => {
                 return oauth_callback_failure_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid user response",
+                    OAuthCallbackFailure::verified(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid user response",
+                    ),
                     auth.secure_cookie,
                 );
             }
         },
         _ => {
             return oauth_callback_failure_response(
-                StatusCode::BAD_GATEWAY,
-                "failed to fetch user",
+                OAuthCallbackFailure::verified(StatusCode::BAD_GATEWAY, "failed to fetch user"),
                 auth.secure_cookie,
             );
         }
@@ -1460,16 +1462,17 @@ async fn auth_callback(
             Ok(g) => g,
             Err(_) => {
                 return oauth_callback_failure_response(
-                    StatusCode::BAD_GATEWAY,
-                    "invalid guilds response",
+                    OAuthCallbackFailure::verified(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid guilds response",
+                    ),
                     auth.secure_cookie,
                 );
             }
         },
         _ => {
             return oauth_callback_failure_response(
-                StatusCode::BAD_GATEWAY,
-                "failed to fetch guilds",
+                OAuthCallbackFailure::verified(StatusCode::BAD_GATEWAY, "failed to fetch guilds"),
                 auth.secure_cookie,
             );
         }
@@ -1477,8 +1480,7 @@ async fn auth_callback(
 
     if !guilds.iter().any(|g| g.id == auth.guild_id) {
         return oauth_callback_failure_response(
-            StatusCode::FORBIDDEN,
-            "not a member of this server",
+            OAuthCallbackFailure::verified(StatusCode::FORBIDDEN, "not a member of this server"),
             auth.secure_cookie,
         );
     }
@@ -1494,7 +1496,7 @@ async fn auth_callback(
     // Create session cookie with user ID
     let redirect = sanitize_redirect(&redirect);
     let session_cookie = session_cookie_value(&user.id, &auth.guild_id, auth);
-    let clear_oauth_nonce_cookie = format_oauth_nonce_cookie("", auth.secure_cookie, 0);
+    let clear_nonce_cookie = clear_oauth_nonce_cookie(auth.secure_cookie);
     record_audit_event(
         &state,
         web_audit_event(
@@ -1513,7 +1515,7 @@ async fn auth_callback(
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, &redirect)
         .header(header::SET_COOKIE, session_cookie)
-        .header(header::SET_COOKIE, clear_oauth_nonce_cookie)
+        .header(header::SET_COOKIE, clear_nonce_cookie)
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -1710,41 +1712,80 @@ fn format_oauth_nonce_cookie(nonce: &str, secure_cookie: bool, max_age: u64) -> 
     }
 }
 
-fn oauth_callback_failure_response(
+fn clear_oauth_nonce_cookie(secure_cookie: bool) -> String {
+    format_oauth_nonce_cookie("", secure_cookie, 0)
+}
+
+#[derive(Debug)]
+struct OAuthCallbackFailure {
     status: StatusCode,
     message: &'static str,
-    secure_cookie: bool,
-) -> Response {
-    Response::builder()
-        .status(status)
-        .header(
-            header::SET_COOKIE,
-            format_oauth_nonce_cookie("", secure_cookie, 0),
-        )
-        .body(axum::body::Body::from(message))
-        .unwrap_or_else(|_| status.into_response())
+    clear_nonce: bool,
+}
+
+impl OAuthCallbackFailure {
+    fn unverified(status: StatusCode, message: &'static str) -> Self {
+        Self {
+            status,
+            message,
+            clear_nonce: false,
+        }
+    }
+
+    fn verified(status: StatusCode, message: &'static str) -> Self {
+        Self {
+            status,
+            message,
+            clear_nonce: true,
+        }
+    }
+}
+
+fn oauth_callback_failure_response(failure: OAuthCallbackFailure, secure_cookie: bool) -> Response {
+    let mut builder = Response::builder().status(failure.status);
+    if failure.clear_nonce {
+        builder = builder.header(header::SET_COOKIE, clear_oauth_nonce_cookie(secure_cookie));
+    }
+    builder
+        .body(axum::body::Body::from(failure.message))
+        .unwrap_or_else(|_| failure.status.into_response())
 }
 
 fn verify_oauth_callback_preexchange(
     params: &CallbackParams,
     headers: &HeaderMap,
     secret: &str,
-) -> Result<String, (StatusCode, &'static str)> {
-    let Some(_) = params.code.as_ref() else {
-        return Err((StatusCode::BAD_REQUEST, "missing code"));
-    };
+) -> Result<String, OAuthCallbackFailure> {
     let Some(state_param) = params.state.as_ref() else {
-        return Err((StatusCode::BAD_REQUEST, "missing state"));
+        return Err(OAuthCallbackFailure::unverified(
+            StatusCode::BAD_REQUEST,
+            "missing state",
+        ));
     };
     let Some(cookie_nonce) = get_cookie(headers, OAUTH_NONCE_COOKIE_NAME) else {
-        return Err((StatusCode::BAD_REQUEST, "missing oauth nonce"));
+        return Err(OAuthCallbackFailure::unverified(
+            StatusCode::BAD_REQUEST,
+            "missing oauth nonce",
+        ));
     };
     if cookie_nonce.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "missing oauth nonce"));
+        return Err(OAuthCallbackFailure::unverified(
+            StatusCode::BAD_REQUEST,
+            "missing oauth nonce",
+        ));
     }
     let Some(redirect) = verify_oauth_state(state_param, &cookie_nonce, secret) else {
-        return Err((StatusCode::BAD_REQUEST, "invalid state"));
+        return Err(OAuthCallbackFailure::unverified(
+            StatusCode::BAD_REQUEST,
+            "invalid state",
+        ));
     };
+    if params.code.is_none() {
+        return Err(OAuthCallbackFailure::verified(
+            StatusCode::BAD_REQUEST,
+            "missing code",
+        ));
+    }
     Ok(redirect)
 }
 
@@ -10274,10 +10315,11 @@ mod discord_channel_full_tests {
 mod oauth_state_tests {
     use super::{
         AuthConfig, CallbackParams, OAUTH_NONCE_COOKIE_PATH, OAUTH_STATE_TTL_SECS,
-        format_oauth_nonce_cookie, get_cookie, prepare_oauth_login, sign_oauth_state,
+        OAuthCallbackFailure, clear_oauth_nonce_cookie, get_cookie,
+        oauth_callback_failure_response, prepare_oauth_login, sign_oauth_state,
         verify_oauth_callback_preexchange, verify_oauth_state,
     };
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 
     const SECRET: &str = "test-session-secret";
 
@@ -10291,6 +10333,27 @@ mod oauth_state_tests {
             bot_token: "bot".to_owned(),
             secure_cookie: true,
         }
+    }
+
+    fn headers_with_oauth_nonce(nonce: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("dt_oauth_nonce={nonce}")).expect("cookie value"),
+        );
+        headers
+    }
+
+    fn response_has_oauth_nonce_clear(response: &axum::response::Response) -> bool {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| {
+                value.to_str().is_ok_and(|cookie| {
+                    cookie.contains("dt_oauth_nonce=;") && cookie.contains("Max-Age=0")
+                })
+            })
     }
 
     #[test]
@@ -10366,11 +10429,7 @@ mod oauth_state_tests {
     fn verify_oauth_callback_preexchange_happy_path() {
         let nonce = "browser-nonce";
         let state = sign_oauth_state("/", nonce, SECRET);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            HeaderValue::from_str(&format!("dt_oauth_nonce={nonce}")).expect("cookie value"),
-        );
+        let headers = headers_with_oauth_nonce(nonce);
         let params = CallbackParams {
             code: Some("discord-code".to_owned()),
             state: Some(state),
@@ -10390,33 +10449,107 @@ mod oauth_state_tests {
         };
         let err =
             verify_oauth_callback_preexchange(&params, &HeaderMap::new(), SECRET).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "missing oauth nonce");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "missing oauth nonce");
+        assert!(!err.clear_nonce);
     }
 
     #[test]
     fn verify_oauth_callback_preexchange_rejects_cross_browser_replay() {
         let state = sign_oauth_state("/", "attacker", SECRET);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            HeaderValue::from_static("dt_oauth_nonce=victim"),
-        );
+        let headers = headers_with_oauth_nonce("victim");
         let params = CallbackParams {
             code: Some("code".to_owned()),
             state: Some(state),
         };
         let err = verify_oauth_callback_preexchange(&params, &headers, SECRET).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "invalid state");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "invalid state");
+        assert!(!err.clear_nonce);
     }
 
     #[test]
-    fn oauth_callback_failure_clears_nonce_cookie() {
-        let cleared = format_oauth_nonce_cookie("", true, 0);
+    fn verify_oauth_callback_preexchange_rejects_missing_state_without_consuming_nonce() {
+        let headers = headers_with_oauth_nonce("browser-nonce");
+        let params = CallbackParams {
+            code: Some("code".to_owned()),
+            state: None,
+        };
+        let err = verify_oauth_callback_preexchange(&params, &headers, SECRET).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "missing state");
+        assert!(!err.clear_nonce);
+
+        let response = oauth_callback_failure_response(err, true);
+        assert!(!response_has_oauth_nonce_clear(&response));
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn oauth_callback_invalid_state_failure_does_not_clear_nonce_cookie() {
+        let state = sign_oauth_state("/", "attacker", SECRET);
+        let headers = headers_with_oauth_nonce("victim");
+        let params = CallbackParams {
+            code: Some("code".to_owned()),
+            state: Some(state),
+        };
+        let err = verify_oauth_callback_preexchange(&params, &headers, SECRET).unwrap_err();
+
+        let response = oauth_callback_failure_response(err, true);
+        assert!(!response_has_oauth_nonce_clear(&response));
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn oauth_callback_verified_missing_code_failure_clears_nonce_cookie() {
+        let nonce = "browser-nonce";
+        let state = sign_oauth_state("/", nonce, SECRET);
+        let headers = headers_with_oauth_nonce(nonce);
+        let params = CallbackParams {
+            code: None,
+            state: Some(state),
+        };
+        let err = verify_oauth_callback_preexchange(&params, &headers, SECRET).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "missing code");
+        assert!(err.clear_nonce);
+
+        let response = oauth_callback_failure_response(err, true);
+        assert!(response_has_oauth_nonce_clear(&response));
+    }
+
+    #[test]
+    fn oauth_callback_verified_exchange_failure_clears_nonce_cookie() {
+        let response = oauth_callback_failure_response(
+            OAuthCallbackFailure::verified(StatusCode::BAD_GATEWAY, "token exchange failed"),
+            true,
+        );
+        assert!(response_has_oauth_nonce_clear(&response));
+    }
+
+    #[test]
+    fn oauth_callback_success_clear_cookie_preserves_attributes() {
+        let cleared = clear_oauth_nonce_cookie(true);
         assert!(cleared.contains("dt_oauth_nonce=;"));
         assert!(cleared.contains(&format!("Path={OAUTH_NONCE_COOKIE_PATH}")));
         assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("HttpOnly"));
+        assert!(cleared.contains("SameSite=Lax"));
+        assert!(cleared.contains("; Secure"));
     }
 }
 
