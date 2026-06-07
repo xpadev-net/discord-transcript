@@ -50,6 +50,7 @@ pub struct AgentWorkspace {
     expected_output_path: PathBuf,
     cursor_config_path: PathBuf,
     root_identity: AgentWorkspaceRootIdentity,
+    cleanup_on_drop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,11 +346,18 @@ impl AgentWorkspace {
     pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
         cleanup_agent_workspace_root(&self.root, &self.root_identity)
     }
+
+    pub fn cleanup_once(mut self) -> Result<(), AgentWorkspaceError> {
+        self.cleanup_on_drop = false;
+        cleanup_agent_workspace_root(&self.root, &self.root_identity)
+    }
 }
 
 impl Drop for AgentWorkspace {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if self.cleanup_on_drop {
+            let _ = self.cleanup();
+        }
     }
 }
 
@@ -479,6 +487,7 @@ impl AgentWorkspaceBuilder {
             expected_output_path: self.expected_output_path,
             cursor_config_path,
             root_identity,
+            cleanup_on_drop: true,
         })
     }
 }

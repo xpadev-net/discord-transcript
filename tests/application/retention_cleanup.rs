@@ -86,6 +86,21 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     std::fs::write(legacy_dir.join("mixdown.wav"), b"legacy").expect("write legacy mixdown");
     std::fs::write(legacy_dir.join("speakers").join("u1_speaker.wav"), b"speaker")
         .expect("write legacy speaker");
+    assert!(
+        workspace
+            .agent_runs_debug_dir()
+            .join("failed-run-1")
+            .join("diagnostics.txt")
+            .is_file()
+    );
+    assert!(
+        workspace
+            .agent_workspace_parent_dir()
+            .join("summary-failed-run")
+            .join("output")
+            .join("summary.md")
+            .is_file()
+    );
 
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
@@ -138,7 +153,6 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     assert_eq!(report.artifacts_deleted, 12);
     assert!(!workspace.audio_dir().exists());
     assert!(!workspace.debug_dir().exists());
-    assert!(!workspace.agent_runs_debug_dir().exists());
     assert!(!workspace.agent_workspace_parent_dir().exists());
     assert!(!workspace.speakers_dir().exists());
     assert!(!workspace.context_dir().exists());

@@ -6867,7 +6867,7 @@ impl ScaffoldHandler {
             match summary_client.summarize(&prompt, Some(agent_workspace.root())) {
                 Ok(markdown) => Ok((markdown, agent_workspace)),
                 Err(err) => {
-                    if let Err(cleanup_err) = agent_workspace.cleanup() {
+                    if let Err(cleanup_err) = agent_workspace.cleanup_once() {
                         warn!(
                             meeting_id = %claimed_job.meeting_id,
                             error = %cleanup_err,
@@ -6979,7 +6979,7 @@ impl ScaffoldHandler {
                 );
             }
         }
-        if let Err(err) = agent_workspace.cleanup() {
+        if let Err(err) = agent_workspace.cleanup_once() {
             let err_string = summary_cleanup_failure_user_message(&err);
             warn!(
                 meeting_id = %claimed_job.meeting_id,
@@ -9693,13 +9693,14 @@ mod status_message_tests {
         let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
         let job = running_summary_job();
         queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let user_message = summary_cleanup_failure_user_message(
-            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied",
-        );
+        let raw_error =
+            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
+        let user_message = summary_cleanup_failure_user_message(raw_error);
 
         let disposition =
             handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 2);
 
+        assert_ne!(user_message, raw_error);
         assert!(!user_message.contains("/tmp/private"));
         assert!(!user_message.contains("summary.md"));
         assert!(user_message.len() < 200);
@@ -9726,13 +9727,14 @@ mod status_message_tests {
         let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
         let job = running_summary_job();
         queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let user_message = summary_cleanup_failure_user_message(
-            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied",
-        );
+        let raw_error =
+            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
+        let user_message = summary_cleanup_failure_user_message(raw_error);
 
         let disposition =
             handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 0);
 
+        assert_ne!(user_message, raw_error);
         assert!(!user_message.contains("/tmp/private"));
         assert!(!user_message.contains("summary.md"));
         assert!(user_message.len() < 200);
