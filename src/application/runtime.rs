@@ -6811,7 +6811,9 @@ impl ScaffoldHandler {
                 &request.workspace,
                 &prompt,
             );
-            summary_client.summarize(&prompt, Some(request.workspace.root()))
+            let agent_workspace =
+                crate::application::summary::materialize_new_summary_agent_workspace(&request)?;
+            summary_client.summarize(&prompt, Some(agent_workspace.root()))
         });
         let markdown = match markdown {
             Ok(m) => m,

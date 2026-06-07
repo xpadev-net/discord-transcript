@@ -5,8 +5,12 @@ use crate::infrastructure::asr::{
     parse_whisper_response,
 };
 use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff, retry_with_backoff_if};
+use crate::infrastructure::workspace::{
+    AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
+    AGENT_SUMMARY_OUTPUT_FILENAME,
+};
 use std::fmt::{Display, Formatter};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -224,6 +228,7 @@ pub struct HarnessCliSummaryClient {
 }
 
 const SANITIZE_MAX_LEN: usize = 500;
+const SUMMARY_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Redact values that look like API keys or tokens, collapse whitespace,
 /// and truncate to a bounded length so error messages stay safe and compact.
@@ -299,12 +304,12 @@ fn summarize_claude_stdin(
     prompt: &str,
     workdir: Option<&Path>,
 ) -> Result<String, SummaryError> {
+    let workdir = require_summary_workdir(workdir)?;
+    remove_stale_summary_output(workdir)?;
     let mut command = Command::new(&client.command_path);
     command.arg("--model").arg(&client.model).arg("-p");
     scrub_agent_command_environment(&mut command);
-    if let Some(dir) = workdir {
-        command.current_dir(dir);
-    }
+    command.current_dir(workdir);
     let output = run_command_with_timeout(
         &mut command,
         Some(prompt.as_bytes()),
@@ -321,7 +326,7 @@ fn summarize_claude_stdin(
         ));
     }
 
-    String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+    read_validated_summary_output(client.harness, workdir, &output.stderr, &output.stdout)
 }
 
 fn summarize_opencode_argv(
@@ -329,6 +334,8 @@ fn summarize_opencode_argv(
     prompt: &str,
     workdir: Option<&Path>,
 ) -> Result<String, SummaryError> {
+    let workdir = require_summary_workdir(workdir)?;
+    remove_stale_summary_output(workdir)?;
     let mut command = Command::new(&client.command_path);
     command
         .arg("run")
@@ -337,9 +344,7 @@ fn summarize_opencode_argv(
         .arg(prompt)
         .stdin(std::process::Stdio::null());
     scrub_agent_command_environment(&mut command);
-    if let Some(dir) = workdir {
-        command.current_dir(dir);
-    }
+    command.current_dir(workdir);
     let output = run_command_with_timeout(&mut command, None, client.command_timeout)
         .map_err(summary_integration_error)?;
     if !output.status.success() {
@@ -350,7 +355,7 @@ fn summarize_opencode_argv(
             &output.stdout,
         ));
     }
-    String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+    read_validated_summary_output(client.harness, workdir, &output.stderr, &output.stdout)
 }
 
 fn summarize_cursor_argv(
@@ -358,6 +363,8 @@ fn summarize_cursor_argv(
     prompt: &str,
     workdir: Option<&Path>,
 ) -> Result<String, SummaryError> {
+    let workdir = require_summary_workdir(workdir)?;
+    remove_stale_summary_output(workdir)?;
     let mut command = Command::new(&client.command_path);
     command
         .arg("-p")
@@ -370,9 +377,7 @@ fn summarize_cursor_argv(
     }
     command.stdin(std::process::Stdio::null());
     scrub_agent_command_environment(&mut command);
-    if let Some(dir) = workdir {
-        command.current_dir(dir);
-    }
+    command.current_dir(workdir);
     let output = run_command_with_timeout(&mut command, None, client.command_timeout)
         .map_err(summary_integration_error)?;
     if !output.status.success() {
@@ -383,7 +388,127 @@ fn summarize_cursor_argv(
             &output.stdout,
         ));
     }
-    String::from_utf8(output.stdout).map_err(|err| SummaryError::SummaryEngine(err.to_string()))
+    read_validated_summary_output(client.harness, workdir, &output.stderr, &output.stdout)
+}
+
+fn require_summary_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> {
+    let workdir = workdir.ok_or_else(|| {
+        SummaryError::SummaryEngine(
+            "summary harness requires a generated agent workspace workdir".to_owned(),
+        )
+    })?;
+    if !workdir.join(AGENT_INPUT_DIR).is_dir()
+        || !workdir.join(AGENT_OUTPUT_DIR).is_dir()
+        || !workdir
+            .join(AGENT_CURSOR_DIR)
+            .join(AGENT_CURSOR_CONFIG_FILENAME)
+            .is_file()
+    {
+        return Err(SummaryError::SummaryEngine(
+            "summary harness requires a generated agent workspace workdir".to_owned(),
+        ));
+    }
+    Ok(workdir)
+}
+
+fn summary_output_path(workdir: &Path) -> std::path::PathBuf {
+    workdir
+        .join(AGENT_OUTPUT_DIR)
+        .join(AGENT_SUMMARY_OUTPUT_FILENAME)
+}
+
+fn remove_stale_summary_output(workdir: &Path) -> Result<(), SummaryError> {
+    let path = summary_output_path(workdir);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SummaryError::SummaryEngine(format!(
+            "failed to remove stale summary output {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {err}"
+        ))),
+    }
+}
+
+fn read_validated_summary_output(
+    harness: SummaryHarness,
+    workdir: &Path,
+    stderr: &[u8],
+    stdout: &[u8],
+) -> Result<String, SummaryError> {
+    let path = summary_output_path(workdir);
+    let metadata = fs::symlink_metadata(&path).map_err(|err| {
+        summary_output_validation_failed(
+            harness,
+            format!(
+                "missing summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {err}"
+            ),
+            stderr,
+            stdout,
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(summary_output_validation_failed(
+            harness,
+            format!(
+                "invalid summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: expected a regular file"
+            ),
+            stderr,
+            stdout,
+        ));
+    }
+    if metadata.len() > SUMMARY_OUTPUT_MAX_BYTES {
+        return Err(summary_output_validation_failed(
+            harness,
+            format!(
+                "oversized summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {} bytes exceeds {} bytes",
+                metadata.len(),
+                SUMMARY_OUTPUT_MAX_BYTES
+            ),
+            stderr,
+            stdout,
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|err| {
+        summary_output_validation_failed(
+            harness,
+            format!(
+                "failed to read summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {err}"
+            ),
+            stderr,
+            stdout,
+        )
+    })?;
+    let markdown = String::from_utf8(bytes).map_err(|err| {
+        summary_output_validation_failed(
+            harness,
+            format!(
+                "invalid summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: not valid UTF-8 ({err})"
+            ),
+            stderr,
+            stdout,
+        )
+    })?;
+    if markdown.trim().is_empty() {
+        return Err(summary_output_validation_failed(
+            harness,
+            format!("empty summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}"),
+            stderr,
+            stdout,
+        ));
+    }
+    Ok(markdown)
+}
+
+fn summary_output_validation_failed(
+    harness: SummaryHarness,
+    reason: String,
+    stderr: &[u8],
+    stdout: &[u8],
+) -> SummaryError {
+    SummaryError::SummaryEngine(format!(
+        "summary output validation failed (harness={harness}): {reason}; stderr={}; stdout={}",
+        sanitize_output(stderr),
+        sanitize_output(stdout)
+    ))
 }
 
 fn scrub_agent_command_environment(command: &mut Command) {
@@ -641,6 +766,7 @@ fn read_temp_output_file(path: &Path) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
+        AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
         CommandWhisperClient, HarnessCliSummaryClient, IntegrationError, create_temp_output_file,
         run_command_with_timeout,
     };
@@ -746,6 +872,228 @@ mod tests {
 
         assert!(!client.supports_transcript_correction());
         assert!(!client.can_run_llm_transcript_correction());
+    }
+
+    #[test]
+    fn summary_harnesses_read_output_file_and_treat_stdout_as_diagnostic() {
+        let _guard = command_test_lock();
+        for harness in [
+            SummaryHarness::Claude,
+            SummaryHarness::OpenCode,
+            SummaryHarness::CursorAgent,
+        ] {
+            let workdir = unique_summary_workdir("summary_file_success");
+            create_summary_agent_workdir(&workdir);
+            let log_path = workdir.join("command.log");
+            let stdin_path = workdir.join("stdin.log");
+            let script_path = write_summary_script(
+                "summary_success",
+                &format!(
+                    "#!/bin/sh\npwd > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\ncat > '{}'\nprintf 'stdout summary must be ignored\\n'\nmkdir -p output\nprintf '## Summary\\nfrom file\\n' > output/summary.md\n",
+                    log_path.display(),
+                    log_path.display(),
+                    stdin_path.display()
+                ),
+            );
+            let client = summary_test_client(harness, &script_path);
+
+            let markdown = client
+                .summarize("PROMPT BODY", Some(&workdir))
+                .expect("summary should be read from output file");
+
+            assert_eq!(markdown, "## Summary\nfrom file\n");
+            let log = std::fs::read_to_string(&log_path).expect("log should exist");
+            let lines = log.lines().collect::<Vec<_>>();
+            assert_eq!(
+                lines[0],
+                std::fs::canonicalize(&workdir)
+                    .expect("workdir should canonicalize")
+                    .to_string_lossy()
+            );
+            match harness {
+                SummaryHarness::Claude => {
+                    assert_eq!(lines[1..], ["--model", "model-a", "-p"]);
+                    assert_eq!(
+                        std::fs::read_to_string(&stdin_path).expect("stdin should be captured"),
+                        "PROMPT BODY"
+                    );
+                }
+                SummaryHarness::OpenCode => {
+                    assert_eq!(lines[1..], ["run", "--model", "model-a", "PROMPT BODY"]);
+                    assert_eq!(
+                        std::fs::read_to_string(&stdin_path).expect("stdin should be empty"),
+                        ""
+                    );
+                }
+                SummaryHarness::CursorAgent => {
+                    assert_eq!(
+                        lines[1..],
+                        [
+                            "-p",
+                            "--trust",
+                            "PROMPT BODY",
+                            "--output-format",
+                            "text",
+                            "--model",
+                            "model-a"
+                        ]
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&stdin_path).expect("stdin should be empty"),
+                        ""
+                    );
+                }
+            }
+
+            let _ = std::fs::remove_dir_all(&workdir);
+            let _ = std::fs::remove_file(&script_path);
+        }
+    }
+
+    #[test]
+    fn summary_harness_missing_output_file_fails_with_sanitized_diagnostics() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("summary_missing_output");
+        create_summary_agent_workdir(&workdir);
+        let script_path = write_summary_script(
+            "summary_missing",
+            "#!/bin/sh\necho 'bearer sk-secret123456789' >&2\necho 'stdout fallback summary'\n",
+        );
+        let client = summary_test_client(SummaryHarness::Claude, &script_path);
+
+        let err = client
+            .summarize("PROMPT BODY", Some(&workdir))
+            .expect_err("stdout must not be accepted as summary content");
+
+        let message = err.to_string();
+        assert!(message.contains("missing summary output file output/summary.md"));
+        assert!(message.contains("stdout fallback summary"));
+        assert!(!message.contains("sk-secret123456789"));
+        assert!(!message.contains(&workdir.to_string_lossy().to_string()));
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn summary_harness_rejects_empty_oversized_and_invalid_output_files() {
+        let _guard = command_test_lock();
+        for (label, script, expected) in [
+            (
+                "empty",
+                "#!/bin/sh\nmkdir -p output\nprintf '  \\n' > output/summary.md\n",
+                "empty summary output file output/summary.md",
+            ),
+            (
+                "oversized",
+                "#!/bin/sh\nmkdir -p output\nperl -e 'print \"x\" x 1048577' > output/summary.md\n",
+                "oversized summary output file output/summary.md",
+            ),
+            (
+                "invalid_utf8",
+                "#!/bin/sh\nmkdir -p output\nprintf '\\377' > output/summary.md\n",
+                "not valid UTF-8",
+            ),
+        ] {
+            let workdir = unique_summary_workdir(label);
+            create_summary_agent_workdir(&workdir);
+            let script_path = write_summary_script(label, script);
+            let client = summary_test_client(SummaryHarness::OpenCode, &script_path);
+
+            let err = client
+                .summarize("PROMPT BODY", Some(&workdir))
+                .expect_err("invalid output should fail");
+
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {label}: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&workdir);
+            let _ = std::fs::remove_file(&script_path);
+        }
+    }
+
+    #[test]
+    fn summary_harness_nonzero_exit_does_not_accept_output_file() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("summary_nonzero");
+        create_summary_agent_workdir(&workdir);
+        let script_path = write_summary_script(
+            "summary_nonzero",
+            "#!/bin/sh\nmkdir -p output\nprintf '## Summary\\nshould fail\\n' > output/summary.md\necho diagnostic >&2\nexit 7\n",
+        );
+        let client = summary_test_client(SummaryHarness::CursorAgent, &script_path);
+
+        let err = client
+            .summarize("PROMPT BODY", Some(&workdir))
+            .expect_err("nonzero command status should fail even with an output file");
+
+        assert!(err.to_string().contains("summary command failed"));
+        assert!(!err.to_string().contains("should fail"));
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn summary_harness_removes_stale_output_before_retry() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("summary_retry_stale");
+        create_summary_agent_workdir(&workdir);
+        std::fs::write(workdir.join("output/summary.md"), "## Summary\nstale\n")
+            .expect("stale output");
+        let attempt_path = workdir.join("attempts");
+        let script_path = write_summary_script(
+            "summary_retry",
+            &format!(
+                "#!/bin/sh\nattempts=$(cat '{}' 2>/dev/null || printf 0)\nattempts=$((attempts + 1))\nprintf '%s' \"$attempts\" > '{}'\nif [ \"$attempts\" -eq 1 ]; then exit 7; fi\nmkdir -p output\nprintf '## Summary\\nfresh\\n' > output/summary.md\n",
+                attempt_path.display(),
+                attempt_path.display()
+            ),
+        );
+        let mut client = summary_test_client(SummaryHarness::Claude, &script_path);
+        client.retry_policy.max_attempts = 2;
+
+        let markdown = client
+            .summarize("PROMPT BODY", Some(&workdir))
+            .expect("second attempt should succeed with fresh output");
+
+        assert_eq!(markdown, "## Summary\nfresh\n");
+        assert_eq!(
+            std::fs::read_to_string(&attempt_path).expect("attempts"),
+            "2"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn summary_harness_rejects_non_agent_workdir_before_spawning_cursor_trust() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("summary_non_agent_workdir");
+        std::fs::create_dir_all(&workdir).expect("workdir");
+        let marker_path = workdir.join("spawned");
+        let script_path = write_summary_script(
+            "summary_non_agent_workdir",
+            &format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nmkdir -p output\nprintf '## Summary\\nunsafe\\n' > output/summary.md\n",
+                marker_path.display()
+            ),
+        );
+        let client = summary_test_client(SummaryHarness::CursorAgent, &script_path);
+
+        let err = client
+            .summarize("PROMPT BODY", Some(&workdir))
+            .expect_err("non-agent workdir must fail before --trust spawn");
+
+        assert!(
+            err.to_string()
+                .contains("requires a generated agent workspace workdir")
+        );
+        assert!(
+            !marker_path.exists(),
+            "cursor command must not spawn with --trust outside generated workspace"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
     }
 
     #[test]
@@ -1107,6 +1455,7 @@ mod tests {
 
     #[test]
     fn whisper_nonzero_exit_still_retries_command() {
+        let _guard = command_test_lock();
         let marker_path = std::env::temp_dir().join(format!(
             "discord_transcript_whisper_exit_retry_{}_{}",
             std::process::id(),
@@ -1172,6 +1521,64 @@ mod tests {
 
     #[cfg(not(unix))]
     fn make_executable(_path: &std::path::Path) {}
+
+    fn summary_test_client(
+        harness: SummaryHarness,
+        script_path: &std::path::Path,
+    ) -> HarnessCliSummaryClient {
+        HarnessCliSummaryClient {
+            harness,
+            command_path: script_path.to_string_lossy().to_string(),
+            model: "model-a".to_owned(),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            command_timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn unique_summary_workdir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "discord_transcript_{label}_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn write_summary_script(label: &str, body: &str) -> std::path::PathBuf {
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_{label}_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&script_path, body).expect("script should be written");
+        make_executable(&script_path);
+        script_path
+    }
+
+    fn create_summary_agent_workdir(workdir: &std::path::Path) {
+        std::fs::create_dir_all(workdir.join(AGENT_INPUT_DIR)).expect("input dir");
+        std::fs::create_dir_all(workdir.join(AGENT_OUTPUT_DIR)).expect("output dir");
+        std::fs::create_dir_all(workdir.join(AGENT_CURSOR_DIR)).expect("cursor dir");
+        std::fs::write(
+            workdir
+                .join(AGENT_CURSOR_DIR)
+                .join(AGENT_CURSOR_CONFIG_FILENAME),
+            "{}",
+        )
+        .expect("cursor config");
+    }
+
+    fn command_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("command test lock should not be poisoned")
+    }
 
     #[cfg(unix)]
     fn process_command_line_contains(marker: &str) -> bool {
