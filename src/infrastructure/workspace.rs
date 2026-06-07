@@ -33,6 +33,8 @@ pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
 
 #[cfg(unix)]
 const AGENT_CLEANUP_MARKER_FILENAME: &str = ".cleanup-token";
+#[cfg(unix)]
+const AGENT_CLEANUP_MARKER_LEN: u64 = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspaceLayout {
@@ -734,7 +736,7 @@ fn read_cleanup_marker(agent_root: &Path) -> Result<String, AgentWorkspaceError>
     use std::os::unix::fs::OpenOptionsExt;
 
     let marker_path = agent_root.join(cleanup_marker_relative_path());
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&marker_path)
@@ -752,12 +754,34 @@ fn read_cleanup_marker(agent_root: &Path) -> Result<String, AgentWorkspaceError>
             reason: "agent workspace cleanup marker must be a real file",
         });
     }
-    let mut marker = String::new();
-    file.read_to_string(&mut marker)
-        .map_err(|err| AgentWorkspaceError::Io {
+    if metadata.len() != AGENT_CLEANUP_MARKER_LEN {
+        return Err(AgentWorkspaceError::InvalidPath {
             path: marker_path,
+            reason: "agent workspace cleanup marker has invalid size",
+        });
+    }
+
+    let mut marker_bytes = Vec::with_capacity(AGENT_CLEANUP_MARKER_LEN as usize);
+    file.take(AGENT_CLEANUP_MARKER_LEN + 1)
+        .read_to_end(&mut marker_bytes)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: marker_path.clone(),
             source: err,
         })?;
+    if marker_bytes.len() as u64 != AGENT_CLEANUP_MARKER_LEN {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: marker_path,
+            reason: "agent workspace cleanup marker has invalid size",
+        });
+    }
+    let marker = String::from_utf8(marker_bytes).map_err(|_| AgentWorkspaceError::InvalidPath {
+        path: marker_path.clone(),
+        reason: "agent workspace cleanup marker must be UTF-8",
+    })?;
+    uuid::Uuid::parse_str(&marker).map_err(|_| AgentWorkspaceError::InvalidPath {
+        path: marker_path,
+        reason: "agent workspace cleanup marker has invalid format",
+    })?;
     Ok(marker)
 }
 
@@ -1169,4 +1193,60 @@ fn write_new_file_no_symlink(
         path: agent_root.join(relative_path),
         reason: "agent workspace materialization requires Unix no-follow write support",
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(test_name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{test_name}_{nanos}"))
+    }
+
+    fn write_cleanup_marker(agent_root: &Path, marker: &str) {
+        let cursor_dir = agent_root.join(AGENT_CURSOR_DIR);
+        std::fs::create_dir_all(&cursor_dir).expect("cursor dir");
+        std::fs::write(cursor_dir.join(AGENT_CLEANUP_MARKER_FILENAME), marker)
+            .expect("cleanup marker");
+    }
+
+    #[test]
+    fn read_cleanup_marker_rejects_oversized_marker() {
+        let agent_root = unique_temp_dir("read_cleanup_marker_oversized");
+        write_cleanup_marker(&agent_root, "00000000-0000-0000-0000-000000000000-extra");
+
+        let err =
+            read_cleanup_marker(&agent_root).expect_err("oversized marker should be rejected");
+
+        assert!(err.to_string().contains("invalid size"));
+        std::fs::remove_dir_all(&agent_root).ok();
+    }
+
+    #[test]
+    fn read_cleanup_marker_rejects_undersized_marker() {
+        let agent_root = unique_temp_dir("read_cleanup_marker_undersized");
+        write_cleanup_marker(&agent_root, "00000000-0000-0000-0000");
+
+        let err =
+            read_cleanup_marker(&agent_root).expect_err("undersized marker should be rejected");
+
+        assert!(err.to_string().contains("invalid size"));
+        std::fs::remove_dir_all(&agent_root).ok();
+    }
+
+    #[test]
+    fn read_cleanup_marker_rejects_malformed_uuid_marker() {
+        let agent_root = unique_temp_dir("read_cleanup_marker_malformed");
+        write_cleanup_marker(&agent_root, "00000000-0000-0000-0000-00000000000z");
+
+        let err =
+            read_cleanup_marker(&agent_root).expect_err("malformed marker should be rejected");
+
+        assert!(err.to_string().contains("invalid format"));
+        std::fs::remove_dir_all(&agent_root).ok();
+    }
 }
