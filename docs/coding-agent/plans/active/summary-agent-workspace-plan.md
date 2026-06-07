@@ -1,8 +1,8 @@
 # Plan: Summary Agent Workspace Boundary
 
-- status: draft
+- status: completed
 - generated: 2026-06-07
-- last_updated: 2026-06-07
+- last_updated: 2026-06-08
 - work_type: code
 
 ## Goal
@@ -74,7 +74,7 @@ All CLI summary harnesses (`claude`, `opencode`, and `cursor_agent`) use the sam
 - Required output:
   - `output/summary.md`: the only successful summary content artifact.
 
-The application accepts a summary run as successful only after the harness exits successfully and `output/summary.md` exists, is non-empty after trimming, is within the configured size limit, and passes markdown/content validation. Harness stdout is never accepted as successful summary markdown. Stdout and stderr are diagnostic-only and must remain bounded and sanitized in failure messages.
+The application accepts a summary run as successful only after the harness exits successfully and `output/summary.md` exists as a regular file, decodes as UTF-8, is non-empty after trimming, and is within the configured size limit. Harness stdout is never accepted as successful summary markdown. Stdout and stderr are diagnostic-only and remain bounded and sanitized in failure messages. Deeper semantic validation of summary section structure or content is not implemented yet.
 
 ### AI-memory extraction run
 
@@ -99,7 +99,7 @@ The application accepts AI-memory extraction as successful only after the harnes
 
 The materializer may copy only the approved inputs listed above from the real meeting workspace, and may create only these generated paths inside the agent workspace:
 
-- `input/**`: approved copied inputs for the specific run type.
+- `input/**`: only the specific approved copied inputs for the run type.
 - `output/`: empty before the harness starts, except for implementation-owned marker files if needed.
 - `output/summary.md` or `output/ai_memory_candidates.json`: the single expected harness output for the run type.
 - `.cursor/cli.json`: generated only for the `cursor_agent` harness.
@@ -109,28 +109,29 @@ The materializer must not copy or symlink:
 
 - `audio/**`, including speaker chunks, `mixdown.wav`, and `ssrc_mapping.json`.
 - `debug/**`, including Whisper responses, correction prompts, summary prompts, and prior agent diagnostics.
-- `summary/**` from the real meeting workspace.
+- `summary/**` from the real meeting workspace, except for the validated `summary/summary.md` file that AI-memory extraction rewrites and then copies into `input/summary/summary.md`.
 - `.env`, credentials, LLM auth/config directories, hidden directories other than generated `.cursor/`, source code, Cargo files, tests, migrations, or repository metadata.
 - Any unknown file discovered by directory traversal. Inputs are selected by exact path, not by copying a parent directory.
 
 ### Cursor permission intent
 
-For `cursor_agent`, `.cursor/cli.json` is generated inside the agent workspace to express least-privilege intent: allow reads under `input/**`, allow writes only to the exact expected output file for the run, and omit or deny shell permissions. This file is defense-in-depth documentation for Cursor's project-level permission model, not the only security boundary. The primary boundary is that the agent workspace contains only approved copied files, no symlinks back to the meeting workspace, scrubbed sensitive environment variables, bounded command execution, and validated output-file collection.
+For `cursor_agent`, `.cursor/cli.json` is generated inside the agent workspace to express least-privilege intent: allow `Read(...)` only for each exact materialized input file, allow `Write(...)` only to the exact expected output file for the run, and deny `.env`, `debug/**`, `../**`, `Write(input/**)`, and `Shell(*)`. This file is defense-in-depth documentation for Cursor's project-level permission model, not the only security boundary. The primary boundary is that the agent workspace contains only approved copied files, no symlinks back to the meeting workspace, scrubbed sensitive environment variables, bounded command execution, and validated output-file collection.
 
 ### Cleanup and retention
 
 - Success: after the expected output file is validated and its content has been persisted or handed to the next trusted application step, delete the entire per-run agent workspace, including `input/**`, `output/**`, `.cursor/`, and generated metadata.
-- Failure: do not accept stdout as fallback content. Capture only bounded, sanitized diagnostics and the validation failure reason, then delete the per-run agent workspace by default.
-- Future debug retention exception: if failed-run workspace retention is later enabled for operators, it must be explicit, bounded, placed under the meeting workspace's `debug/agent-runs/<run_id>/` tree, covered by retention cleanup, and must not include any files outside the allowed agent workspace contents listed above.
+- Failure: do not accept stdout as fallback content. Capture only bounded, sanitized diagnostics and the validation failure reason, then delete the per-run agent workspace on a best-effort basis.
+- Retained cleanup exception: if summary persistence succeeds but immediate workspace cleanup fails, the summary job is retried as `summary_cleanup`; any retained `agent/` directories remain subject to retention cleanup. There is no separate failed-run workspace retention feature in the merged implementation.
 
-### Current call-path review
+### Implementation reconciliation (Task_6 review)
 
-- `src/application/summary.rs` currently writes `transcript/transcript_masked.md` and `transcript/manifest.json`, builds prompts that reference `transcript/**` and `context/**`, and calls `summarize(..., Some(request.workspace.root()))`.
-- `src/application/runtime.rs` and `src/application/worker.rs` both pass the real meeting workspace root to summary generation and optional transcript correction; summary markdown currently comes directly from the `ClaudeSummaryClient` return value.
-- `src/application/ai_memory_extraction.rs` currently uses the same `summarize` interface from the real meeting workspace and parses the returned stdout string as JSON.
-- `src/infrastructure/integrations.rs` currently returns successful CLI harness stdout for Claude, OpenCode, and Cursor; non-zero failures include bounded sanitized stdout/stderr diagnostics.
+- `src/application/summary.rs` now materializes per-run `agent/summary-<uuid>/` workspaces, copies approved inputs into `input/**`, instructs the harness to write `output/summary.md`, and never points the CLI harness at the real meeting workspace.
+- `src/application/runtime.rs` persists validated summary markdown before explicit cleanup; if post-persistence cleanup fails it schedules `summary_cleanup` retry and surfaces a generic user-facing cleanup error.
+- `src/application/worker.rs` and `tests/application/runtime_and_worker.rs` verify failed summary runs clean their per-run agent workspace instead of leaving it behind.
+- `src/application/ai_memory_extraction.rs` now materializes per-run `agent/ai-memory-<uuid>/` workspaces, copies the validated summary into `input/summary/summary.md`, and parses only `output/ai_memory_candidates.json`.
+- `src/infrastructure/integrations.rs` now rejects stdout as success content for all CLI harnesses; success requires the validated output file, while failure messages include bounded sanitized stdout/stderr diagnostics.
 
-Task_2 through Task_5 must migrate prompts and call sites from the current `transcript/**` / `context/**` real-workspace paths to this `input/**` / `output/**` agent workspace contract.
+Task_2 through Task_5 completed that migration. Task_6 verifies that the merged summary and AI-memory paths now use the shared `input/**` / `output/**` agent workspace contract.
 
 ## Tasks
 
@@ -308,12 +309,41 @@ Interpretation:
 - If file-output mode fails in production, disable unsafe agent harness rather than falling back to stdout acceptance.
 - The shared agent workspace contract can be guarded by a temporary config flag during rollout, but the final target should make it the only CLI harness path.
 
+## Final Evidence (2026-06-08)
+
+- Task_1 contract evidence:
+  - README and this plan now describe the merged shared boundary in present tense, including unsafe opt-in, exact copied inputs, output-file-only success, Cursor defense-in-depth, and cleanup behavior.
+- Task_2 materializer evidence:
+  - `src/infrastructure/workspace.rs` builds per-run agent workspaces under `workspaces/<guild>/<voice>/<meeting>/agent/`, rejects traversal/symlink abuse, hardens directories, and emits `.cursor/cli.json`.
+  - `tests/infrastructure/workspace_layout.rs` covers top-level workspace contents, traversal rejection, boundary-directory rejection, and Cursor permission generation.
+- Task_3 summary output-file evidence:
+  - `src/infrastructure/integrations.rs` removes stale output files, requires agent workspace markers, validates `output/summary.md`, sanitizes diagnostics, and scrubs sensitive environment variables before launching the harness.
+  - `tests/domain/asr_summary.rs` and `tests/application/runtime_and_worker.rs` cover prompt instructions, output-file reads, oversized/missing output failures, and the ban on stdout success content.
+- Task_4 AI-memory extraction evidence:
+  - `src/application/ai_memory_extraction.rs` uses the same isolated workspace pattern, copies validated summary markdown into `input/summary/summary.md`, and validates only `output/ai_memory_candidates.json`.
+  - `tests/application/runtime_and_worker.rs` covers prompt/output parity, Cursor write permission for AI-memory output, transcript-excerpt validation, and the ban on stdout JSON parsing.
+- Task_5 cleanup/retention evidence:
+  - `src/application/runtime.rs` retries summary cleanup failures after persistence instead of silently accepting retained workspaces.
+  - `src/application/retention_cleanup.rs` removes retained `agent/` directories as part of raw-workspace cleanup.
+  - `tests/application/runtime_and_worker.rs` and `tests/application/retention_cleanup.rs` cover failed-run cleanup and retention removal of `agent/`.
+- Task_6 validation evidence:
+  - Required command: `rtk cargo test --all-targets`
+  - Result: pass (`cargo test: 575 passed (28 suites, 7.57s)` in the worker run; independent reviewer rerun also passed with `575 passed (28 suites, 5.96s)`).
+  - Documentation consistency checks: targeted `rtk rg` / `rtk sed` verification of README text, plan text, and merged implementation paths around `output/summary.md`, `output/ai_memory_candidates.json`, `.cursor/cli.json`, cleanup, and diagnostic handling.
+- Reviewer evidence:
+  - Independent review initially found two documentation mismatches in this plan (the `summary/**` exception and missing explicit test/review evidence); both were fixed in-scope in Task_6.
+  - Final reviewer rerun: APPROVED. The reviewer confirmed all CLI harness branches share the same workspace/output boundary, AI-memory extraction follows the same isolated workspace/output-file contract, and `rtk cargo test --all-targets` passed again (`575 passed (28 suites, 6.10s)`).
+
 ## Progress Log (append-only)
 
 - 2026-06-07 Draft created:
   - Summary: Planned shared agent workspace and output-file boundary for all summary harnesses.
   - Validation evidence: Static planning only.
   - Notes: Repository rule suite is absent; validation selected from Rust/test paths and security risk profile.
+- 2026-06-08 Task_6 documentation and review evidence:
+  - Summary: Reconciled README/plan language with the merged implementation, especially summary output validation scope, exact Cursor permission intent, and cleanup/retention behavior.
+  - Validation evidence: `rtk cargo test --all-targets` passed (`575 passed (28 suites, 7.57s)`) plus targeted repository text checks for boundary, diagnostics, and cleanup wording.
+  - Notes: Summary output validation is file-level (`regular file`, size, UTF-8, non-empty) rather than semantic markdown validation; independent reviewer rerun approved after the final evidence/reconciliation fixes.
 
 ## Decision Log (append-only; re-plans and major discoveries)
 
@@ -321,20 +351,22 @@ Interpretation:
   - Trigger / new insight: User clarified that all harnesses should share the same virtual filesystem/output boundary, not only Cursor.
   - Plan delta (what changed): Planned a shared materializer and output-file contract before harness-specific configuration.
   - Tradeoffs considered: Full FUSE-style virtual FS vs copied per-run agent workspace. Initial plan chooses copied workspace for lower implementation risk while preserving the security boundary.
-  - User approval: pending.
+  - User approval: delegated by the orchestrator task bundle.
 - 2026-06-07 Task_1 Decision:
   - Trigger / new insight: Current summary, runtime, worker, and AI-memory extraction paths all run CLI harnesses from the real meeting workspace and accept the `summarize` return string as successful content.
   - Plan delta (what changed): Defined exact `input/**` and `output/**` relative paths for summary and AI-memory extraction, made stdout diagnostic-only, excluded real workspace directories from the agent workspace, and chose delete-by-default cleanup for both success and failure.
   - Tradeoffs considered: Keeping current `transcript/**` and `context/**` paths would reduce prompt churn but blur the boundary with the real meeting workspace. `input/**` makes copied data explicit and leaves `output/**` as the only trusted collection point.
   - User approval: delegated by Task_1 acceptance criteria.
+- 2026-06-08 Task_6 Decision:
+  - Trigger / new insight: Final merged code validates summary output files less strictly than the original plan text claimed, and Cursor permissions are exact-path `Read(...)` rules rather than a generic `input/**` read grant.
+  - Plan delta (what changed): Updated README and final evidence to describe the implementation accurately, and converted residual assumptions into explicit follow-up items.
+  - Tradeoffs considered: Keeping stronger documentation wording would read better but would hide a real contract gap. Accurate docs were prioritized so review and follow-up work can target the remaining hardening honestly.
+  - User approval: delegated by Task_6 acceptance criteria.
 
-## Notes
-- Risks:
-  - Cursor permissions are not a replacement for process/environment isolation.
-  - Shell/network permissions remain the highest-risk escape path if granted.
-  - Output validation must be strict enough that prompt-injected content cannot silently become accepted operational data.
-- Edge cases:
-  - Harness exits successfully but writes no output file.
-  - Harness writes multiple files or writes malformed output.
-  - Retry path reuses or collides with stale agent workspace.
-  - AI memory extraction produces valid JSON that embeds transcript-injected instructions as candidate text.
+## Follow-up Items
+
+- Add semantic validation for summary markdown structure/content beyond the current file-level checks (`regular file`, size, UTF-8, non-empty).
+- Revisit whether CLI harness network/process capabilities need stronger sandboxing beyond copied-workspace isolation, environment scrubbing, and Cursor defense-in-depth hints.
+- Decide whether non-Unix support should stay fail-closed for agent workspace materialization or gain equivalent no-follow copy guarantees.
+- Decide whether operators need an explicit failed-run workspace retention mode; if so, add bounded storage, expiry, and cleanup semantics instead of relying only on best-effort deletion plus retention cleanup.
+- Keep regression coverage around stale output-file removal, cleanup retries, and transcript-injected AI-memory candidates because those remain the main contract edges for this feature.
