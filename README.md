@@ -89,7 +89,19 @@ Compose の `app` は Discord voice (songbird) の UDP 通信のため host netw
 - `context/`: 将来のドメイン知識ファイル用プレースホルダ
 - `summary/`: 将来の要約成果物置き場
 
-要約処理はこのワークスペースを作業ディレクトリとして CLI を起動し、トランスクリプトはプロンプトに直埋めせず `transcript/transcript_masked.md` を参照します（`transcript/manifest.json` でメタデータを共有）。
+今後の agent workspace 契約では、要約・AI memory 抽出用の CLI harness は、実会議ワークスペース全体ではなく、実行ごとに生成される agent workspace を作業ディレクトリとして起動します。agent workspace には、許可された入力だけを `input/**` にコピーし、harness の成功結果は `output/**` の検証済みファイルだけから読み取ります。stdout は成功時の要約本文や AI memory JSON としては受け付けず、失敗時のサイズ制限・サニタイズ済み診断にだけ使います。
+
+agent workspace の契約:
+
+- 要約入力: `input/transcript/transcript_masked.md`, `input/transcript/manifest.json`, `input/context/manifest.json`, `input/context/speaker_roster.md`, `input/context/domain_knowledge.md`, `input/context/ai_memory.md`, `input/context/person_aliases.md`, `input/context/user_feedback.md`, 任意の `input/context/summary_template.txt`
+- 要約出力: `output/summary.md`
+- AI memory 抽出入力: 要約入力と同じ context/transcript 一式に加えて、検証済み要約を `input/summary/summary.md` として渡します。
+- AI memory 抽出出力: `output/ai_memory_candidates.json`
+- 除外: `audio/**`, `debug/**`, 実会議ワークスペースの `summary/**`, `.env`, 認証・credential ディレクトリ、リポジトリのソースやテスト、未知のファイル、symlink は agent workspace にコピーしません。
+
+`cursor_agent` harness では agent workspace 内に `.cursor/cli.json` を生成し、`input/**` の読み取りと実行種別ごとの出力ファイルへの書き込みだけを許可する意図を記録します。この設定は Cursor の権限モデル向けの defense-in-depth であり、唯一の境界ではありません。主な境界は、コピー対象を exact path で限定した agent workspace、credential 系環境変数の削除、コマンド実行の制限、`output/**` の検証です。
+
+agent workspace は、成功時には出力ファイルの検証と永続化後に削除します。失敗時も stdout を代替結果として使わず、サニタイズ済み診断と検証失敗理由だけを残して workspace 本体は既定で削除します。失敗 workspace の保持を将来有効にする場合は、明示設定・サイズ上限・保持期間を設け、`debug/agent-runs/<run_id>/` 配下に限定して retention cleanup の対象にしてください。
 
 ### 4. Git Hooks (lefthook)
 
