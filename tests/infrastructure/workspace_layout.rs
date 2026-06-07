@@ -473,6 +473,34 @@ fn agent_workspace_cleanup_removes_only_agent_root() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn agent_workspace_drop_cleans_agent_root_by_default() {
+    let base = unique_temp_dir("agent_workspace_drop_cleanup");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    {
+        let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+            .add_input_file(&source, "input/transcript/transcript_masked.md")
+            .expect("register source")
+            .build()
+            .expect("materialize");
+        assert!(agent_workspace.root().exists());
+    }
+
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
+    assert_eq!(
+        std::fs::read_to_string(source).expect("source remains"),
+        "transcript"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 #[cfg(not(unix))]
 #[test]
 fn agent_workspace_builder_fails_closed_on_non_unix() {

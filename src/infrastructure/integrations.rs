@@ -1065,6 +1065,36 @@ mod tests {
     }
 
     #[test]
+    fn summary_harness_diagnostics_are_bounded_and_redacted() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("summary_bounded_diagnostics");
+        create_summary_agent_workdir(&workdir);
+        let script_path = write_summary_script(
+            "summary_bounded_diagnostics",
+            "#!/bin/sh\npython3 - <<'PY'\nimport sys\nsys.stdout.write('stdout-start sk-secret123456789 ' + ('x' * 2000))\nsys.stderr.write('stderr-start bearer abcdefghijklmnop ' + ('y' * 2000))\nPY\n",
+        );
+        let client = summary_test_client(SummaryHarness::Claude, &script_path);
+
+        let err = client
+            .summarize("PROMPT BODY", Some(&workdir))
+            .expect_err("missing output should fail with diagnostics only");
+
+        let message = err.to_string();
+        assert!(message.contains("stdout-start"));
+        assert!(message.contains("stderr-start"));
+        assert!(message.contains("bytes omitted"));
+        assert!(!message.contains("sk-secret123456789"));
+        assert!(!message.contains("bearer abcdefghijklmnop"));
+        assert!(
+            message.len() < 1_400,
+            "diagnostics should stay bounded, got {} bytes: {message}",
+            message.len()
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
     fn summary_harness_rejects_empty_oversized_and_invalid_output_files() {
         let _guard = command_test_lock();
         for (label, script, expected) in [

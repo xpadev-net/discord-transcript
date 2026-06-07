@@ -50,6 +50,32 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
     std::fs::write(workspace.debug_dir().join("summary_prompt.txt"), b"prompt")
         .expect("write debug");
+    std::fs::create_dir_all(workspace.agent_runs_debug_dir().join("failed-run-1"))
+        .expect("write retained agent run debug dir");
+    std::fs::write(
+        workspace
+            .agent_runs_debug_dir()
+            .join("failed-run-1")
+            .join("diagnostics.txt"),
+        b"bounded diagnostics",
+    )
+    .expect("write retained agent run diagnostics");
+    std::fs::create_dir_all(
+        workspace
+            .agent_workspace_parent_dir()
+            .join("summary-failed-run")
+            .join("output"),
+    )
+    .expect("write retained live agent workspace dir");
+    std::fs::write(
+        workspace
+            .agent_workspace_parent_dir()
+            .join("summary-failed-run")
+            .join("output")
+            .join("summary.md"),
+        b"retained failed output",
+    )
+    .expect("write retained live agent workspace output");
     std::fs::write(workspace.speakers_dir().join("u1_speaker.wav"), b"speaker")
         .expect("write speaker");
     std::fs::write(workspace.context_dir().join("vc_text.json"), b"{}").expect("write context");
@@ -107,10 +133,13 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     assert_eq!(report.transcript_dirs_removed, 1);
     assert_eq!(report.empty_summary_dirs_removed, 1);
     assert_eq!(report.debug_dirs_removed, 1);
+    assert_eq!(report.agent_workspace_dirs_removed, 1);
     assert_eq!(report.transcripts_marked_deleted, 3);
     assert_eq!(report.artifacts_deleted, 12);
     assert!(!workspace.audio_dir().exists());
     assert!(!workspace.debug_dir().exists());
+    assert!(!workspace.agent_runs_debug_dir().exists());
+    assert!(!workspace.agent_workspace_parent_dir().exists());
     assert!(!workspace.speakers_dir().exists());
     assert!(!workspace.context_dir().exists());
     assert!(!workspace.transcript_dir().exists());
