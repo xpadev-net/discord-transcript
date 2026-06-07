@@ -100,6 +100,7 @@ pub enum JobStatus {
     Running,
     Failed,
     Done,
+    Canceled,
 }
 
 impl JobStatus {
@@ -109,6 +110,7 @@ impl JobStatus {
             Self::Running => "running",
             Self::Failed => "failed",
             Self::Done => "done",
+            Self::Canceled => "canceled",
         }
     }
 
@@ -118,6 +120,7 @@ impl JobStatus {
             "running" => Some(Self::Running),
             "failed" => Some(Self::Failed),
             "done" => Some(Self::Done),
+            "canceled" => Some(Self::Canceled),
             _ => None,
         }
     }

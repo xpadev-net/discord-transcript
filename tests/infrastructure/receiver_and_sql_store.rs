@@ -166,6 +166,7 @@ fn sql_job_queue_parses_claimed_job_row() {
             "running".to_owned(),
             "2".to_owned(),
             "temporary error".to_owned(),
+            "2026-06-08T01:02:03.000Z".to_owned(),
         ])],
     );
 
@@ -180,6 +181,7 @@ fn sql_job_queue_parses_claimed_job_row() {
     assert_eq!(job.status, JobStatus::Running);
     assert_eq!(job.retry_count, 2);
     assert_eq!(job.error_message.as_deref(), Some("temporary error"));
+    assert!(job.next_run_at.is_some());
 }
 
 #[test]
@@ -188,7 +190,11 @@ fn schema_defines_enum_check_constraints() {
 
     assert!(schema.contains("meetings_status_check"));
     assert!(schema.contains("jobs_status_check"));
+    assert!(schema.contains("'canceled'"));
     assert!(schema.contains("jobs_job_type_check"));
+    assert!(schema.contains("next_run_at"));
+    assert!(schema.contains("dead_lettered_at"));
+    assert!(schema.contains("cancel_reason"));
     assert!(schema.contains("transcripts_source_check"));
     assert!(!discord_transcript::infrastructure::sql::INITIAL_SCHEMA_SQL
         .contains("status TEXT NOT NULL CHECK"));

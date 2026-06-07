@@ -111,6 +111,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0023_feedback_idempotency_quota",
         sql: include_str!("../../migrations/0023_feedback_idempotency_quota.sql"),
     },
+    Migration {
+        version: "0024_job_operations",
+        sql: include_str!("../../migrations/0024_job_operations.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -171,6 +175,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0022_forward_fixups_for_0020_0021.sql"),
     "\n",
     include_str!("../../migrations/0023_feedback_idempotency_quota.sql"),
+    "\n",
+    include_str!("../../migrations/0024_job_operations.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -413,6 +419,7 @@ pub const RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL: &str = r#"
 UPDATE jobs
 SET status='queued',
     error_message=NULL,
+    next_run_at=NULL,
     leased_until=NULL,
     updated_at=NOW()
 WHERE id=$1
@@ -436,7 +443,11 @@ WHERE id = $1
 "#;
 
 pub const RECOVERY_SUMMARY_JOB_STATUS_SQL: &str = r#"
-SELECT status
+SELECT status,
+       CASE
+         WHEN next_run_at IS NULL OR next_run_at <= NOW() THEN 'true'
+         ELSE 'false'
+       END AS due
 FROM jobs
 WHERE id=$1
   AND job_type='summarize'
@@ -452,33 +463,42 @@ pub const CLAIM_JOB_SQL: &str = r#"
 UPDATE jobs
 SET status = 'running',
     leased_until = NOW() + INTERVAL '90 seconds',
+    next_run_at = NULL,
     updated_at = NOW()
 WHERE id = (
     SELECT id
     FROM jobs
     WHERE job_type = $1
       AND status = 'queued'
-    ORDER BY created_at ASC
+      AND (next_run_at IS NULL OR next_run_at <= NOW())
+    ORDER BY COALESCE(next_run_at, created_at) ASC, created_at ASC
     LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, meeting_id, job_type, status, retry_count, error_message
+RETURNING id, meeting_id, job_type, status, retry_count, error_message,
+          to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 "#;
 
 pub const CLAIM_JOB_BY_ID_SQL: &str = r#"
 UPDATE jobs
 SET status = 'running',
     leased_until = NOW() + INTERVAL '90 seconds',
+    next_run_at = NULL,
     updated_at = NOW()
 WHERE id = $1
   AND status = 'queued'
-RETURNING id, meeting_id, job_type, status, retry_count, error_message
+  AND (next_run_at IS NULL OR next_run_at <= NOW())
+RETURNING id, meeting_id, job_type, status, retry_count, error_message,
+          to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 "#;
 
 pub const MARK_JOB_DONE_SQL: &str = r#"
 UPDATE jobs
 SET status = 'done',
     error_message = NULL,
+    next_run_at = NULL,
+    leased_until = NULL,
+    finished_at = NOW(),
     updated_at = NOW()
 WHERE id = $1
   AND status = 'running'
@@ -488,6 +508,10 @@ pub const MARK_JOB_FAILED_SQL: &str = r#"
 UPDATE jobs
 SET status = 'failed',
     error_message = $2,
+    next_run_at = NULL,
+    leased_until = NULL,
+    finished_at = NOW(),
+    dead_lettered_at = NOW(),
     updated_at = NOW()
 WHERE id = $1
   AND status = 'running'
@@ -499,10 +523,134 @@ SET
   status = CASE WHEN retry_count + 1 > $3::integer THEN 'failed' ELSE 'queued' END,
   retry_count = retry_count + 1,
   error_message = $2,
+  next_run_at = CASE
+    WHEN retry_count + 1 > $3::integer THEN NULL
+    ELSE NOW() + make_interval(secs => LEAST(900, 30 * POWER(2, LEAST(retry_count, 5))::integer))
+  END,
+  leased_until = NULL,
+  finished_at = CASE WHEN retry_count + 1 > $3::integer THEN NOW() ELSE NULL END,
+  dead_lettered_at = CASE WHEN retry_count + 1 > $3::integer THEN NOW() ELSE NULL END,
+  canceled_at = NULL,
+  cancel_reason = NULL,
   updated_at = NOW()
 WHERE id = $1
   AND status = 'running'
 RETURNING status
+"#;
+
+pub const LIST_GUILD_JOBS_SQL: &str = r#"
+SELECT j.id,
+       j.meeting_id,
+       m.guild_id,
+       j.job_type,
+       j.status,
+       j.retry_count,
+       j.error_message,
+       to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
+       to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
+       to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
+       to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
+       to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
+       j.cancel_reason,
+       to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM jobs j
+JOIN meetings m ON m.id = j.meeting_id
+WHERE m.guild_id = $1
+  AND (NULLIF($2, '') IS NULL OR j.status = NULLIF($2, ''))
+  AND (NULLIF($3, '') IS NULL OR j.job_type = NULLIF($3, ''))
+ORDER BY j.updated_at DESC, j.created_at DESC, j.id DESC
+LIMIT $4::integer
+"#;
+
+pub const GET_GUILD_JOB_SQL: &str = r#"
+SELECT j.id,
+       j.meeting_id,
+       m.guild_id,
+       j.job_type,
+       j.status,
+       j.retry_count,
+       j.error_message,
+       to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
+       to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
+       to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
+       to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
+       to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
+       j.cancel_reason,
+       to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM jobs j
+JOIN meetings m ON m.id = j.meeting_id
+WHERE m.guild_id = $1
+  AND j.id = $2
+LIMIT 1
+"#;
+
+pub const ADMIN_RETRY_JOB_SQL: &str = r#"
+UPDATE jobs j
+SET status = 'queued',
+    retry_count = 0,
+    error_message = NULL,
+    next_run_at = COALESCE(NULLIF($3, '')::timestamptz, NOW()),
+    leased_until = NULL,
+    finished_at = NULL,
+    dead_lettered_at = NULL,
+    canceled_at = NULL,
+    cancel_reason = NULL,
+    updated_at = NOW()
+FROM meetings m
+WHERE m.id = j.meeting_id
+  AND m.guild_id = $2
+  AND j.id = $1
+  AND j.status IN ('failed', 'canceled')
+RETURNING j.id,
+          j.meeting_id,
+          $2::text AS guild_id,
+          j.job_type,
+          j.status,
+          j.retry_count,
+          j.error_message,
+          to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
+          to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
+          to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
+          to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
+          to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
+          j.cancel_reason,
+          to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const ADMIN_CANCEL_JOB_SQL: &str = r#"
+UPDATE jobs j
+SET status = 'canceled',
+    error_message = NULL,
+    next_run_at = NULL,
+    leased_until = NULL,
+    finished_at = NOW(),
+    dead_lettered_at = NULL,
+    canceled_at = NOW(),
+    cancel_reason = $3,
+    updated_at = NOW()
+FROM meetings m
+WHERE m.id = j.meeting_id
+  AND m.guild_id = $2
+  AND j.id = $1
+  AND j.status = 'queued'
+RETURNING j.id,
+          j.meeting_id,
+          $2::text AS guild_id,
+          j.job_type,
+          j.status,
+          j.retry_count,
+          j.error_message,
+          to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
+          to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
+          to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
+          to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
+          to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
+          j.cancel_reason,
+          to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
 "#;
 
 pub const INSERT_SUMMARY_SQL: &str = r#"

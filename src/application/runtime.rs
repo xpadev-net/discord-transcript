@@ -44,7 +44,7 @@ use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
 };
-use crate::infrastructure::queue::{Job, JobQueue};
+use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
     HEARTBEAT_RUNNING_JOB_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
@@ -1920,12 +1920,32 @@ fn load_completed_live_transcription_chunks<E: SqlExecutor>(
 enum SummaryJobRunError {
     Terminal(String),
     TerminalStatusUpdated(String),
-    RetryScheduled(String),
+    RetryScheduled {
+        message: String,
+        retry_after: Duration,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSummaryJobOutput {
+    job: Job,
+    output: crate::application::worker::ProcessMeetingOutput,
 }
 
 impl From<String> for SummaryJobRunError {
     fn from(value: String) -> Self {
         Self::Terminal(value)
+    }
+}
+
+fn summary_retry_after_for_job(job: &Job) -> Duration {
+    Duration::from_secs(retry_delay_seconds(job.retry_count.saturating_add(1)))
+}
+
+fn retry_scheduled_error(job: &Job, message: String) -> SummaryJobRunError {
+    SummaryJobRunError::RetryScheduled {
+        message,
+        retry_after: summary_retry_after_for_job(job),
     }
 }
 
@@ -2246,22 +2266,46 @@ fn recover_summary_job_for_startup<E: SqlExecutor>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverySummaryJobClaimState {
+    Claimable,
+    Delayed,
+    Unavailable,
+}
+
 fn recovery_existing_summary_job_is_claimable<E: SqlExecutor>(
     queue: &mut SqlJobQueue<E>,
     job_id: &str,
     meeting_id: &str,
 ) -> bool {
+    recovery_existing_summary_job_claim_state(queue, job_id, meeting_id)
+        == RecoverySummaryJobClaimState::Claimable
+}
+
+fn recovery_existing_summary_job_claim_state<E: SqlExecutor>(
+    queue: &mut SqlJobQueue<E>,
+    job_id: &str,
+    meeting_id: &str,
+) -> RecoverySummaryJobClaimState {
     match queue
         .executor
         .query_rows(RECOVERY_SUMMARY_JOB_STATUS_SQL, &[job_id.to_owned()])
     {
-        Ok(rows) => rows
-            .first()
-            .and_then(|row| row.first())
-            .is_some_and(|status| status.as_deref() == Some("queued")),
+        Ok(rows) => {
+            let Some(row) = rows.first() else {
+                return RecoverySummaryJobClaimState::Unavailable;
+            };
+            let status = row.first().and_then(|status| status.as_deref());
+            let due = row.get(1).and_then(|due| due.as_deref());
+            match (status, due) {
+                (Some("queued"), Some("true")) => RecoverySummaryJobClaimState::Claimable,
+                (Some("queued"), Some("false")) => RecoverySummaryJobClaimState::Delayed,
+                _ => RecoverySummaryJobClaimState::Unavailable,
+            }
+        }
         Err(err) => {
             warn!(meeting_id, job_id, error = %err, "failed to inspect existing summary job during recovery");
-            false
+            RecoverySummaryJobClaimState::Unavailable
         }
     }
 }
@@ -2897,6 +2941,37 @@ impl ScaffoldHandler {
             return;
         }
         self.task_tracker.spawn(future);
+    }
+
+    fn spawn_summary_retry_after(
+        &self,
+        http: Arc<Http>,
+        meeting_id: String,
+        retry_after: Duration,
+    ) {
+        let handler = self.clone();
+        let shutdown_token = handler.shutdown_token.clone();
+        self.spawn_background(async move {
+            tokio::select! {
+                _ = sleep(retry_after) => {
+                    if let Err(err) =
+                        run_summary_background(&handler, Arc::clone(&http), &meeting_id).await
+                    {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "summary retry background task failed"
+                        );
+                    }
+                }
+                _ = shutdown_token.cancelled() => {
+                    debug!(
+                        meeting_id = %meeting_id,
+                        "summary retry background task deferred by shutdown"
+                    );
+                }
+            }
+        });
     }
 
     fn spawn_lifecycle_cleanup_retry<F>(&self, future: F)
@@ -4130,9 +4205,12 @@ impl EventHandler for ScaffoldHandler {
                     "auto stop triggered due to empty voice channel"
                 );
                 if stop_result.outcome == StopOutcome::Owner
-                    && let Err(err) =
-                        run_summary_background(&handler, &ctx_for_task.http, &stop_result.meeting_id)
-                            .await
+                    && let Err(err) = run_summary_background(
+                        &handler,
+                        Arc::clone(&ctx_for_task.http),
+                        &stop_result.meeting_id,
+                    )
+                    .await
                 {
                     warn!(
                         guild_id = %guild_for_task,
@@ -4339,7 +4417,7 @@ impl ScaffoldHandler {
                         continue;
                     }
                     if let Err(err) = self
-                        .run_summary_and_notify(&ctx.http, &snapshot.meeting_id)
+                        .run_summary_and_notify(Arc::clone(&ctx.http), &snapshot.meeting_id)
                         .await
                     {
                         warn!(
@@ -5676,7 +5754,7 @@ impl ScaffoldHandler {
                 let shutdown_token = handler.shutdown_token.clone();
                 self.spawn_background(async move {
                     tokio::select! {
-                        result = run_summary_background(&handler, &http, &meeting_id) => {
+                        result = run_summary_background(&handler, Arc::clone(&http), &meeting_id) => {
                             if let Err(err) = result {
                                 error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
                             }
@@ -5698,7 +5776,11 @@ impl ScaffoldHandler {
         }
     }
 
-    async fn run_summary_and_notify(&self, http: &Http, meeting_id: &str) -> Result<(), String> {
+    async fn run_summary_and_notify(
+        &self,
+        http: Arc<Http>,
+        meeting_id: &str,
+    ) -> Result<(), String> {
         let report_channel_id = match self.report_channel_id_for_meeting(meeting_id).await {
             Ok(value) => value,
             Err(err) => {
@@ -5712,8 +5794,9 @@ impl ScaffoldHandler {
                 return Err(err);
             }
         };
-        match self.process_enqueued_summary_job(http, meeting_id).await {
-            Ok(output) => {
+        match self.process_enqueued_summary_job(&http, meeting_id).await {
+            Ok(job_output) => {
+                let RuntimeSummaryJobOutput { job, output } = job_output;
                 let summary_url = self.meeting_url(meeting_id);
                 let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
@@ -5721,18 +5804,17 @@ impl ScaffoldHandler {
                     output.chunks
                 };
                 if let Err(err) =
-                    post_summary_to_report_channel(http, report_channel_id, &chunks).await
+                    post_summary_to_report_channel(&http, report_channel_id, &chunks).await
                 {
                     let error_message = format!("summary posting failed: {err}");
                     let exhausted = {
                         let mut service = self.service.lock().await;
                         let mut queue = self.queue.lock().await;
-                        let job_id = format!("summary-{meeting_id}");
                         retry_summary_job_after_posting_failure(
                             &mut service.store,
                             &mut *queue,
                             meeting_id,
-                            &job_id,
+                            &job.id,
                             error_message,
                             self.summary_max_retries,
                         )
@@ -5740,7 +5822,7 @@ impl ScaffoldHandler {
                     let exhausted = exhausted.map_err(|state_err| format!("{err}; {state_err}"))?;
                     if let Err(status_err) = self
                         .update_status_message(
-                            http,
+                            &http,
                             meeting_id,
                             StatusMessageUpdate::Failed {
                                 phase: "summary_post",
@@ -5755,9 +5837,16 @@ impl ScaffoldHandler {
                             "failed to update status message after summary posting failure"
                         );
                     }
+                    if !exhausted {
+                        self.spawn_summary_retry_after(
+                            Arc::clone(&http),
+                            meeting_id.to_owned(),
+                            summary_retry_after_for_job(&job),
+                        );
+                    }
                     if exhausted {
                         let _ = post_failure_to_report_channel(
-                            http,
+                            &http,
                             report_channel_id,
                             meeting_id,
                             &err,
@@ -5770,14 +5859,14 @@ impl ScaffoldHandler {
                 if let Some(ref url) = summary_url {
                     let url_msg = format!("詳細はこちら: {url}");
                     if let Err(err) =
-                        post_summary_to_report_channel(http, report_channel_id, &[url_msg]).await
+                        post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await
                     {
                         warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
                     }
                 }
                 if let Err(err) = self
                     .update_status_message(
-                        http,
+                        &http,
                         meeting_id,
                         StatusMessageUpdate::SummaryCompleted {
                             summary_url: summary_url.clone(),
@@ -5813,7 +5902,7 @@ impl ScaffoldHandler {
                     .map_err(|err| err.to_string())?;
                 drop(service);
                 let mut summary_job_done = true;
-                let job_id = format!("summary-{meeting_id}");
+                let job_id = job.id.clone();
                 {
                     let mut queue = self.queue.lock().await;
                     if let Err(err) = queue.mark_done(&job_id) {
@@ -5832,10 +5921,20 @@ impl ScaffoldHandler {
                 }
                 Ok(())
             }
-            Err(SummaryJobRunError::RetryScheduled(err)) => Err(err),
+            Err(SummaryJobRunError::RetryScheduled {
+                message,
+                retry_after,
+            }) => {
+                self.spawn_summary_retry_after(
+                    Arc::clone(&http),
+                    meeting_id.to_owned(),
+                    retry_after,
+                );
+                Err(message)
+            }
             Err(SummaryJobRunError::TerminalStatusUpdated(err)) => {
-                let _ =
-                    post_failure_to_report_channel(http, report_channel_id, meeting_id, &err).await;
+                let _ = post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
+                    .await;
                 Err(err)
             }
             Err(SummaryJobRunError::Terminal(err)) => {
@@ -5843,7 +5942,7 @@ impl ScaffoldHandler {
                 // Also update the status message so users see the failure.
                 if let Err(status_err) = self
                     .update_status_message(
-                        http,
+                        &http,
                         meeting_id,
                         StatusMessageUpdate::Failed {
                             phase: "summary",
@@ -5858,8 +5957,8 @@ impl ScaffoldHandler {
                         "failed to update status message after summary failure"
                     );
                 }
-                let _ =
-                    post_failure_to_report_channel(http, report_channel_id, meeting_id, &err).await;
+                let _ = post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
+                    .await;
                 Err(err)
             }
         }
@@ -6084,7 +6183,7 @@ impl ScaffoldHandler {
         &self,
         http: &Http,
         meeting_id: &str,
-    ) -> Result<crate::application::worker::ProcessMeetingOutput, SummaryJobRunError> {
+    ) -> Result<RuntimeSummaryJobOutput, SummaryJobRunError> {
         let effective_settings = self.effective_settings_for_meeting(meeting_id).await?;
         let whisper = CommandWhisperClient {
             endpoint: self.whisper_endpoint.clone(),
@@ -6148,7 +6247,17 @@ impl ScaffoldHandler {
 
         let claimed_job = {
             let mut queue = self.queue.lock().await;
-            queue.claim_by_id(&job_id).map_err(|err| err.to_string())?
+            let claimed_job = queue.claim_by_id(&job_id).map_err(|err| err.to_string())?;
+            if claimed_job.is_none()
+                && recovery_existing_summary_job_claim_state(&mut queue, &job_id, meeting_id)
+                    == RecoverySummaryJobClaimState::Delayed
+            {
+                return Err(SummaryJobRunError::RetryScheduled {
+                    message: format!("summary job is not due yet for job_id={job_id}"),
+                    retry_after: Duration::from_secs(30),
+                });
+            }
+            claimed_job
         };
         let Some(claimed_job) = claimed_job else {
             return Err(SummaryJobRunError::Terminal(format!(
@@ -6649,7 +6758,7 @@ impl ScaffoldHandler {
             if exhausted {
                 return Err(SummaryJobRunError::TerminalStatusUpdated(err));
             }
-            return Err(SummaryJobRunError::RetryScheduled(err));
+            return Err(retry_scheduled_error(&claimed_job, err));
         }
 
         // Resolve speaker labels for summarization and snapshot to DB (best-effort)
@@ -6762,7 +6871,7 @@ impl ScaffoldHandler {
                 if exhausted {
                     return Err(SummaryJobRunError::TerminalStatusUpdated(err));
                 }
-                return Err(SummaryJobRunError::RetryScheduled(err));
+                return Err(retry_scheduled_error(&claimed_job, err));
             }
         };
 
@@ -6932,6 +7041,8 @@ impl ScaffoldHandler {
                                 "failed to update status message after summary failure"
                             );
                         }
+                    } else {
+                        return Err(retry_scheduled_error(&claimed_job, err_string));
                     }
                 } else {
                     warn!(
@@ -6999,7 +7110,7 @@ impl ScaffoldHandler {
             };
             return match disposition {
                 SummaryCleanupFailureDisposition::RetryScheduled => {
-                    Err(SummaryJobRunError::RetryScheduled(err_string))
+                    Err(retry_scheduled_error(&claimed_job, err_string))
                 }
                 SummaryCleanupFailureDisposition::TerminalStatusUpdated => {
                     if let Err(status_err) = self
@@ -7075,10 +7186,13 @@ impl ScaffoldHandler {
         // must call it after the Discord posting succeeds. This prevents data loss
         // if posting fails -- the job stays Running and can be recovered on restart.
 
-        Ok(crate::application::worker::ProcessMeetingOutput {
-            meeting_id: claimed_job.meeting_id,
-            markdown,
-            chunks,
+        Ok(RuntimeSummaryJobOutput {
+            output: crate::application::worker::ProcessMeetingOutput {
+                meeting_id: claimed_job.meeting_id.clone(),
+                markdown,
+                chunks,
+            },
+            job: claimed_job,
         })
     }
 
@@ -8186,7 +8300,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                             tokio::select! {
                                 summary_result = run_summary_background(
                                     &runtime,
-                                    &http,
+                                    Arc::clone(&http),
                                     &stop_result.meeting_id,
                                 ) => {
                                     if let Err(err) = summary_result {
@@ -8434,7 +8548,7 @@ pub fn parse_stop_reason(value: &str) -> Result<StopReason, String> {
 /// All errors are handled internally (failure notification + status update).
 async fn run_summary_background(
     handler: &ScaffoldHandler,
-    http: &Http,
+    http: Arc<Http>,
     meeting_id: &str,
 ) -> Result<(), String> {
     handler.run_summary_and_notify(http, meeting_id).await
@@ -8660,6 +8774,7 @@ mod status_message_tests {
     struct RecoverySummaryJobExecutor {
         inner: FakeSqlExecutor,
         job_status: String,
+        job_due: bool,
         stale_running: bool,
     }
 
@@ -8681,6 +8796,7 @@ mod status_message_tests {
             Self {
                 inner,
                 job_status: job_status.to_owned(),
+                job_due: true,
                 stale_running,
             }
         }
@@ -8721,7 +8837,10 @@ mod status_message_tests {
                 return Err(err.clone());
             }
             if sql == RECOVERY_SUMMARY_JOB_STATUS_SQL {
-                return Ok(vec![vec![Some(self.job_status.clone())]]);
+                return Ok(vec![vec![
+                    Some(self.job_status.clone()),
+                    Some(self.job_due.to_string()),
+                ]]);
             }
             Ok(self
                 .inner
@@ -8754,11 +8873,29 @@ mod status_message_tests {
         ))
     }
 
+    fn fake_recovery_queue_with_delayed_summary_job() -> RecoverySummaryJobQueue {
+        let mut queue = fake_recovery_queue_with_existing_summary_job_status("queued");
+        queue.executor.job_due = false;
+        queue
+    }
+
     #[test]
     fn recovery_existing_queued_summary_job_is_claimable() {
         let mut queue = fake_recovery_queue_with_existing_summary_job_status("queued");
 
         assert!(recover_summary_job_for_startup(
+            &mut queue,
+            "summary-m1",
+            "m1",
+            true
+        ));
+    }
+
+    #[test]
+    fn recovery_existing_future_queued_summary_job_is_not_claimable() {
+        let mut queue = fake_recovery_queue_with_delayed_summary_job();
+
+        assert!(!recover_summary_job_for_startup(
             &mut queue,
             "summary-m1",
             "m1",
@@ -8887,6 +9024,7 @@ mod status_message_tests {
             status: crate::domain::JobStatus::Running,
             retry_count: 0,
             error_message: None,
+            next_run_at: None,
         }
     }
 
