@@ -552,6 +552,93 @@ fn agent_workspace_cleanup_refuses_replaced_root() {
 
 #[cfg(unix)]
 #[test]
+fn agent_workspace_cleanup_refuses_oversized_cleanup_marker() {
+    let base = unique_temp_dir("agent_workspace_cleanup_oversized_marker");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::write(
+        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        "00000000-0000-0000-0000-000000000000-extra",
+    )
+    .expect("overwrite cleanup marker");
+
+    let err = agent_workspace
+        .cleanup()
+        .expect_err("cleanup should reject oversized marker");
+
+    assert!(err.to_string().contains("identity changed"));
+    assert!(agent_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_refuses_malformed_cleanup_marker() {
+    let base = unique_temp_dir("agent_workspace_cleanup_malformed_marker");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::write(
+        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        "00000000-0000-0000-0000-00000000000z",
+    )
+    .expect("overwrite cleanup marker");
+
+    let err = agent_workspace
+        .cleanup()
+        .expect_err("cleanup should reject malformed marker");
+
+    assert!(err.to_string().contains("identity changed"));
+    assert!(agent_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_refuses_missing_cleanup_marker() {
+    let base = unique_temp_dir("agent_workspace_cleanup_missing_marker");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::remove_file(agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"))
+        .expect("remove cleanup marker");
+
+    let err = agent_workspace
+        .cleanup()
+        .expect_err("cleanup should reject missing marker");
+
+    assert!(err.to_string().contains("identity changed"));
+    assert!(agent_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
 fn agent_workspace_cleanup_missing_root_is_ok() {
     let base = unique_temp_dir("agent_workspace_cleanup_missing");
     let meeting_root = base.join("meeting");
