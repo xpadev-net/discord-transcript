@@ -13,8 +13,11 @@ use crate::domain::transcript::{
 };
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
 use crate::infrastructure::workspace::{
-    CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME, CONTEXT_SPEAKER_ROSTER_FILENAME,
-    MASKED_TRANSCRIPT_FILENAME, MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
+    AGENT_OUTPUT_DIR, AGENT_SUMMARY_OUTPUT_FILENAME, AgentWorkspace, AgentWorkspaceBuilder,
+    AgentWorkspaceError, CONTEXT_AI_MEMORY_FILENAME, CONTEXT_DOMAIN_KNOWLEDGE_FILENAME,
+    CONTEXT_MANIFEST_FILENAME, CONTEXT_PERSON_ALIASES_FILENAME, CONTEXT_SPEAKER_ROSTER_FILENAME,
+    CONTEXT_SUMMARY_TEMPLATE_FILENAME, CONTEXT_USER_FEEDBACK_FILENAME, MASKED_TRANSCRIPT_FILENAME,
+    MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
 };
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::{SecondsFormat, Utc};
@@ -118,6 +121,12 @@ impl std::error::Error for SummaryError {}
 impl From<WhisperParseError> for SummaryError {
     fn from(value: WhisperParseError) -> Self {
         Self::Asr(value.to_string())
+    }
+}
+
+impl From<AgentWorkspaceError> for SummaryError {
+    fn from(value: AgentWorkspaceError) -> Self {
+        Self::SummaryEngine(value.to_string())
     }
 }
 
@@ -731,6 +740,61 @@ pub fn load_summary_context_manifest(
                 manifest_path.display()
             ))
         })
+}
+
+pub fn materialize_summary_agent_workspace(
+    request: &SummaryRequest,
+    agent_root: impl AsRef<Path>,
+) -> Result<AgentWorkspace, SummaryError> {
+    let mut builder = AgentWorkspaceBuilder::new(request.workspace.root(), agent_root)
+        .with_expected_output(format!(
+            "{AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}"
+        ))?
+        .add_input_file(
+            request.workspace.masked_transcript_path(),
+            format!("input/transcript/{MASKED_TRANSCRIPT_FILENAME}"),
+        )?
+        .add_input_file(
+            request.workspace.transcript_manifest_path(),
+            format!("input/transcript/{TRANSCRIPT_MANIFEST_FILENAME}"),
+        )?;
+
+    for (source, destination) in [
+        (
+            request.workspace.context_manifest_path(),
+            format!("input/context/{CONTEXT_MANIFEST_FILENAME}"),
+        ),
+        (
+            request.workspace.context_speaker_roster_path(),
+            format!("input/context/{CONTEXT_SPEAKER_ROSTER_FILENAME}"),
+        ),
+        (
+            request.workspace.context_domain_knowledge_path(),
+            format!("input/context/{CONTEXT_DOMAIN_KNOWLEDGE_FILENAME}"),
+        ),
+        (
+            request.workspace.context_ai_memory_path(),
+            format!("input/context/{CONTEXT_AI_MEMORY_FILENAME}"),
+        ),
+        (
+            request.workspace.context_person_aliases_path(),
+            format!("input/context/{CONTEXT_PERSON_ALIASES_FILENAME}"),
+        ),
+        (
+            request.workspace.context_user_feedback_path(),
+            format!("input/context/{CONTEXT_USER_FEEDBACK_FILENAME}"),
+        ),
+        (
+            request.workspace.context_summary_template_path(),
+            format!("input/context/{CONTEXT_SUMMARY_TEMPLATE_FILENAME}"),
+        ),
+    ] {
+        if source.exists() {
+            builder = builder.add_input_file(source, destination)?;
+        }
+    }
+
+    builder.build().map_err(SummaryError::from)
 }
 
 fn remove_stale_optional_context_file(path: &Path) -> Result<(), SummaryError> {

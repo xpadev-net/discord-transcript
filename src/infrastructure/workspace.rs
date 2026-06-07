@@ -1,6 +1,10 @@
 use crate::infrastructure::storage_fs::sanitize_path_component;
+use serde::Serialize;
+use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 pub const WORKSPACES_ROOT_DIR: &str = "workspaces";
 pub const MASKED_TRANSCRIPT_FILENAME: &str = "transcript_masked.md";
@@ -19,6 +23,11 @@ pub const CONTEXT_AI_MEMORY_FILENAME: &str = "ai_memory.md";
 pub const CONTEXT_PERSON_ALIASES_FILENAME: &str = "person_aliases.md";
 pub const CONTEXT_USER_FEEDBACK_FILENAME: &str = "user_feedback.md";
 pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
+pub const AGENT_INPUT_DIR: &str = "input";
+pub const AGENT_OUTPUT_DIR: &str = "output";
+pub const AGENT_CURSOR_DIR: &str = ".cursor";
+pub const AGENT_CURSOR_CONFIG_FILENAME: &str = "cli.json";
+pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspaceLayout {
@@ -28,6 +37,112 @@ pub struct MeetingWorkspaceLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspacePaths {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentWorkspace {
+    root: PathBuf,
+    expected_output_path: PathBuf,
+    cursor_config_path: PathBuf,
+    root_identity: AgentWorkspaceRootIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentWorkspaceBuilder {
+    meeting_root: PathBuf,
+    agent_root: PathBuf,
+    expected_output_path: PathBuf,
+    inputs: Vec<AgentWorkspaceInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentWorkspaceInput {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentWorkspaceRootIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentWorkspaceRootIdentity;
+
+#[derive(Debug)]
+pub enum AgentWorkspaceError {
+    InvalidPath {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    SourceOutsideMeetingWorkspace {
+        source: PathBuf,
+        meeting_root: PathBuf,
+    },
+    SourceNotRegularFile(PathBuf),
+    DestinationAlreadyExists(PathBuf),
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Serialize(serde_json::Error),
+}
+
+impl Display for AgentWorkspaceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath { path, reason } => {
+                write!(
+                    f,
+                    "invalid agent workspace path {}: {reason}",
+                    path.display()
+                )
+            }
+            Self::SourceOutsideMeetingWorkspace {
+                source,
+                meeting_root,
+            } => write!(
+                f,
+                "agent workspace input {} is outside meeting workspace {}",
+                source.display(),
+                meeting_root.display()
+            ),
+            Self::SourceNotRegularFile(path) => {
+                write!(
+                    f,
+                    "agent workspace input is not a regular file: {}",
+                    path.display()
+                )
+            }
+            Self::DestinationAlreadyExists(path) => {
+                write!(f, "agent workspace already exists: {}", path.display())
+            }
+            Self::Io { path, source } => {
+                write!(
+                    f,
+                    "agent workspace filesystem error at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Serialize(err) => write!(f, "failed to serialize agent workspace config: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for AgentWorkspaceError {}
+
+#[derive(Debug, Serialize)]
+struct CursorCliConfig {
+    permissions: CursorPermissions,
+}
+
+#[derive(Debug, Serialize)]
+struct CursorPermissions {
+    allow: Vec<String>,
+    deny: Vec<String>,
 }
 
 impl MeetingWorkspaceLayout {
@@ -190,4 +305,579 @@ impl MeetingWorkspacePaths {
     pub fn relative_path(&self, path: &Path) -> Option<PathBuf> {
         path.strip_prefix(&self.root).ok().map(PathBuf::from)
     }
+}
+
+impl AgentWorkspace {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn input_dir(&self) -> PathBuf {
+        self.root.join(AGENT_INPUT_DIR)
+    }
+
+    pub fn output_dir(&self) -> PathBuf {
+        self.root.join(AGENT_OUTPUT_DIR)
+    }
+
+    pub fn expected_output_path(&self) -> &Path {
+        &self.expected_output_path
+    }
+
+    pub fn cursor_config_path(&self) -> &Path {
+        &self.cursor_config_path
+    }
+
+    pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
+        validate_root_identity(&self.root, &self.root_identity)?;
+        match fs::remove_dir_all(&self.root) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(AgentWorkspaceError::Io {
+                path: self.root.clone(),
+                source: err,
+            }),
+        }
+    }
+}
+
+impl AgentWorkspaceBuilder {
+    pub fn new(meeting_root: impl AsRef<Path>, agent_root: impl AsRef<Path>) -> Self {
+        let agent_root = agent_root.as_ref().to_path_buf();
+        Self {
+            meeting_root: meeting_root.as_ref().to_path_buf(),
+            expected_output_path: agent_root
+                .join(AGENT_OUTPUT_DIR)
+                .join(AGENT_SUMMARY_OUTPUT_FILENAME),
+            agent_root,
+            inputs: Vec::new(),
+        }
+    }
+
+    pub fn with_expected_output(
+        mut self,
+        relative_output_path: impl AsRef<Path>,
+    ) -> Result<Self, AgentWorkspaceError> {
+        let relative_output_path =
+            validate_agent_relative_path(relative_output_path.as_ref(), AGENT_OUTPUT_DIR)?;
+        self.expected_output_path = self.agent_root.join(relative_output_path);
+        Ok(self)
+    }
+
+    pub fn add_input_file(
+        mut self,
+        source: impl AsRef<Path>,
+        relative_input_path: impl AsRef<Path>,
+    ) -> Result<Self, AgentWorkspaceError> {
+        let destination =
+            validate_agent_relative_path(relative_input_path.as_ref(), AGENT_INPUT_DIR)?;
+        self.inputs.push(AgentWorkspaceInput {
+            source: source.as_ref().to_path_buf(),
+            destination,
+        });
+        Ok(self)
+    }
+
+    pub fn build(self) -> Result<AgentWorkspace, AgentWorkspaceError> {
+        if fs::symlink_metadata(&self.agent_root).is_ok() {
+            return Err(AgentWorkspaceError::DestinationAlreadyExists(
+                self.agent_root,
+            ));
+        }
+
+        let meeting_root = canonicalize_existing(&self.meeting_root)?;
+        prepare_agent_root_parent(&self.meeting_root, &self.agent_root)?;
+        fs::create_dir(&self.agent_root).map_err(|err| AgentWorkspaceError::Io {
+            path: self.agent_root.clone(),
+            source: err,
+        })?;
+        harden_agent_dir(&self.agent_root)?;
+        let agent_root = canonicalize_agent_root(&self.agent_root, &meeting_root)?;
+
+        let cleanup_root = self.agent_root.clone();
+        let build_result = self.populate(meeting_root, agent_root);
+        if build_result.is_err() {
+            let _ = fs::remove_dir_all(cleanup_root);
+        }
+        build_result
+    }
+
+    fn populate(
+        self,
+        meeting_root: PathBuf,
+        agent_root: PathBuf,
+    ) -> Result<AgentWorkspace, AgentWorkspaceError> {
+        let input_dir = self.agent_root.join(AGENT_INPUT_DIR);
+        let output_dir = self.agent_root.join(AGENT_OUTPUT_DIR);
+        let cursor_dir = self.agent_root.join(AGENT_CURSOR_DIR);
+
+        create_agent_dir(&input_dir)?;
+        create_agent_dir(&output_dir)?;
+        create_agent_dir(&cursor_dir)?;
+
+        let root_identity = root_identity(&self.agent_root)?;
+        let mut allowed_reads = Vec::new();
+        let mut destinations = HashSet::new();
+        for input in &self.inputs {
+            let source_metadata = validate_copy_source(&meeting_root, &agent_root, &input.source)?;
+            if !destinations.insert(input.destination.clone()) {
+                return Err(AgentWorkspaceError::InvalidPath {
+                    path: input.destination.clone(),
+                    reason: "duplicate agent workspace input destination",
+                });
+            }
+            let destination = self.agent_root.join(&input.destination);
+            prepare_agent_parent_dirs(&self.agent_root, &agent_root, &destination)?;
+            copy_regular_file_no_symlink(&input.source, &destination, &source_metadata)?;
+            allowed_reads.push(permission_path(&input.destination));
+        }
+
+        let expected_output_relative = self
+            .expected_output_path
+            .strip_prefix(&self.agent_root)
+            .map_err(|_| AgentWorkspaceError::InvalidPath {
+                path: self.expected_output_path.clone(),
+                reason: "expected output must be inside the agent workspace",
+            })?;
+        validate_agent_relative_path(expected_output_relative, AGENT_OUTPUT_DIR)?;
+        let cursor_config_path = cursor_dir.join(AGENT_CURSOR_CONFIG_FILENAME);
+        validate_agent_parent_dir(&agent_root, &cursor_config_path)?;
+        write_cursor_config(
+            &cursor_config_path,
+            allowed_reads,
+            permission_path(expected_output_relative),
+        )?;
+
+        Ok(AgentWorkspace {
+            root: self.agent_root,
+            expected_output_path: self.expected_output_path,
+            cursor_config_path,
+            root_identity,
+        })
+    }
+}
+
+fn create_agent_dir(path: &Path) -> Result<(), AgentWorkspaceError> {
+    fs::create_dir(path).map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
+    harden_agent_dir(path)
+}
+
+#[cfg(unix)]
+fn harden_agent_dir(path: &Path) -> Result<(), AgentWorkspaceError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace directory must not be a symlink",
+        });
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_agent_dir(path: &Path) -> Result<(), AgentWorkspaceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace directory must not be a symlink",
+        });
+    }
+    Ok(())
+}
+
+fn prepare_agent_parent_dirs(
+    lexical_agent_root: &Path,
+    canonical_agent_root: &Path,
+    destination: &Path,
+) -> Result<(), AgentWorkspaceError> {
+    let Some(parent) = destination.parent() else {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: destination.to_path_buf(),
+            reason: "agent workspace destination must have a parent directory",
+        });
+    };
+    let mut current = lexical_agent_root.to_path_buf();
+    let relative_parent =
+        parent
+            .strip_prefix(lexical_agent_root)
+            .map_err(|_| AgentWorkspaceError::InvalidPath {
+                path: parent.to_path_buf(),
+                reason: "agent workspace destination parent escaped the agent root",
+            })?;
+    for component in relative_parent.components() {
+        current.push(component.as_os_str());
+        match fs::create_dir(&current) {
+            Ok(()) => harden_agent_dir(&current)?,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(AgentWorkspaceError::Io {
+                    path: current.clone(),
+                    source: err,
+                });
+            }
+        }
+        validate_agent_dir(canonical_agent_root, &current)?;
+    }
+    validate_agent_parent_dir(canonical_agent_root, destination)
+}
+
+fn validate_agent_parent_dir(
+    canonical_agent_root: &Path,
+    destination: &Path,
+) -> Result<(), AgentWorkspaceError> {
+    let Some(parent) = destination.parent() else {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: destination.to_path_buf(),
+            reason: "agent workspace destination must have a parent directory",
+        });
+    };
+    validate_agent_dir(canonical_agent_root, parent)
+}
+
+fn validate_agent_dir(canonical_agent_root: &Path, path: &Path) -> Result<(), AgentWorkspaceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace destination parent must be a real directory",
+        });
+    }
+    let canonical_path = canonicalize_existing(path)?;
+    if !canonical_path.starts_with(canonical_agent_root) {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace destination parent escaped the agent root",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn root_identity(path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorkspaceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root must be a real directory",
+        });
+    }
+    Ok(AgentWorkspaceRootIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn root_identity(_path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorkspaceError> {
+    Ok(AgentWorkspaceRootIdentity)
+}
+
+#[cfg(unix)]
+fn validate_root_identity(
+    path: &Path,
+    expected: &AgentWorkspaceRootIdentity,
+) -> Result<(), AgentWorkspaceError> {
+    let actual = root_identity(path)?;
+    if &actual != expected {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root identity changed before cleanup",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_root_identity(
+    _path: &Path,
+    _expected: &AgentWorkspaceRootIdentity,
+) -> Result<(), AgentWorkspaceError> {
+    Ok(())
+}
+
+fn canonicalize_existing(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
+    path.canonicalize().map_err(|err| AgentWorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })
+}
+
+fn canonicalize_agent_root(
+    agent_root: &Path,
+    meeting_root: &Path,
+) -> Result<PathBuf, AgentWorkspaceError> {
+    let canonical_agent_root = canonicalize_existing(agent_root)?;
+    if !canonical_agent_root.starts_with(meeting_root) {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: agent_root.to_path_buf(),
+            reason: "agent workspace root escaped the meeting workspace",
+        });
+    }
+    Ok(canonical_agent_root)
+}
+
+fn prepare_agent_root_parent(
+    meeting_root: &Path,
+    agent_root: &Path,
+) -> Result<(), AgentWorkspaceError> {
+    let Some(parent) = agent_root.parent() else {
+        return Ok(());
+    };
+    let canonical_meeting_root = canonicalize_existing(meeting_root)?;
+    let relative_parent =
+        parent
+            .strip_prefix(meeting_root)
+            .map_err(|_| AgentWorkspaceError::InvalidPath {
+                path: parent.to_path_buf(),
+                reason: "agent workspace parent must be under the meeting workspace",
+            })?;
+
+    let mut current = canonical_meeting_root.clone();
+    for component in relative_parent.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(AgentWorkspaceError::InvalidPath {
+                path: parent.to_path_buf(),
+                reason: "agent workspace parent must not contain traversal components",
+            });
+        }
+
+        current.push(component.as_os_str());
+        match fs::create_dir(&current) {
+            Ok(()) => harden_agent_dir(&current)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(AgentWorkspaceError::Io {
+                    path: current.clone(),
+                    source: err,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                validate_agent_dir(&canonical_meeting_root, &current)?;
+            }
+            Err(err) => {
+                return Err(AgentWorkspaceError::Io {
+                    path: current.clone(),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_copy_source(
+    meeting_root: &Path,
+    agent_root: &Path,
+    source: &Path,
+) -> Result<fs::Metadata, AgentWorkspaceError> {
+    let metadata = fs::symlink_metadata(source).map_err(|err| AgentWorkspaceError::Io {
+        path: source.to_path_buf(),
+        source: err,
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::SourceNotRegularFile(
+            source.to_path_buf(),
+        ));
+    }
+
+    let canonical_source = canonicalize_existing(source)?;
+    if !canonical_source.starts_with(meeting_root) {
+        return Err(AgentWorkspaceError::SourceOutsideMeetingWorkspace {
+            source: source.to_path_buf(),
+            meeting_root: meeting_root.to_path_buf(),
+        });
+    }
+    if canonical_source.starts_with(agent_root) {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: source.to_path_buf(),
+            reason: "input source must not be inside the agent workspace",
+        });
+    }
+    Ok(metadata)
+}
+
+#[cfg(unix)]
+fn copy_regular_file_no_symlink(
+    source: &Path,
+    destination: &Path,
+    expected_metadata: &fs::Metadata,
+) -> Result<(), AgentWorkspaceError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: source.to_path_buf(),
+            source: err,
+        })?;
+    let actual_metadata = input.metadata().map_err(|err| AgentWorkspaceError::Io {
+        path: source.to_path_buf(),
+        source: err,
+    })?;
+    if !actual_metadata.file_type().is_file()
+        || expected_metadata.dev() != actual_metadata.dev()
+        || expected_metadata.ino() != actual_metadata.ino()
+    {
+        return Err(AgentWorkspaceError::SourceNotRegularFile(
+            source.to_path_buf(),
+        ));
+    }
+
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(destination)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: destination.to_path_buf(),
+            source: err,
+        })?;
+    io::copy(&mut input, &mut output).map_err(|err| AgentWorkspaceError::Io {
+        path: destination.to_path_buf(),
+        source: err,
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_regular_file_no_symlink(
+    _source: &Path,
+    destination: &Path,
+    _expected_metadata: &fs::Metadata,
+) -> Result<(), AgentWorkspaceError> {
+    Err(AgentWorkspaceError::InvalidPath {
+        path: destination.to_path_buf(),
+        reason: "agent workspace materialization requires Unix no-follow copy support",
+    })
+}
+
+fn validate_agent_relative_path(
+    path: &Path,
+    required_first_component: &str,
+) -> Result<PathBuf, AgentWorkspaceError> {
+    let components = path.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path must not be empty",
+        });
+    }
+    if components.len() < 2 {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path must include a file name below the required agent workspace directory",
+        });
+    }
+    if components
+        .iter()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path must be relative and must not contain traversal components",
+        });
+    }
+    if components.first().and_then(|component| match component {
+        Component::Normal(value) => value.to_str(),
+        _ => None,
+    }) != Some(required_first_component)
+    {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path is not under the required agent workspace directory",
+        });
+    }
+    Ok(path.to_path_buf())
+}
+
+fn permission_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn write_cursor_config(
+    path: &Path,
+    allowed_reads: Vec<String>,
+    expected_output: String,
+) -> Result<(), AgentWorkspaceError> {
+    let mut allow = allowed_reads
+        .into_iter()
+        .map(|path| format!("Read({path})"))
+        .collect::<Vec<_>>();
+    allow.push(format!("Write({expected_output})"));
+
+    let config = CursorCliConfig {
+        permissions: CursorPermissions {
+            allow,
+            deny: vec![
+                "Read(.env)".to_owned(),
+                "Read(debug/**)".to_owned(),
+                "Read(../**)".to_owned(),
+                "Write(input/**)".to_owned(),
+                "Shell(*)".to_owned(),
+            ],
+        },
+    };
+    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(path, &json)
+}
+
+#[cfg(unix)]
+fn write_new_file_no_symlink(path: &Path, bytes: &[u8]) -> Result<(), AgentWorkspaceError> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+    file.write_all(bytes)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })
+}
+
+#[cfg(not(unix))]
+fn write_new_file_no_symlink(path: &Path, _bytes: &[u8]) -> Result<(), AgentWorkspaceError> {
+    Err(AgentWorkspaceError::InvalidPath {
+        path: path.to_path_buf(),
+        reason: "agent workspace materialization requires Unix no-follow write support",
+    })
 }
