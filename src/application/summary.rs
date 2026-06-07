@@ -86,7 +86,40 @@ pub trait ClaudeSummaryClient {
     }
 
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError>;
+
+    fn summarize_with_output_contract(
+        &self,
+        prompt: &str,
+        workdir: Option<&Path>,
+        output: AgentOutputContract,
+    ) -> Result<String, SummaryError> {
+        let _ = (prompt, workdir);
+        Err(SummaryError::SummaryEngine(format!(
+            "summary client does not support agent output contract {}",
+            output.relative_path
+        )))
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentOutputContract {
+    pub relative_path: &'static str,
+    pub label: &'static str,
+    pub max_bytes: u64,
+}
+
+impl AgentOutputContract {
+    pub const fn new(relative_path: &'static str, label: &'static str, max_bytes: u64) -> Self {
+        Self {
+            relative_path,
+            label,
+            max_bytes,
+        }
+    }
+}
+
+pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
+    AgentOutputContract::new("output/summary.md", "summary output", 1024 * 1024);
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {

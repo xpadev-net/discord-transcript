@@ -1,4 +1,6 @@
-use crate::application::summary::{ClaudeSummaryClient, SummaryError};
+use crate::application::summary::{
+    AgentOutputContract, ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT, SummaryError,
+};
 use crate::bootstrap::config::SummaryHarness;
 use crate::infrastructure::asr::{
     WhisperClient, WhisperInferenceRequest, WhisperParseError, WhisperTranscriptionResult,
@@ -7,7 +9,6 @@ use crate::infrastructure::asr::{
 use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff, retry_with_backoff_if};
 use crate::infrastructure::workspace::{
     AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
-    AGENT_SUMMARY_OUTPUT_FILENAME,
 };
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -228,8 +229,6 @@ pub struct HarnessCliSummaryClient {
 }
 
 const SANITIZE_MAX_LEN: usize = 500;
-const SUMMARY_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
-
 /// Redact values that look like API keys or tokens, collapse whitespace,
 /// and truncate to a bounded length so error messages stay safe and compact.
 fn sanitize_output(raw: &[u8]) -> String {
@@ -290,11 +289,20 @@ impl ClaudeSummaryClient for HarnessCliSummaryClient {
     }
 
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
+        self.summarize_with_output_contract(prompt, workdir, SUMMARY_OUTPUT_CONTRACT)
+    }
+
+    fn summarize_with_output_contract(
+        &self,
+        prompt: &str,
+        workdir: Option<&Path>,
+        output: AgentOutputContract,
+    ) -> Result<String, SummaryError> {
         self.ensure_can_run_summary_harness()?;
         retry_with_backoff(self.retry_policy, |_| match self.harness {
-            SummaryHarness::Claude => summarize_claude_stdin(self, prompt, workdir),
-            SummaryHarness::OpenCode => summarize_opencode_argv(self, prompt, workdir),
-            SummaryHarness::CursorAgent => summarize_cursor_argv(self, prompt, workdir),
+            SummaryHarness::Claude => summarize_claude_stdin(self, prompt, workdir, output),
+            SummaryHarness::OpenCode => summarize_opencode_argv(self, prompt, workdir, output),
+            SummaryHarness::CursorAgent => summarize_cursor_argv(self, prompt, workdir, output),
         })
     }
 }
@@ -303,9 +311,10 @@ fn summarize_claude_stdin(
     client: &HarnessCliSummaryClient,
     prompt: &str,
     workdir: Option<&Path>,
+    output_contract: AgentOutputContract,
 ) -> Result<String, SummaryError> {
-    let workdir = require_summary_workdir(workdir)?;
-    remove_stale_summary_output(workdir)?;
+    let workdir = require_agent_workdir(workdir)?;
+    remove_stale_agent_output(workdir, output_contract)?;
     let mut command = Command::new(&client.command_path);
     command.arg("--model").arg(&client.model).arg("-p");
     scrub_agent_command_environment(&mut command);
@@ -326,16 +335,23 @@ fn summarize_claude_stdin(
         ));
     }
 
-    read_validated_summary_output(client.harness, workdir, &output.stderr, &output.stdout)
+    read_validated_agent_output(
+        client.harness,
+        workdir,
+        output_contract,
+        &output.stderr,
+        &output.stdout,
+    )
 }
 
 fn summarize_opencode_argv(
     client: &HarnessCliSummaryClient,
     prompt: &str,
     workdir: Option<&Path>,
+    output_contract: AgentOutputContract,
 ) -> Result<String, SummaryError> {
-    let workdir = require_summary_workdir(workdir)?;
-    remove_stale_summary_output(workdir)?;
+    let workdir = require_agent_workdir(workdir)?;
+    remove_stale_agent_output(workdir, output_contract)?;
     let mut command = Command::new(&client.command_path);
     command
         .arg("run")
@@ -355,16 +371,23 @@ fn summarize_opencode_argv(
             &output.stdout,
         ));
     }
-    read_validated_summary_output(client.harness, workdir, &output.stderr, &output.stdout)
+    read_validated_agent_output(
+        client.harness,
+        workdir,
+        output_contract,
+        &output.stderr,
+        &output.stdout,
+    )
 }
 
 fn summarize_cursor_argv(
     client: &HarnessCliSummaryClient,
     prompt: &str,
     workdir: Option<&Path>,
+    output_contract: AgentOutputContract,
 ) -> Result<String, SummaryError> {
-    let workdir = require_summary_workdir(workdir)?;
-    remove_stale_summary_output(workdir)?;
+    let workdir = require_agent_workdir(workdir)?;
+    remove_stale_agent_output(workdir, output_contract)?;
     let mut command = Command::new(&client.command_path);
     command
         .arg("-p")
@@ -388,10 +411,16 @@ fn summarize_cursor_argv(
             &output.stdout,
         ));
     }
-    read_validated_summary_output(client.harness, workdir, &output.stderr, &output.stdout)
+    read_validated_agent_output(
+        client.harness,
+        workdir,
+        output_contract,
+        &output.stderr,
+        &output.stdout,
+    )
 }
 
-fn require_summary_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> {
+fn require_agent_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> {
     let workdir = workdir.ok_or_else(|| {
         SummaryError::SummaryEngine("summary harness: workdir not provided".to_owned())
     })?;
@@ -409,86 +438,119 @@ fn require_summary_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError
     Ok(workdir)
 }
 
-fn summary_output_path(workdir: &Path) -> std::path::PathBuf {
-    workdir
-        .join(AGENT_OUTPUT_DIR)
-        .join(AGENT_SUMMARY_OUTPUT_FILENAME)
+fn agent_output_path(
+    workdir: &Path,
+    output_contract: AgentOutputContract,
+) -> Result<std::path::PathBuf, SummaryError> {
+    let relative_path = Path::new(output_contract.relative_path);
+    if relative_path.is_absolute()
+        || !relative_path.starts_with(AGENT_OUTPUT_DIR)
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(SummaryError::SummaryEngine(format!(
+            "invalid {} path {}: expected relative output path under {AGENT_OUTPUT_DIR}/",
+            output_contract.label, output_contract.relative_path
+        )));
+    }
+    Ok(workdir.join(relative_path))
 }
 
-fn remove_stale_summary_output(workdir: &Path) -> Result<(), SummaryError> {
-    let path = summary_output_path(workdir);
+fn remove_stale_agent_output(
+    workdir: &Path,
+    output_contract: AgentOutputContract,
+) -> Result<(), SummaryError> {
+    let path = agent_output_path(workdir, output_contract)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(SummaryError::SummaryEngine(format!(
-            "failed to remove stale summary output {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {err}"
+            "failed to remove stale {} {}: {err}",
+            output_contract.label, output_contract.relative_path
         ))),
     }
 }
 
-fn read_validated_summary_output(
+fn read_validated_agent_output(
     harness: SummaryHarness,
     workdir: &Path,
+    output_contract: AgentOutputContract,
     stderr: &[u8],
     stdout: &[u8],
 ) -> Result<String, SummaryError> {
-    let path = summary_output_path(workdir);
+    let path = agent_output_path(workdir, output_contract)?;
     let metadata = fs::symlink_metadata(&path).map_err(|err| {
-        summary_output_validation_failed(
+        agent_output_validation_failed(
             harness,
             format!(
-                "missing summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {err}"
+                "missing {} file {}: {err}",
+                output_contract.label, output_contract.relative_path
             ),
+            output_contract,
             stderr,
             stdout,
         )
     })?;
     if !metadata.file_type().is_file() {
-        return Err(summary_output_validation_failed(
+        return Err(agent_output_validation_failed(
             harness,
             format!(
-                "invalid summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: expected a regular file"
+                "invalid {} file {}: expected a regular file",
+                output_contract.label, output_contract.relative_path
             ),
+            output_contract,
             stderr,
             stdout,
         ));
     }
-    if metadata.len() > SUMMARY_OUTPUT_MAX_BYTES {
-        return Err(summary_output_validation_failed(
+    if metadata.len() > output_contract.max_bytes {
+        return Err(agent_output_validation_failed(
             harness,
             format!(
-                "oversized summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {} bytes exceeds {} bytes",
+                "oversized {} file {}: {} bytes exceeds {} bytes",
+                output_contract.label,
+                output_contract.relative_path,
                 metadata.len(),
-                SUMMARY_OUTPUT_MAX_BYTES
+                output_contract.max_bytes
             ),
+            output_contract,
             stderr,
             stdout,
         ));
     }
     let bytes = fs::read(&path).map_err(|err| {
-        summary_output_validation_failed(
+        agent_output_validation_failed(
             harness,
             format!(
-                "failed to read summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: {err}"
+                "failed to read {} file {}: {err}",
+                output_contract.label, output_contract.relative_path
             ),
+            output_contract,
             stderr,
             stdout,
         )
     })?;
     let markdown = String::from_utf8(bytes).map_err(|err| {
-        summary_output_validation_failed(
+        agent_output_validation_failed(
             harness,
             format!(
-                "invalid summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}: not valid UTF-8 ({err})"
+                "invalid {} file {}: not valid UTF-8 ({err})",
+                output_contract.label, output_contract.relative_path
             ),
+            output_contract,
             stderr,
             stdout,
         )
     })?;
     if markdown.trim().is_empty() {
-        return Err(summary_output_validation_failed(
+        return Err(agent_output_validation_failed(
             harness,
-            format!("empty summary output file {AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}"),
+            format!(
+                "empty {} file {}",
+                output_contract.label, output_contract.relative_path
+            ),
+            output_contract,
             stderr,
             stdout,
         ));
@@ -496,14 +558,16 @@ fn read_validated_summary_output(
     Ok(markdown)
 }
 
-fn summary_output_validation_failed(
+fn agent_output_validation_failed(
     harness: SummaryHarness,
     reason: String,
+    output_contract: AgentOutputContract,
     stderr: &[u8],
     stdout: &[u8],
 ) -> SummaryError {
     SummaryError::SummaryEngine(format!(
-        "summary output validation failed (harness={harness}): {reason}; stderr={}; stdout={}",
+        "{} validation failed (harness={harness}): {reason}; stderr={}; stdout={}",
+        output_contract.label,
         sanitize_output(stderr),
         sanitize_output(stdout)
     ))
@@ -765,8 +829,8 @@ fn read_temp_output_file(path: &Path) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::{
         AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
-        CommandWhisperClient, HarnessCliSummaryClient, IntegrationError, create_temp_output_file,
-        run_command_with_timeout,
+        AgentOutputContract, CommandWhisperClient, HarnessCliSummaryClient, IntegrationError,
+        create_temp_output_file, run_command_with_timeout,
     };
     use crate::application::summary::ClaudeSummaryClient;
     use crate::bootstrap::config::SummaryHarness;
@@ -946,6 +1010,34 @@ mod tests {
             let _ = std::fs::remove_dir_all(&workdir);
             let _ = std::fs::remove_file(&script_path);
         }
+    }
+
+    #[test]
+    fn summary_harness_can_read_non_summary_output_contract() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("ai_memory_file_success");
+        create_summary_agent_workdir(&workdir);
+        let script_path = write_summary_script(
+            "ai_memory_success",
+            "#!/bin/sh\nprintf '{\"memory_notes\":[{\"title\":\"stdout must be ignored\"}]}'\nmkdir -p output\nprintf '{\"memory_notes\":[]}' > output/ai_memory_candidates.json\n",
+        );
+        let client = summary_test_client(SummaryHarness::Claude, &script_path);
+
+        let json = client
+            .summarize_with_output_contract(
+                "PROMPT BODY",
+                Some(&workdir),
+                AgentOutputContract::new(
+                    "output/ai_memory_candidates.json",
+                    "AI memory candidate output",
+                    1024,
+                ),
+            )
+            .expect("AI memory candidates should be read from output file");
+
+        assert_eq!(json, "{\"memory_notes\":[]}");
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
     }
 
     #[test]
