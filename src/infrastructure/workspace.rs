@@ -1227,6 +1227,18 @@ mod tests {
     }
 
     #[test]
+    fn read_cleanup_marker_rejects_undersized_marker() {
+        let agent_root = unique_temp_dir("read_cleanup_marker_undersized");
+        write_cleanup_marker(&agent_root, "00000000-0000-0000-0000");
+
+        let err =
+            read_cleanup_marker(&agent_root).expect_err("undersized marker should be rejected");
+
+        assert!(err.to_string().contains("invalid size"));
+        std::fs::remove_dir_all(&agent_root).ok();
+    }
+
+    #[test]
     fn read_cleanup_marker_rejects_malformed_uuid_marker() {
         let agent_root = unique_temp_dir("read_cleanup_marker_malformed");
         write_cleanup_marker(&agent_root, "00000000-0000-0000-0000-00000000000z");
