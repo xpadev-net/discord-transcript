@@ -393,9 +393,7 @@ fn summarize_cursor_argv(
 
 fn require_summary_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> {
     let workdir = workdir.ok_or_else(|| {
-        SummaryError::SummaryEngine(
-            "summary harness requires a generated agent workspace workdir".to_owned(),
-        )
+        SummaryError::SummaryEngine("summary harness: workdir not provided".to_owned())
     })?;
     if !workdir.join(AGENT_INPUT_DIR).is_dir()
         || !workdir.join(AGENT_OUTPUT_DIR).is_dir()
@@ -405,7 +403,7 @@ fn require_summary_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError
             .is_file()
     {
         return Err(SummaryError::SummaryEngine(
-            "summary harness requires a generated agent workspace workdir".to_owned(),
+            "summary harness: workdir missing expected agent workspace markers (input/, output/, .cursor/cli.json)".to_owned(),
         ));
     }
     Ok(workdir)
@@ -445,7 +443,7 @@ fn read_validated_summary_output(
             stdout,
         )
     })?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    if !metadata.file_type().is_file() {
         return Err(summary_output_validation_failed(
             harness,
             format!(
@@ -1086,7 +1084,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("requires a generated agent workspace workdir")
+                .contains("missing expected agent workspace markers")
         );
         assert!(
             !marker_path.exists(),
