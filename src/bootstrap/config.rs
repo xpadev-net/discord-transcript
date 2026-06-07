@@ -115,7 +115,11 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        validate_unsafe_agent_harness_opt_in(summary_harness, summary_allow_unsafe_agent_harness)?;
+        validate_unsafe_agent_harness_opt_in(
+            summary_harness,
+            summary_allow_unsafe_agent_harness,
+            optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+        )?;
         let (summary_command, summary_model) = resolve_summary_settings(
             summary_harness,
             optional_env("SUMMARY_COMMAND"),
@@ -208,7 +212,11 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        validate_unsafe_agent_harness_opt_in(summary_harness, summary_allow_unsafe_agent_harness)?;
+        validate_unsafe_agent_harness_opt_in(
+            summary_harness,
+            summary_allow_unsafe_agent_harness,
+            optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+        )?;
         let (summary_command, summary_model) = resolve_summary_settings(
             summary_harness,
             optional_from_map(values, "SUMMARY_COMMAND"),
@@ -329,13 +337,25 @@ fn parse_csv_list(value: Option<String>) -> Vec<String> {
 fn validate_unsafe_agent_harness_opt_in(
     _harness: SummaryHarness,
     allow_unsafe_agent_harness: bool,
+    unsafe_agent_harness_profile: Option<String>,
 ) -> Result<(), ConfigError> {
     if !allow_unsafe_agent_harness {
         return Err(ConfigError::MissingEnv {
             key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS",
         });
     }
-    Ok(())
+    let Some(profile) = unsafe_agent_harness_profile else {
+        return Err(ConfigError::MissingEnv {
+            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE",
+        });
+    };
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "local" | "local-dev" | "dev" | "development" | "test" | "testing" => Ok(()),
+        _ => Err(ConfigError::InvalidEnv {
+            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE",
+            value: profile,
+        }),
+    }
 }
 
 fn resolve_summary_settings(
