@@ -7,10 +7,10 @@ use crate::infrastructure::sql::RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL;
 use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{InMemoryMeetingStore, StoreError};
 use crate::infrastructure::workspace::{
-    AGENT_OUTPUT_DIR, AgentWorkspace, AgentWorkspaceBuilder, AgentWorkspaceError,
-    CONTEXT_AI_MEMORY_FILENAME, CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME,
-    CONTEXT_PERSON_ALIASES_FILENAME, CONTEXT_SPEAKER_ROSTER_FILENAME,
-    CONTEXT_USER_FEEDBACK_FILENAME, MASKED_TRANSCRIPT_FILENAME, TRANSCRIPT_MANIFEST_FILENAME,
+    AgentWorkspace, AgentWorkspaceBuilder, AgentWorkspaceError, CONTEXT_AI_MEMORY_FILENAME,
+    CONTEXT_DOMAIN_KNOWLEDGE_FILENAME, CONTEXT_MANIFEST_FILENAME, CONTEXT_PERSON_ALIASES_FILENAME,
+    CONTEXT_SPEAKER_ROSTER_FILENAME, CONTEXT_USER_FEEDBACK_FILENAME, MASKED_TRANSCRIPT_FILENAME,
+    TRANSCRIPT_MANIFEST_FILENAME,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -26,7 +26,6 @@ const MAX_BODY_CHARS: usize = 1_200;
 const MAX_SOURCE_EXCERPT_CHARS: usize = 500;
 const MAX_TAGS: usize = 5;
 const AI_MEMORY_EXTRACTION_ACTOR: &str = "system:ai_memory_extraction";
-const AI_MEMORY_CANDIDATES_OUTPUT_FILENAME: &str = "ai_memory_candidates.json";
 const AI_MEMORY_CANDIDATES_OUTPUT_RELATIVE_PATH: &str = "output/ai_memory_candidates.json";
 const AI_MEMORY_CANDIDATES_MAX_BYTES: u64 = 256 * 1024;
 const AI_MEMORY_SUMMARY_FILENAME: &str = "summary.md";
@@ -344,9 +343,7 @@ pub fn materialize_ai_memory_agent_workspace(
 ) -> Result<AgentWorkspace, AiMemoryExtractionError> {
     let summary_source = write_ai_memory_summary_input_source(request, final_summary_markdown)?;
     let mut builder = AgentWorkspaceBuilder::new(request.workspace.root(), agent_root)
-        .with_expected_output(format!(
-            "{AGENT_OUTPUT_DIR}/{AI_MEMORY_CANDIDATES_OUTPUT_FILENAME}"
-        ))?
+        .with_expected_output(AI_MEMORY_OUTPUT_CONTRACT.relative_path)?
         .add_input_file(
             request.workspace.masked_transcript_path(),
             format!("input/transcript/{MASKED_TRANSCRIPT_FILENAME}"),
