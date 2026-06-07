@@ -12,7 +12,8 @@ use discord_transcript::domain::person_alias::{
 };
 use discord_transcript::infrastructure::sql::{
     ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_PERSON_ALIAS_SQL, INCREMENTAL_MIGRATIONS_SQL,
-    INSERT_AI_MEMORY_NOTE_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_TRANSCRIPT_FEEDBACK_SQL,
+    INSERT_AI_MEMORY_NOTE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL,
+    INSERT_TRANSCRIPT_FEEDBACK_SQL,
     LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, MIGRATIONS,
     RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
@@ -34,6 +35,14 @@ fn forward_fixups_migration_sql() -> &'static str {
         .iter()
         .find(|migration| migration.version == "0022_forward_fixups_for_0020_0021")
         .expect("forward fixup migration should be registered")
+        .sql
+}
+
+fn feedback_idempotency_quota_migration_sql() -> &'static str {
+    MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0023_feedback_idempotency_quota")
+        .expect("feedback idempotency quota migration should be registered")
         .sql
 }
 
@@ -186,6 +195,25 @@ fn migrations_register_forward_fixups_after_ai_memory_feedback() {
 }
 
 #[test]
+fn migrations_register_feedback_idempotency_quota_after_forward_fixups() {
+    let version = MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+
+    let forward_fixup_position = version
+        .iter()
+        .position(|version| *version == "0022_forward_fixups_for_0020_0021")
+        .expect("forward fixup migration should be registered");
+    let idempotency_position = version
+        .iter()
+        .position(|version| *version == "0023_feedback_idempotency_quota")
+        .expect("feedback idempotency quota migration should be registered");
+
+    assert!(idempotency_position > forward_fixup_position);
+}
+
+#[test]
 fn incremental_migrations_include_ai_memory_feedback_schema() {
     let schema = INCREMENTAL_MIGRATIONS_SQL;
 
@@ -208,6 +236,36 @@ fn incremental_migrations_include_ai_memory_feedback_schema() {
     assert!(schema.contains("idx_person_aliases_active_identity"));
     assert!(schema.contains("idx_person_aliases_source_feedback"));
     assert!(schema.contains("idx_person_aliases_guild_source_meeting"));
+    assert!(schema.contains("idx_transcript_feedback_meeting_actor_identity"));
+    assert!(schema.contains("idx_transcript_feedback_meeting_actor_created_at"));
+}
+
+#[test]
+fn feedback_idempotency_quota_migration_indexes_meeting_feedback_identity_and_quota_scope() {
+    let sql = feedback_idempotency_quota_migration_sql();
+
+    assert!(sql.contains("ADD COLUMN IF NOT EXISTS idempotency_key TEXT"));
+    assert!(sql.contains("idx_transcript_feedback_meeting_actor_identity"));
+    assert!(sql.contains("tenant_id"));
+    assert!(sql.contains("guild_id"));
+    assert!(sql.contains("meeting_id"));
+    assert!(sql.contains("actor_user_id"));
+    assert!(sql.contains("idempotency_key"));
+    assert!(sql.contains("WHERE meeting_id IS NOT NULL"));
+    assert!(sql.contains("AND idempotency_key IS NOT NULL"));
+    assert!(sql.contains("idx_transcript_feedback_meeting_actor_created_at"));
+    assert!(sql.contains("created_at DESC"));
+    assert!(sql.contains("CREATE OR REPLACE FUNCTION enforce_transcript_feedback_daily_quota()"));
+    assert!(sql.contains("pg_advisory_xact_lock"));
+    assert!(sql.contains("hashtextextended"));
+    assert!(sql.contains("quota_limit CONSTANT INTEGER := 20"));
+    assert!(sql.contains("NEW.idempotency_key IS NOT NULL"));
+    assert!(
+        sql.find("meeting feedback duplicate submission")
+            < sql.find("meeting feedback daily quota exceeded")
+    );
+    assert!(sql.contains("CONSTRAINT = 'transcript_feedback_daily_quota_check'"));
+    assert!(sql.contains("CREATE TRIGGER trg_enforce_transcript_feedback_daily_quota"));
 }
 
 #[test]
@@ -694,6 +752,16 @@ fn api_sql_mutations_scope_by_tenant_and_guild_and_preserve_review_state_machine
     assert!(INSERT_PERSON_ALIAS_SQL.contains("CASE WHEN $13 = 'unreviewed' THEN NULL ELSE NOW() END"));
     assert!(UPDATE_PERSON_ALIAS_SQL.contains("WHEN $9 = 'unreviewed' THEN NULL"));
     assert!(ARCHIVE_PERSON_ALIAS_SQL.contains("SET active = FALSE"));
+}
+
+#[test]
+fn meeting_feedback_sql_guards_duplicate_retries_and_daily_quota() {
+    assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("idempotency_key"));
+    assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("$17"));
+    assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("'open'"));
+    assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("RETURNING id"));
+    assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("actor_user_id"));
+    assert!(!INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("feedback_create_outcome"));
 }
 
 #[test]
