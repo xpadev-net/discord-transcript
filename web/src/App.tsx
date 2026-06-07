@@ -27,7 +27,7 @@ function storeSelectedGuildId(guildId: string): void {
 }
 
 function canSelectGuild(guild: UserGuild): boolean {
-  return guild.is_member && guild.tenant_id !== null;
+  return guild.is_member && guild.installed;
 }
 
 function chooseSelectedGuildId(
