@@ -1920,6 +1920,7 @@ fn load_completed_live_transcription_chunks<E: SqlExecutor>(
 enum SummaryJobRunError {
     Terminal(String),
     TerminalStatusUpdated(String),
+    NotClaimable(String),
     RetryScheduled {
         message: String,
         retry_after: Duration,
@@ -2270,6 +2271,8 @@ fn recover_summary_job_for_startup<E: SqlExecutor>(
 enum RecoverySummaryJobClaimState {
     Claimable,
     Delayed { next_run_at: DateTime<Utc> },
+    Busy,
+    Terminal,
     Unavailable,
 }
 
@@ -2302,6 +2305,8 @@ fn recovery_existing_summary_job_claim_state<E: SqlExecutor>(
                     RecoverySummaryJobClaimState::Delayed { next_run_at }
                 }
                 (Some("queued"), _) => RecoverySummaryJobClaimState::Claimable,
+                (Some("running"), _) => RecoverySummaryJobClaimState::Busy,
+                (Some("done" | "failed" | "canceled"), _) => RecoverySummaryJobClaimState::Terminal,
                 _ => RecoverySummaryJobClaimState::Unavailable,
             }
         }
@@ -4438,7 +4443,9 @@ impl ScaffoldHandler {
                             );
                             continue;
                         }
-                        RecoverySummaryJobClaimState::Unavailable => {
+                        RecoverySummaryJobClaimState::Busy
+                        | RecoverySummaryJobClaimState::Terminal
+                        | RecoverySummaryJobClaimState::Unavailable => {
                             continue;
                         }
                     }
@@ -5958,6 +5965,7 @@ impl ScaffoldHandler {
                 );
                 Err(message)
             }
+            Err(SummaryJobRunError::NotClaimable(err)) => Err(err),
             Err(SummaryJobRunError::TerminalStatusUpdated(err)) => {
                 let _ = post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
                     .await;
@@ -6274,14 +6282,22 @@ impl ScaffoldHandler {
         let claimed_job = {
             let mut queue = self.queue.lock().await;
             let claimed_job = queue.claim_by_id(&job_id).map_err(|err| err.to_string())?;
-            if claimed_job.is_none()
-                && let RecoverySummaryJobClaimState::Delayed { next_run_at } =
-                    recovery_existing_summary_job_claim_state(&mut queue, &job_id, meeting_id)
-            {
-                return Err(SummaryJobRunError::RetryScheduled {
-                    message: format!("summary job is not due yet for job_id={job_id}"),
-                    retry_after: duration_until_utc(next_run_at),
-                });
+            if claimed_job.is_none() {
+                match recovery_existing_summary_job_claim_state(&mut queue, &job_id, meeting_id) {
+                    RecoverySummaryJobClaimState::Delayed { next_run_at } => {
+                        return Err(SummaryJobRunError::RetryScheduled {
+                            message: format!("summary job is not due yet for job_id={job_id}"),
+                            retry_after: duration_until_utc(next_run_at),
+                        });
+                    }
+                    RecoverySummaryJobClaimState::Busy | RecoverySummaryJobClaimState::Terminal => {
+                        return Err(SummaryJobRunError::NotClaimable(format!(
+                            "summary job is already owned or terminal for job_id={job_id}"
+                        )));
+                    }
+                    RecoverySummaryJobClaimState::Claimable
+                    | RecoverySummaryJobClaimState::Unavailable => {}
+                }
             }
             claimed_job
         };
@@ -8952,13 +8968,13 @@ mod status_message_tests {
         let mut running_queue = fake_recovery_queue_with_existing_summary_job_status("running");
         assert_eq!(
             recover_summary_job_for_startup(&mut running_queue, "summary-m1", "m1", true),
-            RecoverySummaryJobClaimState::Unavailable
+            RecoverySummaryJobClaimState::Busy
         );
 
         let mut failed_queue = fake_recovery_queue_with_existing_summary_job_status("failed");
         assert_eq!(
             recover_summary_job_for_startup(&mut failed_queue, "summary-m1", "m1", true),
-            RecoverySummaryJobClaimState::Unavailable
+            RecoverySummaryJobClaimState::Terminal
         );
     }
 
@@ -8999,7 +9015,7 @@ mod status_message_tests {
 
         assert_eq!(
             recover_summary_job_for_startup(&mut queue, "summary-m1", "m1", true),
-            RecoverySummaryJobClaimState::Unavailable
+            RecoverySummaryJobClaimState::Terminal
         );
         assert_eq!(queue.executor.job_status, "failed");
     }
@@ -9010,7 +9026,7 @@ mod status_message_tests {
 
         assert_eq!(
             recover_summary_job_for_startup(&mut queue, "summary-m1", "m1", true),
-            RecoverySummaryJobClaimState::Unavailable
+            RecoverySummaryJobClaimState::Busy
         );
         assert_eq!(queue.executor.job_status, "running");
     }

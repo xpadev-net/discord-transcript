@@ -560,29 +560,6 @@ ORDER BY j.updated_at DESC, j.created_at DESC, j.id DESC
 LIMIT $4::integer
 "#;
 
-pub const GET_GUILD_JOB_SQL: &str = r#"
-SELECT j.id,
-       j.meeting_id,
-       m.guild_id,
-       j.job_type,
-       j.status,
-       j.retry_count,
-       j.error_message,
-       to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
-       to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
-       to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
-       to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
-       to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
-       j.cancel_reason,
-       to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-       to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
-FROM jobs j
-JOIN meetings m ON m.id = j.meeting_id
-WHERE m.guild_id = $1
-  AND j.id = $2
-LIMIT 1
-"#;
-
 pub const ADMIN_RETRY_JOB_SQL: &str = r#"
 UPDATE jobs j
 SET status = 'queued',
