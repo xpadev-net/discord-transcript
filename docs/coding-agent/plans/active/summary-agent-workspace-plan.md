@@ -3,6 +3,7 @@
 - status: completed
 - generated: 2026-06-07
 - last_updated: 2026-06-08
+- date_basis: Asia/Tokyo (JST)
 - work_type: code
 
 ## Goal
@@ -340,7 +341,7 @@ Interpretation:
   - Summary: Planned shared agent workspace and output-file boundary for all summary harnesses.
   - Validation evidence: Static planning only.
   - Notes: Repository rule suite is absent; validation selected from Rust/test paths and security risk profile.
-- 2026-06-08 Task_6 documentation and review evidence:
+- 2026-06-08 (JST) Task_6 documentation and review evidence:
   - Summary: Reconciled README/plan language with the merged implementation, especially summary output validation scope, exact Cursor permission intent, and cleanup/retention behavior.
   - Validation evidence: `rtk cargo test --all-targets` passed (`575 passed (28 suites, 7.57s)`) plus targeted repository text checks for boundary, diagnostics, and cleanup wording.
   - Notes: Summary output validation is file-level (`regular file`, size, UTF-8, non-empty) rather than semantic markdown validation; independent reviewer rerun approved after the final evidence/reconciliation fixes.
@@ -357,7 +358,7 @@ Interpretation:
   - Plan delta (what changed): Defined exact `input/**` and `output/**` relative paths for summary and AI-memory extraction, made stdout diagnostic-only, excluded real workspace directories from the agent workspace, and chose delete-by-default cleanup for both success and failure.
   - Tradeoffs considered: Keeping current `transcript/**` and `context/**` paths would reduce prompt churn but blur the boundary with the real meeting workspace. `input/**` makes copied data explicit and leaves `output/**` as the only trusted collection point.
   - User approval: delegated by Task_1 acceptance criteria.
-- 2026-06-08 Task_6 Decision:
+- 2026-06-08 (JST) Task_6 Decision:
   - Trigger / new insight: Final merged code validates summary output files less strictly than the original plan text claimed, and Cursor permissions are exact-path `Read(...)` rules rather than a generic `input/**` read grant.
   - Plan delta (what changed): Updated README and final evidence to describe the implementation accurately, and converted residual assumptions into explicit follow-up items.
   - Tradeoffs considered: Keeping stronger documentation wording would read better but would hide a real contract gap. Accurate docs were prioritized so review and follow-up work can target the remaining hardening honestly.
