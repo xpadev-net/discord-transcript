@@ -1,4 +1,4 @@
-use discord_transcript::application::runtime::{BotRunExit, run_bot};
+use discord_transcript::application::runtime::{BotRunExit, SummaryJobWakeups, run_bot};
 use discord_transcript::bootstrap::config::AppConfig;
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
@@ -171,6 +171,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let summary_job_wakeups = SummaryJobWakeups::new();
     let web_state = web::WebState::new(
         Arc::clone(&db_client),
         config.chunk_storage_dir.clone(),
@@ -184,6 +185,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cipher: guild_bot_token_cipher.clone(),
             revision_tx: Some(bot_token_revision_tx),
             operational_metrics_bearer_token: config.operational_metrics_bearer_token.clone(),
+            summary_job_wakeups: Some(summary_job_wakeups.clone()),
         },
         config.static_files_dir.clone(),
         web::GuildSettingsDefaults {
@@ -245,7 +247,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut runtime_config = config.clone();
         runtime_config.discord_token = effective_discord_token;
 
-        match run_bot(&runtime_config, runtime_bot_token_revision_rx).await? {
+        match run_bot(
+            &runtime_config,
+            runtime_bot_token_revision_rx,
+            summary_job_wakeups.clone(),
+        )
+        .await?
+        {
             BotRunExit::Shutdown => break,
             BotRunExit::TokenChanged => {
                 tracing::info!("restarting Discord gateway after guild bot token update");

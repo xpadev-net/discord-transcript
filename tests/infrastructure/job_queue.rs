@@ -9,7 +9,9 @@ use discord_transcript::infrastructure::asr::{
     WhisperTranscriptionResult, parse_whisper_response,
 };
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
-use discord_transcript::infrastructure::sql::{CLAIM_JOB_SQL, RETRY_JOB_SQL};
+use discord_transcript::infrastructure::sql::{
+    ADMIN_CANCEL_JOB_SQL, ADMIN_RETRY_JOB_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, RETRY_JOB_SQL,
+};
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, sql_row_from_strings,
 };
@@ -19,6 +21,7 @@ use discord_transcript::infrastructure::storage::{
 use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use chrono::{Duration, Utc};
 
 fn stopping_meeting(id: &str) -> StoredMeeting {
     meeting_with_status(id, MeetingStatus::Stopping)
@@ -215,6 +218,82 @@ fn in_memory_queue_claim_done_and_retry_flow() {
         .retry(&claimed2.id, "failed once".to_owned(), 2)
         .expect("retry should succeed");
     assert_eq!(status, JobStatus::Queued);
+    let retried = queue.get(&claimed2.id).expect("retried job should exist");
+    assert!(
+        retried.next_run_at.is_some_and(|next_run_at| next_run_at > Utc::now()),
+        "retry should schedule a future next_run_at"
+    );
+    assert!(
+        queue
+            .claim_next(JobType::Summarize)
+            .expect("future retry claim should succeed")
+            .is_none(),
+        "future next_run_at should prevent a tight retry loop"
+    );
+}
+
+#[test]
+fn in_memory_queue_skips_future_next_run_at() {
+    let mut queue = InMemoryJobQueue::new();
+    queue
+        .enqueue(discord_transcript::infrastructure::queue::Job {
+            id: "j-future".to_owned(),
+            meeting_id: "m1".to_owned(),
+            job_type: JobType::Summarize,
+            status: JobStatus::Queued,
+            retry_count: 0,
+            error_message: None,
+            next_run_at: Some(Utc::now() + Duration::minutes(5)),
+        })
+        .expect("enqueue should succeed");
+
+    assert!(
+        queue
+            .claim_next(JobType::Summarize)
+            .expect("claim should succeed")
+            .is_none()
+    );
+    assert!(
+        queue
+            .claim_by_id("j-future")
+            .expect("claim by id should succeed")
+            .is_none()
+    );
+}
+
+#[test]
+fn in_memory_queue_failed_and_canceled_jobs_are_terminal_for_claims() {
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j-failed", "m1").expect("enqueue should succeed");
+    let failed = queue
+        .claim_next(JobType::Summarize)
+        .expect("claim should succeed")
+        .expect("job should be claimed");
+    let failed_status = queue
+        .retry(&failed.id, "still failing".to_owned(), 0)
+        .expect("retry exhaustion should persist");
+    assert_eq!(failed_status, JobStatus::Failed);
+    assert_eq!(
+        queue.get(&failed.id).expect("job should exist").next_run_at,
+        None
+    );
+
+    enqueue_summary_job(&mut queue, "j-canceled", "m2").expect("enqueue should succeed");
+    queue
+        .cancel("j-canceled")
+        .expect("queued job should cancel");
+    assert_eq!(
+        queue.get("j-canceled").expect("job should exist").status,
+        JobStatus::Canceled
+    );
+
+    assert!(
+        queue
+            .claim_next(JobType::Summarize)
+            .expect("claim should succeed")
+            .is_none(),
+        "terminal failed/canceled jobs must not be claimed"
+    );
 }
 
 #[test]
@@ -737,4 +816,45 @@ fn sql_job_queue_running_job_retry_returns_queued() {
         .expect("running SQL job should retry");
 
     assert_eq!(status, JobStatus::Queued);
+}
+
+#[test]
+fn sql_claims_only_due_queued_jobs() {
+    assert!(CLAIM_JOB_SQL.contains("status = 'queued'"));
+    assert!(CLAIM_JOB_SQL.contains("next_run_at IS NULL OR next_run_at <= NOW()"));
+    assert!(CLAIM_JOB_SQL.contains("FOR UPDATE SKIP LOCKED"));
+    assert!(CLAIM_JOB_BY_ID_SQL.contains("status = 'queued'"));
+    assert!(CLAIM_JOB_BY_ID_SQL.contains("next_run_at IS NULL OR next_run_at <= NOW()"));
+    assert!(!CLAIM_JOB_SQL.contains("'failed'"));
+    assert!(!CLAIM_JOB_SQL.contains("'canceled'"));
+}
+
+#[test]
+fn sql_retry_schedules_backoff_and_dead_letters_on_exhaustion() {
+    assert!(RETRY_JOB_SQL.contains("make_interval"));
+    assert!(RETRY_JOB_SQL.contains("LEAST(900"));
+    assert!(RETRY_JOB_SQL.contains("status = 'running'"));
+    assert!(RETRY_JOB_SQL.contains("dead_lettered_at"));
+    assert!(RETRY_JOB_SQL.contains("finished_at"));
+    assert!(RETRY_JOB_SQL.contains("leased_until = NULL"));
+}
+
+#[test]
+fn sql_admin_retry_resets_terminal_state_safely() {
+    assert!(ADMIN_RETRY_JOB_SQL.contains("j.status IN ('failed', 'canceled')"));
+    assert!(ADMIN_RETRY_JOB_SQL.contains("retry_count = 0"));
+    assert!(ADMIN_RETRY_JOB_SQL.contains("dead_lettered_at = NULL"));
+    assert!(ADMIN_RETRY_JOB_SQL.contains("canceled_at = NULL"));
+    assert!(ADMIN_RETRY_JOB_SQL.contains("cancel_reason = NULL"));
+    assert!(ADMIN_RETRY_JOB_SQL.contains("m.guild_id = $2"));
+}
+
+#[test]
+fn sql_admin_cancel_requires_queued_job_and_records_reason() {
+    assert!(ADMIN_CANCEL_JOB_SQL.contains("j.status = 'queued'"));
+    assert!(ADMIN_CANCEL_JOB_SQL.contains("status = 'canceled'"));
+    assert!(ADMIN_CANCEL_JOB_SQL.contains("cancel_reason = $3"));
+    assert!(ADMIN_CANCEL_JOB_SQL.contains("next_run_at = NULL"));
+    assert!(ADMIN_CANCEL_JOB_SQL.contains("m.guild_id = $2"));
+    assert!(!ADMIN_CANCEL_JOB_SQL.contains("j.status IN"));
 }

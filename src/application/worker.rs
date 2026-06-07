@@ -1030,6 +1030,7 @@ pub fn enqueue_summary_job<Q: JobQueue>(
         status: JobStatus::Queued,
         retry_count: 0,
         error_message: None,
+        next_run_at: None,
     }) {
         Ok(()) => {}
         Err(QueueError::AlreadyExists { .. }) => return Err(WorkerError::AlreadyExists),

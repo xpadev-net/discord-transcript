@@ -1029,7 +1029,19 @@ fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
         status,
         retry_count,
         error_message: row.get(5).and_then(|v| v.clone()),
+        next_run_at: parse_optional_job_timestamp(row.get(6).and_then(|v| v.clone()))?,
     })
+}
+
+fn parse_optional_job_timestamp(
+    value: Option<String>,
+) -> Result<Option<DateTime<Utc>>, QueueError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(&value)
+        .map(|timestamp| Some(timestamp.with_timezone(&Utc)))
+        .map_err(|err| QueueError::Backend(format!("invalid job timestamp '{value}': {err}")))
 }
 
 fn require_store_column(

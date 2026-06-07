@@ -1,4 +1,5 @@
 use crate::domain::{JobStatus, JobType};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 
@@ -10,6 +11,7 @@ pub struct Job {
     pub status: JobStatus,
     pub retry_count: u32,
     pub error_message: Option<String>,
+    pub next_run_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,38 @@ impl InMemoryJobQueue {
     pub fn get(&self, job_id: &str) -> Option<&Job> {
         self.jobs.iter().find(|job| job.id == job_id)
     }
+
+    pub fn cancel(&mut self, job_id: &str) -> Result<(), QueueError> {
+        let Some(job) = self.jobs.iter_mut().find(|job| job.id == job_id) else {
+            return Err(QueueError::NotFound {
+                job_id: job_id.to_owned(),
+            });
+        };
+        if job.status != JobStatus::Queued {
+            return Err(QueueError::InvalidState {
+                job_id: job_id.to_owned(),
+                expected: "queued".to_owned(),
+                actual: job.status.as_str().to_owned(),
+            });
+        }
+        job.status = JobStatus::Canceled;
+        job.next_run_at = None;
+        job.error_message = None;
+        Ok(())
+    }
+}
+
+pub fn retry_delay_seconds(retry_count: u32) -> u64 {
+    let multiplier = 1_u64 << retry_count.saturating_sub(1).min(5);
+    (30 * multiplier).min(900)
+}
+
+fn retry_delay(retry_count: u32) -> Duration {
+    Duration::seconds(retry_delay_seconds(retry_count) as i64)
+}
+
+fn due_for_claim(job: &Job, now: DateTime<Utc>) -> bool {
+    job.next_run_at.is_none_or(|next_run_at| next_run_at <= now)
 }
 
 impl JobQueue for InMemoryJobQueue {
@@ -91,12 +125,17 @@ impl JobQueue for InMemoryJobQueue {
     }
 
     fn claim_next(&mut self, job_type: JobType) -> Result<Option<Job>, QueueError> {
+        let now = Utc::now();
         for job_id in &self.order {
             let Some(job) = self.jobs.iter_mut().find(|j| j.id == *job_id) else {
                 continue;
             };
-            if job.job_type == job_type && job.status == JobStatus::Queued {
+            if job.job_type == job_type
+                && job.status == JobStatus::Queued
+                && due_for_claim(job, now)
+            {
                 job.status = JobStatus::Running;
+                job.next_run_at = None;
                 return Ok(Some(job.clone()));
             }
         }
@@ -107,10 +146,11 @@ impl JobQueue for InMemoryJobQueue {
         let Some(job) = self.jobs.iter_mut().find(|job| job.id == job_id) else {
             return Ok(None);
         };
-        if job.status != JobStatus::Queued {
+        if job.status != JobStatus::Queued || !due_for_claim(job, Utc::now()) {
             return Ok(None);
         }
         job.status = JobStatus::Running;
+        job.next_run_at = None;
         Ok(Some(job.clone()))
     }
 
@@ -129,6 +169,7 @@ impl JobQueue for InMemoryJobQueue {
         }
         job.status = JobStatus::Done;
         job.error_message = None;
+        job.next_run_at = None;
         Ok(())
     }
 
@@ -147,6 +188,7 @@ impl JobQueue for InMemoryJobQueue {
         }
         job.status = JobStatus::Failed;
         job.error_message = Some(error_message);
+        job.next_run_at = None;
         Ok(())
     }
 
@@ -172,8 +214,10 @@ impl JobQueue for InMemoryJobQueue {
         job.error_message = Some(error_message);
         if job.retry_count > max_retries {
             job.status = JobStatus::Failed;
+            job.next_run_at = None;
         } else {
             job.status = JobStatus::Queued;
+            job.next_run_at = Some(Utc::now() + retry_delay(job.retry_count));
         }
         Ok(job.status)
     }

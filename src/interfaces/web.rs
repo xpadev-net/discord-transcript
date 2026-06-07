@@ -1,11 +1,12 @@
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, RawQuery, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::application::runtime::SummaryJobWakeups;
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
 use crate::domain::audit::AuditEvent;
@@ -38,24 +40,26 @@ use crate::domain::transcript::{
     TranscriptSource, TranscriptTimelineOrderKey, compare_transcript_timeline_order,
 };
 use crate::domain::usage::{NewUsageEvent, UsageDetailJson, UsageMetric};
+use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use crate::infrastructure::sql::{
-    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL,
-    ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
-    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL,
-    GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
-    GET_SUMMARY_TEMPLATE_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL,
-    INSERT_SUMMARY_TEMPLATE_SQL, INSERT_USAGE_EVENT_SQL,
-    LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
-    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
-    LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
-    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
-    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
-    UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ADMIN_CANCEL_JOB_SQL,
+    ADMIN_RETRY_JOB_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
+    ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL,
+    COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL, GET_AI_MEMORY_NOTE_SQL,
+    GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
+    INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL,
+    INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
+    INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_JOBS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
+    LIST_GUILD_MEETINGS_SQL, LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL,
+    LIST_TRANSCRIPT_FEEDBACK_SQL, LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL,
+    LIST_VISIBLE_GUILD_MEETINGS_SQL, RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL,
+    SET_AI_MEMORY_PINNED_SQL, UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
+    UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -302,6 +306,7 @@ pub struct GuildBotTokenRuntimeConfig {
     pub cipher: Option<Arc<BotTokenCipher>>,
     pub revision_tx: Option<watch::Sender<u64>>,
     pub operational_metrics_bearer_token: Option<String>,
+    pub summary_job_wakeups: Option<SummaryJobWakeups>,
 }
 
 #[derive(Clone)]
@@ -331,6 +336,7 @@ pub struct WebState {
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
     pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
+    summary_job_wakeups: Option<SummaryJobWakeups>,
 }
 
 impl WebState {
@@ -343,6 +349,7 @@ impl WebState {
         static_files_dir: String,
         guild_settings_defaults: GuildSettingsDefaults,
     ) -> Self {
+        let summary_job_wakeups = guild_bot_token.summary_job_wakeups;
         Self {
             db,
             chunk_storage_dir,
@@ -364,6 +371,7 @@ impl WebState {
             transcript_sse_limiter: Arc::new(std::sync::Mutex::new(HashMap::new())),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
+            summary_job_wakeups,
         }
     }
 }
@@ -514,6 +522,9 @@ pub fn create_router(state: WebState) -> Router {
         .route("/api/me", get(api_me))
         .route("/api/me/guilds", get(api_me_guilds))
         .route("/api/guild/meetings", get(api_guild_meetings))
+        .route("/api/guild/jobs", get(api_list_jobs))
+        .route("/api/guild/jobs/{job_id}/retry", post(api_retry_job))
+        .route("/api/guild/jobs/{job_id}/cancel", post(api_cancel_job))
         .route(
             "/api/guilds/{guild_id}/meetings",
             get(api_target_guild_meetings),
@@ -2953,6 +2964,42 @@ struct GuildMeetingsResponse {
     total: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct JobListQuery {
+    status: Option<String>,
+    job_type: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct JobRetryRequest {
+    next_run_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct JobCancelRequest {
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct JobResponse {
+    id: String,
+    meeting_id: String,
+    guild_id: String,
+    job_type: String,
+    status: String,
+    retry_count: i32,
+    error_message: Option<String>,
+    next_run_at: Option<String>,
+    leased_until: Option<String>,
+    finished_at: Option<String>,
+    dead_lettered_at: Option<String>,
+    canceled_at: Option<String>,
+    cancel_reason: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct GuildSettingsResponse {
     whisper_language: Option<String>,
@@ -3619,6 +3666,85 @@ fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Opti
         .map(str::to_owned)
 }
 
+fn parse_job_list_query(raw_query: Option<&str>) -> Result<JobListQuery, StatusCode> {
+    let uri = match raw_query {
+        Some(raw_query) if !raw_query.is_empty() => format!("/?{raw_query}")
+            .parse::<Uri>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+        _ => Uri::from_static("/"),
+    };
+    Query::<JobListQuery>::try_from_uri(&uri)
+        .map(|Query(query)| query)
+        .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_job_retry_request_body(body: &Bytes) -> Result<JobRetryRequest, StatusCode> {
+    if body.is_empty() {
+        return Ok(JobRetryRequest { next_run_at: None });
+    }
+    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_job_cancel_request_body(body: &Bytes) -> Result<JobCancelRequest, StatusCode> {
+    if body.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn normalize_job_list_query(query: &JobListQuery) -> Result<NormalizedJobListQuery, StatusCode> {
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(|status| JobStatus::parse_str(status).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()?
+        .map(|status| status.as_str().to_owned())
+        .unwrap_or_default();
+    let job_type = query
+        .job_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|job_type| !job_type.is_empty())
+        .map(|job_type| JobType::parse_str(job_type).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()?
+        .map(|job_type| job_type.as_str().to_owned())
+        .unwrap_or_default();
+    let limit = query.limit.unwrap_or(50).clamp(1, 100) as i32;
+    Ok(NormalizedJobListQuery {
+        status,
+        job_type,
+        limit,
+    })
+}
+
+fn normalize_job_retry_request(
+    request: &JobRetryRequest,
+) -> Result<NormalizedJobRetryRequest, StatusCode> {
+    let next_run_at = match request.next_run_at.as_deref() {
+        Some(value) if !value.trim().is_empty() => {
+            let next_run_at = DateTime::parse_from_rfc3339(value.trim())
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .with_timezone(&Utc);
+            if next_run_at > Utc::now() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            next_run_at.to_rfc3339()
+        }
+        _ => String::new(),
+    };
+    Ok(NormalizedJobRetryRequest { next_run_at })
+}
+
+fn normalize_job_cancel_request(
+    request: &JobCancelRequest,
+) -> Result<NormalizedJobCancelRequest, StatusCode> {
+    Ok(NormalizedJobCancelRequest {
+        reason: trim_required_text(&request.reason, 1000)?,
+    })
+}
+
 fn user_can_access_target_guild(discord_guilds: &[DiscordGuild], guild_id: &str) -> bool {
     discord_guilds.iter().any(|guild| guild.id == guild_id)
 }
@@ -3743,6 +3869,23 @@ struct NormalizedSummaryTemplateRequest {
     template: String,
     active: Option<bool>,
     variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedJobListQuery {
+    status: String,
+    job_type: String,
+    limit: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedJobRetryRequest {
+    next_run_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedJobCancelRequest {
+    reason: String,
 }
 
 fn validate_domain_knowledge_item_id(id: &str) -> Result<(), StatusCode> {
@@ -4193,6 +4336,26 @@ fn domain_knowledge_response_from_row(row: &tokio_postgres::Row) -> DomainKnowle
         updated_actor_user_id: row.get("updated_actor_user_id"),
         archived_at: row.get("archived_at"),
         archived_actor_user_id: row.get("archived_actor_user_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn job_response_from_row(row: &tokio_postgres::Row) -> JobResponse {
+    JobResponse {
+        id: row.get("id"),
+        meeting_id: row.get("meeting_id"),
+        guild_id: row.get("guild_id"),
+        job_type: row.get("job_type"),
+        status: row.get("status"),
+        retry_count: row.get("retry_count"),
+        error_message: row.get("error_message"),
+        next_run_at: row.get("next_run_at"),
+        leased_until: row.get("leased_until"),
+        finished_at: row.get("finished_at"),
+        dead_lettered_at: row.get("dead_lettered_at"),
+        canceled_at: row.get("canceled_at"),
+        cancel_reason: row.get("cancel_reason"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -4823,6 +4986,130 @@ async fn api_guild_meetings(
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     list_guild_meetings_for_auth(&state, &user_id, auth, query).await
+}
+
+async fn api_list_jobs(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<JobResponse>>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let query = parse_job_list_query(raw_query.as_deref())?;
+    let normalized = normalize_job_list_query(&query)?;
+    let rows = state
+        .db
+        .query(
+            LIST_GUILD_JOBS_SQL,
+            &[
+                &auth.guild_id,
+                &normalized.status,
+                &normalized.job_type,
+                &normalized.limit,
+            ],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows.iter().map(job_response_from_row).collect()))
+}
+
+async fn api_retry_job(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<JobResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    validate_resource_id(&job_id)?;
+    let request = parse_job_retry_request_body(&body)?;
+    let normalized = normalize_job_retry_request(&request)?;
+    let row = state
+        .db
+        .query_opt(
+            ADMIN_RETRY_JOB_SQL,
+            &[&job_id, &auth.guild_id, &normalized.next_run_at],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(row) = row else {
+        return Err(StatusCode::CONFLICT);
+    };
+    let response = job_response_from_row(&row);
+    if let Some(summary_job_wakeups) = &state.summary_job_wakeups {
+        summary_job_wakeups
+            .enqueue(response.meeting_id.clone())
+            .await;
+    }
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id),
+            "job.retry",
+            "job",
+            Some(response.id.clone()),
+            audit_request_metadata(&headers, "POST", &format!("/api/guild/jobs/{job_id}/retry")),
+            json!({
+                "meeting_id": response.meeting_id.clone(),
+                "job_type": response.job_type.clone(),
+                "status": response.status.clone(),
+                "next_run_at": response.next_run_at.clone(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn api_cancel_job(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<JobResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    validate_resource_id(&job_id)?;
+    let request = parse_job_cancel_request_body(&body)?;
+    let normalized = normalize_job_cancel_request(&request)?;
+    let row = state
+        .db
+        .query_opt(
+            ADMIN_CANCEL_JOB_SQL,
+            &[&job_id, &auth.guild_id, &normalized.reason],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(row) = row else {
+        return Err(StatusCode::CONFLICT);
+    };
+    let response = job_response_from_row(&row);
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id),
+            "job.cancel",
+            "job",
+            Some(response.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/guild/jobs/{job_id}/cancel"),
+            ),
+            json!({
+                "meeting_id": response.meeting_id.clone(),
+                "job_type": response.job_type.clone(),
+                "status": response.status.clone(),
+                "reason_set": response.cancel_reason.is_some(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(response))
 }
 
 async fn api_target_guild_meetings(
@@ -8665,27 +8952,29 @@ mod guild_api_tests {
         DiscordBotTokenValidationStage, DiscordGuild, DiscordGuildFull, DiscordRoleFull,
         DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest, GUILD_CACHE_REFRESH_INFLIGHT_SECS,
         GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache, GuildCacheState,
-        GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest,
-        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
-        StoredGuildSettings, SummaryTemplateUpsertRequest, TranscriptFeedbackRequest,
-        TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
-        bot_auth_header_from_cache_with_resolver, classify_discord_bot_token_validation_status,
-        current_user_guilds_response, discord_user_guilds_api_status,
-        guild_admin_member_status_decision, guild_admin_permission_cache_key,
-        guild_admin_required_result, guild_bot_token_delete_is_noop,
-        guild_info_from_cache_with_resolver, guild_settings_response,
-        meeting_feedback_create_audit_detail, meeting_feedback_idempotency_key,
-        normalize_ai_memory_request, normalize_domain_knowledge_list_filter,
-        normalize_domain_knowledge_request, normalize_feedback_request,
-        normalize_feedback_status_request, normalize_guild_bot_token_update,
-        normalize_guild_meetings_pagination, normalize_guild_meetings_voice_channel_id,
-        normalize_person_alias_request, normalize_summary_template_request,
-        normalize_target_guild_id, permission_cache_ttl, target_auth_config,
-        target_guild_has_active_installation, target_guild_settings_path,
-        user_can_access_target_guild, validate_authorized_guild_bot_token_update,
-        validate_authorized_guild_settings_update, validate_authorized_summary_template_request,
-        validate_domain_knowledge_item_id, validate_guild_settings_update, validate_resource_id,
-        validate_summary_template_id,
+        GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest, JobCancelRequest,
+        JobListQuery, JobRetryRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS,
+        PersonAliasUpsertRequest, StoredGuildSettings, SummaryTemplateUpsertRequest,
+        TranscriptFeedbackRequest, TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest,
+        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
+        classify_discord_bot_token_validation_status, current_user_guilds_response,
+        discord_user_guilds_api_status, guild_admin_member_status_decision,
+        guild_admin_permission_cache_key, guild_admin_required_result,
+        guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
+        guild_settings_response, meeting_feedback_create_audit_detail,
+        meeting_feedback_idempotency_key, normalize_ai_memory_request,
+        normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
+        normalize_feedback_request, normalize_feedback_status_request,
+        normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
+        normalize_guild_meetings_voice_channel_id, normalize_job_cancel_request,
+        normalize_job_list_query, normalize_job_retry_request, normalize_person_alias_request,
+        normalize_summary_template_request, normalize_target_guild_id,
+        parse_job_cancel_request_body, parse_job_list_query, parse_job_retry_request_body,
+        permission_cache_ttl, target_auth_config, target_guild_has_active_installation,
+        target_guild_settings_path, user_can_access_target_guild,
+        validate_authorized_guild_bot_token_update, validate_authorized_guild_settings_update,
+        validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
+        validate_guild_settings_update, validate_resource_id, validate_summary_template_id,
     };
     use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
     use crate::domain::feedback::{TranscriptFeedbackStatus, TranscriptFeedbackType};
@@ -9354,6 +9643,30 @@ mod guild_api_tests {
             feedback_status.find("require_current_user_is_guild_admin")
                 < feedback_status.find("normalize_feedback_status_request")
         );
+
+        let retry = source
+            .split_once("async fn api_retry_job")
+            .expect("retry handler should exist")
+            .1
+            .split_once("async fn api_cancel_job")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            retry.find("require_current_user_is_guild_admin")
+                < retry.find("parse_job_retry_request_body")
+        );
+
+        let cancel = source
+            .split_once("async fn api_cancel_job")
+            .expect("cancel handler should exist")
+            .1
+            .split_once("async fn api_target_guild_meetings")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            cancel.find("require_current_user_is_guild_admin")
+                < cancel.find("parse_job_cancel_request_body")
+        );
     }
 
     #[test]
@@ -9963,6 +10276,103 @@ mod guild_api_tests {
                 voice_channel_id: Some(" vc-2 ".to_owned()),
             }),
             Some("vc-2".to_owned())
+        );
+    }
+
+    #[test]
+    fn job_list_filter_validation_accepts_known_status_and_type() {
+        let normalized = normalize_job_list_query(&JobListQuery {
+            status: Some(" failed ".to_owned()),
+            job_type: Some("summarize".to_owned()),
+            limit: Some(250),
+        })
+        .expect("known filters should normalize");
+
+        assert_eq!(normalized.status, "failed");
+        assert_eq!(normalized.job_type, "summarize");
+        assert_eq!(normalized.limit, 100);
+
+        assert_eq!(
+            normalize_job_list_query(&JobListQuery {
+                status: Some("bogus".to_owned()),
+                job_type: None,
+                limit: None,
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_job_list_query(&JobListQuery {
+                status: None,
+                job_type: Some("bogus".to_owned()),
+                limit: None,
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn job_admin_raw_inputs_parse_after_authorization_boundary() {
+        let parsed = parse_job_list_query(Some("status=failed&job_type=summarize&limit=5"))
+            .expect("job query should parse");
+        assert_eq!(parsed.status.as_deref(), Some("failed"));
+        assert_eq!(parsed.job_type.as_deref(), Some("summarize"));
+        assert_eq!(parsed.limit, Some(5));
+        assert_eq!(
+            parse_job_list_query(Some("limit=nope")),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let retry = parse_job_retry_request_body(&axum::body::Bytes::from_static(
+            br#"{"next_run_at":"2000-01-01T01:02:03Z"}"#,
+        ))
+        .expect("retry body should parse");
+        assert_eq!(retry.next_run_at.as_deref(), Some("2000-01-01T01:02:03Z"));
+        assert_eq!(
+            parse_job_retry_request_body(&axum::body::Bytes::from_static(b"{")),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let cancel = parse_job_cancel_request_body(&axum::body::Bytes::from_static(
+            br#"{"reason":"operator requested"}"#,
+        ))
+        .expect("cancel body should parse");
+        assert_eq!(cancel.reason, "operator requested");
+        assert_eq!(
+            parse_job_cancel_request_body(&axum::body::Bytes::new()),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn job_retry_and_cancel_requests_are_normalized() {
+        let retry = normalize_job_retry_request(&JobRetryRequest {
+            next_run_at: Some("2000-01-01T01:02:03Z".to_owned()),
+        })
+        .expect("valid timestamp should normalize");
+        assert_eq!(retry.next_run_at, "2000-01-01T01:02:03+00:00");
+        assert_eq!(
+            normalize_job_retry_request(&JobRetryRequest {
+                next_run_at: Some("soon".to_owned()),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_job_retry_request(&JobRetryRequest {
+                next_run_at: Some("2999-01-01T00:00:00Z".to_owned()),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let cancel = normalize_job_cancel_request(&JobCancelRequest {
+            reason: " operator requested ".to_owned(),
+        })
+        .expect("valid reason should normalize");
+        assert_eq!(cancel.reason, "operator requested");
+        assert_eq!(
+            normalize_job_cancel_request(&JobCancelRequest {
+                reason: " ".to_owned(),
+            }),
+            Err(StatusCode::BAD_REQUEST)
         );
     }
 
