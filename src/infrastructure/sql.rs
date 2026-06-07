@@ -444,10 +444,7 @@ WHERE id = $1
 
 pub const RECOVERY_SUMMARY_JOB_STATUS_SQL: &str = r#"
 SELECT status,
-       CASE
-         WHEN next_run_at IS NULL OR next_run_at <= NOW() THEN 'true'
-         ELSE 'false'
-       END AS due
+       to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 FROM jobs
 WHERE id=$1
   AND job_type='summarize'

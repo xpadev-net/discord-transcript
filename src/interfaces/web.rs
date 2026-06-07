@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -48,7 +48,7 @@ use crate::infrastructure::sql::{
     ADMIN_RETRY_JOB_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
     ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL,
     COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL, GET_AI_MEMORY_NOTE_SQL,
-    GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_JOB_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
+    GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
     INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL,
     INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
     INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
@@ -3662,65 +3662,15 @@ fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Opti
 }
 
 fn parse_job_list_query(raw_query: Option<&str>) -> Result<JobListQuery, StatusCode> {
-    let mut query = JobListQuery {
-        status: None,
-        job_type: None,
-        limit: None,
+    let uri = match raw_query {
+        Some(raw_query) if !raw_query.is_empty() => format!("/?{raw_query}")
+            .parse::<Uri>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+        _ => Uri::from_static("/"),
     };
-    let Some(raw_query) = raw_query else {
-        return Ok(query);
-    };
-    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode_query_component(raw_key)?;
-        let value = percent_decode_query_component(raw_value)?;
-        match key.as_str() {
-            "status" => query.status = Some(value),
-            "job_type" => query.job_type = Some(value),
-            "limit" => {
-                query.limit = if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(
-                        value
-                            .trim()
-                            .parse::<u32>()
-                            .map_err(|_| StatusCode::BAD_REQUEST)?,
-                    )
-                };
-            }
-            _ => {}
-        }
-    }
-    Ok(query)
-}
-
-fn percent_decode_query_component(value: &str) -> Result<String, StatusCode> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'+' => {
-                decoded.push(b' ');
-                idx += 1;
-            }
-            b'%' => {
-                if idx + 2 >= bytes.len() {
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-                let hex = std::str::from_utf8(&bytes[idx + 1..idx + 3])
-                    .map_err(|_| StatusCode::BAD_REQUEST)?;
-                decoded.push(u8::from_str_radix(hex, 16).map_err(|_| StatusCode::BAD_REQUEST)?);
-                idx += 3;
-            }
-            byte => {
-                decoded.push(byte);
-                idx += 1;
-            }
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| StatusCode::BAD_REQUEST)
+    Query::<JobListQuery>::try_from_uri(&uri)
+        .map(|Query(query)| query)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 fn parse_job_retry_request_body(body: &Bytes) -> Result<JobRetryRequest, StatusCode> {
@@ -5079,7 +5029,7 @@ async fn api_retry_job(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let Some(row) = row else {
-        return Err(job_operation_miss_status(&state, &auth.guild_id, &job_id).await?);
+        return Err(StatusCode::CONFLICT);
     };
     let response = job_response_from_row(&row);
     record_audit_event(
@@ -5124,7 +5074,7 @@ async fn api_cancel_job(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let Some(row) = row else {
-        return Err(job_operation_miss_status(&state, &auth.guild_id, &job_id).await?);
+        return Err(StatusCode::CONFLICT);
     };
     let response = job_response_from_row(&row);
     record_audit_event(
@@ -5359,23 +5309,6 @@ async fn load_guild_settings(
         discord_bot_user_id: row.get("bot_user_id"),
         discord_bot_username: row.get("bot_username"),
     }))
-}
-
-async fn job_operation_miss_status(
-    state: &WebState,
-    guild_id: &str,
-    job_id: &str,
-) -> Result<StatusCode, StatusCode> {
-    let existing = state
-        .db
-        .query_opt(GET_GUILD_JOB_SQL, &[&guild_id, &job_id])
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(if existing.is_some() {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::NOT_FOUND
-    })
 }
 
 fn normalize_target_guild_id(guild_id: &str) -> Result<String, StatusCode> {
