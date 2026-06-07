@@ -393,6 +393,392 @@ LEFT JOIN plan_quotas pq ON pq.plan_id = sp.plan_id
 ORDER BY pq.dimension, pq.period, pq.id
 "#;
 
+pub const LIST_ADMIN_PLANS_SQL: &str = r#"
+SELECT p.id,
+       p.code,
+       p.name,
+       p.kind,
+       p.status,
+       to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       pq.id AS quota_id,
+       pq.plan_id AS quota_plan_id,
+       pq.dimension AS quota_dimension,
+       pq.period AS quota_period,
+       pq.limit_value AS quota_limit_value,
+       pq.unlimited AS quota_unlimited,
+       pq.enforcement_mode AS quota_enforcement_mode,
+       to_char(pq.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS quota_created_at,
+       to_char(pq.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS quota_updated_at
+FROM plans p
+LEFT JOIN plan_quotas pq ON pq.plan_id = p.id
+ORDER BY p.kind, p.code, p.id, pq.dimension, pq.period, pq.id
+"#;
+
+pub const GET_ADMIN_PLAN_SQL: &str = r#"
+SELECT p.id,
+       p.code,
+       p.name,
+       p.kind,
+       p.status,
+       to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       pq.id AS quota_id,
+       pq.plan_id AS quota_plan_id,
+       pq.dimension AS quota_dimension,
+       pq.period AS quota_period,
+       pq.limit_value AS quota_limit_value,
+       pq.unlimited AS quota_unlimited,
+       pq.enforcement_mode AS quota_enforcement_mode,
+       to_char(pq.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS quota_created_at,
+       to_char(pq.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS quota_updated_at
+FROM plans p
+LEFT JOIN plan_quotas pq ON pq.plan_id = p.id
+WHERE p.id = $1
+ORDER BY pq.dimension, pq.period, pq.id
+"#;
+
+pub const GET_ADMIN_PLAN_BY_CODE_SQL: &str = r#"
+SELECT p.id,
+       p.code,
+       p.name,
+       p.kind,
+       p.status,
+       to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       pq.id AS quota_id,
+       pq.plan_id AS quota_plan_id,
+       pq.dimension AS quota_dimension,
+       pq.period AS quota_period,
+       pq.limit_value AS quota_limit_value,
+       pq.unlimited AS quota_unlimited,
+       pq.enforcement_mode AS quota_enforcement_mode,
+       to_char(pq.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS quota_created_at,
+       to_char(pq.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS quota_updated_at
+FROM plans p
+LEFT JOIN plan_quotas pq ON pq.plan_id = p.id
+WHERE p.code = $1
+ORDER BY pq.dimension, pq.period, pq.id
+"#;
+
+pub const INSERT_ADMIN_PLAN_SQL: &str = r#"
+INSERT INTO plans (id, code, name, kind, status, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+RETURNING id
+"#;
+
+pub const UPDATE_ADMIN_PLAN_SQL: &str = r#"
+UPDATE plans
+SET code = $2,
+    name = $3,
+    kind = $4,
+    status = COALESCE(NULLIF($5, ''), status),
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id
+"#;
+
+pub const ARCHIVE_ADMIN_PLAN_SQL: &str = r#"
+UPDATE plans
+SET status = 'archived',
+    updated_at = CASE WHEN status <> 'archived' THEN NOW() ELSE updated_at END
+WHERE id = $1
+RETURNING id
+"#;
+
+pub const LIST_ADMIN_PLAN_QUOTAS_SQL: &str = r#"
+SELECT id,
+       plan_id,
+       dimension,
+       period,
+       limit_value,
+       unlimited,
+       enforcement_mode,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM plan_quotas
+WHERE plan_id = $1
+ORDER BY dimension, period, id
+"#;
+
+pub const GET_ADMIN_PLAN_QUOTA_SQL: &str = r#"
+SELECT id,
+       plan_id,
+       dimension,
+       period,
+       limit_value,
+       unlimited,
+       enforcement_mode,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM plan_quotas
+WHERE id = $1
+"#;
+
+pub const INSERT_ADMIN_PLAN_QUOTA_SQL: &str = r#"
+INSERT INTO plan_quotas (
+    id, plan_id, dimension, period, limit_value, unlimited, enforcement_mode, created_at, updated_at
+)
+SELECT $1, p.id, $3, $4, $5, $6, $7, NOW(), NOW()
+FROM plans p
+WHERE p.id = $2
+RETURNING id,
+          plan_id,
+          dimension,
+          period,
+          limit_value,
+          unlimited,
+          enforcement_mode,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const UPDATE_ADMIN_PLAN_QUOTA_SQL: &str = r#"
+UPDATE plan_quotas
+SET dimension = $2,
+    period = $3,
+    limit_value = $4,
+    unlimited = $5,
+    enforcement_mode = $6,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id,
+          plan_id,
+          dimension,
+          period,
+          limit_value,
+          unlimited,
+          enforcement_mode,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const DELETE_ADMIN_PLAN_QUOTA_SQL: &str = r#"
+DELETE FROM plan_quotas
+WHERE id = $1
+RETURNING id,
+          plan_id,
+          dimension,
+          period,
+          limit_value,
+          unlimited,
+          enforcement_mode,
+          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+"#;
+
+pub const LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL: &str = r#"
+SELECT gpa.id,
+       gpa.tenant_id,
+       gpa.guild_id,
+       gpa.plan_id,
+       p.code AS plan_code,
+       p.name AS plan_name,
+       gpa.status,
+       to_char(gpa.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
+       to_char(gpa.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
+       to_char(gpa.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
+       gpa.assigned_by_user_id,
+       gpa.source,
+       to_char(gpa.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(gpa.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM guild_plan_assignments gpa
+JOIN plans p ON p.id = gpa.plan_id
+WHERE (NULLIF($1, '') IS NULL OR gpa.guild_id = NULLIF($1, ''))
+  AND (NULLIF($2, '') IS NULL OR gpa.tenant_id = NULLIF($2, ''))
+  AND ($3::TEXT::BOOLEAN OR gpa.status = 'active')
+ORDER BY gpa.valid_from DESC, gpa.created_at DESC, gpa.id DESC
+LIMIT $4::INTEGER
+"#;
+
+pub const GET_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL: &str = r#"
+SELECT gpa.id,
+       gpa.tenant_id,
+       gpa.guild_id,
+       gpa.plan_id,
+       p.code AS plan_code,
+       p.name AS plan_name,
+       gpa.status,
+       to_char(gpa.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
+       to_char(gpa.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
+       to_char(gpa.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
+       gpa.assigned_by_user_id,
+       gpa.source,
+       to_char(gpa.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(gpa.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM guild_plan_assignments gpa
+JOIN plans p ON p.id = gpa.plan_id
+WHERE gpa.id = $1
+"#;
+
+pub const INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL: &str = r#"
+WITH input AS (
+    SELECT $1 AS id,
+           $2 AS tenant_id,
+           $3 AS guild_id,
+           $4 AS plan_id,
+           $5::TIMESTAMPTZ AS valid_from,
+           NULLIF($6, '')::TIMESTAMPTZ AS valid_until,
+           NULLIF($7, '') AS assigned_by_user_id,
+           $8 AS source
+), valid_input AS (
+    SELECT input.*
+    FROM input
+    JOIN tenant_discord_guilds tg
+      ON tg.tenant_id = input.tenant_id
+     AND tg.guild_id = input.guild_id
+     AND tg.status = 'active'
+    JOIN plans p
+      ON p.id = input.plan_id
+     AND p.status = 'active'
+), tenant_period AS (
+    UPDATE tenants
+    SET period_anchor = COALESCE(
+            period_anchor,
+            date_trunc('day', (SELECT valid_from FROM valid_input) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+        ),
+        updated_at = CASE WHEN period_anchor IS NULL THEN NOW() ELSE updated_at END
+    WHERE id = (SELECT tenant_id FROM valid_input)
+      AND status = 'active'
+    RETURNING id, period_anchor
+), inserted AS (
+    INSERT INTO guild_plan_assignments (
+        id, tenant_id, guild_id, plan_id, status, valid_from, valid_until,
+        period_anchor, assigned_by_user_id, source, created_at, updated_at
+    )
+    SELECT valid_input.id,
+           valid_input.tenant_id,
+           valid_input.guild_id,
+           valid_input.plan_id,
+           'active',
+           valid_input.valid_from,
+           valid_input.valid_until,
+           tenant_period.period_anchor,
+           valid_input.assigned_by_user_id,
+           valid_input.source,
+           NOW(),
+           NOW()
+    FROM valid_input
+    JOIN tenant_period ON tenant_period.id = valid_input.tenant_id
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              plan_id,
+              status,
+              valid_from,
+              valid_until,
+              period_anchor,
+              assigned_by_user_id,
+              source,
+              created_at,
+              updated_at
+)
+SELECT inserted.id,
+       inserted.tenant_id,
+       inserted.guild_id,
+       inserted.plan_id,
+       p.code AS plan_code,
+       p.name AS plan_name,
+       inserted.status,
+       to_char(inserted.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
+       to_char(inserted.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
+       to_char(inserted.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
+       inserted.assigned_by_user_id,
+       inserted.source,
+       to_char(inserted.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(inserted.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM inserted
+JOIN plans p ON p.id = inserted.plan_id
+"#;
+
+pub const UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL: &str = r#"
+WITH updated AS (
+    UPDATE guild_plan_assignments gpa
+    SET plan_id = $2,
+        valid_from = $3::TIMESTAMPTZ,
+        valid_until = NULLIF($4, '')::TIMESTAMPTZ,
+        assigned_by_user_id = NULLIF($5, ''),
+        source = $6,
+        updated_at = NOW()
+    FROM plans p
+    WHERE gpa.id = $1
+      AND gpa.status = 'active'
+      AND p.id = $2
+      AND p.status = 'active'
+    RETURNING gpa.id,
+              gpa.tenant_id,
+              gpa.guild_id,
+              gpa.plan_id,
+              gpa.status,
+              gpa.valid_from,
+              gpa.valid_until,
+              gpa.period_anchor,
+              gpa.assigned_by_user_id,
+              gpa.source,
+              gpa.created_at,
+              gpa.updated_at
+)
+SELECT updated.id,
+       updated.tenant_id,
+       updated.guild_id,
+       updated.plan_id,
+       p.code AS plan_code,
+       p.name AS plan_name,
+       updated.status,
+       to_char(updated.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
+       to_char(updated.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
+       to_char(updated.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
+       updated.assigned_by_user_id,
+       updated.source,
+       to_char(updated.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM updated
+JOIN plans p ON p.id = updated.plan_id
+"#;
+
+pub const ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL: &str = r#"
+WITH archived AS (
+    UPDATE guild_plan_assignments
+    SET status = 'revoked',
+        valid_until = CASE
+            WHEN status = 'active'
+             AND valid_from <= NOW()
+             AND valid_until IS NULL THEN NOW()
+            ELSE valid_until
+        END,
+        updated_at = CASE WHEN status = 'active' THEN NOW() ELSE updated_at END
+    WHERE id = $1
+    RETURNING id,
+              tenant_id,
+              guild_id,
+              plan_id,
+              status,
+              valid_from,
+              valid_until,
+              period_anchor,
+              assigned_by_user_id,
+              source,
+              created_at,
+              updated_at
+)
+SELECT archived.id,
+       archived.tenant_id,
+       archived.guild_id,
+       archived.plan_id,
+       p.code AS plan_code,
+       p.name AS plan_name,
+       archived.status,
+       to_char(archived.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_from,
+       to_char(archived.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS valid_until,
+       to_char(archived.period_anchor AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS period_anchor,
+       archived.assigned_by_user_id,
+       archived.source,
+       to_char(archived.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(archived.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM archived
+JOIN plans p ON p.id = archived.plan_id
+"#;
+
 pub const SET_MEETING_STATUS_CAS_SQL: &str = r#"
 WITH updated AS (
     UPDATE meetings

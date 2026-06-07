@@ -77,6 +77,97 @@ export interface UpdateGuildBotTokenRequest {
   bot_token: string;
 }
 
+export type AdminPlanKind = "default" | "beta" | "custom";
+export type AdminPlanStatus = "active" | "archived";
+export type AdminQuotaDimension =
+  | "recording_minutes"
+  | "asr_seconds"
+  | "summary_runs"
+  | "storage_bytes"
+  | "debug_downloads";
+export type AdminQuotaPeriod = "daily" | "monthly" | "total" | "current";
+export type AdminQuotaEnforcementMode = "observe_only" | "enforce";
+export type AdminGuildPlanAssignmentStatus = "active" | "revoked";
+export type AdminGuildPlanAssignmentSource =
+  | "system"
+  | "admin"
+  | "billing_provider"
+  | "migration";
+
+export interface AdminPlan {
+  id: string;
+  code: string;
+  name: string;
+  kind: AdminPlanKind;
+  status: AdminPlanStatus;
+  quotas: AdminPlanQuota[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminPlanUpsertRequest {
+  id?: string;
+  code: string;
+  name: string;
+  kind: AdminPlanKind;
+  status?: AdminPlanStatus;
+}
+
+export interface AdminPlanQuota {
+  id: string;
+  plan_id: string;
+  dimension: AdminQuotaDimension;
+  period: AdminQuotaPeriod;
+  limit_value: number | null;
+  unlimited: boolean;
+  enforcement_mode: AdminQuotaEnforcementMode;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminPlanQuotaUpsertRequest {
+  id?: string;
+  dimension: AdminQuotaDimension;
+  period: AdminQuotaPeriod;
+  limit_value?: number | null;
+  unlimited?: boolean;
+  enforcement_mode: AdminQuotaEnforcementMode;
+}
+
+export interface AdminGuildPlanAssignment {
+  id: string;
+  tenant_id: string;
+  guild_id: string;
+  plan_id: string;
+  plan_code: string;
+  plan_name: string;
+  status: AdminGuildPlanAssignmentStatus;
+  valid_from: string;
+  valid_until: string | null;
+  period_anchor: string;
+  assigned_by_user_id: string | null;
+  source: AdminGuildPlanAssignmentSource;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminGuildPlanAssignmentUpsertRequest {
+  id?: string;
+  tenant_id?: string;
+  guild_id?: string;
+  plan_id: string;
+  valid_from: string;
+  valid_until?: string | null;
+  assigned_by_user_id?: string | null;
+  source: AdminGuildPlanAssignmentSource;
+}
+
+export interface AdminGuildPlanAssignmentCreateRequest
+  extends AdminGuildPlanAssignmentUpsertRequest {
+  tenant_id: string;
+  guild_id: string;
+}
+
 export type DomainKnowledgeContentType =
   | "glossary"
   | "person_name"
