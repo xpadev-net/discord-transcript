@@ -44,13 +44,15 @@ use crate::infrastructure::bot_token::{
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL,
     ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
-    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, GET_AI_MEMORY_NOTE_SQL,
-    GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL,
-    INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL,
-    INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL, INSERT_TRANSCRIPT_FEEDBACK_SQL,
-    INSERT_USAGE_EVENT_SQL, LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
+    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL,
+    GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
+    GET_SUMMARY_TEMPLATE_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
+    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
+    INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL,
+    LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
     LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
     RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
     UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
     UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
@@ -67,21 +69,6 @@ const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
 const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
 const VIEW_CHANNEL: u64 = 1 << 10;
 const ADMINISTRATOR: u64 = 1 << 3;
-const LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL: &str = r#"
-SELECT id,
-       status,
-       to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as started_at,
-       to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as stopped_at,
-       meeting_duration_seconds,
-       title,
-       stop_reason,
-       voice_channel_id
-FROM meetings
-WHERE guild_id = $1
-  AND ($2::TEXT IS NULL OR voice_channel_id = $2)
-ORDER BY started_at DESC
-LIMIT $3
-"#;
 const OPERATIONAL_SCHEMA_READY_SQL: &str = r#"
 SELECT
   to_regclass('public.meetings') IS NOT NULL AS meetings_ready,
@@ -131,8 +118,6 @@ const OPERATIONAL_METRICS_CACHE_TTL_SECS: u64 = 15;
 const MIN_AUDIO_RANGE_BYTES: u64 = 64 * 1024;
 const AUDIO_RANGE_BUCKET_CAPACITY: f64 = 30.0;
 const AUDIO_RANGE_REFILL_PER_SEC: f64 = 10.0;
-const GUILD_MEETINGS_VISIBILITY_SCAN_MIN: u32 = 100;
-const GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT: u32 = 500;
 const GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP: usize = 32;
 const TRANSCRIPT_SSE_MAX_PER_USER_MEETING: usize = 2;
 const TRANSCRIPT_SSE_BASE_POLL_SECS: u64 = 2;
@@ -2305,6 +2290,94 @@ async fn resolve_channel_permission_flags(
     })
 }
 
+async fn resolve_visible_guild_channel_ids(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<Vec<String>, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+
+    let (guild_result, channels_res, member_res) = tokio::join!(
+        get_guild_info(state, auth),
+        state
+            .http_client
+            .get(format!(
+                "https://discord.com/api/guilds/{}/channels",
+                auth.guild_id
+            ))
+            .header("Authorization", &bot_auth)
+            .send(),
+        state
+            .http_client
+            .get(format!(
+                "https://discord.com/api/guilds/{}/members/{user_id}",
+                auth.guild_id
+            ))
+            .header("Authorization", &bot_auth)
+            .send(),
+    );
+
+    let guild = guild_result?;
+
+    let channels_resp = channels_res.map_err(|err| {
+        warn!(error = %err, "discord guild channels API request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let channels_status = channels_resp.status();
+    if channels_status == reqwest::StatusCode::FORBIDDEN
+        || channels_status == reqwest::StatusCode::UNAUTHORIZED
+    {
+        return Ok(Vec::new());
+    }
+    if !channels_status.is_success() {
+        warn!(status = %channels_status, "discord guild channels API non-success");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let channels: Vec<DiscordChannelFull> = channels_resp.json().await.map_err(|err| {
+        warn!(error = %err, "discord guild channels API response parse failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let member_resp = member_res.map_err(|err| {
+        warn!(error = %err, "discord member API request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    if member_resp.status() == reqwest::StatusCode::NOT_FOUND
+        || member_resp.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        return Ok(Vec::new());
+    }
+    if !member_resp.status().is_success() {
+        warn!(status = %member_resp.status(), "discord member API non-success");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let member: DiscordMemberFull = member_resp.json().await.map_err(|err| {
+        warn!(error = %err, "discord member API response parse failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(channels
+        .into_iter()
+        .filter(|channel| !channel.id.is_empty())
+        .filter_map(|channel| {
+            let permissions = compute_channel_permissions(
+                user_id,
+                &guild.owner_id,
+                &auth.guild_id,
+                &member.roles,
+                &guild.roles,
+                &channel.permission_overwrites,
+            );
+            let is_admin = permissions & ADMINISTRATOR != 0;
+            if permissions & VIEW_CHANNEL != 0 || is_admin {
+                Some(channel.id)
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
 async fn check_guild_admin_permission(
     state: &WebState,
     auth: &AuthConfig,
@@ -2660,6 +2733,8 @@ where
 
 #[derive(Deserialize)]
 struct DiscordChannelFull {
+    #[serde(default)]
+    id: String,
     #[serde(default, deserialize_with = "deserialize_permission_overwrites")]
     permission_overwrites: Vec<DiscordOverwrite>,
 }
@@ -3541,30 +3616,6 @@ fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Opti
         .map(str::trim)
         .filter(|voice_channel_id| !voice_channel_id.is_empty())
         .map(str::to_owned)
-}
-
-fn guild_meetings_visibility_scan_limit(page: u32, limit: u32) -> i64 {
-    let requested = u64::from(page.saturating_sub(1))
-        .saturating_mul(u64::from(limit))
-        .saturating_add(u64::from(limit));
-    i64::from(
-        requested
-            .max(u64::from(limit))
-            .max(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_MIN))
-            .min(u64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)) as u32,
-    )
-}
-
-fn can_scan_new_visibility_channel(known_channel_count: usize) -> bool {
-    known_channel_count < GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP
-}
-
-fn guild_meetings_response_total(is_admin: bool, raw_total: i64, visible_count: usize) -> i64 {
-    if is_admin {
-        raw_total
-    } else {
-        i64::try_from(visible_count).unwrap_or(i64::MAX)
-    }
 }
 
 fn user_can_access_target_guild(discord_guilds: &[DiscordGuild], guild_id: &str) -> bool {
@@ -4777,10 +4828,9 @@ async fn list_guild_meetings_for_auth(
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
     let is_admin = check_guild_admin_permission(state, auth, user_id).await?;
-    let (voice_channels, mut channel_visibility) =
-        list_guild_meeting_voice_channels(state, auth, user_id, is_admin).await?;
 
     if is_admin {
+        let voice_channels = list_admin_guild_meeting_voice_channels(state, auth).await?;
         let count_row = state
             .db
             .query_one(
@@ -4811,59 +4861,47 @@ async fn list_guild_meetings_for_auth(
         }));
     }
 
-    let visibility_scan_limit = guild_meetings_visibility_scan_limit(page, limit);
+    let visible_channel_ids =
+        resolve_visible_meeting_channel_ids_for_query(state, auth, user_id, &voice_channel_filter)
+            .await?;
+    if visible_channel_ids.is_empty() {
+        return Ok(Json(GuildMeetingsResponse {
+            guild_id: auth.guild_id.clone(),
+            meetings: Vec::new(),
+            voice_channels: Vec::new(),
+            page,
+            limit,
+            total: 0,
+        }));
+    }
+    let voice_channels =
+        list_visible_guild_meeting_voice_channels(state, auth, &visible_channel_ids).await?;
+
+    let count_row = state
+        .db
+        .query_one(
+            COUNT_VISIBLE_GUILD_MEETINGS_SQL,
+            &[&auth.guild_id, &visible_channel_ids, &voice_channel_filter],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total: i64 = count_row.get(0);
+
     let rows = state
         .db
         .query(
-            LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL,
+            LIST_VISIBLE_GUILD_MEETINGS_SQL,
             &[
                 &auth.guild_id,
+                &visible_channel_ids,
                 &voice_channel_filter,
-                &visibility_scan_limit,
+                &limit_i64,
+                &offset,
             ],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut visible_meetings = Vec::new();
-
-    for row in &rows {
-        let row_voice_channel_id: String = row.get("voice_channel_id");
-        let visible = if let Some(visible) = channel_visibility.get(&row_voice_channel_id) {
-            *visible
-        } else {
-            let filter_targets_row =
-                voice_channel_filter.as_deref() == Some(row_voice_channel_id.as_str());
-            if !filter_targets_row && !can_scan_new_visibility_channel(channel_visibility.len()) {
-                continue;
-            }
-            let visible = guild_meeting_channel_visible_after_row(
-                auth.guild_id.clone(),
-                row_voice_channel_id.clone(),
-                &auth.guild_id,
-                user_id,
-                &state.permission_cache,
-                resolve_channel_permission_flags(state, auth, &row_voice_channel_id, user_id),
-            )
-            .await?;
-            channel_visibility.insert(row_voice_channel_id.clone(), visible);
-            visible
-        };
-
-        if visible {
-            visible_meetings.push(guild_meeting_entry_from_row(row));
-        }
-    }
-
-    // For non-admins we filter before pagination so hidden rows cannot create
-    // sparse pages or leak the guild-wide count. The scan and unique-channel
-    // caps keep Discord permission work bounded until permission-aware
-    // persistence exists.
-    let total = guild_meetings_response_total(false, 0, visible_meetings.len());
-    let meetings = visible_meetings
-        .into_iter()
-        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-        .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .collect();
+    let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
 
     Ok(Json(GuildMeetingsResponse {
         guild_id: auth.guild_id.clone(),
@@ -4875,12 +4913,36 @@ async fn list_guild_meetings_for_auth(
     }))
 }
 
-async fn list_guild_meeting_voice_channels(
+async fn resolve_visible_meeting_channel_ids_for_query(
     state: &WebState,
     auth: &AuthConfig,
     user_id: &str,
-    is_admin: bool,
-) -> Result<(Vec<GuildMeetingVoiceChannelResponse>, HashMap<String, bool>), StatusCode> {
+    voice_channel_filter: &Option<String>,
+) -> Result<Vec<String>, StatusCode> {
+    if let Some(voice_channel_id) = voice_channel_filter {
+        let visible = guild_meeting_channel_visible_after_row(
+            auth.guild_id.clone(),
+            voice_channel_id.clone(),
+            &auth.guild_id,
+            user_id,
+            &state.permission_cache,
+            resolve_channel_permission_flags(state, auth, voice_channel_id, user_id),
+        )
+        .await?;
+        return if visible {
+            Ok(vec![voice_channel_id.clone()])
+        } else {
+            Ok(Vec::new())
+        };
+    }
+
+    resolve_visible_guild_channel_ids(state, auth, user_id).await
+}
+
+async fn list_admin_guild_meeting_voice_channels(
+    state: &WebState,
+    auth: &AuthConfig,
+) -> Result<Vec<GuildMeetingVoiceChannelResponse>, StatusCode> {
     let channel_limit = i64::try_from(GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP).unwrap_or(i64::MAX);
     let rows = state
         .db
@@ -4891,33 +4953,34 @@ async fn list_guild_meeting_voice_channels(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut voice_channels = Vec::new();
-    let mut channel_visibility = HashMap::new();
+    Ok(rows
+        .into_iter()
+        .map(|row| guild_meeting_voice_channel_response(row.get("voice_channel_id")))
+        .collect())
+}
 
-    for row in rows {
-        let voice_channel_id: String = row.get("voice_channel_id");
-        if is_admin {
-            channel_visibility.insert(voice_channel_id.clone(), true);
-            voice_channels.push(guild_meeting_voice_channel_response(voice_channel_id));
-            continue;
-        }
-
-        let visible = guild_meeting_channel_visible_after_row(
-            auth.guild_id.clone(),
-            voice_channel_id.clone(),
-            &auth.guild_id,
-            user_id,
-            &state.permission_cache,
-            resolve_channel_permission_flags(state, auth, &voice_channel_id, user_id),
-        )
-        .await?;
-        channel_visibility.insert(voice_channel_id.clone(), visible);
-        if visible {
-            voice_channels.push(guild_meeting_voice_channel_response(voice_channel_id));
-        }
+async fn list_visible_guild_meeting_voice_channels(
+    state: &WebState,
+    auth: &AuthConfig,
+    visible_channel_ids: &[String],
+) -> Result<Vec<GuildMeetingVoiceChannelResponse>, StatusCode> {
+    if visible_channel_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    Ok((voice_channels, channel_visibility))
+    let rows = state
+        .db
+        .query(
+            LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL,
+            &[&auth.guild_id, &visible_channel_ids],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| guild_meeting_voice_channel_response(row.get("voice_channel_id")))
+        .collect())
 }
 
 async fn load_guild_settings(
@@ -8563,19 +8626,17 @@ mod guild_api_tests {
         BotTokenCacheState, CachedChannelPermission, DiscordBotTokenValidationError,
         DiscordBotTokenValidationStage, DiscordGuild, DiscordGuildFull, DiscordRoleFull,
         DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest, GUILD_CACHE_REFRESH_INFLIGHT_SECS,
-        GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP, GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT,
-        GUILD_MEETINGS_VISIBILITY_SCAN_MIN, GuildAdminCheck, GuildBotTokenUpdateRequest,
-        GuildCache, GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults,
-        GuildSettingsUpdateRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS,
-        PersonAliasUpsertRequest, StoredGuildSettings, SummaryTemplateUpsertRequest,
-        TranscriptFeedbackRequest, TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest,
-        advance_bot_token_revision, bot_auth_header_from_cache_with_resolver,
-        can_scan_new_visibility_channel, classify_discord_bot_token_validation_status,
+        GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache, GuildCacheState,
+        GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest,
+        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
+        StoredGuildSettings, SummaryTemplateUpsertRequest, TranscriptFeedbackRequest,
+        TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
+        bot_auth_header_from_cache_with_resolver, classify_discord_bot_token_validation_status,
         current_user_guilds_response, discord_user_guilds_api_status,
         guild_admin_member_status_decision, guild_admin_permission_cache_key,
         guild_admin_required_result, guild_bot_token_delete_is_noop,
-        guild_info_from_cache_with_resolver, guild_meetings_visibility_scan_limit,
-        guild_settings_response, meeting_feedback_create_audit_detail, normalize_ai_memory_request,
+        guild_info_from_cache_with_resolver, guild_settings_response,
+        meeting_feedback_create_audit_detail, normalize_ai_memory_request,
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
         normalize_feedback_request, normalize_feedback_status_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
@@ -8591,7 +8652,9 @@ mod guild_api_tests {
     use crate::domain::feedback::{TranscriptFeedbackStatus, TranscriptFeedbackType};
     use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
     use crate::infrastructure::sql::{
-        COUNT_GUILD_MEETINGS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
+        COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL,
+        LIST_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_GUILD_MEETINGS_SQL,
+        LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
     };
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -9872,8 +9935,11 @@ mod guild_api_tests {
     fn guild_meetings_queries_filter_guild_before_pagination() {
         let list_sql = LIST_GUILD_MEETINGS_SQL.to_ascii_uppercase();
         let count_sql = COUNT_GUILD_MEETINGS_SQL.to_ascii_uppercase();
-        let visibility_sql = super::LIST_GUILD_MEETINGS_FOR_VISIBILITY_SQL.to_ascii_uppercase();
+        let visible_list_sql = LIST_VISIBLE_GUILD_MEETINGS_SQL.to_ascii_uppercase();
+        let visible_count_sql = COUNT_VISIBLE_GUILD_MEETINGS_SQL.to_ascii_uppercase();
         let channel_sql = LIST_GUILD_MEETING_VOICE_CHANNELS_SQL.to_ascii_uppercase();
+        let visible_channel_sql =
+            LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL.to_ascii_uppercase();
 
         let list_where = list_sql.find("WHERE GUILD_ID = $1").unwrap();
         let list_voice = list_sql.find("VOICE_CHANNEL_ID = $2").unwrap();
@@ -9886,46 +9952,39 @@ mod guild_api_tests {
         assert!(list_where < list_limit);
         assert!(list_where < list_offset);
 
-        let visibility_where = visibility_sql.find("WHERE GUILD_ID = $1").unwrap();
-        let visibility_voice = visibility_sql.find("VOICE_CHANNEL_ID = $2").unwrap();
-        let visibility_limit = visibility_sql.find("LIMIT $3").unwrap();
-        assert!(visibility_where < visibility_voice);
-        assert!(visibility_voice < visibility_limit);
-        assert!(visibility_where < visibility_limit);
-        assert!(!visibility_sql.contains("OFFSET"));
+        let visible_where = visible_list_sql.find("WHERE GUILD_ID = $1").unwrap();
+        let visible_channels = visible_list_sql
+            .find("VOICE_CHANNEL_ID = ANY($2::TEXT[])")
+            .unwrap();
+        let visible_filter = visible_list_sql.find("VOICE_CHANNEL_ID = $3").unwrap();
+        let visible_order = visible_list_sql.find("ORDER BY").unwrap();
+        let visible_limit = visible_list_sql.find("LIMIT $4").unwrap();
+        let visible_offset = visible_list_sql.find("OFFSET $5").unwrap();
+        assert!(visible_where < visible_channels);
+        assert!(visible_channels < visible_filter);
+        assert!(visible_filter < visible_order);
+        assert!(visible_channels < visible_limit);
+        assert!(visible_channels < visible_offset);
 
         assert!(count_sql.contains("WHERE GUILD_ID = $1"));
         assert!(count_sql.contains("VOICE_CHANNEL_ID = $2"));
+        assert!(visible_count_sql.contains("WHERE GUILD_ID = $1"));
+        assert!(visible_count_sql.contains("VOICE_CHANNEL_ID = ANY($2::TEXT[])"));
+        assert!(visible_count_sql.contains("VOICE_CHANNEL_ID = $3"));
         assert!(channel_sql.contains("WHERE GUILD_ID = $1"));
-        assert!(!channel_sql.contains("VOICE_CHANNEL_ID = $2"));
+        assert!(channel_sql.contains("LIMIT $2"));
+        assert!(visible_channel_sql.contains("WHERE GUILD_ID = $1"));
+        assert!(visible_channel_sql.contains("VOICE_CHANNEL_ID = ANY($2::TEXT[])"));
+        assert!(!visible_channel_sql.contains("LIMIT"));
     }
 
     #[test]
-    fn non_admin_guild_meetings_visibility_scan_is_bounded() {
-        assert_eq!(
-            guild_meetings_visibility_scan_limit(1, 20),
-            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_MIN)
-        );
-        assert_eq!(guild_meetings_visibility_scan_limit(2, 100), 200);
-        assert_eq!(
-            guild_meetings_visibility_scan_limit(10_000, 100),
-            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)
-        );
-        assert_eq!(
-            guild_meetings_visibility_scan_limit(1, GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT + 1),
-            i64::from(GUILD_MEETINGS_VISIBILITY_SCAN_LIMIT)
-        );
-    }
+    fn non_admin_guild_meeting_channel_query_has_no_previous_probe_limit() {
+        let visible_channel_sql =
+            LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL.to_ascii_uppercase();
 
-    #[test]
-    fn non_admin_guild_meetings_channel_scan_is_bounded() {
-        assert!(can_scan_new_visibility_channel(0));
-        assert!(can_scan_new_visibility_channel(
-            GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP - 1
-        ));
-        assert!(!can_scan_new_visibility_channel(
-            GUILD_MEETINGS_VISIBILITY_CHANNEL_CAP
-        ));
+        assert!(!visible_channel_sql.contains("LIMIT"));
+        assert!(visible_channel_sql.contains("VOICE_CHANNEL_ID = ANY($2::TEXT[])"));
     }
 }
 
@@ -9936,8 +9995,8 @@ mod discord_channel_full_tests {
         DiscordRoleFull, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS,
         PermissionCache, VIEW_CHANNEL, authorize_debug_artifact_download,
         build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
-        guild_meeting_channel_visible_after_row, guild_meetings_response_total,
-        meeting_access_from_row, verify_meeting_access_after_row,
+        guild_meeting_channel_visible_after_row, meeting_access_from_row,
+        verify_meeting_access_after_row,
     };
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -10265,12 +10324,6 @@ mod discord_channel_full_tests {
         .await;
 
         assert_eq!(result, Ok(true));
-    }
-
-    #[test]
-    fn guild_meetings_total_preserves_admin_count_and_hides_member_count() {
-        assert_eq!(guild_meetings_response_total(true, 42, 3), 42);
-        assert_eq!(guild_meetings_response_total(false, 42, 3), 3);
     }
 
     #[test]
