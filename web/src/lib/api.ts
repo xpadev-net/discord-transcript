@@ -1,4 +1,11 @@
 import type {
+  AdminGuildPlanAssignment,
+  AdminGuildPlanAssignmentCreateRequest,
+  AdminGuildPlanAssignmentUpsertRequest,
+  AdminPlan,
+  AdminPlanQuota,
+  AdminPlanQuotaUpsertRequest,
+  AdminPlanUpsertRequest,
   AiMemoryNote,
   AiMemoryPromoteRequest,
   AiMemorySourceType,
@@ -75,6 +82,28 @@ function guildMeetingsPath(guildId?: string | null): string {
     : "/api/guild/meetings";
 }
 
+function adminPlanPath(planId?: string): string {
+  return planId
+    ? `/api/admin/plans/${encodeURIComponent(planId)}`
+    : "/api/admin/plans";
+}
+
+function adminPlanQuotaPath(quotaId?: string): string {
+  return quotaId
+    ? `/api/admin/quotas/${encodeURIComponent(quotaId)}`
+    : "/api/admin/quotas";
+}
+
+function adminPlanQuotasPath(planId: string): string {
+  return `${adminPlanPath(planId)}/quotas`;
+}
+
+function adminGuildPlanAssignmentPath(assignmentId?: string): string {
+  return assignmentId
+    ? `/api/admin/guild-plan-assignments/${encodeURIComponent(assignmentId)}`
+    : "/api/admin/guild-plan-assignments";
+}
+
 export function buildLoginRedirectUrl(path: string): string {
   return `/auth/login?redirect=${encodeURIComponent(path)}`;
 }
@@ -129,6 +158,15 @@ function handleMeResponse(response: Response): Promise<MeResponse> {
   return handleResponse<MeResponse>(response);
 }
 
+function handleAdminResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    return Promise.reject(
+      new Error(`${response.status} ${response.statusText}`),
+    );
+  }
+  return response.json() as Promise<T>;
+}
+
 function handleGuildMeetingsResponse(
   response: Response,
 ): Promise<MeetingListResponse> {
@@ -136,6 +174,25 @@ function handleGuildMeetingsResponse(
     throw new Error("forbidden");
   }
   return handleResponse<MeetingListResponse>(response);
+}
+
+export interface AdminRequestOptions {
+  bearerToken?: string;
+  signal?: AbortSignal;
+}
+
+function adminHeaders(
+  options: AdminRequestOptions,
+  jsonBody = false,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (options.bearerToken) {
+    headers.Authorization = `Bearer ${options.bearerToken}`;
+  }
+  if (jsonBody) {
+    headers["Content-Type"] = "application/json";
+  }
+  return headers;
 }
 
 export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
@@ -214,6 +271,213 @@ export function deleteGuildBotToken(
     method: "DELETE",
     signal,
   }).then(handleGuildSettingsResponse);
+}
+
+export function fetchAdminPlans(
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan[]> {
+  return fetch(adminPlanPath(), {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan[]>);
+}
+
+export function fetchAdminPlan(
+  planId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan> {
+  return fetch(adminPlanPath(planId), {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan>);
+}
+
+export function fetchAdminDefaultPlan(
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan> {
+  return fetch("/api/admin/plans/default", {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan>);
+}
+
+export function fetchAdminBetaPlan(
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan> {
+  return fetch("/api/admin/plans/beta", {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan>);
+}
+
+export function createAdminPlan(
+  request: AdminPlanUpsertRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan> {
+  return fetch(adminPlanPath(), {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan>);
+}
+
+export function updateAdminPlan(
+  planId: string,
+  request: AdminPlanUpsertRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan> {
+  return fetch(adminPlanPath(planId), {
+    method: "PUT",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan>);
+}
+
+export function archiveAdminPlan(
+  planId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlan> {
+  return fetch(`${adminPlanPath(planId)}/archive`, {
+    method: "POST",
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlan>);
+}
+
+export function fetchAdminPlanQuotas(
+  planId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlanQuota[]> {
+  return fetch(adminPlanQuotasPath(planId), {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlanQuota[]>);
+}
+
+export function fetchAdminPlanQuota(
+  quotaId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlanQuota> {
+  return fetch(adminPlanQuotaPath(quotaId), {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlanQuota>);
+}
+
+export function createAdminPlanQuota(
+  planId: string,
+  request: AdminPlanQuotaUpsertRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlanQuota> {
+  return fetch(adminPlanQuotasPath(planId), {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlanQuota>);
+}
+
+export function updateAdminPlanQuota(
+  quotaId: string,
+  request: AdminPlanQuotaUpsertRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlanQuota> {
+  return fetch(adminPlanQuotaPath(quotaId), {
+    method: "PUT",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlanQuota>);
+}
+
+export function deleteAdminPlanQuota(
+  quotaId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminPlanQuota> {
+  return fetch(adminPlanQuotaPath(quotaId), {
+    method: "DELETE",
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminPlanQuota>);
+}
+
+export function fetchAdminGuildPlanAssignments(
+  options: AdminRequestOptions & {
+    guildId?: string;
+    tenantId?: string;
+    includeArchived?: boolean;
+    limit?: number;
+  } = {},
+): Promise<AdminGuildPlanAssignment[]> {
+  const params = new URLSearchParams();
+  if (options.guildId) {
+    params.set("guild_id", options.guildId);
+  }
+  if (options.tenantId) {
+    params.set("tenant_id", options.tenantId);
+  }
+  if (options.includeArchived !== undefined) {
+    params.set("include_archived", String(options.includeArchived));
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit));
+  }
+  const query = params.toString();
+  const path = query
+    ? `${adminGuildPlanAssignmentPath()}?${query}`
+    : adminGuildPlanAssignmentPath();
+  return fetch(path, {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminGuildPlanAssignment[]>);
+}
+
+export function fetchAdminGuildPlanAssignment(
+  assignmentId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminGuildPlanAssignment> {
+  return fetch(adminGuildPlanAssignmentPath(assignmentId), {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminGuildPlanAssignment>);
+}
+
+export function createAdminGuildPlanAssignment(
+  request: AdminGuildPlanAssignmentCreateRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminGuildPlanAssignment> {
+  return fetch(adminGuildPlanAssignmentPath(), {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminGuildPlanAssignment>);
+}
+
+export function updateAdminGuildPlanAssignment(
+  assignmentId: string,
+  request: AdminGuildPlanAssignmentUpsertRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminGuildPlanAssignment> {
+  return fetch(adminGuildPlanAssignmentPath(assignmentId), {
+    method: "PUT",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminGuildPlanAssignment>);
+}
+
+export function archiveAdminGuildPlanAssignment(
+  assignmentId: string,
+  options: AdminRequestOptions = {},
+): Promise<AdminGuildPlanAssignment> {
+  return fetch(`${adminGuildPlanAssignmentPath(assignmentId)}/archive`, {
+    method: "POST",
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminGuildPlanAssignment>);
 }
 
 export function fetchDomainKnowledgeItems(
