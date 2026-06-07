@@ -10,14 +10,14 @@ interface NavProps {
 }
 
 function canSelectGuild(guild: UserGuild): boolean {
-  return guild.is_member && guild.tenant_id !== null;
+  return guild.is_member && guild.installed;
 }
 
 function guildOptionLabel(guild: UserGuild): string {
   if (!guild.is_member) {
     return `${guild.name}（未参加）`;
   }
-  if (guild.tenant_id === null) {
+  if (!guild.installed) {
     return `${guild.name}（未導入）`;
   }
   return guild.name;
