@@ -615,10 +615,19 @@ fn validate_root_identity(
 ) -> Result<(), AgentWorkspaceError> {
     match root_identity(path) {
         Ok(actual) if &actual == expected => Ok(()),
-        Ok(_) | Err(_) => Err(AgentWorkspaceError::InvalidPath {
-            path: path.to_path_buf(),
-            reason: "agent workspace root identity changed before cleanup",
-        }),
+        Ok(_) | Err(AgentWorkspaceError::InvalidPath { .. }) => {
+            Err(AgentWorkspaceError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "agent workspace root identity changed before cleanup",
+            })
+        }
+        Err(AgentWorkspaceError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Err(AgentWorkspaceError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "agent workspace root identity changed before cleanup",
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -712,7 +721,7 @@ fn read_cleanup_marker(agent_root: &Path) -> Result<String, AgentWorkspaceError>
         path: marker_path.clone(),
         source: err,
     })?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    if !metadata.file_type().is_file() {
         return Err(AgentWorkspaceError::InvalidPath {
             path: marker_path,
             reason: "agent workspace cleanup marker must be a real file",
@@ -1084,7 +1093,7 @@ fn write_cursor_config(
             allow,
             deny: vec![
                 "Read(.env)".to_owned(),
-                "Read(.cursor/.cleanup-token)".to_owned(),
+                cleanup_marker_deny_rule(),
                 "Read(debug/**)".to_owned(),
                 "Read(../**)".to_owned(),
                 "Write(input/**)".to_owned(),
@@ -1094,6 +1103,19 @@ fn write_cursor_config(
     };
     let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
     write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+#[cfg(unix)]
+fn cleanup_marker_deny_rule() -> String {
+    format!(
+        "Read({}/{})",
+        AGENT_CURSOR_DIR, AGENT_CLEANUP_MARKER_FILENAME
+    )
+}
+
+#[cfg(not(unix))]
+fn cleanup_marker_deny_rule() -> String {
+    "Read(.cursor/.cleanup-token)".to_owned()
 }
 
 #[cfg(unix)]
