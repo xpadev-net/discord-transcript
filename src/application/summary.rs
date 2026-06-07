@@ -797,6 +797,17 @@ pub fn materialize_summary_agent_workspace(
     builder.build().map_err(SummaryError::from)
 }
 
+pub fn materialize_new_summary_agent_workspace(
+    request: &SummaryRequest,
+) -> Result<AgentWorkspace, SummaryError> {
+    let agent_root = request
+        .workspace
+        .root()
+        .join("agent")
+        .join(format!("summary-{}", uuid::Uuid::new_v4()));
+    materialize_summary_agent_workspace(request, agent_root)
+}
+
 fn remove_stale_optional_context_file(path: &Path) -> Result<(), SummaryError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1059,7 +1070,8 @@ pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
     let context_manifest = load_summary_context_manifest(request)?;
     let prompt = build_summary_prompt_with_context(request, &manifest, context_manifest.as_ref());
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
-    let markdown = claude.summarize(&prompt, Some(request.workspace.root()))?;
+    let agent_workspace = materialize_new_summary_agent_workspace(request)?;
+    let markdown = claude.summarize(&prompt, Some(agent_workspace.root()))?;
     let message_chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
 
     Ok(SummaryResult {
@@ -1086,8 +1098,11 @@ pub fn build_summary_prompt_with_context(
         .title
         .as_ref()
         .map_or_else(|| "Untitled meeting".to_owned(), Clone::clone);
-    let transcript_path = format!("transcript/{MASKED_TRANSCRIPT_FILENAME}");
-    let manifest_path = format!("transcript/{TRANSCRIPT_MANIFEST_FILENAME}");
+    let transcript_path =
+        summary_agent_input_path(&format!("transcript/{MASKED_TRANSCRIPT_FILENAME}"));
+    let manifest_path =
+        summary_agent_input_path(&format!("transcript/{TRANSCRIPT_MANIFEST_FILENAME}"));
+    let summary_output_path = format!("{AGENT_OUTPUT_DIR}/{AGENT_SUMMARY_OUTPUT_FILENAME}");
     let language = request
         .language
         .as_deref()
@@ -1100,8 +1115,11 @@ pub fn build_summary_prompt_with_context(
         && let Some(path) = context.summary_template_path.as_deref()
     {
         format!(
-            "- If `{path}` is present, read it as the materialized active summary template and follow it as the primary summary structure/instruction set. Interpret any template variables using these values: transcript_path={transcript_path}, manifest_path={manifest_path}, language={language}, speaker_roster={}, domain_context_path={}. Other context paths are listed in `context/{CONTEXT_MANIFEST_FILENAME}`.\n",
-            context.speaker_roster_path, context.domain_knowledge_path
+            "- If `{}` is present, read it as the materialized active summary template and follow it as the primary summary structure/instruction set. Interpret any template variables using these values: transcript_path={transcript_path}, manifest_path={manifest_path}, language={language}, speaker_roster={}, domain_context_path={}. Other context paths are listed in `{}`.\n",
+            summary_agent_input_path(path),
+            summary_agent_input_path(&context.speaker_roster_path),
+            summary_agent_input_path(&context.domain_knowledge_path),
+            summary_agent_input_path(&format!("context/{CONTEXT_MANIFEST_FILENAME}"))
         )
     } else {
         String::new()
@@ -1134,6 +1152,7 @@ Instructions:\n\
 - Read the transcript file to produce the summary; do not expect transcript text inline.\n\
 {context_instructions}\
 {summary_template_instruction}\
+- Write the final markdown summary to `{summary_output_path}`. Do not rely on stdout for the final answer; stdout and stderr are diagnostic-only.\n\
 - Output language: Write the **entire** markdown output in the **same language** as the Whisper setting above (this matches how the transcript was transcribed). That includes all section headings, paragraphs, and list items. Examples: if the setting is `ja`, use Japanese throughout; if `en`, English throughout; if `de`, German throughout.\n\
 - If the Whisper language is shown as `unknown or auto-detected`, infer the output language from the dominant language of the transcript text.\n\
 - Keep the summary concise and actionable without leaking placeholder tokens.\n",
@@ -1150,40 +1169,44 @@ Instructions:\n\
 
 fn summary_context_file_list(context: Option<&SummaryContextManifest>) -> String {
     let Some(context) = context else {
-        return "- context/: reserved for additional knowledge (may be empty)\n".to_owned();
+        return "- input/context/: reserved for additional knowledge (may be empty)\n".to_owned();
     };
 
     let mut lines = format!(
         "- {}: materialized context metadata and file paths\n\
 - {}: materialized speaker roster ({} speakers)\n\
 - {}: materialized active domain knowledge ({} items)\n",
-        context.manifest_path,
-        context.speaker_roster_path,
+        summary_agent_input_path(&context.manifest_path),
+        summary_agent_input_path(&context.speaker_roster_path),
         context.speaker_count,
-        context.domain_knowledge_path,
+        summary_agent_input_path(&context.domain_knowledge_path),
         context.domain_knowledge_count
     );
     if !context.user_feedback_path.is_empty() {
         lines.push_str(&format!(
             "- {}: materialized accepted user feedback ({} items)\n",
-            context.user_feedback_path, context.user_feedback_count
+            summary_agent_input_path(&context.user_feedback_path),
+            context.user_feedback_count
         ));
     }
     if !context.ai_memory_path.is_empty() {
         lines.push_str(&format!(
             "- {}: materialized AI memory hints ({} notes)\n",
-            context.ai_memory_path, context.ai_memory_count
+            summary_agent_input_path(&context.ai_memory_path),
+            context.ai_memory_count
         ));
     }
     if !context.person_aliases_path.is_empty() {
         lines.push_str(&format!(
             "- {}: materialized person alias hints ({} aliases)\n",
-            context.person_aliases_path, context.person_aliases_count
+            summary_agent_input_path(&context.person_aliases_path),
+            context.person_aliases_count
         ));
     }
     if let Some(path) = &context.summary_template_path {
         lines.push_str(&format!(
-            "- {path}: materialized active summary template instructions\n"
+            "- {}: materialized active summary template instructions\n",
+            summary_agent_input_path(path)
         ));
     }
     lines
@@ -1195,18 +1218,18 @@ fn summary_context_priority_instructions(context: &SummaryContextManifest) -> St
 - Context priority, highest to lowest: current transcript and `{}` > `{}` > {} > {} > general knowledge.\n\
 - Use `{}` as authoritative for current-meeting speaker labels. Do not invent speaker identities beyond the transcript and roster.\n\
 - Use `{}` as curated domain knowledge. If it conflicts with accepted feedback, AI memory, aliases, or general knowledge, prefer domain knowledge.\n",
-        context.manifest_path,
-        context.speaker_roster_path,
-        context.domain_knowledge_path,
+        summary_agent_input_path(&context.manifest_path),
+        summary_agent_input_path(&context.speaker_roster_path),
+        summary_agent_input_path(&context.domain_knowledge_path),
         user_feedback_priority_label(context),
         ai_hint_priority_label(context),
-        context.speaker_roster_path,
-        context.domain_knowledge_path
+        summary_agent_input_path(&context.speaker_roster_path),
+        summary_agent_input_path(&context.domain_knowledge_path)
     );
     if !context.user_feedback_path.is_empty() {
         instructions.push_str(&format!(
             "- Use `{}` as accepted user feedback. Prefer it over AI memory, aliases, and general knowledge, but not over the current transcript, speaker roster, or domain knowledge.\n",
-            context.user_feedback_path
+            summary_agent_input_path(&context.user_feedback_path)
         ));
     }
     if !context.ai_memory_path.is_empty() || !context.person_aliases_path.is_empty() {
@@ -1224,7 +1247,10 @@ fn user_feedback_priority_label(context: &SummaryContextManifest) -> String {
     if context.user_feedback_path.is_empty() {
         "accepted user feedback (not materialized in this manifest)".to_owned()
     } else {
-        format!("`{}`", context.user_feedback_path)
+        format!(
+            "`{}`",
+            summary_agent_input_path(&context.user_feedback_path)
+        )
     }
 }
 
@@ -1235,19 +1261,28 @@ fn ai_hint_priority_label(context: &SummaryContextManifest) -> String {
     ) {
         (false, false) => format!(
             "`{}` and `{}`",
-            context.ai_memory_path, context.person_aliases_path
+            summary_agent_input_path(&context.ai_memory_path),
+            summary_agent_input_path(&context.person_aliases_path)
         ),
         (false, true) => format!(
             "`{}` and person aliases (not materialized in this manifest)",
-            context.ai_memory_path
+            summary_agent_input_path(&context.ai_memory_path)
         ),
         (true, false) => format!(
             "AI memory (not materialized in this manifest) and `{}`",
-            context.person_aliases_path
+            summary_agent_input_path(&context.person_aliases_path)
         ),
         (true, true) => {
             "AI memory and person aliases (not materialized in this manifest)".to_owned()
         }
+    }
+}
+
+fn summary_agent_input_path(relative_workspace_path: &str) -> String {
+    if relative_workspace_path.starts_with("input/") {
+        relative_workspace_path.to_owned()
+    } else {
+        format!("input/{relative_workspace_path}")
     }
 }
 
@@ -1271,15 +1306,23 @@ fn summary_template_values(
     _manifest: &TranscriptManifest,
 ) -> SummaryTemplateVariables {
     SummaryTemplateVariables {
-        transcript_path: format!("transcript/{MASKED_TRANSCRIPT_FILENAME}"),
-        manifest_path: format!("transcript/{TRANSCRIPT_MANIFEST_FILENAME}"),
+        transcript_path: summary_agent_input_path(&format!(
+            "transcript/{MASKED_TRANSCRIPT_FILENAME}"
+        )),
+        manifest_path: summary_agent_input_path(&format!(
+            "transcript/{TRANSCRIPT_MANIFEST_FILENAME}"
+        )),
         language: request
             .language
             .as_deref()
             .unwrap_or("unknown or auto-detected")
             .to_owned(),
-        speaker_roster: format!("context/{CONTEXT_SPEAKER_ROSTER_FILENAME}"),
-        domain_context_path: format!("context/{CONTEXT_DOMAIN_KNOWLEDGE_FILENAME}"),
+        speaker_roster: summary_agent_input_path(&format!(
+            "context/{CONTEXT_SPEAKER_ROSTER_FILENAME}"
+        )),
+        domain_context_path: summary_agent_input_path(&format!(
+            "context/{CONTEXT_DOMAIN_KNOWLEDGE_FILENAME}"
+        )),
     }
 }
 

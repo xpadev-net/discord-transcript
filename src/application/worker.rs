@@ -5,9 +5,10 @@ use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
     TranscriptionOutput, build_correction_prompt_with_context, build_summary_prompt_with_context,
-    correct_transcript_with_prompt_and_workdir, materialize_or_load_summary_context,
-    persist_correction_prompt_debug_artifact, persist_pre_correction_transcript_debug_artifact,
-    persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
+    correct_transcript_with_prompt_and_workdir, materialize_new_summary_agent_workspace,
+    materialize_or_load_summary_context, persist_correction_prompt_debug_artifact,
+    persist_pre_correction_transcript_debug_artifact, persist_summary_prompt_debug_artifact,
+    run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::confidence::ConfidencePermille;
@@ -613,7 +614,15 @@ where
     };
     let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
-    let markdown = match claude.summarize(&prompt, Some(request.workspace.root())) {
+    let agent_workspace = match materialize_new_summary_agent_workspace(&request) {
+        Ok(value) => value,
+        Err(err) => {
+            error!(meeting_id = %input.meeting_id, error = %err, "summary agent workspace materialization failed");
+            revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
+            return Err(WorkerError::from(err));
+        }
+    };
+    let markdown = match claude.summarize(&prompt, Some(agent_workspace.root())) {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summarization failed");

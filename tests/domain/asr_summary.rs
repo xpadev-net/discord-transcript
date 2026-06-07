@@ -749,7 +749,9 @@ fn prompt_contains_required_sections() {
     assert!(prompt.contains("## TODO"));
     assert!(prompt.contains("## Open Questions"));
     assert!(prompt.contains("Meeting ID: m1"));
-    assert!(prompt.contains("transcript/transcript_masked.md"));
+    assert!(prompt.contains("input/transcript/transcript_masked.md"));
+    assert!(prompt.contains("output/summary.md"));
+    assert!(prompt.contains("stdout and stderr are diagnostic-only"));
     assert!(
         prompt.contains("speaker names"),
         "prompt should guide model to retain speaker attribution"
@@ -897,15 +899,15 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
 
     let prompt =
         build_summary_prompt_with_context(&request, &transcript_manifest, Some(&context_manifest));
-    assert!(prompt.contains("context/manifest.json"));
-    assert!(prompt.contains("context/speaker_roster.md"));
-    assert!(prompt.contains("context/domain_knowledge.md"));
-    assert!(prompt.contains("context/ai_memory.md"));
-    assert!(prompt.contains("context/person_aliases.md"));
-    assert!(prompt.contains("context/user_feedback.md"));
+    assert!(prompt.contains("input/context/manifest.json"));
+    assert!(prompt.contains("input/context/speaker_roster.md"));
+    assert!(prompt.contains("input/context/domain_knowledge.md"));
+    assert!(prompt.contains("input/context/ai_memory.md"));
+    assert!(prompt.contains("input/context/person_aliases.md"));
+    assert!(prompt.contains("input/context/user_feedback.md"));
     assert!(prompt.contains("non-authoritative hints"));
-    assert!(prompt.contains("current transcript and `context/speaker_roster.md`"));
-    assert!(prompt.contains("context/summary_template.txt"));
+    assert!(prompt.contains("current transcript and `input/context/speaker_roster.md`"));
+    assert!(prompt.contains("input/context/summary_template.txt"));
     assert!(!prompt.contains(secret_domain_body));
     assert!(!prompt.contains(secret_ai_memory_body));
     assert!(!prompt.contains(secret_feedback_note));
@@ -1133,6 +1135,6 @@ fn summary_prompt_template_renders_custom_template() {
 
     assert_eq!(
         prompt,
-        "Summarize transcript/transcript_masked.md with transcript/manifest.json in en."
+        "Summarize input/transcript/transcript_masked.md with input/transcript/manifest.json in en."
     );
 }
