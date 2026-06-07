@@ -4831,7 +4831,9 @@ fn admin_guild_plan_assignment_response_from_row(
         status: row.get("status"),
         valid_from: row.get("valid_from"),
         valid_until: row.get("valid_until"),
-        period_anchor: row.get("period_anchor"),
+        period_anchor: row
+            .get::<_, Option<String>>("period_anchor")
+            .unwrap_or_default(),
         assigned_by_user_id: row.get("assigned_by_user_id"),
         source: row.get("source"),
         created_at: row.get("created_at"),
@@ -11081,6 +11083,15 @@ mod guild_api_tests {
         assert!(source.contains("StatusCode::CONFLICT"));
         assert!(source.contains("\"name\": response.name.clone()"));
         assert!(source.contains("\"assigned_by_user_id\": response.assigned_by_user_id.clone()"));
+        assert!(source.contains("get::<_, Option<String>>(\"period_anchor\")"));
+        assert!(
+            include_str!("../../migrations/0020_plans_and_quotas.sql")
+                .contains("period_anchor TIMESTAMPTZ NOT NULL")
+        );
+        assert!(
+            include_str!("../../migrations/0022_forward_fixups_for_0020_0021.sql")
+                .contains("ALTER COLUMN period_anchor SET NOT NULL")
+        );
         assert!(!LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL.contains("TEXT::BOOLEAN"));
         assert!(
             LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL.contains("AND ($3 OR gpa.status = 'active')")
