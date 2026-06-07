@@ -14,10 +14,12 @@ use discord_transcript::infrastructure::sql::{
     ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_PERSON_ALIAS_SQL, INCREMENTAL_MIGRATIONS_SQL,
     INSERT_AI_MEMORY_NOTE_SQL, INSERT_PERSON_ALIAS_SQL, INSERT_TRANSCRIPT_FEEDBACK_SQL,
     LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, MIGRATIONS,
-    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL,
+    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
 };
-use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, SqlMeetingStore};
+use discord_transcript::infrastructure::sql_store::{
+    FakeSqlExecutor, SqlMeetingStore, sql_row_from_strings,
+};
 
 fn ai_memory_feedback_migration_sql() -> &'static str {
     MIGRATIONS
@@ -27,12 +29,29 @@ fn ai_memory_feedback_migration_sql() -> &'static str {
         .sql
 }
 
+fn forward_fixups_migration_sql() -> &'static str {
+    MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0022_forward_fixups_for_0020_0021")
+        .expect("forward fixup migration should be registered")
+        .sql
+}
+
 fn sql_between<'a>(sql: &'a str, start: &str, end: &str) -> &'a str {
     sql.split_once(start)
         .expect("start marker should be present")
         .1
         .split_once(end)
         .expect("end marker should be present")
+        .0
+}
+
+fn constraint_block<'a>(sql: &'a str, constraint: &str) -> &'a str {
+    sql.split_once(constraint)
+        .expect("constraint should be present")
+        .1
+        .split_once("EXCEPTION")
+        .expect("constraint block should handle duplicate_object")
         .0
 }
 
@@ -148,6 +167,25 @@ fn migrations_register_ai_memory_feedback_schema_after_plan_quotas() {
 }
 
 #[test]
+fn migrations_register_forward_fixups_after_ai_memory_feedback() {
+    let version = MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+
+    let ai_memory_position = version
+        .iter()
+        .position(|version| *version == "0021_ai_memory_feedback")
+        .expect("ai memory migration should be registered");
+    let forward_fixup_position = version
+        .iter()
+        .position(|version| *version == "0022_forward_fixups_for_0020_0021")
+        .expect("forward fixup migration should be registered");
+
+    assert!(forward_fixup_position > ai_memory_position);
+}
+
+#[test]
 fn incremental_migrations_include_ai_memory_feedback_schema() {
     let schema = INCREMENTAL_MIGRATIONS_SQL;
 
@@ -255,6 +293,97 @@ fn schema_constrains_feedback_kinds_and_targets() {
     assert!(schema.contains("transcript_feedback_converted_ai_memory_target_check"));
     assert!(schema.contains("transcript_feedback_target_exclusive_check"));
     assert!(schema.contains("transcript_feedback_segment_meeting_check"));
+}
+
+#[test]
+fn forward_fixups_migration_adds_feedback_constraints_for_existing_0021_tables() {
+    let sql = forward_fixups_migration_sql();
+
+    for constraint in [
+        "transcript_feedback_mistranscription_text_required_check",
+        "transcript_feedback_speaker_required_check",
+        "transcript_feedback_person_alias_required_check",
+        "transcript_feedback_converted_domain_target_check",
+        "transcript_feedback_converted_ai_memory_target_check",
+    ] {
+        let block = constraint_block(sql, constraint);
+        assert!(block.contains(") NOT VALID"), "{constraint} should be added NOT VALID");
+    }
+    assert!(sql.contains("ALTER TABLE transcript_feedback"));
+    assert!(sql.contains("EXCEPTION\n    WHEN duplicate_object THEN NULL"));
+    assert!(!sql.contains("DROP TABLE"));
+    assert!(!sql.contains("DROP COLUMN"));
+}
+
+#[test]
+fn forward_fixups_migration_aligns_old_ai_memory_and_alias_schema() {
+    let sql = forward_fixups_migration_sql();
+
+    assert!(sql.contains("DROP INDEX IF EXISTS idx_ai_memory_notes_guild_tags"));
+    assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_ai_memory_notes_tags_gin"));
+    assert!(sql.contains("DROP CONSTRAINT IF EXISTS ai_memory_notes_source_feedback_fk"));
+    assert!(sql.contains("ai_memory_notes_source_feedback_scope_fk"));
+    assert!(sql.contains("ai_memory_notes_source_feedback_delete_fk"));
+    assert!(sql.contains("DROP CONSTRAINT IF EXISTS person_aliases_source_feedback_fk"));
+    assert!(sql.contains("ADD COLUMN IF NOT EXISTS created_actor_user_id TEXT"));
+    assert!(sql.contains("ADD COLUMN IF NOT EXISTS updated_actor_user_id TEXT"));
+    assert!(sql.contains("COALESCE(NULLIF(created_actor_user_id, ''), 'migration')"));
+    assert!(sql.contains("person_aliases_created_actor_nonempty_check"));
+    assert!(sql.contains("person_aliases_updated_actor_nonempty_check"));
+    assert!(sql.contains("person_aliases_source_feedback_scope_fk"));
+    assert!(sql.contains("person_aliases_source_feedback_delete_fk"));
+    assert!(sql.contains("person_aliases_guild_source_meeting"));
+    assert!(sql.contains("person_aliases_source_feedback"));
+}
+
+#[test]
+fn forward_fixups_migration_aligns_old_feedback_reference_cleanup_shape() {
+    let sql = forward_fixups_migration_sql();
+
+    assert!(sql.contains("transcript_feedback_meeting_fk"));
+    assert!(sql.contains("transcript_feedback_segment_fk"));
+    assert!(sql.contains("transcript_feedback_segment_delete_fk"));
+    assert!(sql.contains("DROP CONSTRAINT IF EXISTS transcript_feedback_meeting_delete_fk"));
+    assert!(sql.contains("DEFERRABLE INITIALLY DEFERRED NOT VALID"));
+    assert!(sql.contains("REFERENCES transcripts(id) ON DELETE SET NULL"));
+    assert!(sql.contains("CREATE OR REPLACE FUNCTION clear_ai_feedback_meeting_refs()"));
+    assert!(sql.contains("DROP TRIGGER IF EXISTS trg_clear_transcript_feedback_meeting_refs"));
+    assert!(sql.contains("DROP TRIGGER IF EXISTS trg_clear_ai_feedback_meeting_refs"));
+    assert!(sql.contains("DROP FUNCTION IF EXISTS clear_transcript_feedback_meeting_refs()"));
+    assert!(sql.contains("CREATE TRIGGER trg_clear_ai_feedback_meeting_refs"));
+}
+
+#[test]
+fn forward_fixups_apply_when_older_0020_and_0021_versions_are_recorded() {
+    let mut executor = FakeSqlExecutor::default();
+    for migration in MIGRATIONS {
+        if migration.version != "0022_forward_fixups_for_0020_0021" {
+            executor.query_rows_result.insert(
+                format!("{SELECT_SCHEMA_MIGRATION_SQL}|{}", migration.version),
+                vec![sql_row_from_strings(vec!["1".to_owned()])],
+            );
+        }
+    }
+
+    let mut store = SqlMeetingStore::new(executor);
+    store
+        .apply_pending_migrations()
+        .expect("forward fixup migration should apply");
+
+    let applied_sql = store
+        .executor
+        .executed
+        .iter()
+        .map(|(sql, _)| sql.as_str())
+        .filter(|sql| sql.starts_with("BEGIN;"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(applied_sql.len(), 1);
+    assert!(applied_sql[0].contains("ALTER COLUMN period_anchor SET NOT NULL"));
+    assert!(applied_sql[0].contains("transcript_feedback_person_alias_required_check"));
+    assert!(applied_sql[0].contains(
+        "INSERT INTO schema_migrations (version) VALUES ('0022_forward_fixups_for_0020_0021')"
+    ));
 }
 
 #[test]

@@ -3,9 +3,17 @@ use discord_transcript::domain::plans::{
     PlanFallback, PlanKind, QuotaDimension, QuotaEnforcementMode, QuotaLimit, QuotaPeriod,
 };
 use discord_transcript::infrastructure::sql::{
-    INCREMENTAL_MIGRATIONS_SQL, RESOLVE_PLAN_FOR_GUILD_SQL,
+    INCREMENTAL_MIGRATIONS_SQL, MIGRATIONS, RESOLVE_PLAN_FOR_GUILD_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, SqlMeetingStore, SqlRow};
+
+fn forward_fixups_migration_sql() -> &'static str {
+    MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0022_forward_fixups_for_0020_0021")
+        .expect("forward fixup migration should be registered")
+        .sql
+}
 
 fn sql_row(values: Vec<Option<&str>>) -> SqlRow {
     values
@@ -58,6 +66,40 @@ fn incremental_migrations_include_plan_quota_assignment_schema() {
     assert!(schema.contains("'quota:default:debug_downloads:monthly'"));
     assert!(schema.contains("'quota:beta:debug_downloads:monthly'"));
     assert!(schema.contains("ON CONFLICT DO NOTHING"));
+}
+
+#[test]
+fn forward_fixups_migration_backfills_guild_plan_assignment_period_anchor() {
+    let sql = forward_fixups_migration_sql();
+    let add_column_position = sql
+        .find("ADD COLUMN IF NOT EXISTS period_anchor TIMESTAMPTZ")
+        .expect("period_anchor column should be added");
+    let tenant_backfill_position = sql
+        .find("COALESCE(gpa.period_anchor, t.period_anchor, gpa.valid_from)")
+        .expect("tenant period anchor backfill should run");
+    let fallback_backfill_position = sql
+        .find("COALESCE(period_anchor, valid_from, NOW())")
+        .expect("fallback period anchor backfill should run");
+    let not_null_position = sql
+        .find("ALTER COLUMN period_anchor SET NOT NULL")
+        .expect("period_anchor should become non-nullable");
+
+    assert!(add_column_position < tenant_backfill_position);
+    assert!(tenant_backfill_position < fallback_backfill_position);
+    assert!(fallback_backfill_position < not_null_position);
+}
+
+#[test]
+fn forward_fixups_migration_aligns_old_plan_quota_index_and_debug_periods() {
+    let sql = forward_fixups_migration_sql();
+
+    assert!(sql.contains("quota:default:debug_downloads:daily"));
+    assert!(sql.contains("quota:default:debug_downloads:monthly"));
+    assert!(sql.contains("quota:beta:debug_downloads:daily"));
+    assert!(sql.contains("quota:beta:debug_downloads:monthly"));
+    assert!(sql.contains("DROP INDEX IF EXISTS idx_plan_quotas_plan_dimension_period"));
+    assert!(sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_quotas_plan_dimension"));
+    assert!(sql.contains("ON plan_quotas (plan_id, dimension)"));
 }
 
 #[test]

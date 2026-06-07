@@ -20,7 +20,7 @@ export interface UserGuild {
   icon: string | null;
   is_member: boolean;
   is_admin: boolean;
-  tenant_id: string | null;
+  installed: boolean;
 }
 
 export interface MeetingListItem {
