@@ -916,12 +916,11 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
             created_at: updated_at,
             updated_at,
         }],
-        ai_memory: vec![ai_memory_note(
-            "mem-1",
-            "Prior hint",
-            secret_ai_memory_body,
-            updated_at,
-        )],
+        ai_memory: vec![{
+            let mut memory = ai_memory_note("mem-1", "Prior hint", secret_ai_memory_body, updated_at);
+            memory.source_meeting_id = Some("m1".to_owned());
+            memory
+        }],
         user_feedback: vec![{
             let mut feedback = accepted_feedback("fb-1", secret_feedback_note, updated_at);
             feedback.meeting_id = Some("m1".to_owned());
@@ -1329,6 +1328,60 @@ fn materialized_summary_context_rejects_cross_meeting_feedback_phrase_overlap() 
     assert!(!rendered.contains("PRIVATE_PHRASE_OVERLAP_NOTE"));
     assert!(!rendered.contains("PRIVATE_PHRASE_OVERLAP_GUIDANCE"));
     assert!(!rendered.contains("fb-private-phrase-overlap"));
+}
+
+#[test]
+fn materialized_summary_context_rejects_cross_meeting_ai_memory_for_same_speaker_name() {
+    let temp = unique_workspace("context_private_ai_memory_same_speaker", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Standup".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut memory = ai_memory_note(
+        "mem-private-same-speaker",
+        "Alice Example private plan",
+        "PRIVATE_SAME_SPEAKER_AI_MEMORY Alice Example private plan",
+        updated_at,
+    );
+    memory.source_meeting_id = Some("m-private".to_owned());
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "123".to_owned(),
+            username: Some("alice_dev".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: Some("Alice Example".to_owned()),
+        }],
+        ai_memory: vec![memory],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("[0-1000] Alice Example: public standup covered release health"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.ai_memory_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");
+    assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_AI_MEMORY"));
+    assert!(!rendered.contains("mem-private-same-speaker"));
 }
 
 #[test]

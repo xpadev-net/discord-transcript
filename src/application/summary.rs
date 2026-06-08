@@ -979,9 +979,13 @@ impl ContextRelevanceEvidence {
     }
 
     fn matches_ai_memory(&self, note: &AiMemoryNote) -> bool {
-        note.source_meeting_id.as_deref() == Some(self.meeting_id.as_str())
-            || self.contains_phrase(&note.title)
-            || self.contains_phrase(&note.body)
+        if note.source_meeting_id.as_deref() == Some(self.meeting_id.as_str()) {
+            return true;
+        }
+        if note.source_meeting_id.is_some() {
+            return false;
+        }
+        self.contains_phrase(&note.title) || self.contains_phrase(&note.body)
     }
 
     fn matches_person_alias(&self, alias: &PersonAlias) -> bool {
