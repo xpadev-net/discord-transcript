@@ -24,7 +24,7 @@ use crate::domain::plans::{
 use crate::domain::summary_template::{NewSummaryTemplate, SummaryTemplate, UpdateSummaryTemplate};
 use crate::domain::usage::{NewUsageEvent, UsageAggregate, UsageEvent, UsageMetric};
 use crate::domain::{JobStatus, JobType};
-use crate::infrastructure::queue::{Job, JobQueue, QueueError};
+use crate::infrastructure::queue::{Job, JobQueue, QueueError, require_claim_token};
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, AGGREGATE_RECENT_USAGE_SQL,
     ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL,
@@ -32,8 +32,8 @@ use crate::infrastructure::sql::{
     CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL, ENQUEUE_JOB_SQL,
     GET_ACTIVE_SUMMARY_TEMPLATE_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL,
     GET_EFFECTIVE_MEETING_SETTINGS_SQL, GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
-    GET_SUMMARY_TEMPLATE_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_PERSON_ALIAS_SQL,
+    GET_SUMMARY_TEMPLATE_SQL, HEARTBEAT_RUNNING_JOB_SQL, INSERT_AI_MEMORY_NOTE_SQL,
+    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_PERSON_ALIAS_SQL,
     INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
     INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
     INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL, LIST_AI_MEMORY_NOTES_SQL,
@@ -95,7 +95,12 @@ impl SqlExecutor for FakeSqlExecutor {
         if let Some(err) = self.execute_error.get(&key) {
             return Err(err.clone());
         }
-        Ok(*self.execute_result.get(&key).unwrap_or(&1))
+        let wildcard_key = format!("{sql}|*");
+        Ok(*self
+            .execute_result
+            .get(&key)
+            .or_else(|| self.execute_result.get(&wildcard_key))
+            .unwrap_or(&1))
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
@@ -108,9 +113,11 @@ impl SqlExecutor for FakeSqlExecutor {
         if let Some(err) = self.query_rows_error.get(&key) {
             return Err(err.clone());
         }
+        let wildcard_key = format!("{sql}|*");
         Ok(self
             .query_rows_result
             .get(&key)
+            .or_else(|| self.query_rows_result.get(&wildcard_key))
             .cloned()
             .unwrap_or_default())
     }
@@ -957,9 +964,10 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
     }
 
     fn claim_next(&mut self, job_type: JobType) -> Result<Option<Job>, QueueError> {
+        let claim_token = uuid::Uuid::new_v4().to_string();
         let rows = self
             .executor
-            .query_rows(CLAIM_JOB_SQL, &[job_type.as_str().to_owned()])
+            .query_rows(CLAIM_JOB_SQL, &[job_type.as_str().to_owned(), claim_token])
             .map_err(QueueError::Backend)?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
@@ -968,9 +976,10 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
     }
 
     fn claim_by_id(&mut self, job_id: &str) -> Result<Option<Job>, QueueError> {
+        let claim_token = uuid::Uuid::new_v4().to_string();
         let rows = self
             .executor
-            .query_rows(CLAIM_JOB_BY_ID_SQL, &[job_id.to_owned()])
+            .query_rows(CLAIM_JOB_BY_ID_SQL, &[job_id.to_owned(), claim_token])
             .map_err(QueueError::Backend)?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
@@ -978,30 +987,52 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         parse_job_row(&row).map(Some)
     }
 
-    fn mark_done(&mut self, job_id: &str) -> Result<(), QueueError> {
-        // SQL has `AND status = 'running'`, so affected==0 can mean either
-        // "job not found" or "job exists but not in running state". We return
-        // NotFound because SQL cannot distinguish the two without a second query.
+    fn heartbeat(&mut self, job: &Job) -> Result<(), QueueError> {
+        let claim_token = require_claim_token(job)?;
         let affected = self
             .executor
-            .execute(MARK_JOB_DONE_SQL, &[job_id.to_owned()])
+            .execute(
+                HEARTBEAT_RUNNING_JOB_SQL,
+                &[job.id.clone(), claim_token.to_owned()],
+            )
             .map_err(QueueError::Backend)?;
         if affected == 0 {
             return Err(QueueError::NotFound {
-                job_id: job_id.to_owned(),
+                job_id: job.id.clone(),
             });
         }
         Ok(())
     }
 
-    fn mark_failed(&mut self, job_id: &str, error_message: String) -> Result<(), QueueError> {
+    fn mark_done(&mut self, job: &Job) -> Result<(), QueueError> {
+        let claim_token = require_claim_token(job)?;
+        // SQL has `AND status = 'running'`, so affected==0 can mean either
+        // "job not found" or "job exists but not in running state". We return
+        // NotFound because SQL cannot distinguish the two without a second query.
         let affected = self
             .executor
-            .execute(MARK_JOB_FAILED_SQL, &[job_id.to_owned(), error_message])
+            .execute(MARK_JOB_DONE_SQL, &[job.id.clone(), claim_token.to_owned()])
             .map_err(QueueError::Backend)?;
         if affected == 0 {
             return Err(QueueError::NotFound {
-                job_id: job_id.to_owned(),
+                job_id: job.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn mark_failed(&mut self, job: &Job, error_message: String) -> Result<(), QueueError> {
+        let claim_token = require_claim_token(job)?;
+        let affected = self
+            .executor
+            .execute(
+                MARK_JOB_FAILED_SQL,
+                &[job.id.clone(), error_message, claim_token.to_owned()],
+            )
+            .map_err(QueueError::Backend)?;
+        if affected == 0 {
+            return Err(QueueError::NotFound {
+                job_id: job.id.clone(),
             });
         }
         Ok(())
@@ -1009,20 +1040,26 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
 
     fn retry(
         &mut self,
-        job_id: &str,
+        job: &Job,
         error_message: String,
         max_retries: u32,
     ) -> Result<JobStatus, QueueError> {
+        let claim_token = require_claim_token(job)?;
         let rows = self
             .executor
             .query_rows(
                 RETRY_JOB_SQL,
-                &[job_id.to_owned(), error_message, max_retries.to_string()],
+                &[
+                    job.id.clone(),
+                    error_message,
+                    max_retries.to_string(),
+                    claim_token.to_owned(),
+                ],
             )
             .map_err(QueueError::Backend)?;
         let Some(row) = rows.into_iter().next() else {
             return Err(QueueError::NotFound {
-                job_id: job_id.to_owned(),
+                job_id: job.id.clone(),
             });
         };
         let status_value = row
@@ -1048,7 +1085,7 @@ fn require_job_column(
 }
 
 fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
-    if row.len() < 6 {
+    if row.len() < 7 {
         return Err(QueueError::Backend(format!(
             "invalid claimed job row length: {}",
             row.len()
@@ -1072,7 +1109,8 @@ fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
         status,
         retry_count,
         error_message: row.get(5).and_then(|v| v.clone()),
-        next_run_at: parse_optional_job_timestamp(row.get(6).and_then(|v| v.clone()))?,
+        claim_token: row.get(6).and_then(|v| v.clone()),
+        next_run_at: parse_optional_job_timestamp(row.get(7).and_then(|v| v.clone()))?,
     })
 }
 

@@ -119,6 +119,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0025_guild_rbac",
         sql: include_str!("../../migrations/0025_guild_rbac.sql"),
     },
+    Migration {
+        version: "0026_job_claim_token",
+        sql: include_str!("../../migrations/0026_job_claim_token.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -183,6 +187,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0024_job_operations.sql"),
     "\n",
     include_str!("../../migrations/0025_guild_rbac.sql"),
+    "\n",
+    include_str!("../../migrations/0026_job_claim_token.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1264,6 +1270,7 @@ SET status='queued',
     error_message=NULL,
     next_run_at=NULL,
     leased_until=NULL,
+    claim_token=NULL,
     updated_at=NOW()
 WHERE id=$1
   AND job_type='summarize'
@@ -1282,6 +1289,7 @@ UPDATE jobs
 SET leased_until = NOW() + INTERVAL '90 seconds',
     updated_at = NOW()
 WHERE id = $1
+  AND claim_token = $2
   AND status = 'running'
 "#;
 
@@ -1294,6 +1302,40 @@ WHERE id=$1
 LIMIT 1
 "#;
 
+pub const RECOVERY_READY_SUMMARY_JOBS_SQL: &str = r#"
+WITH requeued AS (
+    UPDATE jobs
+    SET status='queued',
+        error_message=NULL,
+        next_run_at=NULL,
+        leased_until=NULL,
+        claim_token=NULL,
+        updated_at=NOW()
+    WHERE job_type='summarize'
+      AND status='running'
+      AND (
+        (leased_until IS NOT NULL AND leased_until < NOW())
+        OR (
+          leased_until IS NULL
+          AND updated_at < NOW() - INTERVAL '15 minutes'
+        )
+      )
+    RETURNING meeting_id
+)
+SELECT DISTINCT meeting_id
+FROM (
+    SELECT meeting_id FROM requeued
+    UNION ALL
+    SELECT meeting_id
+    FROM jobs
+    WHERE job_type='summarize'
+      AND status='queued'
+      AND (next_run_at IS NULL OR next_run_at <= NOW())
+) ready
+ORDER BY meeting_id
+LIMIT 25
+"#;
+
 pub const ENQUEUE_JOB_SQL: &str = r#"
 INSERT INTO jobs (id, meeting_id, job_type, status, retry_count, created_at, updated_at)
 VALUES ($1, $2, $3, 'queued', 0, NOW(), NOW())
@@ -1302,6 +1344,7 @@ VALUES ($1, $2, $3, 'queued', 0, NOW(), NOW())
 pub const CLAIM_JOB_SQL: &str = r#"
 UPDATE jobs
 SET status = 'running',
+    claim_token = $2,
     leased_until = NOW() + INTERVAL '90 seconds',
     next_run_at = NULL,
     updated_at = NOW()
@@ -1316,12 +1359,14 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
 )
 RETURNING id, meeting_id, job_type, status, retry_count, error_message,
+          claim_token,
           to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 "#;
 
 pub const CLAIM_JOB_BY_ID_SQL: &str = r#"
 UPDATE jobs
 SET status = 'running',
+    claim_token = $2,
     leased_until = NOW() + INTERVAL '90 seconds',
     next_run_at = NULL,
     updated_at = NOW()
@@ -1329,6 +1374,7 @@ WHERE id = $1
   AND status = 'queued'
   AND (next_run_at IS NULL OR next_run_at <= NOW())
 RETURNING id, meeting_id, job_type, status, retry_count, error_message,
+          claim_token,
           to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 "#;
 
@@ -1338,9 +1384,11 @@ SET status = 'done',
     error_message = NULL,
     next_run_at = NULL,
     leased_until = NULL,
+    claim_token = NULL,
     finished_at = NOW(),
     updated_at = NOW()
 WHERE id = $1
+  AND claim_token = $2
   AND status = 'running'
 "#;
 
@@ -1350,10 +1398,12 @@ SET status = 'failed',
     error_message = $2,
     next_run_at = NULL,
     leased_until = NULL,
+    claim_token = NULL,
     finished_at = NOW(),
     dead_lettered_at = NOW(),
     updated_at = NOW()
 WHERE id = $1
+  AND claim_token = $3
   AND status = 'running'
 "#;
 
@@ -1368,12 +1418,14 @@ SET
     ELSE NOW() + make_interval(secs => LEAST(900, 30 * POWER(2, LEAST(retry_count, 5))::integer))
   END,
   leased_until = NULL,
+  claim_token = NULL,
   finished_at = CASE WHEN retry_count + 1 > $3::integer THEN NOW() ELSE NULL END,
   dead_lettered_at = CASE WHEN retry_count + 1 > $3::integer THEN NOW() ELSE NULL END,
   canceled_at = NULL,
   cancel_reason = NULL,
   updated_at = NOW()
 WHERE id = $1
+  AND claim_token = $4
   AND status = 'running'
 RETURNING status
 "#;
@@ -1410,6 +1462,7 @@ SET status = 'queued',
     error_message = NULL,
     next_run_at = COALESCE(NULLIF($3, '')::timestamptz, NOW()),
     leased_until = NULL,
+    claim_token = NULL,
     finished_at = NULL,
     dead_lettered_at = NULL,
     canceled_at = NULL,
@@ -1443,6 +1496,7 @@ SET status = 'canceled',
     error_message = NULL,
     next_run_at = NULL,
     leased_until = NULL,
+    claim_token = NULL,
     finished_at = NOW(),
     dead_lettered_at = NULL,
     canceled_at = NOW(),

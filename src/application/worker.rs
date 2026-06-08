@@ -1,5 +1,5 @@
 use crate::application::ai_memory_extraction::{
-    AiMemoryExtractionStore, run_post_meeting_ai_memory_extraction,
+    AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
 use crate::application::runtime::merge_user_chunks_to_mixdown;
 use crate::application::summary::{
@@ -463,14 +463,33 @@ fn revert_to_stopping_for_retry<S: MeetingStore>(
             error = %err,
             "failed to revert meeting to stopping after pipeline error"
         );
-        if let Err(force_err) = store.set_meeting_status(meeting_id, MeetingStatus::Failed, None) {
-            warn!(
-                meeting_id = %meeting_id,
-                error = %force_err,
-                "failed to mark meeting failed after stopping revert conflict"
-            );
+    }
+}
+
+fn mark_meeting_failed_from_summary_state<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    error_message: String,
+) -> Result<(), WorkerError> {
+    for expected in [
+        MeetingStatus::Stopping,
+        MeetingStatus::Transcribing,
+        MeetingStatus::Summarizing,
+    ] {
+        match store.set_meeting_status(meeting_id, MeetingStatus::Failed, Some(expected)) {
+            Ok(()) => {
+                store.set_error_message(meeting_id, Some(error_message))?;
+                return Ok(());
+            }
+            Err(StoreError::CasConflict { .. }) => continue,
+            Err(err) => return Err(err.into()),
         }
     }
+    warn!(
+        meeting_id = %meeting_id,
+        "summary job exhausted retries but meeting is no longer in a summary-owned status"
+    );
+    Ok(())
 }
 
 pub fn process_meeting_summary<S, W, C>(
@@ -483,6 +502,22 @@ where
     S: MeetingStore + AiMemoryExtractionStore,
     W: WhisperClient,
     C: ClaudeSummaryClient,
+{
+    process_meeting_summary_with_ownership_check(store, whisper, claude, input, || Ok(()))
+}
+
+fn process_meeting_summary_with_ownership_check<S, W, C, F>(
+    store: &mut S,
+    whisper: &W,
+    claude: &C,
+    input: &ProcessMeetingInput,
+    mut ensure_owned: F,
+) -> Result<ProcessMeetingOutput, WorkerError>
+where
+    S: MeetingStore + AiMemoryExtractionStore,
+    W: WhisperClient,
+    C: ClaudeSummaryClient,
+    F: FnMut() -> Result<(), WorkerError>,
 {
     info!(meeting_id = %input.meeting_id, "summary pipeline started");
 
@@ -497,8 +532,11 @@ where
         workspace: input.workspace.clone(),
     };
 
+    ensure_owned()?;
     advance_to_transcribing(store, &input.meeting_id)?;
-    let transcription = match run_transcription(whisper, &request) {
+    let transcription_result = run_transcription(whisper, &request);
+    ensure_owned()?;
+    let transcription = match transcription_result {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "transcription failed");
@@ -540,19 +578,21 @@ where
         ),
     }
 
+    ensure_owned()?;
     persist_pre_correction_transcript_debug_artifact(
         &request.workspace,
         &transcription.transcript_for_summary,
     );
+    ensure_owned()?;
     store.set_meeting_status(
         &input.meeting_id,
         MeetingStatus::Summarizing,
         Some(MeetingStatus::Transcribing),
     )?;
-    let context_manifest = match materialize_or_load_summary_context(
-        &request,
-        &input.summary_context,
-    ) {
+    let context_manifest_result =
+        materialize_or_load_summary_context(&request, &input.summary_context);
+    ensure_owned()?;
+    let context_manifest = match context_manifest_result {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summary context materialization failed");
@@ -604,7 +644,10 @@ where
         }
     };
 
-    let manifest = match write_transcript_files(&request, &transcription) {
+    ensure_owned()?;
+    let manifest_result = write_transcript_files(&request, &transcription);
+    ensure_owned()?;
+    let manifest = match manifest_result {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "transcript materialization failed");
@@ -614,7 +657,10 @@ where
     };
     let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
-    let agent_workspace = match materialize_new_summary_agent_workspace(&request) {
+    ensure_owned()?;
+    let agent_workspace_result = materialize_new_summary_agent_workspace(&request);
+    ensure_owned()?;
+    let agent_workspace = match agent_workspace_result {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summary agent workspace materialization failed");
@@ -622,7 +668,9 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    let markdown = match claude.summarize(&prompt, Some(agent_workspace.root())) {
+    let markdown_result = claude.summarize(&prompt, Some(agent_workspace.root()));
+    ensure_owned()?;
+    let markdown = match markdown_result {
         Ok(value) => value,
         Err(err) => {
             error!(meeting_id = %input.meeting_id, error = %err, "summarization failed");
@@ -630,20 +678,43 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    if let Err(err) = run_post_meeting_ai_memory_extraction(
-        store,
-        claude,
-        &request,
-        &transcription.transcript_for_summary,
-        &markdown,
-        &context_manifest,
-    ) {
-        warn!(
-            meeting_id = %input.meeting_id,
-            error = %err,
-            "AI memory extraction failed; keeping summary completion successful"
-        );
+    ensure_owned()?;
+    if store.supports_ai_memory_extraction() {
+        match extract_ai_memory_candidates(
+            claude,
+            &request,
+            &transcription.transcript_for_summary,
+            &markdown,
+            &context_manifest,
+        ) {
+            Ok(candidates) => {
+                ensure_owned()?;
+                match store.persist_ai_memory_extraction_candidates(
+                    &input.meeting_id,
+                    &input.guild_id,
+                    &candidates,
+                ) {
+                    Ok(saved) => info!(
+                        meeting_id = %input.meeting_id,
+                        proposed = candidates.len(),
+                        saved,
+                        "AI memory extraction completed"
+                    ),
+                    Err(err) => warn!(
+                        meeting_id = %input.meeting_id,
+                        error = %err,
+                        "failed to persist AI memory extraction candidates; keeping summary completion successful"
+                    ),
+                }
+            }
+            Err(err) => warn!(
+                meeting_id = %input.meeting_id,
+                error = %err,
+                "AI memory extraction failed; keeping summary completion successful"
+            ),
+        }
     }
+    ensure_owned()?;
 
     let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
     info!(
@@ -745,6 +816,7 @@ where
             match meeting.status {
                 MeetingStatus::Posted => {}
                 MeetingStatus::Stopping => {
+                    queue.heartbeat(&job)?;
                     store.set_meeting_status(
                         &job.meeting_id,
                         MeetingStatus::Posted,
@@ -759,7 +831,8 @@ where
                     )));
                 }
             }
-            queue.mark_done(&job.id)?;
+            queue.heartbeat(&job)?;
+            queue.mark_done(&job)?;
             info!(
                 job_id = %job.id,
                 meeting_id = %job.meeting_id,
@@ -833,10 +906,14 @@ where
                 )
                 .map_err(WorkerError::from)?,
         };
-        process_meeting_summary(store, whisper, claude, &input).map(Some)
+        process_meeting_summary_with_ownership_check(store, whisper, claude, &input, || {
+            queue.heartbeat(&job).map_err(WorkerError::from)
+        })
+        .map(Some)
     })();
     match result {
         Ok(Some(output)) => {
+            queue.heartbeat(&job)?;
             // Set meeting status first: if this fails the job stays Running
             // and can be retried. The reverse order (mark_done first) would
             // leave the meeting stuck in Summarizing with no way to recover.
@@ -845,7 +922,7 @@ where
                 MeetingStatus::Posted,
                 Some(MeetingStatus::Summarizing),
             )?;
-            queue.mark_done(&job.id)?;
+            queue.mark_done(&job)?;
             record_summary_run_usage_observe_only(
                 store,
                 &job.meeting_id,
@@ -860,10 +937,10 @@ where
         }
         Ok(None) => Ok(None),
         Err(err) => {
-            let status = queue.retry(&job.id, err.to_string(), options.max_retries)?;
+            queue.heartbeat(&job)?;
+            let status = queue.retry(&job, err.to_string(), options.max_retries)?;
             if status == JobStatus::Failed {
-                store.set_meeting_status(&job.meeting_id, MeetingStatus::Failed, None)?;
-                store.set_error_message(&job.meeting_id, Some(err.to_string()))?;
+                mark_meeting_failed_from_summary_state(store, &job.meeting_id, err.to_string())?;
                 warn!(
                     job_id = %job.id,
                     meeting_id = %job.meeting_id,
@@ -1031,6 +1108,7 @@ pub fn enqueue_summary_job<Q: JobQueue>(
         retry_count: 0,
         error_message: None,
         next_run_at: None,
+        claim_token: None,
     }) {
         Ok(()) => {}
         Err(QueueError::AlreadyExists { .. }) => return Err(WorkerError::AlreadyExists),
