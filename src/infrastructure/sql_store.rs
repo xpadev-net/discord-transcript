@@ -1022,16 +1022,15 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
 
     fn mark_done(&mut self, job: &Job) -> Result<(), QueueError> {
         let claim_token = require_claim_token(job)?;
-        // SQL has `AND status = 'running'`, so affected==0 can mean either
-        // "job not found" or "job exists but not in running state". We return
-        // NotFound because SQL cannot distinguish the two without a second query.
         let affected = self
             .executor
             .execute(MARK_JOB_DONE_SQL, &[job.id.clone(), claim_token.to_owned()])
             .map_err(QueueError::Backend)?;
         if affected == 0 {
-            return Err(QueueError::NotFound {
+            return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
+                expected: "running with matching claim token".to_owned(),
+                actual: "missing, not running, or different claim token".to_owned(),
             });
         }
         Ok(())
@@ -1047,8 +1046,10 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
             )
             .map_err(QueueError::Backend)?;
         if affected == 0 {
-            return Err(QueueError::NotFound {
+            return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
+                expected: "running with matching claim token".to_owned(),
+                actual: "missing, not running, or different claim token".to_owned(),
             });
         }
         Ok(())
@@ -1074,8 +1075,10 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
             )
             .map_err(QueueError::Backend)?;
         let Some(row) = rows.into_iter().next() else {
-            return Err(QueueError::NotFound {
+            return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
+                expected: "running with matching claim token".to_owned(),
+                actual: "missing, not running, or different claim token".to_owned(),
             });
         };
         let status_value = row

@@ -825,12 +825,10 @@ fn sql_job_queue_done_job_rejects_retry() {
     let err = queue
         .retry(&claimed, "failed once".to_owned(), 2)
         .expect_err("done jobs should not be retryable by SQL");
-    assert_eq!(
+    assert!(matches!(
         err,
-        discord_transcript::infrastructure::queue::QueueError::NotFound {
-            job_id: "j1".to_owned()
-        }
-    );
+        discord_transcript::infrastructure::queue::QueueError::InvalidState { .. }
+    ));
 }
 
 #[test]
