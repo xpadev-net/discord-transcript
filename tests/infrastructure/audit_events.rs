@@ -2,6 +2,7 @@ use chrono::{TimeZone, Utc};
 use discord_transcript::domain::audit::AuditEvent;
 use discord_transcript::infrastructure::sql::{
     INCREMENTAL_MIGRATIONS_SQL, INSERT_AUDIT_EVENT_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
+    PRUNE_STALE_AUDIT_EVENTS_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlMeetingStore, audit_event_params, sql_row_from_strings,
@@ -33,6 +34,18 @@ fn incremental_migrations_include_audit_event_schema() {
     assert!(schema.contains("detail_json JSONB NOT NULL"));
     assert!(schema.contains("idx_audit_events_guild_recent"));
     assert!(schema.contains("idx_audit_events_actor_recent"));
+}
+
+#[test]
+fn audit_insert_sql_prunes_old_rows_and_dedupes_debug_downloads() {
+    assert!(INSERT_AUDIT_EVENT_SQL.contains("ON CONFLICT (id) DO NOTHING"));
+    assert!(!INSERT_AUDIT_EVENT_SQL.contains("INTERVAL '15 minutes'"));
+    assert!(!INSERT_AUDIT_EVENT_SQL.contains("stale_audit_events"));
+    assert!(PRUNE_STALE_AUDIT_EVENTS_SQL.contains("stale_audit_events"));
+    assert!(!PRUNE_STALE_AUDIT_EVENTS_SQL.contains("random()"));
+    assert!(PRUNE_STALE_AUDIT_EVENTS_SQL.contains("INTERVAL '180 days'"));
+    assert!(!PRUNE_STALE_AUDIT_EVENTS_SQL.contains("ORDER BY"));
+    assert!(PRUNE_STALE_AUDIT_EVENTS_SQL.contains("LIMIT 500"));
 }
 
 #[test]

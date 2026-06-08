@@ -1558,23 +1558,49 @@ WITH active_tenant AS (
       AND t.status = 'active'
     ORDER BY tg.effective_at DESC
     LIMIT 1
+),
+candidate AS (
+    SELECT
+        $1 AS id,
+        COALESCE(NULLIF($2, ''), (SELECT tenant_id FROM active_tenant)) AS tenant_id,
+        NULLIF($3, '') AS guild_id,
+        NULLIF($4, '') AS actor_user_id,
+        $5 AS action,
+        $6 AS resource_type,
+        NULLIF($7, '') AS resource_id,
+        COALESCE(NULLIF($8, '')::jsonb, '{}'::jsonb) AS request_metadata,
+        COALESCE(NULLIF($9, '')::jsonb, '{}'::jsonb) AS detail_json,
+        COALESCE(NULLIF($10, '')::timestamptz, NOW()) AS occurred_at
 )
 INSERT INTO audit_events (
     id, tenant_id, guild_id, actor_user_id, action, resource_type, resource_id,
     request_metadata, detail_json, occurred_at, created_at
-) VALUES (
-    $1,
-    COALESCE(NULLIF($2, ''), (SELECT tenant_id FROM active_tenant)),
-    NULLIF($3, ''),
-    NULLIF($4, ''),
-    $5,
-    $6,
-    NULLIF($7, ''),
-    COALESCE(NULLIF($8, '')::jsonb, '{}'::jsonb),
-    COALESCE(NULLIF($9, '')::jsonb, '{}'::jsonb),
-    COALESCE(NULLIF($10, '')::timestamptz, NOW()),
+) SELECT
+    id,
+    tenant_id,
+    guild_id,
+    actor_user_id,
+    action,
+    resource_type,
+    resource_id,
+    request_metadata,
+    detail_json,
+    occurred_at,
     NOW()
+FROM candidate
+ON CONFLICT (id) DO NOTHING
+"#;
+
+pub const PRUNE_STALE_AUDIT_EVENTS_SQL: &str = r#"
+WITH stale_audit_events AS (
+    SELECT events.ctid
+    FROM audit_events events
+    WHERE events.occurred_at < NOW() - INTERVAL '180 days'
+    LIMIT 500
 )
+DELETE FROM audit_events events
+USING stale_audit_events stale
+WHERE events.ctid = stale.ctid
 "#;
 
 pub const LIST_RECENT_AUDIT_EVENTS_SQL: &str = r#"

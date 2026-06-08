@@ -47,7 +47,7 @@ fn workspace_paths_do_not_collide_between_meetings() {
 }
 
 #[test]
-fn debug_paths_are_under_workspace_root() {
+fn debug_paths_are_isolated_from_workspace_root() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -56,9 +56,21 @@ fn debug_paths_are_under_workspace_root() {
     let layout = MeetingWorkspaceLayout::new(&base);
     let workspace = layout.for_meeting("g", "vc", "m");
     let root = workspace.root().to_path_buf();
+    let debug_root = workspace.debug_root().to_path_buf();
 
-    assert!(workspace.debug_dir().starts_with(&root));
-    assert!(workspace.whisper_debug_dir().starts_with(&root));
+    assert!(workspace.debug_dir().starts_with(&debug_root));
+    assert!(workspace.whisper_debug_dir().starts_with(&debug_root));
+    assert!(!workspace.debug_dir().starts_with(&root));
+    assert!(!workspace.whisper_debug_dir().starts_with(&root));
+    for debug_path in [
+        workspace.pre_correction_transcript_path(),
+        workspace.correction_prompt_path(),
+        workspace.summary_prompt_path(),
+        workspace.agent_runs_debug_dir(),
+    ] {
+        assert!(debug_path.starts_with(&debug_root));
+        assert!(!debug_path.starts_with(&root));
+    }
     assert!(
         workspace
             .whisper_response_path("alice")
@@ -84,6 +96,8 @@ fn debug_paths_are_under_workspace_root() {
             .summary_prompt_path()
             .starts_with(workspace.debug_dir())
     );
+    assert!(workspace.context_dir().starts_with(&root));
+    assert!(!workspace.context_dir().starts_with(&debug_root));
     assert!(
         workspace
             .context_manifest_path()
