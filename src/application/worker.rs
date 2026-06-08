@@ -606,8 +606,11 @@ where
         MeetingStatus::Summarizing,
         Some(MeetingStatus::Transcribing),
     )?;
-    let context_manifest_result =
-        materialize_or_load_summary_context(&request, &input.summary_context);
+    let context_manifest_result = materialize_or_load_summary_context(
+        &request,
+        &input.summary_context,
+        Some(&transcription.transcript_for_summary),
+    );
     ensure_owned()?;
     let context_manifest = match context_manifest_result {
         Ok(value) => value,
