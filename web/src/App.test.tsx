@@ -737,6 +737,41 @@ describe("App access controls", () => {
     expect(screen.queryByRole("link", { name: "Retention" })).toBeNull();
   });
 
+  it("waits for permissions before redirecting the admin index", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "usage-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_usage: true,
+            can_view_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/guild/meetings?page=1&limit=100") {
+        return Promise.resolve(
+          jsonResponse(meetingsResponse("guild-1", [meetingItem()])),
+        );
+      }
+      if (url === "/api/guild/jobs?limit=100") {
+        return Promise.resolve(jsonResponse([guildJob()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin", fetchMock);
+
+    await screen.findByRole("heading", { name: "Usage" });
+    expect(screen.queryByText(forbiddenTitle)).toBeNull();
+  });
+
   it("blocks direct retention access for usage-only users before loading settings", async () => {
     const calledUrls: string[] = [];
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

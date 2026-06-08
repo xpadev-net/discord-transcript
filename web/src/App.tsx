@@ -259,7 +259,18 @@ export function App() {
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
         <Route
           path="/admin"
-          element={<Navigate to={defaultAdminPath} replace />}
+          element={
+            loadingMe ? (
+              <GuildAdminRoute
+                isAdmin={false}
+                loading={loadingMe}
+                forbidden={sessionForbidden}
+                error={sessionError}
+              />
+            ) : (
+              <Navigate to={defaultAdminPath} replace />
+            )
+          }
         />
         <Route
           path="/admin/usage"
