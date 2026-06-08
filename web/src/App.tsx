@@ -179,7 +179,9 @@ export function App() {
     canUseCurrentGuildAdminViews && canManageCurrentGuildSettings(me);
   const defaultAdminPath = canUseCurrentGuildUsageAdmin
     ? "/admin/usage"
-    : "/admin/audit";
+    : canUseCurrentGuildAdminViews
+      ? "/admin/audit"
+      : null;
   const currentGuildName =
     guilds.find((guild) => me && guild.guild_id === me.guild_id)?.name ??
     undefined;
@@ -267,8 +269,15 @@ export function App() {
                 forbidden={sessionForbidden}
                 error={sessionError}
               />
-            ) : (
+            ) : defaultAdminPath ? (
               <Navigate to={defaultAdminPath} replace />
+            ) : (
+              <GuildAdminRoute
+                isAdmin={false}
+                loading={false}
+                forbidden={sessionForbidden}
+                error={sessionError}
+              />
             )
           }
         />

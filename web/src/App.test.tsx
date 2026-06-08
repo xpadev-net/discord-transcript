@@ -772,6 +772,33 @@ describe("App access controls", () => {
     expect(screen.queryByText(forbiddenTitle)).toBeNull();
   });
 
+  it("keeps the admin index forbidden in place when no admin surfaces are allowed", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "viewer-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_usage: false,
+            can_view_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Audit" })).toBeNull();
+  });
+
   it("blocks direct retention access for usage-only users before loading settings", async () => {
     const calledUrls: string[] = [];
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

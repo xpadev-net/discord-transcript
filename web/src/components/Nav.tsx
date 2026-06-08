@@ -82,7 +82,7 @@ export function Nav({
               {"\u8a2d\u5b9a"}
             </NavLink>
           ) : null}
-          {canUseAdminViews || canUseUsageAdmin || canUseRetentionAdmin ? (
+          {canUseAdminViews || canUseUsageAdmin ? (
             <>
               {canUseUsageAdmin ? (
                 <>
