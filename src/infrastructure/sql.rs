@@ -1900,11 +1900,9 @@ WHERE guild_id = $1
 
 pub const LIST_GUILD_MEETING_VOICE_CHANNELS_SQL: &str = r#"
 SELECT voice_channel_id,
-       COALESCE(
-           (array_agg(voice_channel_name ORDER BY started_at DESC NULLS LAST, id DESC)
-            FILTER (WHERE voice_channel_name IS NOT NULL AND voice_channel_name <> ''))[1],
-           NULL
-       ) AS voice_channel_name
+       (array_agg(voice_channel_name ORDER BY started_at DESC NULLS LAST, id DESC)
+        FILTER (WHERE voice_channel_name IS NOT NULL AND voice_channel_name <> ''))[1]
+       AS voice_channel_name
 FROM meetings
 WHERE guild_id = $1
 GROUP BY voice_channel_id
@@ -1914,11 +1912,9 @@ LIMIT $2
 
 pub const LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL: &str = r#"
 SELECT voice_channel_id,
-       COALESCE(
-           (array_agg(voice_channel_name ORDER BY started_at DESC NULLS LAST, id DESC)
-            FILTER (WHERE voice_channel_name IS NOT NULL AND voice_channel_name <> ''))[1],
-           NULL
-       ) AS voice_channel_name
+       (array_agg(voice_channel_name ORDER BY started_at DESC NULLS LAST, id DESC)
+        FILTER (WHERE voice_channel_name IS NOT NULL AND voice_channel_name <> ''))[1]
+       AS voice_channel_name
 FROM meetings
 WHERE guild_id = $1
   AND voice_channel_id = ANY($2::TEXT[])

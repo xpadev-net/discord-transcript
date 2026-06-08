@@ -8904,11 +8904,17 @@ fn summary_chunks_with_voice_channel_metadata(
     meeting: &StoredMeeting,
     chunks: Vec<String>,
 ) -> Vec<String> {
-    let header = format!(
-        "VC: {} ({})",
-        meeting_voice_channel_display(meeting),
-        meeting.voice_channel_id
-    );
+    let display = meeting_voice_channel_display(meeting);
+    let has_name = meeting
+        .voice_channel_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .is_some();
+    let header = if has_name {
+        format!("VC: {display} ({})", meeting.voice_channel_id)
+    } else {
+        display
+    };
     let mut with_metadata = Vec::with_capacity(chunks.len().saturating_add(1));
     with_metadata.push(header);
     with_metadata.extend(chunks);
@@ -12471,7 +12477,7 @@ mod status_message_tests {
 
         meeting.voice_channel_name = None;
         let fallback = summary_chunks_with_voice_channel_metadata(&meeting, Vec::new());
-        assert_eq!(fallback[0], "VC: VC ID: vc1 (vc1)");
+        assert_eq!(fallback[0], "VC ID: vc1");
     }
 
     #[test]
