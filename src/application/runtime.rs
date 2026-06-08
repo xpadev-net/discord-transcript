@@ -3067,6 +3067,7 @@ impl ScaffoldHandler {
         let shutdown_token = handler.shutdown_token.clone();
         self.spawn_background(async move {
             let mut durable_poll = tokio::time::interval(Duration::from_secs(30));
+            durable_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             durable_poll.tick().await;
             loop {
                 tokio::select! {
