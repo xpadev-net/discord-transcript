@@ -4,7 +4,8 @@ use discord_transcript::application::retention_cleanup::{
     RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
     RETENTION_EXPIRED_RAW_WORKSPACES_SQL, RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
     RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
-    enforce_retention_policy,
+    ExpiredWorkspaceRow, RetentionDeletionTargets, apply_manual_meeting_filesystem_delete,
+    enforce_retention_policy, estimate_meeting_filesystem_usage, estimate_target_filesystem_usage,
 };
 use discord_transcript::domain::retention::RetentionPolicy;
 use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
@@ -413,4 +414,61 @@ fn retention_cleanup_uses_partial_plan_when_one_workspace_query_fails() {
             .any(|(sql, params)| sql == RETENTION_MARK_TRANSCRIPTS_DELETED_SQL
                 && params == &vec!["30".to_owned()])
     );
+}
+
+#[test]
+fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
+    let (_guard, layout) = temp_layout("manual_delete_targets");
+    let meeting = ExpiredWorkspaceRow {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+    };
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"raw").expect("write raw");
+    std::fs::write(workspace.speakers_dir().join("u1.wav"), b"speaker").expect("write speaker");
+    std::fs::write(workspace.context_dir().join("manifest.json"), b"{}").expect("write context");
+    std::fs::write(workspace.transcript_dir().join("transcript.md"), b"transcript")
+        .expect("write transcript");
+    std::fs::write(workspace.summary_dir().join("summary.md"), b"summary")
+        .expect("write summary");
+    std::fs::write(workspace.debug_dir().join("debug.txt"), b"debug").expect("write debug");
+
+    let usage = estimate_meeting_filesystem_usage(&layout, &meeting).expect("estimate usage");
+    assert!(usage.raw_audio_bytes > 0);
+    assert!(usage.transcript_bytes > 0);
+    assert!(usage.summary_bytes > 0);
+    assert!(usage.debug_bytes > 0);
+
+    let targets = RetentionDeletionTargets {
+        raw_audio: true,
+        transcript: false,
+        summary: true,
+        debug: false,
+    };
+    let target_usage =
+        estimate_target_filesystem_usage(&layout, &meeting, targets).expect("estimate targets");
+    assert_eq!(target_usage.raw_audio_bytes, usage.raw_audio_bytes);
+    assert_eq!(target_usage.transcript_bytes, 0);
+    assert_eq!(target_usage.summary_bytes, usage.summary_bytes);
+    assert_eq!(target_usage.debug_bytes, 0);
+
+    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, targets)
+        .expect("manual delete succeeds");
+    assert_eq!(report.raw_workspaces_scanned, 1);
+    assert_eq!(
+        report.raw_workspace_cleaned_meeting_ids,
+        vec!["m1".to_owned()]
+    );
+    assert_eq!(report.raw_audio_dirs_removed, 1);
+    assert_eq!(report.speaker_dirs_removed, 1);
+    assert_eq!(report.context_dirs_removed, 1);
+    assert_eq!(report.summary_dirs_removed, 1);
+    assert!(workspace.transcript_dir().exists());
+    assert!(workspace.debug_dir().exists());
+    assert!(!workspace.audio_dir().exists());
+    assert!(!workspace.speakers_dir().exists());
+    assert!(!workspace.context_dir().exists());
+    assert!(!workspace.summary_dir().exists());
 }

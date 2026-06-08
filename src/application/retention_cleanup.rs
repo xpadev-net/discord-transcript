@@ -203,6 +203,37 @@ pub struct RetentionCleanupPlan {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionDeletionTargets {
+    pub raw_audio: bool,
+    pub transcript: bool,
+    pub summary: bool,
+    pub debug: bool,
+}
+
+impl RetentionDeletionTargets {
+    pub fn any(self) -> bool {
+        self.raw_audio || self.transcript || self.summary || self.debug
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetentionStorageUsage {
+    pub raw_audio_bytes: u64,
+    pub transcript_bytes: u64,
+    pub summary_bytes: u64,
+    pub debug_bytes: u64,
+}
+
+impl RetentionStorageUsage {
+    pub fn total_bytes(&self) -> u64 {
+        self.raw_audio_bytes
+            .saturating_add(self.transcript_bytes)
+            .saturating_add(self.summary_bytes)
+            .saturating_add(self.debug_bytes)
+    }
+}
+
 /// Enforces retention synchronously, including blocking filesystem deletion.
 /// Async callers should run the filesystem phase through `spawn_blocking` like
 /// `run_startup_retention_cleanup` does.
@@ -391,6 +422,146 @@ pub fn apply_retention_filesystem_cleanup(
             &mut errors,
             remove_dir_if_present(&workspace.summary_dir()),
             || report.summary_dirs_removed += 1,
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(report)
+    } else {
+        Err(RetentionCleanupError {
+            report: Box::new(report),
+            message: errors.join("; "),
+        })
+    }
+}
+
+pub fn estimate_meeting_filesystem_usage(
+    workspace_layout: &MeetingWorkspaceLayout,
+    meeting: &ExpiredWorkspaceRow,
+) -> Result<RetentionStorageUsage, String> {
+    let workspace = workspace_layout.for_meeting(
+        &meeting.guild_id,
+        &meeting.voice_channel_id,
+        &meeting.meeting_id,
+    );
+    Ok(RetentionStorageUsage {
+        raw_audio_bytes: dir_size_if_present(&workspace.audio_dir())?
+            .saturating_add(dir_size_if_present(&workspace.speakers_dir())?)
+            .saturating_add(dir_size_if_present(&workspace.context_dir())?)
+            .saturating_add(legacy_raw_audio_size(
+                &workspace_layout.legacy_meeting_dir(&meeting.meeting_id),
+            )?),
+        transcript_bytes: dir_size_if_present(&workspace.transcript_dir())?,
+        summary_bytes: dir_size_if_present(&workspace.summary_dir())?,
+        debug_bytes: dir_size_if_present(&workspace.debug_dir())?.saturating_add(
+            dir_size_if_present(&workspace.agent_workspace_parent_dir())?,
+        ),
+    })
+}
+
+pub fn estimate_target_filesystem_usage(
+    workspace_layout: &MeetingWorkspaceLayout,
+    meeting: &ExpiredWorkspaceRow,
+    targets: RetentionDeletionTargets,
+) -> Result<RetentionStorageUsage, String> {
+    let usage = estimate_meeting_filesystem_usage(workspace_layout, meeting)?;
+    Ok(RetentionStorageUsage {
+        raw_audio_bytes: if targets.raw_audio {
+            usage.raw_audio_bytes
+        } else {
+            0
+        },
+        transcript_bytes: if targets.transcript {
+            usage.transcript_bytes
+        } else {
+            0
+        },
+        summary_bytes: if targets.summary {
+            usage.summary_bytes
+        } else {
+            0
+        },
+        debug_bytes: if targets.debug { usage.debug_bytes } else { 0 },
+    })
+}
+
+pub fn apply_manual_meeting_filesystem_delete(
+    workspace_layout: &MeetingWorkspaceLayout,
+    meeting: &ExpiredWorkspaceRow,
+    targets: RetentionDeletionTargets,
+) -> Result<RetentionCleanupReport, RetentionCleanupError> {
+    let workspace = workspace_layout.for_meeting(
+        &meeting.guild_id,
+        &meeting.voice_channel_id,
+        &meeting.meeting_id,
+    );
+    let mut report = RetentionCleanupReport::default();
+    let mut errors = Vec::new();
+
+    if targets.raw_audio {
+        report.raw_workspaces_scanned = 1;
+        let error_count_before = errors.len();
+        let speaker_cleanup = remove_dir_if_present(&workspace.speakers_dir());
+        let speaker_cleanup_failed = speaker_cleanup.is_err();
+        record_cleanup_result(&mut errors, speaker_cleanup, || {
+            report.speaker_dirs_removed += 1
+        });
+        if speaker_cleanup_failed {
+            warn!(
+                meeting_id = %meeting.meeting_id,
+                path = %workspace.audio_dir().display(),
+                "skipping parent audio cleanup after speaker directory cleanup failed"
+            );
+        } else {
+            record_cleanup_result(
+                &mut errors,
+                remove_dir_if_present(&workspace.audio_dir()),
+                || report.raw_audio_dirs_removed += 1,
+            );
+        }
+        record_cleanup_result(
+            &mut errors,
+            remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
+            || report.legacy_meetings_cleaned += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.context_dir()),
+            || report.context_dirs_removed += 1,
+        );
+        if errors.len() == error_count_before {
+            report
+                .raw_workspace_cleaned_meeting_ids
+                .push(meeting.meeting_id.clone());
+        }
+    }
+
+    if targets.transcript {
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.transcript_dir()),
+            || report.transcript_dirs_removed += 1,
+        );
+    }
+
+    if targets.summary {
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.summary_dir()),
+            || report.summary_dirs_removed += 1,
+        );
+    }
+
+    if targets.debug {
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.debug_dir()),
+            || report.debug_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.agent_workspace_parent_dir()),
+            || report.agent_workspace_dirs_removed += 1,
         );
     }
 
@@ -612,4 +783,48 @@ fn remove_empty_dir_if_present(path: &Path) -> Result<bool, String> {
         Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
         Err(err) => Err(format!("failed to remove empty {}: {err}", path.display())),
     }
+}
+
+fn dir_size_if_present(path: &Path) -> Result<u64, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(format!("failed to stat {}: {err}", path.display())),
+    };
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut size = 0_u64;
+    let entries =
+        fs::read_dir(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        size = size.saturating_add(dir_size_if_present(&entry.path())?);
+    }
+    Ok(size)
+}
+
+fn legacy_raw_audio_size(meeting_dir: &Path) -> Result<u64, String> {
+    let mut size = 0_u64;
+    let entries = match fs::read_dir(meeting_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(format!("failed to read {}: {err}", meeting_dir.display())),
+    };
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("failed to read {}: {err}", meeting_dir.display()))?;
+        let path = entry.path();
+        let is_legacy_raw_audio = path.extension().and_then(|ext| ext.to_str()) == Some("wav")
+            || path.file_name().and_then(|name| name.to_str()) == Some("speakers");
+        if is_legacy_raw_audio {
+            size = size.saturating_add(dir_size_if_present(&path)?);
+        }
+    }
+    Ok(size)
 }

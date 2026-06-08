@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, watch};
@@ -25,6 +26,12 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::application::retention_cleanup::{
+    ExpiredWorkspaceRow, RetentionCleanupPlan, RetentionCleanupReport, RetentionDeletionTargets,
+    RetentionStorageUsage, apply_manual_meeting_filesystem_delete,
+    apply_retention_filesystem_cleanup, estimate_meeting_filesystem_usage,
+    estimate_target_filesystem_usage,
+};
 use crate::application::runtime::SummaryJobWakeups;
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
@@ -38,6 +45,7 @@ use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType
 use crate::domain::plans::{
     PlanKind, QuotaDimension, QuotaEnforcementMode, QuotaLimit, QuotaPeriod,
 };
+use crate::domain::retention::RetentionPolicy;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{summary_template_variables, validate_summary_template};
 use crate::domain::transcript::{
@@ -50,16 +58,25 @@ use crate::infrastructure::bot_token::{
 };
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ADMIN_CANCEL_JOB_SQL,
-    ADMIN_RETRY_JOB_SQL, ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, ARCHIVE_ADMIN_PLAN_SQL,
-    ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL,
-    ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL,
-    COUNT_VISIBLE_GUILD_MEETINGS_SQL, DELETE_ADMIN_PLAN_QUOTA_SQL,
-    GET_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, GET_ADMIN_PLAN_BY_CODE_SQL, GET_ADMIN_PLAN_QUOTA_SQL,
-    GET_ADMIN_PLAN_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
-    GET_SUMMARY_TEMPLATE_SQL, INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, INSERT_ADMIN_PLAN_QUOTA_SQL,
-    INSERT_ADMIN_PLAN_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL,
-    INSERT_SUMMARY_TEMPLATE_SQL, INSERT_USAGE_EVENT_SQL,
+    ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
+    ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DELETE_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
+    ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+    ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+    ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
+    ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
+    ADMIN_RETENTION_MEETING_DETAIL_SQL, ADMIN_RETENTION_OVERVIEW_SQL, ADMIN_RETRY_JOB_SQL,
+    ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, ARCHIVE_ADMIN_PLAN_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL,
+    ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
+    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL,
+    DELETE_ADMIN_PLAN_QUOTA_SQL, GET_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, GET_ADMIN_PLAN_BY_CODE_SQL,
+    GET_ADMIN_PLAN_QUOTA_SQL, GET_ADMIN_PLAN_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL,
+    GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL, INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL,
+    INSERT_ADMIN_PLAN_QUOTA_SQL, INSERT_ADMIN_PLAN_SQL, INSERT_AI_MEMORY_NOTE_SQL,
+    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL,
+    INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL, INSERT_USAGE_EVENT_SQL,
     LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL,
     LIST_ADMIN_PLAN_QUOTAS_SQL, LIST_ADMIN_PLANS_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_JOBS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
@@ -441,20 +458,45 @@ fn web_audit_event(
     }
 }
 
-async fn record_audit_event(state: &WebState, event: AuditEvent) {
-    let params = audit_event_params(&event);
+async fn persist_audit_event(
+    state: &WebState,
+    event: &AuditEvent,
+) -> Result<(), tokio_postgres::Error> {
+    let params = audit_event_params(event);
     let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
         .iter()
         .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
-    if let Err(err) = state.db.execute(INSERT_AUDIT_EVENT_SQL, &bind).await {
+    state.db.execute(INSERT_AUDIT_EVENT_SQL, &bind).await?;
+    Ok(())
+}
+
+async fn record_audit_event(state: &WebState, event: AuditEvent) -> bool {
+    match persist_audit_event(state, &event).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                error = %err,
+                action = %event.action,
+                resource_type = %event.resource_type,
+                "failed to persist audit event"
+            );
+            false
+        }
+    }
+}
+
+async fn require_audit_event(state: &WebState, event: AuditEvent) -> Result<(), StatusCode> {
+    if let Err(err) = persist_audit_event(state, &event).await {
         warn!(
             error = %err,
             action = %event.action,
             resource_type = %event.resource_type,
-            "failed to persist audit event"
+            "required audit event failed to persist"
         );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    Ok(())
 }
 
 async fn record_usage_event(state: &WebState, event: NewUsageEvent) {
@@ -564,6 +606,23 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/admin/guild-plan-assignments/{assignment_id}/archive",
             post(api_admin_archive_guild_plan_assignment),
+        )
+        .route("/api/admin/retention", get(api_admin_retention_overview))
+        .route(
+            "/api/admin/retention/cleanup-preview",
+            post(api_admin_retention_cleanup_preview),
+        )
+        .route(
+            "/api/admin/retention/cleanup-run",
+            post(api_admin_retention_cleanup_run),
+        )
+        .route(
+            "/api/admin/retention/meetings/{meeting_id}/delete-preview",
+            post(api_admin_retention_meeting_delete_preview),
+        )
+        .route(
+            "/api/admin/retention/meetings/{meeting_id}/delete",
+            post(api_admin_retention_meeting_delete),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -3136,6 +3195,141 @@ struct AdminGuildPlanAssignmentListQuery {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct AdminRetentionPolicyRequest {
+    raw_audio_ttl_days: Option<u32>,
+    transcript_ttl_days: Option<u32>,
+    summary_ttl_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+struct AdminRetentionTargets {
+    #[serde(default)]
+    raw_audio: bool,
+    #[serde(default)]
+    transcript: bool,
+    #[serde(default)]
+    summary: bool,
+    #[serde(default)]
+    debug: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct AdminRetentionMeetingDeleteRequest {
+    targets: AdminRetentionTargets,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionPolicyResponse {
+    raw_audio_ttl_days: u32,
+    transcript_ttl_days: u32,
+    summary_ttl_days: Option<u32>,
+    debug_ttl_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionStorageUsageResponse {
+    raw_audio_bytes: u64,
+    transcript_bytes: u64,
+    summary_bytes: u64,
+    debug_bytes: u64,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionQuotaReadinessResponse {
+    storage_bytes_observed: i64,
+    storage_bytes_current: i64,
+    enforcement_mode: String,
+    hard_quota_enforced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionLegalHoldResponse {
+    supported: bool,
+    active: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionOverviewResponse {
+    guild_id: String,
+    policy: AdminRetentionPolicyResponse,
+    legal_hold: AdminRetentionLegalHoldResponse,
+    storage: AdminRetentionStorageUsageResponse,
+    artifact_count: i64,
+    meeting_count: i64,
+    active_meeting_count: i64,
+    quota_readiness: AdminRetentionQuotaReadinessResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionCleanupPreviewResponse {
+    guild_id: String,
+    policy: AdminRetentionPolicyResponse,
+    deletion_targets: AdminRetentionTargets,
+    raw_workspace_count: usize,
+    transcript_workspace_count: usize,
+    summary_workspace_count: usize,
+    estimated_freed_bytes: AdminRetentionStorageUsageResponse,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionCleanupRunResponse {
+    preview: AdminRetentionCleanupPreviewResponse,
+    report: AdminRetentionCleanupReportResponse,
+    audit_recorded: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionMeetingDeletePreviewResponse {
+    guild_id: String,
+    meeting_id: String,
+    status: String,
+    started_at: Option<String>,
+    stopped_at: Option<String>,
+    targets: AdminRetentionTargets,
+    storage: AdminRetentionStorageUsageResponse,
+    estimated_freed_bytes: AdminRetentionStorageUsageResponse,
+    transcript_count: i64,
+    summary_count: i64,
+    artifact_count: i64,
+    usage_event_count: i64,
+    audit_event_count: i64,
+    legal_hold: AdminRetentionLegalHoldResponse,
+    preserves_usage_history: bool,
+    preserves_audit_history: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionMeetingDeleteResponse {
+    preview: AdminRetentionMeetingDeletePreviewResponse,
+    report: AdminRetentionCleanupReportResponse,
+    audit_recorded: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AdminRetentionCleanupReportResponse {
+    raw_workspaces_scanned: usize,
+    raw_audio_dirs_removed: usize,
+    legacy_meetings_cleaned: usize,
+    raw_workspaces_marked_cleaned: u64,
+    speaker_dirs_removed: usize,
+    context_dirs_removed: usize,
+    transcript_dirs_removed: usize,
+    empty_summary_dirs_removed: usize,
+    summary_dirs_removed: usize,
+    debug_dirs_removed: usize,
+    agent_workspace_dirs_removed: usize,
+    transcripts_marked_deleted: u64,
+    summaries_deleted: u64,
+    artifacts_deleted: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct GuildSettingsResponse {
     whisper_language: Option<String>,
@@ -3878,6 +4072,17 @@ fn parse_json_request_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Statu
         return Err(StatusCode::BAD_REQUEST);
     }
     serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_optional_json_request_body<T: DeserializeOwned>(
+    body: &Bytes,
+) -> Result<Option<T>, StatusCode> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(body)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 fn validate_admin_plan_id(id: &str) -> Result<(), StatusCode> {
@@ -6058,6 +6263,275 @@ async fn api_admin_archive_guild_plan_assignment(
     Ok(Json(response))
 }
 
+async fn api_admin_retention_overview(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+) -> Result<Json<AdminRetentionOverviewResponse>, StatusCode> {
+    require_system_admin_request(&state, &headers, &user_id).await?;
+    let guild_id = configured_guild_id(&state)?;
+    let row = state
+        .db
+        .query_one(ADMIN_RETENTION_OVERVIEW_SQL, &[&guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let policy = default_admin_retention_policy(&state)?;
+    Ok(Json(AdminRetentionOverviewResponse {
+        guild_id,
+        policy: admin_retention_policy_response(policy),
+        legal_hold: admin_retention_legal_hold_response(),
+        storage: AdminRetentionStorageUsageResponse {
+            raw_audio_bytes: i64_to_u64(row.get("raw_audio_bytes")),
+            transcript_bytes: i64_to_u64(row.get("transcript_bytes")),
+            summary_bytes: i64_to_u64(row.get("summary_bytes")),
+            debug_bytes: i64_to_u64(row.get("debug_bytes")),
+            total_bytes: i64_to_u64(row.get("storage_bytes")),
+        },
+        artifact_count: row.get("artifact_count"),
+        meeting_count: row.get("meeting_count"),
+        active_meeting_count: row.get("active_meeting_count"),
+        quota_readiness: AdminRetentionQuotaReadinessResponse {
+            storage_bytes_observed: row.get("observed_storage_bytes"),
+            storage_bytes_current: row.get("storage_bytes"),
+            enforcement_mode: "observe_only".to_owned(),
+            hard_quota_enforced: false,
+        },
+    }))
+}
+
+async fn api_admin_retention_cleanup_preview(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AdminRetentionCleanupPreviewResponse>, StatusCode> {
+    require_system_admin_request(&state, &headers, &user_id).await?;
+    let request = parse_optional_json_request_body::<AdminRetentionPolicyRequest>(&body)?;
+    let policy = normalize_admin_retention_policy(&state, request.as_ref())?;
+    let guild_id = configured_guild_id(&state)?;
+    let preview = build_admin_retention_cleanup_preview(&state, &guild_id, policy).await?;
+    Ok(Json(preview))
+}
+
+async fn api_admin_retention_cleanup_run(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AdminRetentionCleanupRunResponse>, StatusCode> {
+    require_system_admin_request(&state, &headers, &user_id).await?;
+    let request = parse_optional_json_request_body::<AdminRetentionPolicyRequest>(&body)?;
+    let policy = normalize_admin_retention_policy(&state, request.as_ref())?;
+    let guild_id = configured_guild_id(&state)?;
+    let preview = build_admin_retention_cleanup_preview(&state, &guild_id, policy).await?;
+    require_audit_event(
+        &state,
+        web_audit_event(
+            Some(guild_id.clone()),
+            Some(user_id.clone()),
+            "retention.cleanup_run.requested",
+            "retention_cleanup",
+            Some(guild_id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/admin/retention/cleanup-run"),
+            json!({
+                "policy": admin_retention_policy_response(policy),
+                "preview": {
+                    "raw_workspace_count": preview.raw_workspace_count,
+                    "transcript_workspace_count": preview.transcript_workspace_count,
+                    "summary_workspace_count": preview.summary_workspace_count,
+                    "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
+                },
+            }),
+        ),
+    )
+    .await?;
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let plan = collect_admin_retention_cleanup_plan(&state, &guild_id, policy).await?;
+    let filesystem_result =
+        tokio::task::spawn_blocking(move || apply_retention_filesystem_cleanup(&layout, &plan))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (mut report, mut error) = match filesystem_result {
+        Ok(report) => (report, None),
+        Err(err) => (*err.report, Some(err.message)),
+    };
+    match apply_admin_retention_database_cleanup(&state, &guild_id, policy, &report).await {
+        Ok(database_report) => report.merge(database_report),
+        Err(database_error) => {
+            report.merge(database_error.0);
+            error = Some(match error {
+                Some(error) => format!("{error}; database cleanup failed: {}", database_error.1),
+                None => format!("database cleanup failed: {}", database_error.1),
+            });
+        }
+    }
+    let result_audit_recorded = record_audit_event(
+        &state,
+        web_audit_event(
+            Some(guild_id.clone()),
+            Some(user_id.clone()),
+            "retention.cleanup_run",
+            "retention_cleanup",
+            Some(guild_id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/admin/retention/cleanup-run"),
+            json!({
+                "policy": admin_retention_policy_response(policy),
+                "preview": {
+                    "raw_workspace_count": preview.raw_workspace_count,
+                    "transcript_workspace_count": preview.transcript_workspace_count,
+                    "summary_workspace_count": preview.summary_workspace_count,
+                    "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
+                },
+                "report": admin_retention_report_response(&report),
+                "error": error.clone(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(AdminRetentionCleanupRunResponse {
+        preview,
+        report: admin_retention_report_response(&report),
+        audit_recorded: result_audit_recorded,
+        error,
+    }))
+}
+
+async fn api_admin_retention_meeting_delete_preview(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AdminRetentionMeetingDeletePreviewResponse>, StatusCode> {
+    require_system_admin_request(&state, &headers, &user_id).await?;
+    validate_resource_id(&meeting_id)?;
+    let request: AdminRetentionMeetingDeleteRequest = parse_json_request_body(&body)?;
+    let reason = normalize_retention_delete_reason(request.reason.as_deref())?;
+    drop(reason);
+    let targets = retention_targets_from_request(request.targets)?;
+    let guild_id = configured_guild_id(&state)?;
+    let preview =
+        build_admin_retention_meeting_delete_preview(&state, &guild_id, &meeting_id, targets)
+            .await?;
+    Ok(Json(preview))
+}
+
+async fn api_admin_retention_meeting_delete(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(meeting_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AdminRetentionMeetingDeleteResponse>, StatusCode> {
+    require_system_admin_request(&state, &headers, &user_id).await?;
+    validate_resource_id(&meeting_id)?;
+    let request: AdminRetentionMeetingDeleteRequest = parse_json_request_body(&body)?;
+    let reason = normalize_retention_delete_reason(request.reason.as_deref())?;
+    let targets = retention_targets_from_request(request.targets)?;
+    let guild_id = configured_guild_id(&state)?;
+    let preview =
+        build_admin_retention_meeting_delete_preview(&state, &guild_id, &meeting_id, targets)
+            .await?;
+    if !meeting_status_allows_manual_retention_delete(&preview.status) {
+        return Err(StatusCode::CONFLICT);
+    }
+    require_audit_event(
+        &state,
+        web_audit_event(
+            Some(guild_id.clone()),
+            Some(user_id.clone()),
+            "retention.meeting_delete.requested",
+            "meeting",
+            Some(meeting_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/admin/retention/meetings/{meeting_id}/delete"),
+            ),
+            json!({
+                "targets": request.targets,
+                "reason": reason.clone(),
+                "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
+                "preserves_usage_history": preview.preserves_usage_history,
+                "preserves_audit_history": preview.preserves_audit_history,
+                "usage_event_count": preview.usage_event_count,
+                "audit_event_count": preview.audit_event_count,
+            }),
+        ),
+    )
+    .await?;
+
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let meeting = ExpiredWorkspaceRow {
+        meeting_id: meeting_id.clone(),
+        guild_id: guild_id.clone(),
+        voice_channel_id: preview_meeting_voice_channel_id(&state, &guild_id, &meeting_id).await?,
+    };
+    let filesystem_targets = targets;
+    let filesystem_result = tokio::task::spawn_blocking(move || {
+        apply_manual_meeting_filesystem_delete(&layout, &meeting, filesystem_targets)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (mut report, mut error) = match filesystem_result {
+        Ok(report) => (report, None),
+        Err(err) => (*err.report, Some(err.message)),
+    };
+    match apply_admin_retention_meeting_database_delete(
+        &state,
+        &guild_id,
+        &meeting_id,
+        targets,
+        &report,
+    )
+    .await
+    {
+        Ok(database_report) => report.merge(database_report),
+        Err(database_error) => {
+            report.merge(database_error.0);
+            error = Some(match error {
+                Some(error) => format!("{error}; database delete failed: {}", database_error.1),
+                None => format!("database delete failed: {}", database_error.1),
+            });
+        }
+    }
+    let result_audit_recorded = record_audit_event(
+        &state,
+        web_audit_event(
+            Some(guild_id.clone()),
+            Some(user_id.clone()),
+            "retention.meeting_delete",
+            "meeting",
+            Some(meeting_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/admin/retention/meetings/{meeting_id}/delete"),
+            ),
+            json!({
+                "targets": request.targets,
+                "reason": reason,
+                "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
+                "preserves_usage_history": preview.preserves_usage_history,
+                "preserves_audit_history": preview.preserves_audit_history,
+                "usage_event_count": preview.usage_event_count,
+                "audit_event_count": preview.audit_event_count,
+                "report": admin_retention_report_response(&report),
+                "error": error.clone(),
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(AdminRetentionMeetingDeleteResponse {
+        preview,
+        report: admin_retention_report_response(&report),
+        audit_recorded: result_audit_recorded,
+        error,
+    }))
+}
+
 async fn record_admin_guild_plan_assignment_audit(
     state: &WebState,
     headers: &HeaderMap,
@@ -6090,6 +6564,565 @@ async fn record_admin_guild_plan_assignment_audit(
         ),
     )
     .await;
+}
+
+fn configured_guild_id(state: &WebState) -> Result<String, StatusCode> {
+    state
+        .auth
+        .as_ref()
+        .map(|auth| auth.guild_id.clone())
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn default_admin_retention_policy(state: &WebState) -> Result<RetentionPolicy, StatusCode> {
+    let raw_audio_ttl_days =
+        u32::try_from(state.guild_settings_defaults.retention_raw_audio_ttl_days)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transcript_ttl_days =
+        u32::try_from(state.guild_settings_defaults.retention_transcript_ttl_days)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(RetentionPolicy {
+        raw_audio_ttl_days: NonZeroU32::new(raw_audio_ttl_days)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+        transcript_ttl_days: NonZeroU32::new(transcript_ttl_days)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+        summary_ttl_days: None,
+    })
+}
+
+fn normalize_admin_retention_policy(
+    state: &WebState,
+    request: Option<&AdminRetentionPolicyRequest>,
+) -> Result<RetentionPolicy, StatusCode> {
+    let defaults = default_admin_retention_policy(state)?;
+    let raw_audio_ttl_days = request
+        .and_then(|request| request.raw_audio_ttl_days)
+        .unwrap_or_else(|| defaults.raw_audio_ttl_days.get());
+    let transcript_ttl_days = request
+        .and_then(|request| request.transcript_ttl_days)
+        .unwrap_or_else(|| defaults.transcript_ttl_days.get());
+    let summary_ttl_days = request.and_then(|request| request.summary_ttl_days);
+    if !(1..=365).contains(&raw_audio_ttl_days)
+        || !(1..=365).contains(&transcript_ttl_days)
+        || summary_ttl_days.is_some_and(|value| !(1..=365).contains(&value))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(RetentionPolicy {
+        raw_audio_ttl_days: NonZeroU32::new(raw_audio_ttl_days).ok_or(StatusCode::BAD_REQUEST)?,
+        transcript_ttl_days: NonZeroU32::new(transcript_ttl_days).ok_or(StatusCode::BAD_REQUEST)?,
+        summary_ttl_days: summary_ttl_days.and_then(NonZeroU32::new),
+    })
+}
+
+fn admin_retention_policy_response(policy: RetentionPolicy) -> AdminRetentionPolicyResponse {
+    AdminRetentionPolicyResponse {
+        raw_audio_ttl_days: policy.raw_audio_ttl_days.get(),
+        transcript_ttl_days: policy.transcript_ttl_days.get(),
+        summary_ttl_days: policy.summary_ttl_days.map(NonZeroU32::get),
+        debug_ttl_source: "raw_audio_ttl_days".to_owned(),
+    }
+}
+
+fn admin_retention_legal_hold_response() -> AdminRetentionLegalHoldResponse {
+    AdminRetentionLegalHoldResponse {
+        supported: false,
+        active: false,
+        message: "legal hold is not supported by the current meeting schema".to_owned(),
+    }
+}
+
+fn retention_targets_from_request(
+    targets: AdminRetentionTargets,
+) -> Result<RetentionDeletionTargets, StatusCode> {
+    let targets = RetentionDeletionTargets {
+        raw_audio: targets.raw_audio,
+        transcript: targets.transcript,
+        summary: targets.summary,
+        debug: targets.debug,
+    };
+    if targets.any() {
+        Ok(targets)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
+fn retention_targets_response(targets: RetentionDeletionTargets) -> AdminRetentionTargets {
+    AdminRetentionTargets {
+        raw_audio: targets.raw_audio,
+        transcript: targets.transcript,
+        summary: targets.summary,
+        debug: targets.debug,
+    }
+}
+
+fn admin_retention_storage_response(
+    usage: RetentionStorageUsage,
+) -> AdminRetentionStorageUsageResponse {
+    AdminRetentionStorageUsageResponse {
+        raw_audio_bytes: usage.raw_audio_bytes,
+        transcript_bytes: usage.transcript_bytes,
+        summary_bytes: usage.summary_bytes,
+        debug_bytes: usage.debug_bytes,
+        total_bytes: usage.total_bytes(),
+    }
+}
+
+fn admin_retention_report_response(
+    report: &RetentionCleanupReport,
+) -> AdminRetentionCleanupReportResponse {
+    AdminRetentionCleanupReportResponse {
+        raw_workspaces_scanned: report.raw_workspaces_scanned,
+        raw_audio_dirs_removed: report.raw_audio_dirs_removed,
+        legacy_meetings_cleaned: report.legacy_meetings_cleaned,
+        raw_workspaces_marked_cleaned: report.raw_workspaces_marked_cleaned,
+        speaker_dirs_removed: report.speaker_dirs_removed,
+        context_dirs_removed: report.context_dirs_removed,
+        transcript_dirs_removed: report.transcript_dirs_removed,
+        empty_summary_dirs_removed: report.empty_summary_dirs_removed,
+        summary_dirs_removed: report.summary_dirs_removed,
+        debug_dirs_removed: report.debug_dirs_removed,
+        agent_workspace_dirs_removed: report.agent_workspace_dirs_removed,
+        transcripts_marked_deleted: report.transcripts_marked_deleted,
+        summaries_deleted: report.summaries_deleted,
+        artifacts_deleted: report.artifacts_deleted,
+    }
+}
+
+fn normalize_retention_delete_reason(value: Option<&str>) -> Result<Option<String>, StatusCode> {
+    trim_optional_text(value, 1000, true)
+}
+
+fn meeting_status_allows_manual_retention_delete(status: &str) -> bool {
+    matches!(status, "posted" | "failed" | "aborted")
+}
+
+async fn collect_admin_retention_cleanup_plan(
+    state: &WebState,
+    guild_id: &str,
+    policy: RetentionPolicy,
+) -> Result<RetentionCleanupPlan, StatusCode> {
+    let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
+    let transcript_ttl = policy.transcript_ttl_days.get().to_string();
+    let mut errors = Vec::new();
+    let raw_workspaces = query_admin_retention_workspace_rows(
+        state,
+        ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
+        &raw_ttl,
+        guild_id,
+        &mut errors,
+    )
+    .await;
+    let transcript_workspaces = query_admin_retention_workspace_rows(
+        state,
+        ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+        &transcript_ttl,
+        guild_id,
+        &mut errors,
+    )
+    .await;
+    let summary_workspaces = if let Some(summary_ttl_days) = policy.summary_ttl_days {
+        query_admin_retention_workspace_rows(
+            state,
+            ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+            &summary_ttl_days.get().to_string(),
+            guild_id,
+            &mut errors,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    Ok(RetentionCleanupPlan {
+        raw_workspaces,
+        transcript_workspaces,
+        summary_workspaces,
+        errors,
+    })
+}
+
+async fn query_admin_retention_workspace_rows(
+    state: &WebState,
+    sql: &str,
+    ttl_days: &str,
+    guild_id: &str,
+    errors: &mut Vec<String>,
+) -> Vec<ExpiredWorkspaceRow> {
+    match state.db.query(sql, &[&ttl_days, &guild_id]).await {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| {
+                Some(ExpiredWorkspaceRow {
+                    meeting_id: row.try_get::<_, String>("id").ok()?,
+                    guild_id: row.try_get::<_, String>("guild_id").ok()?,
+                    voice_channel_id: row.try_get::<_, String>("voice_channel_id").ok()?,
+                })
+            })
+            .collect(),
+        Err(err) => {
+            errors.push(err.to_string());
+            Vec::new()
+        }
+    }
+}
+
+async fn build_admin_retention_cleanup_preview(
+    state: &WebState,
+    guild_id: &str,
+    policy: RetentionPolicy,
+) -> Result<AdminRetentionCleanupPreviewResponse, StatusCode> {
+    let plan = collect_admin_retention_cleanup_plan(state, guild_id, policy).await?;
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let filesystem_usage = estimate_plan_filesystem_usage(&layout, &plan)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deletion_targets = AdminRetentionTargets {
+        raw_audio: !plan.raw_workspaces.is_empty(),
+        transcript: !plan.transcript_workspaces.is_empty(),
+        summary: !plan.summary_workspaces.is_empty(),
+        debug: !plan.raw_workspaces.is_empty(),
+    };
+    Ok(AdminRetentionCleanupPreviewResponse {
+        guild_id: guild_id.to_owned(),
+        policy: admin_retention_policy_response(policy),
+        deletion_targets,
+        raw_workspace_count: plan.raw_workspaces.len(),
+        transcript_workspace_count: plan.transcript_workspaces.len(),
+        summary_workspace_count: plan.summary_workspaces.len(),
+        estimated_freed_bytes: admin_retention_storage_response(filesystem_usage),
+        errors: plan.errors,
+    })
+}
+
+fn estimate_plan_filesystem_usage(
+    layout: &crate::infrastructure::workspace::MeetingWorkspaceLayout,
+    plan: &RetentionCleanupPlan,
+) -> Result<RetentionStorageUsage, String> {
+    let mut usage = RetentionStorageUsage::default();
+    for meeting in &plan.raw_workspaces {
+        let meeting_usage = estimate_meeting_filesystem_usage(layout, meeting)?;
+        usage.raw_audio_bytes = usage
+            .raw_audio_bytes
+            .saturating_add(meeting_usage.raw_audio_bytes);
+        usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
+    }
+    for meeting in &plan.transcript_workspaces {
+        let meeting_usage = estimate_meeting_filesystem_usage(layout, meeting)?;
+        usage.transcript_bytes = usage
+            .transcript_bytes
+            .saturating_add(meeting_usage.transcript_bytes);
+    }
+    for meeting in &plan.summary_workspaces {
+        let meeting_usage = estimate_meeting_filesystem_usage(layout, meeting)?;
+        usage.summary_bytes = usage
+            .summary_bytes
+            .saturating_add(meeting_usage.summary_bytes);
+    }
+    Ok(usage)
+}
+
+async fn apply_admin_retention_database_cleanup(
+    state: &WebState,
+    guild_id: &str,
+    policy: RetentionPolicy,
+    filesystem_report: &RetentionCleanupReport,
+) -> Result<RetentionCleanupReport, (RetentionCleanupReport, String)> {
+    let mut report = RetentionCleanupReport::default();
+    let mut errors = Vec::new();
+    for meeting_id in &filesystem_report.raw_workspace_cleaned_meeting_ids {
+        match state
+            .db
+            .execute(
+                ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL,
+                &[meeting_id, &guild_id],
+            )
+            .await
+        {
+            Ok(count) => report.raw_workspaces_marked_cleaned += count,
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+
+    let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
+    let transcript_ttl = policy.transcript_ttl_days.get().to_string();
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
+        &[&transcript_ttl, &guild_id],
+        |report, count| report.transcripts_marked_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
+        &[&guild_id],
+        |report, count| report.artifacts_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
+        &[&raw_ttl, &guild_id],
+        |report, count| report.artifacts_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
+        &[&transcript_ttl, &guild_id],
+        |report, count| report.artifacts_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
+        &[&raw_ttl, &guild_id],
+        |report, count| report.artifacts_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+    if let Some(summary_ttl_days) = policy.summary_ttl_days {
+        let summary_ttl = summary_ttl_days.get().to_string();
+        execute_retention_count(
+            state,
+            ADMIN_RETENTION_DELETE_SUMMARIES_SQL,
+            &[&summary_ttl, &guild_id],
+            |report, count| report.summaries_deleted += count,
+            &mut report,
+            &mut errors,
+        )
+        .await;
+        execute_retention_count(
+            state,
+            ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
+            &[&summary_ttl, &guild_id],
+            |report, count| report.artifacts_deleted += count,
+            &mut report,
+            &mut errors,
+        )
+        .await;
+    }
+
+    if errors.is_empty() {
+        Ok(report)
+    } else {
+        Err((report, errors.join("; ")))
+    }
+}
+
+async fn execute_retention_count(
+    state: &WebState,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    apply: impl FnOnce(&mut RetentionCleanupReport, u64),
+    report: &mut RetentionCleanupReport,
+    errors: &mut Vec<String>,
+) {
+    match state.db.execute(sql, params).await {
+        Ok(count) => apply(report, count),
+        Err(err) => errors.push(err.to_string()),
+    }
+}
+
+async fn build_admin_retention_meeting_delete_preview(
+    state: &WebState,
+    guild_id: &str,
+    meeting_id: &str,
+    targets: RetentionDeletionTargets,
+) -> Result<AdminRetentionMeetingDeletePreviewResponse, StatusCode> {
+    let row = state
+        .db
+        .query_opt(
+            ADMIN_RETENTION_MEETING_DETAIL_SQL,
+            &[&meeting_id, &guild_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let meeting = ExpiredWorkspaceRow {
+        meeting_id: row.get("id"),
+        guild_id: row.get("guild_id"),
+        voice_channel_id: row.get("voice_channel_id"),
+    };
+    let layout =
+        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+    let filesystem_usage = estimate_meeting_filesystem_usage(&layout, &meeting)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let target_filesystem_usage = estimate_target_filesystem_usage(&layout, &meeting, targets)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let artifact_usage = RetentionStorageUsage {
+        raw_audio_bytes: i64_to_u64(row.get("raw_audio_artifact_bytes")),
+        transcript_bytes: i64_to_u64(row.get("transcript_artifact_bytes")),
+        summary_bytes: i64_to_u64(row.get("summary_artifact_bytes")),
+        debug_bytes: i64_to_u64(row.get("debug_artifact_bytes")),
+    };
+    let total_storage = RetentionStorageUsage {
+        raw_audio_bytes: filesystem_usage
+            .raw_audio_bytes
+            .saturating_add(artifact_usage.raw_audio_bytes),
+        transcript_bytes: filesystem_usage
+            .transcript_bytes
+            .saturating_add(artifact_usage.transcript_bytes),
+        summary_bytes: filesystem_usage
+            .summary_bytes
+            .saturating_add(artifact_usage.summary_bytes),
+        debug_bytes: filesystem_usage
+            .debug_bytes
+            .saturating_add(artifact_usage.debug_bytes),
+    };
+    let selected_artifact_usage = RetentionStorageUsage {
+        raw_audio_bytes: if targets.raw_audio {
+            artifact_usage.raw_audio_bytes
+        } else {
+            0
+        },
+        transcript_bytes: if targets.transcript {
+            artifact_usage.transcript_bytes
+        } else {
+            0
+        },
+        summary_bytes: if targets.summary {
+            artifact_usage.summary_bytes
+        } else {
+            0
+        },
+        debug_bytes: if targets.debug {
+            artifact_usage.debug_bytes
+        } else {
+            0
+        },
+    };
+    let estimated_freed = RetentionStorageUsage {
+        raw_audio_bytes: target_filesystem_usage
+            .raw_audio_bytes
+            .saturating_add(selected_artifact_usage.raw_audio_bytes),
+        transcript_bytes: target_filesystem_usage
+            .transcript_bytes
+            .saturating_add(selected_artifact_usage.transcript_bytes),
+        summary_bytes: target_filesystem_usage
+            .summary_bytes
+            .saturating_add(selected_artifact_usage.summary_bytes),
+        debug_bytes: target_filesystem_usage
+            .debug_bytes
+            .saturating_add(selected_artifact_usage.debug_bytes),
+    };
+    Ok(AdminRetentionMeetingDeletePreviewResponse {
+        guild_id: guild_id.to_owned(),
+        meeting_id: meeting_id.to_owned(),
+        status: row.get("status"),
+        started_at: row.get("started_at"),
+        stopped_at: row.get("stopped_at"),
+        targets: retention_targets_response(targets),
+        storage: admin_retention_storage_response(total_storage),
+        estimated_freed_bytes: admin_retention_storage_response(estimated_freed),
+        transcript_count: row.get("transcript_count"),
+        summary_count: row.get("summary_count"),
+        artifact_count: row.get("artifact_count"),
+        usage_event_count: row.get("usage_event_count"),
+        audit_event_count: row.get("audit_event_count"),
+        legal_hold: admin_retention_legal_hold_response(),
+        preserves_usage_history: true,
+        preserves_audit_history: true,
+    })
+}
+
+async fn preview_meeting_voice_channel_id(
+    state: &WebState,
+    guild_id: &str,
+    meeting_id: &str,
+) -> Result<String, StatusCode> {
+    let row = state
+        .db
+        .query_opt(
+            ADMIN_RETENTION_MEETING_DETAIL_SQL,
+            &[&meeting_id, &guild_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(row.get("voice_channel_id"))
+}
+
+async fn apply_admin_retention_meeting_database_delete(
+    state: &WebState,
+    guild_id: &str,
+    meeting_id: &str,
+    targets: RetentionDeletionTargets,
+    filesystem_report: &RetentionCleanupReport,
+) -> Result<RetentionCleanupReport, (RetentionCleanupReport, String)> {
+    let mut report = RetentionCleanupReport::default();
+    let mut errors = Vec::new();
+    for cleaned_meeting_id in &filesystem_report.raw_workspace_cleaned_meeting_ids {
+        match state
+            .db
+            .execute(
+                ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL,
+                &[cleaned_meeting_id, &guild_id],
+            )
+            .await
+        {
+            Ok(count) => report.raw_workspaces_marked_cleaned += count,
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+    if targets.transcript {
+        execute_retention_count(
+            state,
+            ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
+            &[&meeting_id, &guild_id],
+            |report, count| report.transcripts_marked_deleted += count,
+            &mut report,
+            &mut errors,
+        )
+        .await;
+    }
+    if targets.summary {
+        execute_retention_count(
+            state,
+            ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL,
+            &[&meeting_id, &guild_id],
+            |report, count| report.summaries_deleted += count,
+            &mut report,
+            &mut errors,
+        )
+        .await;
+    }
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
+        &[
+            &meeting_id,
+            &guild_id,
+            &targets.raw_audio,
+            &targets.transcript,
+            &targets.summary,
+            &targets.debug,
+        ],
+        |report, count| report.artifacts_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+
+    if errors.is_empty() {
+        Ok(report)
+    } else {
+        Err((report, errors.join("; ")))
+    }
+}
+
+fn i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 async fn api_guild_meetings(
@@ -10098,6 +11131,9 @@ mod guild_api_tests {
     use crate::domain::feedback::{TranscriptFeedbackStatus, TranscriptFeedbackType};
     use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
     use crate::infrastructure::sql::{
+        ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
+        ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
+        ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MEETING_DETAIL_SQL,
         ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, COUNT_GUILD_MEETINGS_SQL,
         COUNT_VISIBLE_GUILD_MEETINGS_SQL, INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL,
         LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
@@ -10835,6 +11871,59 @@ mod guild_api_tests {
             list_assignments.find("require_system_admin_request")
                 < list_assignments.find("parse_admin_guild_plan_assignment_list_query")
         );
+
+        let cleanup_preview = source
+            .split_once("async fn api_admin_retention_cleanup_preview")
+            .expect("retention cleanup preview handler should exist")
+            .1
+            .split_once("async fn api_admin_retention_cleanup_run")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            cleanup_preview.find("require_system_admin_request")
+                < cleanup_preview.find("parse_optional_json_request_body")
+        );
+
+        let cleanup_run = source
+            .split_once("async fn api_admin_retention_cleanup_run")
+            .expect("retention cleanup run handler should exist")
+            .1
+            .split_once("async fn api_admin_retention_meeting_delete_preview")
+            .expect("next handler should exist")
+            .0;
+        assert!(cleanup_run.find("require_audit_event") < cleanup_run.find("spawn_blocking"));
+
+        let meeting_delete = source
+            .split_once("async fn api_admin_retention_meeting_delete(")
+            .expect("retention meeting delete handler should exist")
+            .1
+            .split_once("async fn record_admin_guild_plan_assignment_audit")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            meeting_delete.find("require_system_admin_request")
+                < meeting_delete.find("parse_json_request_body")
+        );
+        assert!(
+            meeting_delete.find("require_audit_event")
+                < meeting_delete.find("apply_manual_meeting_filesystem_delete")
+        );
+    }
+
+    #[test]
+    fn retention_admin_delete_sql_preserves_history_and_scopes_meeting() {
+        assert!(ADMIN_RETENTION_MEETING_DETAIL_SQL.contains("m.guild_id = $2"));
+        assert!(ADMIN_RETENTION_MEETING_DETAIL_SQL.contains("usage_events"));
+        assert!(ADMIN_RETENTION_MEETING_DETAIL_SQL.contains("audit_events"));
+        assert!(!ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL.contains("DELETE"));
+        assert!(ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL.contains("is_deleted = TRUE"));
+        assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("WHERE id=$1"));
+        assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("AND guild_id=$2"));
+        assert!(
+            ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL.contains("WHERE meeting_id = $1")
+        );
+        assert!(!ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL.contains("usage_events"));
+        assert!(!ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL.contains("audit_events"));
     }
 
     #[test]
