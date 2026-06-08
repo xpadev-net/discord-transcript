@@ -864,8 +864,6 @@ export function SettingsPage({
     useState<AdminRetentionCleanupRun | null>(null);
   const [retentionMeetingPreview, setRetentionMeetingPreview] =
     useState<AdminRetentionMeetingDeletePreview | null>(null);
-  const [retentionMeetingPreviewReason, setRetentionMeetingPreviewReason] =
-    useState<string | null>(null);
   const [retentionMeetingDelete, setRetentionMeetingDelete] =
     useState<AdminRetentionMeetingDelete | null>(null);
   const [retentionError, setRetentionError] = useState<string | null>(null);
@@ -987,7 +985,6 @@ export function SettingsPage({
     setRetentionCleanupPreviewKey(null);
     setRetentionCleanupRun(null);
     setRetentionMeetingPreview(null);
-    setRetentionMeetingPreviewReason(null);
     setRetentionMeetingDelete(null);
     setRetentionError(null);
     if (!showCustomizations) {
@@ -1084,7 +1081,6 @@ export function SettingsPage({
   );
   const retentionMeetingPreviewMatchesDraft =
     retentionMeetingPreview?.meeting_id === retentionDraft.meeting_id.trim() &&
-    retentionMeetingPreviewReason === retentionDraft.reason.trim() &&
     sameRetentionTargets(
       retentionMeetingPreview.targets,
       retentionDraft.targets,
@@ -1470,7 +1466,6 @@ export function SettingsPage({
   async function handleRetentionMeetingPreview() {
     const token = retentionDraft.token.trim();
     const meetingId = retentionDraft.meeting_id.trim();
-    const reason = retentionDraft.reason.trim();
     const requestGuildKey = currentGuildKeyRef.current;
     if (!token || !meetingId || !retentionTargetsSelected || isSavingAny) {
       setRetentionError("管理トークンと会議IDを入力してください");
@@ -1488,7 +1483,6 @@ export function SettingsPage({
         return;
       }
       setRetentionMeetingPreview(preview);
-      setRetentionMeetingPreviewReason(reason);
       setRetentionMeetingDelete(null);
       setMessage("会議削除の対象を確認しました");
     } catch (err) {
@@ -1531,7 +1525,6 @@ export function SettingsPage({
         return;
       }
       setRetentionMeetingPreview(result.preview);
-      setRetentionMeetingPreviewReason(null);
       setRetentionMeetingDelete(result);
       let refreshWarning = false;
       try {

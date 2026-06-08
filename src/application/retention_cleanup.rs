@@ -787,11 +787,14 @@ fn remove_empty_dir_if_present(path: &Path) -> Result<bool, String> {
 }
 
 fn dir_size_if_present(path: &Path) -> Result<u64, String> {
-    let metadata = match fs::metadata(path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(format!("failed to stat {}: {err}", path.display())),
     };
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
     if metadata.is_file() {
         return Ok(metadata.len());
     }

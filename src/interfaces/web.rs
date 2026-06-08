@@ -57,7 +57,7 @@ use crate::infrastructure::bot_token::{
 };
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ADMIN_CANCEL_JOB_SQL,
-    ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
     ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
@@ -6918,15 +6918,6 @@ async fn apply_admin_retention_database_cleanup(
         ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
         &[&transcript_ttl, &guild_id],
         |report, count| report.transcripts_marked_deleted += count,
-        &mut report,
-        &mut errors,
-    )
-    .await;
-    execute_retention_count(
-        state,
-        ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
-        &[&guild_id],
-        |report, count| report.artifacts_deleted += count,
         &mut report,
         &mut errors,
     )
