@@ -1559,11 +1559,16 @@ WITH active_tenant AS (
     ORDER BY tg.effective_at DESC
     LIMIT 1
 ),
+audit_retention_sample AS (
+    SELECT random() < 0.001 AS run_cleanup
+),
 stale_audit_events AS (
-    SELECT ctid
-    FROM audit_events
-    WHERE occurred_at < NOW() - INTERVAL '180 days'
-    ORDER BY occurred_at ASC
+    SELECT events.ctid
+    FROM audit_retention_sample sample
+    JOIN audit_events events
+      ON sample.run_cleanup
+    WHERE events.occurred_at < NOW() - INTERVAL '180 days'
+    ORDER BY events.occurred_at ASC
     LIMIT 500
 ),
 audit_retention AS (

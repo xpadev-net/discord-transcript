@@ -38,6 +38,8 @@ fn incremental_migrations_include_audit_event_schema() {
 #[test]
 fn audit_insert_sql_prunes_old_rows_and_dedupes_debug_downloads() {
     assert!(INSERT_AUDIT_EVENT_SQL.contains("stale_audit_events"));
+    assert!(INSERT_AUDIT_EVENT_SQL.contains("audit_retention_sample"));
+    assert!(INSERT_AUDIT_EVENT_SQL.contains("random() < 0.001"));
     assert!(INSERT_AUDIT_EVENT_SQL.contains("INTERVAL '180 days'"));
     assert!(INSERT_AUDIT_EVENT_SQL.contains("LIMIT 500"));
     assert!(INSERT_AUDIT_EVENT_SQL.contains("ON CONFLICT (id) DO NOTHING"));
