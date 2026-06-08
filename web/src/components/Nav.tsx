@@ -4,6 +4,8 @@ import type { UserGuild } from "../lib/types";
 interface NavProps {
   canManageSettings: boolean;
   canUseAdminViews: boolean;
+  canUseUsageAdmin: boolean;
+  canUseRetentionAdmin: boolean;
   isSystemAdmin: boolean;
   guilds: UserGuild[];
   selectedGuildId: string | null;
@@ -28,6 +30,8 @@ function guildOptionLabel(guild: UserGuild): string {
 export function Nav({
   canManageSettings,
   canUseAdminViews,
+  canUseUsageAdmin,
+  canUseRetentionAdmin,
   isSystemAdmin,
   guilds,
   selectedGuildId,
@@ -78,40 +82,48 @@ export function Nav({
               {"\u8a2d\u5b9a"}
             </NavLink>
           ) : null}
-          {canUseAdminViews ? (
+          {canUseAdminViews || canUseUsageAdmin ? (
             <>
-              <NavLink
-                to="/admin/usage"
-                className={({ isActive }) =>
-                  `app-nav-link${isActive ? " active" : ""}`
-                }
-              >
-                {"Usage"}
-              </NavLink>
-              <NavLink
-                to="/admin/jobs"
-                className={({ isActive }) =>
-                  `app-nav-link${isActive ? " active" : ""}`
-                }
-              >
-                {"Jobs"}
-              </NavLink>
-              <NavLink
-                to="/admin/audit"
-                className={({ isActive }) =>
-                  `app-nav-link${isActive ? " active" : ""}`
-                }
-              >
-                {"Audit"}
-              </NavLink>
-              <NavLink
-                to="/admin/retention"
-                className={({ isActive }) =>
-                  `app-nav-link${isActive ? " active" : ""}`
-                }
-              >
-                {"Retention"}
-              </NavLink>
+              {canUseUsageAdmin ? (
+                <>
+                  <NavLink
+                    to="/admin/usage"
+                    className={({ isActive }) =>
+                      `app-nav-link${isActive ? " active" : ""}`
+                    }
+                  >
+                    {"Usage"}
+                  </NavLink>
+                  <NavLink
+                    to="/admin/jobs"
+                    className={({ isActive }) =>
+                      `app-nav-link${isActive ? " active" : ""}`
+                    }
+                  >
+                    {"Jobs"}
+                  </NavLink>
+                </>
+              ) : null}
+              {canUseAdminViews ? (
+                <NavLink
+                  to="/admin/audit"
+                  className={({ isActive }) =>
+                    `app-nav-link${isActive ? " active" : ""}`
+                  }
+                >
+                  {"Audit"}
+                </NavLink>
+              ) : null}
+              {canUseRetentionAdmin ? (
+                <NavLink
+                  to="/admin/retention"
+                  className={({ isActive }) =>
+                    `app-nav-link${isActive ? " active" : ""}`
+                  }
+                >
+                  {"Retention"}
+                </NavLink>
+              ) : null}
             </>
           ) : null}
           {isSystemAdmin ? (

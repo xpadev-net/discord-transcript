@@ -45,6 +45,10 @@ function canViewCurrentGuildUsage(me: MeResponse | null): boolean {
   return me?.can_view_usage ?? me?.is_admin ?? false;
 }
 
+function canViewCurrentGuildAdmin(me: MeResponse | null): boolean {
+  return me?.can_view_admin ?? me?.is_admin ?? false;
+}
+
 function chooseSelectedGuildId(
   me: MeResponse,
   guilds: UserGuild[],
@@ -169,7 +173,15 @@ export function App() {
         ? canManageCurrentGuildSettings(me)
         : true)
     : canManageCurrentGuildSettings(me) && selectedGuildId === me?.guild_id;
-  const canUseCurrentGuildAdminViews = canViewCurrentGuildUsage(me);
+  const canUseCurrentGuildAdminViews = canViewCurrentGuildAdmin(me);
+  const canUseCurrentGuildUsageAdmin = canViewCurrentGuildUsage(me);
+  const canUseCurrentGuildRetentionAdmin =
+    canUseCurrentGuildAdminViews && canManageCurrentGuildSettings(me);
+  const defaultAdminPath = canUseCurrentGuildUsageAdmin
+    ? "/admin/usage"
+    : canUseCurrentGuildAdminViews
+      ? "/admin/audit"
+      : null;
   const currentGuildName =
     guilds.find((guild) => me && guild.guild_id === me.guild_id)?.name ??
     undefined;
@@ -181,6 +193,8 @@ export function App() {
       <Nav
         canManageSettings={canUseSelectedGuildSettings}
         canUseAdminViews={canUseCurrentGuildAdminViews}
+        canUseUsageAdmin={canUseCurrentGuildUsageAdmin}
+        canUseRetentionAdmin={canUseCurrentGuildRetentionAdmin}
         isSystemAdmin={me?.is_admin === true}
         guilds={guilds}
         selectedGuildId={selectedGuildId}
@@ -245,12 +259,33 @@ export function App() {
           }
         />
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
-        <Route path="/admin" element={<Navigate to="/admin/usage" replace />} />
+        <Route
+          path="/admin"
+          element={
+            loadingMe ? (
+              <GuildAdminRoute
+                isAdmin={false}
+                loading={loadingMe}
+                forbidden={sessionForbidden}
+                error={sessionError}
+              />
+            ) : defaultAdminPath ? (
+              <Navigate to={defaultAdminPath} replace />
+            ) : (
+              <GuildAdminRoute
+                isAdmin={false}
+                loading={false}
+                forbidden={sessionForbidden}
+                error={sessionError}
+              />
+            )
+          }
+        />
         <Route
           path="/admin/usage"
           element={
             <GuildAdminRoute
-              isAdmin={canUseCurrentGuildAdminViews}
+              isAdmin={canUseCurrentGuildUsageAdmin}
               loading={loadingMe}
               forbidden={sessionForbidden}
               error={sessionError}
@@ -267,7 +302,7 @@ export function App() {
           path="/admin/jobs"
           element={
             <GuildAdminRoute
-              isAdmin={canUseCurrentGuildAdminViews}
+              isAdmin={canUseCurrentGuildUsageAdmin}
               loading={loadingMe}
               forbidden={sessionForbidden}
               error={sessionError}
@@ -296,7 +331,7 @@ export function App() {
           path="/admin/retention"
           element={
             <GuildAdminRoute
-              isAdmin={canUseCurrentGuildAdminViews}
+              isAdmin={canUseCurrentGuildRetentionAdmin}
               loading={loadingMe}
               forbidden={sessionForbidden}
               error={sessionError}
