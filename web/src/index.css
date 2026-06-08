@@ -302,6 +302,33 @@ button {
   padding: 28px 24px 40px;
 }
 
+.admin-view-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.admin-view-header h1 {
+  color: var(--text-primary);
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.admin-view-header p {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.admin-view-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .settings-header {
   display: flex;
   justify-content: space-between;
@@ -632,8 +659,74 @@ button {
   gap: 16px;
 }
 
+.admin-view-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
 .admin-wide-section {
   grid-column: 1 / -1;
+}
+
+.admin-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.admin-view-layout .admin-metric-grid {
+  margin-bottom: 0;
+}
+
+.admin-metric-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  padding: 14px;
+}
+
+.admin-metric-card span,
+.admin-metric-card small {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.admin-metric-card strong {
+  color: var(--text-primary);
+  font-size: 1.25rem;
+  overflow-wrap: anywhere;
+}
+
+.admin-definition-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.admin-definition-list div {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.6fr) minmax(0, 1fr);
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.admin-definition-list dt {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.admin-definition-list dd {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
 }
 
 .admin-plan-summary-grid {
@@ -782,6 +875,29 @@ button {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-secondary);
+}
+
+.admin-table-shell {
+  min-height: 260px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
+
+.admin-table {
+  min-width: 900px;
+}
+
+.admin-table-primary {
+  display: grid;
+  gap: 2px;
+}
+
+.admin-table-primary span {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
 }
 
 .meeting-table {
@@ -1516,10 +1632,7 @@ audio::-webkit-media-controls-panel {
     width: 100%;
   }
   .header {
-    top: 51px;
-  }
-  .app-nav.has-guild-selector + .header {
-    top: 116px;
+    position: static;
   }
   .main-container {
     flex-direction: column;
@@ -1540,9 +1653,21 @@ audio::-webkit-media-controls-panel {
     grid-template-columns: 1fr;
   }
   .admin-layout,
+  .admin-view-layout,
   .admin-plan-summary-grid,
-  .admin-form-grid {
+  .admin-form-grid,
+  .admin-metric-grid {
     grid-template-columns: 1fr;
+  }
+  .admin-view-header {
+    flex-direction: column;
+  }
+  .admin-view-actions {
+    justify-content: flex-start;
+  }
+  .admin-definition-list div {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
   .admin-filter-row {
     align-items: stretch;

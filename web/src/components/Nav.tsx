@@ -2,7 +2,8 @@ import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { UserGuild } from "../lib/types";
 
 interface NavProps {
-  isAdmin: boolean;
+  canManageSettings: boolean;
+  canUseAdminViews: boolean;
   isSystemAdmin: boolean;
   guilds: UserGuild[];
   selectedGuildId: string | null;
@@ -25,7 +26,8 @@ function guildOptionLabel(guild: UserGuild): string {
 }
 
 export function Nav({
-  isAdmin,
+  canManageSettings,
+  canUseAdminViews,
   isSystemAdmin,
   guilds,
   selectedGuildId,
@@ -45,6 +47,7 @@ export function Nav({
   const settingsPath = settingsGuildId
     ? `/guilds/${encodeURIComponent(settingsGuildId)}/settings`
     : "/settings";
+  const isAdminRoute = location.pathname.startsWith("/admin");
   const isSettingsRoute =
     location.pathname === "/settings" ||
     /^\/guilds\/[^/]+\/settings$/.test(location.pathname);
@@ -65,7 +68,7 @@ export function Nav({
           >
             {"\u4f1a\u8b70\u4e00\u89a7"}
           </NavLink>
-          {isAdmin ? (
+          {canManageSettings ? (
             <NavLink
               to={settingsPath}
               className={({ isActive }) =>
@@ -75,6 +78,42 @@ export function Nav({
               {"\u8a2d\u5b9a"}
             </NavLink>
           ) : null}
+          {canUseAdminViews ? (
+            <>
+              <NavLink
+                to="/admin/usage"
+                className={({ isActive }) =>
+                  `app-nav-link${isActive ? " active" : ""}`
+                }
+              >
+                {"Usage"}
+              </NavLink>
+              <NavLink
+                to="/admin/jobs"
+                className={({ isActive }) =>
+                  `app-nav-link${isActive ? " active" : ""}`
+                }
+              >
+                {"Jobs"}
+              </NavLink>
+              <NavLink
+                to="/admin/audit"
+                className={({ isActive }) =>
+                  `app-nav-link${isActive ? " active" : ""}`
+                }
+              >
+                {"Audit"}
+              </NavLink>
+              <NavLink
+                to="/admin/retention"
+                className={({ isActive }) =>
+                  `app-nav-link${isActive ? " active" : ""}`
+                }
+              >
+                {"Retention"}
+              </NavLink>
+            </>
+          ) : null}
           {isSystemAdmin ? (
             <NavLink
               to="/admin/plans"
@@ -82,11 +121,11 @@ export function Nav({
                 `app-nav-link${isActive ? " active" : ""}`
               }
             >
-              {"\u7ba1\u7406"}
+              {"Plans"}
             </NavLink>
           ) : null}
         </div>
-        {shouldShowGuildSelector ? (
+        {shouldShowGuildSelector && !isAdminRoute ? (
           <label className="guild-selector">
             <span>{"\u30ae\u30eb\u30c9"}</span>
             <select
