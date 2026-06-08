@@ -2208,6 +2208,47 @@ describe("App access controls", () => {
     expect(screen.getAllByText("Captured Room").length).toBeGreaterThan(0);
   });
 
+  it("shows a deterministic dashboard fallback for meetings without a title", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse("guild-1", [
+              meetingItem({
+                title: null,
+                started_at: "2026-06-01T00:00:00Z",
+                voice_channel_id: "vc-renamed",
+                voice_channel_name: "Captured Room",
+              }),
+            ]),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(
+      await screen.findByRole("link", {
+        name: "2026/6/1 09:00 Captured Room",
+      }),
+    ).toBeTruthy();
+  });
+
   it("filters dashboard meetings by VC and clears the VC filter", async () => {
     const channels = [voiceChannel("vc-1"), voiceChannel("vc-2")];
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

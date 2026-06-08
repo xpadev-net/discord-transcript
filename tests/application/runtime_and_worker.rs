@@ -530,6 +530,10 @@ impl MeetingStore for ExtractingInMemoryStore {
         self.inner.set_error_message(meeting_id, error_message)
     }
 
+    fn set_meeting_title(&mut self, meeting_id: &str, title: String) -> Result<(), StoreError> {
+        self.inner.set_meeting_title(meeting_id, title)
+    }
+
     fn get_status_message_metadata(
         &mut self,
         meeting_id: &str,
@@ -1773,6 +1777,165 @@ fn worker_skips_transcript_correction_when_client_does_not_support_it() {
     assert!(
         !workspace.correction_prompt_path().exists(),
         "correction prompt artifact should not be written when correction is skipped"
+    );
+}
+
+#[test]
+fn worker_generates_persists_posts_and_debugs_title_from_summary() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc".to_owned(),
+        voice_channel_name: Some("Roadmap VC".to_owned()),
+        report_channel_id: "c1".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Stopping,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"Alpha launch risk review"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "## Summary\nAlpha launch risk review and release blockers were discussed.\n\n## TODO\n- Follow up".to_owned(),
+    };
+    let temp = temp_workspace("m1_generated_title");
+    let workspace = temp.workspace().clone();
+
+    let output = process_meeting_summary(
+        &mut store,
+        &whisper,
+        &claude,
+        &ProcessMeetingInput {
+            meeting_id: "m1".to_owned(),
+            job_id: None,
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc".to_owned(),
+            voice_channel_name: Some("Roadmap VC".to_owned()),
+            title: None,
+            audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+            speaker_audio: vec![SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "audio.wav".to_owned(),
+                offset_ms: 0,
+            }],
+            language: None,
+            workspace: workspace.clone(),
+            summary_context: SummaryContextInput::default(),
+        },
+    )
+    .expect("worker should summarize and save title");
+
+    assert_eq!(
+        output.title,
+        "Alpha launch risk review and release blockers were discussed"
+    );
+    assert_eq!(
+        store.get("m1").and_then(|meeting| meeting.title.as_deref()),
+        Some("Alpha launch risk review and release blockers were discussed")
+    );
+    assert!(
+        output.chunks[0].starts_with(
+            "# Alpha launch risk review and release blockers were discussed\n\n## Summary"
+        ),
+        "Discord post chunks should include the generated meeting title"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.meeting_title_debug_path())
+            .expect("meeting title debug artifact"),
+        "Alpha launch risk review and release blockers were discussed"
+    );
+}
+
+#[test]
+fn worker_rejects_invalid_titles_and_uses_voice_channel_fallback() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-123".to_owned(),
+        voice_channel_name: Some("Ops Room".to_owned()),
+        report_channel_id: "c1".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: Some(format!("{}\u{7}", "x".repeat(90))),
+        status: MeetingStatus::Stopping,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+    });
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: format!("## Summary\n{}\u{7}{}", "x".repeat(40), "x".repeat(90)),
+    };
+    let temp = temp_workspace("m1_title_fallback");
+    let workspace = temp.workspace().clone();
+
+    let output = process_meeting_summary(
+        &mut store,
+        &whisper,
+        &claude,
+        &ProcessMeetingInput {
+            meeting_id: "m1".to_owned(),
+            job_id: None,
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc-123".to_owned(),
+            voice_channel_name: Some("Ops Room".to_owned()),
+            title: Some(format!("{}\u{7}", "x".repeat(90))),
+            audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+            speaker_audio: vec![SpeakerAudioInput {
+                speaker_id: "alice".to_owned(),
+                audio_path: "audio.wav".to_owned(),
+                offset_ms: 0,
+            }],
+            language: None,
+            workspace,
+            summary_context: SummaryContextInput::default(),
+        },
+    )
+    .expect("worker should fall back for invalid titles");
+
+    assert_eq!(output.title, "Ops Room meeting");
+    assert_eq!(
+        store.get("m1").and_then(|meeting| meeting.title.as_deref()),
+        Some("Ops Room meeting")
+    );
+    assert!(!output.title.chars().any(char::is_control));
+    assert!(output.title.chars().count() <= 80);
+}
+
+#[test]
+fn sql_store_updates_meeting_title() {
+    let mut store = SqlMeetingStore::new(FakeSqlExecutor::default());
+
+    store
+        .set_meeting_title("m1", "Alpha launch review".to_owned())
+        .expect("title update should succeed");
+
+    assert!(
+        store.executor.executed.iter().any(|(sql, params)| {
+            sql == "UPDATE meetings SET title=$1, updated_at=NOW() WHERE id=$2"
+                && params == &vec!["Alpha launch review".to_owned(), "m1".to_owned()]
+        }),
+        "SQL store should update meetings.title"
     );
 }
 

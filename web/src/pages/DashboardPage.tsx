@@ -21,9 +21,28 @@ import type {
 } from "../lib/types";
 
 const PAGE_SIZE = 20;
+const MEETING_TITLE_DISPLAY_MAX_CHARS = 80;
 
 function displayTitle(meeting: MeetingListItem): string {
-  return meeting.title || "\u7121\u984c\u306e\u4f1a\u8b70";
+  const title = meeting.title?.trim();
+  if (
+    title &&
+    title.length <= MEETING_TITLE_DISPLAY_MAX_CHARS &&
+    !hasControlCharacter(title)
+  ) {
+    return title;
+  }
+  const channel = displayVoiceChannel(meeting);
+  return meeting.started_at
+    ? `${formatDate(meeting.started_at)} ${channel}`
+    : channel;
+}
+
+function hasControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127;
+  });
 }
 
 function displayDate(value: string | null): string {

@@ -7,8 +7,8 @@ use crate::application::summary::{
     TranscriptionOutput, build_correction_prompt_with_context, build_summary_prompt_with_context,
     correct_transcript_with_prompt_and_workdir, materialize_new_summary_agent_workspace,
     materialize_or_load_summary_context, persist_correction_prompt_debug_artifact,
-    persist_pre_correction_transcript_debug_artifact, persist_summary_prompt_debug_artifact,
-    run_transcription, write_transcript_files,
+    persist_meeting_title_debug_artifact, persist_pre_correction_transcript_debug_artifact,
+    persist_summary_prompt_debug_artifact, run_transcription, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::confidence::ConfidencePermille;
@@ -58,9 +58,12 @@ pub struct ProcessMeetingInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMeetingOutput {
     pub meeting_id: String,
+    pub title: String,
     pub markdown: String,
     pub chunks: Vec<String>,
 }
+
+const MEETING_TITLE_MAX_CHARS: usize = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerError {
@@ -721,18 +724,159 @@ where
     }
     ensure_owned()?;
 
-    let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
+    let title = derive_meeting_title(
+        input.title.as_deref(),
+        &markdown,
+        input.voice_channel_name.as_deref(),
+        &input.voice_channel_id,
+        &input.meeting_id,
+    );
+    store.set_meeting_title(&input.meeting_id, title.clone())?;
+    persist_meeting_title_debug_artifact(&request.workspace, &title);
+    ensure_owned()?;
+
+    let post_markdown = markdown_with_title_for_post(&title, &markdown);
+    let chunks = split_discord_message(&post_markdown, DISCORD_MESSAGE_LIMIT);
     info!(
         meeting_id = %input.meeting_id,
+        title = %title,
         chunks = chunks.len(),
         "summary pipeline completed"
     );
 
     Ok(ProcessMeetingOutput {
         meeting_id: input.meeting_id.clone(),
+        title,
         markdown,
         chunks,
     })
+}
+
+pub(crate) fn derive_meeting_title(
+    existing_title: Option<&str>,
+    markdown: &str,
+    voice_channel_name: Option<&str>,
+    voice_channel_id: &str,
+    meeting_id: &str,
+) -> String {
+    sanitize_meeting_title(existing_title)
+        .or_else(|| extract_title_from_summary_markdown(markdown))
+        .unwrap_or_else(|| fallback_meeting_title(voice_channel_name, voice_channel_id, meeting_id))
+}
+
+fn sanitize_meeting_title(value: Option<&str>) -> Option<String> {
+    let normalized = value?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(['#', '*', '_', '`', '"', '\''])
+        .trim()
+        .to_owned();
+    if normalized.is_empty()
+        || normalized.chars().any(char::is_control)
+        || normalized.chars().count() > MEETING_TITLE_MAX_CHARS
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn extract_title_from_summary_markdown(markdown: &str) -> Option<String> {
+    let mut saw_summary_heading = false;
+    for line in markdown.lines() {
+        let line = line.trim();
+        if line.is_empty() || line == "---" || line.starts_with("```") {
+            continue;
+        }
+        if let Some(heading) = line.strip_prefix('#') {
+            let heading = heading.trim_start_matches('#').trim();
+            if let Some(title) = sanitize_meeting_title(Some(heading)) {
+                if !matches_builtin_summary_heading(&title) {
+                    return Some(title);
+                }
+                saw_summary_heading = true;
+            }
+            continue;
+        }
+        if let Some(title) = line
+            .strip_prefix("Title:")
+            .or_else(|| line.strip_prefix("タイトル:"))
+            .and_then(|value| sanitize_meeting_title(Some(value)))
+        {
+            return Some(title);
+        }
+        if saw_summary_heading && let Some(title) = title_from_summary_text_line(line) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn title_from_summary_text_line(line: &str) -> Option<String> {
+    let without_marker = line
+        .trim_start_matches(['-', '*', '・'])
+        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.')
+        .trim();
+    let first_sentence = without_marker
+        .split(['。', '.', '!', '?', '\n'])
+        .next()
+        .unwrap_or(without_marker)
+        .trim();
+    let title = first_sentence
+        .trim_matches(['#', '*', '_', '`', '"', '\'', ':', '：'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = truncate_title_at_word_boundary(&title);
+    sanitize_meeting_title(Some(&title))
+}
+
+fn truncate_title_at_word_boundary(title: &str) -> String {
+    if title.chars().count() <= MEETING_TITLE_MAX_CHARS {
+        return title.to_owned();
+    }
+    let mut truncated = title
+        .chars()
+        .take(MEETING_TITLE_MAX_CHARS)
+        .collect::<String>();
+    if let Some((prefix, _)) = truncated.rsplit_once(' ')
+        && !prefix.trim().is_empty()
+    {
+        truncated = prefix.to_owned();
+    }
+    truncated.trim().to_owned()
+}
+
+fn matches_builtin_summary_heading(title: &str) -> bool {
+    matches!(
+        title.to_ascii_lowercase().as_str(),
+        "summary" | "decisions" | "todo" | "open questions"
+    ) || matches!(title, "概要" | "決定事項" | "TODO" | "未解決事項" | "課題")
+}
+
+fn fallback_meeting_title(
+    voice_channel_name: Option<&str>,
+    voice_channel_id: &str,
+    meeting_id: &str,
+) -> String {
+    let channel = voice_channel_name
+        .and_then(|name| sanitize_meeting_title(Some(name)))
+        .unwrap_or_else(|| format!("VC {}", voice_channel_id));
+    sanitize_meeting_title(Some(&format!("{} meeting", channel)))
+        .unwrap_or_else(|| format!("Meeting {}", meeting_id))
+}
+
+pub(crate) fn markdown_with_title_for_post(title: &str, markdown: &str) -> String {
+    let trimmed = markdown.trim_start();
+    let expected_heading = format!("# {title}");
+    if trimmed
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == expected_heading)
+    {
+        return markdown.to_owned();
+    }
+    format!("# {title}\n\n{}", markdown.trim_start())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

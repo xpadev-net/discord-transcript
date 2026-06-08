@@ -421,6 +421,10 @@ pub fn persist_summary_prompt_debug_artifact(workspace: &MeetingWorkspacePaths, 
     persist_debug_text(&workspace.summary_prompt_path(), prompt);
 }
 
+pub fn persist_meeting_title_debug_artifact(workspace: &MeetingWorkspacePaths, title: &str) {
+    persist_debug_text(&workspace.meeting_title_debug_path(), title);
+}
+
 /// Best-effort write of a debug artifact (transcript or prompt). Failures are
 /// logged but do not interrupt the summary pipeline.
 fn persist_debug_text(path: &Path, contents: &str) {

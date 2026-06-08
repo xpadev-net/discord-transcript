@@ -7554,7 +7554,29 @@ impl ScaffoldHandler {
             }
         }
 
-        let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
+        let title = crate::application::worker::derive_meeting_title(
+            meeting.title.as_deref(),
+            &markdown,
+            meeting.voice_channel_name.as_deref(),
+            &meeting.voice_channel_id,
+            &claimed_job.meeting_id,
+        );
+        {
+            let mut service = self.service.lock().await;
+            service
+                .store
+                .set_meeting_title(&claimed_job.meeting_id, title.clone())
+                .map_err(|err| {
+                    SummaryJobRunError::Terminal(format!("failed to persist meeting title: {err}"))
+                })?;
+        }
+        crate::application::summary::persist_meeting_title_debug_artifact(
+            &request.workspace,
+            &title,
+        );
+        let post_markdown =
+            crate::application::worker::markdown_with_title_for_post(&title, &markdown);
+        let chunks = split_discord_message(&post_markdown, DISCORD_MESSAGE_LIMIT);
 
         // NOTE: mark_done is NOT called here. The caller (run_summary_and_notify)
         // must call it after the Discord posting succeeds. This prevents data loss
@@ -7565,6 +7587,7 @@ impl ScaffoldHandler {
         Ok(RuntimeSummaryJobOutput {
             output: crate::application::worker::ProcessMeetingOutput {
                 meeting_id: claimed_job.meeting_id.clone(),
+                title,
                 markdown,
                 chunks,
             },
@@ -9862,6 +9885,14 @@ mod status_message_tests {
                 ));
             }
             self.inner.set_error_message(meeting_id, error_message)
+        }
+
+        fn set_meeting_title(
+            &mut self,
+            meeting_id: &str,
+            title: String,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner.set_meeting_title(meeting_id, title)
         }
 
         fn get_status_message_metadata(

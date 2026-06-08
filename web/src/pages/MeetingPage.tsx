@@ -437,7 +437,7 @@ export function MeetingPage() {
 
   useEffect(() => {
     if (meetingId) {
-      document.title = meeting?.title || "Meeting";
+      document.title = meeting?.title?.trim() || "Meeting";
     }
   }, [meetingId, meeting?.title]);
 
