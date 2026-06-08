@@ -115,6 +115,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0024_job_operations",
         sql: include_str!("../../migrations/0024_job_operations.sql"),
     },
+    Migration {
+        version: "0025_guild_rbac",
+        sql: include_str!("../../migrations/0025_guild_rbac.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -177,6 +181,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0023_feedback_idempotency_quota.sql"),
     "\n",
     include_str!("../../migrations/0024_job_operations.sql"),
+    "\n",
+    include_str!("../../migrations/0025_guild_rbac.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -191,6 +197,21 @@ FROM session_revocations
 WHERE user_id = $1
   AND issued_at = $2
 LIMIT 1
+"#;
+
+pub const LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLES_SQL: &str = r#"
+SELECT
+    permissions.guild_id,
+    permissions.discord_role_id,
+    permissions.permission_name
+FROM guild_rbac_permissions permissions
+JOIN guild_rbac_role_bindings bindings
+  ON bindings.guild_id = permissions.guild_id
+ AND bindings.discord_role_id = permissions.discord_role_id
+WHERE permissions.guild_id = $1
+  AND permissions.discord_role_id = ANY($2::TEXT[])
+  AND bindings.active = TRUE
+ORDER BY permissions.discord_role_id, permissions.permission_name
 "#;
 
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
