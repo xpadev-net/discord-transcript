@@ -46,6 +46,7 @@ fn recording_meeting(id: &str) -> StoredMeeting {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     }
 }
 

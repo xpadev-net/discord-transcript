@@ -159,6 +159,7 @@ pub struct StoredMeeting {
     pub error_message: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub stopped_at: Option<DateTime<Utc>>,
+    pub duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,9 +402,16 @@ impl MeetingStore for InMemoryMeetingStore {
         };
 
         if meeting.status == MeetingStatus::Recording {
+            let stopped_at = Utc::now();
             meeting.status = MeetingStatus::Stopping;
             meeting.stop_reason = Some(reason);
-            meeting.stopped_at = Some(Utc::now());
+            meeting.stopped_at = Some(stopped_at);
+            meeting.duration_seconds = meeting.started_at.map(|started_at| {
+                stopped_at
+                    .signed_duration_since(started_at)
+                    .num_seconds()
+                    .max(0) as u64
+            });
             return Ok(StopTransition::Acquired);
         }
 
@@ -452,6 +460,7 @@ impl MeetingStore for InMemoryMeetingStore {
             error_message: None,
             started_at: None,
             stopped_at: None,
+            duration_seconds: None,
         };
         self.meetings.insert(request.id, meeting);
         if let Some(settings) = effective_settings {
@@ -487,6 +496,7 @@ impl MeetingStore for InMemoryMeetingStore {
             error_message: None,
             started_at: Some(Utc::now()),
             stopped_at: None,
+            duration_seconds: None,
         };
         self.meetings.insert(request.id, meeting);
         if let Some(settings) = effective_settings {

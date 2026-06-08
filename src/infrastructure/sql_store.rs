@@ -2083,7 +2083,8 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .query_rows(
                 "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
-                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at, \
+                        meeting_duration_seconds \
                   FROM meetings WHERE id=$1 LIMIT 1",
                 &[meeting_id.to_owned()],
             )
@@ -2091,7 +2092,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        if row.len() < 14 {
+        if row.len() < 15 {
             return Err(StoreError::Backend(format!(
                 "invalid meeting row length for id={meeting_id}: {}",
                 row.len()
@@ -2128,6 +2129,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             error_message: row.get(11).and_then(|v| v.clone()),
             started_at: parse_optional_rfc3339(row.get(12).and_then(|v| v.clone())),
             stopped_at: parse_optional_rfc3339(row.get(13).and_then(|v| v.clone())),
+            duration_seconds: parse_optional_u64(row.get(14).and_then(|v| v.clone())),
         }))
     }
 
@@ -2549,7 +2551,7 @@ impl SqlExecutor for PgSqlExecutor {
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
+        let sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at, meeting_duration_seconds FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
         let client = self.client()?;
         let runtime = self.runtime()?;
         std::thread::scope(|s| {
@@ -2641,6 +2643,11 @@ fn row_to_stored_meeting(row: &Row) -> Result<StoredMeeting, String> {
         error_message: row.get("error_message"),
         started_at: parse_optional_rfc3339(row.get::<_, Option<String>>("started_at")),
         stopped_at: parse_optional_rfc3339(row.get::<_, Option<String>>("stopped_at")),
+        duration_seconds: row
+            .try_get::<_, Option<i32>>("meeting_duration_seconds")
+            .ok()
+            .flatten()
+            .and_then(|value| u64::try_from(value).ok()),
     })
 }
 
@@ -2649,6 +2656,10 @@ fn parse_optional_rfc3339(value: Option<String>) -> Option<DateTime<Utc>> {
         .as_deref()
         .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
         .map(|ts| ts.with_timezone(&Utc))
+}
+
+fn parse_optional_u64(value: Option<String>) -> Option<u64> {
+    value.and_then(|value| value.parse::<u64>().ok())
 }
 
 fn pg_row_to_optional_strings(row: Row) -> Result<SqlRow, String> {
@@ -2662,8 +2673,16 @@ fn pg_row_to_optional_strings(row: Row) -> Result<SqlRow, String> {
             values.push(Some(v));
             continue;
         }
+        if let Ok(v) = row.try_get::<usize, Option<i32>>(idx) {
+            values.push(v.map(|value| value.to_string()));
+            continue;
+        }
         if let Ok(v) = row.try_get::<usize, i32>(idx) {
             values.push(Some(v.to_string()));
+            continue;
+        }
+        if let Ok(v) = row.try_get::<usize, Option<i64>>(idx) {
+            values.push(v.map(|value| value.to_string()));
             continue;
         }
         if let Ok(v) = row.try_get::<usize, i64>(idx) {

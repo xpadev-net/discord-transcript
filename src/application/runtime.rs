@@ -468,6 +468,9 @@ fn record_recording_duration_usage<S: MeetingStore>(store: &mut S, meeting_id: &
 }
 
 fn recording_duration_seconds(meeting: &StoredMeeting) -> Option<u64> {
+    if let Some(duration_seconds) = meeting.duration_seconds {
+        return Some(duration_seconds);
+    }
     let started_at = meeting.started_at?;
     let stopped_at = meeting.stopped_at?;
     let seconds = stopped_at.signed_duration_since(started_at).num_seconds();
@@ -6866,6 +6869,9 @@ impl ScaffoldHandler {
             voice_channel_id: meeting.voice_channel_id.clone(),
             voice_channel_name: meeting.voice_channel_name.clone(),
             title: meeting.title.clone(),
+            started_at: meeting.started_at,
+            stopped_at: meeting.stopped_at,
+            duration_seconds: meeting.duration_seconds,
             speaker_audio,
             audio_path,
             language: effective_settings.whisper_language.clone(),
@@ -9663,6 +9669,7 @@ mod status_message_tests {
             error_message: None,
             started_at: None,
             stopped_at: None,
+            duration_seconds: None,
         }
     }
 
@@ -10134,6 +10141,7 @@ mod status_message_tests {
             error_message: None,
             started_at: None,
             stopped_at: None,
+            duration_seconds: None,
         }
     }
 
@@ -11470,6 +11478,71 @@ mod status_message_tests {
             .expect("meeting should remain");
         assert_eq!(meeting.status, MeetingStatus::Posted);
         assert_eq!(meeting.error_message, None);
+        assert!(meeting.started_at.is_some());
+        assert!(meeting.stopped_at.is_some());
+        assert_eq!(
+            meeting.duration_seconds,
+            Some(recording_duration_seconds(&meeting).unwrap())
+        );
+    }
+
+    #[test]
+    fn stop_paths_finalize_meeting_timing_metadata() {
+        for (meeting_id, reason) in [
+            ("manual", StopReason::Manual),
+            ("auto-empty", StopReason::AutoEmpty),
+            ("client-disconnect", StopReason::ClientDisconnect),
+        ] {
+            let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            let mut service = BotCommandService::new(store);
+            service
+                .handle_record_start(StartCommandInput {
+                    meeting_id: meeting_id.to_owned(),
+                    guild_id: "g1".to_owned(),
+                    user_id: "u1".to_owned(),
+                    command_channel_id: "tc1".to_owned(),
+                    user_voice_channel_id: Some("vc1".to_owned()),
+                    user_voice_channel_name: None,
+                    permissions: PermissionSet {
+                        can_connect_voice: true,
+                        can_send_messages: true,
+                    },
+                    caller_role: UserRole::GuildAdmin,
+                    effective_settings: None,
+                })
+                .expect("recording should start");
+            let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+
+            let result = stop_and_enqueue_summary_job_for_teardown(
+                &mut service,
+                &mut queue,
+                "g1",
+                "u1",
+                UserRole::BotAdmin,
+                Some(meeting_id),
+                reason,
+            )
+            .expect("stop should finalize timing metadata");
+
+            assert_eq!(result.stop_result.outcome, StopOutcome::Owner);
+            let meeting = service
+                .store
+                .get_meeting(meeting_id)
+                .expect("meeting lookup should succeed")
+                .expect("meeting should remain");
+            let started_at = meeting.started_at.expect("started_at should be preserved");
+            let stopped_at = meeting.stopped_at.expect("stopped_at should be finalized");
+            assert!(stopped_at >= started_at);
+            assert_eq!(meeting.stop_reason, Some(reason));
+            assert_eq!(
+                meeting.duration_seconds,
+                Some(recording_duration_seconds(&meeting).unwrap())
+            );
+            assert!(
+                queue.get(&format!("summary-{meeting_id}")).is_some(),
+                "summary-enabled stop should enqueue summary job"
+            );
+        }
     }
 
     #[test]

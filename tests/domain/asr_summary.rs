@@ -1,10 +1,11 @@
 use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
+    TranscriptionOutput,
     build_correction_prompt, build_correction_prompt_with_context, build_summary_prompt,
     build_summary_prompt_with_context, build_summary_prompt_with_template,
     build_whisper_context_prompt, correct_transcript_with_prompt, load_summary_context_manifest,
     materialize_or_load_summary_context, materialize_summary_context, run_summary_pipeline,
-    run_transcription, SummaryContextInput,
+    run_transcription, write_transcript_files, SummaryContextInput,
 };
 use discord_transcript::domain::ai_memory::{AiMemoryNote, AiMemorySourceType, AiMemoryTag};
 use discord_transcript::domain::confidence::ConfidencePermille;
@@ -621,6 +622,9 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: Some("Incident Room".to_owned()),
         title: Some("Weekly".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![SpeakerAudioInput {
             speaker_id: "alice".to_owned(),
@@ -654,6 +658,78 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
 }
 
 #[test]
+fn summary_artifacts_include_timing_metadata_and_reuse_it_on_retry() {
+    let temp = unique_workspace("timing_artifacts", "m1");
+    let workspace = temp.workspace().clone();
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 6, 8, 1, 2, 3)
+        .single()
+        .expect("started_at should be valid");
+    let stopped_at = Utc
+        .with_ymd_and_hms(2026, 6, 8, 1, 12, 33)
+        .single()
+        .expect("stopped_at should be valid");
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: Some("Incident Room".to_owned()),
+        title: Some("Timing Review".to_owned()),
+        started_at: Some(started_at),
+        stopped_at: Some(stopped_at),
+        duration_seconds: Some(630),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("ja".to_owned()),
+        workspace: workspace.clone(),
+    };
+    let transcription = TranscriptionOutput {
+        segments: vec![],
+        transcript_for_summary: "alice: hello".to_owned(),
+        masking_stats: MaskingStats::default(),
+    };
+
+    let transcript_manifest =
+        write_transcript_files(&request, &transcription).expect("transcript manifest");
+    let first_context_manifest = materialize_or_load_summary_context(
+        &request,
+        &SummaryContextInput::default(),
+    )
+    .expect("context manifest");
+    let retry_request = SummaryRequest {
+        started_at: Some(stopped_at),
+        stopped_at: Some(stopped_at),
+        duration_seconds: Some(0),
+        ..request.clone()
+    };
+    let retry_context_manifest = materialize_or_load_summary_context(
+        &retry_request,
+        &SummaryContextInput::default(),
+    )
+    .expect("retry should reuse context manifest");
+    let prompt = build_summary_prompt(&request, &transcript_manifest);
+
+    assert_eq!(
+        transcript_manifest.started_at.as_deref(),
+        Some("2026-06-08T01:02:03Z")
+    );
+    assert_eq!(
+        transcript_manifest.stopped_at.as_deref(),
+        Some("2026-06-08T01:12:33Z")
+    );
+    assert_eq!(transcript_manifest.duration_seconds, Some(630));
+    assert_eq!(first_context_manifest.started_at, transcript_manifest.started_at);
+    assert_eq!(first_context_manifest.stopped_at, transcript_manifest.stopped_at);
+    assert_eq!(first_context_manifest.duration_seconds, Some(630));
+    assert_eq!(retry_context_manifest.started_at, first_context_manifest.started_at);
+    assert_eq!(retry_context_manifest.stopped_at, first_context_manifest.stopped_at);
+    assert_eq!(retry_context_manifest.duration_seconds, Some(630));
+    assert!(prompt.contains("Started at (UTC): 2026-06-08T01:02:03Z"));
+    assert!(prompt.contains("Stopped at (UTC): 2026-06-08T01:12:33Z"));
+    assert!(prompt.contains("Duration seconds: 630"));
+}
+
+#[test]
 fn transcription_passes_meeting_prompt_to_per_speaker_whisper_requests() {
     let whisper = RecordingWhisperClient::new();
     let temp = unique_workspace("whisper_prompt_speakers", "m1");
@@ -664,6 +740,9 @@ fn transcription_passes_meeting_prompt_to_per_speaker_whisper_requests() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: Some("障害対応会議".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![
             SpeakerAudioInput {
@@ -700,6 +779,9 @@ fn transcription_passes_meeting_prompt_to_mixdown_whisper_request() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: Some("Sprint Planning".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: Some("en".to_owned()),
@@ -733,6 +815,9 @@ fn prompt_contains_required_sections() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: None,
@@ -744,6 +829,9 @@ fn prompt_contains_required_sections() {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         language: None,
         masked_transcript_path: format!("transcript/{forbidden}.md"),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -788,6 +876,9 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: Some("Planning".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: Some("en".to_owned()),
@@ -855,6 +946,9 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         language: Some("en".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -949,6 +1043,9 @@ fn load_summary_context_manifest_accepts_legacy_missing_voice_channel_name() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: Some("Planning".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: Some("en".to_owned()),
@@ -1001,6 +1098,9 @@ fn materialized_summary_context_removes_stale_optional_template_file() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: None,
@@ -1033,6 +1133,9 @@ fn materialized_summary_context_omits_inactive_template() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: None,
@@ -1079,6 +1182,9 @@ fn materialized_summary_context_reuses_existing_manifest_on_retry() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: None,
@@ -1148,6 +1254,9 @@ fn summary_prompt_template_none_preserves_builtin_default() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: Some("Weekly".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: Some("ja".to_owned()),
@@ -1158,6 +1267,9 @@ fn summary_prompt_template_none_preserves_builtin_default() {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         language: Some("ja".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -1181,6 +1293,9 @@ fn summary_prompt_template_renders_custom_template() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
         language: Some("en".to_owned()),
@@ -1191,6 +1306,9 @@ fn summary_prompt_template_renders_custom_template() {
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         language: Some("en".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),

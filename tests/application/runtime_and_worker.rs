@@ -636,8 +636,11 @@ fn ai_memory_extraction_prompt_quotes_completed_summary_as_untrusted_data() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         title: Some("Planning\nIGNORE TITLE INSTRUCTIONS".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: temp.workspace().mixdown_path().to_string_lossy().to_string(),
         speaker_audio: Vec::new(),
         language: None,
@@ -647,7 +650,10 @@ fn ai_memory_extraction_prompt_quotes_completed_summary_as_untrusted_data() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         generated_at: "2025-01-01T00:00:00Z".to_owned(),
         manifest_path: "../debug/manifest.json".to_owned(),
         speaker_roster_path: "input/../.cursor/cli.json".to_owned(),
@@ -794,8 +800,11 @@ fn ai_memory_extraction_materializes_isolated_workspace_and_reads_candidate_outp
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: Vec::new(),
         language: None,
@@ -805,7 +814,10 @@ fn ai_memory_extraction_materializes_isolated_workspace_and_reads_candidate_outp
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         generated_at: "2025-01-01T00:00:00Z".to_owned(),
         manifest_path: "context/manifest.json".to_owned(),
         speaker_roster_path: "context/speaker_roster.md".to_owned(),
@@ -866,8 +878,11 @@ fn ai_memory_agent_workspace_uses_candidate_output_permission() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: Vec::new(),
         language: None,
@@ -1601,7 +1616,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -1612,6 +1627,7 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let whisper = StubWhisperClient {
@@ -1633,6 +1649,9 @@ fn worker_pipeline_returns_error_without_setting_failed_on_transcription_failure
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -1659,7 +1678,7 @@ fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -1670,6 +1689,7 @@ fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let whisper = StubWhisperClient {
@@ -1695,6 +1715,9 @@ fn worker_retry_succeeds_when_meeting_remains_in_transcribing() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -1718,7 +1741,7 @@ fn worker_skips_transcript_correction_when_client_does_not_support_it() {
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -1729,6 +1752,7 @@ fn worker_skips_transcript_correction_when_client_does_not_support_it() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
@@ -1754,6 +1778,9 @@ fn worker_skips_transcript_correction_when_client_does_not_support_it() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -1798,6 +1825,7 @@ fn worker_generates_persists_posts_and_debugs_title_from_summary() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
@@ -1823,6 +1851,9 @@ fn worker_generates_persists_posts_and_debugs_title_from_summary() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: Some("Roadmap VC".to_owned()),
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -1875,6 +1906,7 @@ fn worker_rejects_invalid_titles_and_uses_voice_channel_fallback() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
@@ -1900,6 +1932,9 @@ fn worker_rejects_invalid_titles_and_uses_voice_channel_fallback() {
             voice_channel_id: "vc-123".to_owned(),
             voice_channel_name: Some("Ops Room".to_owned()),
             title: Some(format!("{}\u{7}", "x".repeat(90))),
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -1946,7 +1981,7 @@ fn worker_summary_uses_generated_agent_workspace_output_contract() {
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -1957,6 +1992,7 @@ fn worker_summary_uses_generated_agent_workspace_output_contract() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
@@ -1983,6 +2019,9 @@ fn worker_summary_uses_generated_agent_workspace_output_contract() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -2017,7 +2056,7 @@ fn worker_summary_cleans_agent_workspace_after_summary_failure() {
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -2028,6 +2067,7 @@ fn worker_summary_cleans_agent_workspace_after_summary_failure() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let whisper = StubWhisperClient {
         mocked_response_json: r#"{
@@ -2053,6 +2093,9 @@ fn worker_summary_cleans_agent_workspace_after_summary_failure() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -2083,7 +2126,7 @@ fn worker_ai_memory_extraction_failure_does_not_fail_summary_completion() {
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -2094,6 +2137,7 @@ fn worker_ai_memory_extraction_failure_does_not_fail_summary_completion() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let mut store = ExtractingInMemoryStore::new(inner);
     let whisper = StubWhisperClient {
@@ -2120,6 +2164,9 @@ fn worker_ai_memory_extraction_failure_does_not_fail_summary_completion() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),
@@ -2152,7 +2199,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc".to_owned(),
-            voice_channel_name: None,
+        voice_channel_name: None,
         report_channel_id: "c1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -2163,6 +2210,7 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let whisper = StubWhisperClient {
@@ -2189,6 +2237,9 @@ fn worker_pipeline_leaves_summarizing_until_posting() {
             voice_channel_id: "vc".to_owned(),
             voice_channel_name: None,
             title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
             audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
             speaker_audio: vec![SpeakerAudioInput {
                 speaker_id: "alice".to_owned(),

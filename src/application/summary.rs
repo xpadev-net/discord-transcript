@@ -20,7 +20,7 @@ use crate::infrastructure::workspace::{
     MeetingWorkspacePaths, TRANSCRIPT_MANIFEST_FILENAME,
 };
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fmt::{Display, Formatter};
@@ -35,6 +35,9 @@ pub struct SummaryRequest {
     pub voice_channel_id: String,
     pub voice_channel_name: Option<String>,
     pub title: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub duration_seconds: Option<u64>,
     pub audio_path: String,
     pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
@@ -177,6 +180,9 @@ pub struct TranscriptManifest {
     pub guild_id: String,
     pub voice_channel_id: String,
     pub voice_channel_name: Option<String>,
+    pub started_at: Option<String>,
+    pub stopped_at: Option<String>,
+    pub duration_seconds: Option<u64>,
     pub language: Option<String>,
     /// Relative path from the workspace root to the masked transcript file.
     pub masked_transcript_path: String,
@@ -191,6 +197,12 @@ pub struct SummaryContextManifest {
     pub voice_channel_id: String,
     #[serde(default)]
     pub voice_channel_name: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub stopped_at: Option<String>,
+    #[serde(default)]
+    pub duration_seconds: Option<u64>,
     pub generated_at: String,
     pub manifest_path: String,
     pub speaker_roster_path: String,
@@ -471,6 +483,9 @@ pub fn write_transcript_files(
         guild_id: request.guild_id.clone(),
         voice_channel_id: request.voice_channel_id.clone(),
         voice_channel_name: request.voice_channel_name.clone(),
+        started_at: format_optional_utc(request.started_at),
+        stopped_at: format_optional_utc(request.stopped_at),
+        duration_seconds: request.duration_seconds,
         language: request.language.clone(),
         masked_transcript_path: request
             .workspace
@@ -672,6 +687,9 @@ pub fn materialize_summary_context(
         guild_id: request.guild_id.clone(),
         voice_channel_id: request.voice_channel_id.clone(),
         voice_channel_name: request.voice_channel_name.clone(),
+        started_at: format_optional_utc(request.started_at),
+        stopped_at: format_optional_utc(request.stopped_at),
+        duration_seconds: request.duration_seconds,
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         manifest_path: relative_workspace_path(&request.workspace, &manifest_path)?,
         speaker_roster_path: relative_workspace_path(&request.workspace, &speaker_path)?,
@@ -868,6 +886,10 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<
     fs::write(path, json).map_err(|err| {
         SummaryError::SummaryEngine(format!("failed to write {label} {}: {err}", path.display()))
     })
+}
+
+fn format_optional_utc(value: Option<DateTime<Utc>>) -> Option<String> {
+    value.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 fn relative_workspace_path(
@@ -1150,6 +1172,14 @@ pub fn build_summary_prompt_with_context(
         .language
         .as_deref()
         .unwrap_or("unknown or auto-detected");
+    let started_at =
+        format_optional_utc(request.started_at).unwrap_or_else(|| "unknown".to_owned());
+    let stopped_at =
+        format_optional_utc(request.stopped_at).unwrap_or_else(|| "unknown".to_owned());
+    let duration_seconds = request
+        .duration_seconds
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
     let context_files = summary_context_file_list(context);
     let context_instructions = context
         .map(summary_context_priority_instructions)
@@ -1186,6 +1216,9 @@ Meeting ID: {}\n\
 Guild ID: {}\n\
 Voice channel ID: {}\n\
 Meeting title: {}\n\
+Started at (UTC): {}\n\
+Stopped at (UTC): {}\n\
+Duration seconds: {}\n\
 Whisper language (ISO 639-1, speech-recognition setting): {}\n\
 Masking stats: mentions={}, emails={}, phones={}\n\
 \n\
@@ -1203,6 +1236,9 @@ Instructions:\n\
         request.guild_id,
         request.voice_channel_id,
         title,
+        started_at,
+        stopped_at,
+        duration_seconds,
         language,
         manifest.masking_stats.mention_replacements,
         manifest.masking_stats.email_replacements,

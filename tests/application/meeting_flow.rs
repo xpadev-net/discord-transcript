@@ -40,6 +40,7 @@ fn stopping_meeting(id: &str) -> StoredMeeting {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     }
 }
 
@@ -95,6 +96,9 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         voice_channel_id: "vc1".to_owned(),
         voice_channel_name: None,
         title: Some("Weekly".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![SpeakerAudioInput {
             speaker_id: "alice".to_owned(),

@@ -31,7 +31,7 @@ use crate::infrastructure::storage::{
 };
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -48,6 +48,9 @@ pub struct ProcessMeetingInput {
     pub voice_channel_id: String,
     pub voice_channel_name: Option<String>,
     pub title: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub duration_seconds: Option<u64>,
     pub audio_path: String,
     pub speaker_audio: Vec<SpeakerAudioInput>,
     pub language: Option<String>,
@@ -538,6 +541,9 @@ where
         voice_channel_id: input.voice_channel_id.clone(),
         voice_channel_name: input.voice_channel_name.clone(),
         title: input.title.clone(),
+        started_at: input.started_at,
+        stopped_at: input.stopped_at,
+        duration_seconds: input.duration_seconds,
         audio_path: input.audio_path.clone(),
         speaker_audio: input.speaker_audio.clone(),
         language: input.language.clone(),
@@ -1045,6 +1051,9 @@ where
             voice_channel_id: meeting.voice_channel_id.clone(),
             voice_channel_name: meeting.voice_channel_name.clone(),
             title: meeting.title.clone(),
+            started_at: meeting.started_at,
+            stopped_at: meeting.stopped_at,
+            duration_seconds: meeting.duration_seconds,
             audio_path: mixdown_path,
             speaker_audio: build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
                 .map_err(WorkerError::Summary)?,
