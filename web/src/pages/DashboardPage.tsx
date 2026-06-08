@@ -34,6 +34,12 @@ function displayDuration(value: number | null): string {
   return value != null ? formatDuration(value) : "--";
 }
 
+function displayVoiceChannel(meeting: MeetingListItem): string {
+  return (
+    meeting.voice_channel_name?.trim() || `VC ID: ${meeting.voice_channel_id}`
+  );
+}
+
 function meetingPath(meetingId: string): string {
   return `/meetings/${meetingId}`;
 }
@@ -161,7 +167,7 @@ export function DashboardPage({
       ) {
         options.push({
           id: meeting.voice_channel_id,
-          label: `VC ID: ${meeting.voice_channel_id}`,
+          label: displayVoiceChannel(meeting),
         });
       }
     }
@@ -306,6 +312,7 @@ export function DashboardPage({
             <thead>
               <tr>
                 <th scope="col">{"\u30bf\u30a4\u30c8\u30eb"}</th>
+                <th scope="col">{"VC"}</th>
                 <th scope="col">{"\u30b9\u30c6\u30fc\u30bf\u30b9"}</th>
                 <th scope="col">{"\u958b\u59cb"}</th>
                 <th scope="col">{"\u7d42\u4e86"}</th>
@@ -323,6 +330,11 @@ export function DashboardPage({
                         to={path}
                       >
                         {displayTitle(meeting)}
+                      </Link>
+                    </td>
+                    <td>
+                      <Link className="meeting-table-cell-link" to={path}>
+                        {displayVoiceChannel(meeting)}
                       </Link>
                     </td>
                     <td>

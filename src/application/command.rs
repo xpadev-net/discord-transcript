@@ -19,6 +19,7 @@ pub struct RecordStartRequest {
     pub started_by_user_id: String,
     pub command_channel_id: String,
     pub user_voice_channel_id: Option<String>,
+    pub user_voice_channel_name: Option<String>,
     pub permissions: PermissionSet,
     pub caller_role: UserRole,
     pub effective_settings: Option<EffectiveMeetingSettings>,
@@ -139,6 +140,7 @@ pub(crate) fn record_start_after_preflight<S: MeetingStore>(
         id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),
         voice_channel_id: voice_channel_id.clone(),
+        voice_channel_name: request.user_voice_channel_name,
         report_channel_id: request.command_channel_id.clone(),
         status_message_channel_id: None,
         status_message_id: None,
@@ -258,6 +260,7 @@ mod tests {
             started_by_user_id: "u1".to_owned(),
             command_channel_id: "report-chan".to_owned(),
             user_voice_channel_id: Some("vc-1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -302,5 +305,22 @@ mod tests {
             store.get("m1").is_none(),
             "missing voice channel must not create a meeting"
         );
+    }
+
+    #[test]
+    fn record_start_persists_captured_voice_channel_name() {
+        let mut store = InMemoryMeetingStore::new();
+        let mut request = default_start_request();
+        request.user_voice_channel_name = Some("Weekly Sync".to_owned());
+        let preflight = RecordStartPreflight {
+            voice_channel_id: "vc-1".to_owned(),
+        };
+
+        record_start_after_preflight(&mut store, request, preflight)
+            .expect("recording should start");
+
+        let meeting = store.get("m1").expect("meeting should be stored");
+        assert_eq!(meeting.voice_channel_id, "vc-1");
+        assert_eq!(meeting.voice_channel_name.as_deref(), Some("Weekly Sync"));
     }
 }

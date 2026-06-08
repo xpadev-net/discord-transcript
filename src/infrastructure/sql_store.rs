@@ -2081,7 +2081,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let rows = self
             .executor
             .query_rows(
-                "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+                "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
                         to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
                   FROM meetings WHERE id=$1 LIMIT 1",
@@ -2091,7 +2091,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        if row.len() < 13 {
+        if row.len() < 14 {
             return Err(StoreError::Backend(format!(
                 "invalid meeting row length for id={meeting_id}: {}",
                 row.len()
@@ -2102,14 +2102,14 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                 .and_then(|v| v.clone())
                 .ok_or_else(|| StoreError::Backend(format!("{field} is NULL for id={meeting_id}")))
         };
-        let status_raw = require(8, "status")?;
+        let status_raw = require(9, "status")?;
         let status = MeetingStatus::parse_str(&status_raw).ok_or_else(|| {
             StoreError::Backend(format!(
                 "invalid meeting status for id={meeting_id}: {status_raw}"
             ))
         })?;
         let stop_reason = parse_stop_reason_column(
-            row.get(9).and_then(|v| v.clone()),
+            row.get(10).and_then(|v| v.clone()),
             &format!("meeting_id={meeting_id}"),
         )
         .map_err(StoreError::Backend)?;
@@ -2117,16 +2117,17 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             id: require(0, "id")?,
             guild_id: require(1, "guild_id")?,
             voice_channel_id: require(2, "voice_channel_id")?,
-            report_channel_id: require(3, "report_channel_id")?,
-            status_message_channel_id: row.get(4).and_then(|v| v.clone()),
-            status_message_id: row.get(5).and_then(|v| v.clone()),
-            started_by_user_id: require(6, "started_by_user_id")?,
-            title: row.get(7).and_then(|v| v.clone()),
+            voice_channel_name: row.get(3).and_then(|v| v.clone()),
+            report_channel_id: require(4, "report_channel_id")?,
+            status_message_channel_id: row.get(5).and_then(|v| v.clone()),
+            status_message_id: row.get(6).and_then(|v| v.clone()),
+            started_by_user_id: require(7, "started_by_user_id")?,
+            title: row.get(8).and_then(|v| v.clone()),
             status,
             stop_reason,
-            error_message: row.get(10).and_then(|v| v.clone()),
-            started_at: parse_optional_rfc3339(row.get(11).and_then(|v| v.clone())),
-            stopped_at: parse_optional_rfc3339(row.get(12).and_then(|v| v.clone())),
+            error_message: row.get(11).and_then(|v| v.clone()),
+            started_at: parse_optional_rfc3339(row.get(12).and_then(|v| v.clone())),
+            stopped_at: parse_optional_rfc3339(row.get(13).and_then(|v| v.clone())),
         }))
     }
 
@@ -2150,7 +2151,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     }
                 })?;
         } else {
-            let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')";
+            let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'scheduled')";
             self.executor
                 .execute(
                     sql,
@@ -2158,6 +2159,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                         request.id,
                         request.guild_id,
                         request.voice_channel_id,
+                        request.voice_channel_name.unwrap_or_default(),
                         request.report_channel_id,
                         request.status_message_channel_id.unwrap_or_default(),
                         request.status_message_id.unwrap_or_default(),
@@ -2195,7 +2197,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                     }
                 })?;
         } else {
-            let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')";
+            let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'recording')";
             self.executor
                 .execute(
                     sql,
@@ -2203,6 +2205,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
                         request.id,
                         request.guild_id,
                         request.voice_channel_id,
+                        request.voice_channel_name.unwrap_or_default(),
                         request.report_channel_id,
                         request.status_message_channel_id.unwrap_or_default(),
                         request.status_message_id.unwrap_or_default(),
@@ -2396,6 +2399,7 @@ fn create_meeting_with_settings_params(
         request.id,
         request.guild_id,
         request.voice_channel_id,
+        request.voice_channel_name.unwrap_or_default(),
         request.report_channel_id,
         request.status_message_channel_id.unwrap_or_default(),
         request.status_message_id.unwrap_or_default(),
@@ -2529,7 +2533,7 @@ impl SqlExecutor for PgSqlExecutor {
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
+        let sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
         let client = self.client()?;
         let runtime = self.runtime()?;
         std::thread::scope(|s| {
@@ -2610,6 +2614,7 @@ fn row_to_stored_meeting(row: &Row) -> Result<StoredMeeting, String> {
         id: row.get("id"),
         guild_id: row.get("guild_id"),
         voice_channel_id: row.get("voice_channel_id"),
+        voice_channel_name: row.get("voice_channel_name"),
         report_channel_id: row.get("report_channel_id"),
         status_message_channel_id: row.get("status_message_channel_id"),
         status_message_id: row.get("status_message_id"),

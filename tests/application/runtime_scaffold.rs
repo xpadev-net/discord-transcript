@@ -177,6 +177,7 @@ fn runtime_dispatch_routes_record_start() {
             user_id: "u1".to_owned(),
             command_channel_id: "c1".to_owned(),
             user_voice_channel_id: Some("vc1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -213,6 +214,7 @@ fn stop_and_enqueue_summary_job_enqueues_on_owner_stop() {
             user_id: "u1".to_owned(),
             command_channel_id: "c1".to_owned(),
             user_voice_channel_id: Some("vc1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -256,6 +258,7 @@ fn stop_and_enqueue_summary_job_uses_meeting_snapshot_when_summary_disabled() {
             user_id: "u1".to_owned(),
             command_channel_id: "c1".to_owned(),
             user_voice_channel_id: Some("vc1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -298,6 +301,7 @@ fn stop_and_enqueue_summary_job_is_idempotent_for_queueing() {
             user_id: "u1".to_owned(),
             command_channel_id: "c1".to_owned(),
             user_voice_channel_id: Some("vc1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -372,6 +376,7 @@ fn stop_and_enqueue_summary_job_can_recover_after_enqueue_failure() {
             user_id: "u1".to_owned(),
             command_channel_id: "c1".to_owned(),
             user_voice_channel_id: Some("vc1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -429,6 +434,7 @@ fn stop_and_enqueue_summary_job_does_not_enqueue_for_scheduled_abort() {
             id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
+            voice_channel_name: None,
             report_channel_id: "c1".to_owned(),
             status_message_channel_id: None,
             status_message_id: None,

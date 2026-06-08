@@ -618,6 +618,7 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: Some("Incident Room".to_owned()),
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![SpeakerAudioInput {
@@ -642,6 +643,10 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
     assert!(result.masking_stats.mention_replacements >= 1);
+    let manifest_json =
+        std::fs::read_to_string(workspace.transcript_manifest_path()).expect("manifest");
+    assert!(manifest_json.contains("\"voice_channel_id\": \"vc1\""));
+    assert!(manifest_json.contains("\"voice_channel_name\": \"Incident Room\""));
     assert!(!workspace.context_manifest_path().exists());
     assert!(!workspace.context_speaker_roster_path().exists());
     assert!(!workspace.context_domain_knowledge_path().exists());
@@ -656,6 +661,7 @@ fn transcription_passes_meeting_prompt_to_per_speaker_whisper_requests() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("障害対応会議".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![
@@ -691,6 +697,7 @@ fn transcription_passes_meeting_prompt_to_mixdown_whisper_request() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("Sprint Planning".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -723,6 +730,7 @@ fn prompt_contains_required_sections() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -734,6 +742,7 @@ fn prompt_contains_required_sections() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: None,
         masked_transcript_path: format!("transcript/{forbidden}.md"),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -776,6 +785,7 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("Planning".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -843,6 +853,7 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: Some("en".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -935,6 +946,7 @@ fn materialized_summary_context_removes_stale_optional_template_file() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -966,6 +978,7 @@ fn materialized_summary_context_omits_inactive_template() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1011,6 +1024,7 @@ fn materialized_summary_context_reuses_existing_manifest_on_retry() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1079,6 +1093,7 @@ fn summary_prompt_template_none_preserves_builtin_default() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1089,6 +1104,7 @@ fn summary_prompt_template_none_preserves_builtin_default() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: Some("ja".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -1110,6 +1126,7 @@ fn summary_prompt_template_renders_custom_template() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1120,6 +1137,7 @@ fn summary_prompt_template_renders_custom_template() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: Some("en".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),

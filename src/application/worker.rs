@@ -46,6 +46,7 @@ pub struct ProcessMeetingInput {
     pub job_id: Option<String>,
     pub guild_id: String,
     pub voice_channel_id: String,
+    pub voice_channel_name: Option<String>,
     pub title: Option<String>,
     pub audio_path: String,
     pub speaker_audio: Vec<SpeakerAudioInput>,
@@ -532,6 +533,7 @@ where
         meeting_id: input.meeting_id.clone(),
         guild_id: input.guild_id.clone(),
         voice_channel_id: input.voice_channel_id.clone(),
+        voice_channel_name: input.voice_channel_name.clone(),
         title: input.title.clone(),
         audio_path: input.audio_path.clone(),
         speaker_audio: input.speaker_audio.clone(),
@@ -892,6 +894,7 @@ where
             job_id: Some(job.id.clone()),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
+            voice_channel_name: meeting.voice_channel_name.clone(),
             title: meeting.title.clone(),
             audio_path: mixdown_path,
             speaker_audio: build_speaker_audio_inputs(&meeting_dir, resample_to_16k)

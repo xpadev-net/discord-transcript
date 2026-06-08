@@ -33,6 +33,7 @@ pub struct SummaryRequest {
     pub meeting_id: String,
     pub guild_id: String,
     pub voice_channel_id: String,
+    pub voice_channel_name: Option<String>,
     pub title: Option<String>,
     pub audio_path: String,
     pub speaker_audio: Vec<SpeakerAudioInput>,
@@ -175,6 +176,7 @@ pub struct TranscriptManifest {
     pub meeting_id: String,
     pub guild_id: String,
     pub voice_channel_id: String,
+    pub voice_channel_name: Option<String>,
     pub language: Option<String>,
     /// Relative path from the workspace root to the masked transcript file.
     pub masked_transcript_path: String,
@@ -187,6 +189,7 @@ pub struct SummaryContextManifest {
     pub meeting_id: String,
     pub guild_id: String,
     pub voice_channel_id: String,
+    pub voice_channel_name: Option<String>,
     pub generated_at: String,
     pub manifest_path: String,
     pub speaker_roster_path: String,
@@ -462,6 +465,7 @@ pub fn write_transcript_files(
         meeting_id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),
         voice_channel_id: request.voice_channel_id.clone(),
+        voice_channel_name: request.voice_channel_name.clone(),
         language: request.language.clone(),
         masked_transcript_path: request
             .workspace
@@ -662,6 +666,7 @@ pub fn materialize_summary_context(
         meeting_id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),
         voice_channel_id: request.voice_channel_id.clone(),
+        voice_channel_name: request.voice_channel_name.clone(),
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         manifest_path: relative_workspace_path(&request.workspace, &manifest_path)?,
         speaker_roster_path: relative_workspace_path(&request.workspace, &speaker_path)?,

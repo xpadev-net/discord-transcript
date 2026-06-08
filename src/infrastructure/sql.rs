@@ -123,6 +123,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0026_job_claim_token",
         sql: include_str!("../../migrations/0026_job_claim_token.sql"),
     },
+    Migration {
+        version: "0027_meeting_voice_channel_name",
+        sql: include_str!("../../migrations/0027_meeting_voice_channel_name.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -189,6 +193,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0025_guild_rbac.sql"),
     "\n",
     include_str!("../../migrations/0026_job_claim_token.sql"),
+    "\n",
+    include_str!("../../migrations/0027_meeting_voice_channel_name.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1711,10 +1717,10 @@ WHERE guild_id = $1
 pub const INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL: &str = r#"
 WITH inserted_meeting AS (
     INSERT INTO meetings(
-        id, guild_id, voice_channel_id, report_channel_id,
+        id, guild_id, voice_channel_id, voice_channel_name, report_channel_id,
         status_message_channel_id, status_message_id, started_by_user_id, status
     )
-    VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'recording')
+    VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'recording')
     RETURNING id
 )
 INSERT INTO meeting_effective_settings (
@@ -1724,21 +1730,21 @@ INSERT INTO meeting_effective_settings (
     retention_transcript_ttl_days, retention_summary_ttl_days, summary_enabled,
     summary_template_id, domain_knowledge_version_id, updated_at
 )
-SELECT id, NULLIF($8,''), $9::TEXT::BOOLEAN, $10::TEXT::INTEGER,
-       $11::TEXT::BOOLEAN, NULLIF($12,''), $13::TEXT::DOUBLE PRECISION,
-       $14::TEXT::BOOLEAN, $15::TEXT::BIGINT, $16::TEXT::INTEGER,
-       $17::TEXT::INTEGER, NULLIF($18,'')::TEXT::INTEGER,
-       $19::TEXT::BOOLEAN, NULLIF($20,''), NULLIF($21,''), NOW()
+SELECT id, NULLIF($9,''), $10::TEXT::BOOLEAN, $11::TEXT::INTEGER,
+       $12::TEXT::BOOLEAN, NULLIF($13,''), $14::TEXT::DOUBLE PRECISION,
+       $15::TEXT::BOOLEAN, $16::TEXT::BIGINT, $17::TEXT::INTEGER,
+       $18::TEXT::INTEGER, NULLIF($19,'')::TEXT::INTEGER,
+       $20::TEXT::BOOLEAN, NULLIF($21,''), NULLIF($22,''), NOW()
 FROM inserted_meeting
 "#;
 
 pub const INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL: &str = r#"
 WITH inserted_meeting AS (
     INSERT INTO meetings(
-        id, guild_id, voice_channel_id, report_channel_id,
+        id, guild_id, voice_channel_id, voice_channel_name, report_channel_id,
         status_message_channel_id, status_message_id, started_by_user_id, status
     )
-    VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,'scheduled')
+    VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'scheduled')
     RETURNING id
 )
 INSERT INTO meeting_effective_settings (
@@ -1748,11 +1754,11 @@ INSERT INTO meeting_effective_settings (
     retention_transcript_ttl_days, retention_summary_ttl_days, summary_enabled,
     summary_template_id, domain_knowledge_version_id, updated_at
 )
-SELECT id, NULLIF($8,''), $9::TEXT::BOOLEAN, $10::TEXT::INTEGER,
-       $11::TEXT::BOOLEAN, NULLIF($12,''), $13::TEXT::DOUBLE PRECISION,
-       $14::TEXT::BOOLEAN, $15::TEXT::BIGINT, $16::TEXT::INTEGER,
-       $17::TEXT::INTEGER, NULLIF($18,'')::TEXT::INTEGER,
-       $19::TEXT::BOOLEAN, NULLIF($20,''), NULLIF($21,''), NOW()
+SELECT id, NULLIF($9,''), $10::TEXT::BOOLEAN, $11::TEXT::INTEGER,
+       $12::TEXT::BOOLEAN, NULLIF($13,''), $14::TEXT::DOUBLE PRECISION,
+       $15::TEXT::BOOLEAN, $16::TEXT::BIGINT, $17::TEXT::INTEGER,
+       $18::TEXT::INTEGER, NULLIF($19,'')::TEXT::INTEGER,
+       $20::TEXT::BOOLEAN, NULLIF($21,''), NULLIF($22,''), NOW()
 FROM inserted_meeting
 "#;
 
@@ -1852,7 +1858,8 @@ SELECT id,
        meeting_duration_seconds,
        title,
        stop_reason,
-       voice_channel_id
+       voice_channel_id,
+       voice_channel_name
 FROM meetings
 WHERE guild_id = $1
   AND ($2::TEXT IS NULL OR voice_channel_id = $2)
@@ -1874,7 +1881,8 @@ SELECT id,
        meeting_duration_seconds,
        title,
        stop_reason,
-       voice_channel_id
+       voice_channel_id,
+       voice_channel_name
 FROM meetings
 WHERE guild_id = $1
   AND voice_channel_id = ANY($2::TEXT[])
@@ -1891,7 +1899,12 @@ WHERE guild_id = $1
 "#;
 
 pub const LIST_GUILD_MEETING_VOICE_CHANNELS_SQL: &str = r#"
-SELECT voice_channel_id
+SELECT voice_channel_id,
+       COALESCE(
+           (array_agg(voice_channel_name ORDER BY started_at DESC NULLS LAST, id DESC)
+            FILTER (WHERE voice_channel_name IS NOT NULL AND voice_channel_name <> ''))[1],
+           NULL
+       ) AS voice_channel_name
 FROM meetings
 WHERE guild_id = $1
 GROUP BY voice_channel_id
@@ -1900,7 +1913,12 @@ LIMIT $2
 "#;
 
 pub const LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL: &str = r#"
-SELECT voice_channel_id
+SELECT voice_channel_id,
+       COALESCE(
+           (array_agg(voice_channel_name ORDER BY started_at DESC NULLS LAST, id DESC)
+            FILTER (WHERE voice_channel_name IS NOT NULL AND voice_channel_name <> ''))[1],
+           NULL
+       ) AS voice_channel_name
 FROM meetings
 WHERE guild_id = $1
   AND voice_channel_id = ANY($2::TEXT[])

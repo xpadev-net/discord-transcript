@@ -35,6 +35,7 @@ fn recording_meeting(id: &str) -> StoredMeeting {
         id: id.to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+    voice_channel_name: None,
         report_channel_id: "tc1".to_owned(),
         status_message_channel_id: None,
         status_message_id: None,

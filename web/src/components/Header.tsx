@@ -9,6 +9,9 @@ export function Header({ meeting }: { meeting: MeetingResponse | null }) {
     meeting?.duration_seconds != null
       ? formatDuration(meeting.duration_seconds)
       : "--";
+  const voiceChannel = meeting
+    ? meeting.voice_channel_name?.trim() || `VC ID: ${meeting.voice_channel_id}`
+    : "--";
   const statusText = meeting?.status || "unknown";
   const displayStatus = statusLabel(statusText);
 
@@ -24,6 +27,10 @@ export function Header({ meeting }: { meeting: MeetingResponse | null }) {
           <div className="header-meta-item">
             <span className="label">{"\u6642\u9593:"}</span>
             <span>{duration}</span>
+          </div>
+          <div className="header-meta-item">
+            <span className="label">{"VC:"}</span>
+            <span>{voiceChannel}</span>
           </div>
           <div className="header-meta-item">
             <span
