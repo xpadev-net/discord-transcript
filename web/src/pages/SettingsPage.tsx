@@ -2561,7 +2561,13 @@ export function SettingsPage({
                   retentionDraft.token.trim() === "" ||
                   retentionDraft.meeting_id.trim() === "" ||
                   !retentionTargetsSelected ||
-                  !retentionMeetingPreviewMatchesDraft
+                  !retentionMeetingPreviewMatchesDraft ||
+                  !!(
+                    retentionMeetingPreview &&
+                    !["posted", "failed", "aborted"].includes(
+                      retentionMeetingPreview.status,
+                    )
+                  )
                 }
                 onClick={handleRetentionMeetingDelete}
               >
