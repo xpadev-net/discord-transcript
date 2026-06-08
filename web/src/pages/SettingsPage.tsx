@@ -368,6 +368,19 @@ function retentionMeetingDeleteRequest(draft: RetentionAdminDraft) {
   };
 }
 
+function retentionMeetingPreviewKeyFor(
+  meetingId: string,
+  targets: AdminRetentionTargets,
+): string {
+  return [
+    meetingId,
+    targets.raw_audio ? "raw" : "",
+    targets.transcript ? "transcript" : "",
+    targets.summary ? "summary" : "",
+    targets.debug ? "debug" : "",
+  ].join("|");
+}
+
 function sameRetentionTargets(
   left: AdminRetentionTargets,
   right: AdminRetentionTargets,
@@ -864,6 +877,9 @@ export function SettingsPage({
     useState<AdminRetentionCleanupRun | null>(null);
   const [retentionMeetingPreview, setRetentionMeetingPreview] =
     useState<AdminRetentionMeetingDeletePreview | null>(null);
+  const [retentionMeetingPreviewKey, setRetentionMeetingPreviewKey] = useState<
+    string | null
+  >(null);
   const [retentionMeetingDelete, setRetentionMeetingDelete] =
     useState<AdminRetentionMeetingDelete | null>(null);
   const [retentionError, setRetentionError] = useState<string | null>(null);
@@ -985,6 +1001,7 @@ export function SettingsPage({
     setRetentionCleanupPreviewKey(null);
     setRetentionCleanupRun(null);
     setRetentionMeetingPreview(null);
+    setRetentionMeetingPreviewKey(null);
     setRetentionMeetingDelete(null);
     setRetentionError(null);
     if (!showCustomizations) {
@@ -1080,6 +1097,11 @@ export function SettingsPage({
     Boolean,
   );
   const retentionMeetingPreviewMatchesDraft =
+    retentionMeetingPreviewKey ===
+      retentionMeetingPreviewKeyFor(
+        retentionDraft.meeting_id.trim(),
+        retentionDraft.targets,
+      ) &&
     retentionMeetingPreview?.meeting_id === retentionDraft.meeting_id.trim() &&
     sameRetentionTargets(
       retentionMeetingPreview.targets,
@@ -1406,8 +1428,11 @@ export function SettingsPage({
     }
     const request = retentionPolicyRequestFromDraft(retentionDraft, form);
     const requestKey = retentionPolicyKey(request);
+    if (!token) {
+      setRetentionError("管理トークンを入力してください");
+      return;
+    }
     if (
-      !token ||
       !retentionCleanupPreview ||
       retentionCleanupPreviewKey !== requestKey ||
       isSavingAny
@@ -1483,6 +1508,9 @@ export function SettingsPage({
         return;
       }
       setRetentionMeetingPreview(preview);
+      setRetentionMeetingPreviewKey(
+        retentionMeetingPreviewKeyFor(meetingId, retentionDraft.targets),
+      );
       setRetentionMeetingDelete(null);
       setMessage("会議削除の対象を確認しました");
     } catch (err) {
@@ -1503,8 +1531,11 @@ export function SettingsPage({
     const token = retentionDraft.token.trim();
     const meetingId = retentionDraft.meeting_id.trim();
     const requestGuildKey = currentGuildKeyRef.current;
+    if (!token) {
+      setRetentionError("管理トークンを入力してください");
+      return;
+    }
     if (
-      !token ||
       !meetingId ||
       !retentionTargetsSelected ||
       !retentionMeetingPreviewMatchesDraft ||
@@ -1525,6 +1556,7 @@ export function SettingsPage({
         return;
       }
       setRetentionMeetingPreview(result.preview);
+      setRetentionMeetingPreviewKey(null);
       setRetentionMeetingDelete(result);
       let refreshWarning = false;
       try {
