@@ -7563,12 +7563,62 @@ impl ScaffoldHandler {
         );
         {
             let mut service = self.service.lock().await;
-            service
+            if let Err(err) = service
                 .store
                 .set_meeting_title(&claimed_job.meeting_id, title.clone())
-                .map_err(|err| {
-                    SummaryJobRunError::Terminal(format!("failed to persist meeting title: {err}"))
-                })?;
+            {
+                let err_string = format!("failed to persist meeting title: {err}");
+                drop(service);
+                let retry_result = {
+                    let mut service = self.service.lock().await;
+                    let mut queue = self.queue.lock().await;
+                    retry_summary_job_after_transcribing_phase_failure(
+                        &mut service.store,
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "title_persistence",
+                        MeetingStatus::Summarizing,
+                    )
+                };
+                let exhausted = match retry_result {
+                    Ok(exhausted) => exhausted,
+                    Err(retry_err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %retry_err,
+                            "failed to update title persistence retry state"
+                        );
+                        true
+                    }
+                };
+                if exhausted
+                    && self
+                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
+                        .await
+                    && let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "title_persistence",
+                                error: &err_string,
+                            },
+                        )
+                        .await
+                {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %status_err,
+                        "failed to update status message after title persistence failure"
+                    );
+                }
+                if exhausted {
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(err_string));
+                }
+                return Err(retry_scheduled_error(&claimed_job, err_string));
+            }
         }
         crate::application::summary::persist_meeting_title_debug_artifact(
             &request.workspace,

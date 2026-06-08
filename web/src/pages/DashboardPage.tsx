@@ -11,6 +11,7 @@ import {
   statusClassName,
   statusLabel,
 } from "../lib/meetingStatus";
+import { displayMeetingTitle } from "../lib/meetingTitle";
 import type {
   GuildJob,
   GuildJobStatus,
@@ -21,28 +22,9 @@ import type {
 } from "../lib/types";
 
 const PAGE_SIZE = 20;
-const MEETING_TITLE_DISPLAY_MAX_CHARS = 80;
 
 function displayTitle(meeting: MeetingListItem): string {
-  const title = meeting.title?.trim();
-  if (
-    title &&
-    title.length <= MEETING_TITLE_DISPLAY_MAX_CHARS &&
-    !hasControlCharacter(title)
-  ) {
-    return title;
-  }
-  const channel = displayVoiceChannel(meeting);
-  return meeting.started_at
-    ? `${formatDate(meeting.started_at)} ${channel}`
-    : channel;
-}
-
-function hasControlCharacter(value: string): boolean {
-  return Array.from(value).some((character) => {
-    const code = character.charCodeAt(0);
-    return code < 32 || code === 127;
-  });
+  return displayMeetingTitle(meeting);
 }
 
 function displayDate(value: string | null): string {

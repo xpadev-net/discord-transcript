@@ -4498,21 +4498,35 @@ fn display_meeting_title(
     voice_channel_name: Option<&str>,
     voice_channel_id: &str,
 ) -> String {
-    let normalized = title
+    if let Some(title) = normalize_display_meeting_title(title) {
+        return title;
+    }
+    let channel = voice_channel_label(voice_channel_id, voice_channel_name);
+    let fallback = match started_at.and_then(format_meeting_title_timestamp) {
+        Some(timestamp) => format!("{timestamp} {channel}"),
+        None => channel,
+    };
+    normalize_display_meeting_title(Some(&fallback)).unwrap_or_else(|| "Meeting".to_owned())
+}
+
+fn normalize_display_meeting_title(title: Option<&str>) -> Option<String> {
+    title
         .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|value| {
             !value.is_empty()
                 && !value.chars().any(char::is_control)
                 && value.chars().count() <= MEETING_TITLE_DISPLAY_MAX_CHARS
-        });
-    if let Some(title) = normalized {
-        return title;
-    }
-    let channel = voice_channel_label(voice_channel_id, voice_channel_name);
-    match started_at.and_then(|value| value.split('T').next()) {
-        Some(date) if !date.is_empty() => format!("{date} {channel}"),
-        _ => channel,
-    }
+        })
+}
+
+fn format_meeting_title_timestamp(value: &str) -> Option<String> {
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let time = time.get(0..5)?;
+    Some(format!("{year}/{month}/{day} {time}"))
 }
 
 fn voice_channel_label(id: &str, name: Option<&str>) -> String {
