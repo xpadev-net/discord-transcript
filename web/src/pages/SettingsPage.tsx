@@ -1107,6 +1107,9 @@ export function SettingsPage({
       retentionMeetingPreview.targets,
       retentionDraft.targets,
     );
+  const retentionMeetingPreviewStatusAllowsDelete =
+    !retentionMeetingPreview ||
+    ["posted", "failed", "aborted"].includes(retentionMeetingPreview.status);
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
@@ -2562,12 +2565,7 @@ export function SettingsPage({
                   retentionDraft.meeting_id.trim() === "" ||
                   !retentionTargetsSelected ||
                   !retentionMeetingPreviewMatchesDraft ||
-                  !!(
-                    retentionMeetingPreview &&
-                    !["posted", "failed", "aborted"].includes(
-                      retentionMeetingPreview.status,
-                    )
-                  )
+                  !retentionMeetingPreviewStatusAllowsDelete
                 }
                 onClick={handleRetentionMeetingDelete}
               >

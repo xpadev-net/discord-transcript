@@ -3273,6 +3273,7 @@ struct AdminRetentionCleanupPreviewResponse {
     summary_workspace_count: usize,
     expired_artifact_count: i64,
     expired_artifact_bytes: i64,
+    /// Filesystem-only estimate; `expired_artifact_bytes` reports the DB-tracked component.
     estimated_freed_bytes: AdminRetentionStorageUsageResponse,
 }
 
@@ -6324,28 +6325,33 @@ async fn api_admin_retention_cleanup_run(
     let guild_id = configured_guild_id(&state)?;
     let request = parse_optional_json_request_body::<AdminRetentionPolicyRequest>(&body)?;
     let policy = normalize_admin_retention_policy(&state, &guild_id, request.as_ref()).await?;
-    let preview = match build_admin_retention_cleanup_preview(&state, &guild_id, policy).await {
-        Ok(preview) => preview,
-        Err(status) => {
-            record_audit_event(
-                &state,
-                web_audit_event(
-                    Some(guild_id.clone()),
-                    Some(user_id.clone()),
-                    "retention.cleanup_run",
-                    "retention_cleanup",
-                    Some(guild_id.clone()),
-                    audit_request_metadata(&headers, "POST", "/api/admin/retention/cleanup-run"),
-                    json!({
-                        "policy": admin_retention_policy_response(policy),
-                        "error": "cleanup target enumeration failed",
-                    }),
-                ),
-            )
-            .await;
-            return Err(status);
-        }
-    };
+    let (preview, plan) =
+        match build_admin_retention_cleanup_preview_with_plan(&state, &guild_id, policy).await {
+            Ok(result) => result,
+            Err(status) => {
+                record_audit_event(
+                    &state,
+                    web_audit_event(
+                        Some(guild_id.clone()),
+                        Some(user_id.clone()),
+                        "retention.cleanup_run",
+                        "retention_cleanup",
+                        Some(guild_id.clone()),
+                        audit_request_metadata(
+                            &headers,
+                            "POST",
+                            "/api/admin/retention/cleanup-run",
+                        ),
+                        json!({
+                            "policy": admin_retention_policy_response(policy),
+                            "error": "cleanup target enumeration failed",
+                        }),
+                    ),
+                )
+                .await;
+                return Err(status);
+            }
+        };
     require_audit_event(
         &state,
         web_audit_event(
@@ -6371,35 +6377,6 @@ async fn api_admin_retention_cleanup_run(
     .await?;
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
-    let plan = collect_admin_retention_cleanup_plan(&state, &guild_id, policy).await?;
-    if !plan.errors.is_empty() {
-        let error = plan.errors.join("; ");
-        record_audit_event(
-            &state,
-            web_audit_event(
-                Some(guild_id.clone()),
-                Some(user_id.clone()),
-                "retention.cleanup_run",
-                "retention_cleanup",
-                Some(guild_id.clone()),
-                audit_request_metadata(&headers, "POST", "/api/admin/retention/cleanup-run"),
-                json!({
-                    "policy": admin_retention_policy_response(policy),
-                    "preview": {
-                        "raw_workspace_count": preview.raw_workspace_count,
-                        "transcript_workspace_count": preview.transcript_workspace_count,
-                        "summary_workspace_count": preview.summary_workspace_count,
-                        "expired_artifact_count": preview.expired_artifact_count,
-                        "expired_artifact_bytes": preview.expired_artifact_bytes,
-                        "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
-                    },
-                    "error": error,
-                }),
-            ),
-        )
-        .await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
     let filesystem_result =
         tokio::task::spawn_blocking(move || apply_retention_filesystem_cleanup(&layout, &plan))
             .await
@@ -6818,16 +6795,38 @@ async fn query_admin_retention_workspace_rows(
     errors: &mut Vec<String>,
 ) -> Vec<ExpiredWorkspaceRow> {
     match state.db.query(sql, &[&ttl_days, &guild_id]).await {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|row| {
-                Some(ExpiredWorkspaceRow {
-                    meeting_id: row.try_get::<_, String>("id").ok()?,
-                    guild_id: row.try_get::<_, String>("guild_id").ok()?,
-                    voice_channel_id: row.try_get::<_, String>("voice_channel_id").ok()?,
-                })
-            })
-            .collect(),
+        Ok(rows) => {
+            let mut workspaces = Vec::new();
+            for row in rows {
+                let meeting_id = match row.try_get::<_, String>("id") {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
+                let guild_id = match row.try_get::<_, String>("guild_id") {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
+                let voice_channel_id = match row.try_get::<_, String>("voice_channel_id") {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
+                workspaces.push(ExpiredWorkspaceRow {
+                    meeting_id,
+                    guild_id,
+                    voice_channel_id,
+                });
+            }
+            workspaces
+        }
         Err(err) => {
             errors.push(err.to_string());
             Vec::new()
@@ -6840,6 +6839,16 @@ async fn build_admin_retention_cleanup_preview(
     guild_id: &str,
     policy: RetentionPolicy,
 ) -> Result<AdminRetentionCleanupPreviewResponse, StatusCode> {
+    let (preview, _) =
+        build_admin_retention_cleanup_preview_with_plan(state, guild_id, policy).await?;
+    Ok(preview)
+}
+
+async fn build_admin_retention_cleanup_preview_with_plan(
+    state: &WebState,
+    guild_id: &str,
+    policy: RetentionPolicy,
+) -> Result<(AdminRetentionCleanupPreviewResponse, RetentionCleanupPlan), StatusCode> {
     let plan = collect_admin_retention_cleanup_plan(state, guild_id, policy).await?;
     if !plan.errors.is_empty() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -6860,7 +6869,7 @@ async fn build_admin_retention_cleanup_preview(
         summary: !plan.summary_workspaces.is_empty(),
         debug: !plan.raw_workspaces.is_empty(),
     };
-    Ok(AdminRetentionCleanupPreviewResponse {
+    let preview = AdminRetentionCleanupPreviewResponse {
         guild_id: guild_id.to_owned(),
         policy: admin_retention_policy_response(policy),
         deletion_targets,
@@ -6870,7 +6879,8 @@ async fn build_admin_retention_cleanup_preview(
         expired_artifact_count: expired_artifacts.0,
         expired_artifact_bytes: expired_artifacts.1,
         estimated_freed_bytes: admin_retention_storage_response(filesystem_usage),
-    })
+    };
+    Ok((preview, plan))
 }
 
 async fn query_admin_retention_expired_artifacts(
