@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     id TEXT PRIMARY KEY,
     guild_id TEXT NOT NULL,
     voice_channel_id TEXT NOT NULL,
+    voice_channel_name TEXT,
     report_channel_id TEXT NOT NULL,
     status_message_channel_id TEXT,
     status_message_id TEXT,

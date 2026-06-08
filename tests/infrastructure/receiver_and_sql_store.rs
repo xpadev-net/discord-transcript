@@ -61,6 +61,7 @@ fn sql_store_applies_migration_and_writes_sql() {
             id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
+            voice_channel_name: None,
             report_channel_id: "c1".to_owned(),
             status_message_channel_id: None,
             status_message_id: None,
@@ -83,6 +84,34 @@ fn sql_store_applies_migration_and_writes_sql() {
 }
 
 #[test]
+fn sql_store_binds_captured_voice_channel_name_on_recording_create() {
+    let executor = FakeSqlExecutor::default();
+    let mut store = SqlMeetingStore::new(executor);
+
+    store
+        .create_meeting_as_recording(CreateMeetingRequest {
+            id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc1".to_owned(),
+            voice_channel_name: Some("Planning VC".to_owned()),
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u1".to_owned(),
+            effective_settings: None,
+        })
+        .expect("insert should execute");
+
+    let (_, params) = store
+        .executor
+        .executed
+        .last()
+        .expect("insert should be recorded");
+    assert_eq!(params[2], "vc1");
+    assert_eq!(params[3], "Planning VC");
+}
+
+#[test]
 fn sql_store_can_read_active_meeting_from_executor_snapshot() {
     let mut executor = FakeSqlExecutor::default();
     executor.active_by_guild.insert(
@@ -91,6 +120,7 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
             id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
+            voice_channel_name: None,
             report_channel_id: "c1".to_owned(),
             status_message_channel_id: None,
             status_message_id: None,
@@ -115,12 +145,12 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
 #[test]
 fn sql_store_get_meeting_rejects_unknown_status() {
     let mut executor = FakeSqlExecutor::default();
-    let query_sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+    let query_sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
                         to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
                   FROM meetings WHERE id=$1 LIMIT 1";
     let mut corrupt_status_row = meeting_row_for_title_test(None);
-    corrupt_status_row[8] = Some("corrupt".to_owned());
+    corrupt_status_row[9] = Some("corrupt".to_owned());
     executor
         .query_rows_result
         .insert(format!("{query_sql}|m1"), vec![corrupt_status_row]);
@@ -135,13 +165,13 @@ fn sql_store_get_meeting_rejects_unknown_status() {
 #[test]
 fn sql_store_get_meeting_rejects_unknown_stop_reason() {
     let mut executor = FakeSqlExecutor::default();
-    let query_sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+    let query_sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
                         to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
                   FROM meetings WHERE id=$1 LIMIT 1";
     let mut row = meeting_row_for_title_test(None);
-    row[8] = Some("recording".to_owned());
-    row[9] = Some("bogus".to_owned());
+    row[9] = Some("recording".to_owned());
+    row[10] = Some("bogus".to_owned());
     executor
         .query_rows_result
         .insert(format!("{query_sql}|m1"), vec![row]);
@@ -387,11 +417,14 @@ fn sql_store_reads_and_sets_status_message_metadata() {
     );
 }
 
-fn meeting_row_for_title_test(title: Option<String>) -> discord_transcript::infrastructure::sql_store::SqlRow {
+fn meeting_row_for_title_test(
+    title: Option<String>,
+) -> discord_transcript::infrastructure::sql_store::SqlRow {
     vec![
         Some("m1".to_owned()),
         Some("g1".to_owned()),
         Some("vc1".to_owned()),
+        None,
         Some("c1".to_owned()),
         None,
         None,
@@ -407,7 +440,7 @@ fn meeting_row_for_title_test(title: Option<String>) -> discord_transcript::infr
 
 #[test]
 fn sql_store_get_meeting_distinguishes_null_title_from_empty_string() {
-    let query_sql = "SELECT id, guild_id, voice_channel_id, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
+    let query_sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
                         to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
                   FROM meetings WHERE id=$1 LIMIT 1";

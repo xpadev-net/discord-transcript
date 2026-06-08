@@ -5,6 +5,8 @@ export interface MeetingResponse {
   started_at: string | null;
   stopped_at: string | null;
   duration_seconds: number | null;
+  voice_channel_id: string;
+  voice_channel_name: string | null;
 }
 
 export interface MeResponse {
@@ -38,6 +40,7 @@ export interface MeetingListItem {
   duration_seconds: number | null;
   stop_reason: string | null;
   voice_channel_id: string;
+  voice_channel_name: string | null;
 }
 
 export interface MeetingVoiceChannel {

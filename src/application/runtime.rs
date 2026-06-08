@@ -257,6 +257,7 @@ where
             started_by_user_id: input.user_id,
             command_channel_id: input.command_channel_id,
             user_voice_channel_id: input.user_voice_channel_id,
+            user_voice_channel_name: input.user_voice_channel_name,
             permissions: input.permissions,
             caller_role: input.caller_role,
             effective_settings: input.effective_settings,
@@ -5516,6 +5517,8 @@ impl ScaffoldHandler {
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
         let guild_key = guild_id.get().to_string();
         let voice_channel_id_u64 = resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
+        let voice_channel_name = voice_channel_id_u64
+            .and_then(|channel_id| resolve_voice_channel_name(ctx, guild_id, channel_id));
 
         let meeting_id = format!("{}-{}", guild_id.get(), command.id.get());
         let permissions = resolve_bot_permissions(
@@ -5577,6 +5580,7 @@ impl ScaffoldHandler {
                     started_by_user_id: command.user.id.get().to_string(),
                     command_channel_id: command.channel_id.get().to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
+                    user_voice_channel_name: voice_channel_name.clone(),
                     permissions,
                     caller_role: internal_caller_role,
                     effective_settings: None,
@@ -5598,6 +5602,7 @@ impl ScaffoldHandler {
                     user_id: command.user.id.get().to_string(),
                     command_channel_id: command.channel_id.get().to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
+                    user_voice_channel_name: voice_channel_name,
                     permissions,
                     caller_role: internal_caller_role,
                     effective_settings: Some(effective_settings),
@@ -6072,6 +6077,17 @@ impl ScaffoldHandler {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
                 } else {
                     output.chunks
+                };
+                let chunks = match self.load_meeting(meeting_id).await {
+                    Ok(meeting) => summary_chunks_with_voice_channel_metadata(&meeting, chunks),
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "failed to load meeting voice channel metadata for summary post"
+                        );
+                        chunks
+                    }
                 };
                 if let Err(err) =
                     post_summary_to_report_channel(&http, report_channel_id, &chunks).await
@@ -6848,6 +6864,7 @@ impl ScaffoldHandler {
             meeting_id: claimed_job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
+            voice_channel_name: meeting.voice_channel_name.clone(),
             title: meeting.title.clone(),
             speaker_audio,
             audio_path,
@@ -8948,6 +8965,15 @@ fn resolve_user_voice_channel_id(ctx: &Context, guild_id: GuildId, user_id: User
         .map(|id| id.get())
 }
 
+fn resolve_voice_channel_name(ctx: &Context, guild_id: GuildId, channel_id: u64) -> Option<String> {
+    let guild = ctx.cache.guild(guild_id)?;
+    guild
+        .channels
+        .get(&ChannelId::new(channel_id))
+        .map(|channel| channel.name.clone())
+        .filter(|name| !name.trim().is_empty())
+}
+
 pub fn stop_reason_from_interaction(command: &CommandInteraction) -> Result<StopReason, String> {
     for option in &command.data.options {
         if option.name != "reason" {
@@ -8990,6 +9016,36 @@ async fn post_summary_to_report_channel(
             .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+fn meeting_voice_channel_display(meeting: &StoredMeeting) -> String {
+    meeting
+        .voice_channel_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("VC ID: {}", meeting.voice_channel_id))
+}
+
+fn summary_chunks_with_voice_channel_metadata(
+    meeting: &StoredMeeting,
+    chunks: Vec<String>,
+) -> Vec<String> {
+    let display = meeting_voice_channel_display(meeting);
+    let has_name = meeting
+        .voice_channel_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .is_some();
+    let header = if has_name {
+        format!("VC: {display} ({})", meeting.voice_channel_id)
+    } else {
+        display
+    };
+    let mut with_metadata = Vec::with_capacity(chunks.len().saturating_add(1));
+    with_metadata.push(header);
+    with_metadata.extend(chunks);
+    with_metadata
 }
 
 async fn post_failure_to_report_channel(
@@ -9523,6 +9579,7 @@ mod status_message_tests {
             id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
+            voice_channel_name: None,
             report_channel_id: "tc1".to_owned(),
             status_message_channel_id: None,
             status_message_id: None,
@@ -9985,6 +10042,7 @@ mod status_message_tests {
             id: "m1".to_owned(),
             guild_id: "g1".to_owned(),
             voice_channel_id: "vc1".to_owned(),
+            voice_channel_name: None,
             report_channel_id: "tc1".to_owned(),
             status_message_channel_id: None,
             status_message_id: None,
@@ -11296,6 +11354,7 @@ mod status_message_tests {
                 user_id: "u1".to_owned(),
                 command_channel_id: "tc1".to_owned(),
                 user_voice_channel_id: Some("vc1".to_owned()),
+                user_voice_channel_name: None,
                 permissions: PermissionSet {
                     can_connect_voice: true,
                     can_send_messages: true,
@@ -12600,6 +12659,7 @@ mod status_message_tests {
             user_id: "u1".to_owned(),
             command_channel_id: "c1".to_owned(),
             user_voice_channel_id: Some("vc1".to_owned()),
+            user_voice_channel_name: None,
             permissions: PermissionSet {
                 can_connect_voice: true,
                 can_send_messages: true,
@@ -12622,6 +12682,7 @@ mod status_message_tests {
                 started_by_user_id: input.user_id.clone(),
                 command_channel_id: input.command_channel_id.clone(),
                 user_voice_channel_id: input.user_voice_channel_id.clone(),
+                user_voice_channel_name: input.user_voice_channel_name.clone(),
                 permissions: input.permissions,
                 caller_role: input.caller_role,
                 effective_settings: input.effective_settings.clone(),
@@ -12766,6 +12827,22 @@ mod status_message_tests {
         );
         assert!(message.contains("https://example.test/meetings/meeting-1"));
         assert!(message.contains("✅"));
+    }
+
+    #[test]
+    fn summary_post_chunks_include_captured_voice_channel_name_or_id_fallback() {
+        let mut meeting = recording_meeting();
+        meeting.voice_channel_name = Some("Sprint Room".to_owned());
+
+        let chunks =
+            summary_chunks_with_voice_channel_metadata(&meeting, vec!["summary body".to_owned()]);
+
+        assert_eq!(chunks[0], "VC: Sprint Room (vc1)");
+        assert_eq!(chunks[1], "summary body");
+
+        meeting.voice_channel_name = None;
+        let fallback = summary_chunks_with_voice_channel_metadata(&meeting, Vec::new());
+        assert_eq!(fallback[0], "VC ID: vc1");
     }
 
     #[test]

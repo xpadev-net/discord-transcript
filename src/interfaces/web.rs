@@ -3098,6 +3098,8 @@ struct MeetingResponse {
     started_at: Option<String>,
     stopped_at: Option<String>,
     duration_seconds: Option<i32>,
+    voice_channel_id: String,
+    voice_channel_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3140,6 +3142,7 @@ struct GuildMeetingEntryResponse {
     duration_seconds: Option<i32>,
     stop_reason: Option<String>,
     voice_channel_id: String,
+    voice_channel_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4476,12 +4479,22 @@ fn guild_meeting_entry_from_row(row: &tokio_postgres::Row) -> GuildMeetingEntryR
         duration_seconds: row.get("meeting_duration_seconds"),
         stop_reason: row.get("stop_reason"),
         voice_channel_id: row.get("voice_channel_id"),
+        voice_channel_name: row.get("voice_channel_name"),
     }
 }
 
-fn guild_meeting_voice_channel_response(id: String) -> GuildMeetingVoiceChannelResponse {
+fn voice_channel_label(id: &str, name: Option<&str>) -> String {
+    name.filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("VC ID: {id}"))
+}
+
+fn guild_meeting_voice_channel_response(
+    id: String,
+    name: Option<String>,
+) -> GuildMeetingVoiceChannelResponse {
     GuildMeetingVoiceChannelResponse {
-        label: format!("VC ID: {id}"),
+        label: voice_channel_label(&id, name.as_deref()),
         id,
     }
 }
@@ -8225,7 +8238,12 @@ async fn list_admin_guild_meeting_voice_channels(
 
     Ok(rows
         .into_iter()
-        .map(|row| guild_meeting_voice_channel_response(row.get("voice_channel_id")))
+        .map(|row| {
+            guild_meeting_voice_channel_response(
+                row.get("voice_channel_id"),
+                row.get("voice_channel_name"),
+            )
+        })
         .collect())
 }
 
@@ -8249,7 +8267,12 @@ async fn list_visible_guild_meeting_voice_channels(
 
     Ok(rows
         .into_iter()
-        .map(|row| guild_meeting_voice_channel_response(row.get("voice_channel_id")))
+        .map(|row| {
+            guild_meeting_voice_channel_response(
+                row.get("voice_channel_id"),
+                row.get("voice_channel_name"),
+            )
+        })
         .collect())
 }
 
@@ -10745,7 +10768,7 @@ async fn api_meeting(
     let row = state
         .db
         .query_opt(
-            "SELECT id, title, status, \
+            "SELECT id, title, status, voice_channel_id, voice_channel_name, \
              to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as started_at, \
              to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as stopped_at, \
              meeting_duration_seconds \
@@ -10763,6 +10786,8 @@ async fn api_meeting(
         started_at: row.get("started_at"),
         stopped_at: row.get("stopped_at"),
         duration_seconds: row.get("meeting_duration_seconds"),
+        voice_channel_id: row.get("voice_channel_id"),
+        voice_channel_name: row.get("voice_channel_name"),
     }))
 }
 
@@ -12634,7 +12659,7 @@ mod guild_api_tests {
         validate_authorized_guild_bot_token_update, validate_authorized_guild_settings_update,
         validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
         validate_guild_settings_update, validate_rbac_role_exists, validate_resource_id,
-        validate_summary_template_id,
+        validate_summary_template_id, voice_channel_label,
     };
     use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
     use crate::domain::authz::RbacPermission;
@@ -14844,6 +14869,16 @@ mod guild_api_tests {
         assert!(visible_channel_sql.contains("WHERE GUILD_ID = $1"));
         assert!(visible_channel_sql.contains("VOICE_CHANNEL_ID = ANY($2::TEXT[])"));
         assert!(!visible_channel_sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn voice_channel_label_uses_captured_name_or_id_fallback() {
+        assert_eq!(
+            voice_channel_label("vc-1", Some("Planning VC")),
+            "Planning VC"
+        );
+        assert_eq!(voice_channel_label("vc-1", None), "VC ID: vc-1");
+        assert_eq!(voice_channel_label("vc-1", Some("   ")), "VC ID: vc-1");
     }
 
     #[test]

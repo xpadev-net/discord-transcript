@@ -2,8 +2,9 @@ use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
     build_correction_prompt, build_correction_prompt_with_context, build_summary_prompt,
     build_summary_prompt_with_context, build_summary_prompt_with_template,
-    build_whisper_context_prompt, correct_transcript_with_prompt, materialize_or_load_summary_context,
-    materialize_summary_context, run_summary_pipeline, run_transcription, SummaryContextInput,
+    build_whisper_context_prompt, correct_transcript_with_prompt, load_summary_context_manifest,
+    materialize_or_load_summary_context, materialize_summary_context, run_summary_pipeline,
+    run_transcription, SummaryContextInput,
 };
 use discord_transcript::domain::ai_memory::{AiMemoryNote, AiMemorySourceType, AiMemoryTag};
 use discord_transcript::domain::confidence::ConfidencePermille;
@@ -618,6 +619,7 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: Some("Incident Room".to_owned()),
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![SpeakerAudioInput {
@@ -642,6 +644,10 @@ fn summary_pipeline_masks_pii_and_chunks_output() {
     assert!(result.masking_stats.email_replacements >= 1);
     assert!(result.masking_stats.phone_replacements >= 1);
     assert!(result.masking_stats.mention_replacements >= 1);
+    let manifest_json =
+        std::fs::read_to_string(workspace.transcript_manifest_path()).expect("manifest");
+    assert!(manifest_json.contains("\"voice_channel_id\": \"vc1\""));
+    assert!(manifest_json.contains("\"voice_channel_name\": \"Incident Room\""));
     assert!(!workspace.context_manifest_path().exists());
     assert!(!workspace.context_speaker_roster_path().exists());
     assert!(!workspace.context_domain_knowledge_path().exists());
@@ -656,6 +662,7 @@ fn transcription_passes_meeting_prompt_to_per_speaker_whisper_requests() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("障害対応会議".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![
@@ -691,6 +698,7 @@ fn transcription_passes_meeting_prompt_to_mixdown_whisper_request() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("Sprint Planning".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -723,6 +731,7 @@ fn prompt_contains_required_sections() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -734,6 +743,7 @@ fn prompt_contains_required_sections() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: None,
         masked_transcript_path: format!("transcript/{forbidden}.md"),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -776,6 +786,7 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("Planning".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -843,6 +854,7 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: Some("en".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -928,6 +940,58 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
 }
 
 #[test]
+fn load_summary_context_manifest_accepts_legacy_missing_voice_channel_name() {
+    let temp = unique_workspace("legacy_context_manifest_voice_name", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Planning".to_owned()),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    std::fs::create_dir_all(
+        request
+            .workspace
+            .context_manifest_path()
+            .parent()
+            .expect("manifest should have parent directory"),
+    )
+    .expect("context directory should be created");
+    std::fs::write(
+        request.workspace.context_manifest_path(),
+        r#"{
+          "meeting_id": "m1",
+          "guild_id": "g1",
+          "voice_channel_id": "vc1",
+          "generated_at": "2026-01-01T00:00:00Z",
+          "manifest_path": "context/manifest.json",
+          "speaker_roster_path": "context/speaker_roster.md",
+          "speaker_count": 0,
+          "domain_knowledge_path": "context/domain_knowledge.md",
+          "domain_knowledge_count": 0,
+          "domain_knowledge_items": [],
+          "effective_domain_knowledge_version_id": null,
+          "summary_template_path": null,
+          "summary_template": null,
+          "effective_summary_template_id": null
+        }"#,
+    )
+    .expect("legacy context manifest should be written");
+
+    let manifest = load_summary_context_manifest(&request)
+        .expect("legacy context manifest should load")
+        .expect("context manifest should exist");
+
+    assert_eq!(manifest.voice_channel_id, "vc1");
+    assert_eq!(manifest.voice_channel_name, None);
+}
+
+#[test]
 fn materialized_summary_context_removes_stale_optional_template_file() {
     let temp = unique_workspace("context_stale_template", "m1");
     let workspace = temp.workspace().clone();
@@ -935,6 +999,7 @@ fn materialized_summary_context_removes_stale_optional_template_file() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -966,6 +1031,7 @@ fn materialized_summary_context_omits_inactive_template() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1011,6 +1077,7 @@ fn materialized_summary_context_reuses_existing_manifest_on_retry() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1079,6 +1146,7 @@ fn summary_prompt_template_none_preserves_builtin_default() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: Some("Weekly".to_owned()),
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1089,6 +1157,7 @@ fn summary_prompt_template_none_preserves_builtin_default() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: Some("ja".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -1110,6 +1179,7 @@ fn summary_prompt_template_renders_custom_template() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         title: None,
         audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
         speaker_audio: vec![],
@@ -1120,6 +1190,7 @@ fn summary_prompt_template_renders_custom_template() {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
         voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
         language: Some("en".to_owned()),
         masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
         generated_at: "2026-01-01T00:00:00Z".to_owned(),

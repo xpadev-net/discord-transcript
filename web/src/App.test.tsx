@@ -214,6 +214,7 @@ function meetingItem(overrides: Record<string, unknown> = {}) {
     duration_seconds: 600,
     stop_reason: null,
     voice_channel_id: "vc-1",
+    voice_channel_name: null,
     ...overrides,
   };
 }
@@ -226,6 +227,8 @@ function meetingResponse(overrides: Record<string, unknown> = {}) {
     started_at: "2026-06-01T00:00:00Z",
     stopped_at: "2026-06-01T00:10:00Z",
     duration_seconds: 600,
+    voice_channel_id: "vc-1",
+    voice_channel_name: null,
     ...overrides,
   };
 }
@@ -448,7 +451,11 @@ function renderApp(route: string, fetchMock: ReturnType<typeof vi.fn>) {
 }
 
 function meetingPageFetch(
-  options: { feedbackStatus?: number; segments?: unknown[] } = {},
+  options: {
+    feedbackStatus?: number;
+    meeting?: Record<string, unknown>;
+    segments?: unknown[];
+  } = {},
 ) {
   let feedbackRequest: unknown = null;
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -466,7 +473,7 @@ function meetingPageFetch(
       return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
     }
     if (url === "/api/meetings/meeting-1") {
-      return Promise.resolve(jsonResponse(meetingResponse()));
+      return Promise.resolve(jsonResponse(meetingResponse(options.meeting)));
     }
     if (url === "/api/meetings/meeting-1/transcript") {
       return Promise.resolve(
@@ -2160,6 +2167,47 @@ describe("App access controls", () => {
     );
   });
 
+  it("shows captured VC names on dashboard meeting rows", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse(
+              "guild-1",
+              [
+                meetingItem({
+                  title: "Named VC meeting",
+                  voice_channel_id: "vc-renamed",
+                  voice_channel_name: "Captured Room",
+                }),
+              ],
+              [voiceChannel("vc-renamed", "Captured Room")],
+            ),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/", fetchMock);
+
+    expect(await screen.findByText("Named VC meeting")).toBeTruthy();
+    expect(screen.getAllByText("Captured Room").length).toBeGreaterThan(0);
+  });
+
   it("filters dashboard meetings by VC and clears the VC filter", async () => {
     const channels = [voiceChannel("vc-1"), voiceChannel("vc-2")];
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -3059,6 +3107,18 @@ describe("App access controls", () => {
     expect(
       await screen.findByText("音声の読み込みが完了していません"),
     ).toBeTruthy();
+  });
+
+  it("shows meeting VC ID fallback when the captured name is unavailable", async () => {
+    const { fetchMock } = meetingPageFetch({
+      meeting: {
+        voice_channel_id: "deleted-vc",
+        voice_channel_name: null,
+      },
+    });
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    expect(await screen.findByText("VC ID: deleted-vc")).toBeTruthy();
   });
 
   it("submits corrected transcript feedback to the meeting API", async () => {
