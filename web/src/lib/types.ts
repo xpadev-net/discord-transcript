@@ -48,6 +48,32 @@ export interface MeetingListResponse {
   total: number;
 }
 
+export type GuildJobStatus =
+  | "queued"
+  | "running"
+  | "failed"
+  | "done"
+  | "canceled";
+export type GuildJobType = "transcribe" | "summarize" | "cleanup";
+
+export interface GuildJob {
+  id: string;
+  meeting_id: string;
+  guild_id: string;
+  job_type: GuildJobType;
+  status: GuildJobStatus;
+  retry_count: number;
+  error_message: string | null;
+  next_run_at: string | null;
+  leased_until: string | null;
+  finished_at: string | null;
+  dead_lettered_at: string | null;
+  canceled_at: string | null;
+  cancel_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface GuildSettingsResponse {
   whisper_language: string | null;
   whisper_language_explicit: boolean;

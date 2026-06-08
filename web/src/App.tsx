@@ -1,11 +1,17 @@
-import { useEffect, useState } from "react";
-import { Route, Routes, useParams } from "react-router-dom";
+import { type ReactNode, useEffect, useState } from "react";
+import { Navigate, Route, Routes, useParams } from "react-router-dom";
 import { ForbiddenState } from "./components/ForbiddenState";
 import { Nav } from "./components/Nav";
 import { fetchMe, fetchMeGuilds } from "./lib/api";
 import type { MeResponse, UserGuild } from "./lib/types";
 import { AdminPlansPage } from "./pages/AdminPlansPage";
-import { DashboardPage } from "./pages/DashboardPage";
+import {
+  AdminAuditPage,
+  AdminJobsPage,
+  AdminRetentionPage,
+  AdminUsagePage,
+  DashboardPage,
+} from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
@@ -152,13 +158,18 @@ export function App() {
   const canUseSelectedGuildSettings = selectedGuild
     ? canSelectGuild(selectedGuild) && selectedGuild.is_admin
     : me?.is_admin === true && selectedGuildId === me.guild_id;
+  const canUseCurrentGuildAdminViews = me?.is_admin === true;
+  const currentGuildName =
+    guilds.find((guild) => me && guild.guild_id === me.guild_id)?.name ??
+    undefined;
   const useCurrentGuildMeetings =
     guildsUnavailable && me !== null && selectedGuildId === me.guild_id;
 
   return (
     <>
       <Nav
-        isAdmin={canUseSelectedGuildSettings}
+        canManageSettings={canUseSelectedGuildSettings}
+        canUseAdminViews={canUseCurrentGuildAdminViews}
         isSystemAdmin={me?.is_admin === true}
         guilds={guilds}
         selectedGuildId={selectedGuildId}
@@ -220,10 +231,69 @@ export function App() {
           }
         />
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
+        <Route path="/admin" element={<Navigate to="/admin/usage" replace />} />
+        <Route
+          path="/admin/usage"
+          element={
+            <GuildAdminRoute
+              isAdmin={canUseCurrentGuildAdminViews}
+              loading={loadingMe}
+              forbidden={sessionForbidden}
+              error={sessionError}
+            >
+              <AdminUsagePage
+                selectedGuildName={currentGuildName}
+                isSystemAdmin={me?.is_admin === true}
+              />
+            </GuildAdminRoute>
+          }
+        />
+        <Route
+          path="/admin/jobs"
+          element={
+            <GuildAdminRoute
+              isAdmin={canUseCurrentGuildAdminViews}
+              loading={loadingMe}
+              forbidden={sessionForbidden}
+              error={sessionError}
+            >
+              <AdminJobsPage selectedGuildName={currentGuildName} />
+            </GuildAdminRoute>
+          }
+        />
+        <Route
+          path="/admin/audit"
+          element={
+            <GuildAdminRoute
+              isAdmin={canUseCurrentGuildAdminViews}
+              loading={loadingMe}
+              forbidden={sessionForbidden}
+              error={sessionError}
+            >
+              <AdminAuditPage
+                selectedGuildName={currentGuildName}
+                isSystemAdmin={me?.is_admin === true}
+              />
+            </GuildAdminRoute>
+          }
+        />
+        <Route
+          path="/admin/retention"
+          element={
+            <GuildAdminRoute
+              isAdmin={canUseCurrentGuildAdminViews}
+              loading={loadingMe}
+              forbidden={sessionForbidden}
+              error={sessionError}
+            >
+              <AdminRetentionPage selectedGuildName={currentGuildName} />
+            </GuildAdminRoute>
+          }
+        />
         <Route
           path="/admin/plans"
           element={
-            <AdminRoute
+            <SystemAdminRoute
               isAdmin={me?.is_admin === true}
               loading={loadingMe}
               forbidden={sessionForbidden}
@@ -251,9 +321,17 @@ interface AdminRouteProps {
   loading: boolean;
   forbidden: boolean;
   error: boolean;
+  children?: ReactNode;
 }
 
-function AdminRoute({ isAdmin, loading, forbidden, error }: AdminRouteProps) {
+function AdminRouteFrame({
+  isAdmin,
+  loading,
+  forbidden,
+  error,
+  forbiddenMessage,
+  children,
+}: AdminRouteProps & { forbiddenMessage: string }) {
   if (loading) {
     return (
       <main className="admin-page">
@@ -280,12 +358,26 @@ function AdminRoute({ isAdmin, loading, forbidden, error }: AdminRouteProps) {
   if (forbidden || !isAdmin) {
     return (
       <main className="admin-page">
-        <ForbiddenState message="\u30b7\u30b9\u30c6\u30e0\u7ba1\u7406\u6a29\u9650\u304c\u5fc5\u8981\u3067\u3059" />
+        <ForbiddenState message={forbiddenMessage} />
       </main>
     );
   }
 
-  return <AdminPlansPage />;
+  return <>{children}</>;
+}
+
+function GuildAdminRoute(props: AdminRouteProps) {
+  return (
+    <AdminRouteFrame {...props} forbiddenMessage="ギルド管理者権限が必要です" />
+  );
+}
+
+function SystemAdminRoute(props: AdminRouteProps) {
+  return (
+    <AdminRouteFrame {...props} forbiddenMessage="システム管理権限が必要です">
+      <AdminPlansPage />
+    </AdminRouteFrame>
+  );
 }
 
 interface SettingsRouteProps {

@@ -272,6 +272,27 @@ function adminAssignment(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function guildJob(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "job-1",
+    meeting_id: "meeting-1",
+    guild_id: "guild-1",
+    job_type: "summarize",
+    status: "failed",
+    retry_count: 2,
+    error_message: "summary failed",
+    next_run_at: "2026-06-01T00:20:00.000Z",
+    leased_until: null,
+    finished_at: null,
+    dead_lettered_at: null,
+    canceled_at: null,
+    cancel_reason: null,
+    created_at: "2026-06-01T00:10:00.000Z",
+    updated_at: "2026-06-01T00:15:00.000Z",
+    ...overrides,
+  };
+}
+
 function transcriptSegment(overrides: Record<string, unknown> = {}) {
   return {
     id: "segment-1",
@@ -557,7 +578,7 @@ describe("App access controls", () => {
 
     renderApp("/admin/plans", fetchMock);
 
-    await screen.findByRole("link", { name: "管理" });
+    await screen.findByRole("link", { name: "Plans" });
     fireEvent.change(screen.getByLabelText("管理トークン"), {
       target: { value: "admin-token" },
     });
@@ -566,6 +587,147 @@ describe("App access controls", () => {
     await screen.findByText("Default Plan");
     screen.getByText("Beta Plan");
     screen.getByText("guild-1 -> Default Plan");
+  });
+
+  it("loads the admin usage overview from read-only guild APIs", async () => {
+    const calledUrls: string[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      calledUrls.push(url);
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/meetings?page=1&limit=100") {
+        return Promise.resolve(
+          jsonResponse(meetingsResponse("guild-1", [meetingItem()])),
+        );
+      }
+      if (url === "/api/guild/jobs?limit=100") {
+        return Promise.resolve(jsonResponse([guildJob()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/usage", fetchMock);
+
+    await screen.findByRole("heading", { name: "Usage" });
+    screen.getByRole("link", { name: "Jobs" });
+    screen.getByRole("link", { name: "Audit" });
+    screen.getByRole("link", { name: "Retention" });
+    await screen.findByText("API未提供");
+    screen.getByText("10");
+    expect(screen.queryByLabelText("ギルド")).toBeNull();
+    expect(calledUrls).toContain("/api/guild/jobs?limit=100");
+  });
+
+  it("shows failed jobs with read-only status filters", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/guild/jobs?status=failed&limit=100") {
+        return Promise.resolve(jsonResponse([guildJob()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/jobs", fetchMock);
+
+    await screen.findByRole("heading", { name: "Jobs" });
+    await screen.findByText("summary failed");
+    screen.getByText("2");
+    expect(screen.queryByRole("button", { name: "再実行" })).toBeNull();
+  });
+
+  it("derives retention candidates from settings and visible meetings", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/meetings?page=1&limit=100") {
+        return Promise.resolve(
+          jsonResponse(
+            meetingsResponse("guild-1", [
+              meetingItem({
+                id: "old-meeting",
+                title: "Old meeting",
+                started_at: "2000-01-01T00:00:00Z",
+                stopped_at: "2000-01-01T00:10:00Z",
+              }),
+            ]),
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/retention", fetchMock);
+
+    await screen.findByRole("heading", { name: "Retention" });
+    await screen.findByText("Old meeting");
+    expect(screen.getAllByText("Candidate")).toHaveLength(2);
+  });
+
+  it("shows an unsupported state for audit reads without calling a missing API", async () => {
+    const calledUrls: string[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      calledUrls.push(url);
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/audit", fetchMock);
+
+    await screen.findByRole("heading", { name: "Audit" });
+    screen.getByText("API未提供");
+    expect(calledUrls).not.toContain("/api/guild/audit");
   });
 
   it("sends null limit_value when creating an unlimited quota", async () => {

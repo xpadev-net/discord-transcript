@@ -14,6 +14,9 @@ import type {
   DomainKnowledgeContentType,
   DomainKnowledgeItem,
   DomainKnowledgeUpsertRequest,
+  GuildJob,
+  GuildJobStatus,
+  GuildJobType,
   GuildSettingsResponse,
   MeetingListResponse,
   MeetingResponse,
@@ -80,6 +83,10 @@ function guildMeetingsPath(guildId?: string | null): string {
   return guildId
     ? `/api/guilds/${encodeURIComponent(guildId)}/meetings`
     : "/api/guild/meetings";
+}
+
+function guildJobsPath(): string {
+  return "/api/guild/jobs";
 }
 
 function adminPlanPath(planId?: string): string {
@@ -176,6 +183,13 @@ function handleGuildMeetingsResponse(
   return handleResponse<MeetingListResponse>(response);
 }
 
+function handleGuildJobsResponse(response: Response): Promise<GuildJob[]> {
+  if (response.status === 403) {
+    throw new Error("forbidden");
+  }
+  return handleResponse<GuildJob[]>(response);
+}
+
 export interface AdminRequestOptions {
   bearerToken?: string;
   signal?: AbortSignal;
@@ -222,6 +236,29 @@ export function fetchGuildMeetings(
   return fetch(`${guildMeetingsPath(guildId)}?${params.toString()}`, {
     signal,
   }).then(handleGuildMeetingsResponse);
+}
+
+export function fetchGuildJobs(
+  options: {
+    status?: GuildJobStatus | "";
+    jobType?: GuildJobType | "";
+    limit?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<GuildJob[]> {
+  const params = new URLSearchParams();
+  if (options.status) {
+    params.set("status", options.status);
+  }
+  if (options.jobType) {
+    params.set("job_type", options.jobType);
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit));
+  }
+  const query = params.toString();
+  const path = query ? `${guildJobsPath()}?${query}` : guildJobsPath();
+  return fetch(path, { signal: options.signal }).then(handleGuildJobsResponse);
 }
 
 export function fetchGuildSettings(
