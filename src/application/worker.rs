@@ -585,7 +585,6 @@ where
         ),
     }
 
-    ensure_owned()?;
     persist_pre_correction_transcript_debug_artifact(
         &request.workspace,
         &transcription.transcript_for_summary,
@@ -651,7 +650,6 @@ where
         }
     };
 
-    ensure_owned()?;
     let manifest_result = write_transcript_files(&request, &transcription);
     ensure_owned()?;
     let manifest = match manifest_result {
@@ -664,7 +662,6 @@ where
     };
     let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
-    ensure_owned()?;
     let agent_workspace_result = materialize_new_summary_agent_workspace(&request);
     ensure_owned()?;
     let agent_workspace = match agent_workspace_result {
@@ -685,7 +682,6 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    ensure_owned()?;
     if store.supports_ai_memory_extraction() {
         match extract_ai_memory_candidates(
             claude,

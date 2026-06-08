@@ -95,6 +95,8 @@ impl SqlExecutor for FakeSqlExecutor {
         if let Some(err) = self.execute_error.get(&key) {
             return Err(err.clone());
         }
+        // Wildcard keys support SQL whose params include generated values such as
+        // claim tokens. They intentionally bypass exact parameter arity checks.
         let wildcard_key = format!("{sql}|*");
         Ok(*self
             .execute_result
@@ -113,6 +115,8 @@ impl SqlExecutor for FakeSqlExecutor {
         if let Some(err) = self.query_rows_error.get(&key) {
             return Err(err.clone());
         }
+        // Wildcard keys support SQL whose params include generated values such as
+        // claim tokens. They intentionally bypass exact parameter arity checks.
         let wildcard_key = format!("{sql}|*");
         Ok(self
             .query_rows_result
