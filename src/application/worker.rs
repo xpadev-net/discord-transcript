@@ -466,11 +466,11 @@ fn revert_to_stopping_for_retry<S: MeetingStore>(
     }
 }
 
-fn mark_meeting_failed_from_summary_state<S: MeetingStore>(
+pub(crate) fn mark_summary_meeting_failed_from_summary_state<S: MeetingStore>(
     store: &mut S,
     meeting_id: &str,
     error_message: String,
-) -> Result<(), WorkerError> {
+) -> Result<bool, StoreError> {
     for expected in [
         MeetingStatus::Stopping,
         MeetingStatus::Transcribing,
@@ -479,17 +479,17 @@ fn mark_meeting_failed_from_summary_state<S: MeetingStore>(
         match store.set_meeting_status(meeting_id, MeetingStatus::Failed, Some(expected)) {
             Ok(()) => {
                 store.set_error_message(meeting_id, Some(error_message))?;
-                return Ok(());
+                return Ok(true);
             }
             Err(StoreError::CasConflict { .. }) => continue,
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
     }
     warn!(
         meeting_id = %meeting_id,
         "summary job exhausted retries but meeting is no longer in a summary-owned status"
     );
-    Ok(())
+    Ok(false)
 }
 
 pub fn process_meeting_summary<S, W, C>(
@@ -940,7 +940,12 @@ where
             queue.heartbeat(&job)?;
             let status = queue.retry(&job, err.to_string(), options.max_retries)?;
             if status == JobStatus::Failed {
-                mark_meeting_failed_from_summary_state(store, &job.meeting_id, err.to_string())?;
+                mark_summary_meeting_failed_from_summary_state(
+                    store,
+                    &job.meeting_id,
+                    err.to_string(),
+                )
+                .map_err(WorkerError::from)?;
                 warn!(
                     job_id = %job.id,
                     meeting_id = %job.meeting_id,

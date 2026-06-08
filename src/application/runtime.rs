@@ -14,7 +14,9 @@ use crate::application::retention_cleanup::{
 };
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
-use crate::application::worker::enqueue_summary_job;
+use crate::application::worker::{
+    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+};
 use crate::audio::meeting_audio::{
     ProcessedAudioChunk, build_speaker_audio_inputs,
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
@@ -1601,34 +1603,6 @@ fn retry_claimed_summary_job<Q: JobQueue>(
     summary_retry_exhausted(retry_status, &job.meeting_id, &job.id, phase)
 }
 
-fn mark_summary_meeting_failed_if_owned<S: MeetingStore>(
-    store: &mut S,
-    meeting_id: &str,
-    error_message: String,
-) -> Result<bool, String> {
-    for expected in [
-        MeetingStatus::Stopping,
-        MeetingStatus::Transcribing,
-        MeetingStatus::Summarizing,
-    ] {
-        match store.set_meeting_status(meeting_id, MeetingStatus::Failed, Some(expected)) {
-            Ok(()) => {
-                store
-                    .set_error_message(meeting_id, Some(error_message))
-                    .map_err(|err| err.to_string())?;
-                return Ok(true);
-            }
-            Err(StoreError::CasConflict { .. }) => continue,
-            Err(err) => return Err(err.to_string()),
-        }
-    }
-    warn!(
-        meeting_id,
-        "summary job tried to mark meeting failed after ownership was lost"
-    );
-    Ok(false)
-}
-
 fn db_safe_transcript_timestamp_ms(
     segment_index: usize,
     field: &str,
@@ -2081,11 +2055,10 @@ where
             Ok(false)
         }
         Ok(crate::domain::JobStatus::Failed) => {
-            mark_summary_meeting_failed_if_owned(store, meeting_id, error_message).map_err(
-                |err| {
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message)
+                .map_err(|err| {
                     format!("summary post retry exhausted but meeting failure update failed: {err}")
-                },
-            )?;
+                })?;
             Ok(true)
         }
         Ok(status) => {
@@ -2144,7 +2117,6 @@ where
                 error = %err,
                 "failed to prove summary job ownership before retry state restore; leaving meeting status unchanged"
             );
-            let _ = store.set_error_message(meeting_id, Some(error_message));
             return Ok(false);
         }
         Err(err) => {
@@ -2170,7 +2142,7 @@ where
             "summary job retry cannot restore meeting to retryable state; marking job failed"
         );
         let _ = queue.mark_failed(job, error_message.clone());
-        mark_summary_meeting_failed_if_owned(store, meeting_id, error_message).map_err(
+        mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
             |store_err| {
                 format!(
                     "{phase} retry status restore failed ({err}) and meeting failure update failed: {store_err}"
@@ -2194,9 +2166,10 @@ where
             Ok(false)
         }
         Ok(crate::domain::JobStatus::Failed) => {
-            mark_summary_meeting_failed_if_owned(store, meeting_id, error_message).map_err(
-                |err| format!("{phase} retry exhausted but meeting failure update failed: {err}"),
-            )?;
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message)
+                .map_err(|err| {
+                    format!("{phase} retry exhausted but meeting failure update failed: {err}")
+                })?;
             Ok(true)
         }
         Ok(status) => {
@@ -2207,7 +2180,7 @@ where
                 status = %status.as_str(),
                 "unexpected summary job retry status; marking meeting failed"
             );
-            mark_summary_meeting_failed_if_owned(store, meeting_id, error_message).map_err(
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
                 |err| {
                     format!(
                         "{phase} retry returned unexpected status {status:?} and meeting failure update failed: {err}"
@@ -2248,7 +2221,7 @@ where
                 error = %err,
                 "summary job retry cannot be durably scheduled"
             );
-            mark_summary_meeting_failed_if_owned(store, meeting_id, error_message).map_err(
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
                 |store_err| {
                     format!(
                         "{phase} retry failed ({err}) and meeting failure update failed: {store_err}"
@@ -2306,15 +2279,22 @@ where
             "summary_cleanup",
         );
         if exhausted {
-            let _ =
-                mark_summary_meeting_failed_if_owned(store, &claimed_job.meeting_id, err_string);
+            let _ = mark_summary_meeting_failed_from_summary_state(
+                store,
+                &claimed_job.meeting_id,
+                err_string,
+            );
             SummaryCleanupFailureDisposition::TerminalStatusUpdated
         } else {
             SummaryCleanupFailureDisposition::RetryScheduled
         }
     } else {
         let _ = queue.mark_failed(claimed_job, err_string.clone());
-        let _ = mark_summary_meeting_failed_if_owned(store, &claimed_job.meeting_id, err_string);
+        let _ = mark_summary_meeting_failed_from_summary_state(
+            store,
+            &claimed_job.meeting_id,
+            err_string,
+        );
         SummaryCleanupFailureDisposition::TerminalStatusUpdated
     }
 }
@@ -6653,7 +6633,7 @@ impl ScaffoldHandler {
                 drop(queue);
                 if exhausted {
                     let mut service = self.service.lock().await;
-                    let _ = mark_summary_meeting_failed_if_owned(
+                    let _ = mark_summary_meeting_failed_from_summary_state(
                         &mut service.store,
                         &claimed_job.meeting_id,
                         err_string.clone(),
@@ -6732,7 +6712,7 @@ impl ScaffoldHandler {
                 drop(queue);
                 if exhausted {
                     let mut service = self.service.lock().await;
-                    let _ = mark_summary_meeting_failed_if_owned(
+                    let _ = mark_summary_meeting_failed_from_summary_state(
                         &mut service.store,
                         &claimed_job.meeting_id,
                         err.to_string(),
@@ -6956,7 +6936,7 @@ impl ScaffoldHandler {
                         let mut service = self.service.lock().await;
                         let mut queue = self.queue.lock().await;
                         let _ = queue.mark_failed(&claimed_job, message.clone());
-                        let _ = mark_summary_meeting_failed_if_owned(
+                        let _ = mark_summary_meeting_failed_from_summary_state(
                             &mut service.store,
                             &claimed_job.meeting_id,
                             message.clone(),

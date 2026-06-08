@@ -997,8 +997,13 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
             )
             .map_err(QueueError::Backend)?;
         if affected == 0 {
-            return Err(QueueError::NotFound {
+            // SQL cannot distinguish missing, non-running, and claim-token mismatch
+            // without an extra read; for heartbeat callers the actionable state is
+            // that this claim no longer owns a running job.
+            return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
+                expected: "running with matching claim token".to_owned(),
+                actual: "missing, not running, or different claim token".to_owned(),
             });
         }
         Ok(())
