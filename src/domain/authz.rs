@@ -33,69 +33,56 @@ pub fn is_allowed(role: UserRole, action: Action) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RbacPermission {
-    RecordingStart,
-    RecordingStop,
-    MeetingView,
-    MeetingReprocess,
-    MeetingDelete,
-    SettingsManage,
-    SummaryTemplateManage,
-    DomainKnowledgeManage,
-    UsageView,
-    AdminView,
-}
-
-impl RbacPermission {
-    pub const ALL: [Self; 10] = [
-        Self::RecordingStart,
-        Self::RecordingStop,
-        Self::MeetingView,
-        Self::MeetingReprocess,
-        Self::MeetingDelete,
-        Self::SettingsManage,
-        Self::SummaryTemplateManage,
-        Self::DomainKnowledgeManage,
-        Self::UsageView,
-        Self::AdminView,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RecordingStart => "recording:start",
-            Self::RecordingStop => "recording:stop",
-            Self::MeetingView => "meeting:view",
-            Self::MeetingReprocess => "meeting:reprocess",
-            Self::MeetingDelete => "meeting:delete",
-            Self::SettingsManage => "settings:manage",
-            Self::SummaryTemplateManage => "summary_template:manage",
-            Self::DomainKnowledgeManage => "domain_knowledge:manage",
-            Self::UsageView => "usage:view",
-            Self::AdminView => "admin:view",
+macro_rules! define_rbac_permissions {
+    ($(($variant:ident, $name:literal)),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum RbacPermission {
+            $($variant),+
         }
-    }
-}
 
-impl FromStr for RbacPermission {
-    type Err = RbacPermissionParseError;
+        impl RbacPermission {
+            pub const ALL: [Self; define_rbac_permissions!(@count $($variant),+)] = [
+                $(Self::$variant),+
+            ];
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "recording:start" => Ok(Self::RecordingStart),
-            "recording:stop" => Ok(Self::RecordingStop),
-            "meeting:view" => Ok(Self::MeetingView),
-            "meeting:reprocess" => Ok(Self::MeetingReprocess),
-            "meeting:delete" => Ok(Self::MeetingDelete),
-            "settings:manage" => Ok(Self::SettingsManage),
-            "summary_template:manage" => Ok(Self::SummaryTemplateManage),
-            "domain_knowledge:manage" => Ok(Self::DomainKnowledgeManage),
-            "usage:view" => Ok(Self::UsageView),
-            "admin:view" => Ok(Self::AdminView),
-            _ => Err(RbacPermissionParseError),
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
         }
-    }
+
+        impl FromStr for RbacPermission {
+            type Err = RbacPermissionParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($name => Ok(Self::$variant),)+
+                    _ => Err(RbacPermissionParseError),
+                }
+            }
+        }
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(define_rbac_permissions!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => {
+        ()
+    };
 }
+
+define_rbac_permissions!(
+    (RecordingStart, "recording:start"),
+    (RecordingStop, "recording:stop"),
+    (MeetingView, "meeting:view"),
+    (MeetingReprocess, "meeting:reprocess"),
+    (MeetingDelete, "meeting:delete"),
+    (SettingsManage, "settings:manage"),
+    (SummaryTemplateManage, "summary_template:manage"),
+    (DomainKnowledgeManage, "domain_knowledge:manage"),
+    (UsageView, "usage:view"),
+    (AdminView, "admin:view"),
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbacPermissionParseError;
@@ -258,6 +245,10 @@ fn legacy_access_source(
     if subject.is_meeting_starter && is_allowed(UserRole::StartedMeeting, action) {
         PermissionDecisionSource::LegacyMeetingStarter
     } else {
+        debug_assert!(
+            subject.has_channel_view && is_allowed(UserRole::Member, action),
+            "legacy_access_source called for a subject without legacy access"
+        );
         PermissionDecisionSource::LegacyChannelView
     }
 }
