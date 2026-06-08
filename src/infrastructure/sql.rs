@@ -214,6 +214,156 @@ WHERE permissions.guild_id = $1
 ORDER BY permissions.discord_role_id, permissions.permission_name
 "#;
 
+pub const LIST_GUILD_RBAC_ROLE_GRANTS_SQL: &str = r#"
+SELECT
+    bindings.guild_id,
+    bindings.discord_role_id,
+    COALESCE(
+        array_remove(array_agg(permissions.permission_name ORDER BY permissions.permission_name), NULL),
+        ARRAY[]::TEXT[]
+    ) AS permission_names,
+    bindings.created_actor_user_id,
+    bindings.updated_actor_user_id,
+    bindings.created_at::TEXT AS created_at,
+    bindings.updated_at::TEXT AS updated_at
+FROM guild_rbac_role_bindings bindings
+LEFT JOIN guild_rbac_permissions permissions
+  ON permissions.guild_id = bindings.guild_id
+ AND permissions.discord_role_id = bindings.discord_role_id
+WHERE bindings.guild_id = $1
+  AND bindings.active = TRUE
+GROUP BY
+    bindings.guild_id,
+    bindings.discord_role_id,
+    bindings.created_actor_user_id,
+    bindings.updated_actor_user_id,
+    bindings.created_at,
+    bindings.updated_at
+ORDER BY bindings.discord_role_id
+"#;
+
+pub const UPSERT_GUILD_RBAC_ROLE_GRANT_SQL: &str = r#"
+WITH normalized_permissions AS (
+    SELECT DISTINCT permission_name
+    FROM unnest($4::TEXT[]) AS permission_name
+),
+binding AS (
+    INSERT INTO guild_rbac_role_bindings (
+        guild_id,
+        discord_role_id,
+        active,
+        created_actor_user_id,
+        updated_actor_user_id
+    )
+    VALUES ($1, $2, TRUE, $3, $3)
+    ON CONFLICT (guild_id, discord_role_id) DO UPDATE
+    SET
+        active = TRUE,
+        updated_actor_user_id = $3
+    RETURNING
+        guild_id,
+        discord_role_id,
+        created_actor_user_id,
+        updated_actor_user_id,
+        created_at::TEXT AS created_at,
+        updated_at::TEXT AS updated_at
+),
+removed_permissions AS (
+    DELETE FROM guild_rbac_permissions permissions
+    WHERE permissions.guild_id = $1
+      AND permissions.discord_role_id = $2
+      AND permissions.permission_name NOT IN (
+          SELECT permission_name FROM normalized_permissions
+      )
+),
+upserted_permissions AS (
+    INSERT INTO guild_rbac_permissions (
+        guild_id,
+        discord_role_id,
+        permission_name,
+        created_actor_user_id,
+        updated_actor_user_id
+    )
+    SELECT $1, $2, permission_name, $3, $3
+    FROM normalized_permissions
+    ON CONFLICT (guild_id, discord_role_id, permission_name) DO UPDATE
+    SET updated_actor_user_id = $3
+)
+SELECT
+    binding.guild_id,
+    binding.discord_role_id,
+    COALESCE(
+        (
+            SELECT array_agg(permission_name ORDER BY permission_name)
+            FROM normalized_permissions
+        ),
+        ARRAY[]::TEXT[]
+    ) AS permission_names,
+    binding.created_actor_user_id,
+    binding.updated_actor_user_id,
+    binding.created_at,
+    binding.updated_at
+FROM binding
+GROUP BY
+    binding.guild_id,
+    binding.discord_role_id,
+    binding.created_actor_user_id,
+    binding.updated_actor_user_id,
+    binding.created_at,
+    binding.updated_at
+"#;
+
+pub const RESET_GUILD_RBAC_ROLE_GRANT_SQL: &str = r#"
+WITH binding AS (
+    INSERT INTO guild_rbac_role_bindings (
+        guild_id,
+        discord_role_id,
+        active,
+        created_actor_user_id,
+        updated_actor_user_id
+    )
+    VALUES ($1, $2, FALSE, $3, $3)
+    ON CONFLICT (guild_id, discord_role_id) DO UPDATE
+    SET
+        active = FALSE,
+        updated_actor_user_id = $3
+    RETURNING
+        guild_id,
+        discord_role_id,
+        created_actor_user_id,
+        updated_actor_user_id,
+        created_at::TEXT AS created_at,
+        updated_at::TEXT AS updated_at
+),
+removed_permissions AS (
+    DELETE FROM guild_rbac_permissions
+    WHERE guild_id = $1
+      AND discord_role_id = $2
+    RETURNING permission_name
+)
+SELECT
+    binding.guild_id,
+    binding.discord_role_id,
+    ARRAY[]::TEXT[] AS permission_names,
+    binding.created_actor_user_id,
+    binding.updated_actor_user_id,
+    binding.created_at,
+    binding.updated_at,
+    COALESCE(
+        array_remove(array_agg(removed_permissions.permission_name ORDER BY removed_permissions.permission_name), NULL),
+        ARRAY[]::TEXT[]
+    ) AS removed_permission_names
+FROM binding
+LEFT JOIN removed_permissions ON TRUE
+GROUP BY
+    binding.guild_id,
+    binding.discord_role_id,
+    binding.created_actor_user_id,
+    binding.updated_actor_user_id,
+    binding.created_at,
+    binding.updated_at
+"#;
+
 pub const MARK_STOPPING_IF_RECORDING_SQL: &str = r#"
 UPDATE meetings
 SET

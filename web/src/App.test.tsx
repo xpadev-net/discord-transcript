@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -179,6 +180,9 @@ function emptyCustomizationResponse(url: string): Response | null {
   ) {
     return jsonResponse([]);
   }
+  if (url === "/api/guild/rbac" || /^\/api\/guilds\/[^/]+\/rbac$/.test(url)) {
+    return jsonResponse(rbacResponse());
+  }
   return null;
 }
 
@@ -268,6 +272,60 @@ function adminAssignment(overrides: Record<string, unknown> = {}) {
     source: "admin",
     created_at: "2026-06-01T00:00:00.000Z",
     updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function rbacResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    guild_id: "guild-1",
+    degraded: false,
+    permissions: [
+      {
+        name: "recording:start",
+        label: "Start recording",
+        description: "Allows starting new Discord recordings.",
+      },
+      {
+        name: "meeting:view",
+        label: "View meetings",
+        description: "Allows reading meetings.",
+      },
+      {
+        name: "meeting:delete",
+        label: "Delete meetings",
+        description: "Allows deleting meetings.",
+      },
+    ],
+    roles: [
+      {
+        id: "role-ops",
+        name: "Ops",
+        position: 10,
+        color: 0,
+        managed: false,
+        hoist: true,
+        is_admin: false,
+        grant: {
+          discord_role_id: "role-ops",
+          permissions: ["meeting:view"],
+          created_actor_user_id: "admin-1",
+          updated_actor_user_id: "admin-1",
+          created_at: "2026-06-01T00:00:00.000Z",
+          updated_at: "2026-06-01T00:00:00.000Z",
+        },
+      },
+      {
+        id: "role-viewers",
+        name: "Viewers",
+        position: 5,
+        color: 0,
+        managed: false,
+        hoist: false,
+        is_admin: false,
+        grant: null,
+      },
+    ],
     ...overrides,
   };
 }
@@ -965,6 +1023,70 @@ describe("App access controls", () => {
       screen.queryByRole("button", { name: "\u524a\u9664\u3092\u78ba\u5b9a" }),
     ).toBeNull();
     expect(screen.getByRole("button", { name: "\u524a\u9664" })).toBeTruthy();
+  });
+
+  it("lets admins save Discord role RBAC permissions", async () => {
+    let rbacRequest: unknown = null;
+    let rbacLoads = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings" && !init?.method) {
+        return Promise.resolve(jsonResponse(settingsResponse()));
+      }
+      if (url === "/api/guild/rbac" && !init?.method) {
+        rbacLoads += 1;
+        return Promise.resolve(jsonResponse(rbacResponse()));
+      }
+      if (url === "/api/guild/rbac/roles/role-ops" && init?.method === "PUT") {
+        rbacRequest = JSON.parse(String(init.body));
+        return Promise.resolve(
+          jsonResponse({
+            discord_role_id: "role-ops",
+            permissions: ["meeting:view", "meeting:delete"],
+            created_actor_user_id: "admin-1",
+            updated_actor_user_id: "admin-1",
+            created_at: "2026-06-01T00:00:00.000Z",
+            updated_at: "2026-06-01T00:05:00.000Z",
+          }),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    const rbacSection = await screen.findByRole("heading", {
+      name: "Discordロール権限",
+    });
+    const panel = rbacSection.closest("section");
+    expect(panel).not.toBeNull();
+
+    const deletePermission = within(panel as HTMLElement).getByLabelText(
+      /Delete meetings/,
+    );
+    fireEvent.click(deletePermission);
+    fireEvent.click(
+      within(panel as HTMLElement).getByRole("button", { name: "権限を保存" }),
+    );
+
+    await waitFor(() =>
+      expect(rbacRequest).toEqual({
+        permissions: ["meeting:view", "meeting:delete"],
+      }),
+    );
+    await waitFor(() => expect(rbacLoads).toBeGreaterThanOrEqual(2));
+    expect(
+      await screen.findByText("RBACロール権限を保存しました"),
+    ).toBeTruthy();
   });
 
   it("loads active domain knowledge and summary template versions for admins", async () => {

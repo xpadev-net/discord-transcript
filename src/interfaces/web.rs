@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, watch};
@@ -35,6 +36,7 @@ use crate::application::runtime::SummaryJobWakeups;
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
 use crate::domain::audit::AuditEvent;
+use crate::domain::authz::RbacPermission;
 use crate::domain::confidence::ConfidencePermille;
 use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::feedback::{
@@ -80,13 +82,14 @@ use crate::infrastructure::sql::{
     LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL,
     LIST_ADMIN_PLAN_QUOTAS_SQL, LIST_ADMIN_PLANS_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_JOBS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
-    LIST_GUILD_MEETINGS_SQL, LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL,
-    LIST_TRANSCRIPT_FEEDBACK_SQL, LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL,
-    LIST_VISIBLE_GUILD_MEETINGS_SQL, RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL,
+    LIST_GUILD_MEETINGS_SQL, LIST_GUILD_RBAC_ROLE_GRANTS_SQL, LIST_PERSON_ALIASES_SQL,
+    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
+    RESET_GUILD_RBAC_ROLE_GRANT_SQL, RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL,
     SET_AI_MEMORY_PINNED_SQL, UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, UPDATE_ADMIN_PLAN_QUOTA_SQL,
     UPDATE_ADMIN_PLAN_SQL, UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
     UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
-    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_RBAC_ROLE_GRANT_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -648,6 +651,11 @@ pub fn create_router(state: WebState) -> Router {
             "/api/guilds/{guild_id}/settings/bot-token",
             put(api_update_target_guild_bot_token).delete(api_delete_target_guild_bot_token),
         )
+        .route("/api/guilds/{guild_id}/rbac", get(api_target_guild_rbac))
+        .route(
+            "/api/guilds/{guild_id}/rbac/roles/{role_id}",
+            put(api_update_target_guild_rbac_role).delete(api_reset_target_guild_rbac_role),
+        )
         .route(
             "/api/guild/settings",
             get(api_guild_settings).put(api_update_guild_settings),
@@ -655,6 +663,11 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/guild/settings/bot-token",
             put(api_update_guild_bot_token).delete(api_delete_guild_bot_token),
+        )
+        .route("/api/guild/rbac", get(api_guild_rbac))
+        .route(
+            "/api/guild/rbac/roles/{role_id}",
+            put(api_update_guild_rbac_role).delete(api_reset_guild_rbac_role),
         )
         .route(
             "/api/guild/domain-knowledge",
@@ -2100,6 +2113,14 @@ async fn get_guild_info(
     get_guild_info_with_bot_auth(state, auth, &bot_auth).await
 }
 
+async fn fetch_fresh_guild_info(
+    state: &WebState,
+    auth: &AuthConfig,
+) -> Result<DiscordGuildFull, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+    fetch_guild_info_with_bot_auth(state, auth, &bot_auth).await
+}
+
 fn cached_guild_result(cache: &GuildCacheState) -> Option<Result<DiscordGuildFull, StatusCode>> {
     let now = Instant::now();
     if let Some((guild, expires_at)) = cache.entry.as_ref()
@@ -2773,6 +2794,16 @@ struct DiscordGuildFull {
 #[derive(Deserialize, Clone)]
 struct DiscordRoleFull {
     id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    position: i64,
+    #[serde(default)]
+    color: i64,
+    #[serde(default)]
+    managed: bool,
+    #[serde(default)]
+    hoist: bool,
     #[serde(deserialize_with = "deserialize_permission_bits")]
     permissions: u64,
 }
@@ -3110,6 +3141,48 @@ struct JobResponse {
     cancel_reason: Option<String>,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildRbacPermissionCatalogEntry {
+    name: String,
+    label: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildRbacRoleGrantResponse {
+    discord_role_id: String,
+    permissions: Vec<String>,
+    created_actor_user_id: Option<String>,
+    updated_actor_user_id: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildRbacRoleResponse {
+    id: String,
+    name: String,
+    position: i64,
+    color: i64,
+    managed: bool,
+    hoist: bool,
+    is_admin: bool,
+    grant: Option<GuildRbacRoleGrantResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuildRbacManagementResponse {
+    guild_id: String,
+    permissions: Vec<GuildRbacPermissionCatalogEntry>,
+    roles: Vec<GuildRbacRoleResponse>,
+    degraded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GuildRbacRoleGrantUpdateRequest {
+    permissions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7649,6 +7722,200 @@ fn target_guild_settings_path(guild_id: &str, suffix: &str) -> String {
     format!("/api/guilds/{guild_id}/settings{suffix}")
 }
 
+fn target_guild_rbac_path(guild_id: &str, suffix: &str) -> String {
+    format!("/api/guilds/{guild_id}/rbac{suffix}")
+}
+
+fn rbac_permission_catalog() -> Vec<GuildRbacPermissionCatalogEntry> {
+    RbacPermission::ALL
+        .iter()
+        .map(|permission| GuildRbacPermissionCatalogEntry {
+            name: permission.as_str().to_owned(),
+            label: rbac_permission_label(*permission).to_owned(),
+            description: rbac_permission_description(*permission).to_owned(),
+        })
+        .collect()
+}
+
+fn rbac_permission_label(permission: RbacPermission) -> &'static str {
+    match permission {
+        RbacPermission::RecordingStart => "Start recording",
+        RbacPermission::RecordingStop => "Stop recording",
+        RbacPermission::MeetingView => "View meetings",
+        RbacPermission::MeetingReprocess => "Reprocess meetings",
+        RbacPermission::MeetingDelete => "Delete meetings",
+        RbacPermission::SettingsManage => "Manage settings",
+        RbacPermission::SummaryTemplateManage => "Manage summary templates",
+        RbacPermission::DomainKnowledgeManage => "Manage domain knowledge",
+        RbacPermission::UsageView => "View usage",
+        RbacPermission::AdminView => "View admin pages",
+    }
+}
+
+fn rbac_permission_description(permission: RbacPermission) -> &'static str {
+    match permission {
+        RbacPermission::RecordingStart => "Allows starting new Discord recordings.",
+        RbacPermission::RecordingStop => "Allows stopping active recordings.",
+        RbacPermission::MeetingView => {
+            "Allows reading meeting lists, transcripts, summaries, and audio."
+        }
+        RbacPermission::MeetingReprocess => {
+            "Allows retrying meeting transcription or summary jobs."
+        }
+        RbacPermission::MeetingDelete => "Allows deleting meeting records and artifacts.",
+        RbacPermission::SettingsManage => "Allows managing guild settings.",
+        RbacPermission::SummaryTemplateManage => "Allows editing summary templates.",
+        RbacPermission::DomainKnowledgeManage => "Allows editing domain knowledge and AI memory.",
+        RbacPermission::UsageView => "Allows viewing usage and quota information.",
+        RbacPermission::AdminView => "Allows viewing guild administration surfaces.",
+    }
+}
+
+fn normalize_rbac_role_id(role_id: &str) -> Result<String, StatusCode> {
+    let trimmed = role_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed.contains('/')
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn normalize_rbac_permission_names(names: &[String]) -> Result<Vec<String>, StatusCode> {
+    let requested = names
+        .iter()
+        .map(|name| {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            RbacPermission::from_str(trimmed)
+                .map(|permission| permission.as_str().to_owned())
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    Ok(RbacPermission::ALL
+        .iter()
+        .map(|permission| permission.as_str())
+        .filter(|name| requested.contains(*name))
+        .map(str::to_owned)
+        .collect())
+}
+
+fn validate_rbac_role_exists(
+    guild_id: &str,
+    role_id: &str,
+    guild: &DiscordGuildFull,
+) -> Result<(), StatusCode> {
+    let exists = guild
+        .roles
+        .iter()
+        .any(|role| role.id == role_id && role.id != guild_id);
+    if exists {
+        Ok(())
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+fn rbac_role_grant_response_from_row(row: &tokio_postgres::Row) -> GuildRbacRoleGrantResponse {
+    GuildRbacRoleGrantResponse {
+        discord_role_id: row.get("discord_role_id"),
+        permissions: row.get("permission_names"),
+        created_actor_user_id: row.get("created_actor_user_id"),
+        updated_actor_user_id: row.get("updated_actor_user_id"),
+        created_at: Some(row.get("created_at")),
+        updated_at: Some(row.get("updated_at")),
+    }
+}
+
+async fn load_guild_rbac_role_grants(
+    state: &WebState,
+    guild_id: &str,
+) -> Result<Vec<GuildRbacRoleGrantResponse>, StatusCode> {
+    let rows = state
+        .db
+        .query(LIST_GUILD_RBAC_ROLE_GRANTS_SQL, &[&guild_id])
+        .await
+        .map_err(|err| {
+            warn!(error = %err, guild_id = %guild_id, "failed to load guild RBAC grants");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(rows.iter().map(rbac_role_grant_response_from_row).collect())
+}
+
+fn guild_rbac_management_response(
+    guild_id: &str,
+    guild: &DiscordGuildFull,
+    grants: Vec<GuildRbacRoleGrantResponse>,
+) -> GuildRbacManagementResponse {
+    let grant_by_role = grants
+        .into_iter()
+        .map(|grant| (grant.discord_role_id.clone(), grant))
+        .collect::<HashMap<_, _>>();
+    let mut roles = guild
+        .roles
+        .iter()
+        .filter(|role| role.id != guild_id)
+        .map(|role| {
+            let role_name = role.name.trim();
+            GuildRbacRoleResponse {
+                id: role.id.clone(),
+                name: if role_name.is_empty() {
+                    role.id.clone()
+                } else {
+                    role_name.to_owned()
+                },
+                position: role.position,
+                color: role.color,
+                managed: role.managed,
+                hoist: role.hoist,
+                is_admin: role.permissions & ADMINISTRATOR != 0,
+                grant: grant_by_role.get(&role.id).cloned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    roles.sort_by(|left, right| {
+        right
+            .position
+            .cmp(&left.position)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    GuildRbacManagementResponse {
+        guild_id: guild_id.to_owned(),
+        permissions: rbac_permission_catalog(),
+        roles,
+        degraded: false,
+    }
+}
+
+fn permissions_for_grant(grants: &[GuildRbacRoleGrantResponse], role_id: &str) -> Vec<String> {
+    grants
+        .iter()
+        .find(|grant| grant.discord_role_id == role_id)
+        .map(|grant| grant.permissions.clone())
+        .unwrap_or_default()
+}
+
+fn rbac_audit_detail(
+    discord_role_id: &str,
+    previous_permissions: Vec<String>,
+    permissions: Vec<String>,
+) -> Value {
+    json!({
+        "discord_role_id": discord_role_id,
+        "previous_permission_count": previous_permissions.len(),
+        "previous_permissions": previous_permissions,
+        "permission_count": permissions.len(),
+        "permissions": permissions,
+    })
+}
+
 async fn require_active_target_guild_installation(
     state: &WebState,
     guild_id: &str,
@@ -7826,6 +8093,232 @@ async fn api_update_guild_settings(
         stored,
         true,
     )))
+}
+
+async fn api_target_guild_rbac(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(guild_id): Path<String>,
+) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let guild = get_guild_info(&state, &target_auth).await?;
+    let grants = load_guild_rbac_role_grants(&state, &target_auth.guild_id).await?;
+
+    Ok(Json(guild_rbac_management_response(
+        &target_auth.guild_id,
+        &guild,
+        grants,
+    )))
+}
+
+async fn api_guild_rbac(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    let guild = get_guild_info(&state, auth).await?;
+    let grants = load_guild_rbac_role_grants(&state, &auth.guild_id).await?;
+
+    Ok(Json(guild_rbac_management_response(
+        &auth.guild_id,
+        &guild,
+        grants,
+    )))
+}
+
+async fn api_update_target_guild_rbac_role(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path((guild_id, role_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    let role_id = normalize_rbac_role_id(&role_id)?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    update_guild_rbac_role_grant(
+        &state,
+        &target_auth,
+        &user_id,
+        &role_id,
+        &headers,
+        &body,
+        &target_guild_rbac_path(&target_auth.guild_id, &format!("/roles/{role_id}")),
+    )
+    .await
+    .map(Json)
+}
+
+async fn api_update_guild_rbac_role(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(role_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let role_id = normalize_rbac_role_id(&role_id)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    update_guild_rbac_role_grant(
+        &state,
+        auth,
+        &user_id,
+        &role_id,
+        &headers,
+        &body,
+        &format!("/api/guild/rbac/roles/{role_id}"),
+    )
+    .await
+    .map(Json)
+}
+
+async fn update_guild_rbac_role_grant(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    role_id: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+    path: &str,
+) -> Result<GuildRbacRoleGrantResponse, StatusCode> {
+    let guild = fetch_fresh_guild_info(state, auth).await?;
+    validate_rbac_role_exists(&auth.guild_id, role_id, &guild)?;
+    let previous_grants = load_guild_rbac_role_grants(state, &auth.guild_id).await?;
+    let request = parse_json_request_body::<GuildRbacRoleGrantUpdateRequest>(body)?;
+    let permissions = normalize_rbac_permission_names(&request.permissions)?;
+    if permissions.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    require_audit_event(
+        state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.to_owned()),
+            "guild_rbac_role_grant.update",
+            "guild_rbac_role_grant",
+            Some(role_id.to_owned()),
+            audit_request_metadata(headers, "PUT", path),
+            rbac_audit_detail(
+                role_id,
+                permissions_for_grant(&previous_grants, role_id),
+                permissions.clone(),
+            ),
+        ),
+    )
+    .await?;
+    let row = state
+        .db
+        .query_one(
+            UPSERT_GUILD_RBAC_ROLE_GRANT_SQL,
+            &[&auth.guild_id, &role_id, &user_id, &permissions],
+        )
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %auth.guild_id,
+                discord_role_id = %role_id,
+                "failed to update guild RBAC role grant"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let response = rbac_role_grant_response_from_row(&row);
+    Ok(response)
+}
+
+async fn api_reset_target_guild_rbac_role(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path((guild_id, role_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let guild_id = normalize_target_guild_id(&guild_id)?;
+    let role_id = normalize_rbac_role_id(&role_id)?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    reset_guild_rbac_role_grant(
+        &state,
+        &target_auth,
+        &user_id,
+        &role_id,
+        &headers,
+        &target_guild_rbac_path(&target_auth.guild_id, &format!("/roles/{role_id}")),
+    )
+    .await
+    .map(Json)
+}
+
+async fn api_reset_guild_rbac_role(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(role_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let role_id = normalize_rbac_role_id(&role_id)?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
+    reset_guild_rbac_role_grant(
+        &state,
+        auth,
+        &user_id,
+        &role_id,
+        &headers,
+        &format!("/api/guild/rbac/roles/{role_id}"),
+    )
+    .await
+    .map(Json)
+}
+
+async fn reset_guild_rbac_role_grant(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    role_id: &str,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<GuildRbacRoleGrantResponse, StatusCode> {
+    let guild = fetch_fresh_guild_info(state, auth).await?;
+    validate_rbac_role_exists(&auth.guild_id, role_id, &guild)?;
+    let previous_grants = load_guild_rbac_role_grants(state, &auth.guild_id).await?;
+    require_audit_event(
+        state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id.to_owned()),
+            "guild_rbac_role_grant.reset",
+            "guild_rbac_role_grant",
+            Some(role_id.to_owned()),
+            audit_request_metadata(headers, "DELETE", path),
+            rbac_audit_detail(
+                role_id,
+                permissions_for_grant(&previous_grants, role_id),
+                Vec::new(),
+            ),
+        ),
+    )
+    .await?;
+    let row = state
+        .db
+        .query_one(
+            RESET_GUILD_RBAC_ROLE_GRANT_SQL,
+            &[&auth.guild_id, &role_id, &user_id],
+        )
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                guild_id = %auth.guild_id,
+                discord_role_id = %role_id,
+                "failed to reset guild RBAC role grant"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let response = rbac_role_grant_response_from_row(&row);
+    Ok(response)
 }
 
 async fn api_list_domain_knowledge(
@@ -11259,8 +11752,8 @@ mod guild_api_tests {
         DiscordBotTokenValidationError, DiscordBotTokenValidationStage, DiscordGuild,
         DiscordGuildFull, DiscordRoleFull, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
         GUILD_CACHE_REFRESH_INFLIGHT_SECS, GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache,
-        GuildCacheState, GuildMeetingsQuery, GuildSettingsDefaults, GuildSettingsUpdateRequest,
-        JobCancelRequest, JobListQuery, JobRetryRequest,
+        GuildCacheState, GuildMeetingsQuery, GuildRbacRoleGrantResponse, GuildSettingsDefaults,
+        GuildSettingsUpdateRequest, JobCancelRequest, JobListQuery, JobRetryRequest,
         PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
         StoredGuildSettings, SummaryTemplateUpsertRequest, TranscriptFeedbackRequest,
         TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
@@ -11278,16 +11771,20 @@ mod guild_api_tests {
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
         normalize_guild_meetings_voice_channel_id, normalize_job_cancel_request,
         normalize_job_list_query, normalize_job_retry_request, normalize_person_alias_request,
+        normalize_rbac_permission_names, normalize_rbac_role_id,
         normalize_summary_template_request, normalize_target_guild_id,
         parse_admin_guild_plan_assignment_list_query, parse_job_cancel_request_body,
         parse_job_list_query, parse_job_retry_request_body, permission_cache_ttl,
+        permissions_for_grant, rbac_audit_detail, rbac_permission_catalog,
         system_admin_bearer_token, target_auth_config, target_guild_has_active_installation,
-        target_guild_settings_path, user_can_access_target_guild,
+        target_guild_rbac_path, target_guild_settings_path, user_can_access_target_guild,
         validate_authorized_guild_bot_token_update, validate_authorized_guild_settings_update,
         validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
-        validate_guild_settings_update, validate_resource_id, validate_summary_template_id,
+        validate_guild_settings_update, validate_rbac_role_exists, validate_resource_id,
+        validate_summary_template_id,
     };
     use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
+    use crate::domain::authz::RbacPermission;
     use crate::domain::feedback::{TranscriptFeedbackStatus, TranscriptFeedbackType};
     use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
     use crate::infrastructure::sql::{
@@ -11677,6 +12174,125 @@ mod guild_api_tests {
     }
 
     #[test]
+    fn guild_rbac_permission_catalog_tracks_domain_permissions() {
+        let catalog = rbac_permission_catalog();
+        let names = catalog
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            RbacPermission::ALL
+                .iter()
+                .map(|permission| permission.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(catalog.iter().all(|entry| !entry.label.is_empty()));
+        assert!(catalog.iter().all(|entry| !entry.description.is_empty()));
+    }
+
+    #[test]
+    fn guild_rbac_validation_normalizes_ids_and_permissions() {
+        assert_eq!(normalize_rbac_role_id(" role-1 "), Ok("role-1".to_owned()));
+        assert_eq!(
+            normalize_rbac_role_id("role/1"),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            normalize_rbac_permission_names(&[
+                "meeting:delete".to_owned(),
+                "recording:start".to_owned(),
+                "meeting:delete".to_owned(),
+            ]),
+            Ok(vec![
+                "recording:start".to_owned(),
+                "meeting:delete".to_owned(),
+            ])
+        );
+        assert_eq!(
+            normalize_rbac_permission_names(&["unknown".to_owned()]),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_rbac_role_validation_rejects_everyone_and_missing_roles() {
+        let guild = DiscordGuildFull {
+            owner_id: "owner".to_owned(),
+            roles: vec![
+                DiscordRoleFull {
+                    id: "guild-1".to_owned(),
+                    name: "@everyone".to_owned(),
+                    position: 0,
+                    color: 0,
+                    managed: false,
+                    hoist: false,
+                    permissions: 0,
+                },
+                DiscordRoleFull {
+                    id: "role-admin".to_owned(),
+                    name: "Admin".to_owned(),
+                    position: 10,
+                    color: 0,
+                    managed: false,
+                    hoist: true,
+                    permissions: ADMINISTRATOR,
+                },
+            ],
+        };
+
+        assert_eq!(
+            validate_rbac_role_exists("guild-1", "role-admin", &guild),
+            Ok(())
+        );
+        assert_eq!(
+            validate_rbac_role_exists("guild-1", "guild-1", &guild),
+            Err(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            validate_rbac_role_exists("guild-1", "role-missing", &guild),
+            Err(StatusCode::NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn guild_rbac_audit_detail_is_role_and_permission_scoped() {
+        let detail = rbac_audit_detail(
+            "role-1",
+            vec!["meeting:view".to_owned()],
+            vec!["meeting:view".to_owned(), "meeting:delete".to_owned()],
+        );
+
+        assert_eq!(detail["discord_role_id"], "role-1");
+        assert_eq!(detail["previous_permission_count"], 1);
+        assert_eq!(detail["permission_count"], 2);
+        assert!(detail.get("bot_token").is_none());
+    }
+
+    #[test]
+    fn guild_rbac_helpers_scope_target_paths_and_grant_lookup() {
+        let grants = vec![GuildRbacRoleGrantResponse {
+            discord_role_id: "role-1".to_owned(),
+            permissions: vec!["meeting:view".to_owned()],
+            created_actor_user_id: Some("admin-1".to_owned()),
+            updated_actor_user_id: Some("admin-1".to_owned()),
+            created_at: Some("2026-06-01T00:00:00Z".to_owned()),
+            updated_at: Some("2026-06-01T00:00:00Z".to_owned()),
+        }];
+
+        assert_eq!(
+            target_guild_rbac_path("guild-1", "/roles/role-1"),
+            "/api/guilds/guild-1/rbac/roles/role-1"
+        );
+        assert_eq!(
+            permissions_for_grant(&grants, "role-1"),
+            vec!["meeting:view".to_owned()]
+        );
+        assert!(permissions_for_grant(&grants, "role-2").is_empty());
+    }
+
+    #[test]
     fn guild_admin_permission_cache_key_includes_target_guild() {
         assert_ne!(
             guild_admin_permission_cache_key("guild-a", "user-1"),
@@ -11984,6 +12600,36 @@ mod guild_api_tests {
             cancel.find("require_current_user_is_guild_admin")
                 < cancel.find("parse_job_cancel_request_body")
         );
+
+        let rbac_update = source
+            .split_once("async fn update_guild_rbac_role_grant")
+            .expect("RBAC update helper should exist")
+            .1
+            .split_once("async fn api_reset_target_guild_rbac_role")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            rbac_update.find("validate_rbac_role_exists")
+                < rbac_update.find("parse_json_request_body")
+        );
+        assert!(
+            rbac_update.find("fetch_fresh_guild_info")
+                < rbac_update.find("validate_rbac_role_exists")
+        );
+        assert!(rbac_update.find("require_audit_event") < rbac_update.find(".query_one"));
+
+        let rbac_reset = source
+            .split_once("async fn reset_guild_rbac_role_grant")
+            .expect("RBAC reset helper should exist")
+            .1
+            .split_once("async fn api_list_domain_knowledge")
+            .expect("next handler should exist")
+            .0;
+        assert!(
+            rbac_reset.find("fetch_fresh_guild_info")
+                < rbac_reset.find("validate_rbac_role_exists")
+        );
+        assert!(rbac_reset.find("require_audit_event") < rbac_reset.find(".query_one"));
 
         let create_plan = source
             .split_once("async fn api_admin_create_plan")
@@ -12678,6 +13324,11 @@ mod guild_api_tests {
             owner_id: owner_id.to_owned(),
             roles: vec![DiscordRoleFull {
                 id: "guild".to_owned(),
+                name: "@everyone".to_owned(),
+                position: 0,
+                color: 0,
+                managed: false,
+                hoist: false,
                 permissions: 0,
             }],
         }
@@ -13336,10 +13987,20 @@ mod discord_channel_full_tests {
         let guild_roles = vec![
             DiscordRoleFull {
                 id: guild_id.to_owned(),
+                name: "@everyone".to_owned(),
+                position: 0,
+                color: 0,
+                managed: false,
+                hoist: false,
                 permissions: 0,
             },
             DiscordRoleFull {
                 id: "role-a".to_owned(),
+                name: "Role A".to_owned(),
+                position: 1,
+                color: 0,
+                managed: false,
+                hoist: false,
                 permissions: 0,
             },
         ];
