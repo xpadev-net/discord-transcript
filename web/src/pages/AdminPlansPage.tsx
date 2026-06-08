@@ -81,6 +81,10 @@ interface AssignmentFilters {
   limit: string;
 }
 
+interface RefreshAdminOptions {
+  reportError?: boolean;
+}
+
 const planKinds: AdminPlanKind[] = ["default", "beta", "custom"];
 const planStatuses: AdminPlanStatus[] = ["active", "archived"];
 const quotaDimensions: AdminQuotaDimension[] = [
@@ -279,6 +283,14 @@ function isArchiveConfirmKey(action: string, id: string | null): string {
   return `${action}:${id ?? "new"}`;
 }
 
+function upsertById<T extends { id: string }>(items: T[], item: T): T[] {
+  const index = items.findIndex((current) => current.id === item.id);
+  if (index === -1) {
+    return [item, ...items];
+  }
+  return items.map((current) => (current.id === item.id ? item : current));
+}
+
 function canRunConfirmedAction(armedAt: number | null): boolean {
   return armedAt !== null && Date.now() - armedAt >= 700;
 }
@@ -334,7 +346,8 @@ export function AdminPlansPage() {
       token: string,
       signal?: AbortSignal,
       filters: AssignmentFilters = emptyAssignmentFilters(),
-    ) => {
+      refreshOptions: RefreshAdminOptions = {},
+    ): Promise<boolean> => {
       const requestId = refreshRequestIdRef.current + 1;
       refreshRequestIdRef.current = requestId;
       const canApply = () =>
@@ -357,7 +370,7 @@ export function AdminPlansPage() {
             }),
           ]);
         if (!canApply()) {
-          return;
+          return false;
         }
         setPlans(planList);
         setDefaultPlan(defaultResult);
@@ -373,10 +386,12 @@ export function AdminPlansPage() {
           ...current,
           plan_id: current.plan_id || planList[0]?.id || "",
         }));
+        return true;
       } catch (err) {
-        if (canApply()) {
+        if (canApply() && refreshOptions.reportError !== false) {
           setError(adminErrorMessage(err, "管理情報の読み込みに失敗しました"));
         }
+        return false;
       } finally {
         if (canApply()) {
           setActiveOperation(null);
@@ -385,6 +400,44 @@ export function AdminPlansPage() {
     },
     [],
   );
+
+  function applyPlanSnapshot(plan: AdminPlan) {
+    setPlans((current) => upsertById(current, plan));
+    setDefaultPlan((current) => (plan.code === "default" ? plan : current));
+    setBetaPlan((current) => (plan.code === "beta" ? plan : current));
+    setSelectedPlanId(plan.id);
+    setPlanDraft(planDraftFromPlan(plan));
+  }
+
+  function applyQuotaSnapshot(quota: AdminPlanQuota) {
+    setPlans((current) =>
+      current.map((plan) =>
+        plan.id === quota.plan_id
+          ? { ...plan, quotas: upsertById(plan.quotas, quota) }
+          : plan,
+      ),
+    );
+    setQuotaDraft(quotaDraftFromQuota(quota));
+  }
+
+  function removeQuotaSnapshot(quota: AdminPlanQuota) {
+    setPlans((current) =>
+      current.map((plan) =>
+        plan.id === quota.plan_id
+          ? {
+              ...plan,
+              quotas: plan.quotas.filter((item) => item.id !== quota.id),
+            }
+          : plan,
+      ),
+    );
+    setQuotaDraft(emptyQuotaDraft());
+  }
+
+  function applyAssignmentSnapshot(assignment: AdminGuildPlanAssignment) {
+    setAssignments((current) => upsertById(current, assignment));
+    setAssignmentDraft(assignmentDraftFromAssignment(assignment));
+  }
 
   useEffect(() => {
     document.title = "プラン管理";
@@ -485,12 +538,20 @@ export function AdminPlansPage() {
             bearerToken: adminToken,
           })
         : await createAdminPlan(request, { bearerToken: adminToken });
-      await refreshAdminData(adminToken, undefined, assignmentFilters);
-      setSelectedPlanId(updated.id);
+      applyPlanSnapshot(updated);
+      const refreshed = await refreshAdminData(
+        adminToken,
+        undefined,
+        assignmentFilters,
+        { reportError: false },
+      );
+      const reloadWarning = refreshed
+        ? ""
+        : " ただし一覧の再読み込みに失敗しました。再読み込みしてください。";
       setMessage(
         planDraft.id
-          ? "プランを保存しました。監査ログに plan.update が記録されます。"
-          : "プランを作成しました。監査ログに plan.create が記録されます。",
+          ? `プランを保存しました。監査ログに plan.update が記録されます。${reloadWarning}`
+          : `プランを作成しました。監査ログに plan.create が記録されます。${reloadWarning}`,
       );
     } catch (err) {
       setError(adminErrorMessage(err, "プランの保存に失敗しました"));
@@ -522,10 +583,18 @@ export function AdminPlansPage() {
       const updated = await archiveAdminPlan(planDraft.id, {
         bearerToken: adminToken,
       });
-      await refreshAdminData(adminToken, undefined, assignmentFilters);
-      setSelectedPlanId(updated.id);
+      applyPlanSnapshot(updated);
+      const refreshed = await refreshAdminData(
+        adminToken,
+        undefined,
+        assignmentFilters,
+        { reportError: false },
+      );
+      const reloadWarning = refreshed
+        ? ""
+        : " ただし一覧の再読み込みに失敗しました。再読み込みしてください。";
       setMessage(
-        "プランをアーカイブしました。監査ログに plan.archive が記録されます。",
+        `プランをアーカイブしました。監査ログに plan.archive が記録されます。${reloadWarning}`,
       );
     } catch (err) {
       setError(adminErrorMessage(err, "プランのアーカイブに失敗しました"));
@@ -561,12 +630,20 @@ export function AdminPlansPage() {
         : await createAdminPlanQuota(selectedPlan.id, request, {
             bearerToken: adminToken,
           });
-      await refreshAdminData(adminToken, undefined, assignmentFilters);
-      setQuotaDraft(quotaDraftFromQuota(updated));
+      applyQuotaSnapshot(updated);
+      const refreshed = await refreshAdminData(
+        adminToken,
+        undefined,
+        assignmentFilters,
+        { reportError: false },
+      );
+      const reloadWarning = refreshed
+        ? ""
+        : " ただし一覧の再読み込みに失敗しました。再読み込みしてください。";
       setMessage(
         quotaDraft.id
-          ? "クォータを保存しました。監査ログに plan_quota.update が記録されます。"
-          : "クォータを追加しました。監査ログに plan_quota.create が記録されます。",
+          ? `クォータを保存しました。監査ログに plan_quota.update が記録されます。${reloadWarning}`
+          : `クォータを追加しました。監査ログに plan_quota.create が記録されます。${reloadWarning}`,
       );
     } catch (err) {
       setError(adminErrorMessage(err, "クォータの保存に失敗しました"));
@@ -595,11 +672,21 @@ export function AdminPlansPage() {
     setError(null);
     setMessage(null);
     try {
-      await deleteAdminPlanQuota(quotaDraft.id, { bearerToken: adminToken });
-      await refreshAdminData(adminToken, undefined, assignmentFilters);
-      setQuotaDraft(emptyQuotaDraft());
+      const deleted = await deleteAdminPlanQuota(quotaDraft.id, {
+        bearerToken: adminToken,
+      });
+      removeQuotaSnapshot(deleted);
+      const refreshed = await refreshAdminData(
+        adminToken,
+        undefined,
+        assignmentFilters,
+        { reportError: false },
+      );
+      const reloadWarning = refreshed
+        ? ""
+        : " ただし一覧の再読み込みに失敗しました。再読み込みしてください。";
       setMessage(
-        "クォータを削除しました。監査ログに plan_quota.delete が記録されます。",
+        `クォータを削除しました。監査ログに plan_quota.delete が記録されます。${reloadWarning}`,
       );
     } catch (err) {
       setError(adminErrorMessage(err, "クォータの削除に失敗しました"));
@@ -670,12 +757,20 @@ export function AdminPlansPage() {
             request as AdminGuildPlanAssignmentCreateRequest,
             { bearerToken: adminToken },
           );
-      await refreshAdminData(adminToken, undefined, assignmentFilters);
-      setAssignmentDraft(assignmentDraftFromAssignment(updated));
+      applyAssignmentSnapshot(updated);
+      const refreshed = await refreshAdminData(
+        adminToken,
+        undefined,
+        assignmentFilters,
+        { reportError: false },
+      );
+      const reloadWarning = refreshed
+        ? ""
+        : " ただし一覧の再読み込みに失敗しました。再読み込みしてください。";
       setMessage(
         assignmentDraft.id
-          ? "ギルド割り当てを保存しました。監査ログに guild_plan_assignment.update が記録されます。"
-          : "ギルド割り当てを作成しました。監査ログに guild_plan_assignment.create が記録されます。",
+          ? `ギルド割り当てを保存しました。監査ログに guild_plan_assignment.update が記録されます。${reloadWarning}`
+          : `ギルド割り当てを作成しました。監査ログに guild_plan_assignment.create が記録されます。${reloadWarning}`,
       );
     } catch (err) {
       setError(adminErrorMessage(err, "ギルド割り当ての保存に失敗しました"));
@@ -710,10 +805,18 @@ export function AdminPlansPage() {
           bearerToken: adminToken,
         },
       );
-      await refreshAdminData(adminToken, undefined, assignmentFilters);
-      setAssignmentDraft(assignmentDraftFromAssignment(updated));
+      applyAssignmentSnapshot(updated);
+      const refreshed = await refreshAdminData(
+        adminToken,
+        undefined,
+        assignmentFilters,
+        { reportError: false },
+      );
+      const reloadWarning = refreshed
+        ? ""
+        : " ただし一覧の再読み込みに失敗しました。再読み込みしてください。";
       setMessage(
-        "ギルド割り当てをアーカイブしました。監査ログに guild_plan_assignment.archive が記録されます。",
+        `ギルド割り当てをアーカイブしました。監査ログに guild_plan_assignment.archive が記録されます。${reloadWarning}`,
       );
     } catch (err) {
       setError(
@@ -1504,12 +1607,14 @@ function validateAssignmentDraft(draft: AssignmentDraft): string | null {
   if (Number.isNaN(new Date(draft.valid_from).getTime())) {
     return "開始日時を確認してください";
   }
-  if (
-    draft.valid_until.trim() &&
-    new Date(draft.valid_until).getTime() <=
-      new Date(draft.valid_from).getTime()
-  ) {
-    return "終了日時は開始日時より後にしてください";
+  if (draft.valid_until.trim()) {
+    const untilMs = new Date(draft.valid_until).getTime();
+    if (Number.isNaN(untilMs)) {
+      return "終了日時を確認してください";
+    }
+    if (untilMs <= new Date(draft.valid_from).getTime()) {
+      return "終了日時は開始日時より後にしてください";
+    }
   }
   if (draft.source === "admin" && !draft.assigned_by_user_id.trim()) {
     return "ソースが Admin の場合は担当 User ID が必要です";
