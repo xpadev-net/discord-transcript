@@ -68,6 +68,7 @@ BEGIN
         SELECT 1
         FROM pg_trigger
         WHERE tgname = 'trg_guild_rbac_role_bindings_updated_at'
+          AND tgrelid = 'guild_rbac_role_bindings'::regclass
     ) THEN
         CREATE TRIGGER trg_guild_rbac_role_bindings_updated_at
         BEFORE UPDATE ON guild_rbac_role_bindings
@@ -79,6 +80,7 @@ BEGIN
         SELECT 1
         FROM pg_trigger
         WHERE tgname = 'trg_guild_rbac_permissions_updated_at'
+          AND tgrelid = 'guild_rbac_permissions'::regclass
     ) THEN
         CREATE TRIGGER trg_guild_rbac_permissions_updated_at
         BEFORE UPDATE ON guild_rbac_permissions
