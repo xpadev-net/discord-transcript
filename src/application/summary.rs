@@ -989,11 +989,16 @@ impl ContextRelevanceEvidence {
     }
 
     fn matches_person_alias(&self, alias: &PersonAlias) -> bool {
-        alias.source_meeting_id.as_deref() == Some(self.meeting_id.as_str())
-            || alias
-                .discord_user_id
-                .as_ref()
-                .is_some_and(|user_id| self.speaker_ids.contains(user_id))
+        if alias.source_meeting_id.as_deref() == Some(self.meeting_id.as_str()) {
+            return true;
+        }
+        if alias.source_meeting_id.is_some() {
+            return false;
+        }
+        alias
+            .discord_user_id
+            .as_ref()
+            .is_some_and(|user_id| self.speaker_ids.contains(user_id))
             || self.contains_phrase(&alias.canonical_name)
             || self.contains_phrase(&alias.alias)
     }

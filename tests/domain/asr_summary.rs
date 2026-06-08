@@ -1385,6 +1385,61 @@ fn materialized_summary_context_rejects_cross_meeting_ai_memory_for_same_speaker
 }
 
 #[test]
+fn materialized_summary_context_rejects_cross_meeting_alias_for_same_speaker_name() {
+    let temp = unique_workspace("context_private_alias_same_speaker", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Standup".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut alias = person_alias(
+        "alias-private-same-speaker",
+        "Alice Example",
+        "PRIVATE_SAME_SPEAKER_ALIAS",
+        updated_at,
+    );
+    alias.discord_user_id = None;
+    alias.source_meeting_id = Some("m-private".to_owned());
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "123".to_owned(),
+            username: Some("alice_dev".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: Some("Alice Example".to_owned()),
+        }],
+        person_aliases: vec![alias],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("[0-1000] Alice Example: public standup covered release health"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.person_aliases_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_person_aliases_path()).expect("aliases");
+    assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_ALIAS"));
+    assert!(!rendered.contains("alias-private-same-speaker"));
+}
+
+#[test]
 fn load_summary_context_manifest_accepts_legacy_missing_voice_channel_name() {
     let temp = unique_workspace("legacy_context_manifest_voice_name", "m1");
     let workspace = temp.workspace().clone();
