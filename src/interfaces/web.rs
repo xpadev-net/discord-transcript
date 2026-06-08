@@ -3272,7 +3272,6 @@ struct AdminRetentionCleanupPreviewResponse {
     transcript_workspace_count: usize,
     summary_workspace_count: usize,
     estimated_freed_bytes: AdminRetentionStorageUsageResponse,
-    errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -6860,7 +6859,6 @@ async fn build_admin_retention_cleanup_preview(
         transcript_workspace_count: plan.transcript_workspaces.len(),
         summary_workspace_count: plan.summary_workspaces.len(),
         estimated_freed_bytes: admin_retention_storage_response(filesystem_usage),
-        errors: plan.errors,
     })
 }
 

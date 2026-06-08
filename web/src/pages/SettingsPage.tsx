@@ -1429,7 +1429,7 @@ export function SettingsPage({
         return;
       }
       setRetentionCleanupPreview(result.preview);
-      setRetentionCleanupPreviewKey(requestKey);
+      setRetentionCleanupPreviewKey(null);
       setRetentionCleanupRun(result);
       let refreshWarning = false;
       try {
@@ -1508,7 +1508,6 @@ export function SettingsPage({
   async function handleRetentionMeetingDelete() {
     const token = retentionDraft.token.trim();
     const meetingId = retentionDraft.meeting_id.trim();
-    const reason = retentionDraft.reason.trim();
     const requestGuildKey = currentGuildKeyRef.current;
     if (
       !token ||
@@ -1532,7 +1531,7 @@ export function SettingsPage({
         return;
       }
       setRetentionMeetingPreview(result.preview);
-      setRetentionMeetingPreviewReason(reason);
+      setRetentionMeetingPreviewReason(null);
       setRetentionMeetingDelete(result);
       let refreshWarning = false;
       try {

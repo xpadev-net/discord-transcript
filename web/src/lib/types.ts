@@ -254,7 +254,6 @@ export interface AdminRetentionCleanupPreview {
   transcript_workspace_count: number;
   summary_workspace_count: number;
   estimated_freed_bytes: AdminRetentionStorageUsage;
-  errors: string[];
 }
 
 export interface AdminRetentionCleanupReport {
