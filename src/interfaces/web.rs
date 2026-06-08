@@ -96,6 +96,11 @@ use crate::infrastructure::sql::{
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
+use crate::infrastructure::workspace::{
+    DEBUG_CORRECTION_PROMPT_FILENAME, DEBUG_DIR, DEBUG_MIXDOWN_WHISPER_FILENAME,
+    DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME, DEBUG_SUMMARY_PROMPT_FILENAME, DEBUG_WHISPER_DIR,
+    MeetingWorkspacePaths,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
@@ -165,6 +170,7 @@ const USER_GUILDS_CACHE_TTL_SECS: u64 = 60;
 const OAUTH_ACCESS_TOKEN_DEFAULT_TTL_SECS: u64 = 3600;
 const OAUTH_ACCESS_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
 const DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS: i64 = 15 * 60;
+const AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS: u128 = 100;
 
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
@@ -480,12 +486,19 @@ async fn persist_audit_event(
 }
 
 fn spawn_audit_retention_cleanup(state: &WebState) {
+    if !should_sample_audit_retention_cleanup(Uuid::new_v4().as_u128()) {
+        return;
+    }
     let state = state.clone();
     tokio::spawn(async move {
         if let Err(err) = state.db.execute(PRUNE_STALE_AUDIT_EVENTS_SQL, &[]).await {
             warn!(error = %err, "failed to prune stale audit events");
         }
     });
+}
+
+fn should_sample_audit_retention_cleanup(sample: u128) -> bool {
+    sample.is_multiple_of(AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS)
 }
 
 async fn record_audit_event(state: &WebState, event: AuditEvent) -> bool {
@@ -11488,7 +11501,7 @@ async fn api_debug_manifest(
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<DebugArtifactEntry>>, StatusCode> {
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
-    let raw_debug_allowed = verify_raw_debug_artifact_access(&state, &access, &user_id)
+    let raw_debug_allowed = verify_raw_debug_artifact_access(&state, &user_id)
         .await
         .unwrap_or(false);
 
@@ -11513,11 +11526,18 @@ async fn api_debug_manifest(
     let mixdown_primary = workspace.mixdown_path();
     let mixdown_legacy = legacy_dir.join("mixdown.wav");
     let mixdown_whisper_path = workspace.mixdown_whisper_response_path();
+    let mixdown_whisper_legacy =
+        legacy_debug_whisper_dir(&workspace).join(DEBUG_MIXDOWN_WHISPER_FILENAME);
     let pre_correction_path = workspace.pre_correction_transcript_path();
+    let pre_correction_legacy =
+        legacy_debug_dir(&workspace).join(DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME);
     let masked_path = workspace.masked_transcript_path();
     let manifest_path = workspace.transcript_manifest_path();
     let correction_prompt_path = workspace.correction_prompt_path();
+    let correction_prompt_legacy =
+        legacy_debug_dir(&workspace).join(DEBUG_CORRECTION_PROMPT_FILENAME);
     let summary_prompt_path = workspace.summary_prompt_path();
+    let summary_prompt_legacy = legacy_debug_dir(&workspace).join(DEBUG_SUMMARY_PROMPT_FILENAME);
 
     let summary_query_params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&meeting_id];
     let summary_query = state.db.query_opt(
@@ -11529,21 +11549,29 @@ async fn api_debug_manifest(
         mixdown_primary_exists,
         mixdown_legacy_exists,
         mixdown_whisper_exists,
+        mixdown_whisper_legacy_exists,
         pre_correction_exists,
+        pre_correction_legacy_exists,
         masked_exists,
         manifest_exists,
         correction_prompt_exists,
+        correction_prompt_legacy_exists,
         summary_prompt_exists,
+        summary_prompt_legacy_exists,
         summary_row,
     ) = tokio::join!(
         tokio::fs::try_exists(&mixdown_primary),
         tokio::fs::try_exists(&mixdown_legacy),
         tokio::fs::try_exists(&mixdown_whisper_path),
+        tokio::fs::try_exists(&mixdown_whisper_legacy),
         tokio::fs::try_exists(&pre_correction_path),
+        tokio::fs::try_exists(&pre_correction_legacy),
         tokio::fs::try_exists(&masked_path),
         tokio::fs::try_exists(&manifest_path),
         tokio::fs::try_exists(&correction_prompt_path),
+        tokio::fs::try_exists(&correction_prompt_legacy),
         tokio::fs::try_exists(&summary_prompt_path),
+        tokio::fs::try_exists(&summary_prompt_legacy),
         summary_query,
     );
 
@@ -11572,18 +11600,21 @@ async fn api_debug_manifest(
             let primary_speaker_path = primary_speakers_dir.join(&speaker_filename);
             let legacy_speaker_path = legacy_speakers_dir.join(&speaker_filename);
             let whisper_path = workspace.whisper_response_path_for_sanitized(&safe_speaker);
+            let whisper_legacy_path =
+                legacy_debug_whisper_dir(&workspace).join(format!("{safe_speaker}.json"));
             async move {
-                let (primary_exists, legacy_exists, whisper_exists) = tokio::join!(
+                let (primary_exists, legacy_exists, whisper_exists, whisper_legacy_exists) = tokio::join!(
                     tokio::fs::try_exists(&primary_speaker_path),
                     tokio::fs::try_exists(&legacy_speaker_path),
                     tokio::fs::try_exists(&whisper_path),
+                    tokio::fs::try_exists(&whisper_legacy_path),
                 );
                 (
                     safe_speaker,
                     label_base,
                     speaker_filename,
                     primary_exists.unwrap_or(false) || legacy_exists.unwrap_or(false),
-                    whisper_exists.unwrap_or(false),
+                    whisper_exists.unwrap_or(false) || whisper_legacy_exists.unwrap_or(false),
                 )
             }
         })
@@ -11642,7 +11673,8 @@ async fn api_debug_manifest(
             id: StaticDebugArtifactKind::WhisperMixdown.as_id().to_owned(),
             label: "Whisperレスポンス (mixdown)".to_owned(),
             category: "whisper",
-            available: mixdown_whisper_exists.unwrap_or(false),
+            available: mixdown_whisper_exists.unwrap_or(false)
+                || mixdown_whisper_legacy_exists.unwrap_or(false),
             download_url: format!(
                 "{base_url}/{}",
                 StaticDebugArtifactKind::WhisperMixdown.as_id()
@@ -11659,7 +11691,8 @@ async fn api_debug_manifest(
                 .to_owned(),
             label: "Transcript (補正前)".to_owned(),
             category: "transcript",
-            available: pre_correction_exists.unwrap_or(false),
+            available: pre_correction_exists.unwrap_or(false)
+                || pre_correction_legacy_exists.unwrap_or(false),
             download_url: format!(
                 "{base_url}/{}",
                 StaticDebugArtifactKind::TranscriptPreCorrection.as_id()
@@ -11704,7 +11737,8 @@ async fn api_debug_manifest(
             id: StaticDebugArtifactKind::CorrectionPrompt.as_id().to_owned(),
             label: "Transcript補正プロンプト".to_owned(),
             category: "prompt",
-            available: correction_prompt_exists.unwrap_or(false),
+            available: correction_prompt_exists.unwrap_or(false)
+                || correction_prompt_legacy_exists.unwrap_or(false),
             download_url: format!(
                 "{base_url}/{}",
                 StaticDebugArtifactKind::CorrectionPrompt.as_id()
@@ -11717,7 +11751,8 @@ async fn api_debug_manifest(
             id: StaticDebugArtifactKind::SummaryPrompt.as_id().to_owned(),
             label: "要約プロンプト".to_owned(),
             category: "prompt",
-            available: summary_prompt_exists.unwrap_or(false),
+            available: summary_prompt_exists.unwrap_or(false)
+                || summary_prompt_legacy_exists.unwrap_or(false),
             download_url: format!(
                 "{base_url}/{}",
                 StaticDebugArtifactKind::SummaryPrompt.as_id()
@@ -11751,7 +11786,7 @@ async fn api_debug_file(
 ) -> Result<Response, StatusCode> {
     let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
     if debug_artifact_requires_admin(&artifact_id) {
-        let allowed = verify_raw_debug_artifact_access(&state, &access, &user_id).await?;
+        let allowed = verify_raw_debug_artifact_access(&state, &user_id).await?;
         authorize_debug_artifact_download(allowed)?;
     }
 
@@ -11846,7 +11881,6 @@ async fn api_debug_file(
 
 async fn verify_raw_debug_artifact_access(
     state: &WebState,
-    _access: &MeetingAccess,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
@@ -11922,10 +11956,9 @@ async fn resolve_debug_artifact(
                 });
             }
             "whisper" => {
-                // Unlike speaker_audio there is no legacy fallback, so we
-                // skip the explicit existence check here and let
-                // stream_debug_file's metadata() call surface 404s.
-                let path = workspace.whisper_response_path_for_sanitized(&safe);
+                let primary = workspace.whisper_response_path_for_sanitized(&safe);
+                let legacy = legacy_debug_whisper_dir(&workspace).join(format!("{safe}.json"));
+                let path = existing_debug_path(primary, legacy).await?;
                 return Ok(DebugArtifactSource::File {
                     path,
                     filename: format!("whisper_{safe}.json"),
@@ -11954,16 +11987,25 @@ async fn resolve_debug_artifact(
                 content_type: "audio/wav",
             }
         }
-        StaticDebugArtifactKind::WhisperMixdown => DebugArtifactSource::File {
-            path: workspace.mixdown_whisper_response_path(),
-            filename: "whisper_mixdown.json".to_owned(),
-            content_type: "application/json",
-        },
-        StaticDebugArtifactKind::TranscriptPreCorrection => DebugArtifactSource::File {
-            path: workspace.pre_correction_transcript_path(),
-            filename: "transcript_pre_correction.md".to_owned(),
-            content_type: "text/markdown",
-        },
+        StaticDebugArtifactKind::WhisperMixdown => {
+            let primary = workspace.mixdown_whisper_response_path();
+            let legacy = legacy_debug_whisper_dir(&workspace).join(DEBUG_MIXDOWN_WHISPER_FILENAME);
+            DebugArtifactSource::File {
+                path: existing_debug_path(primary, legacy).await?,
+                filename: "whisper_mixdown.json".to_owned(),
+                content_type: "application/json",
+            }
+        }
+        StaticDebugArtifactKind::TranscriptPreCorrection => {
+            let primary = workspace.pre_correction_transcript_path();
+            let legacy =
+                legacy_debug_dir(&workspace).join(DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME);
+            DebugArtifactSource::File {
+                path: existing_debug_path(primary, legacy).await?,
+                filename: "transcript_pre_correction.md".to_owned(),
+                content_type: "text/markdown",
+            }
+        }
         StaticDebugArtifactKind::TranscriptPostCorrection => DebugArtifactSource::File {
             path: workspace.masked_transcript_path(),
             filename: "transcript_masked.md".to_owned(),
@@ -11974,16 +12016,24 @@ async fn resolve_debug_artifact(
             filename: "manifest.json".to_owned(),
             content_type: "application/json",
         },
-        StaticDebugArtifactKind::CorrectionPrompt => DebugArtifactSource::File {
-            path: workspace.correction_prompt_path(),
-            filename: "correction_prompt.txt".to_owned(),
-            content_type: "text/plain",
-        },
-        StaticDebugArtifactKind::SummaryPrompt => DebugArtifactSource::File {
-            path: workspace.summary_prompt_path(),
-            filename: "summary_prompt.txt".to_owned(),
-            content_type: "text/plain",
-        },
+        StaticDebugArtifactKind::CorrectionPrompt => {
+            let primary = workspace.correction_prompt_path();
+            let legacy = legacy_debug_dir(&workspace).join(DEBUG_CORRECTION_PROMPT_FILENAME);
+            DebugArtifactSource::File {
+                path: existing_debug_path(primary, legacy).await?,
+                filename: "correction_prompt.txt".to_owned(),
+                content_type: "text/plain",
+            }
+        }
+        StaticDebugArtifactKind::SummaryPrompt => {
+            let primary = workspace.summary_prompt_path();
+            let legacy = legacy_debug_dir(&workspace).join(DEBUG_SUMMARY_PROMPT_FILENAME);
+            DebugArtifactSource::File {
+                path: existing_debug_path(primary, legacy).await?,
+                filename: "summary_prompt.txt".to_owned(),
+                content_type: "text/plain",
+            }
+        }
         StaticDebugArtifactKind::SummaryOutput => {
             let summary_row = state
                 .db
@@ -12003,6 +12053,27 @@ async fn resolve_debug_artifact(
             }
         }
     })
+}
+
+fn legacy_debug_dir(workspace: &MeetingWorkspacePaths) -> std::path::PathBuf {
+    workspace.root().join(DEBUG_DIR)
+}
+
+fn legacy_debug_whisper_dir(workspace: &MeetingWorkspacePaths) -> std::path::PathBuf {
+    legacy_debug_dir(workspace).join(DEBUG_WHISPER_DIR)
+}
+
+async fn existing_debug_path(
+    primary: std::path::PathBuf,
+    legacy: std::path::PathBuf,
+) -> Result<std::path::PathBuf, StatusCode> {
+    if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+        Ok(primary)
+    } else if tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
+        Ok(legacy)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 async fn stream_debug_file(
@@ -14792,9 +14863,10 @@ mod discord_channel_full_tests {
         DiscordRoleFull, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS,
         PermissionCache, VIEW_CHANNEL, authorize_debug_artifact_download,
         build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
-        debug_download_dedupe_bucket, debug_download_usage_event_id,
+        debug_download_dedupe_bucket, debug_download_usage_event_id, existing_debug_path,
         guild_meeting_channel_visible_after_row, meeting_access_from_row,
-        raw_debug_artifact_permission, verify_meeting_access_after_row,
+        raw_debug_artifact_permission, should_sample_audit_retention_cleanup,
+        verify_meeting_access_after_row,
     };
     use crate::domain::authz::RbacPermission;
     use axum::http::StatusCode;
@@ -15214,6 +15286,54 @@ mod discord_channel_full_tests {
                 next_bucket
             )
         );
+    }
+
+    #[test]
+    fn audit_retention_cleanup_sampling_is_one_percent() {
+        assert!(should_sample_audit_retention_cleanup(0));
+        assert!(should_sample_audit_retention_cleanup(100));
+        assert!(!should_sample_audit_retention_cleanup(1));
+        assert!(!should_sample_audit_retention_cleanup(99));
+    }
+
+    #[tokio::test]
+    async fn debug_path_resolution_prefers_isolated_path_and_falls_back_to_legacy() {
+        let unique = Utc::now()
+            .timestamp_nanos_opt()
+            .expect("timestamp should fit");
+        let base = std::env::temp_dir().join(format!("debug_path_fallback_{unique}"));
+        let primary = base.join("debug-artifacts").join("summary_prompt.txt");
+        let legacy = base
+            .join("workspaces")
+            .join("debug")
+            .join("summary_prompt.txt");
+
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("create legacy");
+        std::fs::write(&legacy, b"legacy").expect("write legacy");
+
+        assert_eq!(
+            existing_debug_path(primary.clone(), legacy.clone()).await,
+            Ok(legacy.clone())
+        );
+
+        std::fs::create_dir_all(primary.parent().expect("primary parent")).expect("create primary");
+        std::fs::write(&primary, b"primary").expect("write primary");
+
+        assert_eq!(
+            existing_debug_path(primary.clone(), legacy.clone()).await,
+            Ok(primary.clone())
+        );
+
+        assert_eq!(
+            existing_debug_path(
+                base.join("debug-artifacts").join("missing.txt"),
+                base.join("workspaces").join("debug").join("missing.txt")
+            )
+            .await,
+            Err(StatusCode::NOT_FOUND)
+        );
+
+        std::fs::remove_dir_all(&base).expect("remove temp dir");
     }
 
     #[test]

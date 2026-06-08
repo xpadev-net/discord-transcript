@@ -1592,14 +1592,9 @@ ON CONFLICT (id) DO NOTHING
 "#;
 
 pub const PRUNE_STALE_AUDIT_EVENTS_SQL: &str = r#"
-WITH audit_retention_sample AS (
-    SELECT random() < 0.01 AS run_cleanup
-),
-stale_audit_events AS (
+WITH stale_audit_events AS (
     SELECT events.ctid
-    FROM audit_retention_sample sample
-    JOIN audit_events events
-      ON sample.run_cleanup
+    FROM audit_events events
     WHERE events.occurred_at < NOW() - INTERVAL '180 days'
     ORDER BY events.occurred_at ASC
     LIMIT 500
