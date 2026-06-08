@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 pub const WORKSPACES_ROOT_DIR: &str = "workspaces";
+pub const DEBUG_ARTIFACTS_ROOT_DIR: &str = "debug-artifacts";
 pub const MASKED_TRANSCRIPT_FILENAME: &str = "transcript_masked.md";
 pub const TRANSCRIPT_MANIFEST_FILENAME: &str = "manifest.json";
 pub const SSRC_MAPPING_FILENAME: &str = "ssrc_mapping.json";
@@ -44,6 +45,7 @@ pub struct MeetingWorkspaceLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingWorkspacePaths {
     root: PathBuf,
+    debug_root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +167,10 @@ impl MeetingWorkspaceLayout {
         self.base_dir.join(WORKSPACES_ROOT_DIR)
     }
 
+    pub fn debug_artifacts_root(&self) -> PathBuf {
+        self.base_dir.join(DEBUG_ARTIFACTS_ROOT_DIR)
+    }
+
     pub fn for_meeting(
         &self,
         guild_id: &str,
@@ -176,10 +182,15 @@ impl MeetingWorkspaceLayout {
         let meeting = sanitize_path_component(meeting_id);
         let root = self
             .workspace_root()
+            .join(&guild)
+            .join(&channel)
+            .join(&meeting);
+        let debug_root = self
+            .debug_artifacts_root()
             .join(guild)
             .join(channel)
             .join(meeting);
-        MeetingWorkspacePaths { root }
+        MeetingWorkspacePaths { root, debug_root }
     }
 
     pub fn legacy_meeting_dir(&self, meeting_id: &str) -> PathBuf {
@@ -190,6 +201,10 @@ impl MeetingWorkspaceLayout {
 impl MeetingWorkspacePaths {
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn debug_root(&self) -> &Path {
+        &self.debug_root
     }
 
     pub fn audio_dir(&self) -> PathBuf {
@@ -229,7 +244,7 @@ impl MeetingWorkspacePaths {
     }
 
     pub fn debug_dir(&self) -> PathBuf {
-        self.root.join(DEBUG_DIR)
+        self.debug_root.join(DEBUG_DIR)
     }
 
     pub fn whisper_debug_dir(&self) -> PathBuf {

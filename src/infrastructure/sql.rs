@@ -1558,23 +1558,70 @@ WITH active_tenant AS (
       AND t.status = 'active'
     ORDER BY tg.effective_at DESC
     LIMIT 1
+),
+stale_audit_events AS (
+    SELECT ctid
+    FROM audit_events
+    WHERE occurred_at < NOW() - INTERVAL '180 days'
+    ORDER BY occurred_at ASC
+    LIMIT 500
+),
+audit_retention AS (
+    DELETE FROM audit_events events
+    USING stale_audit_events stale
+    WHERE events.ctid = stale.ctid
+    RETURNING 1
+),
+retention_batch AS (
+    SELECT COUNT(*) AS deleted_count
+    FROM audit_retention
+),
+candidate AS (
+    SELECT
+        $1 AS id,
+        COALESCE(NULLIF($2, ''), (SELECT tenant_id FROM active_tenant)) AS tenant_id,
+        NULLIF($3, '') AS guild_id,
+        NULLIF($4, '') AS actor_user_id,
+        $5 AS action,
+        $6 AS resource_type,
+        NULLIF($7, '') AS resource_id,
+        COALESCE(NULLIF($8, '')::jsonb, '{}'::jsonb) AS request_metadata,
+        COALESCE(NULLIF($9, '')::jsonb, '{}'::jsonb) AS detail_json,
+        COALESCE(NULLIF($10, '')::timestamptz, NOW()) AS occurred_at
+    FROM retention_batch
 )
 INSERT INTO audit_events (
     id, tenant_id, guild_id, actor_user_id, action, resource_type, resource_id,
     request_metadata, detail_json, occurred_at, created_at
-) VALUES (
-    $1,
-    COALESCE(NULLIF($2, ''), (SELECT tenant_id FROM active_tenant)),
-    NULLIF($3, ''),
-    NULLIF($4, ''),
-    $5,
-    $6,
-    NULLIF($7, ''),
-    COALESCE(NULLIF($8, '')::jsonb, '{}'::jsonb),
-    COALESCE(NULLIF($9, '')::jsonb, '{}'::jsonb),
-    COALESCE(NULLIF($10, '')::timestamptz, NOW()),
+) SELECT
+    id,
+    tenant_id,
+    guild_id,
+    actor_user_id,
+    action,
+    resource_type,
+    resource_id,
+    request_metadata,
+    detail_json,
+    occurred_at,
     NOW()
+FROM candidate
+WHERE NOT (
+    action = 'debug_artifact.download'
+    AND EXISTS (
+        SELECT 1
+        FROM audit_events existing
+        WHERE existing.action = candidate.action
+          AND existing.resource_type = candidate.resource_type
+          AND existing.resource_id IS NOT DISTINCT FROM candidate.resource_id
+          AND existing.guild_id IS NOT DISTINCT FROM candidate.guild_id
+          AND existing.actor_user_id IS NOT DISTINCT FROM candidate.actor_user_id
+          AND existing.detail_json->>'meeting_id' = candidate.detail_json->>'meeting_id'
+          AND existing.occurred_at >= NOW() - INTERVAL '15 minutes'
+        LIMIT 1
+    )
 )
+ON CONFLICT (id) DO NOTHING
 "#;
 
 pub const LIST_RECENT_AUDIT_EVENTS_SQL: &str = r#"

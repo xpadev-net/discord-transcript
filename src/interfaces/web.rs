@@ -163,6 +163,7 @@ const TRANSCRIPT_SSE_MAX_IDLE_POLLS: u32 = 60;
 const USER_GUILDS_CACHE_TTL_SECS: u64 = 60;
 const OAUTH_ACCESS_TOKEN_DEFAULT_TTL_SECS: u64 = 3600;
 const OAUTH_ACCESS_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
+const DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS: i64 = 15 * 60;
 
 type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
@@ -527,8 +528,10 @@ fn debug_download_usage_event_id(
     filename: &str,
     content_type: &str,
     user_id: &str,
+    bucket: i64,
 ) -> String {
     let mut hasher = Sha256::new();
+    let bucket = bucket.to_string();
     for part in [
         "debug_downloads",
         guild_id,
@@ -537,6 +540,7 @@ fn debug_download_usage_event_id(
         filename,
         content_type,
         user_id,
+        bucket.as_str(),
     ] {
         hasher.update(part.as_bytes());
         hasher.update([0]);
@@ -547,6 +551,40 @@ fn debug_download_usage_event_id(
         id.push_str(&format!("{byte:02x}"));
     }
     id
+}
+
+fn debug_download_audit_event_id(
+    guild_id: &str,
+    meeting_id: &str,
+    artifact_id: &str,
+    user_id: &str,
+    bucket: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    let bucket = bucket.to_string();
+    for part in [
+        "audit:debug_artifact.download",
+        guild_id,
+        meeting_id,
+        artifact_id,
+        user_id,
+        bucket.as_str(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut id = String::from("audit:debug_download:");
+    for byte in &digest[..16] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
+}
+
+fn debug_download_dedupe_bucket(observed_at: DateTime<Utc>) -> i64 {
+    observed_at
+        .timestamp()
+        .div_euclid(DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS)
 }
 
 #[derive(Clone)]
@@ -2538,17 +2576,6 @@ async fn resolve_visible_guild_channel_ids(
         .collect())
 }
 
-async fn check_guild_admin_permission(
-    state: &WebState,
-    auth: &AuthConfig,
-    user_id: &str,
-) -> Result<bool, StatusCode> {
-    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
-    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true)
-        .await?
-        .into_status_result()
-}
-
 async fn check_guild_admin_permission_with_bot_auth(
     state: &WebState,
     auth: &AuthConfig,
@@ -2743,27 +2770,6 @@ async fn cache_guild_admin_permission(
         let now = Instant::now();
         cache.retain(|_, (_, exp)| *exp > now);
     }
-}
-
-async fn check_channel_admin_permission(
-    state: &WebState,
-    auth: &AuthConfig,
-    channel_id: &str,
-    user_id: &str,
-) -> Result<bool, StatusCode> {
-    let cache_key = (user_id.to_owned(), channel_id.to_owned());
-    {
-        let cache = state.permission_cache.read().await;
-        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
-            && Instant::now() < expires_at
-        {
-            return Ok(permission.is_admin);
-        }
-    }
-
-    let permission = resolve_channel_permission_flags(state, auth, channel_id, user_id).await?;
-    cache_channel_permission(&state.permission_cache, cache_key, permission).await;
-    Ok(permission.is_admin)
 }
 
 // Discord API response types for permission checking
@@ -11635,20 +11641,22 @@ async fn api_debug_manifest(
         });
     }
 
-    entries.push(DebugArtifactEntry {
-        id: StaticDebugArtifactKind::TranscriptPreCorrection
-            .as_id()
-            .to_owned(),
-        label: "Transcript (補正前)".to_owned(),
-        category: "transcript",
-        available: pre_correction_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::TranscriptPreCorrection.as_id()
-        ),
-        filename: "transcript_pre_correction.md".to_owned(),
-        content_type: "text/markdown",
-    });
+    if raw_debug_allowed {
+        entries.push(DebugArtifactEntry {
+            id: StaticDebugArtifactKind::TranscriptPreCorrection
+                .as_id()
+                .to_owned(),
+            label: "Transcript (補正前)".to_owned(),
+            category: "transcript",
+            available: pre_correction_exists.unwrap_or(false),
+            download_url: format!(
+                "{base_url}/{}",
+                StaticDebugArtifactKind::TranscriptPreCorrection.as_id()
+            ),
+            filename: "transcript_pre_correction.md".to_owned(),
+            content_type: "text/markdown",
+        });
+    }
 
     entries.push(DebugArtifactEntry {
         id: StaticDebugArtifactKind::TranscriptPostCorrection
@@ -11680,31 +11688,33 @@ async fn api_debug_manifest(
         content_type: "application/json",
     });
 
-    entries.push(DebugArtifactEntry {
-        id: StaticDebugArtifactKind::CorrectionPrompt.as_id().to_owned(),
-        label: "Transcript補正プロンプト".to_owned(),
-        category: "prompt",
-        available: correction_prompt_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::CorrectionPrompt.as_id()
-        ),
-        filename: "correction_prompt.txt".to_owned(),
-        content_type: "text/plain",
-    });
+    if raw_debug_allowed {
+        entries.push(DebugArtifactEntry {
+            id: StaticDebugArtifactKind::CorrectionPrompt.as_id().to_owned(),
+            label: "Transcript補正プロンプト".to_owned(),
+            category: "prompt",
+            available: correction_prompt_exists.unwrap_or(false),
+            download_url: format!(
+                "{base_url}/{}",
+                StaticDebugArtifactKind::CorrectionPrompt.as_id()
+            ),
+            filename: "correction_prompt.txt".to_owned(),
+            content_type: "text/plain",
+        });
 
-    entries.push(DebugArtifactEntry {
-        id: StaticDebugArtifactKind::SummaryPrompt.as_id().to_owned(),
-        label: "要約プロンプト".to_owned(),
-        category: "prompt",
-        available: summary_prompt_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::SummaryPrompt.as_id()
-        ),
-        filename: "summary_prompt.txt".to_owned(),
-        content_type: "text/plain",
-    });
+        entries.push(DebugArtifactEntry {
+            id: StaticDebugArtifactKind::SummaryPrompt.as_id().to_owned(),
+            label: "要約プロンプト".to_owned(),
+            category: "prompt",
+            available: summary_prompt_exists.unwrap_or(false),
+            download_url: format!(
+                "{base_url}/{}",
+                StaticDebugArtifactKind::SummaryPrompt.as_id()
+            ),
+            filename: "summary_prompt.txt".to_owned(),
+            content_type: "text/plain",
+        });
+    }
 
     entries.push(DebugArtifactEntry {
         id: StaticDebugArtifactKind::SummaryOutput.as_id().to_owned(),
@@ -11749,28 +11759,36 @@ async fn api_debug_file(
             content_type,
         } => Ok(build_inline_debug_response(bytes, &filename, content_type)),
     }?;
-    record_audit_event(
-        &state,
-        web_audit_event(
-            Some(access.guild_id.clone()),
-            Some(user_id.clone()),
-            "debug_artifact.download",
-            "debug_artifact",
-            Some(artifact_id.clone()),
-            audit_request_metadata(
-                &headers,
-                "GET",
-                &format!("/api/meetings/{meeting_id}/debug/files/{artifact_id}"),
-            ),
-            json!({
-                "meeting_id": meeting_id,
-                "filename": audit_filename,
-                "content_type": audit_content_type,
-                "admin_only": debug_artifact_requires_admin(&artifact_id),
-            }),
+    let observed_at = Utc::now();
+    let dedupe_bucket = debug_download_dedupe_bucket(observed_at);
+    let mut audit_event = web_audit_event(
+        Some(access.guild_id.clone()),
+        Some(user_id.clone()),
+        "debug_artifact.download",
+        "debug_artifact",
+        Some(artifact_id.clone()),
+        audit_request_metadata(
+            &headers,
+            "GET",
+            &format!("/api/meetings/{meeting_id}/debug/files/{artifact_id}"),
         ),
-    )
-    .await;
+        json!({
+            "meeting_id": meeting_id,
+            "filename": audit_filename,
+            "content_type": audit_content_type,
+            "admin_only": debug_artifact_requires_admin(&artifact_id),
+            "dedupe_window_seconds": DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS,
+        }),
+    );
+    audit_event.id = debug_download_audit_event_id(
+        &access.guild_id,
+        &meeting_id,
+        &artifact_id,
+        &user_id,
+        dedupe_bucket,
+    );
+    audit_event.occurred_at = observed_at;
+    record_audit_event(&state, audit_event).await;
     let usage_state = state.clone();
     let usage_guild_id = access.guild_id.clone();
     let usage_meeting_id = meeting_id.clone();
@@ -11779,22 +11797,18 @@ async fn api_debug_file(
     let usage_content_type = audit_content_type.to_owned();
     let usage_user_id = user_id.clone();
     let usage_admin_only = debug_artifact_requires_admin(&artifact_id);
-    let observed_at = Utc::now();
     tokio::spawn(async move {
         record_usage_event(
             &usage_state,
             NewUsageEvent {
-                id: format!(
-                    "{}:{}",
-                    debug_download_usage_event_id(
-                        &usage_guild_id,
-                        &usage_meeting_id,
-                        &usage_artifact_id,
-                        &usage_filename,
-                        &usage_content_type,
-                        &usage_user_id,
-                    ),
-                    observed_at.timestamp_micros()
+                id: debug_download_usage_event_id(
+                    &usage_guild_id,
+                    &usage_meeting_id,
+                    &usage_artifact_id,
+                    &usage_filename,
+                    &usage_content_type,
+                    &usage_user_id,
+                    dedupe_bucket,
                 ),
                 tenant_id: None,
                 guild_id: usage_guild_id,
@@ -11821,14 +11835,19 @@ async fn api_debug_file(
 
 async fn verify_raw_debug_artifact_access(
     state: &WebState,
-    access: &MeetingAccess,
+    _access: &MeetingAccess,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    if check_guild_admin_permission(state, auth, user_id).await? {
-        return Ok(true);
-    }
-    check_channel_admin_permission(state, auth, &access.voice_channel_id, user_id).await
+    current_user_has_rbac_permission_for_auth(
+        state,
+        auth,
+        user_id,
+        RbacPermission::AdminView,
+        false,
+        false,
+    )
+    .await
 }
 
 fn authorize_debug_artifact_download(raw_debug_allowed: bool) -> Result<(), StatusCode> {
@@ -11845,7 +11864,12 @@ fn debug_artifact_requires_admin(artifact_id: &str) -> bool {
     }
     matches!(
         StaticDebugArtifactKind::parse(artifact_id),
-        Some(StaticDebugArtifactKind::WhisperMixdown)
+        Some(
+            StaticDebugArtifactKind::WhisperMixdown
+                | StaticDebugArtifactKind::TranscriptPreCorrection
+                | StaticDebugArtifactKind::CorrectionPrompt
+                | StaticDebugArtifactKind::SummaryPrompt
+        )
     )
 }
 
@@ -14753,10 +14777,12 @@ mod discord_channel_full_tests {
         DiscordRoleFull, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS,
         PermissionCache, VIEW_CHANNEL, authorize_debug_artifact_download,
         build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
+        debug_download_dedupe_bucket, debug_download_usage_event_id,
         guild_meeting_channel_visible_after_row, meeting_access_from_row,
         verify_meeting_access_after_row,
     };
     use axum::http::StatusCode;
+    use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
     use std::sync::{
         Arc,
@@ -15098,9 +15124,13 @@ mod discord_channel_full_tests {
     fn raw_whisper_debug_artifacts_require_admin_access() {
         assert!(debug_artifact_requires_admin("whisper_mixdown"));
         assert!(debug_artifact_requires_admin("whisper~speaker-1"));
+        assert!(debug_artifact_requires_admin("transcript_pre_correction"));
+        assert!(debug_artifact_requires_admin("correction_prompt"));
+        assert!(debug_artifact_requires_admin("summary_prompt"));
         assert!(!debug_artifact_requires_admin("mixdown_audio"));
         assert!(!debug_artifact_requires_admin("speaker_audio~speaker-1"));
         assert!(!debug_artifact_requires_admin("transcript_post_correction"));
+        assert!(!debug_artifact_requires_admin("transcript_manifest"));
     }
 
     #[test]
@@ -15110,6 +15140,74 @@ mod discord_channel_full_tests {
             Err(StatusCode::FORBIDDEN)
         );
         assert_eq!(authorize_debug_artifact_download(true), Ok(()));
+    }
+
+    #[test]
+    fn raw_debug_artifact_access_uses_explicit_admin_view_permission() {
+        let source = include_str!("web.rs");
+        let helper = source
+            .split_once("async fn verify_raw_debug_artifact_access")
+            .expect("raw debug access helper should exist")
+            .1
+            .split_once("fn authorize_debug_artifact_download")
+            .expect("next helper should exist")
+            .0;
+
+        assert!(helper.contains("RbacPermission::AdminView"));
+        assert!(!helper.contains("check_channel_admin_permission"));
+    }
+
+    #[test]
+    fn debug_download_usage_id_dedupes_within_short_window() {
+        let first_bucket =
+            debug_download_dedupe_bucket(Utc.with_ymd_and_hms(2026, 6, 8, 1, 0, 1).unwrap());
+        let same_bucket =
+            debug_download_dedupe_bucket(Utc.with_ymd_and_hms(2026, 6, 8, 1, 14, 59).unwrap());
+        let next_bucket =
+            debug_download_dedupe_bucket(Utc.with_ymd_and_hms(2026, 6, 8, 1, 15, 0).unwrap());
+
+        assert_eq!(first_bucket, same_bucket);
+        assert_ne!(first_bucket, next_bucket);
+        assert_eq!(
+            debug_download_usage_event_id(
+                "g",
+                "m",
+                "summary_prompt",
+                "summary_prompt.txt",
+                "text/plain",
+                "u",
+                first_bucket
+            ),
+            debug_download_usage_event_id(
+                "g",
+                "m",
+                "summary_prompt",
+                "summary_prompt.txt",
+                "text/plain",
+                "u",
+                same_bucket
+            )
+        );
+        assert_ne!(
+            debug_download_usage_event_id(
+                "g",
+                "m",
+                "summary_prompt",
+                "summary_prompt.txt",
+                "text/plain",
+                "u",
+                first_bucket
+            ),
+            debug_download_usage_event_id(
+                "g",
+                "m",
+                "summary_prompt",
+                "summary_prompt.txt",
+                "text/plain",
+                "u",
+                next_bucket
+            )
+        );
     }
 
     #[test]
