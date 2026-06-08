@@ -6762,8 +6762,16 @@ impl ScaffoldHandler {
             // CAS failed — another process may own this meeting.  Mark the
             // job failed so it does not stay Running forever.
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping→Transcribing failed; marking job failed");
-            let mut queue = self.queue.lock().await;
-            let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
+            {
+                let mut queue = self.queue.lock().await;
+                let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
+            }
+            let mut service = self.service.lock().await;
+            let _ = mark_summary_meeting_failed_from_summary_state(
+                &mut service.store,
+                &claimed_job.meeting_id,
+                cas_err_string.clone(),
+            );
             return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
@@ -7193,8 +7201,16 @@ impl ScaffoldHandler {
         } {
             let cas_err_string = cas_err.to_string();
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
-            let mut queue = self.queue.lock().await;
-            let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
+            {
+                let mut queue = self.queue.lock().await;
+                let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
+            }
+            let mut service = self.service.lock().await;
+            let _ = mark_summary_meeting_failed_from_summary_state(
+                &mut service.store,
+                &claimed_job.meeting_id,
+                cas_err_string.clone(),
+            );
             return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
@@ -9868,6 +9884,52 @@ mod status_message_tests {
         let mut meeting = summarizing_meeting();
         meeting.status = crate::domain::MeetingStatus::Transcribing;
         meeting
+    }
+
+    #[test]
+    fn summary_state_failure_helper_marks_summary_phases_failed() {
+        for status in [
+            crate::domain::MeetingStatus::Stopping,
+            crate::domain::MeetingStatus::Transcribing,
+            crate::domain::MeetingStatus::Summarizing,
+        ] {
+            let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            let mut meeting = summarizing_meeting();
+            meeting.status = status;
+            store.insert(meeting);
+
+            let updated = mark_summary_meeting_failed_from_summary_state(
+                &mut store,
+                "m1",
+                "summary CAS failed".to_owned(),
+            )
+            .expect("summary failure helper should update summary phase");
+
+            assert!(updated);
+            let meeting = store.get("m1").expect("meeting should remain");
+            assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+            assert_eq!(meeting.error_message.as_deref(), Some("summary CAS failed"));
+        }
+    }
+
+    #[test]
+    fn summary_state_failure_helper_preserves_posted_meeting() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = summarizing_meeting();
+        meeting.status = crate::domain::MeetingStatus::Posted;
+        store.insert(meeting);
+
+        let updated = mark_summary_meeting_failed_from_summary_state(
+            &mut store,
+            "m1",
+            "summary CAS failed".to_owned(),
+        )
+        .expect("posted meeting should not be clobbered");
+
+        assert!(!updated);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
     }
 
     fn transcript_segment(start_ms: u64, end_ms: u64) -> TranscriptSegment {
