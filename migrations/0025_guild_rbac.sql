@@ -93,5 +93,7 @@ $$;
 CREATE INDEX IF NOT EXISTS idx_guild_rbac_role_bindings_guild_active
     ON guild_rbac_role_bindings (guild_id, active, updated_at DESC, discord_role_id);
 
+-- Supports "list all roles in guild X that hold permission Y" queries for
+-- the Task 66 management API. Active role lookup by role id uses the primary key.
 CREATE INDEX IF NOT EXISTS idx_guild_rbac_permissions_guild_permission
     ON guild_rbac_permissions (guild_id, permission_name, discord_role_id);
