@@ -6469,6 +6469,13 @@ async fn api_admin_update_plan_quota(
     let limit_value = normalized.limit.limit_value();
     let unlimited = normalized.limit.is_unlimited();
     let enforcement_mode = normalized.enforcement_mode.as_str().to_owned();
+    let existing_row = state
+        .db
+        .query_opt(GET_ADMIN_PLAN_QUOTA_SQL, &[&quota_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let existing = admin_plan_quota_response_from_row(&existing_row);
     require_audit_event(
         &state,
         web_audit_event(
@@ -6479,6 +6486,7 @@ async fn api_admin_update_plan_quota(
             Some(quota_id.clone()),
             audit_request_metadata(&headers, "PUT", &format!("/api/admin/quotas/{quota_id}")),
             json!({
+                "plan_id": existing.plan_id.clone(),
                 "dimension": dimension.clone(),
                 "period": period.clone(),
                 "limit_value": limit_value,
