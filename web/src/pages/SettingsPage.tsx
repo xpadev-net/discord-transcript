@@ -18,6 +18,7 @@ import {
   createPersonAlias,
   createSummaryTemplate,
   deleteGuildBotToken,
+  fetchAdminRetentionOverview,
   fetchAiMemoryNotes,
   fetchDomainKnowledgeItems,
   fetchGuildSettings,
@@ -25,7 +26,11 @@ import {
   fetchSummaryTemplates,
   fetchTranscriptFeedbackQueue,
   pinAiMemoryNote,
+  previewAdminRetentionCleanup,
+  previewAdminRetentionMeetingDelete,
   promoteAiMemoryToDomainKnowledge,
+  runAdminRetentionCleanup,
+  runAdminRetentionMeetingDelete,
   unpinAiMemoryNote,
   updateAiMemoryNote,
   updateDomainKnowledgeItem,
@@ -36,6 +41,13 @@ import {
   updateTranscriptFeedbackStatus,
 } from "../lib/api";
 import type {
+  AdminRetentionCleanupPreview,
+  AdminRetentionCleanupRun,
+  AdminRetentionMeetingDelete,
+  AdminRetentionMeetingDeletePreview,
+  AdminRetentionOverview,
+  AdminRetentionPolicyRequest,
+  AdminRetentionTargets,
   AiMemoryNote,
   AiMemoryTag,
   AiMemoryUpsertRequest,
@@ -79,7 +91,20 @@ type ActiveOperation =
   | "alias-archive"
   | "template-save"
   | "template-activate"
-  | "template-archive";
+  | "template-archive"
+  | "retention-load"
+  | "retention-preview"
+  | "retention-run"
+  | "retention-meeting-preview"
+  | "retention-meeting-delete";
+
+interface RetentionAdminDraft {
+  token: string;
+  summary_ttl_days: string;
+  meeting_id: string;
+  reason: string;
+  targets: AdminRetentionTargets;
+}
 
 interface DomainKnowledgeDraft {
   id: string | null;
@@ -252,6 +277,120 @@ function emptyPersonAliasDraft(): PersonAliasDraft {
     active: true,
     review_status: "unreviewed",
   };
+}
+
+function emptyRetentionAdminDraft(): RetentionAdminDraft {
+  return {
+    token: "",
+    summary_ttl_days: "",
+    meeting_id: "",
+    reason: "",
+    targets: {
+      raw_audio: true,
+      transcript: true,
+      summary: true,
+      debug: true,
+    },
+  };
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function retentionPolicyRequestFromDraft(
+  draft: RetentionAdminDraft,
+  form: SettingsForm | null,
+): AdminRetentionPolicyRequest {
+  const summaryTtl = draft.summary_ttl_days.trim();
+  return {
+    raw_audio_ttl_days: form
+      ? readNumber(form.retention_raw_audio_ttl_days)
+      : undefined,
+    transcript_ttl_days: form
+      ? readNumber(form.retention_transcript_ttl_days)
+      : undefined,
+    summary_ttl_days: summaryTtl === "" ? undefined : readNumber(summaryTtl),
+  };
+}
+
+function validateRetentionPolicyDraft(
+  draft: RetentionAdminDraft,
+  form: SettingsForm | null,
+): string | null {
+  if (!form) {
+    return "設定を読み込んでから保持条件を確認してください";
+  }
+  const rawAudioTtlDays = readNumber(form.retention_raw_audio_ttl_days);
+  const transcriptTtlDays = readNumber(form.retention_transcript_ttl_days);
+  const summaryTtl = draft.summary_ttl_days.trim();
+  const summaryTtlDays = summaryTtl === "" ? null : readNumber(summaryTtl);
+  if (
+    !Number.isFinite(rawAudioTtlDays) ||
+    !Number.isFinite(transcriptTtlDays) ||
+    rawAudioTtlDays < 1 ||
+    rawAudioTtlDays > 365 ||
+    transcriptTtlDays < 1 ||
+    transcriptTtlDays > 365 ||
+    (summaryTtlDays !== null &&
+      (!Number.isFinite(summaryTtlDays) ||
+        summaryTtlDays < 1 ||
+        summaryTtlDays > 365))
+  ) {
+    return "保持日数は1から365の整数で入力してください";
+  }
+  return null;
+}
+
+function retentionPolicyKey(request: AdminRetentionPolicyRequest): string {
+  return [
+    request.raw_audio_ttl_days ?? "",
+    request.transcript_ttl_days ?? "",
+    request.summary_ttl_days ?? "",
+  ].join("|");
+}
+
+function retentionMeetingDeleteRequest(draft: RetentionAdminDraft) {
+  const reason = draft.reason.trim();
+  return {
+    targets: draft.targets,
+    reason: reason === "" ? null : reason,
+  };
+}
+
+function retentionMeetingPreviewKeyFor(
+  meetingId: string,
+  targets: AdminRetentionTargets,
+): string {
+  return [
+    meetingId,
+    targets.raw_audio ? "raw" : "",
+    targets.transcript ? "transcript" : "",
+    targets.summary ? "summary" : "",
+    targets.debug ? "debug" : "",
+  ].join("|");
+}
+
+function sameRetentionTargets(
+  left: AdminRetentionTargets,
+  right: AdminRetentionTargets,
+): boolean {
+  return (
+    left.raw_audio === right.raw_audio &&
+    left.transcript === right.transcript &&
+    left.summary === right.summary &&
+    left.debug === right.debug
+  );
 }
 
 function domainKnowledgeDraftFromItem(
@@ -724,6 +863,26 @@ export function SettingsPage({
   );
   const [summaryTemplateDraft, setSummaryTemplateDraft] =
     useState<SummaryTemplateDraft>(emptySummaryTemplateDraft);
+  const [retentionDraft, setRetentionDraft] = useState<RetentionAdminDraft>(
+    emptyRetentionAdminDraft,
+  );
+  const [retentionOverview, setRetentionOverview] =
+    useState<AdminRetentionOverview | null>(null);
+  const [retentionCleanupPreview, setRetentionCleanupPreview] =
+    useState<AdminRetentionCleanupPreview | null>(null);
+  const [retentionCleanupPreviewKey, setRetentionCleanupPreviewKey] = useState<
+    string | null
+  >(null);
+  const [retentionCleanupRun, setRetentionCleanupRun] =
+    useState<AdminRetentionCleanupRun | null>(null);
+  const [retentionMeetingPreview, setRetentionMeetingPreview] =
+    useState<AdminRetentionMeetingDeletePreview | null>(null);
+  const [retentionMeetingPreviewKey, setRetentionMeetingPreviewKey] = useState<
+    string | null
+  >(null);
+  const [retentionMeetingDelete, setRetentionMeetingDelete] =
+    useState<AdminRetentionMeetingDelete | null>(null);
+  const [retentionError, setRetentionError] = useState<string | null>(null);
   const [botTokenValue, setBotTokenValue] = useState("");
   const [loading, setLoading] = useState(true);
   const [customizationLoading, setCustomizationLoading] = useState(false);
@@ -837,6 +996,14 @@ export function SettingsPage({
     setForm(null);
     setBotTokenValue("");
     setTokenDeleteConfirmPending(false);
+    setRetentionOverview(null);
+    setRetentionCleanupPreview(null);
+    setRetentionCleanupPreviewKey(null);
+    setRetentionCleanupRun(null);
+    setRetentionMeetingPreview(null);
+    setRetentionMeetingPreviewKey(null);
+    setRetentionMeetingDelete(null);
+    setRetentionError(null);
     if (!showCustomizations) {
       setDomainKnowledgeItems([]);
       setAiMemoryNotes([]);
@@ -919,6 +1086,30 @@ export function SettingsPage({
   );
   const customizationControlsDisabled =
     !canEdit || customizationLoading || isSavingAny;
+  const retentionPolicyDraft = retentionPolicyRequestFromDraft(
+    retentionDraft,
+    form,
+  );
+  const retentionPolicyDraftKey = retentionPolicyKey(retentionPolicyDraft);
+  const retentionCleanupPreviewMatchesDraft =
+    retentionCleanupPreviewKey === retentionPolicyDraftKey;
+  const retentionTargetsSelected = Object.values(retentionDraft.targets).some(
+    Boolean,
+  );
+  const retentionMeetingPreviewMatchesDraft =
+    retentionMeetingPreviewKey ===
+      retentionMeetingPreviewKeyFor(
+        retentionDraft.meeting_id.trim(),
+        retentionDraft.targets,
+      ) &&
+    retentionMeetingPreview?.meeting_id === retentionDraft.meeting_id.trim() &&
+    sameRetentionTargets(
+      retentionMeetingPreview.targets,
+      retentionDraft.targets,
+    );
+  const retentionMeetingPreviewStatusAllowsDelete =
+    !retentionMeetingPreview ||
+    ["posted", "failed", "aborted"].includes(retentionMeetingPreview.status);
 
   function updateForm(update: Partial<SettingsForm>) {
     setForm((current) => (current ? { ...current, ...update } : current));
@@ -1130,6 +1321,277 @@ export function SettingsPage({
     } finally {
       if (currentGuildKeyRef.current === requestGuildKey) {
         setTokenDeleteConfirmPending(false);
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  function updateRetentionDraft(update: Partial<RetentionAdminDraft>) {
+    setRetentionDraft((current) => ({ ...current, ...update }));
+    setRetentionError(null);
+    setMessage(null);
+  }
+
+  function updateRetentionTarget(
+    target: keyof AdminRetentionTargets,
+    value: boolean,
+  ) {
+    setRetentionDraft((current) => ({
+      ...current,
+      targets: { ...current.targets, [target]: value },
+    }));
+    setRetentionError(null);
+    setMessage(null);
+  }
+
+  async function handleRetentionLoad(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const token = retentionDraft.token.trim();
+    const requestGuildKey = currentGuildKeyRef.current;
+    if (!token || isSavingAny) {
+      setRetentionError("管理トークンを入力してください");
+      return;
+    }
+    setActiveOperation("retention-load");
+    setRetentionError(null);
+    try {
+      const overview = await fetchAdminRetentionOverview({
+        bearerToken: token,
+      });
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionOverview(overview);
+      setMessage("保持管理情報を読み込みました");
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionError(
+        customizationErrorMessage(err, "保持管理情報の読み込みに失敗しました"),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleRetentionCleanupPreview() {
+    const token = retentionDraft.token.trim();
+    const requestGuildKey = currentGuildKeyRef.current;
+    if (!token || isSavingAny) {
+      setRetentionError("管理トークンを入力してください");
+      return;
+    }
+    const validationError = validateRetentionPolicyDraft(retentionDraft, form);
+    if (validationError) {
+      setRetentionError(validationError);
+      return;
+    }
+    const request = retentionPolicyRequestFromDraft(retentionDraft, form);
+    const requestKey = retentionPolicyKey(request);
+    setActiveOperation("retention-preview");
+    setRetentionError(null);
+    try {
+      const preview = await previewAdminRetentionCleanup(request, {
+        bearerToken: token,
+      });
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionCleanupPreview(preview);
+      setRetentionCleanupPreviewKey(requestKey);
+      setRetentionCleanupRun(null);
+      setMessage("クリーンアップ候補を確認しました");
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionError(
+        customizationErrorMessage(
+          err,
+          "クリーンアップ候補の確認に失敗しました",
+        ),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleRetentionCleanupRun() {
+    const token = retentionDraft.token.trim();
+    const requestGuildKey = currentGuildKeyRef.current;
+    const validationError = validateRetentionPolicyDraft(retentionDraft, form);
+    if (validationError) {
+      setRetentionError(validationError);
+      return;
+    }
+    const request = retentionPolicyRequestFromDraft(retentionDraft, form);
+    const requestKey = retentionPolicyKey(request);
+    if (!token) {
+      setRetentionError("管理トークンを入力してください");
+      return;
+    }
+    if (
+      !retentionCleanupPreview ||
+      retentionCleanupPreviewKey !== requestKey ||
+      isSavingAny
+    ) {
+      setRetentionError("実行前に現在の保持条件で確認を実行してください");
+      return;
+    }
+    setActiveOperation("retention-run");
+    setRetentionError(null);
+    try {
+      const result = await runAdminRetentionCleanup(request, {
+        bearerToken: token,
+      });
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionCleanupPreview(result.preview);
+      setRetentionCleanupPreviewKey(null);
+      setRetentionCleanupRun(result);
+      let refreshWarning = false;
+      try {
+        const overview = await fetchAdminRetentionOverview({
+          bearerToken: token,
+        });
+        if (currentGuildKeyRef.current !== requestGuildKey) {
+          return;
+        }
+        setRetentionOverview(overview);
+      } catch {
+        if (currentGuildKeyRef.current !== requestGuildKey) {
+          return;
+        }
+        refreshWarning = true;
+      }
+      setMessage(
+        result.error
+          ? "一部エラー付きでクリーンアップを実行しました"
+          : refreshWarning
+            ? "クリーンアップを実行しました。使用量の再読み込みに失敗しました"
+            : "クリーンアップを実行しました",
+      );
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionError(
+        customizationErrorMessage(err, "クリーンアップの実行に失敗しました"),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleRetentionMeetingPreview() {
+    const token = retentionDraft.token.trim();
+    const meetingId = retentionDraft.meeting_id.trim();
+    const requestGuildKey = currentGuildKeyRef.current;
+    if (!token || !meetingId || !retentionTargetsSelected || isSavingAny) {
+      setRetentionError("管理トークンと会議IDを入力してください");
+      return;
+    }
+    setActiveOperation("retention-meeting-preview");
+    setRetentionError(null);
+    try {
+      const preview = await previewAdminRetentionMeetingDelete(
+        meetingId,
+        retentionMeetingDeleteRequest(retentionDraft),
+        { bearerToken: token },
+      );
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionMeetingPreview(preview);
+      setRetentionMeetingPreviewKey(
+        retentionMeetingPreviewKeyFor(meetingId, retentionDraft.targets),
+      );
+      setRetentionMeetingDelete(null);
+      setMessage("会議削除の対象を確認しました");
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionError(
+        customizationErrorMessage(err, "会議削除の確認に失敗しました"),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleRetentionMeetingDelete() {
+    const token = retentionDraft.token.trim();
+    const meetingId = retentionDraft.meeting_id.trim();
+    const requestGuildKey = currentGuildKeyRef.current;
+    if (!token) {
+      setRetentionError("管理トークンを入力してください");
+      return;
+    }
+    if (
+      !meetingId ||
+      !retentionTargetsSelected ||
+      !retentionMeetingPreviewMatchesDraft ||
+      isSavingAny
+    ) {
+      setRetentionError("削除前に現在の対象で確認を実行してください");
+      return;
+    }
+    setActiveOperation("retention-meeting-delete");
+    setRetentionError(null);
+    try {
+      const result = await runAdminRetentionMeetingDelete(
+        meetingId,
+        retentionMeetingDeleteRequest(retentionDraft),
+        { bearerToken: token },
+      );
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionMeetingPreview(result.preview);
+      setRetentionMeetingPreviewKey(null);
+      setRetentionMeetingDelete(result);
+      let refreshWarning = false;
+      try {
+        const overview = await fetchAdminRetentionOverview({
+          bearerToken: token,
+        });
+        if (currentGuildKeyRef.current !== requestGuildKey) {
+          return;
+        }
+        setRetentionOverview(overview);
+      } catch {
+        if (currentGuildKeyRef.current !== requestGuildKey) {
+          return;
+        }
+        refreshWarning = true;
+      }
+      setMessage(
+        result.error
+          ? "一部エラー付きで会議コンテンツを削除しました"
+          : refreshWarning
+            ? "会議コンテンツを削除しました。使用量の再読み込みに失敗しました"
+            : "会議コンテンツを削除しました",
+      );
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRetentionError(
+        customizationErrorMessage(err, "会議コンテンツの削除に失敗しました"),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
         setActiveOperation(null);
       }
     }
@@ -1887,6 +2349,251 @@ export function SettingsPage({
             </button>
           </div>
         </form>
+      ) : null}
+
+      {settings && canEdit ? (
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <div>
+              <h2>{"保持管理"}</h2>
+              <p>
+                {
+                  "Betaでは容量制限は監視のみです。現在の使用量、削除候補、監査付きの手動削除を確認できます"
+                }
+              </p>
+            </div>
+          </div>
+
+          <form className="settings-token-form" onSubmit={handleRetentionLoad}>
+            <label className="settings-field">
+              <span>{"管理トークン"}</span>
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={retentionDraft.token}
+                disabled={isSavingAny}
+                onChange={(event) =>
+                  updateRetentionDraft({ token: event.target.value })
+                }
+              />
+            </label>
+            <label className="settings-field">
+              <span>{"要約保持日数"}</span>
+              <input
+                type="number"
+                min={1}
+                max={365}
+                step={1}
+                placeholder="未設定"
+                value={retentionDraft.summary_ttl_days}
+                disabled={isSavingAny}
+                onChange={(event) =>
+                  updateRetentionDraft({
+                    summary_ttl_days: event.target.value,
+                  })
+                }
+              />
+            </label>
+            <div className="settings-token-actions">
+              <button
+                type="submit"
+                className="secondary-button"
+                disabled={isSavingAny || retentionDraft.token.trim() === ""}
+              >
+                {activeOperation === "retention-load"
+                  ? "読み込み中"
+                  : "使用量を読み込み"}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={isSavingAny || retentionDraft.token.trim() === ""}
+                onClick={handleRetentionCleanupPreview}
+              >
+                {activeOperation === "retention-preview"
+                  ? "確認中"
+                  : "クリーンアップ確認"}
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={
+                  isSavingAny ||
+                  retentionDraft.token.trim() === "" ||
+                  !retentionCleanupPreviewMatchesDraft
+                }
+                onClick={handleRetentionCleanupRun}
+              >
+                {activeOperation === "retention-run"
+                  ? "実行中"
+                  : "クリーンアップ実行"}
+              </button>
+            </div>
+          </form>
+
+          {retentionOverview ? (
+            <div className="settings-token-status-row">
+              <span className="settings-token-status is-set">
+                {formatBytes(retentionOverview.storage.total_bytes)}
+              </span>
+              <span className="settings-token-meta">
+                {`会議 ${retentionOverview.meeting_count} / 成果物 ${retentionOverview.artifact_count}`}
+              </span>
+              <span className="settings-token-meta">
+                {`Quota: ${retentionOverview.quota_readiness.enforcement_mode} / hard limitなし`}
+              </span>
+              <span className="settings-token-meta">
+                {retentionOverview.legal_hold.supported
+                  ? "Legal hold対応"
+                  : "Legal hold未対応"}
+              </span>
+            </div>
+          ) : null}
+
+          {retentionCleanupPreview ? (
+            <div className="settings-review-item">
+              <div>
+                <div className="settings-review-title">
+                  {"削除候補"}
+                  <span className="settings-review-meta">
+                    {formatBytes(
+                      retentionCleanupPreview.estimated_freed_bytes.total_bytes,
+                    )}
+                  </span>
+                </div>
+                <p>
+                  {`Raw ${retentionCleanupPreview.raw_workspace_count} / Transcript ${retentionCleanupPreview.transcript_workspace_count} / Summary ${retentionCleanupPreview.summary_workspace_count}`}
+                </p>
+                <p className="settings-review-meta">
+                  {`Expired artifacts ${retentionCleanupPreview.expired_artifact_count} / ${formatBytes(
+                    retentionCleanupPreview.expired_artifact_bytes,
+                  )}`}
+                </p>
+                {retentionCleanupRun ? (
+                  <p className="settings-review-meta">
+                    {`監査: ${
+                      retentionCleanupRun.audit_recorded ? "記録済み" : "未記録"
+                    } / transcripts ${retentionCleanupRun.report.transcripts_marked_deleted} / summaries ${retentionCleanupRun.report.summaries_deleted} / artifacts ${retentionCleanupRun.report.artifacts_deleted}`}
+                  </p>
+                ) : null}
+                {retentionCleanupRun?.error ? (
+                  <p className="settings-version-meta">
+                    {retentionCleanupRun.error}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="settings-customization-panel">
+            <div className="settings-customization-header">
+              <div>
+                <h3>{"会議コンテンツ削除"}</h3>
+                <p>
+                  {
+                    "会議行、使用量履歴、監査履歴は残し、選択したアクティブコンテンツだけを削除します"
+                  }
+                </p>
+              </div>
+            </div>
+            <label className="settings-field">
+              <span>{"会議ID"}</span>
+              <input
+                type="text"
+                value={retentionDraft.meeting_id}
+                disabled={isSavingAny}
+                onChange={(event) =>
+                  updateRetentionDraft({ meeting_id: event.target.value })
+                }
+              />
+            </label>
+            <label className="settings-field">
+              <span>{"理由"}</span>
+              <input
+                type="text"
+                value={retentionDraft.reason}
+                disabled={isSavingAny}
+                onChange={(event) =>
+                  updateRetentionDraft({ reason: event.target.value })
+                }
+              />
+            </label>
+            <div className="settings-token-actions">
+              {(
+                [
+                  ["raw_audio", "Raw audio"],
+                  ["transcript", "Transcript"],
+                  ["summary", "Summary"],
+                  ["debug", "Debug"],
+                ] as const
+              ).map(([target, label]) => (
+                <label key={target} className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={retentionDraft.targets[target]}
+                    disabled={isSavingAny}
+                    onChange={(event) =>
+                      updateRetentionTarget(target, event.target.checked)
+                    }
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </div>
+            <div className="settings-token-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={
+                  isSavingAny ||
+                  retentionDraft.token.trim() === "" ||
+                  retentionDraft.meeting_id.trim() === "" ||
+                  !retentionTargetsSelected
+                }
+                onClick={handleRetentionMeetingPreview}
+              >
+                {activeOperation === "retention-meeting-preview"
+                  ? "確認中"
+                  : "削除確認"}
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={
+                  isSavingAny ||
+                  retentionDraft.token.trim() === "" ||
+                  retentionDraft.meeting_id.trim() === "" ||
+                  !retentionTargetsSelected ||
+                  !retentionMeetingPreviewMatchesDraft ||
+                  !retentionMeetingPreviewStatusAllowsDelete
+                }
+                onClick={handleRetentionMeetingDelete}
+              >
+                {activeOperation === "retention-meeting-delete"
+                  ? "削除中"
+                  : "削除実行"}
+              </button>
+            </div>
+            {retentionMeetingPreview ? (
+              <p className="settings-version-meta">
+                {`対象: ${retentionMeetingPreview.status} / 解放見込み ${formatBytes(
+                  retentionMeetingPreview.estimated_freed_bytes.total_bytes,
+                )} / 使用量履歴 ${retentionMeetingPreview.usage_event_count}件保持 / 監査履歴 ${retentionMeetingPreview.audit_event_count}件保持`}
+              </p>
+            ) : null}
+            {retentionMeetingDelete ? (
+              <p className="settings-version-meta">
+                {`削除結果: transcripts ${retentionMeetingDelete.report.transcripts_marked_deleted} / summaries ${retentionMeetingDelete.report.summaries_deleted} / artifacts ${retentionMeetingDelete.report.artifacts_deleted} / 監査 ${
+                  retentionMeetingDelete.audit_recorded ? "記録済み" : "未記録"
+                }`}
+              </p>
+            ) : null}
+          </div>
+
+          {retentionError ? (
+            <p className="settings-error">{retentionError}</p>
+          ) : null}
+        </section>
       ) : null}
 
       {settings && showCustomizations ? (

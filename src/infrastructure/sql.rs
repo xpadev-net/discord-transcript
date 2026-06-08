@@ -236,6 +236,276 @@ SELECT
 ON CONFLICT (id) DO NOTHING
 "#;
 
+pub const ADMIN_RETENTION_OVERVIEW_SQL: &str = r#"
+WITH artifact_totals AS (
+    SELECT
+        COALESCE(SUM(a.size_bytes), 0)::BIGINT AS storage_bytes,
+        COUNT(*)::BIGINT AS artifact_count,
+        COALESCE(SUM(a.size_bytes) FILTER (WHERE a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')), 0)::BIGINT AS raw_audio_bytes,
+        COALESCE(SUM(a.size_bytes) FILTER (WHERE a.kind IN ('transcript', 'masked_transcript')), 0)::BIGINT AS transcript_bytes,
+        COALESCE(SUM(a.size_bytes) FILTER (WHERE a.kind IN ('summary', 'summary_markdown')), 0)::BIGINT AS summary_bytes,
+        COALESCE(SUM(a.size_bytes) FILTER (WHERE a.kind IN ('debug', 'debug_artifact', 'whisper_debug')), 0)::BIGINT AS debug_bytes
+    FROM artifacts a
+    JOIN meetings m ON m.id = a.meeting_id
+    WHERE m.guild_id = $1
+),
+meeting_totals AS (
+    SELECT
+        COUNT(*)::BIGINT AS meeting_count,
+        COUNT(*) FILTER (WHERE status IN ('recording', 'stopping', 'transcribing', 'summarizing'))::BIGINT AS active_meeting_count
+    FROM meetings
+    WHERE guild_id = $1
+),
+usage_totals AS (
+    SELECT COALESCE(SUM(quantity), 0)::BIGINT AS observed_storage_bytes
+    FROM usage_events
+    WHERE guild_id = $1
+      AND metric = 'storage_bytes'
+)
+SELECT
+    meeting_totals.meeting_count,
+    meeting_totals.active_meeting_count,
+    artifact_totals.artifact_count,
+    artifact_totals.storage_bytes,
+    artifact_totals.raw_audio_bytes,
+    artifact_totals.transcript_bytes,
+    artifact_totals.summary_bytes,
+    artifact_totals.debug_bytes,
+    usage_totals.observed_storage_bytes
+FROM artifact_totals, meeting_totals, usage_totals
+"#;
+
+pub const ADMIN_RETENTION_MEETING_DETAIL_SQL: &str = r#"
+SELECT
+    m.id,
+    m.guild_id,
+    m.voice_channel_id,
+    m.status,
+    to_char(m.started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS started_at,
+    to_char(m.stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stopped_at,
+    COALESCE((SELECT COUNT(*) FROM transcripts t WHERE t.meeting_id = m.id AND NOT t.is_deleted), 0)::BIGINT AS transcript_count,
+    COALESCE((SELECT COUNT(*) FROM summaries s WHERE s.meeting_id = m.id), 0)::BIGINT AS summary_count,
+    COALESCE((SELECT COUNT(*) FROM artifacts a WHERE a.meeting_id = m.id), 0)::BIGINT AS artifact_count,
+    COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a WHERE a.meeting_id = m.id), 0)::BIGINT AS artifact_bytes,
+    COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a WHERE a.meeting_id = m.id AND a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')), 0)::BIGINT AS raw_audio_artifact_bytes,
+    COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a WHERE a.meeting_id = m.id AND a.kind IN ('transcript', 'masked_transcript')), 0)::BIGINT AS transcript_artifact_bytes,
+    COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a WHERE a.meeting_id = m.id AND a.kind IN ('summary', 'summary_markdown')), 0)::BIGINT AS summary_artifact_bytes,
+    COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a WHERE a.meeting_id = m.id AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')), 0)::BIGINT AS debug_artifact_bytes,
+    COALESCE((SELECT COUNT(*) FROM usage_events u WHERE u.meeting_id = m.id), 0)::BIGINT AS usage_event_count,
+    COALESCE((SELECT COUNT(*) FROM audit_events e WHERE e.resource_id = m.id), 0)::BIGINT AS audit_event_count
+FROM meetings m
+WHERE m.id = $1
+  AND m.guild_id = $2
+"#;
+
+pub const ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL: &str = r#"
+UPDATE transcripts
+SET is_deleted = TRUE
+WHERE meeting_id = $1
+  AND EXISTS (
+    SELECT 1
+    FROM meetings m
+    WHERE m.id = $1
+      AND m.guild_id = $2
+      AND m.status IN ('posted', 'failed', 'aborted')
+  )
+  AND is_deleted = FALSE
+"#;
+
+pub const ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL: &str = r#"
+UPDATE meetings
+SET retention_raw_cleaned_at=NOW(),
+    updated_at=NOW()
+WHERE id=$1
+  AND guild_id=$2
+  AND status IN ('posted', 'failed', 'aborted')
+  AND retention_raw_cleaned_at IS NULL
+"#;
+
+pub const ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL: &str = r#"
+DELETE FROM summaries
+WHERE meeting_id = $1
+  AND EXISTS (
+    SELECT 1
+    FROM meetings m
+    WHERE m.id = $1
+      AND m.guild_id = $2
+      AND m.status IN ('posted', 'failed', 'aborted')
+  )
+"#;
+
+pub const ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL: &str = r#"
+DELETE FROM artifacts
+WHERE meeting_id = $1
+  AND EXISTS (
+    SELECT 1
+    FROM meetings m
+    WHERE m.id = $1
+      AND m.guild_id = $2
+      AND m.status IN ('posted', 'failed', 'aborted')
+  )
+  AND (
+    ($3::boolean AND kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio'))
+    OR ($4::boolean AND kind IN ('transcript', 'masked_transcript'))
+    OR ($5::boolean AND kind IN ('summary', 'summary_markdown'))
+    OR ($6::boolean AND kind IN ('debug', 'debug_artifact', 'whisper_debug'))
+  )
+"#;
+
+pub const ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = r#"
+SELECT id, guild_id, voice_channel_id
+FROM meetings
+WHERE guild_id = $2
+  AND stopped_at IS NOT NULL
+  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND status IN ('posted', 'failed', 'aborted')
+  AND retention_raw_cleaned_at IS NULL
+"#;
+
+pub const ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
+SELECT m.id, m.guild_id, m.voice_channel_id
+FROM meetings m
+WHERE m.guild_id = $2
+  AND m.status IN ('posted', 'failed', 'aborted')
+  AND (
+    NOT EXISTS (
+      SELECT 1
+      FROM transcripts active_t
+      WHERE active_t.meeting_id = m.id
+        AND active_t.is_deleted = FALSE
+        AND active_t.created_at >= NOW() - (($1 || ' days')::interval)
+    )
+  )
+  AND (
+    EXISTS (
+      SELECT 1
+      FROM transcripts expired_t
+      WHERE expired_t.meeting_id = m.id
+        AND expired_t.is_deleted = FALSE
+        AND expired_t.created_at < NOW() - (($1 || ' days')::interval)
+    )
+    OR (
+      NOT EXISTS (SELECT 1 FROM transcripts any_t WHERE any_t.meeting_id = m.id)
+      AND m.stopped_at IS NOT NULL
+      AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+    )
+  )
+"#;
+
+pub const ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
+SELECT m.id, m.guild_id, m.voice_channel_id
+FROM meetings m
+WHERE m.guild_id = $2
+  AND m.status IN ('posted', 'failed', 'aborted')
+  AND NOT EXISTS (
+    SELECT 1
+    FROM summaries active_s
+    WHERE active_s.meeting_id = m.id
+      AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM summaries expired_s
+    WHERE expired_s.meeting_id = m.id
+      AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+  )
+"#;
+
+pub const ADMIN_RETENTION_EXPIRED_ARTIFACTS_PREVIEW_SQL: &str = r#"
+SELECT
+    COUNT(*)::BIGINT AS artifact_count,
+    COALESCE(SUM(a.size_bytes), 0)::BIGINT AS artifact_bytes
+FROM artifacts a
+JOIN meetings m ON m.id = a.meeting_id
+WHERE m.guild_id = $1
+  AND a.expires_at IS NOT NULL
+  AND a.expires_at <= NOW()
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DEBUG_ARTIFACTS_PREVIEW_SQL: &str = r#"
+SELECT COUNT(*)::BIGINT AS artifact_count
+FROM artifacts a
+JOIN meetings m ON m.id = a.meeting_id
+WHERE m.guild_id = $2
+  AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')
+  AND m.stopped_at IS NOT NULL
+  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
+UPDATE transcripts t
+SET is_deleted=TRUE
+FROM meetings m
+WHERE t.meeting_id = m.id
+  AND m.guild_id = $2
+  AND t.is_deleted=FALSE
+  AND t.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DELETE_SUMMARIES_SQL: &str = r#"
+DELETE FROM summaries s
+USING meetings m
+WHERE s.meeting_id = m.id
+  AND m.guild_id = $2
+  AND s.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL: &str = r#"
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND m.guild_id = $1
+  AND a.expires_at IS NOT NULL
+  AND a.expires_at <= NOW()
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL: &str = r#"
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
+  AND a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')
+  AND m.stopped_at IS NOT NULL
+  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL: &str = r#"
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
+  AND a.kind IN ('transcript', 'masked_transcript')
+  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL: &str = r#"
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
+  AND a.kind IN ('summary', 'summary_markdown')
+  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
+pub const ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL: &str = r#"
+DELETE FROM artifacts a
+USING meetings m
+WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
+  AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')
+  AND m.stopped_at IS NOT NULL
+  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
 pub const LIST_RECENT_USAGE_EVENTS_SQL: &str = r#"
 SELECT id, tenant_id, guild_id, meeting_id, job_id, resource_type, resource_id,
        metric, quantity, detail_json::TEXT,

@@ -194,6 +194,126 @@ export interface AdminGuildPlanAssignmentCreateRequest
   guild_id: string;
 }
 
+export interface AdminRetentionPolicyRequest {
+  raw_audio_ttl_days?: number;
+  transcript_ttl_days?: number;
+  summary_ttl_days?: number | null;
+}
+
+export interface AdminRetentionTargets {
+  raw_audio: boolean;
+  transcript: boolean;
+  summary: boolean;
+  debug: boolean;
+}
+
+export interface AdminRetentionStorageUsage {
+  raw_audio_bytes: number;
+  transcript_bytes: number;
+  summary_bytes: number;
+  debug_bytes: number;
+  total_bytes: number;
+}
+
+export interface AdminRetentionPolicy {
+  raw_audio_ttl_days: number;
+  transcript_ttl_days: number;
+  summary_ttl_days: number | null;
+  debug_ttl_source: string;
+}
+
+export interface AdminRetentionLegalHold {
+  supported: boolean;
+  active: boolean;
+  message: string;
+}
+
+export interface AdminRetentionQuotaReadiness {
+  storage_bytes_observed: number;
+  storage_bytes_current: number;
+  enforcement_mode: string;
+  hard_quota_enforced: boolean;
+}
+
+export interface AdminRetentionOverview {
+  guild_id: string;
+  policy: AdminRetentionPolicy;
+  legal_hold: AdminRetentionLegalHold;
+  storage: AdminRetentionStorageUsage;
+  artifact_count: number;
+  meeting_count: number;
+  active_meeting_count: number;
+  quota_readiness: AdminRetentionQuotaReadiness;
+}
+
+export interface AdminRetentionCleanupPreview {
+  guild_id: string;
+  policy: AdminRetentionPolicy;
+  deletion_targets: AdminRetentionTargets;
+  raw_workspace_count: number;
+  transcript_workspace_count: number;
+  summary_workspace_count: number;
+  expired_artifact_count: number;
+  expired_artifact_bytes: number;
+  estimated_freed_bytes: AdminRetentionStorageUsage;
+}
+
+export interface AdminRetentionCleanupReport {
+  raw_workspaces_scanned: number;
+  raw_audio_dirs_removed: number;
+  legacy_meetings_cleaned: number;
+  raw_workspaces_marked_cleaned: number;
+  speaker_dirs_removed: number;
+  context_dirs_removed: number;
+  transcript_dirs_removed: number;
+  empty_summary_dirs_removed: number;
+  summary_dirs_removed: number;
+  debug_dirs_removed: number;
+  agent_workspace_dirs_removed: number;
+  transcripts_marked_deleted: number;
+  summaries_deleted: number;
+  artifacts_deleted: number;
+}
+
+export interface AdminRetentionCleanupRun {
+  preview: AdminRetentionCleanupPreview;
+  report: AdminRetentionCleanupReport;
+  audit_recorded: boolean;
+  error: string | null;
+}
+
+export interface AdminRetentionMeetingDeleteRequest {
+  targets: AdminRetentionTargets;
+  reason?: string | null;
+}
+
+export interface AdminRetentionMeetingDeletePreview {
+  guild_id: string;
+  meeting_id: string;
+  voice_channel_id: string;
+  status: string;
+  started_at: string | null;
+  stopped_at: string | null;
+  targets: AdminRetentionTargets;
+  storage: AdminRetentionStorageUsage;
+  estimated_freed_bytes: AdminRetentionStorageUsage;
+  transcript_count: number;
+  summary_count: number;
+  artifact_count: number;
+  usage_event_count: number;
+  audit_event_count: number;
+  legal_hold: AdminRetentionLegalHold;
+  preserves_usage_history: boolean;
+  preserves_audit_history: boolean;
+}
+
+export interface AdminRetentionMeetingDelete {
+  preview: AdminRetentionMeetingDeletePreview;
+  report: AdminRetentionCleanupReport;
+  audit_recorded: boolean;
+  error: string | null;
+}
+
 export type DomainKnowledgeContentType =
   | "glossary"
   | "person_name"

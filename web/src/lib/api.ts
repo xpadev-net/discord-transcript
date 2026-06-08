@@ -6,6 +6,13 @@ import type {
   AdminPlanQuota,
   AdminPlanQuotaUpsertRequest,
   AdminPlanUpsertRequest,
+  AdminRetentionCleanupPreview,
+  AdminRetentionCleanupRun,
+  AdminRetentionMeetingDelete,
+  AdminRetentionMeetingDeletePreview,
+  AdminRetentionMeetingDeleteRequest,
+  AdminRetentionOverview,
+  AdminRetentionPolicyRequest,
   AiMemoryNote,
   AiMemoryPromoteRequest,
   AiMemorySourceType,
@@ -109,6 +116,10 @@ function adminGuildPlanAssignmentPath(assignmentId?: string): string {
   return assignmentId
     ? `/api/admin/guild-plan-assignments/${encodeURIComponent(assignmentId)}`
     : "/api/admin/guild-plan-assignments";
+}
+
+function adminRetentionMeetingPath(meetingId: string, action: string): string {
+  return `/api/admin/retention/meetings/${encodeURIComponent(meetingId)}/${action}`;
 }
 
 export function buildLoginRedirectUrl(path: string): string {
@@ -515,6 +526,65 @@ export function archiveAdminGuildPlanAssignment(
     headers: adminHeaders(options),
     signal: options.signal,
   }).then(handleAdminResponse<AdminGuildPlanAssignment>);
+}
+
+export function fetchAdminRetentionOverview(
+  options: AdminRequestOptions = {},
+): Promise<AdminRetentionOverview> {
+  return fetch("/api/admin/retention", {
+    headers: adminHeaders(options),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminRetentionOverview>);
+}
+
+export function previewAdminRetentionCleanup(
+  request: AdminRetentionPolicyRequest = {},
+  options: AdminRequestOptions = {},
+): Promise<AdminRetentionCleanupPreview> {
+  return fetch("/api/admin/retention/cleanup-preview", {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminRetentionCleanupPreview>);
+}
+
+export function runAdminRetentionCleanup(
+  request: AdminRetentionPolicyRequest = {},
+  options: AdminRequestOptions = {},
+): Promise<AdminRetentionCleanupRun> {
+  return fetch("/api/admin/retention/cleanup-run", {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminRetentionCleanupRun>);
+}
+
+export function previewAdminRetentionMeetingDelete(
+  meetingId: string,
+  request: AdminRetentionMeetingDeleteRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminRetentionMeetingDeletePreview> {
+  return fetch(adminRetentionMeetingPath(meetingId, "delete-preview"), {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminRetentionMeetingDeletePreview>);
+}
+
+export function runAdminRetentionMeetingDelete(
+  meetingId: string,
+  request: AdminRetentionMeetingDeleteRequest,
+  options: AdminRequestOptions = {},
+): Promise<AdminRetentionMeetingDelete> {
+  return fetch(adminRetentionMeetingPath(meetingId, "delete"), {
+    method: "POST",
+    headers: adminHeaders(options, true),
+    body: JSON.stringify(request),
+    signal: options.signal,
+  }).then(handleAdminResponse<AdminRetentionMeetingDelete>);
 }
 
 export function fetchDomainKnowledgeItems(
