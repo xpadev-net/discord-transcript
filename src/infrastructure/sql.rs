@@ -307,6 +307,7 @@ WHERE meeting_id = $1
     FROM meetings m
     WHERE m.id = $1
       AND m.guild_id = $2
+      AND m.status IN ('posted', 'failed', 'aborted')
   )
   AND is_deleted = FALSE
 "#;
@@ -328,6 +329,7 @@ WHERE meeting_id = $1
     FROM meetings m
     WHERE m.id = $1
       AND m.guild_id = $2
+      AND m.status IN ('posted', 'failed', 'aborted')
   )
 "#;
 
@@ -339,6 +341,7 @@ WHERE meeting_id = $1
     FROM meetings m
     WHERE m.id = $1
       AND m.guild_id = $2
+      AND m.status IN ('posted', 'failed', 'aborted')
   )
   AND (
     ($3::boolean AND kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio'))

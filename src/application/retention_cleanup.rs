@@ -357,7 +357,8 @@ pub fn apply_retention_filesystem_cleanup(
         if speaker_cleanup_failed {
             warn!(
                 meeting_id = %meeting.meeting_id,
-                path = %workspace.audio_dir().display(),
+                path = %workspace.speakers_dir().display(),
+                skipped_path = %workspace.audio_dir().display(),
                 "skipping parent audio cleanup after speaker directory cleanup failed"
             );
         } else {
@@ -446,7 +447,6 @@ pub fn estimate_meeting_filesystem_usage(
     );
     Ok(RetentionStorageUsage {
         raw_audio_bytes: dir_size_if_present(&workspace.audio_dir())?
-            .saturating_add(dir_size_if_present(&workspace.speakers_dir())?)
             .saturating_add(dir_size_if_present(&workspace.context_dir())?)
             .saturating_add(legacy_raw_audio_size(
                 &workspace_layout.legacy_meeting_dir(&meeting.meeting_id),
@@ -509,7 +509,8 @@ pub fn apply_manual_meeting_filesystem_delete(
         if speaker_cleanup_failed {
             warn!(
                 meeting_id = %meeting.meeting_id,
-                path = %workspace.audio_dir().display(),
+                path = %workspace.speakers_dir().display(),
+                skipped_path = %workspace.audio_dir().display(),
                 "skipping parent audio cleanup after speaker directory cleanup failed"
             );
         } else {

@@ -289,6 +289,7 @@ export interface AdminRetentionMeetingDeleteRequest {
 export interface AdminRetentionMeetingDeletePreview {
   guild_id: string;
   meeting_id: string;
+  voice_channel_id: string;
   status: string;
   started_at: string | null;
   stopped_at: string | null;

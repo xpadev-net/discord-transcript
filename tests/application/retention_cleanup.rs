@@ -465,6 +465,9 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
     assert_eq!(report.speaker_dirs_removed, 1);
     assert_eq!(report.context_dirs_removed, 1);
     assert_eq!(report.summary_dirs_removed, 1);
+    assert_eq!(report.transcript_dirs_removed, 0);
+    assert_eq!(report.debug_dirs_removed, 0);
+    assert_eq!(report.agent_workspace_dirs_removed, 0);
     assert!(workspace.transcript_dir().exists());
     assert!(workspace.debug_dir().exists());
     assert!(!workspace.audio_dir().exists());
