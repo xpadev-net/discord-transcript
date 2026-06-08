@@ -557,15 +557,15 @@ describe("App access controls", () => {
 
     renderApp("/admin/plans", fetchMock);
 
-    expect(await screen.findByRole("link", { name: "管理" })).toBeTruthy();
+    await screen.findByRole("link", { name: "管理" });
     fireEvent.change(screen.getByLabelText("管理トークン"), {
       target: { value: "admin-token" },
     });
     fireEvent.click(screen.getByRole("button", { name: "適用" }));
 
-    expect(await screen.findByText("Default Plan")).toBeTruthy();
-    expect(screen.getByText("Beta Plan")).toBeTruthy();
-    expect(screen.getByText("guild-1 -> Default Plan")).toBeTruthy();
+    await screen.findByText("Default Plan");
+    screen.getByText("Beta Plan");
+    screen.getByText("guild-1 -> Default Plan");
   });
 
   it("sends null limit_value when creating an unlimited quota", async () => {

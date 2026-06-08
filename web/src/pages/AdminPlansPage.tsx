@@ -708,6 +708,7 @@ export function AdminPlansPage() {
       mountedRef.current && refreshRequestIdRef.current === requestId;
     setActiveOperation("load");
     setError(null);
+    setMessage(null);
     try {
       const assignmentList = await fetchAdminGuildPlanAssignments({
         ...assignmentQueryFromFilters(assignmentFilters),
