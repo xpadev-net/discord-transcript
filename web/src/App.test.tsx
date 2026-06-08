@@ -731,6 +731,129 @@ describe("App access controls", () => {
     await screen.findByRole("heading", { name: "Usage" });
     expect(calledUrls).toContain("/api/guild/jobs?limit=100");
     expect(calledUrls).not.toContain("/api/guild/settings");
+    screen.getByRole("link", { name: "Usage" });
+    screen.getByRole("link", { name: "Jobs" });
+    expect(screen.queryByRole("link", { name: "Audit" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Retention" })).toBeNull();
+  });
+
+  it("blocks direct retention access for usage-only users before loading settings", async () => {
+    const calledUrls: string[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      calledUrls.push(url);
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "usage-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_usage: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/retention", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(calledUrls).not.toContain("/api/guild/settings");
+    expect(calledUrls).not.toContain("/api/guild/meetings?page=1&limit=100");
+  });
+
+  it("opens guild admin surfaces for admin-view RBAC users", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-view-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_admin: true,
+            can_view_usage: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/audit", fetchMock);
+
+    await screen.findByRole("heading", { name: "Audit" });
+    screen.getByRole("link", { name: "Audit" });
+    expect(screen.queryByRole("link", { name: "Usage" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Jobs" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Retention" })).toBeNull();
+  });
+
+  it("blocks direct usage access for admin-view-only RBAC users before loading usage data", async () => {
+    const calledUrls: string[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      calledUrls.push(url);
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-view-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_admin: true,
+            can_view_usage: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/usage", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(calledUrls).not.toContain("/api/guild/meetings?page=1&limit=100");
+    expect(calledUrls).not.toContain("/api/guild/jobs?limit=100");
+  });
+
+  it("blocks direct jobs access for admin-view-only RBAC users before loading jobs", async () => {
+    const calledUrls: string[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      calledUrls.push(url);
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-view-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_admin: true,
+            can_view_usage: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/jobs", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(calledUrls).not.toContain("/api/guild/jobs?status=failed&limit=100");
+    expect(calledUrls).not.toContain("/api/guild/jobs?limit=100");
   });
 
   it("shows failed jobs with read-only status filters", async () => {

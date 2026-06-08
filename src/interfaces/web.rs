@@ -3076,6 +3076,7 @@ struct CurrentUserResponse {
     guild_id: String,
     is_admin: bool,
     can_manage_settings: bool,
+    can_view_admin: bool,
     can_view_usage: bool,
     can_reprocess_meetings: bool,
     can_manage_domain_knowledge: bool,
@@ -6010,6 +6011,16 @@ async fn api_me(
         false,
     )
     .await?;
+    let can_view_admin_permission = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::AdminView,
+        false,
+        false,
+    )
+    .await?;
+    let can_view_admin = can_view_admin_permission;
     let can_reprocess_meetings = current_user_has_rbac_permission_for_auth(
         &state,
         auth,
@@ -6042,6 +6053,7 @@ async fn api_me(
         guild_id: auth.guild_id.clone(),
         is_admin,
         can_manage_settings,
+        can_view_admin,
         can_view_usage,
         can_reprocess_meetings,
         can_manage_domain_knowledge,
@@ -6134,6 +6146,24 @@ async fn api_admin_create_plan(
     let request: AdminPlanUpsertRequest = parse_json_request_body(&body)?;
     let normalized = normalize_admin_plan_request(&request, "active")?;
     let kind = normalized.kind.as_str().to_owned();
+    require_audit_event(
+        &state,
+        web_audit_event(
+            None,
+            Some(user_id),
+            "plan.create",
+            "plan",
+            Some(normalized.id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/admin/plans"),
+            json!({
+                "code": normalized.code.clone(),
+                "name": normalized.name.clone(),
+                "kind": kind.clone(),
+                "status": normalized.status.clone(),
+            }),
+        ),
+    )
+    .await?;
     let row = state
         .db
         .query_one(
@@ -6150,24 +6180,6 @@ async fn api_admin_create_plan(
         .map_err(|err| admin_plan_mutation_status(&err))?;
     let plan_id: String = row.get("id");
     let response = load_admin_plan_by_id(&state, &plan_id).await?;
-    record_audit_event(
-        &state,
-        web_audit_event(
-            None,
-            Some(user_id),
-            "plan.create",
-            "plan",
-            Some(response.id.clone()),
-            audit_request_metadata(&headers, "POST", "/api/admin/plans"),
-            json!({
-                "code": response.code.clone(),
-                "name": response.name.clone(),
-                "kind": response.kind.clone(),
-                "status": response.status.clone(),
-            }),
-        ),
-    )
-    .await;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -6183,6 +6195,24 @@ async fn api_admin_update_plan(
     let request: AdminPlanUpsertRequest = parse_json_request_body(&body)?;
     let normalized = normalize_admin_plan_request(&request, "")?;
     let kind = normalized.kind.as_str().to_owned();
+    require_audit_event(
+        &state,
+        web_audit_event(
+            None,
+            Some(user_id),
+            "plan.update",
+            "plan",
+            Some(plan_id.clone()),
+            audit_request_metadata(&headers, "PUT", &format!("/api/admin/plans/{plan_id}")),
+            json!({
+                "code": normalized.code.clone(),
+                "name": normalized.name.clone(),
+                "kind": kind.clone(),
+                "status": normalized.status.clone(),
+            }),
+        ),
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -6200,24 +6230,6 @@ async fn api_admin_update_plan(
         .ok_or(StatusCode::NOT_FOUND)?;
     let updated_plan_id: String = row.get("id");
     let response = load_admin_plan_by_id(&state, &updated_plan_id).await?;
-    record_audit_event(
-        &state,
-        web_audit_event(
-            None,
-            Some(user_id),
-            "plan.update",
-            "plan",
-            Some(response.id.clone()),
-            audit_request_metadata(&headers, "PUT", &format!("/api/admin/plans/{plan_id}")),
-            json!({
-                "code": response.code.clone(),
-                "name": response.name.clone(),
-                "kind": response.kind.clone(),
-                "status": response.status.clone(),
-            }),
-        ),
-    )
-    .await;
     Ok(Json(response))
 }
 
@@ -6229,6 +6241,25 @@ async fn api_admin_archive_plan(
 ) -> Result<Json<AdminPlanResponse>, StatusCode> {
     require_system_admin_request(&state, &headers, &user_id).await?;
     validate_admin_plan_id(&plan_id)?;
+    require_audit_event(
+        &state,
+        web_audit_event(
+            None,
+            Some(user_id),
+            "plan.archive",
+            "plan",
+            Some(plan_id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/admin/plans/{plan_id}/archive"),
+            ),
+            json!({
+                "plan_id": plan_id.clone(),
+            }),
+        ),
+    )
+    .await?;
     let row = state
         .db
         .query_opt(ARCHIVE_ADMIN_PLAN_SQL, &[&plan_id])
@@ -6237,27 +6268,6 @@ async fn api_admin_archive_plan(
         .ok_or(StatusCode::NOT_FOUND)?;
     let archived_plan_id: String = row.get("id");
     let response = load_admin_plan_by_id(&state, &archived_plan_id).await?;
-    record_audit_event(
-        &state,
-        web_audit_event(
-            None,
-            Some(user_id),
-            "plan.archive",
-            "plan",
-            Some(response.id.clone()),
-            audit_request_metadata(
-                &headers,
-                "POST",
-                &format!("/api/admin/plans/{plan_id}/archive"),
-            ),
-            json!({
-                "code": response.code.clone(),
-                "name": response.name.clone(),
-                "status": response.status.clone(),
-            }),
-        ),
-    )
-    .await;
     Ok(Json(response))
 }
 
@@ -6315,6 +6325,30 @@ async fn api_admin_create_plan_quota(
     let limit_value = normalized.limit.limit_value();
     let unlimited = normalized.limit.is_unlimited();
     let enforcement_mode = normalized.enforcement_mode.as_str().to_owned();
+    require_audit_event(
+        &state,
+        web_audit_event(
+            None,
+            Some(user_id),
+            "plan_quota.create",
+            "plan_quota",
+            Some(normalized.id.clone()),
+            audit_request_metadata(
+                &headers,
+                "POST",
+                &format!("/api/admin/plans/{plan_id}/quotas"),
+            ),
+            json!({
+                "plan_id": plan_id.clone(),
+                "dimension": dimension.clone(),
+                "period": period.clone(),
+                "limit_value": limit_value,
+                "unlimited": unlimited,
+                "enforcement_mode": enforcement_mode.clone(),
+            }),
+        ),
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -6333,30 +6367,6 @@ async fn api_admin_create_plan_quota(
         .map_err(|err| admin_plan_quota_mutation_status(&err))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let response = admin_plan_quota_response_from_row(&row);
-    record_audit_event(
-        &state,
-        web_audit_event(
-            None,
-            Some(user_id),
-            "plan_quota.create",
-            "plan_quota",
-            Some(response.id.clone()),
-            audit_request_metadata(
-                &headers,
-                "POST",
-                &format!("/api/admin/plans/{plan_id}/quotas"),
-            ),
-            json!({
-                "plan_id": response.plan_id.clone(),
-                "dimension": response.dimension.clone(),
-                "period": response.period.clone(),
-                "limit_value": response.limit_value,
-                "unlimited": response.unlimited,
-                "enforcement_mode": response.enforcement_mode.clone(),
-            }),
-        ),
-    )
-    .await;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -6376,6 +6386,25 @@ async fn api_admin_update_plan_quota(
     let limit_value = normalized.limit.limit_value();
     let unlimited = normalized.limit.is_unlimited();
     let enforcement_mode = normalized.enforcement_mode.as_str().to_owned();
+    require_audit_event(
+        &state,
+        web_audit_event(
+            None,
+            Some(user_id),
+            "plan_quota.update",
+            "plan_quota",
+            Some(quota_id.clone()),
+            audit_request_metadata(&headers, "PUT", &format!("/api/admin/quotas/{quota_id}")),
+            json!({
+                "dimension": dimension.clone(),
+                "period": period.clone(),
+                "limit_value": limit_value,
+                "unlimited": unlimited,
+                "enforcement_mode": enforcement_mode.clone(),
+            }),
+        ),
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -6393,26 +6422,6 @@ async fn api_admin_update_plan_quota(
         .map_err(|err| admin_plan_quota_mutation_status(&err))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let response = admin_plan_quota_response_from_row(&row);
-    record_audit_event(
-        &state,
-        web_audit_event(
-            None,
-            Some(user_id),
-            "plan_quota.update",
-            "plan_quota",
-            Some(response.id.clone()),
-            audit_request_metadata(&headers, "PUT", &format!("/api/admin/quotas/{quota_id}")),
-            json!({
-                "plan_id": response.plan_id.clone(),
-                "dimension": response.dimension.clone(),
-                "period": response.period.clone(),
-                "limit_value": response.limit_value,
-                "unlimited": response.unlimited,
-                "enforcement_mode": response.enforcement_mode.clone(),
-            }),
-        ),
-    )
-    .await;
     Ok(Json(response))
 }
 
@@ -6424,6 +6433,21 @@ async fn api_admin_delete_plan_quota(
 ) -> Result<Json<AdminPlanQuotaResponse>, StatusCode> {
     require_system_admin_request(&state, &headers, &user_id).await?;
     validate_admin_plan_quota_id(&quota_id)?;
+    require_audit_event(
+        &state,
+        web_audit_event(
+            None,
+            Some(user_id),
+            "plan_quota.delete",
+            "plan_quota",
+            Some(quota_id.clone()),
+            audit_request_metadata(&headers, "DELETE", &format!("/api/admin/quotas/{quota_id}")),
+            json!({
+                "quota_id": quota_id.clone(),
+            }),
+        ),
+    )
+    .await?;
     let row = state
         .db
         .query_opt(DELETE_ADMIN_PLAN_QUOTA_SQL, &[&quota_id])
@@ -6431,23 +6455,6 @@ async fn api_admin_delete_plan_quota(
         .map_err(|err| admin_plan_quota_mutation_status(&err))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let response = admin_plan_quota_response_from_row(&row);
-    record_audit_event(
-        &state,
-        web_audit_event(
-            None,
-            Some(user_id),
-            "plan_quota.delete",
-            "plan_quota",
-            Some(response.id.clone()),
-            audit_request_metadata(&headers, "DELETE", &format!("/api/admin/quotas/{quota_id}")),
-            json!({
-                "plan_id": response.plan_id.clone(),
-                "dimension": response.dimension.clone(),
-                "period": response.period.clone(),
-            }),
-        ),
-    )
-    .await;
     Ok(Json(response))
 }
 
@@ -6520,6 +6527,28 @@ async fn api_admin_create_guild_plan_assignment(
         .map(|valid_until| valid_until.to_rfc3339())
         .unwrap_or_default();
     let assigned_by_user_id = normalized.assigned_by_user_id.unwrap_or_default();
+    require_admin_guild_plan_assignment_audit(
+        &state,
+        &headers,
+        AdminGuildPlanAssignmentAuditRequest {
+            method: "POST",
+            path: "/api/admin/guild-plan-assignments",
+            action: "guild_plan_assignment.create",
+            actor_user_id: &user_id,
+            guild_id: Some(guild_id.clone()),
+            assignment_id: &normalized.id,
+            detail: json!({
+                "tenant_id": tenant_id.clone(),
+                "plan_id": normalized.plan_id.clone(),
+                "status": "active",
+                "source": normalized.source.clone(),
+                "assigned_by_user_id": assigned_by_user_id.clone(),
+                "valid_from": valid_from.clone(),
+                "valid_until": valid_until.clone(),
+            }),
+        },
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -6539,16 +6568,6 @@ async fn api_admin_create_guild_plan_assignment(
         .map_err(|err| admin_guild_plan_assignment_mutation_status(&err))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let response = admin_guild_plan_assignment_response_from_row(&row);
-    record_admin_guild_plan_assignment_audit(
-        &state,
-        &headers,
-        "POST",
-        "/api/admin/guild-plan-assignments",
-        "guild_plan_assignment.create",
-        &user_id,
-        &response,
-    )
-    .await;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -6569,6 +6588,27 @@ async fn api_admin_update_guild_plan_assignment(
         .map(|valid_until| valid_until.to_rfc3339())
         .unwrap_or_default();
     let assigned_by_user_id = normalized.assigned_by_user_id.unwrap_or_default();
+    require_admin_guild_plan_assignment_audit(
+        &state,
+        &headers,
+        AdminGuildPlanAssignmentAuditRequest {
+            method: "PUT",
+            path: &format!("/api/admin/guild-plan-assignments/{assignment_id}"),
+            action: "guild_plan_assignment.update",
+            actor_user_id: &user_id,
+            guild_id: None,
+            assignment_id: &assignment_id,
+            detail: json!({
+                "plan_id": normalized.plan_id.clone(),
+                "status": "active",
+                "source": normalized.source.clone(),
+                "assigned_by_user_id": assigned_by_user_id.clone(),
+                "valid_from": valid_from.clone(),
+                "valid_until": valid_until.clone(),
+            }),
+        },
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -6586,16 +6626,6 @@ async fn api_admin_update_guild_plan_assignment(
         .map_err(|err| admin_guild_plan_assignment_mutation_status(&err))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let response = admin_guild_plan_assignment_response_from_row(&row);
-    record_admin_guild_plan_assignment_audit(
-        &state,
-        &headers,
-        "PUT",
-        &format!("/api/admin/guild-plan-assignments/{assignment_id}"),
-        "guild_plan_assignment.update",
-        &user_id,
-        &response,
-    )
-    .await;
     Ok(Json(response))
 }
 
@@ -6607,6 +6637,23 @@ async fn api_admin_archive_guild_plan_assignment(
 ) -> Result<Json<AdminGuildPlanAssignmentResponse>, StatusCode> {
     require_system_admin_request(&state, &headers, &user_id).await?;
     validate_admin_guild_plan_assignment_id(&assignment_id)?;
+    require_admin_guild_plan_assignment_audit(
+        &state,
+        &headers,
+        AdminGuildPlanAssignmentAuditRequest {
+            method: "POST",
+            path: &format!("/api/admin/guild-plan-assignments/{assignment_id}/archive"),
+            action: "guild_plan_assignment.archive",
+            actor_user_id: &user_id,
+            guild_id: None,
+            assignment_id: &assignment_id,
+            detail: json!({
+                "assignment_id": assignment_id.clone(),
+                "status": "archived",
+            }),
+        },
+    )
+    .await?;
     let row = state
         .db
         .query_opt(ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, &[&assignment_id])
@@ -6614,16 +6661,6 @@ async fn api_admin_archive_guild_plan_assignment(
         .map_err(|err| admin_guild_plan_assignment_mutation_status(&err))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let response = admin_guild_plan_assignment_response_from_row(&row);
-    record_admin_guild_plan_assignment_audit(
-        &state,
-        &headers,
-        "POST",
-        &format!("/api/admin/guild-plan-assignments/{assignment_id}/archive"),
-        "guild_plan_assignment.archive",
-        &user_id,
-        &response,
-    )
-    .await;
     Ok(Json(response))
 }
 
@@ -6925,38 +6962,34 @@ async fn api_admin_retention_meeting_delete(
     }))
 }
 
-async fn record_admin_guild_plan_assignment_audit(
+struct AdminGuildPlanAssignmentAuditRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    action: &'a str,
+    actor_user_id: &'a str,
+    guild_id: Option<String>,
+    assignment_id: &'a str,
+    detail: Value,
+}
+
+async fn require_admin_guild_plan_assignment_audit(
     state: &WebState,
     headers: &HeaderMap,
-    method: &str,
-    path: &str,
-    action: &str,
-    actor_user_id: &str,
-    response: &AdminGuildPlanAssignmentResponse,
-) {
-    record_audit_event(
+    request: AdminGuildPlanAssignmentAuditRequest<'_>,
+) -> Result<(), StatusCode> {
+    require_audit_event(
         state,
         web_audit_event(
-            Some(response.guild_id.clone()),
-            Some(actor_user_id.to_owned()),
-            action,
+            request.guild_id,
+            Some(request.actor_user_id.to_owned()),
+            request.action,
             "guild_plan_assignment",
-            Some(response.id.clone()),
-            audit_request_metadata(headers, method, path),
-            json!({
-                "tenant_id": response.tenant_id.clone(),
-                "plan_id": response.plan_id.clone(),
-                "plan_code": response.plan_code.clone(),
-                "status": response.status.clone(),
-                "source": response.source.clone(),
-                "assigned_by_user_id": response.assigned_by_user_id.clone(),
-                "valid_from": response.valid_from.clone(),
-                "valid_until": response.valid_until.clone(),
-                "period_anchor": response.period_anchor.clone(),
-            }),
+            Some(request.assignment_id.to_owned()),
+            audit_request_metadata(headers, request.method, request.path),
+            request.detail,
         ),
     )
-    .await;
+    .await
 }
 
 fn configured_guild_id(state: &WebState) -> Result<String, StatusCode> {
@@ -12236,6 +12269,7 @@ mod operational_endpoint_tests {
 
 #[cfg(test)]
 mod guild_api_tests {
+    use super::CurrentUserResponse;
     use super::{
         ADMINISTRATOR, AdminGuildPlanAssignmentListQuery, AdminGuildPlanAssignmentUpsertRequest,
         AdminPlanQuotaUpsertRequest, AdminPlanUpsertRequest, AiMemoryUpsertRequest, AuthConfig,
@@ -12430,6 +12464,44 @@ mod guild_api_tests {
             discord_user_guilds_api_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
             Err(StatusCode::BAD_GATEWAY)
         );
+    }
+
+    #[test]
+    fn me_response_exposes_admin_view_capability() {
+        let response = CurrentUserResponse {
+            user_id: "user-1".to_owned(),
+            guild_id: "guild-1".to_owned(),
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_admin: true,
+            can_view_usage: false,
+            can_reprocess_meetings: false,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: false,
+        };
+
+        let serialized = serde_json::to_value(response).expect("response should serialize");
+
+        assert_eq!(serialized["can_view_admin"], true);
+        assert_eq!(serialized["can_view_usage"], false);
+    }
+
+    #[test]
+    fn me_handler_keeps_admin_view_separate_from_usage_view() {
+        let source = include_str!("web.rs");
+        let api_me = source
+            .split_once("async fn api_me")
+            .expect("api_me handler should exist")
+            .1
+            .split_once("async fn api_me_guilds")
+            .expect("next handler should exist")
+            .0;
+
+        assert!(api_me.contains("RbacPermission::UsageView"));
+        assert!(api_me.contains("RbacPermission::AdminView"));
+        assert!(api_me.contains("let can_view_admin = can_view_admin_permission;"));
+        assert!(!api_me.contains("can_view_admin_permission || can_view_usage"));
+        assert!(api_me.contains("can_view_usage,"));
     }
 
     fn stored_settings_with_token(registered: bool) -> StoredGuildSettings {
@@ -13069,6 +13141,30 @@ mod guild_api_tests {
                 panic!("handler section should contain authorization marker {marker}")
             })
         }
+        fn handler_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("handler {start} should exist"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("handler {start} should be followed by {end}"))
+                .0
+        }
+        fn assert_required_audit_before_write(section: &str, write_marker: &str) {
+            assert!(section.contains("require_audit_event"));
+            assert!(!section.contains("record_audit_event("));
+            assert!(
+                marker_index(section, "require_audit_event") < marker_index(section, write_marker)
+            );
+        }
+        fn assert_required_assignment_audit_before_write(section: &str, write_marker: &str) {
+            assert!(section.contains("require_admin_guild_plan_assignment_audit"));
+            assert!(section.contains(".await?"));
+            assert!(
+                marker_index(section, "require_admin_guild_plan_assignment_audit")
+                    < marker_index(section, write_marker)
+            );
+        }
 
         let promote = source
             .split_once("async fn api_promote_ai_memory_to_domain_knowledge")
@@ -13154,40 +13250,88 @@ mod guild_api_tests {
                 < marker_index(rbac_reset, ".query_one")
         );
 
-        let create_plan = source
-            .split_once("async fn api_admin_create_plan")
-            .expect("plan create handler should exist")
-            .1
-            .split_once("async fn api_admin_update_plan")
-            .expect("next handler should exist")
-            .0;
+        let create_plan = handler_section(
+            source,
+            "async fn api_admin_create_plan",
+            "async fn api_admin_update_plan",
+        );
         assert!(
             marker_index(create_plan, "require_system_admin_request")
                 < marker_index(create_plan, "parse_json_request_body")
         );
+        assert_required_audit_before_write(create_plan, "INSERT_ADMIN_PLAN_SQL");
 
-        let create_quota = source
-            .split_once("async fn api_admin_create_plan_quota")
-            .expect("quota create handler should exist")
-            .1
-            .split_once("async fn api_admin_update_plan_quota")
-            .expect("next handler should exist")
-            .0;
+        let update_plan = handler_section(
+            source,
+            "async fn api_admin_update_plan",
+            "async fn api_admin_archive_plan",
+        );
+        assert_required_audit_before_write(update_plan, "UPDATE_ADMIN_PLAN_SQL");
+
+        let archive_plan = handler_section(
+            source,
+            "async fn api_admin_archive_plan",
+            "async fn api_admin_list_plan_quotas",
+        );
+        assert_required_audit_before_write(archive_plan, "ARCHIVE_ADMIN_PLAN_SQL");
+
+        let create_quota = handler_section(
+            source,
+            "async fn api_admin_create_plan_quota",
+            "async fn api_admin_update_plan_quota",
+        );
         assert!(
             marker_index(create_quota, "require_system_admin_request")
                 < marker_index(create_quota, "parse_json_request_body")
         );
+        assert_required_audit_before_write(create_quota, "INSERT_ADMIN_PLAN_QUOTA_SQL");
 
-        let create_assignment = source
-            .split_once("async fn api_admin_create_guild_plan_assignment")
-            .expect("assignment create handler should exist")
-            .1
-            .split_once("async fn api_admin_update_guild_plan_assignment")
-            .expect("next handler should exist")
-            .0;
+        let update_quota = handler_section(
+            source,
+            "async fn api_admin_update_plan_quota",
+            "async fn api_admin_delete_plan_quota",
+        );
+        assert_required_audit_before_write(update_quota, "UPDATE_ADMIN_PLAN_QUOTA_SQL");
+
+        let delete_quota = handler_section(
+            source,
+            "async fn api_admin_delete_plan_quota",
+            "async fn api_admin_list_guild_plan_assignments",
+        );
+        assert_required_audit_before_write(delete_quota, "DELETE_ADMIN_PLAN_QUOTA_SQL");
+
+        let create_assignment = handler_section(
+            source,
+            "async fn api_admin_create_guild_plan_assignment",
+            "async fn api_admin_update_guild_plan_assignment",
+        );
         assert!(
             marker_index(create_assignment, "require_system_admin_request")
                 < marker_index(create_assignment, "parse_json_request_body")
+        );
+        assert_required_assignment_audit_before_write(
+            create_assignment,
+            "INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL",
+        );
+
+        let update_assignment = handler_section(
+            source,
+            "async fn api_admin_update_guild_plan_assignment",
+            "async fn api_admin_archive_guild_plan_assignment",
+        );
+        assert_required_assignment_audit_before_write(
+            update_assignment,
+            "UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL",
+        );
+
+        let archive_assignment = handler_section(
+            source,
+            "async fn api_admin_archive_guild_plan_assignment",
+            "async fn api_admin_retention_overview",
+        );
+        assert_required_assignment_audit_before_write(
+            archive_assignment,
+            "ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL",
         );
 
         let list_assignments = source
@@ -13233,7 +13377,7 @@ mod guild_api_tests {
             .split_once("async fn api_admin_retention_meeting_delete(")
             .expect("retention meeting delete handler should exist")
             .1
-            .split_once("async fn record_admin_guild_plan_assignment_audit")
+            .split_once("async fn require_admin_guild_plan_assignment_audit")
             .expect("next handler should exist")
             .0;
         assert!(
@@ -13244,6 +13388,16 @@ mod guild_api_tests {
             marker_index(meeting_delete, "require_audit_event")
                 < marker_index(meeting_delete, "apply_manual_meeting_filesystem_delete")
         );
+
+        let assignment_audit = source
+            .split_once("async fn require_admin_guild_plan_assignment_audit")
+            .expect("assignment audit helper should exist")
+            .1
+            .split_once("fn configured_guild_id")
+            .expect("next function should exist")
+            .0;
+        assert!(assignment_audit.contains("-> Result<(), StatusCode>"));
+        assert!(assignment_audit.contains("require_audit_event"));
     }
 
     #[test]
@@ -13522,8 +13676,8 @@ mod guild_api_tests {
         let source = include_str!("web.rs");
         assert!(source.contains("SqlState::EXCLUSION_VIOLATION"));
         assert!(source.contains("StatusCode::CONFLICT"));
-        assert!(source.contains("\"name\": response.name.clone()"));
-        assert!(source.contains("\"assigned_by_user_id\": response.assigned_by_user_id.clone()"));
+        assert!(source.contains("\"plan_id\": normalized.plan_id.clone()"));
+        assert!(source.contains("\"assigned_by_user_id\": assigned_by_user_id.clone()"));
         assert!(source.contains("get::<_, Option<String>>(\"period_anchor\")"));
         assert!(
             include_str!("../../migrations/0020_plans_and_quotas.sql")

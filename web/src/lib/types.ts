@@ -13,6 +13,7 @@ export interface MeResponse {
   guild_id: string;
   is_admin: boolean;
   can_manage_settings: boolean;
+  can_view_admin?: boolean;
   can_view_usage: boolean;
   can_reprocess_meetings: boolean;
   can_manage_domain_knowledge: boolean;
