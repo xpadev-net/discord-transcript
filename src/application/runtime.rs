@@ -2219,16 +2219,9 @@ where
                 job_id = %job.id,
                 phase,
                 error = %err,
-                "summary job retry cannot be durably scheduled"
+                "summary job retry ownership was not current after status restore; leaving meeting status unchanged"
             );
-            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
-                |store_err| {
-                    format!(
-                        "{phase} retry failed ({err}) and meeting failure update failed: {store_err}"
-                    )
-                },
-            )?;
-            Ok(true)
+            Ok(false)
         }
     }
 }
@@ -2236,6 +2229,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SummaryCleanupFailureDisposition {
     RetryScheduled,
+    OwnershipLost,
     TerminalStatusUpdated,
 }
 
@@ -2261,7 +2255,7 @@ where
             error = %err,
             "summary cleanup retry skipped because job ownership could not be proven"
         );
-        return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
+        return SummaryCleanupFailureDisposition::OwnershipLost;
     }
     let reverted = store
         .set_meeting_status(
@@ -7329,6 +7323,9 @@ impl ScaffoldHandler {
             return match disposition {
                 SummaryCleanupFailureDisposition::RetryScheduled => {
                     Err(retry_scheduled_error(&claimed_job, err_string))
+                }
+                SummaryCleanupFailureDisposition::OwnershipLost => {
+                    Err(SummaryJobRunError::NotClaimable(err_string))
                 }
                 SummaryCleanupFailureDisposition::TerminalStatusUpdated => {
                     if self

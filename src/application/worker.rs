@@ -478,7 +478,14 @@ pub(crate) fn mark_summary_meeting_failed_from_summary_state<S: MeetingStore>(
     ] {
         match store.set_meeting_status(meeting_id, MeetingStatus::Failed, Some(expected)) {
             Ok(()) => {
-                store.set_error_message(meeting_id, Some(error_message))?;
+                if let Err(err) = store.set_error_message(meeting_id, Some(error_message)) {
+                    warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "mark_summary_meeting_failed_from_summary_state set_meeting_status succeeded but set_error_message failed"
+                    );
+                    return Err(err);
+                }
                 return Ok(true);
             }
             Err(StoreError::CasConflict { .. }) => continue,
