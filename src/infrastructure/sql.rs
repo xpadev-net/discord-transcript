@@ -318,6 +318,7 @@ SET retention_raw_cleaned_at=NOW(),
     updated_at=NOW()
 WHERE id=$1
   AND guild_id=$2
+  AND status IN ('posted', 'failed', 'aborted')
   AND retention_raw_cleaned_at IS NULL
 "#;
 

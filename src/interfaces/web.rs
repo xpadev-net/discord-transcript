@@ -6921,23 +6921,53 @@ fn estimate_plan_filesystem_usage(
 ) -> Result<RetentionStorageUsage, String> {
     let mut usage = RetentionStorageUsage::default();
     for meeting in &plan.raw_workspaces {
-        let meeting_usage = estimate_meeting_filesystem_usage(layout, meeting)?;
-        usage.raw_audio_bytes = usage
-            .raw_audio_bytes
-            .saturating_add(meeting_usage.raw_audio_bytes);
-        usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
+        match estimate_meeting_filesystem_usage(layout, meeting) {
+            Ok(meeting_usage) => {
+                usage.raw_audio_bytes = usage
+                    .raw_audio_bytes
+                    .saturating_add(meeting_usage.raw_audio_bytes);
+                usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    meeting_id = %meeting.meeting_id,
+                    "failed to estimate retention cleanup filesystem usage"
+                );
+            }
+        }
     }
     for meeting in &plan.transcript_workspaces {
-        let meeting_usage = estimate_meeting_filesystem_usage(layout, meeting)?;
-        usage.transcript_bytes = usage
-            .transcript_bytes
-            .saturating_add(meeting_usage.transcript_bytes);
+        match estimate_meeting_filesystem_usage(layout, meeting) {
+            Ok(meeting_usage) => {
+                usage.transcript_bytes = usage
+                    .transcript_bytes
+                    .saturating_add(meeting_usage.transcript_bytes);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    meeting_id = %meeting.meeting_id,
+                    "failed to estimate retention cleanup filesystem usage"
+                );
+            }
+        }
     }
     for meeting in &plan.summary_workspaces {
-        let meeting_usage = estimate_meeting_filesystem_usage(layout, meeting)?;
-        usage.summary_bytes = usage
-            .summary_bytes
-            .saturating_add(meeting_usage.summary_bytes);
+        match estimate_meeting_filesystem_usage(layout, meeting) {
+            Ok(meeting_usage) => {
+                usage.summary_bytes = usage
+                    .summary_bytes
+                    .saturating_add(meeting_usage.summary_bytes);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    meeting_id = %meeting.meeting_id,
+                    "failed to estimate retention cleanup filesystem usage"
+                );
+            }
+        }
     }
     Ok(usage)
 }
@@ -12054,6 +12084,10 @@ mod guild_api_tests {
         );
         assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("WHERE id=$1"));
         assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("AND guild_id=$2"));
+        assert!(
+            ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL
+                .contains("status IN ('posted', 'failed', 'aborted')")
+        );
         assert!(
             ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL.contains("WHERE meeting_id = $1")
         );
