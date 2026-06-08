@@ -922,7 +922,11 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
             secret_ai_memory_body,
             updated_at,
         )],
-        user_feedback: vec![accepted_feedback("fb-1", secret_feedback_note, updated_at)],
+        user_feedback: vec![{
+            let mut feedback = accepted_feedback("fb-1", secret_feedback_note, updated_at);
+            feedback.meeting_id = Some("m1".to_owned());
+            feedback
+        }],
         person_aliases: vec![person_alias("alias-1", "Alice Example", "alice", updated_at)],
         summary_template: Some(SummaryTemplate {
             id: "st-1".to_owned(),
@@ -1279,6 +1283,52 @@ fn materialized_summary_context_rejects_cross_meeting_feedback_for_same_speaker(
     assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_FEEDBACK"));
     assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_GUIDANCE"));
     assert!(!rendered.contains("fb-same-speaker-private"));
+}
+
+#[test]
+fn materialized_summary_context_rejects_cross_meeting_feedback_phrase_overlap() {
+    let temp = unique_workspace("context_private_feedback_phrase_overlap", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Release health".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut feedback = accepted_feedback(
+        "fb-private-phrase-overlap",
+        "PRIVATE_PHRASE_OVERLAP_NOTE release health status",
+        updated_at,
+    );
+    feedback.meeting_id = Some("m-private".to_owned());
+    feedback.corrected_text = Some("PRIVATE_PHRASE_OVERLAP_GUIDANCE release health".to_owned());
+    let context = SummaryContextInput {
+        user_feedback: vec![feedback],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest =
+        materialize_summary_context(&request, &context, Some("We discussed release health today."))
+            .expect("context should materialize");
+
+    assert_eq!(manifest.user_feedback_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_user_feedback_path()).expect("feedback");
+    assert!(!rendered.contains("PRIVATE_PHRASE_OVERLAP_NOTE"));
+    assert!(!rendered.contains("PRIVATE_PHRASE_OVERLAP_GUIDANCE"));
+    assert!(!rendered.contains("fb-private-phrase-overlap"));
 }
 
 #[test]

@@ -995,11 +995,16 @@ impl ContextRelevanceEvidence {
     }
 
     fn matches_feedback(&self, feedback: &TranscriptFeedback) -> bool {
-        feedback.meeting_id.as_deref() == Some(self.meeting_id.as_str())
-            || feedback
-                .original_text
-                .as_ref()
-                .is_some_and(|value| self.contains_phrase(value))
+        if feedback.meeting_id.as_deref() == Some(self.meeting_id.as_str()) {
+            return true;
+        }
+        if feedback.meeting_id.is_some() {
+            return false;
+        }
+        feedback
+            .original_text
+            .as_ref()
+            .is_some_and(|value| self.contains_phrase(value))
             || feedback
                 .corrected_text
                 .as_ref()
@@ -1012,7 +1017,7 @@ impl ContextRelevanceEvidence {
 
     fn contains_phrase(&self, value: &str) -> bool {
         let normalized = normalize_context_evidence(value);
-        let tokens = context_evidence_tokens(value);
+        let tokens = context_evidence_tokens(&normalized);
         (tokens.len() >= 2
             && normalized.chars().count() >= 8
             && self.normalized_haystack.contains(&normalized))
@@ -1042,8 +1047,8 @@ fn normalize_context_evidence(value: &str) -> String {
         .join(" ")
 }
 
-fn context_evidence_tokens(value: &str) -> Vec<String> {
-    normalize_context_evidence(value)
+fn context_evidence_tokens(normalized: &str) -> Vec<String> {
+    normalized
         .split_whitespace()
         .filter(|token| token.chars().count() >= 4 && !is_weak_context_evidence_token(token))
         .map(str::to_owned)
