@@ -48,8 +48,8 @@ use crate::infrastructure::integrations::{
 use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
-    RECOVERY_READY_SUMMARY_JOBS_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL,
-    RECOVERY_SCAN_SQL, RECOVERY_SUMMARY_JOB_STATUS_SQL,
+    RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
+    RECOVERY_SUMMARY_JOB_STATUS_SQL,
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
 use crate::infrastructure::storage::{
@@ -3088,14 +3088,8 @@ impl ScaffoldHandler {
     async fn wake_ready_summary_jobs(&self, http: Arc<Http>) {
         let meeting_ids = {
             let mut queue = self.queue.lock().await;
-            match queue
-                .executor
-                .query_rows(RECOVERY_READY_SUMMARY_JOBS_SQL, &[])
-            {
-                Ok(rows) => rows
-                    .into_iter()
-                    .filter_map(|row| row.first().and_then(|value| value.clone()))
-                    .collect::<Vec<_>>(),
+            match queue.ready_summary_meeting_ids() {
+                Ok(meeting_ids) => meeting_ids,
                 Err(err) => {
                     warn!(
                         error = %err,

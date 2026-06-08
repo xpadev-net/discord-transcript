@@ -1311,15 +1311,22 @@ WITH requeued AS (
         leased_until=NULL,
         claim_token=NULL,
         updated_at=NOW()
-    WHERE job_type='summarize'
-      AND status='running'
-      AND (
-        (leased_until IS NOT NULL AND leased_until < NOW())
-        OR (
-          leased_until IS NULL
-          AND updated_at < NOW() - INTERVAL '15 minutes'
-        )
-      )
+    WHERE id IN (
+        SELECT id
+        FROM jobs
+        WHERE job_type='summarize'
+          AND status='running'
+          AND (
+            (leased_until IS NOT NULL AND leased_until < NOW())
+            OR (
+              leased_until IS NULL
+              AND updated_at < NOW() - INTERVAL '15 minutes'
+            )
+          )
+        ORDER BY updated_at, id
+        LIMIT 25
+        FOR UPDATE SKIP LOCKED
+    )
     RETURNING meeting_id
 )
 SELECT DISTINCT meeting_id

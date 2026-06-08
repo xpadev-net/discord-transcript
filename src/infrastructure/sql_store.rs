@@ -41,12 +41,12 @@ use crate::infrastructure::sql::{
     LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_RECENT_USAGE_EVENTS_SQL,
     LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
     MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
-    RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
-    SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL,
-    UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
-    UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
-    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
-    migration_transaction_sql,
+    RECOVERY_READY_SUMMARY_JOBS_SQL, RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
+    RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
+    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL, migration_transaction_sql,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -941,6 +941,17 @@ pub struct SqlJobQueue<E: SqlExecutor> {
 impl<E: SqlExecutor> SqlJobQueue<E> {
     pub fn new(executor: E) -> Self {
         Self { executor }
+    }
+
+    pub fn ready_summary_meeting_ids(&mut self) -> Result<Vec<String>, QueueError> {
+        self.executor
+            .query_rows(RECOVERY_READY_SUMMARY_JOBS_SQL, &[])
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|row| row.first().and_then(|value| value.clone()))
+                    .collect()
+            })
+            .map_err(QueueError::Backend)
     }
 }
 
