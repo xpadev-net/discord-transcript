@@ -211,6 +211,23 @@ fn rbac_resolver_ignores_deleted_or_missing_roles() {
 }
 
 #[test]
+fn rbac_resolver_ignores_matching_roles_from_other_guilds() {
+    let roles = vec!["role-ops".to_owned()];
+    let grants = vec![grant("g2", "role-ops", RbacPermission::MeetingDelete)];
+
+    let decision = resolve_rbac_permission(
+        RbacPermission::MeetingDelete,
+        "g1",
+        RbacSubject::default(),
+        MemberRoleSource::Available(&roles),
+        &grants,
+    );
+
+    assert!(!decision.allowed);
+    assert_eq!(decision.source, PermissionDecisionSource::NoGrant);
+}
+
+#[test]
 fn rbac_resolver_fails_closed_when_member_roles_are_unavailable() {
     let grants = vec![grant("g1", "role-ops", RbacPermission::MeetingDelete)];
 
