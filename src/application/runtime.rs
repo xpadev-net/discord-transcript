@@ -6073,13 +6073,22 @@ impl ScaffoldHandler {
                         | SummaryJobRunError::RetryScheduled { message, .. } => message,
                     })?;
                 let summary_url = self.meeting_url(meeting_id);
-                let meeting = self.load_meeting(meeting_id).await?;
                 let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
                 } else {
                     output.chunks
                 };
-                let chunks = summary_chunks_with_voice_channel_metadata(&meeting, chunks);
+                let chunks = match self.load_meeting(meeting_id).await {
+                    Ok(meeting) => summary_chunks_with_voice_channel_metadata(&meeting, chunks),
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "failed to load meeting voice channel metadata for summary post"
+                        );
+                        chunks
+                    }
+                };
                 if let Err(err) =
                     post_summary_to_report_channel(&http, report_channel_id, &chunks).await
                 {
