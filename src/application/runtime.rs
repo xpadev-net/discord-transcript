@@ -1636,34 +1636,20 @@ fn persist_transcript_segments<E: SqlExecutor>(
     segments: &[TranscriptSegment],
 ) -> Result<(), TranscriptPersistError> {
     if segments.is_empty() {
-        executor
-            .execute(
-                "DELETE FROM transcripts WHERE meeting_id=$1",
-                &[meeting_id.to_owned()],
-            )
-            .map(|_| ())
-            .map_err(|err| {
-                TranscriptPersistError::Database(format!(
-                    "failed to clear old transcript segments: {err}"
-                ))
-            })?;
         return Ok(());
     }
 
     let ordered_segments = ordered_transcript_segments(segments);
-    let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(
-        ordered_segments.len(),
-        1,
-    );
-    let sql = format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
-    let mut params = Vec::with_capacity(ordered_segments.len() * 9 + 1);
-    params.push(meeting_id.to_owned());
+    let mut params = Vec::with_capacity(ordered_segments.len() * 9);
+    let mut final_row_ids = Vec::with_capacity(ordered_segments.len());
     for (i, seg) in ordered_segments.iter().enumerate() {
         let start_ms = db_safe_transcript_timestamp_ms(i, "start_ms", seg.start_ms)
             .map_err(TranscriptPersistError::Validation)?;
         let end_ms = db_safe_transcript_timestamp_ms(i, "end_ms", seg.end_ms)
             .map_err(TranscriptPersistError::Validation)?;
-        params.push(format!("{meeting_id}-t-{i}"));
+        let row_id = format!("{meeting_id}-t-{i}");
+        final_row_ids.push(row_id.clone());
+        params.push(row_id);
         params.push(meeting_id.to_owned());
         params.push(seg.speaker_id.clone());
         params.push(start_ms.to_string());
@@ -1674,9 +1660,67 @@ fn persist_transcript_segments<E: SqlExecutor>(
         params.push(seg.source.as_str().to_owned());
     }
 
-    executor.execute(&sql, &params).map(|_| ()).map_err(|err| {
-        TranscriptPersistError::Database(format!("failed to persist transcript segments: {err}"))
-    })
+    executor.execute("BEGIN", &[]).map(|_| ()).map_err(|err| {
+        TranscriptPersistError::Database(format!(
+            "failed to begin transcript persistence transaction: {err}"
+        ))
+    })?;
+
+    let result = (|| {
+        let sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(
+            ordered_segments.len(),
+            0,
+        );
+        executor.execute(&sql, &params).map_err(|err| {
+            TranscriptPersistError::Database(format!(
+                "failed to persist transcript segments: {err}"
+            ))
+        })?;
+
+        let placeholders = (0..final_row_ids.len())
+            .map(|i| format!("${}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stale_sql = format!(
+            "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='final' AND id NOT IN ({placeholders})"
+        );
+        let mut stale_params = Vec::with_capacity(final_row_ids.len() + 1);
+        stale_params.push(meeting_id.to_owned());
+        stale_params.extend(final_row_ids.clone());
+        executor.execute(&stale_sql, &stale_params).map_err(|err| {
+            TranscriptPersistError::Database(format!(
+                "failed to clear stale final transcript segments: {err}"
+            ))
+        })?;
+
+        executor
+            .execute(
+                "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live'",
+                &[meeting_id.to_owned()],
+            )
+            .map_err(|err| {
+                TranscriptPersistError::Database(format!(
+                    "failed to clear live transcript segments after final persistence: {err}"
+                ))
+            })?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => match executor.execute("COMMIT", &[]) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let _ = executor.execute("ROLLBACK", &[]);
+                Err(TranscriptPersistError::Database(format!(
+                    "failed to commit transcript persistence transaction: {err}"
+                )))
+            }
+        },
+        Err(err) => {
+            let _ = executor.execute("ROLLBACK", &[]);
+            Err(err)
+        }
+    }
 }
 
 fn live_chunk_id(chunk: &PersistedChunk) -> String {
@@ -1905,7 +1949,7 @@ fn parse_transcript_row(row: &[Option<String>]) -> Result<TranscriptSegment, Str
 fn load_live_transcript_segments<E: SqlExecutor>(
     executor: &mut E,
     meeting_id: &str,
-    final_timeline_base_ms: u64,
+    final_timeline_base_ms: Option<u64>,
 ) -> Result<Vec<TranscriptSegment>, String> {
     let rows = executor.query_rows(
         "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, c.timeline_base_ms \
@@ -1919,7 +1963,9 @@ fn load_live_transcript_segments<E: SqlExecutor>(
         .iter()
         .map(|row| {
             let mut segment = parse_transcript_row(row)?;
-            if let Some(Some(base)) = row.get(7) {
+            if let (Some(final_timeline_base_ms), Some(Some(base))) =
+                (final_timeline_base_ms, row.get(7))
+            {
                 let live_base = base
                     .parse::<u64>()
                     .map_err(|err| format!("invalid live timeline_base_ms: {err}"))?;
@@ -1935,6 +1981,25 @@ fn load_live_transcript_segments<E: SqlExecutor>(
             }
             Ok(segment)
         })
+        .collect::<Result<Vec<_>, String>>()?;
+    sort_transcript_segments(&mut segments);
+    Ok(segments)
+}
+
+fn load_final_transcript_segments<E: SqlExecutor>(
+    executor: &mut E,
+    meeting_id: &str,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let rows = executor.query_rows(
+        "SELECT speaker_id, start_ms, end_ms, text, confidence, is_noisy, source \
+         FROM transcripts \
+         WHERE meeting_id=$1 AND transcript_stage='final' AND NOT is_deleted \
+         ORDER BY start_ms, end_ms, CASE source WHEN 'voice' THEN 0 ELSE 1 END, substring(id from '-t-([0-9]+)$')::INTEGER NULLS LAST, id",
+        &[meeting_id.to_owned()],
+    )?;
+    let mut segments = rows
+        .iter()
+        .map(|row| parse_transcript_row(row))
         .collect::<Result<Vec<_>, String>>()?;
     sort_transcript_segments(&mut segments);
     Ok(segments)
@@ -6610,82 +6675,125 @@ impl ScaffoldHandler {
         }
         let _heartbeat_guard = SummaryJobHeartbeatGuard(heartbeat_task);
 
-        let audio_path = match merge_user_chunks_to_mixdown(
-            &meeting_dir,
-            effective_settings.whisper_resample_to_16k,
-        ) {
-            Ok(path) => path,
-            Err(err) => {
-                let err_string = format!("merge failed: {err}");
-                let mut queue = self.queue.lock().await;
-                let exhausted = retry_claimed_summary_job(
-                    &mut *queue,
-                    &claimed_job,
-                    err_string.clone(),
-                    self.summary_max_retries,
-                    "merge",
-                );
-                drop(queue);
-                if exhausted {
-                    let mut service = self.service.lock().await;
-                    let _ = mark_summary_meeting_failed_from_summary_state(
-                        &mut service.store,
-                        &claimed_job.meeting_id,
-                        err_string.clone(),
-                    );
-                    return Err(SummaryJobRunError::Terminal(err_string));
-                }
-                return Err(retry_scheduled_error(&claimed_job, err_string));
-            }
-        };
-
-        let final_timeline_base_ms = match load_chunks(&meeting_dir) {
-            Ok(chunks) => compute_meeting_start_ms(&chunks),
-            Err(err) => {
-                warn!(
-                    meeting_id = %meeting.id,
-                    error = %err,
-                    "failed to compute final transcript timeline base; live transcript rows will not be timeline-adjusted"
-                );
-                0
-            }
-        };
-
-        let (live_segments, completed_live_chunks) = {
+        let final_segments = {
             let mut service = self.service.lock().await;
-            let live_segments = match load_live_transcript_segments(
-                &mut service.store.executor,
-                &meeting.id,
-                final_timeline_base_ms,
-            ) {
+            match load_final_transcript_segments(&mut service.store.executor, &meeting.id) {
                 Ok(value) => value,
                 Err(err) => {
                     warn!(
                         meeting_id = %meeting.id,
                         error = %err,
-                        "failed to load live transcript segments; final transcription will process all audio"
+                        "failed to load existing final transcript segments; final transcription will rebuild from audio or live rows"
                     );
                     Vec::new()
                 }
-            };
-            let completed_live_chunks = match load_completed_live_transcription_chunks(
-                &mut service.store.executor,
-                &meeting.id,
+            }
+        };
+        let recovered_from_final_segments = !final_segments.is_empty();
+        let (audio_path, live_segments, completed_live_chunks) = if recovered_from_final_segments {
+            (
+                workspace
+                    .audio_dir()
+                    .join("mixdown.wav")
+                    .to_string_lossy()
+                    .to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let audio_path = match merge_user_chunks_to_mixdown(
+                &meeting_dir,
+                effective_settings.whisper_resample_to_16k,
             ) {
-                Ok(value) => value,
+                Ok(path) => path,
+                Err(err) => {
+                    let err_string = format!("merge failed: {err}");
+                    let mut queue = self.queue.lock().await;
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "merge",
+                    );
+                    drop(queue);
+                    if exhausted {
+                        let mut service = self.service.lock().await;
+                        let _ = mark_summary_meeting_failed_from_summary_state(
+                            &mut service.store,
+                            &claimed_job.meeting_id,
+                            err_string.clone(),
+                        );
+                        return Err(SummaryJobRunError::Terminal(err_string));
+                    }
+                    return Err(retry_scheduled_error(&claimed_job, err_string));
+                }
+            };
+
+            let final_timeline_base_ms = match load_chunks(&meeting_dir) {
+                Ok(chunks) => Some(compute_meeting_start_ms(&chunks)),
                 Err(err) => {
                     warn!(
                         meeting_id = %meeting.id,
                         error = %err,
-                        "failed to load completed live chunks; final transcription will process all audio"
+                        "failed to compute final transcript timeline base; live transcript rows will not be timeline-adjusted"
                     );
-                    Vec::new()
+                    None
                 }
             };
-            (live_segments, completed_live_chunks)
+
+            let (live_segments, completed_live_chunks) = {
+                let mut service = self.service.lock().await;
+                let mut live_segments = match load_live_transcript_segments(
+                    &mut service.store.executor,
+                    &meeting.id,
+                    final_timeline_base_ms,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %meeting.id,
+                            error = %err,
+                            "failed to load live transcript segments; final transcription will process all audio"
+                        );
+                        Vec::new()
+                    }
+                };
+                let completed_live_chunks = if live_segments.is_empty() {
+                    Vec::new()
+                } else {
+                    match load_completed_live_transcription_chunks(
+                        &mut service.store.executor,
+                        &meeting.id,
+                    ) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!(
+                                meeting_id = %meeting.id,
+                                error = %err,
+                                "failed to load completed live chunks; final transcription will process all audio"
+                            );
+                            live_segments.clear();
+                            Vec::new()
+                        }
+                    }
+                };
+                (live_segments, completed_live_chunks)
+            };
+
+            (audio_path, live_segments, completed_live_chunks)
         };
 
-        let speaker_audio = match if completed_live_chunks.is_empty() {
+        if recovered_from_final_segments {
+            debug!(
+                meeting_id = %claimed_job.meeting_id,
+                "recovered final transcript rows before audio merge"
+            );
+        }
+
+        let speaker_audio = match if !final_segments.is_empty() {
+            Ok(Vec::new())
+        } else if completed_live_chunks.is_empty() {
             build_speaker_audio_inputs(&meeting_dir, effective_settings.whisper_resample_to_16k)
         } else {
             build_speaker_audio_inputs_excluding_processed_chunks(
@@ -6790,8 +6898,9 @@ impl ScaffoldHandler {
             );
         }
 
-        let transcription = if request.speaker_audio.is_empty() && !completed_live_chunks.is_empty()
-        {
+        let transcription = if recovered_from_final_segments {
+            crate::application::summary::build_transcription_output(final_segments.clone())
+        } else if request.speaker_audio.is_empty() && !completed_live_chunks.is_empty() {
             crate::application::summary::build_transcription_output(live_segments.clone())
         } else {
             tokio::task::block_in_place(|| {
@@ -6862,16 +6971,25 @@ impl ScaffoldHandler {
             }
         };
 
-        self.record_asr_seconds_usage(
-            &meeting.guild_id,
-            &claimed_job.meeting_id,
-            &claimed_job.id,
-            &request.audio_path,
-            &transcription,
-        )
-        .await;
+        if !recovered_from_final_segments {
+            self.record_asr_seconds_usage(
+                &meeting.guild_id,
+                &claimed_job.meeting_id,
+                &claimed_job.id,
+                &request.audio_path,
+                &transcription,
+            )
+            .await;
+        }
 
-        if let (Some(started_at), Some(stopped_at)) = (meeting.started_at, meeting.stopped_at) {
+        if recovered_from_final_segments {
+            debug!(
+                meeting_id = %claimed_job.meeting_id,
+                "skipping VC text enrichment because final transcript rows were recovered for retry"
+            );
+        } else if let (Some(started_at), Some(stopped_at)) =
+            (meeting.started_at, meeting.stopped_at)
+        {
             match fetch_vc_text_messages(http, &meeting.voice_channel_id, started_at, stopped_at)
                 .await
             {
@@ -9980,11 +10098,8 @@ mod status_message_tests {
     fn transcript_persist_surfaces_insert_failure() {
         let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
         let segment = transcript_segment(0, 1_000);
-        let base_sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(1, 1);
-        let sql =
-            format!("WITH cleared AS (DELETE FROM transcripts WHERE meeting_id=$1) {base_sql}");
+        let sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(1, 0);
         let params = vec![
-            "m1".to_owned(),
             "m1-t-0".to_owned(),
             "m1".to_owned(),
             "alice".to_owned(),
@@ -10012,6 +10127,95 @@ mod status_message_tests {
     }
 
     #[test]
+    fn transcript_persist_empty_segments_does_not_delete_durable_final_rows() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+
+        persist_transcript_segments(&mut executor, "m1", &[])
+            .expect("empty transcript persistence should be a safe no-op");
+
+        assert!(
+            executor.executed.is_empty(),
+            "empty retry input must not erase existing final rows"
+        );
+    }
+
+    #[test]
+    fn transcript_persist_rolls_back_before_live_cleanup_when_final_insert_fails() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let segment = transcript_segment(0, 1_000);
+        let sql = crate::infrastructure::sql::build_insert_transcripts_sql_with_offset(1, 0);
+        let params = vec![
+            "m1-t-0".to_owned(),
+            "m1".to_owned(),
+            "alice".to_owned(),
+            "0".to_owned(),
+            "1000".to_owned(),
+            "hello".to_owned(),
+            "0.9".to_owned(),
+            "false".to_owned(),
+            "voice".to_owned(),
+        ];
+        let key = format!("{}|{}", sql, params.join("\u{1f}"));
+        executor
+            .execute_error
+            .insert(key, "connection dropped".to_owned());
+
+        let err = persist_transcript_segments(&mut executor, "m1", &[segment])
+            .expect_err("insert failure should be retryable");
+
+        assert!(matches!(err, TranscriptPersistError::Database(_)));
+        assert!(
+            executor.executed.iter().any(|(sql, _)| sql == "ROLLBACK"),
+            "failed final persistence should rollback"
+        );
+        assert!(
+            !executor.executed.iter().any(|(sql, _)| {
+                sql.contains("DELETE FROM transcripts") && sql.contains("transcript_stage='live'")
+            }),
+            "live rows must remain reconstructable until final rows are inserted"
+        );
+    }
+
+    #[test]
+    fn transcript_persist_rolls_back_if_cleanup_after_final_insert_fails() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let segment = transcript_segment(0, 1_000);
+        let stale_sql = "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='final' AND id NOT IN ($2)";
+        executor.execute_error.insert(
+            format!("{}|{}", stale_sql, "m1\u{1f}m1-t-0"),
+            "deadlock detected".to_owned(),
+        );
+
+        let err = persist_transcript_segments(&mut executor, "m1", &[segment])
+            .expect_err("cleanup failure should keep whole final persistence retryable");
+
+        assert!(matches!(err, TranscriptPersistError::Database(_)));
+        let insert_index = executor
+            .executed
+            .iter()
+            .position(|(sql, _)| sql.contains("INSERT INTO transcripts"))
+            .expect("final insert should execute before cleanup");
+        let cleanup_index = executor
+            .executed
+            .iter()
+            .position(|(sql, _)| sql == stale_sql)
+            .expect("stale final cleanup should execute");
+        let rollback_index = executor
+            .executed
+            .iter()
+            .position(|(sql, _)| sql == "ROLLBACK")
+            .expect("cleanup failure should rollback");
+        assert!(insert_index < cleanup_index);
+        assert!(cleanup_index < rollback_index);
+        assert!(
+            !executor.executed.iter().any(|(sql, _)| {
+                sql.contains("DELETE FROM transcripts") && sql.contains("transcript_stage='live'")
+            }),
+            "live cleanup should not run if final cleanup fails"
+        );
+    }
+
+    #[test]
     fn transcript_persist_orders_rows_by_canonical_timeline() {
         let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
         let mut early_alice = transcript_segment(0, 5_000);
@@ -10030,12 +10234,84 @@ mod status_message_tests {
             .iter()
             .find(|(sql, _)| sql.contains("INSERT INTO transcripts"))
             .expect("transcript insert should execute");
-        assert_eq!(params[3], "alice");
-        assert_eq!(params[4], "0");
-        assert_eq!(params[12], "bob");
-        assert_eq!(params[13], "1200");
-        assert_eq!(params[21], "alice");
-        assert_eq!(params[22], "2200");
+        assert_eq!(params[2], "alice");
+        assert_eq!(params[3], "0");
+        assert_eq!(params[11], "bob");
+        assert_eq!(params[12], "1200");
+        assert_eq!(params[20], "alice");
+        assert_eq!(params[21], "2200");
+    }
+
+    #[test]
+    fn transcript_persist_is_idempotent_for_repeated_final_writes() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let first = transcript_segment(0, 1_000);
+        let mut second = transcript_segment(1_000, 2_000);
+        second.text = "again".to_owned();
+
+        persist_transcript_segments(&mut executor, "m1", &[first.clone(), second.clone()])
+            .expect("first final persistence should succeed");
+        persist_transcript_segments(&mut executor, "m1", &[first, second])
+            .expect("retrying the same final persistence should succeed");
+
+        let inserts = executor
+            .executed
+            .iter()
+            .filter(|(sql, params)| {
+                sql.contains("INSERT INTO transcripts")
+                    && params.first() == Some(&"m1-t-0".to_owned())
+                    && params.get(9) == Some(&"m1-t-1".to_owned())
+            })
+            .count();
+        assert_eq!(
+            inserts, 2,
+            "retries should upsert the same deterministic final row ids"
+        );
+        assert!(
+            executor.executed.iter().any(|(sql, _)| {
+                sql.contains("ON CONFLICT (id) DO UPDATE")
+                    && sql.contains("is_deleted = FALSE")
+                    && sql.contains("transcript_stage = 'final'")
+                    && sql.contains("live_chunk_id = NULL")
+            }),
+            "final upserts should repair deleted or live-staged conflicting rows"
+        );
+        assert!(
+            !executor
+                .executed
+                .iter()
+                .any(|(sql, _)| sql.contains("WITH cleared AS")),
+            "final persistence must not use same-statement delete/upsert"
+        );
+    }
+
+    #[test]
+    fn transcript_persist_cleans_live_rows_only_after_final_rows_are_written() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+
+        persist_transcript_segments(&mut executor, "m1", &[transcript_segment(0, 1_000)])
+            .expect("final transcript should persist");
+
+        let insert_index = executor
+            .executed
+            .iter()
+            .position(|(sql, _)| sql.contains("INSERT INTO transcripts"))
+            .expect("final insert should execute");
+        let live_delete_index = executor
+            .executed
+            .iter()
+            .position(|(sql, params)| {
+                sql == "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live'"
+                    && params == &vec!["m1".to_owned()]
+            })
+            .expect("live rows should be cleaned after final persistence");
+        let commit_index = executor
+            .executed
+            .iter()
+            .position(|(sql, _)| sql == "COMMIT")
+            .expect("final persistence should commit");
+        assert!(insert_index < live_delete_index);
+        assert!(live_delete_index < commit_index);
     }
 
     #[test]
@@ -10138,7 +10414,7 @@ mod status_message_tests {
             ],
         );
 
-        let segments = load_live_transcript_segments(&mut executor, "m1", 1_000)
+        let segments = load_live_transcript_segments(&mut executor, "m1", Some(1_000))
             .expect("live transcript should load");
 
         assert_eq!(segments.len(), 2);
@@ -10148,6 +10424,86 @@ mod status_message_tests {
         assert_eq!(segments[1].speaker_id, "later");
         assert_eq!(segments[1].start_ms, 1_000);
         assert_eq!(segments[1].end_ms, 1_500);
+    }
+
+    #[test]
+    fn final_transcript_can_be_rebuilt_from_completed_live_rows() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let sql = "SELECT t.speaker_id, t.start_ms, t.end_ms, t.text, t.confidence, t.is_noisy, t.source, c.timeline_base_ms \
+         FROM transcripts t \
+         INNER JOIN live_transcription_chunks c ON c.id = t.live_chunk_id AND c.status='done' \
+         WHERE t.meeting_id=$1 AND t.transcript_stage='live' AND NOT t.is_deleted \
+         ORDER BY t.start_ms, t.end_ms, t.speaker_id, t.id";
+        executor.query_rows_result.insert(
+            format!("{}|{}", sql, "m1"),
+            vec![vec![
+                Some("alice".to_owned()),
+                Some("250".to_owned()),
+                Some("750".to_owned()),
+                Some("recovered live text".to_owned()),
+                Some("0.8".to_owned()),
+                Some("false".to_owned()),
+                Some("voice".to_owned()),
+                Some("1000".to_owned()),
+            ]],
+        );
+
+        let segments = load_live_transcript_segments(&mut executor, "m1", Some(1_000))
+            .expect("completed live rows should load");
+        persist_transcript_segments(&mut executor, "m1", &segments)
+            .expect("final transcript should rebuild from completed live rows");
+
+        let (_, params) = executor
+            .executed
+            .iter()
+            .find(|(sql, _)| sql.contains("INSERT INTO transcripts"))
+            .expect("rebuilt final transcript should be inserted");
+        assert_eq!(params[0], "m1-t-0");
+        assert_eq!(params[2], "alice");
+        assert_eq!(params[3], "250");
+        assert_eq!(params[4], "750");
+        assert_eq!(params[5], "recovered live text");
+        assert!(executor.executed.iter().any(|(sql, params)| {
+            sql == "DELETE FROM transcripts WHERE meeting_id=$1 AND transcript_stage='live'"
+                && params == &vec!["m1".to_owned()]
+        }));
+    }
+
+    #[test]
+    fn final_transcript_loader_recovers_existing_final_rows_for_retry() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let sql = "SELECT speaker_id, start_ms, end_ms, text, confidence, is_noisy, source \
+         FROM transcripts \
+         WHERE meeting_id=$1 AND transcript_stage='final' AND NOT is_deleted \
+         ORDER BY start_ms, end_ms, CASE source WHEN 'voice' THEN 0 ELSE 1 END, substring(id from '-t-([0-9]+)$')::INTEGER NULLS LAST, id";
+        executor.query_rows_result.insert(
+            format!("{}|{}", sql, "m1"),
+            vec![vec![
+                Some("alice".to_owned()),
+                Some("250".to_owned()),
+                Some("750".to_owned()),
+                Some("existing final text".to_owned()),
+                Some("0.8".to_owned()),
+                Some("false".to_owned()),
+                Some("voice".to_owned()),
+            ]],
+        );
+
+        let segments = load_final_transcript_segments(&mut executor, "m1")
+            .expect("existing final rows should load");
+
+        assert!(
+            executor
+                .executed
+                .iter()
+                .any(|(sql, _)| sql.contains("substring(id from '-t-([0-9]+)$')::INTEGER")),
+            "final recovery should use persisted final row ids as its stable tie-breaker"
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speaker_id, "alice");
+        assert_eq!(segments[0].start_ms, 250);
+        assert_eq!(segments[0].end_ms, 750);
+        assert_eq!(segments[0].text, "existing final text");
     }
 
     #[test]

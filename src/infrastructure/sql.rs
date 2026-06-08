@@ -1552,10 +1552,10 @@ ON CONFLICT (meeting_id, speaker_id) DO UPDATE SET
 /// String-only `SqlExecutor::execute` interface.
 ///
 /// `param_offset` shifts placeholders by N positions to allow callers to
-/// reserve leading parameters for wrapping CTEs.
+/// reserve leading parameters for surrounding statements.
 pub fn build_insert_transcripts_sql_with_offset(count: usize, param_offset: usize) -> String {
     let mut sql = String::from(
-        "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy, source) VALUES ",
+        "INSERT INTO transcripts (id, meeting_id, speaker_id, start_ms, end_ms, text, confidence, is_noisy, source, is_deleted, transcript_stage, live_chunk_id) VALUES ",
     );
     for i in 0..count {
         let base = i * 9 + param_offset;
@@ -1563,7 +1563,7 @@ pub fn build_insert_transcripts_sql_with_offset(count: usize, param_offset: usiz
             sql.push_str(", ");
         }
         sql.push_str(&format!(
-            "(${}, ${}, ${}, ${}::TEXT::INTEGER, ${}::TEXT::INTEGER, ${}, NULLIF(${},'')::TEXT::DOUBLE PRECISION, ${}::TEXT::BOOLEAN, ${})",
+            "(${}, ${}, ${}, ${}::TEXT::INTEGER, ${}::TEXT::INTEGER, ${}, NULLIF(${},'')::TEXT::DOUBLE PRECISION, ${}::TEXT::BOOLEAN, ${}, FALSE, 'final', NULL)",
             base + 1,
             base + 2,
             base + 3,
@@ -1584,7 +1584,10 @@ pub fn build_insert_transcripts_sql_with_offset(count: usize, param_offset: usiz
         text = EXCLUDED.text, \
         confidence = EXCLUDED.confidence, \
         is_noisy = EXCLUDED.is_noisy, \
-        source = EXCLUDED.source",
+        source = EXCLUDED.source, \
+        is_deleted = FALSE, \
+        transcript_stage = 'final', \
+        live_chunk_id = NULL",
     );
     sql
 }
