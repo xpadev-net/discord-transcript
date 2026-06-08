@@ -5982,6 +5982,12 @@ impl ScaffoldHandler {
         let report_channel_id = match self.report_channel_id_for_meeting(meeting_id).await {
             Ok(value) => value,
             Err(err) => {
+                let mut service = self.service.lock().await;
+                let _ = mark_summary_meeting_failed_from_summary_state(
+                    &mut service.store,
+                    meeting_id,
+                    err.clone(),
+                );
                 return Err(err);
             }
         };
