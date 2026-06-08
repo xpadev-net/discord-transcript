@@ -2,9 +2,7 @@ use crate::application::ai_memory_extraction::{
     AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
 use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
-use crate::application::bot::{
-    BotCommandService, StartCommandInput, StopCommandInput, StopCommandResult,
-};
+use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
 use crate::application::command::{
     CommandError, PermissionSet, RecordStartPreflight, RecordStartRequest,
     record_start_after_preflight, validate_record_start_preconditions,
@@ -293,7 +291,14 @@ where
         expected_meeting_id,
         reason,
     )
+    .map(|result| result.stop_result)
     .map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingStopTeardownResult {
+    stop_result: crate::application::bot::StopCommandResult,
+    summary_job_enqueued: bool,
 }
 
 fn stop_and_enqueue_summary_job_for_teardown<S, Q>(
@@ -304,7 +309,7 @@ fn stop_and_enqueue_summary_job_for_teardown<S, Q>(
     caller_role: UserRole,
     expected_meeting_id: Option<&str>,
     reason: StopReason,
-) -> Result<crate::application::bot::StopCommandResult, TeardownStopError>
+) -> Result<RecordingStopTeardownResult, TeardownStopError>
 where
     S: MeetingStore,
     Q: crate::infrastructure::queue::JobQueue,
@@ -361,7 +366,22 @@ where
                 meeting_id = %stop_result.meeting_id,
                 "summary job not enqueued because meeting snapshot disabled summaries"
             );
-            return Ok(stop_result);
+            service
+                .store
+                .set_meeting_status(
+                    &stop_result.meeting_id,
+                    MeetingStatus::Posted,
+                    Some(MeetingStatus::Stopping),
+                )
+                .map_err(|err| TeardownStopError::Other(err.to_string()))?;
+            service
+                .store
+                .set_error_message(&stop_result.meeting_id, None)
+                .map_err(|err| TeardownStopError::Other(err.to_string()))?;
+            return Ok(RecordingStopTeardownResult {
+                stop_result,
+                summary_job_enqueued: false,
+            });
         }
         let job_id = format!("summary-{}", stop_result.meeting_id);
         match enqueue_summary_job(queue, &job_id, &stop_result.meeting_id) {
@@ -381,9 +401,16 @@ where
             }
             Err(err) => return Err(TeardownStopError::Other(err.to_string())),
         }
+        return Ok(RecordingStopTeardownResult {
+            stop_result,
+            summary_job_enqueued: true,
+        });
     }
 
-    Ok(stop_result)
+    Ok(RecordingStopTeardownResult {
+        stop_result,
+        summary_job_enqueued: false,
+    })
 }
 
 fn record_recording_duration_usage<S: MeetingStore>(store: &mut S, meeting_id: &str) {
@@ -4266,6 +4293,8 @@ impl EventHandler for ScaffoldHandler {
                         }
                     }
                 };
+                let summary_job_enqueued = stop_result.summary_job_enqueued;
+                let stop_result = stop_result.stop_result;
                 if stop_result.outcome == StopOutcome::Owner
                     && let Err(err) = handler
                         .update_status_message(
@@ -4287,7 +4316,7 @@ impl EventHandler for ScaffoldHandler {
                     meeting_id = %stop_result.meeting_id,
                     "auto stop triggered due to empty voice channel"
                 );
-                if stop_result.outcome == StopOutcome::Owner
+                if summary_job_enqueued
                     && let Err(err) = run_summary_background(
                         &handler,
                         Arc::clone(&ctx_for_task.http),
@@ -4677,7 +4706,7 @@ impl ScaffoldHandler {
         request: &RecordingStopTeardownRequest<'_>,
     ) -> Result<
         (
-            StopCommandResult,
+            RecordingStopTeardownResult,
             Option<RecordingSession<LocalChunkStorage>>,
         ),
         RecordingTeardownError,
@@ -5799,7 +5828,13 @@ impl ScaffoldHandler {
             resolve_command_member_roles(ctx, guild_id, command.user.id, command.member.as_deref());
         let caller_user_id = command.user.id.get().to_string();
 
-        let (stop_result, removed_session, authorized_meeting_id, reset_guard) = {
+        let (
+            stop_result,
+            summary_job_enqueued,
+            removed_session,
+            authorized_meeting_id,
+            reset_guard,
+        ) = {
             let lifecycle_permit = self.recording_lifecycle_write_permit().await;
             self.reject_if_shutting_down()?;
             let mut service = self.service.lock().await;
@@ -5845,8 +5880,11 @@ impl ScaffoldHandler {
                 .await
                 .map_err(|err| err.to_string())?;
             let reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
+            let summary_job_enqueued = stop_result.summary_job_enqueued;
+            let stop_result = stop_result.stop_result;
             (
                 stop_result,
+                summary_job_enqueued,
                 removed_session,
                 authorized_meeting_id,
                 reset_guard,
@@ -5883,24 +5921,26 @@ impl ScaffoldHandler {
                         "failed to update status message after manual stop"
                     );
                 }
-                // Spawn summary processing in background — transcription and
-                // AI summarization can take minutes, far beyond the interaction
-                // response window, and should not block the command reply.
-                let handler = self.clone();
-                let http = Arc::clone(&ctx.http);
-                let shutdown_token = handler.shutdown_token.clone();
-                self.spawn_background(async move {
-                    tokio::select! {
-                        result = run_summary_background(&handler, Arc::clone(&http), &meeting_id) => {
-                            if let Err(err) = result {
-                                error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                if summary_job_enqueued {
+                    // Spawn summary processing in background — transcription and
+                    // AI summarization can take minutes, far beyond the interaction
+                    // response window, and should not block the command reply.
+                    let handler = self.clone();
+                    let http = Arc::clone(&ctx.http);
+                    let shutdown_token = handler.shutdown_token.clone();
+                    self.spawn_background(async move {
+                        tokio::select! {
+                            result = run_summary_background(&handler, Arc::clone(&http), &meeting_id) => {
+                                if let Err(err) = result {
+                                    error!(meeting_id = %meeting_id, error = %err, "summary background task failed");
+                                }
+                            }
+                            _ = shutdown_token.cancelled() => {
+                                debug!(meeting_id = %meeting_id, "summary background task deferred by shutdown");
                             }
                         }
-                        _ = shutdown_token.cancelled() => {
-                            debug!(meeting_id = %meeting_id, "summary background task deferred by shutdown");
-                        }
-                    }
-                });
+                    });
+                }
             }
 
             info!(
@@ -8426,6 +8466,8 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 }
                             }
                         };
+                        let summary_job_enqueued = stop_result.summary_job_enqueued;
+                        let stop_result = stop_result.stop_result;
                         if stop_result.outcome == StopOutcome::Owner
                             && let Err(err) = runtime
                                 .update_status_message(
@@ -8442,7 +8484,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 "failed to update status message after driver disconnect stop"
                             );
                         }
-                        if stop_result.outcome == StopOutcome::Owner {
+                        if summary_job_enqueued {
                             tokio::select! {
                                 summary_result = run_summary_background(
                                     &runtime,
@@ -10723,6 +10765,72 @@ mod status_message_tests {
 
         assert!(err.is_target_absent());
         assert_eq!(err.to_string(), CommandError::NoActiveMeeting.to_string());
+    }
+
+    fn disabled_summary_effective_settings() -> EffectiveMeetingSettings {
+        EffectiveMeetingSettings {
+            whisper_language: None,
+            whisper_vad: false,
+            whisper_beam_size: 5,
+            whisper_suppress_non_speech: false,
+            whisper_prompt: None,
+            whisper_temperature: 0.0,
+            whisper_resample_to_16k: false,
+            auto_stop_grace_seconds: 120,
+            retention_raw_audio_ttl_days: 7,
+            retention_transcript_ttl_days: 30,
+            retention_summary_ttl_days: None,
+            summary_enabled: false,
+            summary_template_id: None,
+            domain_knowledge_version_id: None,
+        }
+    }
+
+    #[test]
+    fn summary_disabled_teardown_marks_meeting_posted_without_job() {
+        let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut service = BotCommandService::new(store);
+        service
+            .handle_record_start(StartCommandInput {
+                meeting_id: "m1".to_owned(),
+                guild_id: "g1".to_owned(),
+                user_id: "u1".to_owned(),
+                command_channel_id: "tc1".to_owned(),
+                user_voice_channel_id: Some("vc1".to_owned()),
+                permissions: PermissionSet {
+                    can_connect_voice: true,
+                    can_send_messages: true,
+                },
+                caller_role: UserRole::GuildAdmin,
+                effective_settings: Some(disabled_summary_effective_settings()),
+            })
+            .expect("recording should start");
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+
+        let result = stop_and_enqueue_summary_job_for_teardown(
+            &mut service,
+            &mut queue,
+            "g1",
+            "u1",
+            UserRole::BotAdmin,
+            Some("m1"),
+            StopReason::AutoEmpty,
+        )
+        .expect("summary-disabled teardown should stop cleanly");
+
+        assert_eq!(result.stop_result.outcome, StopOutcome::Owner);
+        assert!(!result.summary_job_enqueued);
+        assert!(
+            queue.get("summary-m1").is_none(),
+            "summary-disabled meetings should not enqueue summary jobs"
+        );
+        let meeting = service
+            .store
+            .get_meeting("m1")
+            .expect("meeting lookup should succeed")
+            .expect("meeting should remain");
+        assert_eq!(meeting.status, MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
     }
 
     #[test]

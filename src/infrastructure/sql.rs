@@ -567,14 +567,9 @@ WHERE m.guild_id = $2
       SELECT 1
       FROM transcripts expired_t
       WHERE expired_t.meeting_id = m.id
-        AND expired_t.is_deleted = FALSE
         AND expired_t.created_at < NOW() - (($1 || ' days')::interval)
     )
-    OR (
-      NOT EXISTS (SELECT 1 FROM transcripts any_t WHERE any_t.meeting_id = m.id)
-      AND m.stopped_at IS NOT NULL
-      AND m.stopped_at < NOW() - (($1 || ' days')::interval)
-    )
+    OR (m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - (($1 || ' days')::interval))
   )
 "#;
 
@@ -589,11 +584,17 @@ WHERE m.guild_id = $2
     WHERE active_s.meeting_id = m.id
       AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
   )
-  AND EXISTS (
+  AND (
+    (
+      m.stopped_at IS NOT NULL
+      AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+    )
+    OR EXISTS (
     SELECT 1
     FROM summaries expired_s
     WHERE expired_s.meeting_id = m.id
       AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+    )
   )
 "#;
 
