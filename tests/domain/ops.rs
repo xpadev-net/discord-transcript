@@ -1,7 +1,10 @@
 use discord_transcript::application::recovery_runner::{RecoveryEffect, run_recovery};
 use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::audit::{AuditEvent, AuditLog};
-use discord_transcript::domain::authz::{Action, UserRole, is_allowed};
+use discord_transcript::domain::authz::{
+    Action, MemberRoleSource, PermissionDecisionSource, RbacPermission, RbacRoleGrant,
+    RbacSubject, UserRole, is_allowed, resolve_rbac_permission,
+};
 use discord_transcript::domain::plans::{
     PlanQuota, QuotaDimension, QuotaEnforcementMode, QuotaLimit, QuotaPeriod,
 };
@@ -82,6 +85,177 @@ fn command_authorization_policies_cover_command_roles() {
     assert!(is_allowed(UserRole::GuildAdmin, Action::StopRecording));
     assert!(is_allowed(UserRole::BotAdmin, Action::StartRecording));
     assert!(is_allowed(UserRole::BotAdmin, Action::StopRecording));
+}
+
+fn grant(guild_id: &str, discord_role_id: &str, permission: RbacPermission) -> RbacRoleGrant {
+    RbacRoleGrant {
+        guild_id: guild_id.to_owned(),
+        discord_role_id: discord_role_id.to_owned(),
+        permission,
+    }
+}
+
+#[test]
+fn rbac_resolver_preserves_legacy_channel_view_defaults() {
+    let subject = RbacSubject {
+        has_channel_view: true,
+        ..RbacSubject::default()
+    };
+
+    let view = resolve_rbac_permission(
+        RbacPermission::MeetingView,
+        "g1",
+        subject,
+        MemberRoleSource::LookupFailed,
+        &[],
+    );
+    assert!(view.allowed);
+    assert_eq!(view.source, PermissionDecisionSource::LegacyChannelView);
+
+    let start = resolve_rbac_permission(
+        RbacPermission::RecordingStart,
+        "g1",
+        subject,
+        MemberRoleSource::Available(&[]),
+        &[],
+    );
+    assert!(!start.allowed);
+    assert_eq!(start.source, PermissionDecisionSource::NoGrant);
+}
+
+#[test]
+fn rbac_resolver_preserves_legacy_meeting_starter_defaults() {
+    let subject = RbacSubject {
+        is_meeting_starter: true,
+        ..RbacSubject::default()
+    };
+
+    let stop = resolve_rbac_permission(
+        RbacPermission::RecordingStop,
+        "g1",
+        subject,
+        MemberRoleSource::LookupFailed,
+        &[],
+    );
+
+    assert!(stop.allowed);
+    assert_eq!(stop.source, PermissionDecisionSource::LegacyMeetingStarter);
+}
+
+#[test]
+fn rbac_resolver_allows_member_role_grant() {
+    let roles = vec!["role-recorders".to_owned()];
+    let grants = vec![grant(
+        "g1",
+        "role-recorders",
+        RbacPermission::RecordingStart,
+    )];
+
+    let decision = resolve_rbac_permission(
+        RbacPermission::RecordingStart,
+        "g1",
+        RbacSubject::default(),
+        MemberRoleSource::Available(&roles),
+        &grants,
+    );
+
+    assert!(decision.allowed);
+    assert_eq!(
+        decision.source,
+        PermissionDecisionSource::RbacRole {
+            discord_role_id: "role-recorders".to_owned()
+        }
+    );
+}
+
+#[test]
+fn rbac_resolver_unions_multiple_member_roles() {
+    let roles = vec!["role-viewers".to_owned(), "role-ops".to_owned()];
+    let grants = vec![
+        grant("g1", "role-viewers", RbacPermission::MeetingView),
+        grant("g1", "role-ops", RbacPermission::MeetingDelete),
+    ];
+
+    let decision = resolve_rbac_permission(
+        RbacPermission::MeetingDelete,
+        "g1",
+        RbacSubject::default(),
+        MemberRoleSource::Available(&roles),
+        &grants,
+    );
+
+    assert!(decision.allowed);
+    assert_eq!(
+        decision.source,
+        PermissionDecisionSource::RbacRole {
+            discord_role_id: "role-ops".to_owned()
+        }
+    );
+}
+
+#[test]
+fn rbac_resolver_ignores_deleted_or_missing_roles() {
+    let roles = vec!["role-current".to_owned()];
+    let grants = vec![grant("g1", "role-deleted", RbacPermission::MeetingDelete)];
+
+    let decision = resolve_rbac_permission(
+        RbacPermission::MeetingDelete,
+        "g1",
+        RbacSubject::default(),
+        MemberRoleSource::Available(&roles),
+        &grants,
+    );
+
+    assert!(!decision.allowed);
+    assert_eq!(decision.source, PermissionDecisionSource::NoGrant);
+}
+
+#[test]
+fn rbac_resolver_fails_closed_when_member_roles_are_unavailable() {
+    let grants = vec![grant("g1", "role-ops", RbacPermission::MeetingDelete)];
+
+    let decision = resolve_rbac_permission(
+        RbacPermission::MeetingDelete,
+        "g1",
+        RbacSubject::default(),
+        MemberRoleSource::LookupFailed,
+        &grants,
+    );
+
+    assert!(!decision.allowed);
+    assert_eq!(
+        decision.source,
+        PermissionDecisionSource::MemberRoleLookupFailed
+    );
+}
+
+#[test]
+fn rbac_resolver_admin_overrides_precede_role_lookup_failures() {
+    let bot_admin = resolve_rbac_permission(
+        RbacPermission::SettingsManage,
+        "g1",
+        RbacSubject {
+            is_bot_admin: true,
+            ..RbacSubject::default()
+        },
+        MemberRoleSource::LookupFailed,
+        &[],
+    );
+    assert!(bot_admin.allowed);
+    assert_eq!(bot_admin.source, PermissionDecisionSource::BotAdmin);
+
+    let guild_admin = resolve_rbac_permission(
+        RbacPermission::SettingsManage,
+        "g1",
+        RbacSubject {
+            is_guild_admin: true,
+            ..RbacSubject::default()
+        },
+        MemberRoleSource::LookupFailed,
+        &[],
+    );
+    assert!(guild_admin.allowed);
+    assert_eq!(guild_admin.source, PermissionDecisionSource::GuildAdmin);
 }
 
 #[test]
