@@ -2,8 +2,9 @@ use discord_transcript::application::summary::{
     SpeakerAudioInput, StubClaudeSummaryClient, SummaryRequest, TranscriptManifest,
     build_correction_prompt, build_correction_prompt_with_context, build_summary_prompt,
     build_summary_prompt_with_context, build_summary_prompt_with_template,
-    build_whisper_context_prompt, correct_transcript_with_prompt, materialize_or_load_summary_context,
-    materialize_summary_context, run_summary_pipeline, run_transcription, SummaryContextInput,
+    build_whisper_context_prompt, correct_transcript_with_prompt, load_summary_context_manifest,
+    materialize_or_load_summary_context, materialize_summary_context, run_summary_pipeline,
+    run_transcription, SummaryContextInput,
 };
 use discord_transcript::domain::ai_memory::{AiMemoryNote, AiMemorySourceType, AiMemoryTag};
 use discord_transcript::domain::confidence::ConfidencePermille;
@@ -936,6 +937,58 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
     assert!(!correction_prompt.contains(secret_domain_body));
     assert!(!correction_prompt.contains(secret_ai_memory_body));
     assert!(!correction_prompt.contains(secret_feedback_note));
+}
+
+#[test]
+fn load_summary_context_manifest_accepts_legacy_missing_voice_channel_name() {
+    let temp = unique_workspace("legacy_context_manifest_voice_name", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Planning".to_owned()),
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    std::fs::create_dir_all(
+        request
+            .workspace
+            .context_manifest_path()
+            .parent()
+            .expect("manifest should have parent directory"),
+    )
+    .expect("context directory should be created");
+    std::fs::write(
+        request.workspace.context_manifest_path(),
+        r#"{
+          "meeting_id": "m1",
+          "guild_id": "g1",
+          "voice_channel_id": "vc1",
+          "generated_at": "2026-01-01T00:00:00Z",
+          "manifest_path": "context/manifest.json",
+          "speaker_roster_path": "context/speaker_roster.md",
+          "speaker_count": 0,
+          "domain_knowledge_path": "context/domain_knowledge.md",
+          "domain_knowledge_count": 0,
+          "domain_knowledge_items": [],
+          "effective_domain_knowledge_version_id": null,
+          "summary_template_path": null,
+          "summary_template": null,
+          "effective_summary_template_id": null
+        }"#,
+    )
+    .expect("legacy context manifest should be written");
+
+    let manifest = load_summary_context_manifest(&request)
+        .expect("legacy context manifest should load")
+        .expect("context manifest should exist");
+
+    assert_eq!(manifest.voice_channel_id, "vc1");
+    assert_eq!(manifest.voice_channel_name, None);
 }
 
 #[test]

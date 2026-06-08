@@ -189,6 +189,7 @@ pub struct SummaryContextManifest {
     pub meeting_id: String,
     pub guild_id: String,
     pub voice_channel_id: String,
+    #[serde(default)]
     pub voice_channel_name: Option<String>,
     pub generated_at: String,
     pub manifest_path: String,
