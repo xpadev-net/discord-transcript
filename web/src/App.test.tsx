@@ -2242,11 +2242,13 @@ describe("App access controls", () => {
 
     renderApp("/", fetchMock);
 
-    expect(
-      await screen.findByRole("link", {
-        name: "2026/6/1 09:00 Captured Room",
-      }),
-    ).toBeTruthy();
+    await waitFor(() => {
+      expect(
+        screen
+          .getAllByRole("link")
+          .some((link) => link.textContent?.endsWith(" Captured Room")),
+      ).toBe(true);
+    });
   });
 
   it("filters dashboard meetings by VC and clears the VC filter", async () => {

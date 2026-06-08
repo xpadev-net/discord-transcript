@@ -783,9 +783,14 @@ fn sanitize_meeting_title(value: Option<&str>) -> Option<String> {
 
 fn extract_title_from_summary_markdown(markdown: &str) -> Option<String> {
     let mut saw_summary_heading = false;
+    let mut in_code_block = false;
     for line in markdown.lines() {
         let line = line.trim();
-        if line.is_empty() || line == "---" || line.starts_with("```") {
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block || line.is_empty() || line == "---" {
             continue;
         }
         if let Some(heading) = line.strip_prefix('#') {

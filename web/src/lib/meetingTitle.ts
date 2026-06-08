@@ -35,7 +35,7 @@ export function displayMeetingTitle(meeting: MeetingTitleFields): string {
 
 export function hasControlCharacter(value: string): boolean {
   return Array.from(value).some((character) => {
-    const code = character.charCodeAt(0);
-    return code < 32 || code === 127;
+    const code = character.codePointAt(0) ?? 0;
+    return code < 32 || (code >= 127 && code <= 159);
   });
 }
