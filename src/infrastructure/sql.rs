@@ -422,6 +422,17 @@ WHERE m.guild_id = $1
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
+pub const ADMIN_RETENTION_DEBUG_ARTIFACTS_PREVIEW_SQL: &str = r#"
+SELECT COUNT(*)::BIGINT AS artifact_count
+FROM artifacts a
+JOIN meetings m ON m.id = a.meeting_id
+WHERE m.guild_id = $2
+  AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')
+  AND m.stopped_at IS NOT NULL
+  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
 pub const ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts t
 SET is_deleted=TRUE

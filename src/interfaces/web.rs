@@ -57,7 +57,8 @@ use crate::infrastructure::bot_token::{
 };
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ADMIN_CANCEL_JOB_SQL,
-    ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DEBUG_ARTIFACTS_PREVIEW_SQL, ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
     ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
@@ -6863,11 +6864,13 @@ async fn build_admin_retention_cleanup_preview_with_plan(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let expired_artifacts = query_admin_retention_expired_artifacts(state, guild_id).await?;
+    let debug_artifact_count =
+        query_admin_retention_debug_artifact_count(state, guild_id, policy).await?;
     let deletion_targets = AdminRetentionTargets {
         raw_audio: !plan.raw_workspaces.is_empty(),
         transcript: !plan.transcript_workspaces.is_empty(),
         summary: !plan.summary_workspaces.is_empty(),
-        debug: !plan.raw_workspaces.is_empty(),
+        debug: !plan.raw_workspaces.is_empty() || debug_artifact_count > 0,
     };
     let preview = AdminRetentionCleanupPreviewResponse {
         guild_id: guild_id.to_owned(),
@@ -6893,6 +6896,23 @@ async fn query_admin_retention_expired_artifacts(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((row.get("artifact_count"), row.get("artifact_bytes")))
+}
+
+async fn query_admin_retention_debug_artifact_count(
+    state: &WebState,
+    guild_id: &str,
+    policy: RetentionPolicy,
+) -> Result<i64, StatusCode> {
+    let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
+    let row = state
+        .db
+        .query_one(
+            ADMIN_RETENTION_DEBUG_ARTIFACTS_PREVIEW_SQL,
+            &[&raw_ttl, &guild_id],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(row.get("artifact_count"))
 }
 
 fn estimate_plan_filesystem_usage(
