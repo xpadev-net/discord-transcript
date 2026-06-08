@@ -40,10 +40,8 @@ fn audit_insert_sql_prunes_old_rows_and_dedupes_debug_downloads() {
     assert!(INSERT_AUDIT_EVENT_SQL.contains("stale_audit_events"));
     assert!(INSERT_AUDIT_EVENT_SQL.contains("INTERVAL '180 days'"));
     assert!(INSERT_AUDIT_EVENT_SQL.contains("LIMIT 500"));
-    assert!(INSERT_AUDIT_EVENT_SQL.contains("debug_artifact.download"));
-    assert!(INSERT_AUDIT_EVENT_SQL.contains("INTERVAL '15 minutes'"));
-    assert!(INSERT_AUDIT_EVENT_SQL.contains("existing.detail_json->>'meeting_id'"));
     assert!(INSERT_AUDIT_EVENT_SQL.contains("ON CONFLICT (id) DO NOTHING"));
+    assert!(!INSERT_AUDIT_EVENT_SQL.contains("INTERVAL '15 minutes'"));
 }
 
 #[test]

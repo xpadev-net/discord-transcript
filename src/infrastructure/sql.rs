@@ -1606,21 +1606,6 @@ INSERT INTO audit_events (
     occurred_at,
     NOW()
 FROM candidate
-WHERE NOT (
-    action = 'debug_artifact.download'
-    AND EXISTS (
-        SELECT 1
-        FROM audit_events existing
-        WHERE existing.action = candidate.action
-          AND existing.resource_type = candidate.resource_type
-          AND existing.resource_id IS NOT DISTINCT FROM candidate.resource_id
-          AND existing.guild_id IS NOT DISTINCT FROM candidate.guild_id
-          AND existing.actor_user_id IS NOT DISTINCT FROM candidate.actor_user_id
-          AND existing.detail_json->>'meeting_id' = candidate.detail_json->>'meeting_id'
-          AND existing.occurred_at >= NOW() - INTERVAL '15 minutes'
-        LIMIT 1
-    )
-)
 ON CONFLICT (id) DO NOTHING
 "#;
 
