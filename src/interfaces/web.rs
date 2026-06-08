@@ -57,12 +57,12 @@ use crate::infrastructure::bot_token::{
 };
 use crate::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ADMIN_CANCEL_JOB_SQL,
-    ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
+    ADMIN_RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
     ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
-    ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
-    ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+    ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, ADMIN_RETENTION_EXPIRED_ARTIFACTS_PREVIEW_SQL,
+    ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
     ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
     ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
     ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
@@ -3271,6 +3271,8 @@ struct AdminRetentionCleanupPreviewResponse {
     raw_workspace_count: usize,
     transcript_workspace_count: usize,
     summary_workspace_count: usize,
+    expired_artifact_count: i64,
+    expired_artifact_bytes: i64,
     estimated_freed_bytes: AdminRetentionStorageUsageResponse,
 }
 
@@ -6359,6 +6361,8 @@ async fn api_admin_retention_cleanup_run(
                     "raw_workspace_count": preview.raw_workspace_count,
                     "transcript_workspace_count": preview.transcript_workspace_count,
                     "summary_workspace_count": preview.summary_workspace_count,
+                    "expired_artifact_count": preview.expired_artifact_count,
+                    "expired_artifact_bytes": preview.expired_artifact_bytes,
                     "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
                 },
             }),
@@ -6385,6 +6389,8 @@ async fn api_admin_retention_cleanup_run(
                         "raw_workspace_count": preview.raw_workspace_count,
                         "transcript_workspace_count": preview.transcript_workspace_count,
                         "summary_workspace_count": preview.summary_workspace_count,
+                        "expired_artifact_count": preview.expired_artifact_count,
+                        "expired_artifact_bytes": preview.expired_artifact_bytes,
                         "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
                     },
                     "error": error,
@@ -6427,6 +6433,8 @@ async fn api_admin_retention_cleanup_run(
                     "raw_workspace_count": preview.raw_workspace_count,
                     "transcript_workspace_count": preview.transcript_workspace_count,
                     "summary_workspace_count": preview.summary_workspace_count,
+                    "expired_artifact_count": preview.expired_artifact_count,
+                    "expired_artifact_bytes": preview.expired_artifact_bytes,
                     "estimated_freed_bytes": preview.estimated_freed_bytes.total_bytes,
                 },
                 "report": admin_retention_report_response(&report),
@@ -6845,6 +6853,7 @@ async fn build_admin_retention_cleanup_preview(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let expired_artifacts = query_admin_retention_expired_artifacts(state, guild_id).await?;
     let deletion_targets = AdminRetentionTargets {
         raw_audio: !plan.raw_workspaces.is_empty(),
         transcript: !plan.transcript_workspaces.is_empty(),
@@ -6858,8 +6867,22 @@ async fn build_admin_retention_cleanup_preview(
         raw_workspace_count: plan.raw_workspaces.len(),
         transcript_workspace_count: plan.transcript_workspaces.len(),
         summary_workspace_count: plan.summary_workspaces.len(),
+        expired_artifact_count: expired_artifacts.0,
+        expired_artifact_bytes: expired_artifacts.1,
         estimated_freed_bytes: admin_retention_storage_response(filesystem_usage),
     })
+}
+
+async fn query_admin_retention_expired_artifacts(
+    state: &WebState,
+    guild_id: &str,
+) -> Result<(i64, i64), StatusCode> {
+    let row = state
+        .db
+        .query_one(ADMIN_RETENTION_EXPIRED_ARTIFACTS_PREVIEW_SQL, &[&guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((row.get("artifact_count"), row.get("artifact_bytes")))
 }
 
 fn estimate_plan_filesystem_usage(
@@ -6918,6 +6941,15 @@ async fn apply_admin_retention_database_cleanup(
         ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
         &[&transcript_ttl, &guild_id],
         |report, count| report.transcripts_marked_deleted += count,
+        &mut report,
+        &mut errors,
+    )
+    .await;
+    execute_retention_count(
+        state,
+        ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
+        &[&guild_id],
+        |report, count| report.artifacts_deleted += count,
         &mut report,
         &mut errors,
     )

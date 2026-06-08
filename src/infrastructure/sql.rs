@@ -410,6 +410,18 @@ WHERE m.guild_id = $2
   )
 "#;
 
+pub const ADMIN_RETENTION_EXPIRED_ARTIFACTS_PREVIEW_SQL: &str = r#"
+SELECT
+    COUNT(*)::BIGINT AS artifact_count,
+    COALESCE(SUM(a.size_bytes), 0)::BIGINT AS artifact_bytes
+FROM artifacts a
+JOIN meetings m ON m.id = a.meeting_id
+WHERE m.guild_id = $1
+  AND a.expires_at IS NOT NULL
+  AND a.expires_at <= NOW()
+  AND m.status IN ('posted', 'failed', 'aborted')
+"#;
+
 pub const ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts t
 SET is_deleted=TRUE

@@ -2461,6 +2461,11 @@ export function SettingsPage({
                 <p>
                   {`Raw ${retentionCleanupPreview.raw_workspace_count} / Transcript ${retentionCleanupPreview.transcript_workspace_count} / Summary ${retentionCleanupPreview.summary_workspace_count}`}
                 </p>
+                <p className="settings-review-meta">
+                  {`Expired artifacts ${retentionCleanupPreview.expired_artifact_count} / ${formatBytes(
+                    retentionCleanupPreview.expired_artifact_bytes,
+                  )}`}
+                </p>
                 {retentionCleanupRun ? (
                   <p className="settings-review-meta">
                     {`監査: ${

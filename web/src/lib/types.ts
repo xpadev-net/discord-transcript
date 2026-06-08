@@ -253,6 +253,8 @@ export interface AdminRetentionCleanupPreview {
   raw_workspace_count: number;
   transcript_workspace_count: number;
   summary_workspace_count: number;
+  expired_artifact_count: number;
+  expired_artifact_bytes: number;
   estimated_freed_bytes: AdminRetentionStorageUsage;
 }
 
