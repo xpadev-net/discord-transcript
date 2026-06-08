@@ -223,6 +223,55 @@ function meetingResponse(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function adminPlan(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "plan-default",
+    code: "default",
+    name: "Default Plan",
+    kind: "default",
+    status: "active",
+    quotas: [],
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function adminQuota(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "quota-1",
+    plan_id: "plan-default",
+    dimension: "recording_minutes",
+    period: "monthly",
+    limit_value: 1200,
+    unlimited: false,
+    enforcement_mode: "observe_only",
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function adminAssignment(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "assignment-1",
+    tenant_id: "tenant-1",
+    guild_id: "guild-1",
+    plan_id: "plan-default",
+    plan_code: "default",
+    plan_name: "Default Plan",
+    status: "active",
+    valid_from: "2026-06-01T00:00:00.000Z",
+    valid_until: null,
+    period_anchor: "2026-06-01T00:00:00.000Z",
+    assigned_by_user_id: "admin-1",
+    source: "admin",
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
 function transcriptSegment(overrides: Record<string, unknown> = {}) {
   return {
     id: "segment-1",
@@ -458,6 +507,141 @@ describe("App access controls", () => {
     const tokenInput = screen.getByLabelText("Bot token") as HTMLInputElement;
     expect(tokenInput.value).toBe("");
     expect(screen.queryByDisplayValue("bot-secret")).toBeNull();
+  });
+
+  it("loads plan administration with the provided bearer token", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/admin/plans") {
+        expect(init?.headers).toEqual({ Authorization: "Bearer admin-token" });
+        return Promise.resolve(jsonResponse([adminPlan()]));
+      }
+      if (url === "/api/admin/plans/default") {
+        expect(init?.headers).toEqual({ Authorization: "Bearer admin-token" });
+        return Promise.resolve(jsonResponse(adminPlan()));
+      }
+      if (url === "/api/admin/plans/beta") {
+        expect(init?.headers).toEqual({ Authorization: "Bearer admin-token" });
+        return Promise.resolve(
+          jsonResponse(
+            adminPlan({
+              id: "plan-beta",
+              code: "beta",
+              name: "Beta Plan",
+              kind: "beta",
+            }),
+          ),
+        );
+      }
+      if (
+        url ===
+        "/api/admin/guild-plan-assignments?include_archived=false&limit=50"
+      ) {
+        expect(init?.headers).toEqual({ Authorization: "Bearer admin-token" });
+        return Promise.resolve(jsonResponse([adminAssignment()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/plans", fetchMock);
+
+    await screen.findByRole("link", { name: "管理" });
+    fireEvent.change(screen.getByLabelText("管理トークン"), {
+      target: { value: "admin-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "適用" }));
+
+    await screen.findByText("Default Plan");
+    screen.getByText("Beta Plan");
+    screen.getByText("guild-1 -> Default Plan");
+  });
+
+  it("sends null limit_value when creating an unlimited quota", async () => {
+    let quotaRequest: unknown = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "admin-1",
+            guild_id: "guild-1",
+            is_admin: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/admin/plans" && !init?.method) {
+        return Promise.resolve(jsonResponse([adminPlan()]));
+      }
+      if (url === "/api/admin/plans/default") {
+        return Promise.resolve(jsonResponse(adminPlan()));
+      }
+      if (url === "/api/admin/plans/beta") {
+        return Promise.resolve(emptyResponse(404));
+      }
+      if (
+        url ===
+        "/api/admin/guild-plan-assignments?include_archived=false&limit=50"
+      ) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (
+        url === "/api/admin/plans/plan-default/quotas" &&
+        init?.method === "POST"
+      ) {
+        quotaRequest = JSON.parse(String(init.body));
+        expect(init.headers).toEqual({
+          Authorization: "Bearer admin-token",
+          "Content-Type": "application/json",
+        });
+        return Promise.resolve(
+          jsonResponse(
+            adminQuota({
+              id: "quota-unlimited",
+              limit_value: null,
+              unlimited: true,
+            }),
+            201,
+          ),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/plans", fetchMock);
+
+    fireEvent.change(await screen.findByLabelText("管理トークン"), {
+      target: { value: "admin-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "適用" }));
+    await screen.findByText("Default Plan");
+    fireEvent.click(screen.getByLabelText("Unlimited"));
+    fireEvent.click(screen.getByRole("button", { name: "追加" }));
+
+    await screen.findByText(
+      "クォータを追加しました。監査ログに plan_quota.create が記録されます。",
+    );
+    expect(quotaRequest).toEqual({
+      dimension: "recording_minutes",
+      period: "monthly",
+      unlimited: true,
+      limit_value: null,
+      enforcement_mode: "observe_only",
+    });
   });
 
   it("keeps unsaved settings edits when saving a bot token", async () => {

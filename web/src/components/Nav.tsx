@@ -3,6 +3,7 @@ import type { UserGuild } from "../lib/types";
 
 interface NavProps {
   isAdmin: boolean;
+  isSystemAdmin: boolean;
   guilds: UserGuild[];
   selectedGuildId: string | null;
   settingsGuildId: string | null;
@@ -25,6 +26,7 @@ function guildOptionLabel(guild: UserGuild): string {
 
 export function Nav({
   isAdmin,
+  isSystemAdmin,
   guilds,
   selectedGuildId,
   settingsGuildId,
@@ -71,6 +73,16 @@ export function Nav({
               }
             >
               {"\u8a2d\u5b9a"}
+            </NavLink>
+          ) : null}
+          {isSystemAdmin ? (
+            <NavLink
+              to="/admin/plans"
+              className={({ isActive }) =>
+                `app-nav-link${isActive ? " active" : ""}`
+              }
+            >
+              {"\u7ba1\u7406"}
             </NavLink>
           ) : null}
         </div>

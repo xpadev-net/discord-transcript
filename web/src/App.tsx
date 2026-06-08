@@ -4,6 +4,7 @@ import { ForbiddenState } from "./components/ForbiddenState";
 import { Nav } from "./components/Nav";
 import { fetchMe, fetchMeGuilds } from "./lib/api";
 import type { MeResponse, UserGuild } from "./lib/types";
+import { AdminPlansPage } from "./pages/AdminPlansPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -158,6 +159,7 @@ export function App() {
     <>
       <Nav
         isAdmin={canUseSelectedGuildSettings}
+        isSystemAdmin={me?.is_admin === true}
         guilds={guilds}
         selectedGuildId={selectedGuildId}
         settingsGuildId={selectedGuildId}
@@ -219,6 +221,17 @@ export function App() {
         />
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
         <Route
+          path="/admin/plans"
+          element={
+            <AdminRoute
+              isAdmin={me?.is_admin === true}
+              loading={loadingMe}
+              forbidden={sessionForbidden}
+              error={sessionError}
+            />
+          }
+        />
+        <Route
           path="*"
           element={
             <div className="empty-state">
@@ -231,6 +244,48 @@ export function App() {
       </Routes>
     </>
   );
+}
+
+interface AdminRouteProps {
+  isAdmin: boolean;
+  loading: boolean;
+  forbidden: boolean;
+  error: boolean;
+}
+
+function AdminRoute({ isAdmin, loading, forbidden, error }: AdminRouteProps) {
+  if (loading) {
+    return (
+      <main className="admin-page">
+        <output className="loading settings-panel-message">
+          <span className="loading-spinner" />
+          {"\u8aad\u307f\u8fbc\u307f\u4e2d"}
+        </output>
+      </main>
+    );
+  }
+
+  if (error) {
+    return (
+      <main className="admin-page">
+        <div className="panel-error settings-panel-message" role="alert">
+          {
+            "\u6a29\u9650\u60c5\u5831\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f"
+          }
+        </div>
+      </main>
+    );
+  }
+
+  if (forbidden || !isAdmin) {
+    return (
+      <main className="admin-page">
+        <ForbiddenState message="\u30b7\u30b9\u30c6\u30e0\u7ba1\u7406\u6a29\u9650\u304c\u5fc5\u8981\u3067\u3059" />
+      </main>
+    );
+  }
+
+  return <AdminPlansPage />;
 }
 
 interface SettingsRouteProps {
