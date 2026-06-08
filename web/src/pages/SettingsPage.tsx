@@ -960,6 +960,8 @@ export function SettingsPage({
 
   const refreshCustomizations = useCallback(
     async (
+      canManageDomainKnowledge: boolean,
+      canManageSummaryTemplates: boolean,
       signal?: AbortSignal,
       preferredDomainKnowledgeId?: string | null,
       preferredAiMemoryId?: string | null,
@@ -973,11 +975,21 @@ export function SettingsPage({
       try {
         const [domainItems, memoryNotes, feedbackQueue, aliases, templates] =
           await Promise.all([
-            fetchDomainKnowledgeItems({ includeArchived: true }, signal),
-            fetchAiMemoryNotes({ includeArchived: true }, signal),
-            fetchTranscriptFeedbackQueue({ status: "open" }, signal),
-            fetchPersonAliases({ includeArchived: true }, signal),
-            fetchSummaryTemplates({ includeArchived: true }, signal),
+            canManageDomainKnowledge
+              ? fetchDomainKnowledgeItems({ includeArchived: true }, signal)
+              : Promise.resolve([]),
+            canManageDomainKnowledge
+              ? fetchAiMemoryNotes({ includeArchived: true }, signal)
+              : Promise.resolve([]),
+            canManageDomainKnowledge
+              ? fetchTranscriptFeedbackQueue({ status: "open" }, signal)
+              : Promise.resolve([]),
+            canManageDomainKnowledge
+              ? fetchPersonAliases({ includeArchived: true }, signal)
+              : Promise.resolve([]),
+            canManageSummaryTemplates
+              ? fetchSummaryTemplates({ includeArchived: true }, signal)
+              : Promise.resolve([]),
           ]);
         if (signal?.aborted || currentGuildKeyRef.current !== requestGuildKey) {
           return;
@@ -1120,11 +1132,19 @@ export function SettingsPage({
         if (!controller.signal.aborted) {
           setSettings(settingsResponse);
           setForm(formFromSettings(settingsResponse));
-          if (settingsResponse.is_admin) {
+          if (settingsResponse.can_manage_settings) {
             void refreshRbac(controller.signal);
           }
-          if (settingsResponse.is_admin && showCustomizations) {
-            void refreshCustomizations(controller.signal);
+          if (
+            showCustomizations &&
+            (settingsResponse.can_manage_domain_knowledge ||
+              settingsResponse.can_manage_summary_templates)
+          ) {
+            void refreshCustomizations(
+              settingsResponse.can_manage_domain_knowledge,
+              settingsResponse.can_manage_summary_templates,
+              controller.signal,
+            );
           }
         }
       })
@@ -1151,7 +1171,15 @@ export function SettingsPage({
     return () => controller.abort();
   }, [guildId, refreshCustomizations, refreshRbac, showCustomizations]);
 
-  const canEdit = settings?.is_admin ?? false;
+  const canEdit = settings?.can_manage_settings ?? settings?.is_admin ?? false;
+  const canManageDomainKnowledge =
+    showCustomizations &&
+    (settings?.can_manage_domain_knowledge ?? settings?.is_admin ?? false);
+  const canManageSummaryTemplates =
+    showCustomizations &&
+    (settings?.can_manage_summary_templates ?? settings?.is_admin ?? false);
+  const canManageCustomizations =
+    canManageDomainKnowledge || canManageSummaryTemplates;
   const isSavingAny = activeOperation !== null;
   const controlsDisabled = !canEdit || loading || isSavingAny || form == null;
   const tokenControlsDisabled =
@@ -1204,7 +1232,7 @@ export function SettingsPage({
     (item) => item.active && item.archived_at == null,
   );
   const customizationControlsDisabled =
-    !canEdit || customizationLoading || isSavingAny;
+    !canManageCustomizations || customizationLoading || isSavingAny;
   const retentionPolicyDraft = retentionPolicyRequestFromDraft(
     retentionDraft,
     form,
@@ -1874,6 +1902,8 @@ export function SettingsPage({
         ? await updateDomainKnowledgeItem(domainKnowledgeDraft.id, request)
         : await createDomainKnowledgeItem(request);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         updated.id,
         aiMemoryDraft.id,
@@ -1913,6 +1943,8 @@ export function SettingsPage({
         selectedDomainKnowledgeItem.id,
       );
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         updated.id,
         aiMemoryDraft.id,
@@ -1953,6 +1985,8 @@ export function SettingsPage({
         selectedDomainKnowledgeItem.id,
       );
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         updated.id,
         aiMemoryDraft.id,
@@ -2003,6 +2037,8 @@ export function SettingsPage({
         ? await updateSummaryTemplate(summaryTemplateDraft.id, request)
         : await createSummaryTemplate(request);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         aiMemoryDraft.id,
@@ -2036,6 +2072,8 @@ export function SettingsPage({
     try {
       const updated = await activateSummaryTemplate(selectedSummaryTemplate.id);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         aiMemoryDraft.id,
@@ -2074,6 +2112,8 @@ export function SettingsPage({
     try {
       const updated = await archiveSummaryTemplate(selectedSummaryTemplate.id);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         aiMemoryDraft.id,
@@ -2123,6 +2163,8 @@ export function SettingsPage({
         ? await updateAiMemoryNote(aiMemoryDraft.id, request)
         : await createAiMemoryNote(request);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         updated.id,
@@ -2160,6 +2202,8 @@ export function SettingsPage({
         ? await unpinAiMemoryNote(selectedAiMemoryNote.id)
         : await pinAiMemoryNote(selectedAiMemoryNote.id);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         updated.id,
@@ -2204,6 +2248,8 @@ export function SettingsPage({
     try {
       const updated = await archiveAiMemoryNote(selectedAiMemoryNote.id);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         updated.id,
@@ -2247,6 +2293,8 @@ export function SettingsPage({
         { content_type: aiMemoryDraft.promoteContentType },
       );
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         promoted.id,
         selectedAiMemoryNote.id,
@@ -2291,6 +2339,8 @@ export function SettingsPage({
         feedbackStatusRequest(status),
       );
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         aiMemoryDraft.id,
@@ -2348,6 +2398,8 @@ export function SettingsPage({
         ? await updatePersonAlias(personAliasDraft.id, request)
         : await createPersonAlias(request);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         aiMemoryDraft.id,
@@ -2388,6 +2440,8 @@ export function SettingsPage({
     try {
       const updated = await archivePersonAlias(selectedPersonAlias.id);
       await refreshCustomizations(
+        canManageDomainKnowledge,
+        canManageSummaryTemplates,
         undefined,
         domainKnowledgeDraft.id,
         aiMemoryDraft.id,
@@ -2976,7 +3030,7 @@ export function SettingsPage({
         </section>
       ) : null}
 
-      {settings && showCustomizations ? (
+      {settings && canManageCustomizations ? (
         <section className="settings-section settings-customization-section">
           <div className="settings-section-heading">
             <div>
@@ -2993,6 +3047,8 @@ export function SettingsPage({
               disabled={customizationControlsDisabled}
               onClick={() =>
                 void refreshCustomizations(
+                  canManageDomainKnowledge,
+                  canManageSummaryTemplates,
                   undefined,
                   domainKnowledgeDraft.id,
                   aiMemoryDraft.id,
@@ -3019,410 +3075,74 @@ export function SettingsPage({
           ) : null}
 
           <div className="settings-customization-grid">
-            <form
-              className="settings-customization-panel"
-              onSubmit={handleDomainKnowledgeSave}
-            >
-              <div className="settings-customization-header">
-                <div>
-                  <h3>{"\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58"}</h3>
-                  <p>
-                    {activeDomainKnowledgeItems.length > 0
-                      ? `\u6709\u52b9: ${activeDomainKnowledgeItems
-                          .map((item) => `${item.title} v${item.version}`)
-                          .join(", ")}`
-                      : "\u6709\u52b9\u306a\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58\u306f\u3042\u308a\u307e\u305b\u3093"}
-                  </p>
+            {canManageDomainKnowledge ? (
+              <form
+                className="settings-customization-panel"
+                onSubmit={handleDomainKnowledgeSave}
+              >
+                <div className="settings-customization-header">
+                  <div>
+                    <h3>{"\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58"}</h3>
+                    <p>
+                      {activeDomainKnowledgeItems.length > 0
+                        ? `\u6709\u52b9: ${activeDomainKnowledgeItems
+                            .map((item) => `${item.title} v${item.version}`)
+                            .join(", ")}`
+                        : "\u6709\u52b9\u306a\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58\u306f\u3042\u308a\u307e\u305b\u3093"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={customizationControlsDisabled}
+                    onClick={() => handleDomainKnowledgeSelect("")}
+                  >
+                    {"\u65b0\u898f"}
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={customizationControlsDisabled}
-                  onClick={() => handleDomainKnowledgeSelect("")}
-                >
-                  {"\u65b0\u898f"}
-                </button>
-              </div>
 
-              <label className="settings-field">
-                <span>{"\u30d0\u30fc\u30b8\u30e7\u30f3"}</span>
-                <select
-                  value={domainKnowledgeDraft.id ?? ""}
-                  disabled={
-                    customizationControlsDisabled ||
-                    domainKnowledgeItems.length === 0
-                  }
-                  onChange={(event) =>
-                    handleDomainKnowledgeSelect(event.target.value)
-                  }
-                >
-                  <option value="">
-                    {"\u65b0\u898f\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58"}
-                  </option>
-                  {domainKnowledgeItems.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {`${item.title} v${item.version} / ${
-                        domainKnowledgeTypeLabels[item.content_type]
-                      }${
-                        item.archived_at
-                          ? " / \u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
-                          : item.active
-                            ? " / \u6709\u52b9"
-                            : " / \u4e0b\u66f8\u304d"
-                      }`}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="settings-field">
-                <span>{"\u7a2e\u5225"}</span>
-                <select
-                  value={domainKnowledgeDraft.content_type}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedDomainKnowledgeItem?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateDomainKnowledgeDraft({
-                      content_type: event.target
-                        .value as DomainKnowledgeContentType,
-                    })
-                  }
-                >
-                  {domainKnowledgeContentTypes.map((contentType) => (
-                    <option key={contentType} value={contentType}>
-                      {domainKnowledgeTypeLabels[contentType]}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="settings-field">
-                <span>{"\u30bf\u30a4\u30c8\u30eb"}</span>
-                <input
-                  type="text"
-                  value={domainKnowledgeDraft.title}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedDomainKnowledgeItem?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateDomainKnowledgeDraft({ title: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"\u672c\u6587"}</span>
-                <textarea
-                  rows={7}
-                  value={domainKnowledgeDraft.body}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedDomainKnowledgeItem?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateDomainKnowledgeDraft({ body: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-checkbox">
-                <input
-                  type="checkbox"
-                  checked={domainKnowledgeDraft.active}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedDomainKnowledgeItem?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateDomainKnowledgeDraft({
-                      active: event.target.checked,
-                    })
-                  }
-                />
-                <span>
-                  {"\u4fdd\u5b58\u6642\u306b\u6709\u52b9\u306b\u3059\u308b"}
-                </span>
-              </label>
-
-              {selectedDomainKnowledgeItem ? (
-                <p className="settings-version-meta">
-                  {`v${selectedDomainKnowledgeItem.version} / ${
-                    selectedDomainKnowledgeItem.archived_at
-                      ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
-                      : selectedDomainKnowledgeItem.active
-                        ? "\u6709\u52b9"
-                        : "\u4e0b\u66f8\u304d"
-                  } / \u66f4\u65b0: ${selectedDomainKnowledgeItem.updated_at}`}
-                </p>
-              ) : null}
-
-              <div className="settings-token-actions">
-                <button
-                  type="submit"
-                  className="primary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedDomainKnowledgeItem?.archived_at != null
-                  }
-                >
-                  {activeOperation === "domain-save"
-                    ? "\u4fdd\u5b58\u4e2d"
-                    : "\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58\u3092\u4fdd\u5b58"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedDomainKnowledgeItem ||
-                    selectedDomainKnowledgeItem.active ||
-                    selectedDomainKnowledgeItem.archived_at != null
-                  }
-                  onClick={handleDomainKnowledgeActivate}
-                >
-                  {activeOperation === "domain-activate"
-                    ? "\u6709\u52b9\u5316\u4e2d"
-                    : "\u6709\u52b9\u5316"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedDomainKnowledgeItem ||
-                    selectedDomainKnowledgeItem.archived_at != null
-                  }
-                  onClick={handleDomainKnowledgeArchive}
-                >
-                  {activeOperation === "domain-archive"
-                    ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u4e2d"
-                    : "\u30a2\u30fc\u30ab\u30a4\u30d6"}
-                </button>
-              </div>
-            </form>
-
-            <form
-              className="settings-customization-panel"
-              onSubmit={handleAiMemorySave}
-            >
-              <div className="settings-customization-header">
-                <div>
-                  <h3>{"AIメモ"}</h3>
-                  <p>
-                    {activeAiMemoryNotes.length > 0
-                      ? `有効: ${activeAiMemoryNotes.length}件 / ピン留め: ${pinnedAiMemoryNotes.length}件`
-                      : "有効なAIメモはありません"}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={customizationControlsDisabled}
-                  onClick={() => handleAiMemorySelect("")}
-                >
-                  {"新規"}
-                </button>
-              </div>
-
-              <label className="settings-field">
-                <span>{"メモ"}</span>
-                <select
-                  value={aiMemoryDraft.id ?? ""}
-                  disabled={
-                    customizationControlsDisabled || aiMemoryNotes.length === 0
-                  }
-                  onChange={(event) => handleAiMemorySelect(event.target.value)}
-                >
-                  <option value="">{"新規AIメモ"}</option>
-                  {aiMemoryNotes.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {`${item.pinned ? "★ " : ""}${item.title} / ${labelFromRecord(
-                        aiMemorySourceLabels,
-                        item.source_type,
-                      )}${
-                        item.archived_at
-                          ? " / アーカイブ済み"
-                          : item.active
-                            ? " / 有効"
-                            : " / 無効"
-                      }`}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="settings-field">
-                <span>{"AIメモタイトル"}</span>
-                <input
-                  type="text"
-                  value={aiMemoryDraft.title}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateAiMemoryDraft({ title: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"AIメモ本文"}</span>
-                <textarea
-                  rows={6}
-                  value={aiMemoryDraft.body}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateAiMemoryDraft({ body: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"タグ"}</span>
-                <input
-                  type="text"
-                  list="ai-memory-tags"
-                  placeholder="terminology, summary_hint"
-                  value={aiMemoryDraft.tagsText}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateAiMemoryDraft({ tagsText: event.target.value })
-                  }
-                />
-              </label>
-              <datalist id="ai-memory-tags">
-                {aiMemoryTags.map((tag) => (
-                  <option key={tag} value={tag}>
-                    {aiMemoryTagLabels[tag]}
-                  </option>
-                ))}
-              </datalist>
-
-              <label className="settings-field">
-                <span>{"信頼度"}</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={1}
-                  step={0.001}
-                  placeholder="0.8"
-                  value={aiMemoryDraft.confidence}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateAiMemoryDraft({ confidence: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-checkbox">
-                <input
-                  type="checkbox"
-                  checked={aiMemoryDraft.active}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateAiMemoryDraft({ active: event.target.checked })
-                  }
-                />
-                <span>{"有効にする"}</span>
-              </label>
-
-              <label className="settings-checkbox">
-                <input
-                  type="checkbox"
-                  checked={aiMemoryDraft.pinned}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateAiMemoryDraft({ pinned: event.target.checked })
-                  }
-                />
-                <span>{"保存時にピン留めする"}</span>
-              </label>
-
-              {selectedAiMemoryNote ? (
-                <p className="settings-version-meta">
-                  {`${selectedAiMemoryNote.archived_at ? "アーカイブ済み" : selectedAiMemoryNote.active ? "有効" : "無効"} / ${
-                    selectedAiMemoryNote.pinned ? "ピン留め" : "通常"
-                  } / 更新: ${selectedAiMemoryNote.updated_at}`}
-                </p>
-              ) : null}
-
-              <div className="settings-token-actions">
-                <button
-                  type="submit"
-                  className="primary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedAiMemoryNote?.archived_at != null
-                  }
-                >
-                  {activeOperation === "memory-save"
-                    ? "保存中"
-                    : "AIメモを保存"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedAiMemoryNote ||
-                    selectedAiMemoryNote.archived_at != null
-                  }
-                  onClick={handleAiMemoryPinToggle}
-                >
-                  {activeOperation === "memory-pin"
-                    ? "更新中"
-                    : selectedAiMemoryNote?.pinned
-                      ? "ピン解除"
-                      : "ピン留め"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedAiMemoryNote ||
-                    selectedAiMemoryNote.archived_at != null
-                  }
-                  onClick={handleAiMemoryArchive}
-                >
-                  {activeOperation === "memory-archive"
-                    ? "アーカイブ中"
-                    : "アーカイブ"}
-                </button>
-              </div>
-
-              <div className="settings-promote-row">
                 <label className="settings-field">
-                  <span>{"昇格先"}</span>
+                  <span>{"\u30d0\u30fc\u30b8\u30e7\u30f3"}</span>
                   <select
-                    value={aiMemoryDraft.promoteContentType}
+                    value={domainKnowledgeDraft.id ?? ""}
                     disabled={
                       customizationControlsDisabled ||
-                      !selectedAiMemoryNote ||
-                      selectedAiMemoryNote.archived_at != null
+                      domainKnowledgeItems.length === 0
                     }
                     onChange={(event) =>
-                      updateAiMemoryDraft({
-                        promoteContentType: event.target
+                      handleDomainKnowledgeSelect(event.target.value)
+                    }
+                  >
+                    <option value="">
+                      {"\u65b0\u898f\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58"}
+                    </option>
+                    {domainKnowledgeItems.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {`${item.title} v${item.version} / ${
+                          domainKnowledgeTypeLabels[item.content_type]
+                        }${
+                          item.archived_at
+                            ? " / \u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
+                            : item.active
+                              ? " / \u6709\u52b9"
+                              : " / \u4e0b\u66f8\u304d"
+                        }`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="settings-field">
+                  <span>{"\u7a2e\u5225"}</span>
+                  <select
+                    value={domainKnowledgeDraft.content_type}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedDomainKnowledgeItem?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateDomainKnowledgeDraft({
+                        content_type: event.target
                           .value as DomainKnowledgeContentType,
                       })
                     }
@@ -3434,456 +3154,815 @@ export function SettingsPage({
                     ))}
                   </select>
                 </label>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedAiMemoryNote ||
-                    selectedAiMemoryNote.archived_at != null
-                  }
-                  onClick={handleAiMemoryPromote}
-                >
-                  {activeOperation === "memory-promote"
-                    ? "昇格中"
-                    : "ドメイン知識へ昇格"}
-                </button>
-              </div>
-            </form>
 
-            <div className="settings-customization-panel">
-              <div className="settings-customization-header">
-                <div>
-                  <h3>{"フィードバックキュー"}</h3>
-                  <p>
-                    {feedbackItems.length > 0
-                      ? `未対応: ${feedbackItems.length}件`
-                      : "未対応のフィードバックはありません"}
-                  </p>
-                </div>
-              </div>
-
-              {feedbackItems.length > 0 ? (
-                <ul className="settings-review-list">
-                  {feedbackItems.map((item) => (
-                    <li key={item.id} className="settings-review-item">
-                      <div>
-                        <div className="settings-review-title">
-                          {labelFromRecord(
-                            feedbackTypeLabels,
-                            item.feedback_type,
-                          )}
-                          <span className="settings-review-meta">
-                            {labelFromRecord(feedbackStatusLabels, item.status)}
-                          </span>
-                        </div>
-                        <p>{feedbackText(item)}</p>
-                        <p className="settings-review-meta">
-                          {`作成: ${item.created_at}${
-                            item.meeting_id ? ` / 会議: ${item.meeting_id}` : ""
-                          }`}
-                        </p>
-                      </div>
-                      <div className="settings-token-actions">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          aria-label={feedbackActionLabel(item, "採用")}
-                          disabled={customizationControlsDisabled}
-                          onClick={() =>
-                            void handleFeedbackStatus(item, "accepted")
-                          }
-                        >
-                          {"採用"}
-                        </button>
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          aria-label={feedbackActionLabel(item, "却下")}
-                          disabled={customizationControlsDisabled}
-                          onClick={() =>
-                            void handleFeedbackStatus(item, "dismissed")
-                          }
-                        >
-                          {"却下"}
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="settings-version-meta">
-                  {"会議ページから送信されたフィードバックがここに表示されます"}
-                </p>
-              )}
-            </div>
-
-            <form
-              className="settings-customization-panel"
-              onSubmit={handlePersonAliasSave}
-            >
-              <div className="settings-customization-header">
-                <div>
-                  <h3>{"人名別名"}</h3>
-                  <p>
-                    {activePersonAliases.length > 0
-                      ? `有効: ${activePersonAliases.length}件`
-                      : "有効な人名別名はありません"}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={customizationControlsDisabled}
-                  onClick={() => handlePersonAliasSelect("")}
-                >
-                  {"新規"}
-                </button>
-              </div>
-
-              <label className="settings-field">
-                <span>{"別名レコード"}</span>
-                <select
-                  value={personAliasDraft.id ?? ""}
-                  disabled={
-                    customizationControlsDisabled || personAliases.length === 0
-                  }
-                  onChange={(event) =>
-                    handlePersonAliasSelect(event.target.value)
-                  }
-                >
-                  <option value="">{"新規人名別名"}</option>
-                  {personAliases.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {`${item.canonical_name} / ${item.alias} / ${
-                        personAliasReviewStatusLabels[item.review_status]
-                      }${
-                        item.archived_at
-                          ? " / アーカイブ済み"
-                          : item.active
-                            ? " / 有効"
-                            : " / 無効"
-                      }`}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="settings-field">
-                <span>{"正式名"}</span>
-                <input
-                  type="text"
-                  value={personAliasDraft.canonical_name}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updatePersonAliasDraft({
-                      canonical_name: event.target.value,
-                    })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"別名"}</span>
-                <input
-                  type="text"
-                  value={personAliasDraft.alias}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updatePersonAliasDraft({ alias: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"DiscordユーザーID"}</span>
-                <input
-                  type="text"
-                  value={personAliasDraft.discord_user_id}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updatePersonAliasDraft({
-                      discord_user_id: event.target.value,
-                    })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"信頼度"}</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={1}
-                  step={0.001}
-                  value={personAliasDraft.confidence}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updatePersonAliasDraft({ confidence: event.target.value })
-                  }
-                />
-              </label>
-
-              <label className="settings-field">
-                <span>{"レビュー状態"}</span>
-                <select
-                  value={personAliasDraft.review_status}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updatePersonAliasDraft({
-                      review_status: event.target
-                        .value as PersonAliasReviewStatus,
-                    })
-                  }
-                >
-                  {(
-                    Object.keys(
-                      personAliasReviewStatusLabels,
-                    ) as PersonAliasReviewStatus[]
-                  ).map((status) => (
-                    <option key={status} value={status}>
-                      {personAliasReviewStatusLabels[status]}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="settings-checkbox">
-                <input
-                  type="checkbox"
-                  checked={personAliasDraft.active}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updatePersonAliasDraft({ active: event.target.checked })
-                  }
-                />
-                <span>{"有効にする"}</span>
-              </label>
-
-              {selectedPersonAlias ? (
-                <p className="settings-version-meta">
-                  {`${labelFromRecord(
-                    personAliasSourceLabels,
-                    selectedPersonAlias.source_type,
-                  )} / ${
-                    selectedPersonAlias.archived_at
-                      ? "アーカイブ済み"
-                      : selectedPersonAlias.active
-                        ? "有効"
-                        : "無効"
-                  } / 更新: ${selectedPersonAlias.updated_at}`}
-                </p>
-              ) : null}
-
-              <div className="settings-token-actions">
-                <button
-                  type="submit"
-                  className="primary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedPersonAlias?.archived_at != null
-                  }
-                >
-                  {activeOperation === "alias-save"
-                    ? "保存中"
-                    : "人名別名を保存"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedPersonAlias ||
-                    selectedPersonAlias.archived_at != null
-                  }
-                  onClick={handlePersonAliasArchive}
-                >
-                  {activeOperation === "alias-archive"
-                    ? "アーカイブ中"
-                    : "アーカイブ"}
-                </button>
-              </div>
-            </form>
-
-            <form
-              className="settings-customization-panel"
-              onSubmit={handleSummaryTemplateSave}
-            >
-              <div className="settings-customization-header">
-                <div>
-                  <h3>{"\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8"}</h3>
-                  <p>
-                    {activeSummaryTemplate
-                      ? `\u6709\u52b9: ${activeSummaryTemplate.name} v${activeSummaryTemplate.version}`
-                      : "\u6709\u52b9\u306a\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u306f\u3042\u308a\u307e\u305b\u3093"}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={customizationControlsDisabled}
-                  onClick={() => handleSummaryTemplateSelect("")}
-                >
-                  {"\u65b0\u898f"}
-                </button>
-              </div>
-
-              <label className="settings-field">
-                <span>{"\u30d0\u30fc\u30b8\u30e7\u30f3"}</span>
-                <select
-                  value={summaryTemplateDraft.id ?? ""}
-                  disabled={
-                    customizationControlsDisabled ||
-                    summaryTemplates.length === 0
-                  }
-                  onChange={(event) =>
-                    handleSummaryTemplateSelect(event.target.value)
-                  }
-                >
-                  <option value="">
-                    {
-                      "\u65b0\u898f\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8"
+                <label className="settings-field">
+                  <span>{"\u30bf\u30a4\u30c8\u30eb"}</span>
+                  <input
+                    type="text"
+                    value={domainKnowledgeDraft.title}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedDomainKnowledgeItem?.archived_at != null
                     }
-                  </option>
-                  {summaryTemplates.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {`${item.name} v${item.version}${
-                        item.archived_at
-                          ? " / \u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
-                          : item.active
-                            ? " / \u6709\u52b9"
-                            : " / \u4e0b\u66f8\u304d"
-                      }`}
+                    onChange={(event) =>
+                      updateDomainKnowledgeDraft({ title: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"\u672c\u6587"}</span>
+                  <textarea
+                    rows={7}
+                    value={domainKnowledgeDraft.body}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedDomainKnowledgeItem?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateDomainKnowledgeDraft({ body: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={domainKnowledgeDraft.active}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedDomainKnowledgeItem?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateDomainKnowledgeDraft({
+                        active: event.target.checked,
+                      })
+                    }
+                  />
+                  <span>
+                    {"\u4fdd\u5b58\u6642\u306b\u6709\u52b9\u306b\u3059\u308b"}
+                  </span>
+                </label>
+
+                {selectedDomainKnowledgeItem ? (
+                  <p className="settings-version-meta">
+                    {`v${selectedDomainKnowledgeItem.version} / ${
+                      selectedDomainKnowledgeItem.archived_at
+                        ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
+                        : selectedDomainKnowledgeItem.active
+                          ? "\u6709\u52b9"
+                          : "\u4e0b\u66f8\u304d"
+                    } / \u66f4\u65b0: ${selectedDomainKnowledgeItem.updated_at}`}
+                  </p>
+                ) : null}
+
+                <div className="settings-token-actions">
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedDomainKnowledgeItem?.archived_at != null
+                    }
+                  >
+                    {activeOperation === "domain-save"
+                      ? "\u4fdd\u5b58\u4e2d"
+                      : "\u30c9\u30e1\u30a4\u30f3\u77e5\u8b58\u3092\u4fdd\u5b58"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedDomainKnowledgeItem ||
+                      selectedDomainKnowledgeItem.active ||
+                      selectedDomainKnowledgeItem.archived_at != null
+                    }
+                    onClick={handleDomainKnowledgeActivate}
+                  >
+                    {activeOperation === "domain-activate"
+                      ? "\u6709\u52b9\u5316\u4e2d"
+                      : "\u6709\u52b9\u5316"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedDomainKnowledgeItem ||
+                      selectedDomainKnowledgeItem.archived_at != null
+                    }
+                    onClick={handleDomainKnowledgeArchive}
+                  >
+                    {activeOperation === "domain-archive"
+                      ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u4e2d"
+                      : "\u30a2\u30fc\u30ab\u30a4\u30d6"}
+                  </button>
+                </div>
+              </form>
+            ) : null}
+
+            {canManageDomainKnowledge ? (
+              <form
+                className="settings-customization-panel"
+                onSubmit={handleAiMemorySave}
+              >
+                <div className="settings-customization-header">
+                  <div>
+                    <h3>{"AIメモ"}</h3>
+                    <p>
+                      {activeAiMemoryNotes.length > 0
+                        ? `有効: ${activeAiMemoryNotes.length}件 / ピン留め: ${pinnedAiMemoryNotes.length}件`
+                        : "有効なAIメモはありません"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={customizationControlsDisabled}
+                    onClick={() => handleAiMemorySelect("")}
+                  >
+                    {"新規"}
+                  </button>
+                </div>
+
+                <label className="settings-field">
+                  <span>{"メモ"}</span>
+                  <select
+                    value={aiMemoryDraft.id ?? ""}
+                    disabled={
+                      customizationControlsDisabled ||
+                      aiMemoryNotes.length === 0
+                    }
+                    onChange={(event) =>
+                      handleAiMemorySelect(event.target.value)
+                    }
+                  >
+                    <option value="">{"新規AIメモ"}</option>
+                    {aiMemoryNotes.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {`${item.pinned ? "★ " : ""}${item.title} / ${labelFromRecord(
+                          aiMemorySourceLabels,
+                          item.source_type,
+                        )}${
+                          item.archived_at
+                            ? " / アーカイブ済み"
+                            : item.active
+                              ? " / 有効"
+                              : " / 無効"
+                        }`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="settings-field">
+                  <span>{"AIメモタイトル"}</span>
+                  <input
+                    type="text"
+                    value={aiMemoryDraft.title}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({ title: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"AIメモ本文"}</span>
+                  <textarea
+                    rows={6}
+                    value={aiMemoryDraft.body}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({ body: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"タグ"}</span>
+                  <input
+                    type="text"
+                    list="ai-memory-tags"
+                    placeholder="terminology, summary_hint"
+                    value={aiMemoryDraft.tagsText}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({ tagsText: event.target.value })
+                    }
+                  />
+                </label>
+                <datalist id="ai-memory-tags">
+                  {aiMemoryTags.map((tag) => (
+                    <option key={tag} value={tag}>
+                      {aiMemoryTagLabels[tag]}
                     </option>
                   ))}
-                </select>
-              </label>
+                </datalist>
 
-              <label className="settings-field">
-                <span>{"\u540d\u524d"}</span>
-                <input
-                  type="text"
-                  value={summaryTemplateDraft.name}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedSummaryTemplate?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateSummaryTemplateDraft({ name: event.target.value })
-                  }
-                />
-              </label>
+                <label className="settings-field">
+                  <span>{"信頼度"}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.001}
+                    placeholder="0.8"
+                    value={aiMemoryDraft.confidence}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({ confidence: event.target.value })
+                    }
+                  />
+                </label>
 
-              <label className="settings-field">
-                <span>{"\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8"}</span>
-                <textarea
-                  rows={9}
-                  value={summaryTemplateDraft.template}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedSummaryTemplate?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateSummaryTemplateDraft({
-                      template: event.target.value,
-                    })
-                  }
-                />
-              </label>
+                <label className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={aiMemoryDraft.active}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({ active: event.target.checked })
+                    }
+                  />
+                  <span>{"有効にする"}</span>
+                </label>
 
-              <label className="settings-checkbox">
-                <input
-                  type="checkbox"
-                  checked={summaryTemplateDraft.active}
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedSummaryTemplate?.archived_at != null
-                  }
-                  onChange={(event) =>
-                    updateSummaryTemplateDraft({
-                      active: event.target.checked,
-                    })
-                  }
-                />
-                <span>
-                  {"\u4fdd\u5b58\u6642\u306b\u6709\u52b9\u306b\u3059\u308b"}
-                </span>
-              </label>
+                <label className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={aiMemoryDraft.pinned}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateAiMemoryDraft({ pinned: event.target.checked })
+                    }
+                  />
+                  <span>{"保存時にピン留めする"}</span>
+                </label>
 
-              {selectedSummaryTemplate ? (
-                <p className="settings-version-meta">
-                  {`v${selectedSummaryTemplate.version} / ${
-                    selectedSummaryTemplate.archived_at
-                      ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
-                      : selectedSummaryTemplate.active
-                        ? "\u6709\u52b9"
-                        : "\u4e0b\u66f8\u304d"
-                  } / \u66f4\u65b0: ${selectedSummaryTemplate.updated_at}`}
-                </p>
-              ) : null}
+                {selectedAiMemoryNote ? (
+                  <p className="settings-version-meta">
+                    {`${selectedAiMemoryNote.archived_at ? "アーカイブ済み" : selectedAiMemoryNote.active ? "有効" : "無効"} / ${
+                      selectedAiMemoryNote.pinned ? "ピン留め" : "通常"
+                    } / 更新: ${selectedAiMemoryNote.updated_at}`}
+                  </p>
+                ) : null}
 
-              <div className="settings-token-actions">
-                <button
-                  type="submit"
-                  className="primary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    selectedSummaryTemplate?.archived_at != null
-                  }
-                >
-                  {activeOperation === "template-save"
-                    ? "\u4fdd\u5b58\u4e2d"
-                    : "\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u3092\u4fdd\u5b58"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedSummaryTemplate ||
-                    selectedSummaryTemplate.active ||
-                    selectedSummaryTemplate.archived_at != null
-                  }
-                  onClick={handleSummaryTemplateActivate}
-                >
-                  {activeOperation === "template-activate"
-                    ? "\u6709\u52b9\u5316\u4e2d"
-                    : "\u6709\u52b9\u5316"}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={
-                    customizationControlsDisabled ||
-                    !selectedSummaryTemplate ||
-                    selectedSummaryTemplate.archived_at != null
-                  }
-                  onClick={handleSummaryTemplateArchive}
-                >
-                  {activeOperation === "template-archive"
-                    ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u4e2d"
-                    : "\u30a2\u30fc\u30ab\u30a4\u30d6"}
-                </button>
+                <div className="settings-token-actions">
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedAiMemoryNote?.archived_at != null
+                    }
+                  >
+                    {activeOperation === "memory-save"
+                      ? "保存中"
+                      : "AIメモを保存"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedAiMemoryNote ||
+                      selectedAiMemoryNote.archived_at != null
+                    }
+                    onClick={handleAiMemoryPinToggle}
+                  >
+                    {activeOperation === "memory-pin"
+                      ? "更新中"
+                      : selectedAiMemoryNote?.pinned
+                        ? "ピン解除"
+                        : "ピン留め"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedAiMemoryNote ||
+                      selectedAiMemoryNote.archived_at != null
+                    }
+                    onClick={handleAiMemoryArchive}
+                  >
+                    {activeOperation === "memory-archive"
+                      ? "アーカイブ中"
+                      : "アーカイブ"}
+                  </button>
+                </div>
+
+                <div className="settings-promote-row">
+                  <label className="settings-field">
+                    <span>{"昇格先"}</span>
+                    <select
+                      value={aiMemoryDraft.promoteContentType}
+                      disabled={
+                        customizationControlsDisabled ||
+                        !selectedAiMemoryNote ||
+                        selectedAiMemoryNote.archived_at != null
+                      }
+                      onChange={(event) =>
+                        updateAiMemoryDraft({
+                          promoteContentType: event.target
+                            .value as DomainKnowledgeContentType,
+                        })
+                      }
+                    >
+                      {domainKnowledgeContentTypes.map((contentType) => (
+                        <option key={contentType} value={contentType}>
+                          {domainKnowledgeTypeLabels[contentType]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedAiMemoryNote ||
+                      selectedAiMemoryNote.archived_at != null
+                    }
+                    onClick={handleAiMemoryPromote}
+                  >
+                    {activeOperation === "memory-promote"
+                      ? "昇格中"
+                      : "ドメイン知識へ昇格"}
+                  </button>
+                </div>
+              </form>
+            ) : null}
+
+            {canManageDomainKnowledge ? (
+              <div className="settings-customization-panel">
+                <div className="settings-customization-header">
+                  <div>
+                    <h3>{"フィードバックキュー"}</h3>
+                    <p>
+                      {feedbackItems.length > 0
+                        ? `未対応: ${feedbackItems.length}件`
+                        : "未対応のフィードバックはありません"}
+                    </p>
+                  </div>
+                </div>
+
+                {feedbackItems.length > 0 ? (
+                  <ul className="settings-review-list">
+                    {feedbackItems.map((item) => (
+                      <li key={item.id} className="settings-review-item">
+                        <div>
+                          <div className="settings-review-title">
+                            {labelFromRecord(
+                              feedbackTypeLabels,
+                              item.feedback_type,
+                            )}
+                            <span className="settings-review-meta">
+                              {labelFromRecord(
+                                feedbackStatusLabels,
+                                item.status,
+                              )}
+                            </span>
+                          </div>
+                          <p>{feedbackText(item)}</p>
+                          <p className="settings-review-meta">
+                            {`作成: ${item.created_at}${
+                              item.meeting_id
+                                ? ` / 会議: ${item.meeting_id}`
+                                : ""
+                            }`}
+                          </p>
+                        </div>
+                        <div className="settings-token-actions">
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            aria-label={feedbackActionLabel(item, "採用")}
+                            disabled={customizationControlsDisabled}
+                            onClick={() =>
+                              void handleFeedbackStatus(item, "accepted")
+                            }
+                          >
+                            {"採用"}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            aria-label={feedbackActionLabel(item, "却下")}
+                            disabled={customizationControlsDisabled}
+                            onClick={() =>
+                              void handleFeedbackStatus(item, "dismissed")
+                            }
+                          >
+                            {"却下"}
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="settings-version-meta">
+                    {
+                      "会議ページから送信されたフィードバックがここに表示されます"
+                    }
+                  </p>
+                )}
               </div>
-            </form>
+            ) : null}
+
+            {canManageDomainKnowledge ? (
+              <form
+                className="settings-customization-panel"
+                onSubmit={handlePersonAliasSave}
+              >
+                <div className="settings-customization-header">
+                  <div>
+                    <h3>{"人名別名"}</h3>
+                    <p>
+                      {activePersonAliases.length > 0
+                        ? `有効: ${activePersonAliases.length}件`
+                        : "有効な人名別名はありません"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={customizationControlsDisabled}
+                    onClick={() => handlePersonAliasSelect("")}
+                  >
+                    {"新規"}
+                  </button>
+                </div>
+
+                <label className="settings-field">
+                  <span>{"別名レコード"}</span>
+                  <select
+                    value={personAliasDraft.id ?? ""}
+                    disabled={
+                      customizationControlsDisabled ||
+                      personAliases.length === 0
+                    }
+                    onChange={(event) =>
+                      handlePersonAliasSelect(event.target.value)
+                    }
+                  >
+                    <option value="">{"新規人名別名"}</option>
+                    {personAliases.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {`${item.canonical_name} / ${item.alias} / ${
+                          personAliasReviewStatusLabels[item.review_status]
+                        }${
+                          item.archived_at
+                            ? " / アーカイブ済み"
+                            : item.active
+                              ? " / 有効"
+                              : " / 無効"
+                        }`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="settings-field">
+                  <span>{"正式名"}</span>
+                  <input
+                    type="text"
+                    value={personAliasDraft.canonical_name}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updatePersonAliasDraft({
+                        canonical_name: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"別名"}</span>
+                  <input
+                    type="text"
+                    value={personAliasDraft.alias}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updatePersonAliasDraft({ alias: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"DiscordユーザーID"}</span>
+                  <input
+                    type="text"
+                    value={personAliasDraft.discord_user_id}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updatePersonAliasDraft({
+                        discord_user_id: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"信頼度"}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.001}
+                    value={personAliasDraft.confidence}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updatePersonAliasDraft({ confidence: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"レビュー状態"}</span>
+                  <select
+                    value={personAliasDraft.review_status}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updatePersonAliasDraft({
+                        review_status: event.target
+                          .value as PersonAliasReviewStatus,
+                      })
+                    }
+                  >
+                    {(
+                      Object.keys(
+                        personAliasReviewStatusLabels,
+                      ) as PersonAliasReviewStatus[]
+                    ).map((status) => (
+                      <option key={status} value={status}>
+                        {personAliasReviewStatusLabels[status]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={personAliasDraft.active}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updatePersonAliasDraft({ active: event.target.checked })
+                    }
+                  />
+                  <span>{"有効にする"}</span>
+                </label>
+
+                {selectedPersonAlias ? (
+                  <p className="settings-version-meta">
+                    {`${labelFromRecord(
+                      personAliasSourceLabels,
+                      selectedPersonAlias.source_type,
+                    )} / ${
+                      selectedPersonAlias.archived_at
+                        ? "アーカイブ済み"
+                        : selectedPersonAlias.active
+                          ? "有効"
+                          : "無効"
+                    } / 更新: ${selectedPersonAlias.updated_at}`}
+                  </p>
+                ) : null}
+
+                <div className="settings-token-actions">
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedPersonAlias?.archived_at != null
+                    }
+                  >
+                    {activeOperation === "alias-save"
+                      ? "保存中"
+                      : "人名別名を保存"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedPersonAlias ||
+                      selectedPersonAlias.archived_at != null
+                    }
+                    onClick={handlePersonAliasArchive}
+                  >
+                    {activeOperation === "alias-archive"
+                      ? "アーカイブ中"
+                      : "アーカイブ"}
+                  </button>
+                </div>
+              </form>
+            ) : null}
+
+            {canManageSummaryTemplates ? (
+              <form
+                className="settings-customization-panel"
+                onSubmit={handleSummaryTemplateSave}
+              >
+                <div className="settings-customization-header">
+                  <div>
+                    <h3>
+                      {"\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8"}
+                    </h3>
+                    <p>
+                      {activeSummaryTemplate
+                        ? `\u6709\u52b9: ${activeSummaryTemplate.name} v${activeSummaryTemplate.version}`
+                        : "\u6709\u52b9\u306a\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u306f\u3042\u308a\u307e\u305b\u3093"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={customizationControlsDisabled}
+                    onClick={() => handleSummaryTemplateSelect("")}
+                  >
+                    {"\u65b0\u898f"}
+                  </button>
+                </div>
+
+                <label className="settings-field">
+                  <span>{"\u30d0\u30fc\u30b8\u30e7\u30f3"}</span>
+                  <select
+                    value={summaryTemplateDraft.id ?? ""}
+                    disabled={
+                      customizationControlsDisabled ||
+                      summaryTemplates.length === 0
+                    }
+                    onChange={(event) =>
+                      handleSummaryTemplateSelect(event.target.value)
+                    }
+                  >
+                    <option value="">
+                      {
+                        "\u65b0\u898f\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8"
+                      }
+                    </option>
+                    {summaryTemplates.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {`${item.name} v${item.version}${
+                          item.archived_at
+                            ? " / \u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
+                            : item.active
+                              ? " / \u6709\u52b9"
+                              : " / \u4e0b\u66f8\u304d"
+                        }`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="settings-field">
+                  <span>{"\u540d\u524d"}</span>
+                  <input
+                    type="text"
+                    value={summaryTemplateDraft.name}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedSummaryTemplate?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateSummaryTemplateDraft({ name: event.target.value })
+                    }
+                  />
+                </label>
+
+                <label className="settings-field">
+                  <span>{"\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8"}</span>
+                  <textarea
+                    rows={9}
+                    value={summaryTemplateDraft.template}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedSummaryTemplate?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateSummaryTemplateDraft({
+                        template: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+
+                <label className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={summaryTemplateDraft.active}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedSummaryTemplate?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateSummaryTemplateDraft({
+                        active: event.target.checked,
+                      })
+                    }
+                  />
+                  <span>
+                    {"\u4fdd\u5b58\u6642\u306b\u6709\u52b9\u306b\u3059\u308b"}
+                  </span>
+                </label>
+
+                {selectedSummaryTemplate ? (
+                  <p className="settings-version-meta">
+                    {`v${selectedSummaryTemplate.version} / ${
+                      selectedSummaryTemplate.archived_at
+                        ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u6e08\u307f"
+                        : selectedSummaryTemplate.active
+                          ? "\u6709\u52b9"
+                          : "\u4e0b\u66f8\u304d"
+                    } / \u66f4\u65b0: ${selectedSummaryTemplate.updated_at}`}
+                  </p>
+                ) : null}
+
+                <div className="settings-token-actions">
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedSummaryTemplate?.archived_at != null
+                    }
+                  >
+                    {activeOperation === "template-save"
+                      ? "\u4fdd\u5b58\u4e2d"
+                      : "\u8981\u7d04\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u3092\u4fdd\u5b58"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedSummaryTemplate ||
+                      selectedSummaryTemplate.active ||
+                      selectedSummaryTemplate.archived_at != null
+                    }
+                    onClick={handleSummaryTemplateActivate}
+                  >
+                    {activeOperation === "template-activate"
+                      ? "\u6709\u52b9\u5316\u4e2d"
+                      : "\u6709\u52b9\u5316"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      customizationControlsDisabled ||
+                      !selectedSummaryTemplate ||
+                      selectedSummaryTemplate.archived_at != null
+                    }
+                    onClick={handleSummaryTemplateArchive}
+                  >
+                    {activeOperation === "template-archive"
+                      ? "\u30a2\u30fc\u30ab\u30a4\u30d6\u4e2d"
+                      : "\u30a2\u30fc\u30ab\u30a4\u30d6"}
+                  </button>
+                </div>
+              </form>
+            ) : null}
           </div>
         </section>
       ) : null}

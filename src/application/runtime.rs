@@ -7,8 +7,7 @@ use crate::application::bot::{
 };
 use crate::application::command::{
     CommandError, PermissionSet, RecordStartPreflight, RecordStartRequest,
-    authorize_record_stop_for_meeting, record_start_after_preflight,
-    validate_record_start_preconditions,
+    record_start_after_preflight, validate_record_start_preconditions,
 };
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::retention_cleanup::{
@@ -26,7 +25,9 @@ use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{PersistedChunk, RecordingSession};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
 use crate::bootstrap::config::{AppConfig, SummaryHarness};
-use crate::domain::authz::UserRole;
+use crate::domain::authz::{
+    MemberRoleSource, RbacPermission, RbacSubject, UserRole, resolve_rbac_permission,
+};
 use crate::domain::feedback::TranscriptFeedbackStatus;
 use crate::domain::person_alias::PersonAliasReviewStatus;
 use crate::domain::recovery::RecoveryCandidate;
@@ -5415,6 +5416,8 @@ impl ScaffoldHandler {
             command.member.as_deref(),
             &self.bot_admin_user_ids,
         );
+        let member_roles =
+            resolve_command_member_roles(ctx, guild_id, command.user.id, command.member.as_deref());
         let voice_channel_id_u64 =
             voice_channel_id_u64.ok_or_else(|| CommandError::UserNotInVoice.to_string())?;
 
@@ -5431,6 +5434,26 @@ impl ScaffoldHandler {
             .ok_or_else(|| "songbird not initialized".to_owned())?;
         let response = {
             let mut service = self.service.lock().await;
+            let role_grants = match member_roles.as_ref() {
+                Some(member_roles) => service
+                    .store
+                    .list_rbac_role_grants_for_member_roles(&guild_key, member_roles)
+                    .map_err(|err| format!("failed to authorize command: {err}"))?,
+                None => Vec::new(),
+            };
+            authorize_runtime_rbac_permission(
+                RbacPermission::RecordingStart,
+                &guild_key,
+                caller_role,
+                member_roles.as_deref(),
+                &role_grants,
+                false,
+            )
+            .map_err(|err| err.to_string())?;
+            let internal_caller_role = match caller_role {
+                UserRole::BotAdmin | UserRole::GuildAdmin => caller_role,
+                UserRole::StartedMeeting | UserRole::Member => UserRole::GuildAdmin,
+            };
             let preflight = validate_record_start_preconditions(
                 &mut service.store,
                 &RecordStartRequest {
@@ -5440,7 +5463,7 @@ impl ScaffoldHandler {
                     command_channel_id: command.channel_id.get().to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
                     permissions,
-                    caller_role,
+                    caller_role: internal_caller_role,
                     effective_settings: None,
                 },
             )
@@ -5461,7 +5484,7 @@ impl ScaffoldHandler {
                     command_channel_id: command.channel_id.get().to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
                     permissions,
-                    caller_role,
+                    caller_role: internal_caller_role,
                     effective_settings: Some(effective_settings),
                 },
                 preflight,
@@ -5772,6 +5795,8 @@ impl ScaffoldHandler {
             command.member.as_deref(),
             &self.bot_admin_user_ids,
         );
+        let member_roles =
+            resolve_command_member_roles(ctx, guild_id, command.user.id, command.member.as_deref());
         let caller_user_id = command.user.id.get().to_string();
 
         let (stop_result, removed_session, authorized_meeting_id, reset_guard) = {
@@ -5783,15 +5808,34 @@ impl ScaffoldHandler {
                 .find_active_meeting_by_guild(&guild_key)
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
-            authorize_record_stop_for_meeting(&meeting, &caller_user_id, caller_role)
-                .map_err(|err| err.to_string())?;
+            let role_grants = match member_roles.as_ref() {
+                Some(member_roles) => service
+                    .store
+                    .list_rbac_role_grants_for_member_roles(&guild_key, member_roles)
+                    .map_err(|err| format!("failed to authorize command: {err}"))?,
+                None => Vec::new(),
+            };
+            let is_meeting_starter = meeting.started_by_user_id == caller_user_id;
+            authorize_runtime_rbac_permission(
+                RbacPermission::RecordingStop,
+                &guild_key,
+                caller_role,
+                member_roles.as_deref(),
+                &role_grants,
+                is_meeting_starter,
+            )
+            .map_err(|err| err.to_string())?;
+            let internal_caller_role = match caller_role {
+                UserRole::BotAdmin | UserRole::GuildAdmin => caller_role,
+                UserRole::StartedMeeting | UserRole::Member => UserRole::StartedMeeting,
+            };
             let authorized_meeting_id = meeting.id;
             drop(service);
 
             let request = RecordingStopTeardownRequest {
                 guild_key: &guild_key,
                 caller_user_id: &caller_user_id,
-                caller_role,
+                caller_role: internal_caller_role,
                 expected_meeting_id: &authorized_meeting_id,
                 reason: StopReason::Manual,
                 phase: "manual stop",
@@ -8599,6 +8643,65 @@ fn resolve_command_user_role(
     }
 }
 
+fn resolve_command_member_roles(
+    ctx: &Context,
+    guild_id: GuildId,
+    user_id: UserId,
+    interaction_member: Option<&Member>,
+) -> Option<Vec<String>> {
+    if let Some(member) = interaction_member {
+        return Some(
+            member
+                .roles
+                .iter()
+                .map(|role_id| role_id.get().to_string())
+                .collect(),
+        );
+    }
+    ctx.cache.guild(guild_id).and_then(|guild| {
+        guild.members.get(&user_id).map(|member| {
+            member
+                .roles
+                .iter()
+                .map(|role_id| role_id.get().to_string())
+                .collect()
+        })
+    })
+}
+
+fn authorize_runtime_rbac_permission(
+    permission: RbacPermission,
+    guild_id: &str,
+    caller_role: UserRole,
+    member_roles: Option<&[String]>,
+    role_grants: &[crate::domain::authz::RbacRoleGrant],
+    is_meeting_starter: bool,
+) -> Result<(), CommandError> {
+    let decision = resolve_rbac_permission(
+        permission,
+        guild_id,
+        RbacSubject {
+            is_bot_admin: caller_role == UserRole::BotAdmin,
+            is_guild_admin: caller_role == UserRole::GuildAdmin,
+            has_channel_view: false,
+            is_meeting_starter,
+        },
+        member_roles
+            .map(MemberRoleSource::Available)
+            .unwrap_or(MemberRoleSource::LookupFailed),
+        role_grants,
+    );
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(CommandError::Unauthorized(match permission {
+            RbacPermission::RecordingStart => "start recording",
+            RbacPermission::RecordingStop => "stop recording",
+            _ => "use command",
+        }))
+    }
+}
+
 pub fn denied_bot_permissions() -> PermissionSet {
     PermissionSet {
         can_connect_voice: false,
@@ -8698,6 +8801,7 @@ async fn post_failure_to_report_channel(
 mod status_message_tests {
     use super::*;
     use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
+    use crate::domain::authz::RbacRoleGrant;
     use crate::infrastructure::sql_store::{FakeSqlExecutor, SqlExecutor};
     use crate::infrastructure::storage_fs::{ChunkStorageError, SavedChunk};
     use serenity::async_trait;
@@ -8705,6 +8809,72 @@ mod status_message_tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn runtime_rbac_allows_role_granted_recording_commands() {
+        let member_roles = vec!["role-recorder".to_owned()];
+        let role_grants = vec![
+            RbacRoleGrant {
+                guild_id: "guild-1".to_owned(),
+                discord_role_id: "role-recorder".to_owned(),
+                permission: RbacPermission::RecordingStart,
+            },
+            RbacRoleGrant {
+                guild_id: "guild-1".to_owned(),
+                discord_role_id: "role-recorder".to_owned(),
+                permission: RbacPermission::RecordingStop,
+            },
+        ];
+
+        assert_eq!(
+            authorize_runtime_rbac_permission(
+                RbacPermission::RecordingStart,
+                "guild-1",
+                UserRole::Member,
+                Some(&member_roles),
+                &role_grants,
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_runtime_rbac_permission(
+                RbacPermission::RecordingStop,
+                "guild-1",
+                UserRole::Member,
+                Some(&member_roles),
+                &role_grants,
+                false,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn runtime_rbac_preserves_legacy_stop_starter_fallback() {
+        assert_eq!(
+            authorize_runtime_rbac_permission(
+                RbacPermission::RecordingStop,
+                "guild-1",
+                UserRole::Member,
+                None,
+                &[],
+                true,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_runtime_rbac_permission(
+                RbacPermission::RecordingStop,
+                "guild-1",
+                UserRole::Member,
+                None,
+                &[],
+                false,
+            ),
+            Err(CommandError::Unauthorized("stop recording"))
+        );
+    }
 
     #[derive(Debug, Clone)]
     struct RuntimeFlakyChunkStorage {

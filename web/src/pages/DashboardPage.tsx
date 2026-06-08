@@ -573,11 +573,13 @@ function AdminMetricCard({
 interface AdminViewProps {
   selectedGuildName?: string;
   isSystemAdmin?: boolean;
+  canManageSettings?: boolean;
 }
 
 export function AdminUsagePage({
   selectedGuildName,
   isSystemAdmin = false,
+  canManageSettings = false,
 }: AdminViewProps) {
   const [reloadKey, setReloadKey] = useState(0);
   const [settings, setSettings] = useState<GuildSettingsResponse | null>(null);
@@ -596,7 +598,9 @@ export function AdminUsagePage({
     setLoading(true);
     setError(null);
     Promise.all([
-      fetchGuildSettings(undefined, controller.signal),
+      canManageSettings
+        ? fetchGuildSettings(undefined, controller.signal)
+        : Promise.resolve(null),
       fetchGuildMeetings(null, 1, ADMIN_MEETING_LIMIT, null, controller.signal),
       fetchGuildJobs({ limit: ADMIN_JOB_LIMIT, signal: controller.signal }),
     ])
@@ -618,7 +622,7 @@ export function AdminUsagePage({
         }
       });
     return () => controller.abort();
-  }, [reloadKey]);
+  }, [canManageSettings, reloadKey]);
 
   const meetingItems = meetings?.meetings ?? [];
   const totalDurationSeconds = meetingItems.reduce(
@@ -708,7 +712,13 @@ export function AdminUsagePage({
             <dl className="admin-definition-list">
               <div>
                 <dt>{"Summary enabled"}</dt>
-                <dd>{settings?.summary_enabled ? "Enabled" : "Disabled"}</dd>
+                <dd>
+                  {settings
+                    ? settings.summary_enabled
+                      ? "Enabled"
+                      : "Disabled"
+                    : "--"}
+                </dd>
               </div>
               <div>
                 <dt>{"Meeting completion rate"}</dt>

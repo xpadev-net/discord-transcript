@@ -1,8 +1,8 @@
 use discord_transcript::domain::authz::RbacPermission;
 use discord_transcript::infrastructure::sql::{
-    INCREMENTAL_MIGRATIONS_SQL, LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLES_SQL,
-    LIST_GUILD_RBAC_ROLE_GRANTS_SQL, MIGRATIONS, RESET_GUILD_RBAC_ROLE_GRANT_SQL,
-    UPSERT_GUILD_RBAC_ROLE_GRANT_SQL,
+    INCREMENTAL_MIGRATIONS_SQL, LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL,
+    LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLES_SQL, LIST_GUILD_RBAC_ROLE_GRANTS_SQL, MIGRATIONS,
+    RESET_GUILD_RBAC_ROLE_GRANT_SQL, UPSERT_GUILD_RBAC_ROLE_GRANT_SQL,
 };
 
 fn guild_rbac_migration_sql() -> &'static str {
@@ -65,6 +65,16 @@ fn guild_rbac_role_lookup_filters_by_guild_roles_and_active_bindings() {
 
     assert!(sql.contains("permissions.guild_id = $1"));
     assert!(sql.contains("permissions.discord_role_id = ANY($2::TEXT[])"));
+    assert!(sql.contains("bindings.active = TRUE"));
+    assert!(sql.contains("ORDER BY permissions.discord_role_id, permissions.permission_name"));
+}
+
+#[test]
+fn guild_rbac_runtime_role_lookup_uses_csv_without_losing_scope_guards() {
+    let sql = LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL;
+
+    assert!(sql.contains("permissions.guild_id = $1"));
+    assert!(sql.contains("permissions.discord_role_id = ANY(string_to_array($2, ','))"));
     assert!(sql.contains("bindings.active = TRUE"));
     assert!(sql.contains("ORDER BY permissions.discord_role_id, permissions.permission_name"));
 }
