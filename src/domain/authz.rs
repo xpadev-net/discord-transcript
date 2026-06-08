@@ -249,7 +249,11 @@ fn legacy_access_source(
     permission: RbacPermission,
 ) -> PermissionDecisionSource {
     let Some(action) = legacy_action_for_permission(permission) else {
-        return PermissionDecisionSource::LegacyChannelView;
+        unreachable!(
+            "legacy_access_source called for permission {:?} that has no legacy action; \
+             caller must guard with legacy_access_allows",
+            permission
+        );
     };
     if subject.is_meeting_starter && is_allowed(UserRole::StartedMeeting, action) {
         PermissionDecisionSource::LegacyMeetingStarter
