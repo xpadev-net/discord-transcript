@@ -2,7 +2,7 @@ use discord_transcript::audio::receiver::{BufferedFrame, ReceiverConfig, Receive
 use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::StopReason;
 use discord_transcript::domain::{JobStatus, JobType};
-use discord_transcript::infrastructure::queue::JobQueue;
+use discord_transcript::infrastructure::queue::{Job, JobQueue};
 use discord_transcript::infrastructure::sql::{
     CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
     MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_MEETING_STATUS_CAS_SQL,
@@ -156,7 +156,7 @@ fn sql_store_get_meeting_rejects_unknown_stop_reason() {
 #[test]
 fn sql_job_queue_parses_claimed_job_row() {
     let mut executor = FakeSqlExecutor::default();
-    let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
+    let claim_key = format!("{}|*", CLAIM_JOB_SQL);
     executor.query_rows_result.insert(
         claim_key,
         vec![sql_row_from_strings(vec![
@@ -166,6 +166,7 @@ fn sql_job_queue_parses_claimed_job_row() {
             "running".to_owned(),
             "2".to_owned(),
             "temporary error".to_owned(),
+            "token-1".to_owned(),
             "2026-06-08T01:02:03.000Z".to_owned(),
         ])],
     );
@@ -181,6 +182,7 @@ fn sql_job_queue_parses_claimed_job_row() {
     assert_eq!(job.status, JobStatus::Running);
     assert_eq!(job.retry_count, 2);
     assert_eq!(job.error_message.as_deref(), Some("temporary error"));
+    assert_eq!(job.claim_token.as_deref(), Some("token-1"));
     assert!(job.next_run_at.is_some());
 }
 
@@ -270,14 +272,27 @@ fn pending_migrations_apply_and_record_unseen_versions() {
 #[test]
 fn sql_job_queue_retry_returns_failed_status() {
     let mut executor = FakeSqlExecutor::default();
-    let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j-1\u{1f}still failing\u{1f}1");
+    let retry_key = format!(
+        "{}|{}",
+        RETRY_JOB_SQL, "j-1\u{1f}still failing\u{1f}1\u{1f}token-1"
+    );
     executor
         .query_rows_result
         .insert(retry_key, vec![sql_row_from_strings(vec!["failed".to_owned()])]);
     let mut queue = SqlJobQueue::new(executor);
+    let claimed = Job {
+        id: "j-1".to_owned(),
+        meeting_id: "m-1".to_owned(),
+        job_type: JobType::Summarize,
+        status: JobStatus::Running,
+        retry_count: 0,
+        error_message: None,
+        claim_token: Some("token-1".to_owned()),
+        next_run_at: None,
+    };
 
     let status = queue
-        .retry("j-1", "still failing".to_owned(), 1)
+        .retry(&claimed, "still failing".to_owned(), 1)
         .expect("retry should succeed");
     assert_eq!(status, JobStatus::Failed);
 }

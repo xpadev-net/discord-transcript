@@ -14,7 +14,9 @@ use crate::application::retention_cleanup::{
 };
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
-use crate::application::worker::enqueue_summary_job;
+use crate::application::worker::{
+    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+};
 use crate::audio::meeting_audio::{
     ProcessedAudioChunk, build_speaker_audio_inputs,
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
@@ -46,7 +48,7 @@ use crate::infrastructure::integrations::{
 use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
-    HEARTBEAT_RUNNING_JOB_SQL, RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
+    RECOVERY_REQUEUE_STALE_RUNNING_SUMMARY_JOB_SQL, RECOVERY_SCAN_SQL,
     RECOVERY_SUMMARY_JOB_STATUS_SQL,
 };
 use crate::infrastructure::sql_store::{PgSqlExecutor, SqlExecutor, SqlJobQueue, SqlMeetingStore};
@@ -1583,9 +1585,9 @@ fn summary_retry_exhausted(
                 job_id,
                 phase,
                 error = %err,
-                "summary job retry cannot be durably scheduled"
+                "summary job retry ownership was not current; leaving meeting status unchanged"
             );
-            true
+            false
         }
     }
 }
@@ -1597,7 +1599,7 @@ fn retry_claimed_summary_job<Q: JobQueue>(
     max_retries: u32,
     phase: &str,
 ) -> bool {
-    let retry_status = queue.retry(&job.id, error_message, max_retries);
+    let retry_status = queue.retry(job, error_message, max_retries);
     summary_retry_exhausted(retry_status, &job.meeting_id, &job.id, phase)
 }
 
@@ -2091,7 +2093,7 @@ fn retry_summary_job_after_posting_failure<S, Q>(
     store: &mut S,
     queue: &mut Q,
     meeting_id: &str,
-    job_id: &str,
+    job: &Job,
     error_message: String,
     max_retries: u32,
 ) -> Result<bool, String>
@@ -2099,7 +2101,7 @@ where
     S: MeetingStore,
     Q: JobQueue,
 {
-    match queue.retry(job_id, error_message.clone(), max_retries) {
+    match queue.retry(job, error_message.clone(), max_retries) {
         Ok(crate::domain::JobStatus::Queued) => {
             store
                 .set_meeting_status(
@@ -2118,22 +2120,16 @@ where
             Ok(false)
         }
         Ok(crate::domain::JobStatus::Failed) => {
-            store
-                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message)
                 .map_err(|err| {
                     format!("summary post retry exhausted but meeting failure update failed: {err}")
-                })?;
-            store
-                .set_error_message(meeting_id, Some(error_message))
-                .map_err(|err| {
-                    format!("summary post retry exhausted but error message update failed: {err}")
                 })?;
             Ok(true)
         }
         Ok(status) => {
             warn!(
                 meeting_id,
-                job_id,
+                job_id = %job.id,
                 status = %status.as_str(),
                 "unexpected summary post retry status; leaving meeting status unchanged"
             );
@@ -2142,7 +2138,7 @@ where
         Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
             warn!(
                 meeting_id,
-                job_id,
+                job_id = %job.id,
                 error = %err,
                 "failed to durably retry summary post failure; leaving meeting status unchanged"
             );
@@ -2152,25 +2148,11 @@ where
         Err(err) => {
             warn!(
                 meeting_id,
-                job_id,
+                job_id = %job.id,
                 error = %err,
-                "summary post retry cannot be durably scheduled"
+                "summary post retry ownership was not current; leaving meeting status unchanged"
             );
-            store
-                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
-                .map_err(|store_err| {
-                    format!(
-                        "summary post retry failed ({err}) and meeting failure update failed: {store_err}"
-                    )
-                })?;
-            store
-                .set_error_message(meeting_id, Some(error_message))
-                .map_err(|store_err| {
-                    format!(
-                        "summary post retry failed ({err}) and error message update failed: {store_err}"
-                    )
-                })?;
-            Ok(true)
+            Ok(false)
         }
     }
 }
@@ -2178,52 +2160,69 @@ where
 fn retry_summary_job_after_transcribing_phase_failure<S, Q>(
     store: &mut S,
     queue: &mut Q,
-    meeting_id: &str,
-    job_id: &str,
+    job: &Job,
     error_message: String,
     max_retries: u32,
     phase: &str,
+    retry_from_status: MeetingStatus,
 ) -> Result<bool, String>
 where
     S: MeetingStore,
     Q: JobQueue,
 {
-    if let Err(err) = store.set_meeting_status(
-        meeting_id,
-        MeetingStatus::Stopping,
-        Some(MeetingStatus::Transcribing),
-    ) {
+    let meeting_id = job.meeting_id.as_str();
+
+    match queue.heartbeat(job) {
+        Ok(()) => {}
+        Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
+            warn!(
+                meeting_id,
+                job_id = %job.id,
+                phase,
+                error = %err,
+                "failed to prove summary job ownership before retry state restore; leaving meeting status unchanged"
+            );
+            return Ok(false);
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                job_id = %job.id,
+                phase,
+                error = %err,
+                "summary job ownership lost before retry state restore"
+            );
+            return Ok(false);
+        }
+    }
+
+    if let Err(err) =
+        store.set_meeting_status(meeting_id, MeetingStatus::Stopping, Some(retry_from_status))
+    {
         warn!(
             meeting_id,
-            job_id,
+            job_id = %job.id,
             phase,
             error = %err,
             "summary job retry cannot restore meeting to retryable state; marking job failed"
         );
-        let _ = queue.mark_failed(job_id, error_message.clone());
-        store
-            .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
-            .map_err(|store_err| {
+        let _ = queue.mark_failed(job, error_message.clone());
+        mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
+            |store_err| {
                 format!(
                     "{phase} retry status restore failed ({err}) and meeting failure update failed: {store_err}"
                 )
-            })?;
-        store
-            .set_error_message(meeting_id, Some(error_message))
-            .map_err(|store_err| {
-                format!(
-                    "{phase} retry status restore failed ({err}) and error message update failed: {store_err}"
-                )
-            })?;
+            },
+        )?;
         return Ok(true);
     }
 
-    match queue.retry(job_id, error_message.clone(), max_retries) {
+    match queue.retry(job, error_message.clone(), max_retries) {
         Ok(crate::domain::JobStatus::Queued) => {
             if let Err(err) = store.set_error_message(meeting_id, Some(error_message)) {
                 warn!(
                     meeting_id,
-                    job_id,
+                    job_id = %job.id,
                     phase,
                     error = %err,
                     "summary job retry queued but error message update failed"
@@ -2232,58 +2231,45 @@ where
             Ok(false)
         }
         Ok(crate::domain::JobStatus::Failed) => {
-            store
-                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message)
                 .map_err(|err| {
                     format!("{phase} retry exhausted but meeting failure update failed: {err}")
-                })?;
-            store
-                .set_error_message(meeting_id, Some(error_message))
-                .map_err(|err| {
-                    format!("{phase} retry exhausted but error message update failed: {err}")
                 })?;
             Ok(true)
         }
         Ok(status) => {
             warn!(
                 meeting_id,
-                job_id,
+                job_id = %job.id,
                 phase,
                 status = %status.as_str(),
                 "unexpected summary job retry status; marking meeting failed"
             );
-            store
-                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
-                .map_err(|err| {
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
+                |err| {
                     format!(
                         "{phase} retry returned unexpected status {status:?} and meeting failure update failed: {err}"
                     )
-                })?;
-            store
-                .set_error_message(meeting_id, Some(error_message))
-                .map_err(|err| {
-                    format!(
-                        "{phase} retry returned unexpected status {status:?} and error message update failed: {err}"
-                    )
-                })?;
+                },
+            )?;
             Ok(true)
         }
         Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
             warn!(
                 meeting_id,
-                job_id,
+                job_id = %job.id,
                 phase,
                 error = %err,
                 "failed to durably retry summary job failure; leaving meeting status unchanged"
             );
             if let Err(status_err) = store.set_meeting_status(
                 meeting_id,
-                MeetingStatus::Transcribing,
+                retry_from_status,
                 Some(MeetingStatus::Stopping),
             ) {
                 warn!(
                     meeting_id,
-                    job_id,
+                    job_id = %job.id,
                     phase,
                     error = %status_err,
                     "failed to restore meeting status after retry backend error"
@@ -2295,26 +2281,12 @@ where
         Err(err) => {
             warn!(
                 meeting_id,
-                job_id,
+                job_id = %job.id,
                 phase,
                 error = %err,
-                "summary job retry cannot be durably scheduled"
+                "summary job retry ownership was not current after status restore; leaving meeting status unchanged"
             );
-            store
-                .set_meeting_status(meeting_id, MeetingStatus::Failed, None)
-                .map_err(|store_err| {
-                    format!(
-                        "{phase} retry failed ({err}) and meeting failure update failed: {store_err}"
-                    )
-                })?;
-            store
-                .set_error_message(meeting_id, Some(error_message))
-                .map_err(|store_err| {
-                    format!(
-                        "{phase} retry failed ({err}) and error message update failed: {store_err}"
-                    )
-                })?;
-            Ok(true)
+            Ok(false)
         }
     }
 }
@@ -2322,6 +2294,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SummaryCleanupFailureDisposition {
     RetryScheduled,
+    OwnershipLost,
     TerminalStatusUpdated,
 }
 
@@ -2340,6 +2313,15 @@ where
     S: MeetingStore,
     Q: JobQueue,
 {
+    if let Err(err) = queue.heartbeat(claimed_job) {
+        warn!(
+            meeting_id = %claimed_job.meeting_id,
+            job_id = %claimed_job.id,
+            error = %err,
+            "summary cleanup retry skipped because job ownership could not be proven"
+        );
+        return SummaryCleanupFailureDisposition::OwnershipLost;
+    }
     let reverted = store
         .set_meeting_status(
             &claimed_job.meeting_id,
@@ -2356,16 +2338,22 @@ where
             "summary_cleanup",
         );
         if exhausted {
-            let _ = store.set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
-            let _ = store.set_error_message(&claimed_job.meeting_id, Some(err_string));
+            let _ = mark_summary_meeting_failed_from_summary_state(
+                store,
+                &claimed_job.meeting_id,
+                err_string,
+            );
             SummaryCleanupFailureDisposition::TerminalStatusUpdated
         } else {
             SummaryCleanupFailureDisposition::RetryScheduled
         }
     } else {
-        let _ = queue.mark_failed(&claimed_job.id, err_string.clone());
-        let _ = store.set_meeting_status(&claimed_job.meeting_id, MeetingStatus::Failed, None);
-        let _ = store.set_error_message(&claimed_job.meeting_id, Some(err_string));
+        let _ = queue.mark_failed(claimed_job, err_string.clone());
+        let _ = mark_summary_meeting_failed_from_summary_state(
+            store,
+            &claimed_job.meeting_id,
+            err_string,
+        );
         SummaryCleanupFailureDisposition::TerminalStatusUpdated
     }
 }
@@ -3143,10 +3131,43 @@ impl ScaffoldHandler {
         let handler = self.clone();
         let shutdown_token = handler.shutdown_token.clone();
         self.spawn_background(async move {
-            while let Some(meeting_id) = summary_job_wakeups.next(&shutdown_token).await {
-                handler.spawn_summary_retry_after(Arc::clone(&http), meeting_id, Duration::ZERO);
+            let mut durable_poll = tokio::time::interval(Duration::from_secs(30));
+            durable_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            durable_poll.tick().await;
+            loop {
+                tokio::select! {
+                    meeting_id = summary_job_wakeups.next(&shutdown_token) => {
+                        let Some(meeting_id) = meeting_id else {
+                            break;
+                        };
+                        handler.spawn_summary_retry_after(Arc::clone(&http), meeting_id, Duration::ZERO);
+                    }
+                    _ = durable_poll.tick() => {
+                        handler.wake_ready_summary_jobs(Arc::clone(&http)).await;
+                    }
+                    _ = shutdown_token.cancelled() => break,
+                }
             }
         });
+    }
+
+    async fn wake_ready_summary_jobs(&self, http: Arc<Http>) {
+        let meeting_ids = {
+            let mut queue = self.queue.lock().await;
+            match queue.ready_summary_meeting_ids() {
+                Ok(meeting_ids) => meeting_ids,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "failed to poll ready summary jobs"
+                    );
+                    return;
+                }
+            }
+        };
+        for meeting_id in meeting_ids {
+            self.spawn_summary_retry_after(Arc::clone(&http), meeting_id, Duration::ZERO);
+        }
     }
 
     fn spawn_lifecycle_cleanup_retry<F>(&self, future: F)
@@ -6027,18 +6048,25 @@ impl ScaffoldHandler {
             Ok(value) => value,
             Err(err) => {
                 let mut service = self.service.lock().await;
-                let _ = service
-                    .store
-                    .set_meeting_status(meeting_id, MeetingStatus::Failed, None);
-                let _ = service
-                    .store
-                    .set_error_message(meeting_id, Some(err.clone()));
+                let _ = mark_summary_meeting_failed_from_summary_state(
+                    &mut service.store,
+                    meeting_id,
+                    err.clone(),
+                );
                 return Err(err);
             }
         };
         match self.process_enqueued_summary_job(&http, meeting_id).await {
             Ok(job_output) => {
                 let RuntimeSummaryJobOutput { job, output } = job_output;
+                self.refresh_summary_job_ownership(&job, "summary_post")
+                    .await
+                    .map_err(|err| match err {
+                        SummaryJobRunError::Terminal(message)
+                        | SummaryJobRunError::TerminalStatusUpdated(message)
+                        | SummaryJobRunError::NotClaimable(message)
+                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                    })?;
                 let summary_url = self.meeting_url(meeting_id);
                 let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
                     vec!["会議が終了しました。要約内容がありません。".to_owned()]
@@ -6056,7 +6084,7 @@ impl ScaffoldHandler {
                             &mut service.store,
                             &mut *queue,
                             meeting_id,
-                            &job.id,
+                            &job,
                             error_message,
                             self.summary_max_retries,
                         )
@@ -6086,7 +6114,11 @@ impl ScaffoldHandler {
                             summary_retry_after_for_job(&job),
                         );
                     }
-                    if exhausted {
+                    if exhausted
+                        && self
+                            .meeting_status_is(meeting_id, MeetingStatus::Failed)
+                            .await
+                    {
                         let _ = post_failure_to_report_channel(
                             &http,
                             report_channel_id,
@@ -6097,6 +6129,14 @@ impl ScaffoldHandler {
                     }
                     return Err(err);
                 }
+                self.refresh_summary_job_ownership(&job, "summary_post_success")
+                    .await
+                    .map_err(|err| match err {
+                        SummaryJobRunError::Terminal(message)
+                        | SummaryJobRunError::TerminalStatusUpdated(message)
+                        | SummaryJobRunError::NotClaimable(message)
+                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                    })?;
                 // Post meeting URL if PUBLIC_BASE_URL is configured
                 if let Some(ref url) = summary_url {
                     let url_msg = format!("詳細はこちら: {url}");
@@ -6106,6 +6146,14 @@ impl ScaffoldHandler {
                         warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
                     }
                 }
+                self.refresh_summary_job_ownership(&job, "summary_post_finalize")
+                    .await
+                    .map_err(|err| match err {
+                        SummaryJobRunError::Terminal(message)
+                        | SummaryJobRunError::TerminalStatusUpdated(message)
+                        | SummaryJobRunError::NotClaimable(message)
+                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                    })?;
                 if let Err(err) = self
                     .update_status_message(
                         &http,
@@ -6122,6 +6170,14 @@ impl ScaffoldHandler {
                         "failed to update status message after summary completion"
                     );
                 }
+                self.refresh_summary_job_ownership(&job, "summary_status_finalize")
+                    .await
+                    .map_err(|err| match err {
+                        SummaryJobRunError::Terminal(message)
+                        | SummaryJobRunError::TerminalStatusUpdated(message)
+                        | SummaryJobRunError::NotClaimable(message)
+                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                    })?;
                 // Mark meeting as Posted and job as Done only after successful posting.
                 // This order prevents data loss: if posting fails, the job stays
                 // Running and can be recovered on restart.
@@ -6147,7 +6203,7 @@ impl ScaffoldHandler {
                 let job_id = job.id.clone();
                 {
                     let mut queue = self.queue.lock().await;
-                    if let Err(err) = queue.mark_done(&job_id) {
+                    if let Err(err) = queue.mark_done(&job) {
                         error!(
                             job_id = %job_id,
                             meeting_id = %meeting_id,
@@ -6176,32 +6232,50 @@ impl ScaffoldHandler {
             }
             Err(SummaryJobRunError::NotClaimable(err)) => Err(err),
             Err(SummaryJobRunError::TerminalStatusUpdated(err)) => {
-                let _ = post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
-                    .await;
+                if self
+                    .meeting_status_is(meeting_id, MeetingStatus::Failed)
+                    .await
+                {
+                    let _ =
+                        post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
+                            .await;
+                }
                 Err(err)
             }
             Err(SummaryJobRunError::Terminal(err)) => {
                 // process_enqueued_summary_job already handles Failed/retry status.
                 // Also update the status message so users see the failure.
-                if let Err(status_err) = self
-                    .update_status_message(
-                        &http,
-                        meeting_id,
-                        StatusMessageUpdate::Failed {
-                            phase: "summary",
-                            error: &err,
-                        },
-                    )
+                if self
+                    .meeting_status_is(meeting_id, MeetingStatus::Failed)
                     .await
                 {
-                    warn!(
+                    if let Err(status_err) = self
+                        .update_status_message(
+                            &http,
+                            meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "summary",
+                                error: &err,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            meeting_id = %meeting_id,
+                            error = %status_err,
+                            "failed to update status message after summary failure"
+                        );
+                    }
+                    let _ =
+                        post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
+                            .await;
+                } else {
+                    debug!(
                         meeting_id = %meeting_id,
-                        error = %status_err,
-                        "failed to update status message after summary failure"
+                        error = %err,
+                        "summary terminal error skipped failure notification because meeting is no longer failed"
                     );
                 }
-                let _ = post_failure_to_report_channel(&http, report_channel_id, meeting_id, &err)
-                    .await;
                 Err(err)
             }
         }
@@ -6414,6 +6488,49 @@ impl ScaffoldHandler {
             .ok_or_else(|| format!("meeting not found: meeting_id={meeting_id}"))
     }
 
+    async fn meeting_status_is(&self, meeting_id: &str, status: MeetingStatus) -> bool {
+        let mut service = self.service.lock().await;
+        service
+            .store
+            .get_meeting(meeting_id)
+            .ok()
+            .flatten()
+            .is_some_and(|meeting| meeting.status == status)
+    }
+
+    async fn refresh_summary_job_ownership(
+        &self,
+        job: &Job,
+        phase: &str,
+    ) -> Result<(), SummaryJobRunError> {
+        let mut queue = self.queue.lock().await;
+        match queue.heartbeat(job) {
+            Ok(()) => Ok(()),
+            Err(err @ crate::infrastructure::queue::QueueError::Backend(_)) => {
+                warn!(
+                    job_id = %job.id,
+                    meeting_id = %job.meeting_id,
+                    phase,
+                    error = %err,
+                    "summary job ownership heartbeat failed due to backend error"
+                );
+                Err(SummaryJobRunError::Terminal(err.to_string()))
+            }
+            Err(err) => {
+                warn!(
+                    job_id = %job.id,
+                    meeting_id = %job.meeting_id,
+                    phase,
+                    error = %err,
+                    "summary job ownership lost"
+                );
+                Err(SummaryJobRunError::NotClaimable(format!(
+                    "summary job ownership lost during {phase}: {err}"
+                )))
+            }
+        }
+    }
+
     fn workspace_for_meeting(
         &self,
         meeting: &StoredMeeting,
@@ -6524,7 +6641,8 @@ impl ScaffoldHandler {
             );
         }
 
-        let heartbeat_job_id = claimed_job.id.clone();
+        let heartbeat_job = claimed_job.clone();
+        let heartbeat_job_id = heartbeat_job.id.clone();
         let heartbeat_queue = self.queue.clone();
         let heartbeat_shutdown = self.shutdown_token.clone();
         let heartbeat_task = tokio::spawn(async move {
@@ -6535,10 +6653,7 @@ impl ScaffoldHandler {
                     _ = interval.tick() => {
                         let result = {
                             let mut queue = heartbeat_queue.lock().await;
-                            queue.executor.execute(
-                                HEARTBEAT_RUNNING_JOB_SQL,
-                                std::slice::from_ref(&heartbeat_job_id),
-                            )
+                            queue.heartbeat(&heartbeat_job)
                         };
                         if let Err(err) = result {
                             warn!(
@@ -6604,16 +6719,14 @@ impl ScaffoldHandler {
                     drop(queue);
                     if exhausted {
                         let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(
+                        let _ = mark_summary_meeting_failed_from_summary_state(
+                            &mut service.store,
                             &claimed_job.meeting_id,
-                            MeetingStatus::Failed,
-                            None,
+                            err_string.clone(),
                         );
-                        let _ = service
-                            .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
+                        return Err(SummaryJobRunError::Terminal(err_string));
                     }
-                    return Err(SummaryJobRunError::Terminal(err_string));
+                    return Err(retry_scheduled_error(&claimed_job, err_string));
                 }
             };
 
@@ -6702,14 +6815,11 @@ impl ScaffoldHandler {
                 drop(queue);
                 if exhausted {
                     let mut service = self.service.lock().await;
-                    let _ = service.store.set_meeting_status(
+                    let _ = mark_summary_meeting_failed_from_summary_state(
+                        &mut service.store,
                         &claimed_job.meeting_id,
-                        MeetingStatus::Failed,
-                        None,
+                        err.to_string(),
                     );
-                    let _ = service
-                        .store
-                        .set_error_message(&claimed_job.meeting_id, Some(err.to_string()));
                     drop(service);
                     if let Err(status_err) = self
                         .update_status_message(
@@ -6728,8 +6838,9 @@ impl ScaffoldHandler {
                             "failed to update status message after speaker audio error"
                         );
                     }
+                    return Err(SummaryJobRunError::Terminal(err));
                 }
-                return Err(SummaryJobRunError::Terminal(err));
+                return Err(retry_scheduled_error(&claimed_job, err.to_string()));
             }
         };
 
@@ -6745,6 +6856,8 @@ impl ScaffoldHandler {
         };
 
         // Phase 1: Transcription (mutex held only for status update)
+        self.refresh_summary_job_ownership(&claimed_job, "transcription_start")
+            .await?;
         if let Err(cas_err) = {
             let mut service = self.service.lock().await;
             service.store.set_meeting_status(
@@ -6757,26 +6870,16 @@ impl ScaffoldHandler {
             // CAS failed — another process may own this meeting.  Mark the
             // job failed so it does not stay Running forever.
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping→Transcribing failed; marking job failed");
-            let mut queue = self.queue.lock().await;
-            let _ = queue.mark_failed(&claimed_job.id, cas_err_string.clone());
-            drop(queue);
-            if let Err(status_err) = self
-                .update_status_message(
-                    http,
-                    &claimed_job.meeting_id,
-                    StatusMessageUpdate::Failed {
-                        phase: "summary_start",
-                        error: &cas_err_string,
-                    },
-                )
-                .await
             {
-                warn!(
-                    meeting_id = %claimed_job.meeting_id,
-                    error = %status_err,
-                    "failed to update status message after summary start CAS failure"
-                );
+                let mut queue = self.queue.lock().await;
+                let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
             }
+            let mut service = self.service.lock().await;
+            let _ = mark_summary_meeting_failed_from_summary_state(
+                &mut service.store,
+                &claimed_job.meeting_id,
+                cas_err_string.clone(),
+            );
             return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
@@ -6816,67 +6919,35 @@ impl ScaffoldHandler {
             Ok(t) => t,
             Err(err) => {
                 let err_string = err.to_string();
-                // Revert to Stopping so the next retry attempt's CAS guard succeeds.
-                let reverted = {
+                let retry_result = {
                     let mut service = self.service.lock().await;
-                    service
-                        .store
-                        .set_meeting_status(
-                            &claimed_job.meeting_id,
-                            MeetingStatus::Stopping,
-                            Some(MeetingStatus::Transcribing),
-                        )
-                        .is_ok()
-                };
-                if reverted {
                     let mut queue = self.queue.lock().await;
-                    let exhausted = retry_claimed_summary_job(
+                    retry_summary_job_after_transcribing_phase_failure(
+                        &mut service.store,
                         &mut *queue,
                         &claimed_job,
                         err_string.clone(),
                         self.summary_max_retries,
                         "transcription",
-                    );
-                    drop(queue);
-                    if exhausted {
-                        let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(
-                            &claimed_job.meeting_id,
-                            MeetingStatus::Failed,
-                            None,
+                        MeetingStatus::Transcribing,
+                    )
+                };
+                let exhausted = match retry_result {
+                    Ok(exhausted) => exhausted,
+                    Err(retry_err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %retry_err,
+                            "failed to update transcription retry state"
                         );
-                        let _ = service
-                            .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
-                        drop(service);
-                        if let Err(status_err) = self
-                            .update_status_message(
-                                http,
-                                &claimed_job.meeting_id,
-                                StatusMessageUpdate::Failed {
-                                    phase: "transcription",
-                                    error: &err_string,
-                                },
-                            )
-                            .await
-                        {
-                            warn!(
-                                meeting_id = %claimed_job.meeting_id,
-                                error = %status_err,
-                                "failed to update status message after transcription failure"
-                            );
-                        }
+                        true
                     }
-                } else {
-                    // Revert failed — another process may have progressed the
-                    // state.  Mark the job failed so it does not stay Running.
-                    warn!(
-                        meeting_id = %claimed_job.meeting_id,
-                        "CAS revert to Stopping failed; marking job failed"
-                    );
-                    let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_failed(&claimed_job.id, err_string.clone());
-                    if let Err(status_err) = self
+                };
+                if exhausted
+                    && self
+                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
+                        .await
+                    && let Err(status_err) = self
                         .update_status_message(
                             http,
                             &claimed_job.meeting_id,
@@ -6886,15 +6957,17 @@ impl ScaffoldHandler {
                             },
                         )
                         .await
-                    {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %status_err,
-                            "failed to update status message after transcription CAS failure"
-                        );
-                    }
+                {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %status_err,
+                        "failed to update status message after transcription failure"
+                    );
                 }
-                return Err(SummaryJobRunError::Terminal(err_string));
+                if exhausted {
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(err_string));
+                }
+                return Err(retry_scheduled_error(&claimed_job, err_string));
             }
         };
 
@@ -6963,6 +7036,8 @@ impl ScaffoldHandler {
             );
         }
 
+        self.refresh_summary_job_ownership(&claimed_job, "transcript_persist")
+            .await?;
         if let Err(err) = {
             let mut service = self.service.lock().await;
             persist_transcript_segments(
@@ -6981,15 +7056,12 @@ impl ScaffoldHandler {
                     {
                         let mut service = self.service.lock().await;
                         let mut queue = self.queue.lock().await;
-                        let _ = queue.mark_failed(&claimed_job.id, message.clone());
-                        let _ = service.store.set_meeting_status(
+                        let _ = queue.mark_failed(&claimed_job, message.clone());
+                        let _ = mark_summary_meeting_failed_from_summary_state(
+                            &mut service.store,
                             &claimed_job.meeting_id,
-                            MeetingStatus::Failed,
-                            None,
+                            message.clone(),
                         );
-                        let _ = service
-                            .store
-                            .set_error_message(&claimed_job.meeting_id, Some(message.clone()));
                     }
                     if let Err(status_err) = self
                         .update_status_message(
@@ -7023,11 +7095,11 @@ impl ScaffoldHandler {
                 retry_summary_job_after_transcribing_phase_failure(
                     &mut service.store,
                     &mut *queue,
-                    &claimed_job.meeting_id,
-                    &claimed_job.id,
+                    &claimed_job,
                     err.clone(),
                     self.summary_max_retries,
                     "transcript_persist",
+                    MeetingStatus::Transcribing,
                 )
             };
             let exhausted = match retry_result {
@@ -7042,6 +7114,9 @@ impl ScaffoldHandler {
                 }
             };
             if exhausted
+                && self
+                    .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
+                    .await
                 && let Err(status_err) = self
                     .update_status_message(
                         http,
@@ -7136,11 +7211,11 @@ impl ScaffoldHandler {
                     retry_summary_job_after_transcribing_phase_failure(
                         &mut service.store,
                         &mut *queue,
-                        &claimed_job.meeting_id,
-                        &claimed_job.id,
+                        &claimed_job,
                         err.clone(),
                         self.summary_max_retries,
                         "summary_context",
+                        MeetingStatus::Transcribing,
                     )
                 };
                 let exhausted = match retry_result {
@@ -7155,6 +7230,9 @@ impl ScaffoldHandler {
                     }
                 };
                 if exhausted
+                    && self
+                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
+                        .await
                     && let Err(status_err) = self
                         .update_status_message(
                             http,
@@ -7229,6 +7307,8 @@ impl ScaffoldHandler {
             masking_stats: summary_masking_stats,
             ..transcription.clone()
         };
+        self.refresh_summary_job_ownership(&claimed_job, "summary_start")
+            .await?;
         if let Err(cas_err) = {
             let mut service = self.service.lock().await;
             service.store.set_meeting_status(
@@ -7239,25 +7319,16 @@ impl ScaffoldHandler {
         } {
             let cas_err_string = cas_err.to_string();
             warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
-            let mut queue = self.queue.lock().await;
-            let _ = queue.mark_failed(&claimed_job.id, cas_err_string.clone());
-            if let Err(status_err) = self
-                .update_status_message(
-                    http,
-                    &claimed_job.meeting_id,
-                    StatusMessageUpdate::Failed {
-                        phase: "summary_start",
-                        error: &cas_err_string,
-                    },
-                )
-                .await
             {
-                warn!(
-                    meeting_id = %claimed_job.meeting_id,
-                    error = %status_err,
-                    "failed to update status message after summary start CAS failure"
-                );
+                let mut queue = self.queue.lock().await;
+                let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
             }
+            let mut service = self.service.lock().await;
+            let _ = mark_summary_meeting_failed_from_summary_state(
+                &mut service.store,
+                &claimed_job.meeting_id,
+                cas_err_string.clone(),
+            );
             return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
@@ -7295,67 +7366,35 @@ impl ScaffoldHandler {
             Ok(result) => result,
             Err(err) => {
                 let err_string = err.to_string();
-                // Revert to Stopping so the next retry attempt starts from a consistent state.
-                let reverted = {
+                let retry_result = {
                     let mut service = self.service.lock().await;
-                    service
-                        .store
-                        .set_meeting_status(
-                            &claimed_job.meeting_id,
-                            MeetingStatus::Stopping,
-                            Some(MeetingStatus::Summarizing),
-                        )
-                        .is_ok()
-                };
-                if reverted {
                     let mut queue = self.queue.lock().await;
-                    let exhausted = retry_claimed_summary_job(
+                    retry_summary_job_after_transcribing_phase_failure(
+                        &mut service.store,
                         &mut *queue,
                         &claimed_job,
                         err_string.clone(),
                         self.summary_max_retries,
                         "summary",
-                    );
-                    drop(queue);
-                    if exhausted {
-                        let mut service = self.service.lock().await;
-                        let _ = service.store.set_meeting_status(
-                            &claimed_job.meeting_id,
-                            MeetingStatus::Failed,
-                            None,
+                        MeetingStatus::Summarizing,
+                    )
+                };
+                let exhausted = match retry_result {
+                    Ok(exhausted) => exhausted,
+                    Err(retry_err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %retry_err,
+                            "failed to update summary retry state"
                         );
-                        let _ = service
-                            .store
-                            .set_error_message(&claimed_job.meeting_id, Some(err_string.clone()));
-                        drop(service);
-                        if let Err(status_err) = self
-                            .update_status_message(
-                                http,
-                                &claimed_job.meeting_id,
-                                StatusMessageUpdate::Failed {
-                                    phase: "summary",
-                                    error: &err_string,
-                                },
-                            )
-                            .await
-                        {
-                            warn!(
-                                meeting_id = %claimed_job.meeting_id,
-                                error = %status_err,
-                                "failed to update status message after summary failure"
-                            );
-                        }
-                    } else {
-                        return Err(retry_scheduled_error(&claimed_job, err_string));
+                        true
                     }
-                } else {
-                    warn!(
-                        meeting_id = %claimed_job.meeting_id,
-                        "CAS revert to Stopping failed; marking job failed"
-                    );
-                    let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_failed(&claimed_job.id, err_string.clone());
-                    if let Err(status_err) = self
+                };
+                if exhausted
+                    && self
+                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
+                        .await
+                    && let Err(status_err) = self
                         .update_status_message(
                             http,
                             &claimed_job.meeting_id,
@@ -7365,21 +7404,25 @@ impl ScaffoldHandler {
                             },
                         )
                         .await
-                    {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %status_err,
-                            "failed to update status message after summary CAS failure"
-                        );
-                    }
+                {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %status_err,
+                        "failed to update status message after summary failure"
+                    );
                 }
-                return Err(SummaryJobRunError::Terminal(err_string));
+                if exhausted {
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(err_string));
+                }
+                return Err(retry_scheduled_error(&claimed_job, err_string));
             }
         };
 
         // Persist summary markdown to DB (best-effort), then remove the
         // per-run agent workspace. The validated markdown is held in memory for
         // AI-memory extraction and Discord posting after the workspace is gone.
+        self.refresh_summary_job_ownership(&claimed_job, "summary_persist")
+            .await?;
         {
             let summary_id = format!("{}-s-1", claimed_job.meeting_id);
             let mut service = self.service.lock().await;
@@ -7416,17 +7459,23 @@ impl ScaffoldHandler {
                 SummaryCleanupFailureDisposition::RetryScheduled => {
                     Err(retry_scheduled_error(&claimed_job, err_string))
                 }
+                SummaryCleanupFailureDisposition::OwnershipLost => {
+                    Err(SummaryJobRunError::NotClaimable(err_string))
+                }
                 SummaryCleanupFailureDisposition::TerminalStatusUpdated => {
-                    if let Err(status_err) = self
-                        .update_status_message(
-                            http,
-                            &claimed_job.meeting_id,
-                            StatusMessageUpdate::Failed {
-                                phase: "summary_cleanup",
-                                error: &err_string,
-                            },
-                        )
+                    if self
+                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
                         .await
+                        && let Err(status_err) = self
+                            .update_status_message(
+                                http,
+                                &claimed_job.meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: "summary_cleanup",
+                                    error: &err_string,
+                                },
+                            )
+                            .await
                     {
                         warn!(
                             meeting_id = %claimed_job.meeting_id,
@@ -7444,6 +7493,8 @@ impl ScaffoldHandler {
             service.store.supports_ai_memory_extraction()
         };
         if ai_memory_extraction_supported {
+            self.refresh_summary_job_ownership(&claimed_job, "ai_memory_extraction")
+                .await?;
             match tokio::task::block_in_place(|| {
                 extract_ai_memory_candidates(
                     &summary_client,
@@ -7454,6 +7505,8 @@ impl ScaffoldHandler {
                 )
             }) {
                 Ok(candidates) => {
+                    self.refresh_summary_job_ownership(&claimed_job, "ai_memory_persist")
+                        .await?;
                     let persist_result = {
                         let mut service = self.service.lock().await;
                         service.store.persist_ai_memory_extraction_candidates(
@@ -7489,6 +7542,8 @@ impl ScaffoldHandler {
         // NOTE: mark_done is NOT called here. The caller (run_summary_and_notify)
         // must call it after the Discord posting succeeds. This prevents data loss
         // if posting fails -- the job stays Running and can be recovered on restart.
+        self.refresh_summary_job_ownership(&claimed_job, "summary_complete")
+            .await?;
 
         Ok(RuntimeSummaryJobOutput {
             output: crate::application::worker::ProcessMeetingOutput {
@@ -9181,8 +9236,8 @@ mod status_message_tests {
     }
 
     #[test]
-    fn summary_retry_missing_or_invalid_job_marks_exhausted() {
-        assert!(summary_retry_exhausted(
+    fn summary_retry_missing_or_invalid_job_does_not_mark_exhausted() {
+        assert!(!summary_retry_exhausted(
             Err(crate::infrastructure::queue::QueueError::NotFound {
                 job_id: "j1".to_owned()
             }),
@@ -9190,7 +9245,7 @@ mod status_message_tests {
             "j1",
             "summary"
         ));
-        assert!(summary_retry_exhausted(
+        assert!(!summary_retry_exhausted(
             Err(crate::infrastructure::queue::QueueError::InvalidState {
                 job_id: "j1".to_owned(),
                 expected: "running".to_owned(),
@@ -9458,6 +9513,7 @@ mod status_message_tests {
             status: crate::domain::JobStatus::Running,
             retry_count: 0,
             error_message: None,
+            claim_token: Some("token-m1".to_owned()),
             next_run_at: None,
         }
     }
@@ -9946,6 +10002,52 @@ mod status_message_tests {
         let mut meeting = summarizing_meeting();
         meeting.status = crate::domain::MeetingStatus::Transcribing;
         meeting
+    }
+
+    #[test]
+    fn summary_state_failure_helper_marks_summary_phases_failed() {
+        for status in [
+            crate::domain::MeetingStatus::Stopping,
+            crate::domain::MeetingStatus::Transcribing,
+            crate::domain::MeetingStatus::Summarizing,
+        ] {
+            let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            let mut meeting = summarizing_meeting();
+            meeting.status = status;
+            store.insert(meeting);
+
+            let updated = mark_summary_meeting_failed_from_summary_state(
+                &mut store,
+                "m1",
+                "summary CAS failed".to_owned(),
+            )
+            .expect("summary failure helper should update summary phase");
+
+            assert!(updated);
+            let meeting = store.get("m1").expect("meeting should remain");
+            assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
+            assert_eq!(meeting.error_message.as_deref(), Some("summary CAS failed"));
+        }
+    }
+
+    #[test]
+    fn summary_state_failure_helper_preserves_posted_meeting() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = summarizing_meeting();
+        meeting.status = crate::domain::MeetingStatus::Posted;
+        store.insert(meeting);
+
+        let updated = mark_summary_meeting_failed_from_summary_state(
+            &mut store,
+            "m1",
+            "summary CAS failed".to_owned(),
+        )
+        .expect("posted meeting should not be clobbered");
+
+        assert!(!updated);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
     }
 
     fn transcript_segment(start_ms: u64, end_ms: u64) -> TranscriptSegment {
@@ -10448,7 +10550,7 @@ mod status_message_tests {
             &mut store,
             &mut queue,
             "m1",
-            &job.id,
+            &job,
             "summary posting failed: discord 500".to_owned(),
             2,
         )
@@ -10478,7 +10580,7 @@ mod status_message_tests {
             &mut store,
             &mut queue,
             "m1",
-            &job.id,
+            &job,
             "summary posting failed: discord 500".to_owned(),
             0,
         )
@@ -10578,11 +10680,11 @@ mod status_message_tests {
         let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
-            "m1",
-            &job.id,
+            &job,
             "failed to persist transcript segments: integer out of range".to_owned(),
             2,
             "transcript_persist",
+            crate::domain::MeetingStatus::Transcribing,
         )
         .expect("retry should update meeting");
 
@@ -10609,11 +10711,11 @@ mod status_message_tests {
         let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
-            "m1",
-            &job.id,
+            &job,
             "failed to persist transcript segments: integer out of range".to_owned(),
             0,
             "transcript_persist",
+            crate::domain::MeetingStatus::Transcribing,
         )
         .expect("retry exhaustion should update meeting");
 
@@ -10630,7 +10732,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn transcript_persist_retry_status_update_failure_marks_terminal() {
+    fn stale_transcript_retry_cannot_fail_posted_meeting() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = transcribing_meeting();
         meeting.status = crate::domain::MeetingStatus::Posted;
@@ -10642,24 +10744,51 @@ mod status_message_tests {
         let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
-            "m1",
-            &job.id,
+            &job,
             "failed to persist transcript segments: database unavailable".to_owned(),
             2,
             "transcript_persist",
+            crate::domain::MeetingStatus::Transcribing,
         )
-        .expect("status restore failure should be terminalized");
+        .expect("stale retry should not fail posted meeting");
 
         assert!(exhausted);
         let updated = queue.get(&job.id).expect("job should remain");
         assert_eq!(updated.status, crate::domain::JobStatus::Failed);
         assert_eq!(updated.retry_count, 0);
         let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
-        assert_eq!(
-            meeting.error_message.as_deref(),
-            Some("failed to persist transcript segments: database unavailable")
-        );
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
+    }
+
+    #[test]
+    fn stale_claim_token_cannot_revert_transcribing_meeting_for_retry() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(transcribing_meeting());
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let stale_job = running_summary_job();
+        let mut live_job = stale_job.clone();
+        live_job.claim_token = Some("new-owner-token".to_owned());
+        queue.enqueue(live_job).expect("enqueue should succeed");
+
+        let exhausted = retry_summary_job_after_transcribing_phase_failure(
+            &mut store,
+            &mut queue,
+            &stale_job,
+            "failed to persist transcript segments: database unavailable".to_owned(),
+            2,
+            "transcript_persist",
+            crate::domain::MeetingStatus::Transcribing,
+        )
+        .expect("lost ownership should be handled without failing the meeting");
+
+        assert!(!exhausted);
+        let updated = queue.get(&stale_job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Running);
+        assert_eq!(updated.retry_count, 0);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Transcribing);
+        assert_eq!(meeting.error_message, None);
     }
 
     struct UnexpectedRetryStatusQueue;
@@ -10692,16 +10821,23 @@ mod status_message_tests {
             Ok(None)
         }
 
+        fn heartbeat(
+            &mut self,
+            _job: &crate::infrastructure::queue::Job,
+        ) -> Result<(), crate::infrastructure::queue::QueueError> {
+            Ok(())
+        }
+
         fn mark_done(
             &mut self,
-            _job_id: &str,
+            _job: &crate::infrastructure::queue::Job,
         ) -> Result<(), crate::infrastructure::queue::QueueError> {
             Ok(())
         }
 
         fn mark_failed(
             &mut self,
-            _job_id: &str,
+            _job: &crate::infrastructure::queue::Job,
             _error_message: String,
         ) -> Result<(), crate::infrastructure::queue::QueueError> {
             Ok(())
@@ -10709,7 +10845,7 @@ mod status_message_tests {
 
         fn retry(
             &mut self,
-            _job_id: &str,
+            _job: &crate::infrastructure::queue::Job,
             _error_message: String,
             _max_retries: u32,
         ) -> Result<crate::domain::JobStatus, crate::infrastructure::queue::QueueError> {
@@ -10726,11 +10862,11 @@ mod status_message_tests {
         let exhausted = retry_summary_job_after_transcribing_phase_failure(
             &mut store,
             &mut queue,
-            "m1",
-            "summary-m1",
+            &running_summary_job(),
             "failed to persist transcript segments: database unavailable".to_owned(),
             2,
             "transcript_persist",
+            crate::domain::MeetingStatus::Transcribing,
         )
         .expect("unexpected retry status should be terminalized");
 
@@ -10773,16 +10909,23 @@ mod status_message_tests {
             Ok(None)
         }
 
+        fn heartbeat(
+            &mut self,
+            _job: &crate::infrastructure::queue::Job,
+        ) -> Result<(), crate::infrastructure::queue::QueueError> {
+            Ok(())
+        }
+
         fn mark_done(
             &mut self,
-            _job_id: &str,
+            _job: &crate::infrastructure::queue::Job,
         ) -> Result<(), crate::infrastructure::queue::QueueError> {
             Ok(())
         }
 
         fn mark_failed(
             &mut self,
-            _job_id: &str,
+            _job: &crate::infrastructure::queue::Job,
             _error_message: String,
         ) -> Result<(), crate::infrastructure::queue::QueueError> {
             Ok(())
@@ -10790,7 +10933,7 @@ mod status_message_tests {
 
         fn retry(
             &mut self,
-            _job_id: &str,
+            _job: &crate::infrastructure::queue::Job,
             _error_message: String,
             _max_retries: u32,
         ) -> Result<crate::domain::JobStatus, crate::infrastructure::queue::QueueError> {
@@ -10810,7 +10953,7 @@ mod status_message_tests {
             &mut store,
             &mut queue,
             "m1",
-            "summary-m1",
+            &running_summary_job(),
             "summary posting failed: discord 500".to_owned(),
             2,
         )
@@ -10839,7 +10982,7 @@ mod status_message_tests {
             &mut store,
             &mut queue,
             "m1",
-            &job.id,
+            &job,
             "summary posting failed: discord 500".to_owned(),
             2,
         );
