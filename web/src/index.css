@@ -869,6 +869,54 @@ button {
   font-size: 0.88rem;
 }
 
+.rbac-management-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.2fr);
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.rbac-role-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.rbac-permission-editor {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  padding: 12px;
+}
+
+.rbac-permission-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.rbac-permission-option {
+  align-items: flex-start;
+  margin-top: 0;
+}
+
+.rbac-permission-option span {
+  display: grid;
+  gap: 3px;
+}
+
+.rbac-permission-option strong {
+  color: var(--text-primary);
+  font-size: 0.88rem;
+}
+
+.rbac-permission-option small {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
 .dashboard-table-shell {
   min-height: 360px;
   overflow-x: auto;
@@ -1656,7 +1704,8 @@ audio::-webkit-media-controls-panel {
   .admin-view-layout,
   .admin-plan-summary-grid,
   .admin-form-grid,
-  .admin-metric-grid {
+  .admin-metric-grid,
+  .rbac-management-grid {
     grid-template-columns: 1fr;
   }
   .admin-view-header {

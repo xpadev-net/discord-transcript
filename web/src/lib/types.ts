@@ -103,6 +103,43 @@ export interface UpdateGuildBotTokenRequest {
   bot_token: string;
 }
 
+export interface GuildRbacPermissionCatalogEntry {
+  name: string;
+  label: string;
+  description: string;
+}
+
+export interface GuildRbacRoleGrant {
+  discord_role_id: string;
+  permissions: string[];
+  created_actor_user_id: string | null;
+  updated_actor_user_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface GuildRbacRole {
+  id: string;
+  name: string;
+  position: number;
+  color: number;
+  managed: boolean;
+  hoist: boolean;
+  is_admin: boolean;
+  grant: GuildRbacRoleGrant | null;
+}
+
+export interface GuildRbacManagement {
+  guild_id: string;
+  permissions: GuildRbacPermissionCatalogEntry[];
+  roles: GuildRbacRole[];
+  degraded: boolean;
+}
+
+export interface GuildRbacRoleGrantUpdateRequest {
+  permissions: string[];
+}
+
 export type AdminPlanKind = "default" | "beta" | "custom";
 export type AdminPlanStatus = "active" | "archived";
 export type AdminQuotaDimension =

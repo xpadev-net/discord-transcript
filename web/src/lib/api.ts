@@ -24,6 +24,9 @@ import type {
   GuildJob,
   GuildJobStatus,
   GuildJobType,
+  GuildRbacManagement,
+  GuildRbacRoleGrant,
+  GuildRbacRoleGrantUpdateRequest,
   GuildSettingsResponse,
   MeetingListResponse,
   MeetingResponse,
@@ -84,6 +87,19 @@ function guildSettingsPath(guildId?: string): string {
 
 function guildBotTokenPath(guildId?: string): string {
   return `${guildSettingsPath(guildId)}/bot-token`;
+}
+
+function guildRbacPath(guildId?: string): string {
+  return guildId
+    ? `/api/guilds/${encodeURIComponent(guildId)}/rbac`
+    : "/api/guild/rbac";
+}
+
+function guildRbacRolePath(
+  guildId: string | undefined,
+  roleId: string,
+): string {
+  return `${guildRbacPath(guildId)}/roles/${encodeURIComponent(roleId)}`;
 }
 
 function guildMeetingsPath(guildId?: string | null): string {
@@ -319,6 +335,42 @@ export function deleteGuildBotToken(
     method: "DELETE",
     signal,
   }).then(handleGuildSettingsResponse);
+}
+
+export function fetchGuildRbac(
+  guildId?: string,
+  signal?: AbortSignal,
+): Promise<GuildRbacManagement> {
+  return fetch(guildRbacPath(guildId), { signal }).then(
+    handleResponse<GuildRbacManagement>,
+  );
+}
+
+export function updateGuildRbacRoleGrant(
+  roleId: string,
+  request: GuildRbacRoleGrantUpdateRequest,
+  guildId?: string,
+  signal?: AbortSignal,
+): Promise<GuildRbacRoleGrant> {
+  return fetch(guildRbacRolePath(guildId, roleId), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+    signal,
+  }).then(handleResponse<GuildRbacRoleGrant>);
+}
+
+export function resetGuildRbacRoleGrant(
+  roleId: string,
+  guildId?: string,
+  signal?: AbortSignal,
+): Promise<GuildRbacRoleGrant> {
+  return fetch(guildRbacRolePath(guildId, roleId), {
+    method: "DELETE",
+    signal,
+  }).then(handleResponse<GuildRbacRoleGrant>);
 }
 
 export function fetchAdminPlans(

@@ -21,6 +21,7 @@ import {
   fetchAdminRetentionOverview,
   fetchAiMemoryNotes,
   fetchDomainKnowledgeItems,
+  fetchGuildRbac,
   fetchGuildSettings,
   fetchPersonAliases,
   fetchSummaryTemplates,
@@ -29,12 +30,14 @@ import {
   previewAdminRetentionCleanup,
   previewAdminRetentionMeetingDelete,
   promoteAiMemoryToDomainKnowledge,
+  resetGuildRbacRoleGrant,
   runAdminRetentionCleanup,
   runAdminRetentionMeetingDelete,
   unpinAiMemoryNote,
   updateAiMemoryNote,
   updateDomainKnowledgeItem,
   updateGuildBotToken,
+  updateGuildRbacRoleGrant,
   updateGuildSettings,
   updatePersonAlias,
   updateSummaryTemplate,
@@ -54,6 +57,8 @@ import type {
   DomainKnowledgeContentType,
   DomainKnowledgeItem,
   DomainKnowledgeUpsertRequest,
+  GuildRbacManagement,
+  GuildRbacRole,
   GuildSettingsResponse,
   PersonAlias,
   PersonAliasReviewStatus,
@@ -96,7 +101,10 @@ type ActiveOperation =
   | "retention-preview"
   | "retention-run"
   | "retention-meeting-preview"
-  | "retention-meeting-delete";
+  | "retention-meeting-delete"
+  | "rbac-load"
+  | "rbac-save"
+  | "rbac-reset";
 
 interface RetentionAdminDraft {
   token: string;
@@ -140,6 +148,11 @@ interface PersonAliasDraft {
   confidence: string;
   active: boolean;
   review_status: PersonAliasReviewStatus;
+}
+
+interface RbacDraft {
+  selectedRoleId: string | null;
+  permissions: string[];
 }
 
 const domainKnowledgeContentTypes: DomainKnowledgeContentType[] = [
@@ -292,6 +305,46 @@ function emptyRetentionAdminDraft(): RetentionAdminDraft {
       debug: true,
     },
   };
+}
+
+function emptyRbacDraft(): RbacDraft {
+  return {
+    selectedRoleId: null,
+    permissions: [],
+  };
+}
+
+function rbacDraftFromRole(role: GuildRbacRole | null): RbacDraft {
+  return {
+    selectedRoleId: role?.id ?? null,
+    permissions: role?.grant?.permissions ?? [],
+  };
+}
+
+function rbacPermissionSet(values: string[]): Set<string> {
+  return new Set(values);
+}
+
+function rbacDraftMatchesRole(draft: RbacDraft, role: GuildRbacRole | null) {
+  if (!role || draft.selectedRoleId !== role.id) {
+    return false;
+  }
+  const saved = rbacPermissionSet(role.grant?.permissions ?? []);
+  const current = rbacPermissionSet(draft.permissions);
+  if (saved.size !== current.size) {
+    return false;
+  }
+  return Array.from(saved).every((permission) => current.has(permission));
+}
+
+function rbacRoleMeta(role: GuildRbacRole): string {
+  const flags = [
+    role.is_admin ? "Discord Admin" : null,
+    role.managed ? "Managed" : null,
+    role.hoist ? "Hoisted" : null,
+  ].filter(Boolean);
+  const grantCount = role.grant?.permissions.length ?? 0;
+  return [`${grantCount} permissions`, ...flags].join(" / ");
 }
 
 function formatBytes(value: number): string {
@@ -854,6 +907,9 @@ export function SettingsPage({
   const [summaryTemplates, setSummaryTemplates] = useState<SummaryTemplate[]>(
     [],
   );
+  const [rbacManagement, setRbacManagement] =
+    useState<GuildRbacManagement | null>(null);
+  const [rbacDraft, setRbacDraft] = useState<RbacDraft>(emptyRbacDraft);
   const [domainKnowledgeDraft, setDomainKnowledgeDraft] =
     useState<DomainKnowledgeDraft>(emptyDomainKnowledgeDraft);
   const [aiMemoryDraft, setAiMemoryDraft] =
@@ -883,6 +939,7 @@ export function SettingsPage({
   const [retentionMeetingDelete, setRetentionMeetingDelete] =
     useState<AdminRetentionMeetingDelete | null>(null);
   const [retentionError, setRetentionError] = useState<string | null>(null);
+  const [rbacError, setRbacError] = useState<string | null>(null);
   const [botTokenValue, setBotTokenValue] = useState("");
   const [loading, setLoading] = useState(true);
   const [customizationLoading, setCustomizationLoading] = useState(false);
@@ -984,6 +1041,45 @@ export function SettingsPage({
     [],
   );
 
+  const refreshRbac = useCallback(
+    async (signal?: AbortSignal, preferredRoleId?: string | null) => {
+      setRbacError(null);
+      const requestGuildKey = currentGuildKeyRef.current;
+
+      try {
+        const response = await fetchGuildRbac(guildId, signal);
+        if (signal?.aborted || currentGuildKeyRef.current !== requestGuildKey) {
+          return;
+        }
+        setRbacManagement(response);
+        setRbacDraft((current) => {
+          const roleId =
+            preferredRoleId === undefined
+              ? (current.selectedRoleId ?? response.roles[0]?.id ?? null)
+              : preferredRoleId;
+          const role =
+            response.roles.find((item) => item.id === roleId) ??
+            response.roles[0] ??
+            null;
+          return rbacDraftFromRole(role);
+        });
+        return true;
+      } catch (err) {
+        if (signal?.aborted || currentGuildKeyRef.current !== requestGuildKey) {
+          return false;
+        }
+        setRbacError(
+          customizationErrorMessage(
+            err,
+            "RBACロール設定の読み込みに失敗しました",
+          ),
+        );
+        return false;
+      }
+    },
+    [guildId],
+  );
+
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -1004,6 +1100,9 @@ export function SettingsPage({
     setRetentionMeetingPreviewKey(null);
     setRetentionMeetingDelete(null);
     setRetentionError(null);
+    setRbacManagement(null);
+    setRbacDraft(emptyRbacDraft());
+    setRbacError(null);
     if (!showCustomizations) {
       setDomainKnowledgeItems([]);
       setAiMemoryNotes([]);
@@ -1021,6 +1120,9 @@ export function SettingsPage({
         if (!controller.signal.aborted) {
           setSettings(settingsResponse);
           setForm(formFromSettings(settingsResponse));
+          if (settingsResponse.is_admin) {
+            void refreshRbac(controller.signal);
+          }
           if (settingsResponse.is_admin && showCustomizations) {
             void refreshCustomizations(controller.signal);
           }
@@ -1047,7 +1149,7 @@ export function SettingsPage({
       });
 
     return () => controller.abort();
-  }, [guildId, refreshCustomizations, showCustomizations]);
+  }, [guildId, refreshCustomizations, refreshRbac, showCustomizations]);
 
   const canEdit = settings?.is_admin ?? false;
   const isSavingAny = activeOperation !== null;
@@ -1069,6 +1171,23 @@ export function SettingsPage({
   const selectedPersonAlias = personAliasDraft.id
     ? (personAliases.find((item) => item.id === personAliasDraft.id) ?? null)
     : null;
+  const selectedRbacRole =
+    rbacManagement?.roles.find(
+      (role) => role.id === rbacDraft.selectedRoleId,
+    ) ?? null;
+  const rbacDraftPermissionSet = rbacPermissionSet(rbacDraft.permissions);
+  const rbacDraftDirty = !rbacDraftMatchesRole(rbacDraft, selectedRbacRole);
+  const rbacCanSave =
+    canEdit &&
+    !isSavingAny &&
+    selectedRbacRole != null &&
+    rbacDraft.permissions.length > 0 &&
+    rbacDraftDirty;
+  const rbacCanReset =
+    canEdit &&
+    !isSavingAny &&
+    selectedRbacRole != null &&
+    selectedRbacRole.grant != null;
   const activeDomainKnowledgeItems = domainKnowledgeItems.filter(
     (item) => item.active && item.archived_at == null,
   );
@@ -1180,6 +1299,135 @@ export function SettingsPage({
     );
     setCustomizationError(null);
     setMessage(null);
+  }
+
+  function handleRbacRoleSelect(roleId: string) {
+    const selected =
+      rbacManagement?.roles.find((role) => role.id === roleId) ?? null;
+    setRbacDraft(rbacDraftFromRole(selected));
+    setRbacError(null);
+    setMessage(null);
+  }
+
+  function toggleRbacPermission(permissionName: string, checked: boolean) {
+    setRbacDraft((current) => {
+      const next = new Set(current.permissions);
+      if (checked) {
+        next.add(permissionName);
+      } else {
+        next.delete(permissionName);
+      }
+      const ordered = (rbacManagement?.permissions ?? [])
+        .map((permission) => permission.name)
+        .filter((name) => next.has(name));
+      return { ...current, permissions: ordered };
+    });
+    setRbacError(null);
+    setMessage(null);
+  }
+
+  async function handleRbacReload() {
+    if (!canEdit || isSavingAny) {
+      return;
+    }
+    const requestGuildKey = currentGuildKeyRef.current;
+    setActiveOperation("rbac-load");
+    setRbacError(null);
+    setMessage(null);
+    try {
+      const loaded = await refreshRbac(undefined, rbacDraft.selectedRoleId);
+      if (!loaded) {
+        return;
+      }
+      setMessage("RBACロール設定を再読み込みしました");
+    } catch {
+      setRbacError("RBACロール設定の再読み込みに失敗しました");
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleRbacSave() {
+    if (!selectedRbacRole || !rbacCanSave) {
+      return;
+    }
+    const requestGuildKey = currentGuildKeyRef.current;
+    setActiveOperation("rbac-save");
+    setRbacError(null);
+    setMessage(null);
+    try {
+      await updateGuildRbacRoleGrant(
+        selectedRbacRole.id,
+        { permissions: rbacDraft.permissions },
+        guildId,
+      );
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      const reloaded = await refreshRbac(undefined, selectedRbacRole.id);
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      if (!reloaded) {
+        setMessage("RBACロール権限を保存しました。再読み込みに失敗しました");
+        return;
+      }
+      setMessage("RBACロール権限を保存しました");
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRbacError(
+        customizationErrorMessage(err, "RBACロール権限の保存に失敗しました"),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
+  }
+
+  async function handleRbacReset() {
+    if (!selectedRbacRole || !rbacCanReset) {
+      return;
+    }
+    const requestGuildKey = currentGuildKeyRef.current;
+    setActiveOperation("rbac-reset");
+    setRbacError(null);
+    setMessage(null);
+    try {
+      await resetGuildRbacRoleGrant(selectedRbacRole.id, guildId);
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      const reloaded = await refreshRbac(undefined, selectedRbacRole.id);
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      if (!reloaded) {
+        setMessage(
+          "RBACロール権限をリセットしました。再読み込みに失敗しました",
+        );
+        return;
+      }
+      setMessage("RBACロール権限をリセットしました");
+    } catch (err) {
+      if (currentGuildKeyRef.current !== requestGuildKey) {
+        return;
+      }
+      setRbacError(
+        customizationErrorMessage(
+          err,
+          "RBACロール権限のリセットに失敗しました",
+        ),
+      );
+    } finally {
+      if (currentGuildKeyRef.current === requestGuildKey) {
+        setActiveOperation(null);
+      }
+    }
   }
 
   function updateBotTokenValue(value: string) {
@@ -2349,6 +2597,138 @@ export function SettingsPage({
             </button>
           </div>
         </form>
+      ) : null}
+
+      {settings && canEdit ? (
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <div>
+              <h2>{"Discordロール権限"}</h2>
+              <p>{"Discordロールごとに明示的なRBAC権限セットを管理します"}</p>
+            </div>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={isSavingAny}
+              onClick={handleRbacReload}
+            >
+              {activeOperation === "rbac-load" ? "読み込み中" : "再読み込み"}
+            </button>
+          </div>
+
+          {rbacManagement == null && !rbacError ? (
+            <output className="loading settings-panel-message">
+              <span className="loading-spinner" />
+              {"RBACロール設定を読み込み中"}
+            </output>
+          ) : null}
+
+          {rbacManagement?.degraded ? (
+            <p className="settings-version-meta">
+              {"Discordロール情報の一部を取得できませんでした"}
+            </p>
+          ) : null}
+
+          {rbacManagement ? (
+            <div className="rbac-management-grid">
+              <div className="rbac-role-list">
+                {rbacManagement.roles.length === 0 ? (
+                  <p className="admin-empty-inline">
+                    {"管理できるDiscordロールがありません"}
+                  </p>
+                ) : (
+                  rbacManagement.roles.map((role) => (
+                    <button
+                      key={role.id}
+                      type="button"
+                      aria-pressed={role.id === selectedRbacRole?.id}
+                      className={`admin-list-item${
+                        role.id === selectedRbacRole?.id ? " active" : ""
+                      }`}
+                      disabled={isSavingAny}
+                      onClick={() => handleRbacRoleSelect(role.id)}
+                    >
+                      <strong>{role.name}</strong>
+                      <span>{rbacRoleMeta(role)}</span>
+                    </button>
+                  ))
+                )}
+              </div>
+
+              <div className="rbac-permission-editor">
+                {selectedRbacRole ? (
+                  <>
+                    <div className="settings-customization-header">
+                      <div>
+                        <h3>{selectedRbacRole.name}</h3>
+                        <p>{rbacRoleMeta(selectedRbacRole)}</p>
+                      </div>
+                    </div>
+                    <div className="rbac-permission-list">
+                      {rbacManagement.permissions.map((permission) => (
+                        <label
+                          key={permission.name}
+                          className="settings-checkbox rbac-permission-option"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={rbacDraftPermissionSet.has(
+                              permission.name,
+                            )}
+                            disabled={isSavingAny}
+                            onChange={(event) =>
+                              toggleRbacPermission(
+                                permission.name,
+                                event.target.checked,
+                              )
+                            }
+                          />
+                          <span>
+                            <strong>{permission.label}</strong>
+                            <small>{permission.description}</small>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    {rbacDraftDirty && rbacDraft.permissions.length === 0 ? (
+                      <p className="settings-error">
+                        {"保存するには1つ以上の権限を選択してください"}
+                      </p>
+                    ) : null}
+                    <div className="settings-token-actions">
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={!rbacCanSave}
+                        onClick={handleRbacSave}
+                      >
+                        {activeOperation === "rbac-save"
+                          ? "保存中"
+                          : "権限を保存"}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button danger-button"
+                        disabled={!rbacCanReset}
+                        onClick={handleRbacReset}
+                      >
+                        {activeOperation === "rbac-reset"
+                          ? "リセット中"
+                          : "権限をリセット"}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="admin-empty-inline">
+                    {"Discordロールを選択してください"}
+                  </p>
+                )}
+              </div>
+            </div>
+          ) : null}
+
+          {rbacError ? <p className="settings-error">{rbacError}</p> : null}
+        </section>
       ) : null}
 
       {settings && canEdit ? (
