@@ -1,9 +1,10 @@
 import { formatDate, formatDuration } from "../lib/formatters";
 import { statusClassName, statusLabel } from "../lib/meetingStatus";
+import { displayMeetingTitle } from "../lib/meetingTitle";
 import type { MeetingResponse } from "../lib/types";
 
 export function Header({ meeting }: { meeting: MeetingResponse | null }) {
-  const title = meeting?.title || "--";
+  const title = meeting ? displayMeetingTitle(meeting) : "--";
   const date = meeting?.started_at ? formatDate(meeting.started_at) : "--";
   const duration =
     meeting?.duration_seconds != null

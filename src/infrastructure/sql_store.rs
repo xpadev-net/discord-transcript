@@ -2303,6 +2303,22 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         Ok(())
     }
 
+    fn set_meeting_title(&mut self, meeting_id: &str, title: String) -> Result<(), StoreError> {
+        let affected = self
+            .executor
+            .execute(
+                "UPDATE meetings SET title=$1, updated_at=NOW() WHERE id=$2",
+                &[title, meeting_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn get_status_message_metadata(
         &mut self,
         meeting_id: &str,

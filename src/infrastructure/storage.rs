@@ -97,6 +97,8 @@ pub trait MeetingStore: UsageEventStore {
         error_message: Option<String>,
     ) -> Result<(), StoreError>;
 
+    fn set_meeting_title(&mut self, meeting_id: &str, title: String) -> Result<(), StoreError>;
+
     fn get_status_message_metadata(
         &mut self,
         meeting_id: &str,
@@ -526,6 +528,16 @@ impl MeetingStore for InMemoryMeetingStore {
             });
         };
         meeting.error_message = error_message;
+        Ok(())
+    }
+
+    fn set_meeting_title(&mut self, meeting_id: &str, title: String) -> Result<(), StoreError> {
+        let Some(meeting) = self.meetings.get_mut(meeting_id) else {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        };
+        meeting.title = Some(title);
         Ok(())
     }
 

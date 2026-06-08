@@ -7554,7 +7554,79 @@ impl ScaffoldHandler {
             }
         }
 
-        let chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
+        let title = crate::application::worker::derive_meeting_title(
+            meeting.title.as_deref(),
+            &markdown,
+            meeting.voice_channel_name.as_deref(),
+            &meeting.voice_channel_id,
+            &claimed_job.meeting_id,
+        );
+        {
+            let mut service = self.service.lock().await;
+            if let Err(err) = service
+                .store
+                .set_meeting_title(&claimed_job.meeting_id, title.clone())
+            {
+                let err_string = format!("failed to persist meeting title: {err}");
+                drop(service);
+                let retry_result = {
+                    let mut service = self.service.lock().await;
+                    let mut queue = self.queue.lock().await;
+                    retry_summary_job_after_transcribing_phase_failure(
+                        &mut service.store,
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "title_persistence",
+                        MeetingStatus::Summarizing,
+                    )
+                };
+                let exhausted = match retry_result {
+                    Ok(exhausted) => exhausted,
+                    Err(retry_err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %retry_err,
+                            "failed to update title persistence retry state"
+                        );
+                        true
+                    }
+                };
+                if exhausted
+                    && self
+                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
+                        .await
+                    && let Err(status_err) = self
+                        .update_status_message(
+                            http,
+                            &claimed_job.meeting_id,
+                            StatusMessageUpdate::Failed {
+                                phase: "title_persistence",
+                                error: &err_string,
+                            },
+                        )
+                        .await
+                {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %status_err,
+                        "failed to update status message after title persistence failure"
+                    );
+                }
+                if exhausted {
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(err_string));
+                }
+                return Err(retry_scheduled_error(&claimed_job, err_string));
+            }
+        }
+        crate::application::summary::persist_meeting_title_debug_artifact(
+            &request.workspace,
+            &title,
+        );
+        let post_markdown =
+            crate::application::worker::markdown_with_title_for_post(&title, &markdown);
+        let chunks = split_discord_message(&post_markdown, DISCORD_MESSAGE_LIMIT);
 
         // NOTE: mark_done is NOT called here. The caller (run_summary_and_notify)
         // must call it after the Discord posting succeeds. This prevents data loss
@@ -7565,6 +7637,7 @@ impl ScaffoldHandler {
         Ok(RuntimeSummaryJobOutput {
             output: crate::application::worker::ProcessMeetingOutput {
                 meeting_id: claimed_job.meeting_id.clone(),
+                title,
                 markdown,
                 chunks,
             },
@@ -9862,6 +9935,14 @@ mod status_message_tests {
                 ));
             }
             self.inner.set_error_message(meeting_id, error_message)
+        }
+
+        fn set_meeting_title(
+            &mut self,
+            meeting_id: &str,
+            title: String,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner.set_meeting_title(meeting_id, title)
         }
 
         fn get_status_message_metadata(

@@ -20,6 +20,7 @@ import {
   getAudioUrl,
 } from "../lib/api";
 import { isLiveMeetingStatus } from "../lib/meetingStatus";
+import { sanitizeMeetingTitle } from "../lib/meetingTitle";
 import type {
   DebugArtifact,
   TranscriptFeedbackRequest,
@@ -437,7 +438,7 @@ export function MeetingPage() {
 
   useEffect(() => {
     if (meetingId) {
-      document.title = meeting?.title || "Meeting";
+      document.title = sanitizeMeetingTitle(meeting?.title) || "Meeting";
     }
   }, [meetingId, meeting?.title]);
 

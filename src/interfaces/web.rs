@@ -97,9 +97,9 @@ use crate::infrastructure::sql::{
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use crate::infrastructure::workspace::{
-    DEBUG_CORRECTION_PROMPT_FILENAME, DEBUG_DIR, DEBUG_MIXDOWN_WHISPER_FILENAME,
-    DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME, DEBUG_SUMMARY_PROMPT_FILENAME, DEBUG_WHISPER_DIR,
-    MeetingWorkspacePaths,
+    DEBUG_CORRECTION_PROMPT_FILENAME, DEBUG_DIR, DEBUG_MEETING_TITLE_FILENAME,
+    DEBUG_MIXDOWN_WHISPER_FILENAME, DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME,
+    DEBUG_SUMMARY_PROMPT_FILENAME, DEBUG_WHISPER_DIR, MeetingWorkspacePaths,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -170,6 +170,7 @@ const USER_GUILDS_CACHE_TTL_SECS: u64 = 60;
 const OAUTH_ACCESS_TOKEN_DEFAULT_TTL_SECS: u64 = 3600;
 const OAUTH_ACCESS_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
 const DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS: i64 = 15 * 60;
+const MEETING_TITLE_DISPLAY_MAX_CHARS: usize = 80;
 const AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS: u128 = 100;
 
 type PermissionCache =
@@ -4470,17 +4471,62 @@ fn transcript_sse_idle_limit_reached(idle_polls: u32) -> bool {
 }
 
 fn guild_meeting_entry_from_row(row: &tokio_postgres::Row) -> GuildMeetingEntryResponse {
+    let voice_channel_id: String = row.get("voice_channel_id");
+    let voice_channel_name: Option<String> = row.get("voice_channel_name");
+    let started_at: Option<String> = row.get("started_at");
     GuildMeetingEntryResponse {
         id: row.get("id"),
-        title: row.get("title"),
+        title: Some(display_meeting_title(
+            row.get::<_, Option<String>>("title").as_deref(),
+            started_at.as_deref(),
+            voice_channel_name.as_deref(),
+            &voice_channel_id,
+        )),
         status: row.get("status"),
-        started_at: row.get("started_at"),
+        started_at,
         stopped_at: row.get("stopped_at"),
         duration_seconds: row.get("meeting_duration_seconds"),
         stop_reason: row.get("stop_reason"),
-        voice_channel_id: row.get("voice_channel_id"),
-        voice_channel_name: row.get("voice_channel_name"),
+        voice_channel_id,
+        voice_channel_name,
     }
+}
+
+fn display_meeting_title(
+    title: Option<&str>,
+    started_at: Option<&str>,
+    voice_channel_name: Option<&str>,
+    voice_channel_id: &str,
+) -> String {
+    if let Some(title) = normalize_display_meeting_title(title) {
+        return title;
+    }
+    let channel = voice_channel_label(voice_channel_id, voice_channel_name);
+    let fallback = match started_at.and_then(format_meeting_title_timestamp) {
+        Some(timestamp) => format!("{timestamp} {channel}"),
+        None => channel,
+    };
+    normalize_display_meeting_title(Some(&fallback)).unwrap_or_else(|| "Meeting".to_owned())
+}
+
+fn normalize_display_meeting_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| {
+            !value.is_empty()
+                && !value.chars().any(char::is_control)
+                && value.chars().count() <= MEETING_TITLE_DISPLAY_MAX_CHARS
+        })
+}
+
+fn format_meeting_title_timestamp(value: &str) -> Option<String> {
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let time = time.get(0..5)?;
+    Some(format!("{year}/{month}/{day} {time}"))
 }
 
 fn voice_channel_label(id: &str, name: Option<&str>) -> String {
@@ -10779,15 +10825,23 @@ async fn api_meeting(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let started_at: Option<String> = row.get("started_at");
+    let voice_channel_id: String = row.get("voice_channel_id");
+    let voice_channel_name: Option<String> = row.get("voice_channel_name");
     Ok(Json(MeetingResponse {
         id: row.get("id"),
-        title: row.get("title"),
+        title: Some(display_meeting_title(
+            row.get::<_, Option<String>>("title").as_deref(),
+            started_at.as_deref(),
+            voice_channel_name.as_deref(),
+            &voice_channel_id,
+        )),
         status: row.get("status"),
-        started_at: row.get("started_at"),
+        started_at,
         stopped_at: row.get("stopped_at"),
         duration_seconds: row.get("meeting_duration_seconds"),
-        voice_channel_id: row.get("voice_channel_id"),
-        voice_channel_name: row.get("voice_channel_name"),
+        voice_channel_id,
+        voice_channel_name,
     }))
 }
 
@@ -11458,6 +11512,7 @@ enum StaticDebugArtifactKind {
     TranscriptManifest,
     CorrectionPrompt,
     SummaryPrompt,
+    MeetingTitle,
     SummaryOutput,
 }
 
@@ -11471,6 +11526,7 @@ impl StaticDebugArtifactKind {
             Self::TranscriptManifest => "transcript_manifest",
             Self::CorrectionPrompt => "correction_prompt",
             Self::SummaryPrompt => "summary_prompt",
+            Self::MeetingTitle => "meeting_title",
             Self::SummaryOutput => "summary_output",
         }
     }
@@ -11484,6 +11540,7 @@ impl StaticDebugArtifactKind {
             "transcript_manifest" => Self::TranscriptManifest,
             "correction_prompt" => Self::CorrectionPrompt,
             "summary_prompt" => Self::SummaryPrompt,
+            "meeting_title" => Self::MeetingTitle,
             "summary_output" => Self::SummaryOutput,
             _ => return None,
         })
@@ -11563,6 +11620,8 @@ async fn api_debug_manifest(
         legacy_debug_dir(&workspace).join(DEBUG_CORRECTION_PROMPT_FILENAME);
     let summary_prompt_path = workspace.summary_prompt_path();
     let summary_prompt_legacy = legacy_debug_dir(&workspace).join(DEBUG_SUMMARY_PROMPT_FILENAME);
+    let meeting_title_path = workspace.meeting_title_debug_path();
+    let meeting_title_legacy = legacy_debug_dir(&workspace).join(DEBUG_MEETING_TITLE_FILENAME);
 
     let summary_query_params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&meeting_id];
     let summary_query = state.db.query_opt(
@@ -11583,6 +11642,8 @@ async fn api_debug_manifest(
         correction_prompt_legacy_exists,
         summary_prompt_exists,
         summary_prompt_legacy_exists,
+        meeting_title_exists,
+        meeting_title_legacy_exists,
         summary_row,
     ) = tokio::join!(
         tokio::fs::try_exists(&mixdown_primary),
@@ -11597,6 +11658,8 @@ async fn api_debug_manifest(
         tokio::fs::try_exists(&correction_prompt_legacy),
         tokio::fs::try_exists(&summary_prompt_path),
         tokio::fs::try_exists(&summary_prompt_legacy),
+        tokio::fs::try_exists(&meeting_title_path),
+        tokio::fs::try_exists(&meeting_title_legacy),
         summary_query,
     );
 
@@ -11786,6 +11849,20 @@ async fn api_debug_manifest(
             content_type: "text/plain",
         });
     }
+
+    entries.push(DebugArtifactEntry {
+        id: StaticDebugArtifactKind::MeetingTitle.as_id().to_owned(),
+        label: "Meeting title".to_owned(),
+        category: "summary",
+        available: meeting_title_exists.unwrap_or(false)
+            || meeting_title_legacy_exists.unwrap_or(false),
+        download_url: format!(
+            "{base_url}/{}",
+            StaticDebugArtifactKind::MeetingTitle.as_id()
+        ),
+        filename: "meeting_title.txt".to_owned(),
+        content_type: "text/plain",
+    });
 
     entries.push(DebugArtifactEntry {
         id: StaticDebugArtifactKind::SummaryOutput.as_id().to_owned(),
@@ -12056,6 +12133,15 @@ async fn resolve_debug_artifact(
             DebugArtifactSource::File {
                 path: existing_debug_path(primary, legacy).await?,
                 filename: "summary_prompt.txt".to_owned(),
+                content_type: "text/plain",
+            }
+        }
+        StaticDebugArtifactKind::MeetingTitle => {
+            let primary = workspace.meeting_title_debug_path();
+            let legacy = legacy_debug_dir(&workspace).join(DEBUG_MEETING_TITLE_FILENAME);
+            DebugArtifactSource::File {
+                path: existing_debug_path(primary, legacy).await?,
+                filename: "meeting_title.txt".to_owned(),
                 content_type: "text/plain",
             }
         }

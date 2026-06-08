@@ -17,6 +17,7 @@ pub const DEBUG_MIXDOWN_WHISPER_FILENAME: &str = "mixdown.json";
 pub const DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME: &str = "transcript_pre_correction.md";
 pub const DEBUG_CORRECTION_PROMPT_FILENAME: &str = "correction_prompt.txt";
 pub const DEBUG_SUMMARY_PROMPT_FILENAME: &str = "summary_prompt.txt";
+pub const DEBUG_MEETING_TITLE_FILENAME: &str = "meeting_title.txt";
 pub const DEBUG_AGENT_RUNS_DIR: &str = "agent-runs";
 pub const CONTEXT_MANIFEST_FILENAME: &str = "manifest.json";
 pub const CONTEXT_SPEAKER_ROSTER_FILENAME: &str = "speaker_roster.md";
@@ -285,6 +286,10 @@ impl MeetingWorkspacePaths {
 
     pub fn summary_prompt_path(&self) -> PathBuf {
         self.debug_dir().join(DEBUG_SUMMARY_PROMPT_FILENAME)
+    }
+
+    pub fn meeting_title_debug_path(&self) -> PathBuf {
+        self.debug_dir().join(DEBUG_MEETING_TITLE_FILENAME)
     }
 
     pub fn agent_runs_debug_dir(&self) -> PathBuf {

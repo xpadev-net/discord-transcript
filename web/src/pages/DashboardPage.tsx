@@ -11,6 +11,7 @@ import {
   statusClassName,
   statusLabel,
 } from "../lib/meetingStatus";
+import { displayMeetingTitle } from "../lib/meetingTitle";
 import type {
   GuildJob,
   GuildJobStatus,
@@ -23,7 +24,7 @@ import type {
 const PAGE_SIZE = 20;
 
 function displayTitle(meeting: MeetingListItem): string {
-  return meeting.title || "\u7121\u984c\u306e\u4f1a\u8b70";
+  return displayMeetingTitle(meeting);
 }
 
 function displayDate(value: string | null): string {
