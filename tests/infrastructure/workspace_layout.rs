@@ -62,6 +62,15 @@ fn debug_paths_are_isolated_from_workspace_root() {
     assert!(workspace.whisper_debug_dir().starts_with(&debug_root));
     assert!(!workspace.debug_dir().starts_with(&root));
     assert!(!workspace.whisper_debug_dir().starts_with(&root));
+    for debug_path in [
+        workspace.pre_correction_transcript_path(),
+        workspace.correction_prompt_path(),
+        workspace.summary_prompt_path(),
+        workspace.agent_runs_debug_dir(),
+    ] {
+        assert!(debug_path.starts_with(&debug_root));
+        assert!(!debug_path.starts_with(&root));
+    }
     assert!(
         workspace
             .whisper_response_path("alice")

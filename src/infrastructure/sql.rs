@@ -1559,28 +1559,6 @@ WITH active_tenant AS (
     ORDER BY tg.effective_at DESC
     LIMIT 1
 ),
-audit_retention_sample AS (
-    SELECT random() < 0.001 AS run_cleanup
-),
-stale_audit_events AS (
-    SELECT events.ctid
-    FROM audit_retention_sample sample
-    JOIN audit_events events
-      ON sample.run_cleanup
-    WHERE events.occurred_at < NOW() - INTERVAL '180 days'
-    ORDER BY events.occurred_at ASC
-    LIMIT 500
-),
-audit_retention AS (
-    DELETE FROM audit_events events
-    USING stale_audit_events stale
-    WHERE events.ctid = stale.ctid
-    RETURNING 1
-),
-retention_batch AS (
-    SELECT COUNT(*) AS deleted_count
-    FROM audit_retention
-),
 candidate AS (
     SELECT
         $1 AS id,
@@ -1593,7 +1571,6 @@ candidate AS (
         COALESCE(NULLIF($8, '')::jsonb, '{}'::jsonb) AS request_metadata,
         COALESCE(NULLIF($9, '')::jsonb, '{}'::jsonb) AS detail_json,
         COALESCE(NULLIF($10, '')::timestamptz, NOW()) AS occurred_at
-    FROM retention_batch
 )
 INSERT INTO audit_events (
     id, tenant_id, guild_id, actor_user_id, action, resource_type, resource_id,
@@ -1612,6 +1589,24 @@ INSERT INTO audit_events (
     NOW()
 FROM candidate
 ON CONFLICT (id) DO NOTHING
+"#;
+
+pub const PRUNE_STALE_AUDIT_EVENTS_SQL: &str = r#"
+WITH audit_retention_sample AS (
+    SELECT random() < 0.01 AS run_cleanup
+),
+stale_audit_events AS (
+    SELECT events.ctid
+    FROM audit_retention_sample sample
+    JOIN audit_events events
+      ON sample.run_cleanup
+    WHERE events.occurred_at < NOW() - INTERVAL '180 days'
+    ORDER BY events.occurred_at ASC
+    LIMIT 500
+)
+DELETE FROM audit_events events
+USING stale_audit_events stale
+WHERE events.ctid = stale.ctid
 "#;
 
 pub const LIST_RECENT_AUDIT_EVENTS_SQL: &str = r#"

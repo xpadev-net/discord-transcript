@@ -87,11 +87,12 @@ use crate::infrastructure::sql::{
     LIST_GUILD_MEETINGS_SQL, LIST_GUILD_RBAC_ROLE_GRANTS_SQL, LIST_PERSON_ALIASES_SQL,
     LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
     LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
-    RESET_GUILD_RBAC_ROLE_GRANT_SQL, RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL,
-    SET_AI_MEMORY_PINNED_SQL, UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, UPDATE_ADMIN_PLAN_QUOTA_SQL,
-    UPDATE_ADMIN_PLAN_SQL, UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
-    UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
-    UPSERT_GUILD_BOT_TOKEN_SQL, UPSERT_GUILD_RBAC_ROLE_GRANT_SQL, UPSERT_GUILD_SETTINGS_SQL,
+    PRUNE_STALE_AUDIT_EVENTS_SQL, RESET_GUILD_RBAC_ROLE_GRANT_SQL,
+    RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL,
+    UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, UPDATE_ADMIN_PLAN_QUOTA_SQL, UPDATE_ADMIN_PLAN_SQL,
+    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
+    UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_GUILD_BOT_TOKEN_SQL,
+    UPSERT_GUILD_RBAC_ROLE_GRANT_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
 use crate::infrastructure::storage_fs::sanitize_path_component;
@@ -474,7 +475,17 @@ async fn persist_audit_event(
         .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
     state.db.execute(INSERT_AUDIT_EVENT_SQL, &bind).await?;
+    spawn_audit_retention_cleanup(state);
     Ok(())
+}
+
+fn spawn_audit_retention_cleanup(state: &WebState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = state.db.execute(PRUNE_STALE_AUDIT_EVENTS_SQL, &[]).await {
+            warn!(error = %err, "failed to prune stale audit events");
+        }
+    });
 }
 
 async fn record_audit_event(state: &WebState, event: AuditEvent) -> bool {
@@ -11843,11 +11854,15 @@ async fn verify_raw_debug_artifact_access(
         state,
         auth,
         user_id,
-        RbacPermission::AdminView,
+        raw_debug_artifact_permission(),
         false,
         false,
     )
     .await
+}
+
+fn raw_debug_artifact_permission() -> RbacPermission {
+    RbacPermission::AdminView
 }
 
 fn authorize_debug_artifact_download(raw_debug_allowed: bool) -> Result<(), StatusCode> {
@@ -14779,8 +14794,9 @@ mod discord_channel_full_tests {
         build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
         debug_download_dedupe_bucket, debug_download_usage_event_id,
         guild_meeting_channel_visible_after_row, meeting_access_from_row,
-        verify_meeting_access_after_row,
+        raw_debug_artifact_permission, verify_meeting_access_after_row,
     };
+    use crate::domain::authz::RbacPermission;
     use axum::http::StatusCode;
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -15144,17 +15160,7 @@ mod discord_channel_full_tests {
 
     #[test]
     fn raw_debug_artifact_access_uses_explicit_admin_view_permission() {
-        let source = include_str!("web.rs");
-        let helper = source
-            .split_once("async fn verify_raw_debug_artifact_access")
-            .expect("raw debug access helper should exist")
-            .1
-            .split_once("fn authorize_debug_artifact_download")
-            .expect("next helper should exist")
-            .0;
-
-        assert!(helper.contains("RbacPermission::AdminView"));
-        assert!(!helper.contains("check_channel_admin_permission"));
+        assert_eq!(raw_debug_artifact_permission(), RbacPermission::AdminView);
     }
 
     #[test]
