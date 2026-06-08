@@ -4,6 +4,7 @@ use crate::domain::ai_memory::{
     AiMemoryNote, AiMemorySourceType, AiMemoryTag, NewAiMemoryNote, UpdateAiMemoryNote,
 };
 use crate::domain::audit::AuditEvent;
+use crate::domain::authz::{RbacPermission, RbacRoleGrant};
 use crate::domain::confidence::ConfidencePermille;
 use crate::domain::domain_knowledge::{
     DomainKnowledgeContentType, DomainKnowledgeItem, NewDomainKnowledgeItem,
@@ -36,14 +37,14 @@ use crate::infrastructure::sql::{
     INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
     INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
     INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL, LIST_AI_MEMORY_NOTES_SQL,
-    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL,
-    LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
-    LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
-    MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration, RESOLVE_PLAN_FOR_GUILD_SQL,
-    RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
-    SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
-    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
-    UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL,
+    LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_RECENT_USAGE_EVENTS_SQL,
+    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
+    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
+    RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
+    SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL,
+    UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
+    UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
     UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
     migration_transaction_sql,
 };
@@ -53,6 +54,7 @@ use crate::infrastructure::storage::{
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::str::FromStr;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
 
 const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64 / 1_000_000;
@@ -176,6 +178,47 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         }
         self.executor
             .run_migration(&migration_transaction_sql(migration))
+    }
+
+    pub fn list_rbac_role_grants_for_member_roles(
+        &mut self,
+        guild_id: &str,
+        member_roles: &[String],
+    ) -> Result<Vec<RbacRoleGrant>, StoreError> {
+        if member_roles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let role_csv = member_roles.join(",");
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL,
+                &[guild_id.to_owned(), role_csv],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.into_iter()
+            .map(|row| {
+                if row.len() < 3 {
+                    return Err(StoreError::Backend(format!(
+                        "invalid RBAC grant row length for guild={guild_id}: {}",
+                        row.len()
+                    )));
+                }
+                let guild_id = require_store_column(&row, 0, "guild_id")?;
+                let discord_role_id = require_store_column(&row, 1, "discord_role_id")?;
+                let permission_name = require_store_column(&row, 2, "permission_name")?;
+                let permission = RbacPermission::from_str(&permission_name).map_err(|err| {
+                    StoreError::Backend(format!(
+                        "invalid RBAC permission '{permission_name}' for guild={guild_id}: {err}"
+                    ))
+                })?;
+                Ok(RbacRoleGrant {
+                    guild_id,
+                    discord_role_id,
+                    permission,
+                })
+            })
+            .collect()
     }
 
     pub fn resolve_tenant_by_guild(

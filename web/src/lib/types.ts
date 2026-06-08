@@ -12,6 +12,11 @@ export interface MeResponse {
   // Returned by /api/me for future guild-scoped UI decisions.
   guild_id: string;
   is_admin: boolean;
+  can_manage_settings: boolean;
+  can_view_usage: boolean;
+  can_reprocess_meetings: boolean;
+  can_manage_domain_knowledge: boolean;
+  can_manage_summary_templates: boolean;
 }
 
 export interface UserGuild {
@@ -88,6 +93,9 @@ export interface GuildSettingsResponse {
   discord_bot_user_id: string | null;
   discord_bot_username: string | null;
   is_admin: boolean;
+  can_manage_settings: boolean;
+  can_manage_domain_knowledge: boolean;
+  can_manage_summary_templates: boolean;
 }
 
 export interface UpdateGuildSettingsRequest {

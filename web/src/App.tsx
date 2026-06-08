@@ -37,6 +37,14 @@ function canSelectGuild(guild: UserGuild): boolean {
   return guild.is_member && guild.installed;
 }
 
+function canManageCurrentGuildSettings(me: MeResponse | null): boolean {
+  return me?.can_manage_settings ?? me?.is_admin ?? false;
+}
+
+function canViewCurrentGuildUsage(me: MeResponse | null): boolean {
+  return me?.can_view_usage ?? me?.is_admin ?? false;
+}
+
 function chooseSelectedGuildId(
   me: MeResponse,
   guilds: UserGuild[],
@@ -156,9 +164,12 @@ export function App() {
     guilds.length > 0 &&
     guilds.every((guild) => !canSelectGuild(guild));
   const canUseSelectedGuildSettings = selectedGuild
-    ? canSelectGuild(selectedGuild) && selectedGuild.is_admin
-    : me?.is_admin === true && selectedGuildId === me.guild_id;
-  const canUseCurrentGuildAdminViews = me?.is_admin === true;
+    ? canSelectGuild(selectedGuild) &&
+      (selectedGuild.guild_id === me?.guild_id
+        ? canManageCurrentGuildSettings(me)
+        : true)
+    : canManageCurrentGuildSettings(me) && selectedGuildId === me?.guild_id;
+  const canUseCurrentGuildAdminViews = canViewCurrentGuildUsage(me);
   const currentGuildName =
     guilds.find((guild) => me && guild.guild_id === me.guild_id)?.name ??
     undefined;
@@ -201,7 +212,10 @@ export function App() {
           path="/settings"
           element={
             <SettingsRoute
-              isAdmin={me?.is_admin === true && selectedGuildId === me.guild_id}
+              isAdmin={
+                canManageCurrentGuildSettings(me) &&
+                selectedGuildId === me?.guild_id
+              }
               loading={loadingMe || loadingGuilds}
               forbidden={sessionForbidden}
               error={sessionError}
@@ -244,6 +258,7 @@ export function App() {
               <AdminUsagePage
                 selectedGuildName={currentGuildName}
                 isSystemAdmin={me?.is_admin === true}
+                canManageSettings={canManageCurrentGuildSettings(me)}
               />
             </GuildAdminRoute>
           }
@@ -368,7 +383,10 @@ function AdminRouteFrame({
 
 function GuildAdminRoute(props: AdminRouteProps) {
   return (
-    <AdminRouteFrame {...props} forbiddenMessage="ギルド管理者権限が必要です" />
+    <AdminRouteFrame
+      {...props}
+      forbiddenMessage="このページを表示する権限がありません"
+    />
   );
 }
 
@@ -460,8 +478,8 @@ function TargetSettingsRoute({
       : canFallbackToCurrentGuild;
   const targetIsAdmin =
     targetGuild !== null
-      ? targetGuild.is_admin
-      : canFallbackToCurrentGuild && me.is_admin;
+      ? canSelectGuild(targetGuild)
+      : canFallbackToCurrentGuild && canManageCurrentGuildSettings(me);
 
   useEffect(() => {
     if (

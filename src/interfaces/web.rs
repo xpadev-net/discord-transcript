@@ -36,7 +36,9 @@ use crate::application::runtime::SummaryJobWakeups;
 use crate::bootstrap::config::is_iso639_1_format;
 use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag};
 use crate::domain::audit::AuditEvent;
-use crate::domain::authz::RbacPermission;
+use crate::domain::authz::{
+    MemberRoleSource, RbacPermission, RbacRoleGrant, RbacSubject, resolve_rbac_permission,
+};
 use crate::domain::confidence::ConfidencePermille;
 use crate::domain::domain_knowledge::DomainKnowledgeContentType;
 use crate::domain::feedback::{
@@ -2092,8 +2094,21 @@ async fn verify_meeting_access(
         .ok_or(StatusCode::NOT_FOUND)?;
     let guild_id: String = row.get("guild_id");
     let channel_id: String = row.get("voice_channel_id");
+    let access = meeting_access_from_row(guild_id, channel_id.clone(), &auth.guild_id)?;
+    if current_user_has_rbac_permission_for_auth(
+        state,
+        auth,
+        user_id,
+        RbacPermission::MeetingView,
+        false,
+        false,
+    )
+    .await?
+    {
+        return Ok(access);
+    }
     verify_meeting_access_after_row(
-        guild_id,
+        access.guild_id,
         channel_id.clone(),
         &auth.guild_id,
         user_id,
@@ -3060,6 +3075,11 @@ struct CurrentUserResponse {
     user_id: String,
     guild_id: String,
     is_admin: bool,
+    can_manage_settings: bool,
+    can_view_usage: bool,
+    can_reprocess_meetings: bool,
+    can_manage_domain_knowledge: bool,
+    can_manage_summary_templates: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3421,6 +3441,9 @@ struct GuildSettingsResponse {
     discord_bot_user_id: Option<String>,
     discord_bot_username: Option<String>,
     is_admin: bool,
+    can_manage_settings: bool,
+    can_manage_domain_knowledge: bool,
+    can_manage_summary_templates: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4986,6 +5009,7 @@ fn normalize_summary_template_request(
     })
 }
 
+#[cfg(test)]
 fn validate_authorized_summary_template_request(
     is_admin: bool,
     request: &SummaryTemplateUpsertRequest,
@@ -5488,7 +5512,7 @@ async fn validate_discord_bot_token_for_guild(
 fn guild_settings_response(
     defaults: &GuildSettingsDefaults,
     stored: Option<StoredGuildSettings>,
-    is_admin: bool,
+    capabilities: GuildSettingsCapabilities,
 ) -> GuildSettingsResponse {
     let stored = stored.unwrap_or(StoredGuildSettings {
         whisper_language: None,
@@ -5528,8 +5552,19 @@ fn guild_settings_response(
         discord_bot_token_last_validated_at: stored.discord_bot_token_last_validated_at,
         discord_bot_user_id: stored.discord_bot_user_id,
         discord_bot_username: stored.discord_bot_username,
-        is_admin,
+        is_admin: capabilities.is_admin,
+        can_manage_settings: capabilities.can_manage_settings,
+        can_manage_domain_knowledge: capabilities.can_manage_domain_knowledge,
+        can_manage_summary_templates: capabilities.can_manage_summary_templates,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuildSettingsCapabilities {
+    is_admin: bool,
+    can_manage_settings: bool,
+    can_manage_domain_knowledge: bool,
+    can_manage_summary_templates: bool,
 }
 
 fn guild_bot_token_delete_is_noop(stored: Option<&StoredGuildSettings>) -> bool {
@@ -5556,6 +5591,209 @@ async fn require_current_user_is_guild_admin(
     guild_admin_required_result(current_user_is_guild_admin(state, user_id).await?)
 }
 
+async fn fetch_member_roles_for_rbac(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<Vec<String>, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+    let response = state
+        .http_client
+        .get(format!(
+            "https://discord.com/api/guilds/{}/members/{user_id}",
+            auth.guild_id
+        ))
+        .header("Authorization", bot_auth)
+        .send()
+        .await
+        .map_err(|err| {
+            warn!(error = %err, user_id = %user_id, "discord member role lookup request failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND
+        || response.status() == reqwest::StatusCode::FORBIDDEN
+        || response.status() == reqwest::StatusCode::UNAUTHORIZED
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !response.status().is_success() {
+        warn!(
+            status = %response.status(),
+            user_id = %user_id,
+            "discord member role lookup returned non-success"
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let member: DiscordMemberFull = response.json().await.map_err(|err| {
+        warn!(error = %err, user_id = %user_id, "discord member role lookup response parse failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+    Ok(member.roles)
+}
+
+fn rbac_role_grants_from_responses(
+    guild_id: &str,
+    grants: &[GuildRbacRoleGrantResponse],
+) -> Result<Vec<RbacRoleGrant>, StatusCode> {
+    grants
+        .iter()
+        .flat_map(|grant| {
+            grant
+                .permissions
+                .iter()
+                .map(move |permission| (&grant.discord_role_id, permission))
+        })
+        .map(|(discord_role_id, permission)| {
+            RbacPermission::from_str(permission)
+                .map(|permission| RbacRoleGrant {
+                    guild_id: guild_id.to_owned(),
+                    discord_role_id: discord_role_id.clone(),
+                    permission,
+                })
+                .map_err(|err| {
+                    warn!(
+                        error = %err,
+                        guild_id = %guild_id,
+                        permission = %permission,
+                        "stored RBAC permission failed to parse"
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
+        })
+        .collect()
+}
+
+async fn current_user_has_rbac_permission_for_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    permission: RbacPermission,
+    has_channel_view: bool,
+    is_meeting_starter: bool,
+) -> Result<bool, StatusCode> {
+    let is_admin = check_guild_admin_permission_for_settings(state, auth, user_id).await?;
+    if is_admin {
+        return Ok(true);
+    }
+    let member_roles = match fetch_member_roles_for_rbac(state, auth, user_id).await {
+        Ok(member_roles) => member_roles,
+        Err(status) => {
+            warn!(
+                status = %status,
+                guild_id = %auth.guild_id,
+                user_id = %user_id,
+                "denying RBAC permission after member role lookup failure"
+            );
+            let decision = resolve_rbac_permission(
+                permission,
+                &auth.guild_id,
+                RbacSubject {
+                    is_bot_admin: false,
+                    is_guild_admin: false,
+                    has_channel_view,
+                    is_meeting_starter,
+                },
+                MemberRoleSource::LookupFailed,
+                &[],
+            );
+            return Ok(decision.allowed);
+        }
+    };
+    let grants = load_guild_rbac_role_grants(state, &auth.guild_id).await?;
+    let role_grants = rbac_role_grants_from_responses(&auth.guild_id, &grants)?;
+    let decision = resolve_rbac_permission(
+        permission,
+        &auth.guild_id,
+        RbacSubject {
+            is_bot_admin: false,
+            is_guild_admin: false,
+            has_channel_view,
+            is_meeting_starter,
+        },
+        MemberRoleSource::Available(&member_roles),
+        &role_grants,
+    );
+    Ok(decision.allowed)
+}
+
+async fn require_current_user_has_rbac_permission(
+    state: &WebState,
+    user_id: &str,
+    permission: RbacPermission,
+) -> Result<(), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if current_user_has_rbac_permission_for_auth(state, auth, user_id, permission, false, false)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+async fn require_user_has_target_guild_rbac_permission(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    guild_id: &str,
+    permission: RbacPermission,
+) -> Result<AuthConfig, StatusCode> {
+    require_active_target_guild_installation(state, guild_id).await?;
+    let discord_guilds = load_current_user_discord_guilds(state, user_id).await?;
+    if !user_can_access_target_guild(&discord_guilds, guild_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let target_auth = target_auth_config(auth, guild_id);
+    if current_user_has_rbac_permission_for_auth(
+        state,
+        &target_auth,
+        user_id,
+        permission,
+        false,
+        false,
+    )
+    .await?
+    {
+        Ok(target_auth)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+async fn guild_settings_capabilities_for_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    can_manage_settings: bool,
+) -> Result<GuildSettingsCapabilities, StatusCode> {
+    let is_admin = check_guild_admin_permission_for_settings(state, auth, user_id).await?;
+    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_auth(
+        state,
+        auth,
+        user_id,
+        RbacPermission::DomainKnowledgeManage,
+        false,
+        false,
+    )
+    .await?;
+    let can_manage_summary_templates = current_user_has_rbac_permission_for_auth(
+        state,
+        auth,
+        user_id,
+        RbacPermission::SummaryTemplateManage,
+        false,
+        false,
+    )
+    .await?;
+    Ok(GuildSettingsCapabilities {
+        is_admin,
+        can_manage_settings: can_manage_settings || is_admin,
+        can_manage_domain_knowledge,
+        can_manage_summary_templates,
+    })
+}
+
+#[cfg(test)]
 fn validate_authorized_guild_settings_update(
     is_admin: bool,
     request: &GuildSettingsUpdateRequest,
@@ -5754,10 +5992,60 @@ async fn api_me(
 ) -> Result<Json<CurrentUserResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let is_admin = check_guild_admin_permission_for_settings(&state, auth, &user_id).await?;
+    let can_manage_settings = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::SettingsManage,
+        false,
+        false,
+    )
+    .await?;
+    let can_view_usage = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::UsageView,
+        false,
+        false,
+    )
+    .await?;
+    let can_reprocess_meetings = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::MeetingReprocess,
+        false,
+        false,
+    )
+    .await?;
+    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+        false,
+        false,
+    )
+    .await?;
+    let can_manage_summary_templates = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+        false,
+        false,
+    )
+    .await?;
     Ok(Json(CurrentUserResponse {
         user_id,
         guild_id: auth.guild_id.clone(),
         is_admin,
+        can_manage_settings,
+        can_view_usage,
+        can_reprocess_meetings,
+        can_manage_domain_knowledge,
+        can_manage_summary_templates,
     }))
 }
 
@@ -7373,7 +7661,7 @@ async fn api_list_jobs(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<JobResponse>>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::UsageView).await?;
     let query = parse_job_list_query(raw_query.as_deref())?;
     let normalized = normalize_job_list_query(&query)?;
     let rows = state
@@ -7400,7 +7688,8 @@ async fn api_retry_job(
     body: Bytes,
 ) -> Result<Json<JobResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::MeetingReprocess)
+        .await?;
     validate_resource_id(&job_id)?;
     let request = parse_job_retry_request_body(&body)?;
     let normalized = normalize_job_retry_request(&request)?;
@@ -7450,7 +7739,8 @@ async fn api_cancel_job(
     body: Bytes,
 ) -> Result<Json<JobResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::MeetingReprocess)
+        .await?;
     validate_resource_id(&job_id)?;
     let request = parse_job_cancel_request_body(&body)?;
     let normalized = normalize_job_cancel_request(&request)?;
@@ -7518,9 +7808,17 @@ async fn list_guild_meetings_for_auth(
     let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
-    let is_admin = check_guild_admin_permission(state, auth, user_id).await?;
+    let can_view_all_meetings = current_user_has_rbac_permission_for_auth(
+        state,
+        auth,
+        user_id,
+        RbacPermission::MeetingView,
+        false,
+        false,
+    )
+    .await?;
 
-    if is_admin {
+    if can_view_all_meetings {
         let voice_channels = list_admin_guild_meeting_voice_channels(state, auth).await?;
         let count_row = state
             .db
@@ -7930,19 +8228,6 @@ async fn require_active_target_guild_installation(
     }
 }
 
-async fn require_user_is_target_guild_admin(
-    state: &WebState,
-    auth: &AuthConfig,
-    user_id: &str,
-    guild_id: &str,
-) -> Result<AuthConfig, StatusCode> {
-    require_active_target_guild_installation(state, guild_id).await?;
-    let target_auth = target_auth_config(auth, guild_id);
-    let is_admin = check_guild_admin_permission_for_settings(state, &target_auth, user_id).await?;
-    guild_admin_required_result(is_admin)?;
-    Ok(target_auth)
-}
-
 async fn api_target_guild_settings(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -7950,13 +8235,22 @@ async fn api_target_guild_settings(
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await?;
+    let capabilities =
+        guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true).await?;
     let stored = load_guild_settings(&state, &target_auth.guild_id).await?;
 
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -7965,13 +8259,15 @@ async fn api_guild_settings(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
+        .await?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true).await?;
     let stored = load_guild_settings(&state, &auth.guild_id).await?;
 
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -7984,7 +8280,16 @@ async fn api_update_target_guild_settings(
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await?;
+    let capabilities =
+        guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true).await?;
     validate_guild_settings_update(&request)?;
 
     let whisper_language_explicit = request.whisper_language.is_some();
@@ -8034,7 +8339,7 @@ async fn api_update_target_guild_settings(
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -8045,8 +8350,10 @@ async fn api_update_guild_settings(
     Json(request): Json<GuildSettingsUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
-    validate_authorized_guild_settings_update(is_admin, &request)?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
+        .await?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true).await?;
+    validate_guild_settings_update(&request)?;
 
     let whisper_language_explicit = request.whisper_language.is_some();
     state
@@ -8091,7 +8398,7 @@ async fn api_update_guild_settings(
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -8102,7 +8409,14 @@ async fn api_target_guild_rbac(
 ) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await?;
     let guild = get_guild_info(&state, &target_auth).await?;
     let grants = load_guild_rbac_role_grants(&state, &target_auth.guild_id).await?;
 
@@ -8118,7 +8432,8 @@ async fn api_guild_rbac(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
+        .await?;
     let guild = get_guild_info(&state, auth).await?;
     let grants = load_guild_rbac_role_grants(&state, &auth.guild_id).await?;
 
@@ -8139,7 +8454,14 @@ async fn api_update_target_guild_rbac_role(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await?;
     update_guild_rbac_role_grant(
         &state,
         &target_auth,
@@ -8162,7 +8484,8 @@ async fn api_update_guild_rbac_role(
 ) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
+        .await?;
     update_guild_rbac_role_grant(
         &state,
         auth,
@@ -8239,7 +8562,14 @@ async fn api_reset_target_guild_rbac_role(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await?;
     reset_guild_rbac_role_grant(
         &state,
         &target_auth,
@@ -8260,7 +8590,8 @@ async fn api_reset_guild_rbac_role(
 ) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
+        .await?;
     reset_guild_rbac_role_grant(
         &state,
         auth,
@@ -8327,7 +8658,12 @@ async fn api_list_domain_knowledge(
     Query(query): Query<DomainKnowledgeListQuery>,
 ) -> Result<Json<Vec<DomainKnowledgeItemResponse>>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let (include_archived, content_type_filter) = normalize_domain_knowledge_list_filter(&query)?;
     let include_archived_text = include_archived.to_string();
     let rows = state
@@ -8352,7 +8688,12 @@ async fn api_get_domain_knowledge(
 ) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
     validate_domain_knowledge_item_id(&item_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let row = state
         .db
         .query_opt(GET_DOMAIN_KNOWLEDGE_SQL, &[&auth.guild_id, &item_id])
@@ -8370,7 +8711,12 @@ async fn api_create_domain_knowledge(
 ) -> Result<(StatusCode, Json<DomainKnowledgeItemResponse>), StatusCode> {
     let normalized = normalize_domain_knowledge_request(&request)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let id = Uuid::new_v4().to_string();
     let content_type = normalized.content_type.as_str().to_owned();
     let active = normalized.active.unwrap_or(true).to_string();
@@ -8422,7 +8768,12 @@ async fn api_update_domain_knowledge(
     validate_domain_knowledge_item_id(&item_id)?;
     let normalized = normalize_domain_knowledge_request(&request)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let content_type = normalized.content_type.as_str().to_owned();
     let active = normalized
         .active
@@ -8478,7 +8829,12 @@ async fn api_activate_domain_knowledge(
 ) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
     validate_domain_knowledge_item_id(&item_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -8521,7 +8877,12 @@ async fn api_archive_domain_knowledge(
 ) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
     validate_domain_knowledge_item_id(&item_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -8562,7 +8923,12 @@ async fn api_list_ai_memory(
     Query(query): Query<AiMemoryListQuery>,
 ) -> Result<Json<Vec<AiMemoryNoteResponse>>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let source_type = query
         .source_type
@@ -8602,7 +8968,12 @@ async fn api_create_ai_memory(
     Json(request): Json<AiMemoryUpsertRequest>,
 ) -> Result<(StatusCode, Json<AiMemoryNoteResponse>), StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let normalized = normalize_ai_memory_request(&request, AiMemorySourceType::Manual)?;
     let id = Uuid::new_v4().to_string();
@@ -8695,7 +9066,12 @@ async fn api_update_ai_memory_inner(
 ) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
     validate_resource_id(&memory_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let normalized = normalize_ai_memory_request(&request, AiMemorySourceType::Manual)?;
     let tags = ai_memory_tag_strings(&normalized.tags);
@@ -8757,7 +9133,12 @@ async fn update_ai_memory_pin(
 ) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
     validate_resource_id(&memory_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let pinned_text = pinned.to_string();
     let row = state
@@ -8828,7 +9209,12 @@ async fn api_archive_ai_memory(
 ) -> Result<Json<AiMemoryNoteResponse>, StatusCode> {
     validate_resource_id(&memory_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let row = state
         .db
@@ -8869,7 +9255,12 @@ async fn api_promote_ai_memory_to_domain_knowledge(
 ) -> Result<(StatusCode, Json<DomainKnowledgeItemResponse>), StatusCode> {
     validate_resource_id(&memory_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let content_type = parse_domain_knowledge_content_type(&request.content_type)?;
     let memory_row = state
@@ -9021,7 +9412,12 @@ async fn api_list_feedback(
     Query(query): Query<FeedbackListQuery>,
 ) -> Result<Json<Vec<TranscriptFeedbackResponse>>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let status = query
         .status
@@ -9066,7 +9462,12 @@ async fn api_update_feedback_status(
 ) -> Result<Json<TranscriptFeedbackResponse>, StatusCode> {
     validate_resource_id(&feedback_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let normalized = normalize_feedback_status_request(&request)?;
     let status = normalized.status.as_str().to_owned();
@@ -9122,7 +9523,12 @@ async fn api_list_person_aliases(
     Query(query): Query<PersonAliasListQuery>,
 ) -> Result<Json<Vec<PersonAliasResponse>>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let include_archived = query.include_archived.unwrap_or(false).to_string();
     let review_status = query
@@ -9160,7 +9566,12 @@ async fn api_create_person_alias(
     Json(request): Json<PersonAliasUpsertRequest>,
 ) -> Result<(StatusCode, Json<PersonAliasResponse>), StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let normalized = normalize_person_alias_request(&request, PersonAliasSourceType::Manual)?;
     let id = Uuid::new_v4().to_string();
@@ -9253,7 +9664,12 @@ async fn api_update_person_alias_inner(
 ) -> Result<Json<PersonAliasResponse>, StatusCode> {
     validate_resource_id(&alias_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let normalized = normalize_person_alias_request(&request, PersonAliasSourceType::Manual)?;
     let discord_user_id = normalized.discord_user_id.unwrap_or_default();
@@ -9314,7 +9730,12 @@ async fn api_archive_person_alias(
 ) -> Result<Json<PersonAliasResponse>, StatusCode> {
     validate_resource_id(&alias_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::DomainKnowledgeManage,
+    )
+    .await?;
     let tenant = require_single_active_tenant_guild(&state, &auth.guild_id).await?;
     let row = state
         .db
@@ -9352,7 +9773,12 @@ async fn api_list_summary_templates(
     Query(query): Query<SummaryTemplateListQuery>,
 ) -> Result<Json<Vec<SummaryTemplateResponse>>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+    )
+    .await?;
     let include_archived = query.include_archived.unwrap_or(false).to_string();
     let rows = state
         .db
@@ -9376,7 +9802,12 @@ async fn api_get_summary_template(
 ) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
     validate_summary_template_id(&template_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+    )
+    .await?;
     let row = state
         .db
         .query_opt(GET_SUMMARY_TEMPLATE_SQL, &[&auth.guild_id, &template_id])
@@ -9393,8 +9824,13 @@ async fn api_create_summary_template(
     Json(request): Json<SummaryTemplateUpsertRequest>,
 ) -> Result<(StatusCode, Json<SummaryTemplateResponse>), StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
-    let normalized = validate_authorized_summary_template_request(is_admin, &request)?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+    )
+    .await?;
+    let normalized = normalize_summary_template_request(&request)?;
     let id = Uuid::new_v4().to_string();
     let active = normalized.active.unwrap_or(true).to_string();
     let row = state
@@ -9443,8 +9879,13 @@ async fn api_update_summary_template(
 ) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
     validate_summary_template_id(&template_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let is_admin = current_user_is_guild_admin(&state, &user_id).await?;
-    let normalized = validate_authorized_summary_template_request(is_admin, &request)?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+    )
+    .await?;
+    let normalized = normalize_summary_template_request(&request)?;
     let active = normalized
         .active
         .map(|active| active.to_string())
@@ -9498,7 +9939,12 @@ async fn api_activate_summary_template(
 ) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
     validate_summary_template_id(&template_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -9541,7 +9987,12 @@ async fn api_archive_summary_template(
 ) -> Result<Json<SummaryTemplateResponse>, StatusCode> {
     validate_summary_template_id(&template_id)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_is_guild_admin(&state, &user_id).await?;
+    require_current_user_has_rbac_permission(
+        &state,
+        &user_id,
+        RbacPermission::SummaryTemplateManage,
+    )
+    .await?;
     let row = state
         .db
         .query_opt(
@@ -9588,7 +10039,16 @@ async fn api_update_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await
+    .map_err(|status| status.into_response())?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
     let token = validate_authorized_guild_bot_token_update(true, &request).map_err(|status| {
@@ -9676,7 +10136,7 @@ async fn api_update_target_guild_bot_token(
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -9691,7 +10151,16 @@ async fn api_delete_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+    let target_auth = require_user_has_target_guild_rbac_permission(
+        &state,
+        auth,
+        &user_id,
+        &guild_id,
+        RbacPermission::SettingsManage,
+    )
+    .await
+    .map_err(|status| status.into_response())?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
 
@@ -9702,7 +10171,7 @@ async fn api_delete_target_guild_bot_token(
         return Ok(Json(guild_settings_response(
             &state.guild_settings_defaults,
             current,
-            true,
+            capabilities,
         )));
     }
 
@@ -9747,7 +10216,7 @@ async fn api_delete_target_guild_bot_token(
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -9768,16 +10237,27 @@ async fn api_update_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    if !check_guild_admin_permission_for_settings(&state, auth, &user_id)
-        .await
-        .map_err(|status| status.into_response())?
-    {
+    let can_manage_settings = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::SettingsManage,
+        false,
+        false,
+    )
+    .await
+    .map_err(|status| status.into_response())?;
+    if !can_manage_settings {
         return Err(api_error_response(
             StatusCode::FORBIDDEN,
             "forbidden",
-            "Guild administrator permission is required.",
+            "Settings management permission is required.",
         ));
     }
+    let capabilities =
+        guild_settings_capabilities_for_auth(&state, auth, &user_id, can_manage_settings)
+            .await
+            .map_err(|status| status.into_response())?;
 
     let cipher = state.guild_bot_token_cipher.as_ref().ok_or_else(|| {
         api_error_response(
@@ -9852,7 +10332,7 @@ async fn api_update_guild_bot_token(
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -9865,16 +10345,27 @@ async fn api_delete_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    if !check_guild_admin_permission_for_settings(&state, auth, &user_id)
-        .await
-        .map_err(|status| status.into_response())?
-    {
+    let can_manage_settings = current_user_has_rbac_permission_for_auth(
+        &state,
+        auth,
+        &user_id,
+        RbacPermission::SettingsManage,
+        false,
+        false,
+    )
+    .await
+    .map_err(|status| status.into_response())?;
+    if !can_manage_settings {
         return Err(api_error_response(
             StatusCode::FORBIDDEN,
             "forbidden",
-            "Guild administrator permission is required.",
+            "Settings management permission is required.",
         ));
     }
+    let capabilities =
+        guild_settings_capabilities_for_auth(&state, auth, &user_id, can_manage_settings)
+            .await
+            .map_err(|status| status.into_response())?;
 
     let current = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -9883,7 +10374,7 @@ async fn api_delete_guild_bot_token(
         return Ok(Json(guild_settings_response(
             &state.guild_settings_defaults,
             current,
-            true,
+            capabilities,
         )));
     }
 
@@ -9924,7 +10415,7 @@ async fn api_delete_guild_bot_token(
     Ok(Json(guild_settings_response(
         &state.guild_settings_defaults,
         stored,
-        true,
+        capabilities,
     )))
 }
 
@@ -11752,9 +12243,9 @@ mod guild_api_tests {
         DiscordBotTokenValidationError, DiscordBotTokenValidationStage, DiscordGuild,
         DiscordGuildFull, DiscordRoleFull, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
         GUILD_CACHE_REFRESH_INFLIGHT_SECS, GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache,
-        GuildCacheState, GuildMeetingsQuery, GuildRbacRoleGrantResponse, GuildSettingsDefaults,
-        GuildSettingsUpdateRequest, JobCancelRequest, JobListQuery, JobRetryRequest,
-        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
+        GuildCacheState, GuildMeetingsQuery, GuildRbacRoleGrantResponse, GuildSettingsCapabilities,
+        GuildSettingsDefaults, GuildSettingsUpdateRequest, JobCancelRequest, JobListQuery,
+        JobRetryRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
         StoredGuildSettings, SummaryTemplateUpsertRequest, TranscriptFeedbackRequest,
         TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
         authorize_system_admin_request, bot_auth_header_from_cache_with_resolver,
@@ -12031,7 +12522,16 @@ mod guild_api_tests {
 
     #[test]
     fn guild_settings_response_falls_back_to_defaults() {
-        let response = guild_settings_response(&default_settings(), None, false);
+        let response = guild_settings_response(
+            &default_settings(),
+            None,
+            GuildSettingsCapabilities {
+                is_admin: false,
+                can_manage_settings: true,
+                can_manage_domain_knowledge: false,
+                can_manage_summary_templates: false,
+            },
+        );
 
         assert_eq!(response.whisper_language.as_deref(), Some("ja"));
         assert!(!response.whisper_language_explicit);
@@ -12046,6 +12546,9 @@ mod guild_api_tests {
         assert_eq!(response.discord_bot_user_id, None);
         assert_eq!(response.discord_bot_username, None);
         assert!(!response.is_admin);
+        assert!(response.can_manage_settings);
+        assert!(!response.can_manage_domain_knowledge);
+        assert!(!response.can_manage_summary_templates);
     }
 
     #[test]
@@ -12053,7 +12556,12 @@ mod guild_api_tests {
         let response = guild_settings_response(
             &default_settings(),
             Some(stored_settings_with_token(true)),
-            true,
+            GuildSettingsCapabilities {
+                is_admin: true,
+                can_manage_settings: true,
+                can_manage_domain_knowledge: true,
+                can_manage_summary_templates: true,
+            },
         );
 
         assert_eq!(response.whisper_language.as_deref(), Some("fr"));
@@ -12075,6 +12583,9 @@ mod guild_api_tests {
         assert_eq!(response.discord_bot_user_id.as_deref(), Some("bot-1"));
         assert_eq!(response.discord_bot_username.as_deref(), Some("GuildBot"));
         assert!(response.is_admin);
+        assert!(response.can_manage_settings);
+        assert!(response.can_manage_domain_knowledge);
+        assert!(response.can_manage_summary_templates);
     }
 
     #[test]
@@ -12553,6 +13064,12 @@ mod guild_api_tests {
     #[test]
     fn admin_mutation_handlers_authorize_before_body_shape_validation() {
         let source = include_str!("web.rs");
+        fn marker_index(section: &str, marker: &str) -> usize {
+            section.find(marker).unwrap_or_else(|| {
+                panic!("handler section should contain authorization marker {marker}")
+            })
+        }
+
         let promote = source
             .split_once("async fn api_promote_ai_memory_to_domain_knowledge")
             .expect("promote handler should exist")
@@ -12561,8 +13078,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            promote.find("require_current_user_is_guild_admin")
-                < promote.find("parse_domain_knowledge_content_type")
+            marker_index(promote, "require_current_user_has_rbac_permission")
+                < marker_index(promote, "parse_domain_knowledge_content_type")
         );
 
         let feedback_status = source
@@ -12573,8 +13090,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            feedback_status.find("require_current_user_is_guild_admin")
-                < feedback_status.find("normalize_feedback_status_request")
+            marker_index(feedback_status, "require_current_user_has_rbac_permission")
+                < marker_index(feedback_status, "normalize_feedback_status_request")
         );
 
         let retry = source
@@ -12585,8 +13102,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            retry.find("require_current_user_is_guild_admin")
-                < retry.find("parse_job_retry_request_body")
+            marker_index(retry, "require_current_user_has_rbac_permission")
+                < marker_index(retry, "parse_job_retry_request_body")
         );
 
         let cancel = source
@@ -12597,8 +13114,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            cancel.find("require_current_user_is_guild_admin")
-                < cancel.find("parse_job_cancel_request_body")
+            marker_index(cancel, "require_current_user_has_rbac_permission")
+                < marker_index(cancel, "parse_job_cancel_request_body")
         );
 
         let rbac_update = source
@@ -12609,14 +13126,17 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            rbac_update.find("validate_rbac_role_exists")
-                < rbac_update.find("parse_json_request_body")
+            marker_index(rbac_update, "validate_rbac_role_exists")
+                < marker_index(rbac_update, "parse_json_request_body")
         );
         assert!(
-            rbac_update.find("fetch_fresh_guild_info")
-                < rbac_update.find("validate_rbac_role_exists")
+            marker_index(rbac_update, "fetch_fresh_guild_info")
+                < marker_index(rbac_update, "validate_rbac_role_exists")
         );
-        assert!(rbac_update.find("require_audit_event") < rbac_update.find(".query_one"));
+        assert!(
+            marker_index(rbac_update, "require_audit_event")
+                < marker_index(rbac_update, ".query_one")
+        );
 
         let rbac_reset = source
             .split_once("async fn reset_guild_rbac_role_grant")
@@ -12626,10 +13146,13 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            rbac_reset.find("fetch_fresh_guild_info")
-                < rbac_reset.find("validate_rbac_role_exists")
+            marker_index(rbac_reset, "fetch_fresh_guild_info")
+                < marker_index(rbac_reset, "validate_rbac_role_exists")
         );
-        assert!(rbac_reset.find("require_audit_event") < rbac_reset.find(".query_one"));
+        assert!(
+            marker_index(rbac_reset, "require_audit_event")
+                < marker_index(rbac_reset, ".query_one")
+        );
 
         let create_plan = source
             .split_once("async fn api_admin_create_plan")
@@ -12639,8 +13162,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            create_plan.find("require_system_admin_request")
-                < create_plan.find("parse_json_request_body")
+            marker_index(create_plan, "require_system_admin_request")
+                < marker_index(create_plan, "parse_json_request_body")
         );
 
         let create_quota = source
@@ -12651,8 +13174,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            create_quota.find("require_system_admin_request")
-                < create_quota.find("parse_json_request_body")
+            marker_index(create_quota, "require_system_admin_request")
+                < marker_index(create_quota, "parse_json_request_body")
         );
 
         let create_assignment = source
@@ -12663,8 +13186,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            create_assignment.find("require_system_admin_request")
-                < create_assignment.find("parse_json_request_body")
+            marker_index(create_assignment, "require_system_admin_request")
+                < marker_index(create_assignment, "parse_json_request_body")
         );
 
         let list_assignments = source
@@ -12675,8 +13198,11 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            list_assignments.find("require_system_admin_request")
-                < list_assignments.find("parse_admin_guild_plan_assignment_list_query")
+            marker_index(list_assignments, "require_system_admin_request")
+                < marker_index(
+                    list_assignments,
+                    "parse_admin_guild_plan_assignment_list_query"
+                )
         );
 
         let cleanup_preview = source
@@ -12687,8 +13213,8 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            cleanup_preview.find("require_system_admin_request")
-                < cleanup_preview.find("parse_optional_json_request_body")
+            marker_index(cleanup_preview, "require_system_admin_request")
+                < marker_index(cleanup_preview, "parse_optional_json_request_body")
         );
 
         let cleanup_run = source
@@ -12698,7 +13224,10 @@ mod guild_api_tests {
             .split_once("async fn api_admin_retention_meeting_delete_preview")
             .expect("next handler should exist")
             .0;
-        assert!(cleanup_run.find("require_audit_event") < cleanup_run.find("spawn_blocking"));
+        assert!(
+            marker_index(cleanup_run, "require_audit_event")
+                < marker_index(cleanup_run, "spawn_blocking")
+        );
 
         let meeting_delete = source
             .split_once("async fn api_admin_retention_meeting_delete(")
@@ -12708,12 +13237,12 @@ mod guild_api_tests {
             .expect("next handler should exist")
             .0;
         assert!(
-            meeting_delete.find("require_system_admin_request")
-                < meeting_delete.find("parse_json_request_body")
+            marker_index(meeting_delete, "require_system_admin_request")
+                < marker_index(meeting_delete, "parse_json_request_body")
         );
         assert!(
-            meeting_delete.find("require_audit_event")
-                < meeting_delete.find("apply_manual_meeting_filesystem_delete")
+            marker_index(meeting_delete, "require_audit_event")
+                < marker_index(meeting_delete, "apply_manual_meeting_filesystem_delete")
         );
     }
 

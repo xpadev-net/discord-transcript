@@ -70,6 +70,9 @@ function settingsResponse() {
     discord_bot_user_id: null,
     discord_bot_username: null,
     is_admin: true,
+    can_manage_settings: true,
+    can_manage_domain_knowledge: true,
+    can_manage_summary_templates: true,
   };
 }
 
@@ -690,6 +693,46 @@ describe("App access controls", () => {
     expect(calledUrls).toContain("/api/guild/jobs?limit=100");
   });
 
+  it("does not require settings access for usage-only users", async () => {
+    const calledUrls: string[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      calledUrls.push(url);
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "usage-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_view_usage: true,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(emptyResponse(403));
+      }
+      if (url === "/api/guild/meetings?page=1&limit=100") {
+        return Promise.resolve(
+          jsonResponse(meetingsResponse("guild-1", [meetingItem()])),
+        );
+      }
+      if (url === "/api/guild/jobs?limit=100") {
+        return Promise.resolve(jsonResponse([guildJob()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/usage", fetchMock);
+
+    await screen.findByRole("heading", { name: "Usage" });
+    expect(calledUrls).toContain("/api/guild/jobs?limit=100");
+    expect(calledUrls).not.toContain("/api/guild/settings");
+  });
+
   it("shows failed jobs with read-only status filters", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
@@ -1125,6 +1168,54 @@ describe("App access controls", () => {
       ),
     );
     expect(fetchMock).toHaveBeenCalledWith(
+      "/api/guild/summary-templates?include_archived=true",
+      expect.anything(),
+    );
+  });
+
+  it("hides customization panels for settings-only RBAC users", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "settings-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: true,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: false,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            is_admin: false,
+            can_manage_settings: true,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: false,
+          }),
+        );
+      }
+      if (url === "/api/guild/rbac") {
+        return Promise.resolve(jsonResponse(rbacResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    expect(
+      await screen.findByRole("button", { name: saveButtonName }),
+    ).toBeTruthy();
+    expect(screen.queryByText("AI カスタマイズ")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/domain-knowledge?include_archived=true",
+      expect.anything(),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/guild/summary-templates?include_archived=true",
       expect.anything(),
     );
@@ -1831,7 +1922,9 @@ describe("App access controls", () => {
 
     expect(selector.value).toBe("guild-2");
     expect(window.localStorage.getItem("dt.selectedGuildId")).toBe("guild-2");
-    expect(screen.queryByRole("link", { name: settingsLinkName })).toBeNull();
+    expect(
+      screen.getByRole("link", { name: settingsLinkName }).getAttribute("href"),
+    ).toBe("/guilds/guild-2/settings");
   });
 
   it("loads dashboard meetings for the stored selected guild", async () => {
@@ -2229,6 +2322,53 @@ describe("App access controls", () => {
     );
   });
 
+  it("opens target-guild settings when RBAC allows a non-admin member", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse()));
+      }
+      if (url === "/api/guilds/guild-2/settings") {
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            is_admin: false,
+            can_manage_settings: true,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: false,
+          }),
+        );
+      }
+      if (url === "/api/guilds/guild-2/rbac") {
+        return Promise.resolve(jsonResponse(rbacResponse()));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/guilds/guild-2/settings", fetchMock);
+
+    expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
+    expect(
+      await screen.findByRole("button", { name: saveButtonName }),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/guilds/guild-2/settings",
+        expect.anything(),
+      ),
+    );
+  });
+
   it("saves guild-targeted settings to the route guild", async () => {
     let savedUrl: string | null = null;
     let savedRequest: unknown = null;
@@ -2462,7 +2602,7 @@ describe("App access controls", () => {
     await waitFor(() => expect(savedUrl).toBe("/api/guilds/guild-2/settings"));
   });
 
-  it("blocks a guild-targeted settings route for non-admin selected guilds", async () => {
+  it("lets target-guild settings authorization come from the API", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
       if (url === "/api/me") {
@@ -2477,13 +2617,16 @@ describe("App access controls", () => {
       if (url === "/api/me/guilds") {
         return Promise.resolve(jsonResponse(guildsResponse()));
       }
+      if (url === "/api/guilds/guild-2/settings") {
+        return Promise.resolve(emptyResponse(403));
+      }
       return Promise.resolve(emptyResponse(404));
     });
 
     renderApp("/guilds/guild-2/settings", fetchMock);
 
     expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
-    expect(fetchMock).not.toHaveBeenCalledWith(
+    expect(fetchMock).toHaveBeenCalledWith(
       "/api/guilds/guild-2/settings",
       expect.anything(),
     );

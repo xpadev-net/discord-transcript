@@ -214,6 +214,21 @@ WHERE permissions.guild_id = $1
 ORDER BY permissions.discord_role_id, permissions.permission_name
 "#;
 
+pub const LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL: &str = r#"
+SELECT
+    permissions.guild_id,
+    permissions.discord_role_id,
+    permissions.permission_name
+FROM guild_rbac_permissions permissions
+JOIN guild_rbac_role_bindings bindings
+  ON bindings.guild_id = permissions.guild_id
+ AND bindings.discord_role_id = permissions.discord_role_id
+WHERE permissions.guild_id = $1
+  AND permissions.discord_role_id = ANY(string_to_array($2, ','))
+  AND bindings.active = TRUE
+ORDER BY permissions.discord_role_id, permissions.permission_name
+"#;
+
 pub const LIST_GUILD_RBAC_ROLE_GRANTS_SQL: &str = r#"
 SELECT
     bindings.guild_id,
