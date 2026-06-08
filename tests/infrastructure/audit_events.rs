@@ -44,6 +44,7 @@ fn audit_insert_sql_prunes_old_rows_and_dedupes_debug_downloads() {
     assert!(PRUNE_STALE_AUDIT_EVENTS_SQL.contains("stale_audit_events"));
     assert!(!PRUNE_STALE_AUDIT_EVENTS_SQL.contains("random()"));
     assert!(PRUNE_STALE_AUDIT_EVENTS_SQL.contains("INTERVAL '180 days'"));
+    assert!(!PRUNE_STALE_AUDIT_EVENTS_SQL.contains("ORDER BY"));
     assert!(PRUNE_STALE_AUDIT_EVENTS_SQL.contains("LIMIT 500"));
 }
 

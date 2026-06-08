@@ -14859,11 +14859,12 @@ mod guild_api_tests {
 #[cfg(test)]
 mod discord_channel_full_tests {
     use super::{
-        CachedChannelPermission, DiscordChannelFull, DiscordOverwrite, DiscordOverwriteType,
-        DiscordRoleFull, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS,
-        PermissionCache, VIEW_CHANNEL, authorize_debug_artifact_download,
-        build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
-        debug_download_dedupe_bucket, debug_download_usage_event_id, existing_debug_path,
+        AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS, CachedChannelPermission, DiscordChannelFull,
+        DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
+        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS, PermissionCache,
+        VIEW_CHANNEL, authorize_debug_artifact_download, build_content_disposition,
+        compute_channel_permissions, debug_artifact_requires_admin, debug_download_dedupe_bucket,
+        debug_download_usage_event_id, existing_debug_path,
         guild_meeting_channel_visible_after_row, meeting_access_from_row,
         raw_debug_artifact_permission, should_sample_audit_retention_cleanup,
         verify_meeting_access_after_row,
@@ -14877,6 +14878,7 @@ mod discord_channel_full_tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::{Duration, Instant};
+    use uuid::Uuid;
 
     #[test]
     fn channel_full_permission_overwrites_omitted() {
@@ -15290,10 +15292,17 @@ mod discord_channel_full_tests {
 
     #[test]
     fn audit_retention_cleanup_sampling_is_one_percent() {
-        assert!(should_sample_audit_retention_cleanup(0));
-        assert!(should_sample_audit_retention_cleanup(100));
-        assert!(!should_sample_audit_retention_cleanup(1));
-        assert!(!should_sample_audit_retention_cleanup(99));
+        let reachable_multiple = Uuid::parse_str("00000000-0000-4000-8000-000000000030")
+            .expect("uuid-shaped sample")
+            .as_u128();
+
+        assert!(should_sample_audit_retention_cleanup(reachable_multiple));
+        assert!(should_sample_audit_retention_cleanup(
+            reachable_multiple + AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS
+        ));
+        assert!(!should_sample_audit_retention_cleanup(
+            reachable_multiple + 1
+        ));
     }
 
     #[tokio::test]

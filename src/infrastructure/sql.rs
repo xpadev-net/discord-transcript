@@ -1596,7 +1596,6 @@ WITH stale_audit_events AS (
     SELECT events.ctid
     FROM audit_events events
     WHERE events.occurred_at < NOW() - INTERVAL '180 days'
-    ORDER BY events.occurred_at ASC
     LIMIT 500
 )
 DELETE FROM audit_events events
