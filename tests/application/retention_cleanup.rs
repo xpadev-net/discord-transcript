@@ -8,6 +8,9 @@ use discord_transcript::application::retention_cleanup::{
     enforce_retention_policy, estimate_meeting_filesystem_usage, estimate_target_filesystem_usage,
 };
 use discord_transcript::domain::retention::RetentionPolicy;
+use discord_transcript::infrastructure::sql::{
+    ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+};
 use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::num::NonZeroU32;
@@ -249,6 +252,41 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
 }
 
 #[test]
+fn retention_workspace_queries_remain_visible_after_db_tombstones_or_deletes() {
+    for sql in [
+        RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+        ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+    ] {
+        let expired_block = sql
+            .split_once("FROM transcripts expired_t")
+            .expect("expired transcript block should exist")
+            .1
+            .split_once("OR (m.stopped_at IS NOT NULL")
+            .expect("stopped-at retry fallback should exist")
+            .0;
+        assert!(
+            !expired_block.contains("expired_t.is_deleted = FALSE"),
+            "deleted transcript rows must not hide retryable workspace cleanup"
+        );
+    }
+
+    for sql in [
+        RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+        ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+    ] {
+        assert!(
+            sql.contains("OR EXISTS (\n    SELECT 1\n    FROM summaries expired_s")
+                || sql.contains("OR EXISTS (\n      SELECT 1\n      FROM summaries expired_s"),
+            "summary workspace cleanup must still find stopped old meetings after summary rows are deleted"
+        );
+        assert!(
+            sql.contains("m.stopped_at IS NOT NULL"),
+            "summary workspace cleanup needs a stopped-at fallback for deleted/no-row summaries"
+        );
+    }
+}
+
+#[test]
 fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
     let (_guard, layout) = temp_layout("fs_failure_keeps_db_cleanup");
     let workspace = layout.for_meeting("g1", "vc1", "m1");
@@ -344,6 +382,108 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
             .any(|(sql, params)| sql == RETENTION_DELETE_SUMMARIES_SQL
                 && params == &vec!["90".to_owned()])
     );
+}
+
+#[test]
+fn retention_cleanup_can_rerun_after_transcript_and_summary_filesystem_failure() {
+    let (_guard, layout) = temp_layout("fs_failure_rerun_transcript_summary");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    std::fs::create_dir_all(workspace.root()).expect("create workspace root");
+    std::fs::write(workspace.transcript_dir(), b"not a directory")
+        .expect("write transcript path as file");
+    std::fs::write(workspace.summary_dir(), b"not a directory").expect("write summary path as file");
+
+    let mut first_executor = FakeSqlExecutor::default();
+    first_executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+    first_executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, &["90"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let err = enforce_retention_policy(
+        &mut first_executor,
+        &layout,
+        RetentionPolicy {
+            raw_audio_ttl_days: nonzero(7),
+            transcript_ttl_days: nonzero(30),
+            summary_ttl_days: Some(nonzero(90)),
+        },
+    )
+    .expect_err("filesystem cleanup should fail before paths become removable");
+
+    assert!(err.message.contains("failed to remove"));
+    assert_eq!(err.report.transcript_dirs_removed, 0);
+    assert_eq!(err.report.summary_dirs_removed, 0);
+    assert!(
+        first_executor
+            .executed
+            .iter()
+            .any(|(sql, params)| sql == RETENTION_MARK_TRANSCRIPTS_DELETED_SQL
+                && params == &vec!["30".to_owned()]),
+        "database tombstone should still run after filesystem failure"
+    );
+    assert!(
+        first_executor
+            .executed
+            .iter()
+            .any(|(sql, params)| sql == RETENTION_DELETE_SUMMARIES_SQL
+                && params == &vec!["90".to_owned()]),
+        "summary row delete should still run after filesystem failure"
+    );
+
+    std::fs::remove_file(workspace.transcript_dir()).expect("remove obstructing transcript file");
+    std::fs::create_dir_all(workspace.transcript_dir()).expect("create transcript dir");
+    std::fs::write(workspace.transcript_dir().join("transcript.md"), b"transcript")
+        .expect("write remaining transcript");
+    std::fs::remove_file(workspace.summary_dir()).expect("remove obstructing summary file");
+    std::fs::create_dir_all(workspace.summary_dir()).expect("create summary dir");
+    std::fs::write(workspace.summary_dir().join("summary.md"), b"summary")
+        .expect("write remaining summary");
+
+    let mut retry_executor = FakeSqlExecutor::default();
+    retry_executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, &["30"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+    retry_executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, &["90"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let retry_report = enforce_retention_policy(
+        &mut retry_executor,
+        &layout,
+        RetentionPolicy {
+            raw_audio_ttl_days: nonzero(7),
+            transcript_ttl_days: nonzero(30),
+            summary_ttl_days: Some(nonzero(90)),
+        },
+    )
+    .expect("retry should remove the remaining workspace files");
+
+    assert_eq!(retry_report.transcript_dirs_removed, 1);
+    assert_eq!(retry_report.summary_dirs_removed, 1);
+    assert!(!workspace.transcript_dir().exists());
+    assert!(!workspace.summary_dir().exists());
 }
 
 #[test]
