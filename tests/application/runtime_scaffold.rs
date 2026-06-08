@@ -54,17 +54,21 @@ impl JobQueue for FailingEnqueueQueue {
         Ok(None)
     }
 
-    fn mark_done(&mut self, _job_id: &str) -> Result<(), QueueError> {
+    fn heartbeat(&mut self, _job: &Job) -> Result<(), QueueError> {
         Ok(())
     }
 
-    fn mark_failed(&mut self, _job_id: &str, _error_message: String) -> Result<(), QueueError> {
+    fn mark_done(&mut self, _job: &Job) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    fn mark_failed(&mut self, _job: &Job, _error_message: String) -> Result<(), QueueError> {
         Ok(())
     }
 
     fn retry(
         &mut self,
-        _job_id: &str,
+        _job: &Job,
         _error_message: String,
         _max_retries: u32,
     ) -> Result<JobStatus, QueueError> {

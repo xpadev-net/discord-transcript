@@ -10,7 +10,8 @@ use discord_transcript::infrastructure::asr::{
 };
 use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
 use discord_transcript::infrastructure::sql::{
-    ADMIN_CANCEL_JOB_SQL, ADMIN_RETRY_JOB_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, RETRY_JOB_SQL,
+    ADMIN_CANCEL_JOB_SQL, ADMIN_RETRY_JOB_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
+    RECOVERY_READY_SUMMARY_JOBS_SQL, RETRY_JOB_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, sql_row_from_strings,
@@ -204,7 +205,7 @@ fn in_memory_queue_claim_done_and_retry_flow() {
     assert_eq!(claimed.status, JobStatus::Running);
 
     queue
-        .mark_done(&claimed.id)
+        .mark_done(&claimed)
         .expect("mark done should succeed");
     assert_eq!(queue.get("j1").expect("job exists").status, JobStatus::Done);
 
@@ -215,7 +216,7 @@ fn in_memory_queue_claim_done_and_retry_flow() {
         .expect("job should exist");
     assert_eq!(claimed2.id, "j2");
     let status = queue
-        .retry(&claimed2.id, "failed once".to_owned(), 2)
+        .retry(&claimed2, "failed once".to_owned(), 2)
         .expect("retry should succeed");
     assert_eq!(status, JobStatus::Queued);
     let retried = queue.get(&claimed2.id).expect("retried job should exist");
@@ -243,6 +244,7 @@ fn in_memory_queue_skips_future_next_run_at() {
             status: JobStatus::Queued,
             retry_count: 0,
             error_message: None,
+            claim_token: None,
             next_run_at: Some(Utc::now() + Duration::minutes(5)),
         })
         .expect("enqueue should succeed");
@@ -270,7 +272,7 @@ fn in_memory_queue_failed_and_canceled_jobs_are_terminal_for_claims() {
         .expect("claim should succeed")
         .expect("job should be claimed");
     let failed_status = queue
-        .retry(&failed.id, "still failing".to_owned(), 0)
+        .retry(&failed, "still failing".to_owned(), 0)
         .expect("retry exhaustion should persist");
     assert_eq!(failed_status, JobStatus::Failed);
     assert_eq!(
@@ -293,6 +295,30 @@ fn in_memory_queue_failed_and_canceled_jobs_are_terminal_for_claims() {
             .expect("claim should succeed")
             .is_none(),
         "terminal failed/canceled jobs must not be claimed"
+    );
+}
+
+#[test]
+fn in_memory_queue_rejects_stale_claim_token() {
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j-stale", "m1").expect("enqueue should succeed");
+
+    let mut stale = queue
+        .claim_next(JobType::Summarize)
+        .expect("claim should succeed")
+        .expect("job should be claimed");
+    stale.claim_token = Some("stale-token".to_owned());
+
+    let err = queue
+        .mark_done(&stale)
+        .expect_err("stale claim token must not finish a running job");
+    assert!(matches!(
+        err,
+        discord_transcript::infrastructure::queue::QueueError::InvalidState { .. }
+    ));
+    assert_eq!(
+        queue.get("j-stale").expect("job exists").status,
+        JobStatus::Running
     );
 }
 
@@ -763,7 +789,7 @@ fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() 
 #[test]
 fn sql_job_queue_done_job_rejects_retry() {
     let mut executor = FakeSqlExecutor::default();
-    let claim_key = format!("{}|{}", CLAIM_JOB_SQL, "summarize");
+    let claim_key = format!("{}|*", CLAIM_JOB_SQL);
     executor.query_rows_result.insert(
         claim_key,
         vec![vec![
@@ -773,9 +799,14 @@ fn sql_job_queue_done_job_rejects_retry() {
             Some("running".to_owned()),
             Some("0".to_owned()),
             None,
+            Some("token-1".to_owned()),
+            None,
         ]],
     );
-    let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
+    let retry_key = format!(
+        "{}|{}",
+        RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2\u{1f}token-1"
+    );
     executor.query_rows_result.insert(retry_key, Vec::new());
 
     let mut queue = SqlJobQueue::new(executor);
@@ -789,30 +820,41 @@ fn sql_job_queue_done_job_rejects_retry() {
     assert_eq!(claimed.status, JobStatus::Running);
 
     queue
-        .mark_done(&claimed.id)
+        .mark_done(&claimed)
         .expect("mark done should succeed");
     let err = queue
-        .retry(&claimed.id, "failed once".to_owned(), 2)
+        .retry(&claimed, "failed once".to_owned(), 2)
         .expect_err("done jobs should not be retryable by SQL");
-    assert_eq!(
+    assert!(matches!(
         err,
-        discord_transcript::infrastructure::queue::QueueError::NotFound {
-            job_id: "j1".to_owned()
-        }
-    );
+        discord_transcript::infrastructure::queue::QueueError::InvalidState { .. }
+    ));
 }
 
 #[test]
 fn sql_job_queue_running_job_retry_returns_queued() {
     let mut executor = FakeSqlExecutor::default();
-    let retry_key = format!("{}|{}", RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2");
+    let retry_key = format!(
+        "{}|{}",
+        RETRY_JOB_SQL, "j1\u{1f}failed once\u{1f}2\u{1f}token-1"
+    );
     executor
         .query_rows_result
         .insert(retry_key, vec![sql_row_from_strings(vec!["queued".to_owned()])]);
 
     let mut queue = SqlJobQueue::new(executor);
+    let claimed = discord_transcript::infrastructure::queue::Job {
+        id: "j1".to_owned(),
+        meeting_id: "m1".to_owned(),
+        job_type: JobType::Summarize,
+        status: JobStatus::Running,
+        retry_count: 0,
+        error_message: None,
+        claim_token: Some("token-1".to_owned()),
+        next_run_at: None,
+    };
     let status = queue
-        .retry("j1", "failed once".to_owned(), 2)
+        .retry(&claimed, "failed once".to_owned(), 2)
         .expect("running SQL job should retry");
 
     assert_eq!(status, JobStatus::Queued);
@@ -834,9 +876,35 @@ fn sql_retry_schedules_backoff_and_dead_letters_on_exhaustion() {
     assert!(RETRY_JOB_SQL.contains("make_interval"));
     assert!(RETRY_JOB_SQL.contains("LEAST(900"));
     assert!(RETRY_JOB_SQL.contains("status = 'running'"));
+    assert!(RETRY_JOB_SQL.contains("claim_token = $4"));
     assert!(RETRY_JOB_SQL.contains("dead_lettered_at"));
     assert!(RETRY_JOB_SQL.contains("finished_at"));
     assert!(RETRY_JOB_SQL.contains("leased_until = NULL"));
+}
+
+#[test]
+fn sql_running_job_mutations_require_claim_token() {
+    assert!(CLAIM_JOB_SQL.contains("claim_token = $2"));
+    assert!(CLAIM_JOB_BY_ID_SQL.contains("claim_token = $2"));
+    assert!(discord_transcript::infrastructure::sql::MARK_JOB_DONE_SQL.contains(
+        "claim_token = $2"
+    ));
+    assert!(discord_transcript::infrastructure::sql::MARK_JOB_FAILED_SQL.contains(
+        "claim_token = $3"
+    ));
+    assert!(discord_transcript::infrastructure::sql::HEARTBEAT_RUNNING_JOB_SQL.contains(
+        "claim_token = $2"
+    ));
+}
+
+#[test]
+fn sql_ready_summary_poll_recovers_expired_running_and_due_queued_jobs() {
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("status='running'"));
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("leased_until < NOW()"));
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("claim_token=NULL"));
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("status='queued'"));
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("next_run_at <= NOW()"));
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("LIMIT 25"));
 }
 
 #[test]
