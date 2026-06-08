@@ -51,14 +51,45 @@ CREATE TABLE IF NOT EXISTS guild_rbac_permissions (
                 'usage:view',
                 'admin:view'
             )
-        )
+    )
 );
+
+CREATE OR REPLACE FUNCTION touch_guild_rbac_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_guild_rbac_role_bindings_updated_at'
+    ) THEN
+        CREATE TRIGGER trg_guild_rbac_role_bindings_updated_at
+        BEFORE UPDATE ON guild_rbac_role_bindings
+        FOR EACH ROW
+        EXECUTE FUNCTION touch_guild_rbac_updated_at();
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_guild_rbac_permissions_updated_at'
+    ) THEN
+        CREATE TRIGGER trg_guild_rbac_permissions_updated_at
+        BEFORE UPDATE ON guild_rbac_permissions
+        FOR EACH ROW
+        EXECUTE FUNCTION touch_guild_rbac_updated_at();
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_guild_rbac_role_bindings_guild_active
     ON guild_rbac_role_bindings (guild_id, active, updated_at DESC, discord_role_id);
-
-CREATE INDEX IF NOT EXISTS idx_guild_rbac_permissions_guild_role
-    ON guild_rbac_permissions (guild_id, discord_role_id);
 
 CREATE INDEX IF NOT EXISTS idx_guild_rbac_permissions_guild_permission
     ON guild_rbac_permissions (guild_id, permission_name, discord_role_id);

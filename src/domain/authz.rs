@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,14 @@ impl FromStr for RbacPermission {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbacPermissionParseError;
+
+impl fmt::Display for RbacPermissionParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown RBAC permission")
+    }
+}
+
+impl std::error::Error for RbacPermissionParseError {}
 
 impl From<Action> for RbacPermission {
     fn from(action: Action) -> Self {
@@ -228,33 +237,38 @@ pub fn resolve_rbac_permission(
 }
 
 fn legacy_access_allows(subject: RbacSubject, permission: RbacPermission) -> bool {
-    match permission {
-        RbacPermission::MeetingView => subject.has_channel_view || subject.is_meeting_starter,
-        RbacPermission::MeetingDelete | RbacPermission::RecordingStop => subject.is_meeting_starter,
-        RbacPermission::RecordingStart
-        | RbacPermission::MeetingReprocess
-        | RbacPermission::SettingsManage
-        | RbacPermission::SummaryTemplateManage
-        | RbacPermission::DomainKnowledgeManage
-        | RbacPermission::UsageView
-        | RbacPermission::AdminView => false,
-    }
+    let Some(action) = legacy_action_for_permission(permission) else {
+        return false;
+    };
+    (subject.is_meeting_starter && is_allowed(UserRole::StartedMeeting, action))
+        || (subject.has_channel_view && is_allowed(UserRole::Member, action))
 }
 
 fn legacy_access_source(
     subject: RbacSubject,
     permission: RbacPermission,
 ) -> PermissionDecisionSource {
-    if subject.is_meeting_starter
-        && matches!(
-            permission,
-            RbacPermission::MeetingView
-                | RbacPermission::MeetingDelete
-                | RbacPermission::RecordingStop
-        )
-    {
+    let Some(action) = legacy_action_for_permission(permission) else {
+        return PermissionDecisionSource::LegacyChannelView;
+    };
+    if subject.is_meeting_starter && is_allowed(UserRole::StartedMeeting, action) {
         PermissionDecisionSource::LegacyMeetingStarter
     } else {
         PermissionDecisionSource::LegacyChannelView
+    }
+}
+
+fn legacy_action_for_permission(permission: RbacPermission) -> Option<Action> {
+    match permission {
+        RbacPermission::RecordingStart => Some(Action::StartRecording),
+        RbacPermission::RecordingStop => Some(Action::StopRecording),
+        RbacPermission::MeetingView => Some(Action::View),
+        RbacPermission::MeetingReprocess => Some(Action::Reprocess),
+        RbacPermission::MeetingDelete => Some(Action::Delete),
+        RbacPermission::SettingsManage
+        | RbacPermission::SummaryTemplateManage
+        | RbacPermission::DomainKnowledgeManage
+        | RbacPermission::UsageView
+        | RbacPermission::AdminView => None,
     }
 }

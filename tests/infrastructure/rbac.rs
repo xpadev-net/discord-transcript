@@ -37,7 +37,11 @@ fn incremental_migrations_include_guild_rbac_schema() {
     assert!(schema.contains("CREATE TABLE IF NOT EXISTS guild_rbac_role_bindings"));
     assert!(schema.contains("CREATE TABLE IF NOT EXISTS guild_rbac_permissions"));
     assert!(schema.contains("guild_rbac_permissions_role_binding_fk"));
+    assert!(schema.contains("CREATE OR REPLACE FUNCTION touch_guild_rbac_updated_at()"));
+    assert!(schema.contains("trg_guild_rbac_role_bindings_updated_at"));
+    assert!(schema.contains("trg_guild_rbac_permissions_updated_at"));
     assert!(schema.contains("idx_guild_rbac_permissions_guild_permission"));
+    assert!(!schema.contains("idx_guild_rbac_permissions_guild_role"));
 }
 
 #[test]
