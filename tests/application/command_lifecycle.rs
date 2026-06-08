@@ -78,6 +78,7 @@ fn record_start_rejects_if_active_meeting_exists() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let request = RecordStartRequest {
@@ -158,6 +159,7 @@ fn record_start_preflight_rejects_active_meeting_without_creating_requested_meet
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
     let request = RecordStartRequest {
         meeting_id: "new".to_owned(),
@@ -204,6 +206,7 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let request = RecordStartRequest {
@@ -243,6 +246,7 @@ fn record_stop_is_idempotent_for_same_meeting() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     // First stop via command should succeed
@@ -300,6 +304,7 @@ fn record_stop_rejects_non_starter_member() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let error = record_stop(
@@ -333,6 +338,7 @@ fn record_stop_rejects_started_meeting_role_without_matching_user() {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     });
 
     let error = record_stop(

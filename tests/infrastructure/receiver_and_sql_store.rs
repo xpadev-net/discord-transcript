@@ -131,6 +131,7 @@ fn sql_store_can_read_active_meeting_from_executor_snapshot() {
             error_message: None,
             started_at: None,
             stopped_at: None,
+            duration_seconds: None,
         },
     );
 
@@ -147,7 +148,8 @@ fn sql_store_get_meeting_rejects_unknown_status() {
     let mut executor = FakeSqlExecutor::default();
     let query_sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
-                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at, \
+                        meeting_duration_seconds \
                   FROM meetings WHERE id=$1 LIMIT 1";
     let mut corrupt_status_row = meeting_row_for_title_test(None);
     corrupt_status_row[9] = Some("corrupt".to_owned());
@@ -167,7 +169,8 @@ fn sql_store_get_meeting_rejects_unknown_stop_reason() {
     let mut executor = FakeSqlExecutor::default();
     let query_sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
-                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at, \
+                        meeting_duration_seconds \
                   FROM meetings WHERE id=$1 LIMIT 1";
     let mut row = meeting_row_for_title_test(None);
     row[9] = Some("recording".to_owned());
@@ -435,6 +438,7 @@ fn meeting_row_for_title_test(
         None,
         None,
         None,
+        None,
     ]
 }
 
@@ -442,7 +446,8 @@ fn meeting_row_for_title_test(
 fn sql_store_get_meeting_distinguishes_null_title_from_empty_string() {
     let query_sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, \
                         to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as started_at, \
-                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at \
+                        to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as stopped_at, \
+                        meeting_duration_seconds \
                   FROM meetings WHERE id=$1 LIMIT 1";
 
     let mut executor = FakeSqlExecutor::default();
@@ -456,14 +461,18 @@ fn sql_store_get_meeting_distinguishes_null_title_from_empty_string() {
         .expect("meeting should load")
         .expect("row should exist");
     assert_eq!(null_title.title, None);
+    assert_eq!(null_title.duration_seconds, None);
 
+    let mut empty_title_row = meeting_row_for_title_test(Some(String::new()));
+    empty_title_row[14] = Some("123".to_owned());
     store.executor.query_rows_result.insert(
         format!("{query_sql}|m-empty"),
-        vec![meeting_row_for_title_test(Some(String::new()))],
+        vec![empty_title_row],
     );
     let empty_title = store
         .get_meeting("m-empty")
         .expect("meeting should load")
         .expect("row should exist");
     assert_eq!(empty_title.title.as_deref(), Some(""));
+    assert_eq!(empty_title.duration_seconds, Some(123));
 }

@@ -44,6 +44,7 @@ fn meeting_with_status(id: &str, status: MeetingStatus) -> StoredMeeting {
         error_message: None,
         started_at: None,
         stopped_at: None,
+        duration_seconds: None,
     }
 }
 
