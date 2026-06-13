@@ -607,8 +607,11 @@ where
         MeetingStatus::Summarizing,
         Some(MeetingStatus::Transcribing),
     )?;
-    let context_manifest_result =
-        materialize_or_load_summary_context(&request, &input.summary_context);
+    let context_manifest_result = materialize_or_load_summary_context(
+        &request,
+        &input.summary_context,
+        Some(&transcription.transcript_for_summary),
+    );
     ensure_owned()?;
     let context_manifest = match context_manifest_result {
         Ok(value) => value,
@@ -672,13 +675,13 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
-    persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     if let Err(err) = ensure_untrusted_agent_workspace_supported(claude) {
         error!(meeting_id = %input.meeting_id, error = %err, "summary harness cannot safely process untrusted agent workspace");
         revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
         return Err(WorkerError::from(err));
     }
+    let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
+    persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let agent_workspace_result = materialize_new_summary_agent_workspace(&request);
     ensure_owned()?;
     let agent_workspace = match agent_workspace_result {

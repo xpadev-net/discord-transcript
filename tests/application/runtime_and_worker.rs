@@ -683,6 +683,7 @@ fn ai_memory_extraction_prompt_quotes_completed_summary_as_untrusted_data() {
         stopped_at: None,
         duration_seconds: None,
         generated_at: "2025-01-01T00:00:00Z".to_owned(),
+        context_selection_version: 1,
         manifest_path: "../debug/manifest.json".to_owned(),
         speaker_roster_path: "input/../.cursor/cli.json".to_owned(),
         speaker_count: 1,
@@ -792,6 +793,7 @@ fn ai_memory_extraction_refuses_clients_without_untrusted_agent_workspace_suppor
         stopped_at: None,
         duration_seconds: None,
         generated_at: "2025-01-01T00:00:00Z".to_owned(),
+        context_selection_version: 1,
         manifest_path: "context/manifest.json".to_owned(),
         speaker_roster_path: "context/speaker_roster.md".to_owned(),
         speaker_count: 0,
@@ -931,6 +933,7 @@ fn ai_memory_extraction_materializes_isolated_workspace_and_reads_candidate_outp
         stopped_at: None,
         duration_seconds: None,
         generated_at: "2025-01-01T00:00:00Z".to_owned(),
+        context_selection_version: 1,
         manifest_path: "context/manifest.json".to_owned(),
         speaker_roster_path: "context/speaker_roster.md".to_owned(),
         speaker_count: 1,
@@ -2295,6 +2298,10 @@ fn worker_refuses_summary_client_without_untrusted_agent_workspace_support() {
     assert!(
         !workspace.agent_workspace_parent_dir().exists(),
         "agent workspace must not be materialized for unsupported clients"
+    );
+    assert!(
+        !workspace.summary_prompt_path().exists(),
+        "summary prompt debug artifact must not be written for unsupported clients"
     );
     assert_eq!(
         store.get("m1").map(|meeting| meeting.status),

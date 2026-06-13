@@ -248,6 +248,10 @@ impl MeetingWorkspacePaths {
         self.debug_root.join(DEBUG_DIR)
     }
 
+    pub fn legacy_debug_dir(&self) -> PathBuf {
+        self.root.join(DEBUG_DIR)
+    }
+
     pub fn whisper_debug_dir(&self) -> PathBuf {
         self.debug_dir().join(DEBUG_WHISPER_DIR)
     }

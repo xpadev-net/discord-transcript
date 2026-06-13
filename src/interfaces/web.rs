@@ -67,7 +67,8 @@ use crate::infrastructure::sql::{
     ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, ADMIN_RETENTION_EXPIRED_ARTIFACTS_PREVIEW_SQL,
-    ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+    ADMIN_RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
+    ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
     ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
     ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
     ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
@@ -4152,13 +4153,34 @@ fn normalize_guild_meetings_pagination(query: &GuildMeetingsQuery) -> (u32, u32)
     (page, limit)
 }
 
-fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Option<String> {
-    query
+const DISCORD_SNOWFLAKE_MIN_LEN: usize = 17;
+const DISCORD_SNOWFLAKE_MAX_LEN: usize = 20;
+
+fn is_discord_snowflake_shaped(value: &str) -> bool {
+    (DISCORD_SNOWFLAKE_MIN_LEN..=DISCORD_SNOWFLAKE_MAX_LEN).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
+}
+
+fn normalize_guild_meetings_voice_channel_id(
+    query: &GuildMeetingsQuery,
+) -> Result<Option<String>, StatusCode> {
+    let Some(voice_channel_id) = query
         .voice_channel_id
         .as_deref()
-        .map(str::trim)
+        // Only plain spaces are cosmetic around query filters; other whitespace
+        // remains malformed input and must fail snowflake validation.
+        .map(|voice_channel_id| voice_channel_id.trim_matches(' '))
         .filter(|voice_channel_id| !voice_channel_id.is_empty())
-        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+
+    if !is_discord_snowflake_shaped(voice_channel_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(Some(voice_channel_id.to_owned()))
 }
 
 fn parse_job_list_query(raw_query: Option<&str>) -> Result<JobListQuery, StatusCode> {
@@ -5663,6 +5685,14 @@ fn guild_bot_token_delete_is_noop(stored: Option<&StoredGuildSettings>) -> bool 
 
 async fn current_user_is_guild_admin(state: &WebState, user_id: &str) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    current_user_is_guild_admin_for_auth(state, auth, user_id).await
+}
+
+async fn current_user_is_guild_admin_for_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
     check_guild_admin_permission_for_settings(state, auth, user_id).await
 }
 
@@ -5850,6 +5880,24 @@ async fn require_user_has_target_guild_rbac_permission(
     }
 }
 
+async fn require_user_is_target_guild_admin(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    guild_id: &str,
+) -> Result<AuthConfig, StatusCode> {
+    require_active_target_guild_installation(state, guild_id).await?;
+    let discord_guilds = load_current_user_discord_guilds(state, user_id).await?;
+    if !user_can_access_target_guild(&discord_guilds, guild_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let target_auth = target_auth_config(auth, guild_id);
+    guild_admin_required_result(
+        current_user_is_guild_admin_for_auth(state, &target_auth, user_id).await?,
+    )?;
+    Ok(target_auth)
+}
+
 async fn guild_settings_capabilities_for_auth(
     state: &WebState,
     auth: &AuthConfig,
@@ -5892,6 +5940,7 @@ fn validate_authorized_guild_settings_update(
     validate_guild_settings_update(request)
 }
 
+#[cfg(test)]
 fn validate_authorized_guild_bot_token_update(
     is_admin: bool,
     request: &GuildBotTokenUpdateRequest,
@@ -7461,6 +7510,14 @@ async fn collect_admin_retention_cleanup_plan(
         &mut errors,
     )
     .await;
+    let debug_workspaces = query_admin_retention_workspace_rows(
+        state,
+        ADMIN_RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL,
+        &raw_ttl,
+        guild_id,
+        &mut errors,
+    )
+    .await;
     let transcript_workspaces = query_admin_retention_workspace_rows(
         state,
         ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
@@ -7483,6 +7540,7 @@ async fn collect_admin_retention_cleanup_plan(
     };
     Ok(RetentionCleanupPlan {
         raw_workspaces,
+        debug_workspaces,
         transcript_workspaces,
         summary_workspaces,
         errors,
@@ -7571,7 +7629,9 @@ async fn build_admin_retention_cleanup_preview_with_plan(
         raw_audio: !plan.raw_workspaces.is_empty(),
         transcript: !plan.transcript_workspaces.is_empty(),
         summary: !plan.summary_workspaces.is_empty(),
-        debug: !plan.raw_workspaces.is_empty() || debug_artifact_count > 0,
+        debug: !plan.raw_workspaces.is_empty()
+            || !plan.debug_workspaces.is_empty()
+            || debug_artifact_count > 0,
     };
     let preview = AdminRetentionCleanupPreviewResponse {
         guild_id: guild_id.to_owned(),
@@ -7627,6 +7687,20 @@ fn estimate_plan_filesystem_usage(
                 usage.raw_audio_bytes = usage
                     .raw_audio_bytes
                     .saturating_add(meeting_usage.raw_audio_bytes);
+                usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    meeting_id = %meeting.meeting_id,
+                    "failed to estimate retention cleanup filesystem usage"
+                );
+            }
+        }
+    }
+    for meeting in &plan.debug_workspaces {
+        match estimate_meeting_filesystem_usage(layout, meeting) {
+            Ok(meeting_usage) => {
                 usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
             }
             Err(err) => {
@@ -7992,7 +8066,8 @@ async fn api_guild_meetings(
     Query(query): Query<GuildMeetingsQuery>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    list_guild_meetings_for_auth(&state, &user_id, auth, query).await
+    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query)?;
+    list_guild_meetings_for_auth(&state, &user_id, auth, query, voice_channel_filter).await
 }
 
 async fn api_list_jobs(
@@ -8129,13 +8204,14 @@ async fn api_target_guild_meetings(
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
+    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query)?;
     require_active_target_guild_installation(&state, &guild_id).await?;
     let discord_guilds = load_current_user_discord_guilds(&state, &user_id).await?;
     if !user_can_access_target_guild(&discord_guilds, &guild_id) {
         return Err(StatusCode::FORBIDDEN);
     }
     let target_auth = target_auth_config(auth, &guild_id);
-    list_guild_meetings_for_auth(&state, &user_id, &target_auth, query).await
+    list_guild_meetings_for_auth(&state, &user_id, &target_auth, query, voice_channel_filter).await
 }
 
 async fn list_guild_meetings_for_auth(
@@ -8143,9 +8219,9 @@ async fn list_guild_meetings_for_auth(
     user_id: &str,
     auth: &AuthConfig,
     query: GuildMeetingsQuery,
+    voice_channel_filter: Option<String>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let (page, limit) = normalize_guild_meetings_pagination(&query);
-    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
     let can_view_all_meetings = current_user_has_rbac_permission_for_auth(
@@ -8759,14 +8835,7 @@ async fn api_target_guild_rbac(
 ) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
     let guild = get_guild_info(&state, &target_auth).await?;
     let grants = load_guild_rbac_role_grants(&state, &target_auth.guild_id).await?;
 
@@ -8782,8 +8851,7 @@ async fn api_guild_rbac(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     let guild = get_guild_info(&state, auth).await?;
     let grants = load_guild_rbac_role_grants(&state, &auth.guild_id).await?;
 
@@ -8804,14 +8872,7 @@ async fn api_update_target_guild_rbac_role(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
     update_guild_rbac_role_grant(
         &state,
         &target_auth,
@@ -8834,8 +8895,7 @@ async fn api_update_guild_rbac_role(
 ) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     update_guild_rbac_role_grant(
         &state,
         auth,
@@ -8912,14 +8972,7 @@ async fn api_reset_target_guild_rbac_role(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
     reset_guild_rbac_role_grant(
         &state,
         &target_auth,
@@ -8940,8 +8993,7 @@ async fn api_reset_guild_rbac_role(
 ) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     reset_guild_rbac_role_grant(
         &state,
         auth,
@@ -10389,19 +10441,13 @@ async fn api_update_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
-    let token = validate_authorized_guild_bot_token_update(true, &request).map_err(|status| {
+    let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
             "invalid_bot_token_request",
@@ -10501,15 +10547,9 @@ async fn api_delete_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
@@ -10576,6 +10616,16 @@ async fn api_update_guild_bot_token(
     headers: HeaderMap,
     Json(request): Json<GuildBotTokenUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, Response> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    require_current_user_is_guild_admin(&state, &user_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
+        .await
+        .map_err(|status| status.into_response())?;
     let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
@@ -10583,31 +10633,6 @@ async fn api_update_guild_bot_token(
             "Discord bot token is required.",
         )
     })?;
-    let auth = state
-        .auth
-        .as_ref()
-        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    let can_manage_settings = current_user_has_rbac_permission_for_auth(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::SettingsManage,
-        false,
-        false,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
-    if !can_manage_settings {
-        return Err(api_error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Settings management permission is required.",
-        ));
-    }
-    let capabilities =
-        guild_settings_capabilities_for_auth(&state, auth, &user_id, can_manage_settings)
-            .await
-            .map_err(|status| status.into_response())?;
 
     let cipher = state.guild_bot_token_cipher.as_ref().ok_or_else(|| {
         api_error_response(
@@ -10695,27 +10720,12 @@ async fn api_delete_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    let can_manage_settings = current_user_has_rbac_permission_for_auth(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::SettingsManage,
-        false,
-        false,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
-    if !can_manage_settings {
-        return Err(api_error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Settings management permission is required.",
-        ));
-    }
-    let capabilities =
-        guild_settings_capabilities_for_auth(&state, auth, &user_id, can_manage_settings)
-            .await
-            .map_err(|status| status.into_response())?;
+    require_current_user_is_guild_admin(&state, &user_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
+        .await
+        .map_err(|status| status.into_response())?;
 
     let current = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -12753,7 +12763,7 @@ mod guild_api_tests {
     use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
     use crate::infrastructure::sql::{
         ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
-        ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL,
+        ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARIES_SQL,
         ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
         ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MEETING_DETAIL_SQL,
         ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, COUNT_GUILD_MEETINGS_SQL,
@@ -13321,6 +13331,130 @@ mod guild_api_tests {
     }
 
     #[test]
+    fn sensitive_rbac_and_bot_token_handlers_require_guild_admin() {
+        let source = include_str!("web.rs");
+
+        fn marker_index(section: &str, marker: &str) -> usize {
+            section.find(marker).unwrap_or_else(|| {
+                panic!("handler section should contain authorization marker {marker}")
+            })
+        }
+
+        fn handler_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("handler {start} should exist"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("handler {start} should be followed by {end}"))
+                .0
+        }
+
+        fn assert_sensitive_current_handler(section: &str, operation_marker: &str) {
+            assert!(section.contains("require_current_user_is_guild_admin"));
+            assert!(
+                marker_index(section, "require_current_user_is_guild_admin")
+                    < marker_index(section, operation_marker)
+            );
+            assert!(!section.contains("require_current_user_has_rbac_permission"));
+            assert!(!section.contains("current_user_has_rbac_permission_for_auth"));
+            assert!(!section.contains("RbacPermission::SettingsManage"));
+        }
+
+        fn assert_sensitive_target_handler(section: &str, operation_marker: &str) {
+            assert!(section.contains("require_user_is_target_guild_admin"));
+            assert!(
+                marker_index(section, "require_user_is_target_guild_admin")
+                    < marker_index(section, operation_marker)
+            );
+            assert!(!section.contains("require_user_has_target_guild_rbac_permission"));
+            assert!(!section.contains("current_user_has_rbac_permission_for_auth"));
+            assert!(!section.contains("RbacPermission::SettingsManage"));
+        }
+
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_target_guild_rbac",
+                "async fn api_guild_rbac",
+            ),
+            "get_guild_info",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_guild_rbac",
+                "async fn api_update_target_guild_rbac_role",
+            ),
+            "get_guild_info",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_update_target_guild_rbac_role",
+                "async fn api_update_guild_rbac_role",
+            ),
+            "update_guild_rbac_role_grant",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_update_guild_rbac_role",
+                "async fn update_guild_rbac_role_grant",
+            ),
+            "update_guild_rbac_role_grant",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_reset_target_guild_rbac_role",
+                "async fn api_reset_guild_rbac_role",
+            ),
+            "reset_guild_rbac_role_grant",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_reset_guild_rbac_role",
+                "async fn reset_guild_rbac_role_grant",
+            ),
+            "reset_guild_rbac_role_grant",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_update_target_guild_bot_token",
+                "async fn api_delete_target_guild_bot_token",
+            ),
+            "normalize_guild_bot_token_update",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_delete_target_guild_bot_token",
+                "async fn api_update_guild_bot_token",
+            ),
+            "load_guild_settings",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_update_guild_bot_token",
+                "async fn api_delete_guild_bot_token",
+            ),
+            "normalize_guild_bot_token_update",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_delete_guild_bot_token",
+                "async fn invalidate_discord_caches",
+            ),
+            "load_guild_settings",
+        );
+    }
+
+    #[test]
     fn guild_admin_permission_cache_key_includes_target_guild() {
         assert_ne!(
             guild_admin_permission_cache_key("guild-a", "user-1"),
@@ -13814,7 +13948,6 @@ mod guild_api_tests {
             marker_index(cleanup_preview, "require_system_admin_request")
                 < marker_index(cleanup_preview, "parse_optional_json_request_body")
         );
-
         let cleanup_run = source
             .split_once("async fn api_admin_retention_cleanup_run")
             .expect("retention cleanup run handler should exist")
@@ -13852,6 +13985,18 @@ mod guild_api_tests {
             .0;
         assert!(assignment_audit.contains("-> Result<(), StatusCode>"));
         assert!(assignment_audit.contains("require_audit_event"));
+
+        let cleanup_preview_builder = source
+            .split_once("async fn build_admin_retention_cleanup_preview_with_plan")
+            .expect("retention cleanup preview builder should exist")
+            .1
+            .split_once("async fn query_admin_retention_expired_artifacts")
+            .expect("next helper should exist")
+            .0;
+        assert!(
+            cleanup_preview_builder.contains("!plan.debug_workspaces.is_empty()"),
+            "admin retention preview should report legacy debug workspace rechecks"
+        );
     }
 
     #[test]
@@ -13865,6 +14010,10 @@ mod guild_api_tests {
             ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL
                 .contains("m.status IN ('posted', 'failed', 'aborted')")
         );
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("cleared_summary_titles AS"));
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("UPDATE meetings m"));
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("m.guild_id = $2"));
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("m.stopped_at IS NOT NULL"));
         assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("WHERE id=$1"));
         assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("AND guild_id=$2"));
         assert!(
@@ -13878,6 +14027,8 @@ mod guild_api_tests {
             ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL
                 .contains("m.status IN ('posted', 'failed', 'aborted')")
         );
+        assert!(ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL.contains("cleared_summary_title AS"));
+        assert!(ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL.contains("UPDATE meetings m"));
         assert!(
             ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL
                 .contains("m.status IN ('posted', 'failed', 'aborted')")
@@ -14772,7 +14923,7 @@ mod guild_api_tests {
                 limit: None,
                 voice_channel_id: None,
             }),
-            None
+            Ok(None)
         );
         assert_eq!(
             normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
@@ -14780,15 +14931,61 @@ mod guild_api_tests {
                 limit: None,
                 voice_channel_id: Some("  ".to_owned()),
             }),
-            None
+            Ok(None)
         );
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some("\t".to_owned()),
+            }),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_accepts_snowflake_values() {
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some(" 123456789012345678 ".to_owned()),
+            }),
+            Ok(Some("123456789012345678".to_owned()))
+        );
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_rejects_malformed_values() {
+        for voice_channel_id in [
+            "12345678901234567/1",
+            "\n123456789012345678",
+            "123456789\n01234567",
+            "12345678901234567a",
+            "123456789012345678901",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                    page: None,
+                    limit: None,
+                    voice_channel_id: Some(voice_channel_id.to_owned()),
+                }),
+                Err(StatusCode::BAD_REQUEST),
+                "{voice_channel_id:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_rejects_short_non_snowflake_values() {
         assert_eq!(
             normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
                 page: None,
                 limit: None,
                 voice_channel_id: Some(" vc-2 ".to_owned()),
             }),
-            Some("vc-2".to_owned())
+            Err(StatusCode::BAD_REQUEST)
         );
     }
 
