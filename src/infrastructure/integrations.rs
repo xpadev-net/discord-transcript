@@ -257,11 +257,15 @@ fn sanitize_whisper_endpoint_for_log(endpoint: &str) -> String {
 }
 
 fn is_sensitive_query_name(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    [
+    let normalized = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let compact = normalized.replace('_', "");
+    let exact_sensitive_names = [
         "api_key",
         "apikey",
-        "api-key",
         "access_token",
         "token",
         "secret",
@@ -275,10 +279,36 @@ fn is_sensitive_query_name(name: &str) -> bool {
         "signature",
         "sig",
         "client_secret",
-        "subscription-key",
-    ]
-    .iter()
-    .any(|sensitive| normalized.contains(sensitive))
+        "subscription_key",
+        "key",
+    ];
+    if exact_sensitive_names
+        .iter()
+        .any(|sensitive| normalized == *sensitive || compact == *sensitive)
+    {
+        return true;
+    }
+
+    normalized
+        .split('_')
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            matches!(
+                token,
+                "token"
+                    | "secret"
+                    | "password"
+                    | "passwd"
+                    | "pwd"
+                    | "credential"
+                    | "credentials"
+                    | "authorization"
+                    | "auth"
+                    | "signature"
+                    | "sig"
+                    | "key"
+            )
+        })
 }
 
 fn quote_log_arg(part: &str) -> String {
@@ -1427,7 +1457,7 @@ mod tests {
 
         let client = CommandWhisperClient {
             endpoint:
-                "https://user:password@example.test?api_key=secret&bearer_token=tok-secret&x=1"
+                "https://user:password@example.test?api_key=secret&bearer_token=tok-secret&key=raw-key&x=1"
                     .to_owned(),
             curl_bin: script_path.to_string_lossy().to_string(),
             retry_policy: RetryPolicy {
@@ -1459,21 +1489,23 @@ mod tests {
         assert!(!message.contains("user:password"));
         assert!(!message.contains("api_key=secret"));
         assert!(!message.contains("bearer_token=tok-secret"));
+        assert!(!message.contains("key=raw-key"));
         assert!(message.contains("https://REDACTED:REDACTED@example.test/"));
         assert!(message.contains("api_key=REDACTED"));
         assert!(message.contains("bearer_token=REDACTED"));
+        assert!(message.contains("key=REDACTED"));
         assert!(message.contains("x=1"));
     }
 
     #[test]
     fn whisper_endpoint_redaction_preserves_normal_endpoint_context() {
         let rendered = sanitize_whisper_endpoint_for_log(
-            "https://whisper.example.test/base/path/inference?debug=true&x=1",
+            "https://whisper.example.test/base/path/inference?debug=true&design_mode=true&assign=owner&x=1",
         );
 
         assert_eq!(
             rendered,
-            "https://whisper.example.test/base/path/inference?debug=true&x=1"
+            "https://whisper.example.test/base/path/inference?debug=true&design_mode=true&assign=owner&x=1"
         );
     }
 
