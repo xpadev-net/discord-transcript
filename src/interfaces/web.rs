@@ -5918,6 +5918,7 @@ fn validate_authorized_guild_settings_update(
     validate_guild_settings_update(request)
 }
 
+#[cfg(test)]
 fn validate_authorized_guild_bot_token_update(
     is_admin: bool,
     request: &GuildBotTokenUpdateRequest,
@@ -10397,7 +10398,7 @@ async fn api_update_target_guild_bot_token(
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
-    let token = validate_authorized_guild_bot_token_update(true, &request).map_err(|status| {
+    let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
             "invalid_bot_token_request",
@@ -10576,7 +10577,7 @@ async fn api_update_guild_bot_token(
     let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
-    let token = validate_authorized_guild_bot_token_update(true, &request).map_err(|status| {
+    let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
             "invalid_bot_token_request",
@@ -13376,7 +13377,7 @@ mod guild_api_tests {
                 "async fn api_update_target_guild_bot_token",
                 "async fn api_delete_target_guild_bot_token",
             ),
-            "validate_authorized_guild_bot_token_update",
+            "normalize_guild_bot_token_update",
         );
         assert_sensitive_target_handler(
             handler_section(
@@ -13392,7 +13393,7 @@ mod guild_api_tests {
                 "async fn api_update_guild_bot_token",
                 "async fn api_delete_guild_bot_token",
             ),
-            "validate_authorized_guild_bot_token_update",
+            "normalize_guild_bot_token_update",
         );
         assert_sensitive_current_handler(
             handler_section(
