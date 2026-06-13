@@ -903,6 +903,22 @@ fn rearm_auto_stop_state_for_retry(
     }
 }
 
+fn auto_stop_retry_state_unavailable_error(failure_kind: &str, err: &str) -> String {
+    format!("auto-stop timer state unavailable after {failure_kind}: {err}")
+}
+
+fn rearm_auto_stop_state_for_retry_or_terminal_error(
+    states: &mut HashMap<String, AutoStopState>,
+    guild_key: &str,
+    expected_meeting_id: &str,
+    failure_kind: &str,
+    err: &str,
+) -> Result<(), String> {
+    rearm_auto_stop_state_for_retry(states, guild_key, expected_meeting_id)
+        .then_some(())
+        .ok_or_else(|| auto_stop_retry_state_unavailable_error(failure_kind, err))
+}
+
 fn remove_matching_recording_session_for_meeting<S: ChunkStorage>(
     sessions: &mut HashMap<String, RecordingSession<S>>,
     guild_key: &str,
@@ -4156,95 +4172,94 @@ impl EventHandler for ScaffoldHandler {
                                 }
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            if rearm_auto_stop_state_for_retry(
-                                &mut states,
-                                &guild_for_task,
-                                expected_meeting_id_ref,
-                            ) {
+                            let Err(terminal_error) =
+                                rearm_auto_stop_state_for_retry_or_terminal_error(
+                                    &mut states,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                    "final flush failure",
+                                    &err,
+                                )
+                            else {
                                 continue;
-                            }
+                            };
+                            drop(states);
+                            warn!(
+                                guild_id = %guild_for_task,
+                                meeting_id = expected_meeting_id_ref,
+                                error = %err,
+                                "auto-stop timer state missing or changed after final flush failure; marking recording failed"
+                            );
+                            match handler
+                                .fail_recording_after_teardown_exhaustion(
+                                    &lifecycle_permit,
+                                    &ctx_for_task,
+                                    handler.guild_id,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                    &terminal_error,
+                                )
+                                .await
                             {
-                                drop(states);
-                                let terminal_error = format!(
-                                    "auto-stop timer state unavailable after final flush failure: {err}"
-                                );
-                                warn!(
-                                    guild_id = %guild_for_task,
-                                    meeting_id = expected_meeting_id_ref,
-                                    error = %err,
-                                    "auto-stop timer state missing or changed after final flush failure; marking recording failed"
-                                );
-                                match handler
-                                    .fail_recording_after_teardown_exhaustion(
-                                        &lifecycle_permit,
-                                        &ctx_for_task,
-                                        handler.guild_id,
-                                        &guild_for_task,
-                                        expected_meeting_id_ref,
-                                        &terminal_error,
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        if let Err(status_err) = handler
-                                            .update_status_message(
-                                                &ctx_for_task.http,
-                                                expected_meeting_id_ref,
-                                                StatusMessageUpdate::Failed {
-                                                    phase: "Recording persist",
-                                                    error: &terminal_error,
-                                                },
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                guild_id = %guild_for_task,
-                                                meeting_id = expected_meeting_id_ref,
-                                                error = %status_err,
-                                                "failed to notify auto-stop missing timer state"
-                                            );
-                                        }
-                                    }
-                                    Err(mark_err) => {
+                                Ok(()) => {
+                                    if let Err(status_err) = handler
+                                        .update_status_message(
+                                            &ctx_for_task.http,
+                                            expected_meeting_id_ref,
+                                            StatusMessageUpdate::Failed {
+                                                phase: "Recording persist",
+                                                error: &terminal_error,
+                                            },
+                                        )
+                                        .await
+                                    {
                                         warn!(
                                             guild_id = %guild_for_task,
                                             meeting_id = expected_meeting_id_ref,
-                                            error = %mark_err,
-                                            "failed to mark recording failed after auto-stop timer state disappeared; rescheduling"
+                                            error = %status_err,
+                                            "failed to notify auto-stop missing timer state"
                                         );
-                                        if let TerminalCleanupRetryDecision::Cleared {
-                                            removed_session,
-                                        } = handler
-                                            .handle_terminal_cleanup_retry_failure(
-                                                TerminalCleanupRetryFailureRequest {
-                                                    guild_key: &guild_for_task,
-                                                    expected_meeting_id: expected_meeting_id_ref,
-                                                    phase:
-                                                        "auto-stop missing timer state after flush failure",
-                                                    err: &mark_err,
-                                                },
-                                                &mut terminal_cleanup_failures,
-                                            )
-                                            .await
-                                        {
-                                            drop(lifecycle_permit);
-                                            handler
-                                                .finish_terminal_absence_cleanup(
-                                                    &ctx_for_task,
-                                                    handler.guild_id,
-                                                    &guild_for_task,
-                                                    expected_meeting_id_ref,
-                                                    "auto-stop missing timer state after flush failure",
-                                                    *removed_session,
-                                                )
-                                                .await;
-                                            return;
-                                        }
-                                        continue;
                                     }
                                 }
-                                return;
+                                Err(mark_err) => {
+                                    warn!(
+                                        guild_id = %guild_for_task,
+                                        meeting_id = expected_meeting_id_ref,
+                                        error = %mark_err,
+                                        "failed to mark recording failed after auto-stop timer state disappeared; rescheduling"
+                                    );
+                                    if let TerminalCleanupRetryDecision::Cleared {
+                                        removed_session,
+                                    } = handler
+                                        .handle_terminal_cleanup_retry_failure(
+                                            TerminalCleanupRetryFailureRequest {
+                                                guild_key: &guild_for_task,
+                                                expected_meeting_id: expected_meeting_id_ref,
+                                                phase:
+                                                    "auto-stop missing timer state after flush failure",
+                                                err: &mark_err,
+                                            },
+                                            &mut terminal_cleanup_failures,
+                                        )
+                                        .await
+                                    {
+                                        drop(lifecycle_permit);
+                                        handler
+                                            .finish_terminal_absence_cleanup(
+                                                &ctx_for_task,
+                                                handler.guild_id,
+                                                &guild_for_task,
+                                                expected_meeting_id_ref,
+                                                "auto-stop missing timer state after flush failure",
+                                                *removed_session,
+                                            )
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
                             }
+                            return;
                         }
                         Err(RecordingTeardownError::Stop(err)) => {
                             final_flush_failures = 0;
@@ -4365,21 +4380,94 @@ impl EventHandler for ScaffoldHandler {
                                 }
                             }
                             let mut states = handler.auto_stop_states.lock().await;
-                            if !rearm_auto_stop_state_for_retry(
-                                &mut states,
-                                &guild_for_task,
-                                expected_meeting_id_ref,
-                            ) {
-                                drop(states);
-                                let mut startups = handler.recording_startups.lock().await;
-                                clear_matching_recording_startup(
-                                    &mut startups,
+                            let Err(terminal_error) =
+                                rearm_auto_stop_state_for_retry_or_terminal_error(
+                                    &mut states,
                                     &guild_for_task,
                                     expected_meeting_id_ref,
-                                );
-                                return;
+                                    "stop failure",
+                                    &err.to_string(),
+                                )
+                            else {
+                                continue;
+                            };
+                            drop(states);
+                            warn!(
+                                guild_id = %guild_for_task,
+                                meeting_id = expected_meeting_id_ref,
+                                error = %err,
+                                "auto-stop timer state missing or changed after stop failure; marking recording failed"
+                            );
+                            match handler
+                                .fail_recording_after_teardown_exhaustion(
+                                    &lifecycle_permit,
+                                    &ctx_for_task,
+                                    handler.guild_id,
+                                    &guild_for_task,
+                                    expected_meeting_id_ref,
+                                    &terminal_error,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    if let Err(status_err) = handler
+                                        .update_status_message(
+                                            &ctx_for_task.http,
+                                            expected_meeting_id_ref,
+                                            StatusMessageUpdate::Failed {
+                                                phase: "Recording stop",
+                                                error: &terminal_error,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            guild_id = %guild_for_task,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %status_err,
+                                            "failed to notify auto-stop missing timer state after stop failure"
+                                        );
+                                    }
+                                    return;
+                                }
+                                Err(mark_err) => {
+                                    warn!(
+                                        guild_id = %guild_for_task,
+                                        meeting_id = expected_meeting_id_ref,
+                                        error = %mark_err,
+                                        "failed to mark recording failed after auto-stop timer state disappeared following stop failure; rescheduling"
+                                    );
+                                    if let TerminalCleanupRetryDecision::Cleared {
+                                        removed_session,
+                                    } = handler
+                                        .handle_terminal_cleanup_retry_failure(
+                                            TerminalCleanupRetryFailureRequest {
+                                                guild_key: &guild_for_task,
+                                                expected_meeting_id: expected_meeting_id_ref,
+                                                phase:
+                                                    "auto-stop missing timer state after stop failure",
+                                                err: &mark_err,
+                                            },
+                                            &mut terminal_cleanup_failures,
+                                        )
+                                        .await
+                                    {
+                                        drop(lifecycle_permit);
+                                        handler
+                                            .finish_terminal_absence_cleanup(
+                                                &ctx_for_task,
+                                                handler.guild_id,
+                                                &guild_for_task,
+                                                expected_meeting_id_ref,
+                                                "auto-stop missing timer state after stop failure",
+                                                *removed_session,
+                                            )
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
                             }
-                            continue;
                         }
                     }
                 };
@@ -11917,6 +12005,152 @@ mod status_message_tests {
         assert_eq!(
             service.store.meeting().status,
             crate::domain::MeetingStatus::Recording
+        );
+    }
+
+    #[test]
+    fn auto_stop_retry_state_unavailable_after_stop_failure_is_terminal() {
+        let mut states = HashMap::new();
+
+        let err = rearm_auto_stop_state_for_retry_or_terminal_error(
+            &mut states,
+            "g1",
+            "m1",
+            "stop failure",
+            "queue down",
+        )
+        .expect_err("missing auto-stop state must force terminal cleanup");
+
+        assert_eq!(
+            err,
+            "auto-stop timer state unavailable after stop failure: queue down"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_auto_stop_state_loss_after_stop_failure_retries_store_before_clearing() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting().fail_status_updates(1);
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let mut local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        local_state.auto_stop_states.clear();
+        let harness = async_lifecycle_harness(store, local_state);
+        let voice = StubVoiceGateway::default();
+        let local = harness.local_state();
+        let voice_leave = Some(&voice);
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+        let terminal_error = auto_stop_retry_state_unavailable_error("stop failure", "queue down");
+
+        let err = fail_recording_after_teardown_exhaustion_with_dependencies(
+            &harness.service,
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id: GuildId::new(1),
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "auto-stop missing timer state after stop failure",
+            },
+            &terminal_error,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .expect_err("store failure should keep retryable recording state");
+
+        assert!(err.contains("status update unavailable"));
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 0);
+        assert_eq!(saved_chunks.load(Ordering::SeqCst), 0);
+        assert_eq!(persisted_mappings.load(Ordering::SeqCst), 0);
+        assert!(
+            harness
+                .sessions
+                .lock()
+                .await
+                .get("g1")
+                .is_some_and(|session| session.meeting_id == "m1"),
+            "session must remain retryable until terminal status is durable"
+        );
+        assert!(
+            harness.auto_stop_states.lock().await.is_empty(),
+            "the missing auto-stop state should not be recreated as part of cleanup retry"
+        );
+        assert_eq!(
+            harness
+                .recording_startups
+                .lock()
+                .await
+                .get("g1")
+                .map(String::as_str),
+            Some("m1"),
+            "startup reservation must not be cleared while the recording is still active"
+        );
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Recording
+        );
+    }
+
+    #[tokio::test]
+    async fn async_auto_stop_state_loss_after_stop_failure_terminalizes_and_clears_state() {
+        let store = FaultInjectedMeetingStore::with_recording_meeting();
+        let saved_chunks = Arc::new(AtomicUsize::new(0));
+        let mut local_state = RecordingLocalState::with_matching_session_and_saved_counter(
+            0,
+            Arc::clone(&saved_chunks),
+        );
+        local_state.auto_stop_states.clear();
+        let harness = async_lifecycle_harness(store, local_state);
+        let voice = StubVoiceGateway::default();
+        let local = harness.local_state();
+        let voice_leave = Some(&voice);
+        let persisted_mappings = Arc::new(AtomicUsize::new(0));
+        let terminal_error = auto_stop_retry_state_unavailable_error("stop failure", "queue down");
+
+        fail_recording_after_teardown_exhaustion_with_dependencies(
+            &harness.service,
+            &local,
+            &voice_leave,
+            TerminalAbsenceCleanupRequest {
+                guild_id: GuildId::new(1),
+                guild_key: "g1",
+                expected_meeting_id: "m1",
+                phase: "auto-stop missing timer state after stop failure",
+            },
+            &terminal_error,
+            {
+                let persisted_mappings = Arc::clone(&persisted_mappings);
+                move |_, _| {
+                    persisted_mappings.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .expect("terminal cleanup should complete once failed status is durable");
+
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            saved_chunks.load(Ordering::SeqCst),
+            1,
+            "tail audio should flush only after terminal status is durable"
+        );
+        assert_eq!(persisted_mappings.load(Ordering::SeqCst), 1);
+        harness.assert_matching_state_cleared().await;
+        let service = harness.service.lock().await;
+        assert_eq!(
+            service.store.meeting().status,
+            crate::domain::MeetingStatus::Failed
+        );
+        assert_eq!(
+            service.store.meeting().error_message.as_deref(),
+            Some("auto-stop timer state unavailable after stop failure: queue down")
         );
     }
 
