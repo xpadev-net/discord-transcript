@@ -5663,6 +5663,14 @@ fn guild_bot_token_delete_is_noop(stored: Option<&StoredGuildSettings>) -> bool 
 
 async fn current_user_is_guild_admin(state: &WebState, user_id: &str) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    current_user_is_guild_admin_for_auth(state, auth, user_id).await
+}
+
+async fn current_user_is_guild_admin_for_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
     check_guild_admin_permission_for_settings(state, auth, user_id).await
 }
 
@@ -5850,6 +5858,24 @@ async fn require_user_has_target_guild_rbac_permission(
     }
 }
 
+async fn require_user_is_target_guild_admin(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    guild_id: &str,
+) -> Result<AuthConfig, StatusCode> {
+    require_active_target_guild_installation(state, guild_id).await?;
+    let discord_guilds = load_current_user_discord_guilds(state, user_id).await?;
+    if !user_can_access_target_guild(&discord_guilds, guild_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let target_auth = target_auth_config(auth, guild_id);
+    guild_admin_required_result(
+        current_user_is_guild_admin_for_auth(state, &target_auth, user_id).await?,
+    )?;
+    Ok(target_auth)
+}
+
 async fn guild_settings_capabilities_for_auth(
     state: &WebState,
     auth: &AuthConfig,
@@ -5892,6 +5918,7 @@ fn validate_authorized_guild_settings_update(
     validate_guild_settings_update(request)
 }
 
+#[cfg(test)]
 fn validate_authorized_guild_bot_token_update(
     is_admin: bool,
     request: &GuildBotTokenUpdateRequest,
@@ -8759,14 +8786,7 @@ async fn api_target_guild_rbac(
 ) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
     let guild = get_guild_info(&state, &target_auth).await?;
     let grants = load_guild_rbac_role_grants(&state, &target_auth.guild_id).await?;
 
@@ -8782,8 +8802,7 @@ async fn api_guild_rbac(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<GuildRbacManagementResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     let guild = get_guild_info(&state, auth).await?;
     let grants = load_guild_rbac_role_grants(&state, &auth.guild_id).await?;
 
@@ -8804,14 +8823,7 @@ async fn api_update_target_guild_rbac_role(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
     update_guild_rbac_role_grant(
         &state,
         &target_auth,
@@ -8834,8 +8846,7 @@ async fn api_update_guild_rbac_role(
 ) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     update_guild_rbac_role_grant(
         &state,
         auth,
@@ -8912,14 +8923,7 @@ async fn api_reset_target_guild_rbac_role(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id).await?;
     reset_guild_rbac_role_grant(
         &state,
         &target_auth,
@@ -8940,8 +8944,7 @@ async fn api_reset_guild_rbac_role(
 ) -> Result<Json<GuildRbacRoleGrantResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let role_id = normalize_rbac_role_id(&role_id)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_is_guild_admin(&state, &user_id).await?;
     reset_guild_rbac_role_grant(
         &state,
         auth,
@@ -10389,19 +10392,13 @@ async fn api_update_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
-    let token = validate_authorized_guild_bot_token_update(true, &request).map_err(|status| {
+    let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
             "invalid_bot_token_request",
@@ -10501,15 +10498,9 @@ async fn api_delete_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
+    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
+        .await
+        .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
@@ -10576,6 +10567,16 @@ async fn api_update_guild_bot_token(
     headers: HeaderMap,
     Json(request): Json<GuildBotTokenUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, Response> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    require_current_user_is_guild_admin(&state, &user_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
+        .await
+        .map_err(|status| status.into_response())?;
     let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
@@ -10583,31 +10584,6 @@ async fn api_update_guild_bot_token(
             "Discord bot token is required.",
         )
     })?;
-    let auth = state
-        .auth
-        .as_ref()
-        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    let can_manage_settings = current_user_has_rbac_permission_for_auth(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::SettingsManage,
-        false,
-        false,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
-    if !can_manage_settings {
-        return Err(api_error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Settings management permission is required.",
-        ));
-    }
-    let capabilities =
-        guild_settings_capabilities_for_auth(&state, auth, &user_id, can_manage_settings)
-            .await
-            .map_err(|status| status.into_response())?;
 
     let cipher = state.guild_bot_token_cipher.as_ref().ok_or_else(|| {
         api_error_response(
@@ -10695,27 +10671,12 @@ async fn api_delete_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    let can_manage_settings = current_user_has_rbac_permission_for_auth(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::SettingsManage,
-        false,
-        false,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
-    if !can_manage_settings {
-        return Err(api_error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Settings management permission is required.",
-        ));
-    }
-    let capabilities =
-        guild_settings_capabilities_for_auth(&state, auth, &user_id, can_manage_settings)
-            .await
-            .map_err(|status| status.into_response())?;
+    require_current_user_is_guild_admin(&state, &user_id)
+        .await
+        .map_err(|status| status.into_response())?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
+        .await
+        .map_err(|status| status.into_response())?;
 
     let current = load_guild_settings(&state, &auth.guild_id)
         .await
@@ -13318,6 +13279,130 @@ mod guild_api_tests {
             vec!["meeting:view".to_owned()]
         );
         assert!(permissions_for_grant(&grants, "role-2").is_empty());
+    }
+
+    #[test]
+    fn sensitive_rbac_and_bot_token_handlers_require_guild_admin() {
+        let source = include_str!("web.rs");
+
+        fn marker_index(section: &str, marker: &str) -> usize {
+            section.find(marker).unwrap_or_else(|| {
+                panic!("handler section should contain authorization marker {marker}")
+            })
+        }
+
+        fn handler_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("handler {start} should exist"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("handler {start} should be followed by {end}"))
+                .0
+        }
+
+        fn assert_sensitive_current_handler(section: &str, operation_marker: &str) {
+            assert!(section.contains("require_current_user_is_guild_admin"));
+            assert!(
+                marker_index(section, "require_current_user_is_guild_admin")
+                    < marker_index(section, operation_marker)
+            );
+            assert!(!section.contains("require_current_user_has_rbac_permission"));
+            assert!(!section.contains("current_user_has_rbac_permission_for_auth"));
+            assert!(!section.contains("RbacPermission::SettingsManage"));
+        }
+
+        fn assert_sensitive_target_handler(section: &str, operation_marker: &str) {
+            assert!(section.contains("require_user_is_target_guild_admin"));
+            assert!(
+                marker_index(section, "require_user_is_target_guild_admin")
+                    < marker_index(section, operation_marker)
+            );
+            assert!(!section.contains("require_user_has_target_guild_rbac_permission"));
+            assert!(!section.contains("current_user_has_rbac_permission_for_auth"));
+            assert!(!section.contains("RbacPermission::SettingsManage"));
+        }
+
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_target_guild_rbac",
+                "async fn api_guild_rbac",
+            ),
+            "get_guild_info",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_guild_rbac",
+                "async fn api_update_target_guild_rbac_role",
+            ),
+            "get_guild_info",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_update_target_guild_rbac_role",
+                "async fn api_update_guild_rbac_role",
+            ),
+            "update_guild_rbac_role_grant",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_update_guild_rbac_role",
+                "async fn update_guild_rbac_role_grant",
+            ),
+            "update_guild_rbac_role_grant",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_reset_target_guild_rbac_role",
+                "async fn api_reset_guild_rbac_role",
+            ),
+            "reset_guild_rbac_role_grant",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_reset_guild_rbac_role",
+                "async fn reset_guild_rbac_role_grant",
+            ),
+            "reset_guild_rbac_role_grant",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_update_target_guild_bot_token",
+                "async fn api_delete_target_guild_bot_token",
+            ),
+            "normalize_guild_bot_token_update",
+        );
+        assert_sensitive_target_handler(
+            handler_section(
+                source,
+                "async fn api_delete_target_guild_bot_token",
+                "async fn api_update_guild_bot_token",
+            ),
+            "load_guild_settings",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_update_guild_bot_token",
+                "async fn api_delete_guild_bot_token",
+            ),
+            "normalize_guild_bot_token_update",
+        );
+        assert_sensitive_current_handler(
+            handler_section(
+                source,
+                "async fn api_delete_guild_bot_token",
+                "async fn invalidate_discord_caches",
+            ),
+            "load_guild_settings",
+        );
     }
 
     #[test]
