@@ -23,6 +23,7 @@ use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
@@ -124,6 +125,7 @@ impl AgentOutputContract {
 
 pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
     AgentOutputContract::new("output/summary.md", "summary output", 1024 * 1024);
+const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {
@@ -204,6 +206,8 @@ pub struct SummaryContextManifest {
     #[serde(default)]
     pub duration_seconds: Option<u64>,
     pub generated_at: String,
+    #[serde(default)]
+    pub context_selection_version: u32,
     pub manifest_path: String,
     pub speaker_roster_path: String,
     pub speaker_count: usize,
@@ -519,6 +523,7 @@ pub fn write_transcript_files(
 pub fn materialize_summary_context(
     request: &SummaryRequest,
     context: &SummaryContextInput,
+    current_transcript: Option<&str>,
 ) -> Result<SummaryContextManifest, SummaryError> {
     request.workspace.ensure_base_dirs().map_err(|err| {
         SummaryError::SummaryEngine(format!(
@@ -551,10 +556,14 @@ pub fn materialize_summary_context(
         ))
     })?;
 
+    let evidence = ContextRelevanceEvidence::new(request, &speakers, current_transcript);
+
     let mut domain_knowledge = context
         .domain_knowledge
         .iter()
-        .filter(|item| item.active && item.archived_at.is_none())
+        .filter(|item| {
+            item.active && item.archived_at.is_none() && evidence.matches_domain_knowledge(item)
+        })
         .cloned()
         .collect::<Vec<_>>();
     domain_knowledge.sort_by(|left, right| {
@@ -579,7 +588,9 @@ pub fn materialize_summary_context(
     let mut ai_memory = context
         .ai_memory
         .iter()
-        .filter(|note| note.active && note.archived_at.is_none())
+        .filter(|note| {
+            note.active && note.archived_at.is_none() && evidence.matches_ai_memory(note)
+        })
         .cloned()
         .collect::<Vec<_>>();
     ai_memory.sort_by(|left, right| {
@@ -605,6 +616,7 @@ pub fn materialize_summary_context(
             alias.active
                 && alias.archived_at.is_none()
                 && alias.review_status == PersonAliasReviewStatus::Accepted
+                && evidence.matches_person_alias(alias)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -629,7 +641,10 @@ pub fn materialize_summary_context(
     let mut user_feedback = context
         .user_feedback
         .iter()
-        .filter(|feedback| feedback.status == TranscriptFeedbackStatus::Accepted)
+        .filter(|feedback| {
+            feedback.status == TranscriptFeedbackStatus::Accepted
+                && evidence.matches_feedback(feedback)
+        })
         .cloned()
         .collect::<Vec<_>>();
     user_feedback.sort_by(|left, right| {
@@ -691,6 +706,7 @@ pub fn materialize_summary_context(
         stopped_at: format_optional_utc(request.stopped_at),
         duration_seconds: request.duration_seconds,
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        context_selection_version: SUMMARY_CONTEXT_SELECTION_VERSION,
         manifest_path: relative_workspace_path(&request.workspace, &manifest_path)?,
         speaker_roster_path: relative_workspace_path(&request.workspace, &speaker_path)?,
         speaker_count: speaker_entries.len(),
@@ -699,7 +715,7 @@ pub fn materialize_summary_context(
         domain_knowledge_items: domain_knowledge
             .iter()
             .map(|item| DomainKnowledgeContextMetadata {
-                id: item.id.clone(),
+                id: redacted_context_id("domain_knowledge", item.id.as_str()),
                 content_type: item.content_type.as_str().to_owned(),
                 version: item.version,
                 active: item.active,
@@ -711,7 +727,7 @@ pub fn materialize_summary_context(
         ai_memory_items: ai_memory
             .iter()
             .map(|note| AiMemoryContextMetadata {
-                id: note.id.clone(),
+                id: redacted_context_id("ai_memory", note.id.as_str()),
                 source_type: note.source_type.as_str().to_owned(),
                 tags: note
                     .tags
@@ -729,7 +745,7 @@ pub fn materialize_summary_context(
         person_alias_items: person_aliases
             .iter()
             .map(|alias| PersonAliasContextMetadata {
-                id: alias.id.clone(),
+                id: redacted_context_id("person_alias", alias.id.as_str()),
                 source_type: alias.source_type.as_str().to_owned(),
                 review_status: alias.review_status.as_str().to_owned(),
                 confidence_permille: alias.confidence.map(|confidence| confidence.as_permille()),
@@ -742,7 +758,7 @@ pub fn materialize_summary_context(
         user_feedback_items: user_feedback
             .iter()
             .map(|feedback| UserFeedbackContextMetadata {
-                id: feedback.id.clone(),
+                id: redacted_context_id("user_feedback", feedback.id.as_str()),
                 feedback_type: feedback.feedback_type.as_str().to_owned(),
                 term_type: feedback
                     .term_type
@@ -771,12 +787,15 @@ pub fn materialize_summary_context(
 pub fn materialize_or_load_summary_context(
     request: &SummaryRequest,
     context: &SummaryContextInput,
+    current_transcript: Option<&str>,
 ) -> Result<SummaryContextManifest, SummaryError> {
-    if let Some(manifest) = load_summary_context_manifest(request)? {
+    if let Some(manifest) = load_summary_context_manifest(request)?
+        && manifest.context_selection_version == SUMMARY_CONTEXT_SELECTION_VERSION
+    {
         return Ok(manifest);
     }
 
-    materialize_summary_context(request, context)
+    materialize_summary_context(request, context, current_transcript)
 }
 
 pub fn load_summary_context_manifest(
@@ -908,6 +927,183 @@ fn relative_workspace_path(
         .map(|path| path.to_string_lossy().to_string())
 }
 
+#[derive(Debug)]
+struct ContextRelevanceEvidence {
+    meeting_id: String,
+    normalized_haystack: String,
+    speaker_ids: HashSet<String>,
+}
+
+impl ContextRelevanceEvidence {
+    fn new(
+        request: &SummaryRequest,
+        speakers: &[SpeakerProfile],
+        current_transcript: Option<&str>,
+    ) -> Self {
+        let mut haystack_parts = Vec::new();
+        haystack_parts.push(request.meeting_id.as_str());
+        haystack_parts.push(request.voice_channel_id.as_str());
+        if let Some(value) = request.voice_channel_name.as_deref() {
+            haystack_parts.push(value);
+        }
+        if let Some(value) = request.title.as_deref() {
+            haystack_parts.push(value);
+        }
+        if let Some(value) = current_transcript {
+            haystack_parts.push(value);
+        }
+        let mut speaker_ids = HashSet::new();
+        for speaker in speakers {
+            speaker_ids.insert(speaker.speaker_id.clone());
+            haystack_parts.push(speaker.speaker_id.as_str());
+            if let Some(value) = speaker.username.as_deref() {
+                haystack_parts.push(value);
+            }
+            if let Some(value) = speaker.nickname.as_deref() {
+                haystack_parts.push(value);
+            }
+            if let Some(value) = speaker.display_name.as_deref() {
+                haystack_parts.push(value);
+            }
+        }
+
+        Self {
+            meeting_id: request.meeting_id.clone(),
+            normalized_haystack: normalize_context_evidence(&haystack_parts.join("\n")),
+            speaker_ids,
+        }
+    }
+
+    fn matches_domain_knowledge(&self, item: &DomainKnowledgeItem) -> bool {
+        self.contains_phrase(&item.title) || self.contains_phrase(&item.body)
+    }
+
+    fn matches_ai_memory(&self, note: &AiMemoryNote) -> bool {
+        if note.source_meeting_id.as_deref() == Some(self.meeting_id.as_str()) {
+            return true;
+        }
+        if note.source_meeting_id.is_some() {
+            return false;
+        }
+        self.contains_phrase(&note.title) || self.contains_phrase(&note.body)
+    }
+
+    fn matches_person_alias(&self, alias: &PersonAlias) -> bool {
+        if alias.source_meeting_id.as_deref() == Some(self.meeting_id.as_str()) {
+            return true;
+        }
+        if alias.source_meeting_id.is_some() {
+            return false;
+        }
+        alias
+            .discord_user_id
+            .as_ref()
+            .is_some_and(|user_id| self.speaker_ids.contains(user_id))
+            || self.contains_phrase(&alias.canonical_name)
+            || self.contains_phrase(&alias.alias)
+    }
+
+    fn matches_feedback(&self, feedback: &TranscriptFeedback) -> bool {
+        if feedback.meeting_id.as_deref() == Some(self.meeting_id.as_str()) {
+            return true;
+        }
+        if feedback.meeting_id.is_some() {
+            return false;
+        }
+        feedback
+            .original_text
+            .as_ref()
+            .is_some_and(|value| self.contains_phrase(value))
+            || feedback
+                .corrected_text
+                .as_ref()
+                .is_some_and(|value| self.contains_phrase(value))
+            || feedback
+                .note
+                .as_ref()
+                .is_some_and(|value| self.contains_phrase(value))
+    }
+
+    fn contains_phrase(&self, value: &str) -> bool {
+        let normalized = normalize_context_evidence(value);
+        let tokens = context_evidence_tokens(&normalized);
+        (tokens.len() >= 2
+            && normalized.chars().count() >= 8
+            && self.normalized_haystack.contains(&normalized))
+            || context_evidence_token_pairs(&tokens)
+                .into_iter()
+                .any(|phrase| self.normalized_haystack.contains(&phrase))
+    }
+}
+
+fn normalize_context_evidence(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric()
+                || ('\u{3040}'..='\u{30ff}').contains(&ch)
+                || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+            {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn context_evidence_tokens(normalized: &str) -> Vec<String> {
+    normalized
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 4 && !is_weak_context_evidence_token(token))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn context_evidence_token_pairs(tokens: &[String]) -> Vec<String> {
+    tokens
+        .windows(2)
+        .map(|pair| format!("{} {}", pair[0], pair[1]))
+        .collect()
+}
+
+fn is_weak_context_evidence_token(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "after"
+            | "before"
+            | "from"
+            | "meeting"
+            | "note"
+            | "private"
+            | "public"
+            | "that"
+            | "this"
+            | "with"
+    )
+}
+
+fn redacted_context_id(kind: &str, id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(id.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{kind}:{suffix}")
+}
+
 fn render_speaker_roster_context(speakers: &[SpeakerRosterEntry]) -> String {
     if speakers.is_empty() {
         return "# Speaker Roster\n\nNo speaker roster was materialized for this meeting.\n"
@@ -943,9 +1139,8 @@ fn render_domain_knowledge_context(items: &[DomainKnowledgeItem]) -> String {
     );
     for item in items {
         rendered.push_str(&format!(
-            "\n## {}\n\n- id: {}\n- content_type: {}\n- version: {}\n\n{}\n",
+            "\n## {}\n\n- content_type: {}\n- version: {}\n\n{}\n",
             item.title,
-            item.id,
             item.content_type.as_str(),
             item.version,
             item.body
@@ -964,9 +1159,8 @@ fn render_ai_memory_context(notes: &[AiMemoryNote]) -> String {
     );
     for note in notes {
         rendered.push_str(&format!(
-            "\n## {}\n\n- id: {}\n- source_type: {}\n- confidence: {}\n- pinned: {}\n- updated_at: {}\n",
+            "\n## {}\n\n- source_type: {}\n- confidence: {}\n- pinned: {}\n- updated_at: {}\n",
             note.title,
-            note.id,
             note.source_type.as_str(),
             confidence_label(note.confidence),
             note.pinned,
@@ -979,16 +1173,6 @@ fn render_ai_memory_context(notes: &[AiMemoryNote]) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         push_optional_metadata_line(&mut rendered, "tags", Some(&tags));
-        push_optional_metadata_line(
-            &mut rendered,
-            "source_meeting_id",
-            note.source_meeting_id.as_deref(),
-        );
-        push_optional_metadata_line(
-            &mut rendered,
-            "source_feedback_id",
-            note.source_feedback_id.as_deref(),
-        );
         rendered.push_str(&format!("\n{}\n", note.body));
     }
     rendered
@@ -1005,30 +1189,14 @@ fn render_person_aliases_context(aliases: &[PersonAlias]) -> String {
     );
     for alias in aliases {
         rendered.push_str(&format!(
-            "\n## {}\n\n- id: {}\n- alias: {}\n- source_type: {}\n- review_status: {}\n- confidence: {}\n- updated_at: {}\n",
+            "\n## {}\n\n- alias: {}\n- source_type: {}\n- review_status: {}\n- confidence: {}\n- updated_at: {}\n",
             alias.canonical_name,
-            alias.id,
             alias.alias,
             alias.source_type.as_str(),
             alias.review_status.as_str(),
             confidence_label(alias.confidence),
             alias.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true)
         ));
-        push_optional_metadata_line(
-            &mut rendered,
-            "discord_user_id",
-            alias.discord_user_id.as_deref(),
-        );
-        push_optional_metadata_line(
-            &mut rendered,
-            "source_meeting_id",
-            alias.source_meeting_id.as_deref(),
-        );
-        push_optional_metadata_line(
-            &mut rendered,
-            "source_feedback_id",
-            alias.source_feedback_id.as_deref(),
-        );
     }
     rendered
 }
@@ -1044,10 +1212,8 @@ fn render_user_feedback_context(feedback_items: &[TranscriptFeedback]) -> String
     );
     for feedback in feedback_items {
         rendered.push_str(&format!(
-            "\n## {} ({})\n\n- id: {}\n- feedback_type: {}\n- status: {}\n- created_at: {}\n",
+            "\n## {}\n\n- feedback_type: {}\n- status: {}\n- created_at: {}\n",
             feedback.feedback_type.as_str(),
-            feedback.id,
-            feedback.id,
             feedback.feedback_type.as_str(),
             feedback.status.as_str(),
             feedback
@@ -1063,36 +1229,9 @@ fn render_user_feedback_context(feedback_items: &[TranscriptFeedback]) -> String
                 reviewed_at.to_rfc3339_opts(SecondsFormat::Secs, true)
             ));
         }
-        push_optional_metadata_line(&mut rendered, "meeting_id", feedback.meeting_id.as_deref());
-        push_optional_metadata_line(
-            &mut rendered,
-            "transcript_segment_id",
-            feedback.transcript_segment_id.as_deref(),
-        );
-        push_optional_metadata_line(&mut rendered, "speaker_id", feedback.speaker_id.as_deref());
-        push_optional_metadata_line(
-            &mut rendered,
-            "corrected_speaker_id",
-            feedback.corrected_speaker_id.as_deref(),
-        );
-        push_optional_metadata_line(
-            &mut rendered,
-            "target_domain_knowledge_id",
-            feedback.target_domain_knowledge_id.as_deref(),
-        );
-        push_optional_metadata_line(
-            &mut rendered,
-            "target_ai_memory_note_id",
-            feedback.target_ai_memory_note_id.as_deref(),
-        );
         push_optional_section(
             &mut rendered,
-            "Original Text",
-            feedback.original_text.as_deref(),
-        );
-        push_optional_section(
-            &mut rendered,
-            "Corrected Text",
+            "Accepted Guidance",
             feedback.corrected_text.as_deref(),
         );
         push_optional_section(&mut rendered, "Note", feedback.note.as_deref());
