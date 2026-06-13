@@ -4167,6 +4167,8 @@ fn normalize_guild_meetings_voice_channel_id(
     let Some(voice_channel_id) = query
         .voice_channel_id
         .as_deref()
+        // Only plain spaces are cosmetic around query filters; other whitespace
+        // remains malformed input and must fail snowflake validation.
         .map(|voice_channel_id| voice_channel_id.trim_matches(' '))
         .filter(|voice_channel_id| !voice_channel_id.is_empty())
     else {
@@ -14802,6 +14804,14 @@ mod guild_api_tests {
                 voice_channel_id: Some("  ".to_owned()),
             }),
             Ok(None)
+        );
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some("\t".to_owned()),
+            }),
+            Err(StatusCode::BAD_REQUEST)
         );
     }
 
