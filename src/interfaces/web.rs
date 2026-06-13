@@ -4152,13 +4152,32 @@ fn normalize_guild_meetings_pagination(query: &GuildMeetingsQuery) -> (u32, u32)
     (page, limit)
 }
 
-fn normalize_guild_meetings_voice_channel_id(query: &GuildMeetingsQuery) -> Option<String> {
-    query
+const DISCORD_SNOWFLAKE_MIN_LEN: usize = 17;
+const DISCORD_SNOWFLAKE_MAX_LEN: usize = 20;
+
+fn is_discord_snowflake_shaped(value: &str) -> bool {
+    (DISCORD_SNOWFLAKE_MIN_LEN..=DISCORD_SNOWFLAKE_MAX_LEN).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
+}
+
+fn normalize_guild_meetings_voice_channel_id(
+    query: &GuildMeetingsQuery,
+) -> Result<Option<String>, StatusCode> {
+    let Some(voice_channel_id) = query
         .voice_channel_id
         .as_deref()
-        .map(str::trim)
+        .map(|voice_channel_id| voice_channel_id.trim_matches(' '))
         .filter(|voice_channel_id| !voice_channel_id.is_empty())
-        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+
+    if !is_discord_snowflake_shaped(voice_channel_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(Some(voice_channel_id.to_owned()))
 }
 
 fn parse_job_list_query(raw_query: Option<&str>) -> Result<JobListQuery, StatusCode> {
@@ -7992,7 +8011,8 @@ async fn api_guild_meetings(
     Query(query): Query<GuildMeetingsQuery>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    list_guild_meetings_for_auth(&state, &user_id, auth, query).await
+    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query)?;
+    list_guild_meetings_for_auth(&state, &user_id, auth, query, voice_channel_filter).await
 }
 
 async fn api_list_jobs(
@@ -8129,13 +8149,14 @@ async fn api_target_guild_meetings(
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
+    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query)?;
     require_active_target_guild_installation(&state, &guild_id).await?;
     let discord_guilds = load_current_user_discord_guilds(&state, &user_id).await?;
     if !user_can_access_target_guild(&discord_guilds, &guild_id) {
         return Err(StatusCode::FORBIDDEN);
     }
     let target_auth = target_auth_config(auth, &guild_id);
-    list_guild_meetings_for_auth(&state, &user_id, &target_auth, query).await
+    list_guild_meetings_for_auth(&state, &user_id, &target_auth, query, voice_channel_filter).await
 }
 
 async fn list_guild_meetings_for_auth(
@@ -8143,9 +8164,9 @@ async fn list_guild_meetings_for_auth(
     user_id: &str,
     auth: &AuthConfig,
     query: GuildMeetingsQuery,
+    voice_channel_filter: Option<String>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
     let (page, limit) = normalize_guild_meetings_pagination(&query);
-    let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
     let can_view_all_meetings = current_user_has_rbac_permission_for_auth(
@@ -14772,7 +14793,7 @@ mod guild_api_tests {
                 limit: None,
                 voice_channel_id: None,
             }),
-            None
+            Ok(None)
         );
         assert_eq!(
             normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
@@ -14780,15 +14801,53 @@ mod guild_api_tests {
                 limit: None,
                 voice_channel_id: Some("  ".to_owned()),
             }),
-            None
+            Ok(None)
         );
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_accepts_snowflake_values() {
+        assert_eq!(
+            normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                page: None,
+                limit: None,
+                voice_channel_id: Some(" 123456789012345678 ".to_owned()),
+            }),
+            Ok(Some("123456789012345678".to_owned()))
+        );
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_rejects_malformed_values() {
+        for voice_channel_id in [
+            "12345678901234567/1",
+            "\n123456789012345678",
+            "123456789\n01234567",
+            "12345678901234567a",
+            "123456789012345678901",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
+                    page: None,
+                    limit: None,
+                    voice_channel_id: Some(voice_channel_id.to_owned()),
+                }),
+                Err(StatusCode::BAD_REQUEST),
+                "{voice_channel_id:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn guild_meetings_voice_channel_filter_rejects_short_non_snowflake_values() {
         assert_eq!(
             normalize_guild_meetings_voice_channel_id(&GuildMeetingsQuery {
                 page: None,
                 limit: None,
                 voice_channel_id: Some(" vc-2 ".to_owned()),
             }),
-            Some("vc-2".to_owned())
+            Err(StatusCode::BAD_REQUEST)
         );
     }
 
