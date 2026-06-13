@@ -597,6 +597,7 @@ where
         ),
     }
 
+    ensure_owned()?;
     persist_pre_correction_transcript_debug_artifact(
         &request.workspace,
         &transcription.transcript_for_summary,
@@ -607,6 +608,7 @@ where
         MeetingStatus::Summarizing,
         Some(MeetingStatus::Transcribing),
     )?;
+    ensure_owned()?;
     let context_manifest_result = materialize_or_load_summary_context(
         &request,
         &input.summary_context,
@@ -634,6 +636,7 @@ where
         // it inside `correct_transcript`. Falls back to a fresh build only for the
         // (rare) case where the artifact was skipped — e.g., transcript fully
         // empty — but `correct_transcript_with_prompt` still short-circuits there.
+        ensure_owned()?;
         let correction_prompt = persist_correction_prompt_debug_artifact(
             &request.workspace,
             &transcription.transcript_for_summary,
@@ -665,6 +668,7 @@ where
         }
     };
 
+    ensure_owned()?;
     let manifest_result = write_transcript_files(&request, &transcription);
     ensure_owned()?;
     let manifest = match manifest_result {
@@ -681,7 +685,9 @@ where
         return Err(WorkerError::from(err));
     }
     let prompt = build_summary_prompt_with_context(&request, &manifest, Some(&context_manifest));
+    ensure_owned()?;
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
+    ensure_owned()?;
     let agent_workspace_result = materialize_new_summary_agent_workspace(&request);
     ensure_owned()?;
     let agent_workspace = match agent_workspace_result {
@@ -746,7 +752,9 @@ where
         &input.voice_channel_id,
         &input.meeting_id,
     );
+    ensure_owned()?;
     store.set_meeting_title(&input.meeting_id, title.clone())?;
+    ensure_owned()?;
     persist_meeting_title_debug_artifact(&request.workspace, &title);
     ensure_owned()?;
 
@@ -1294,4 +1302,136 @@ pub fn enqueue_summary_job<Q: JobQueue>(
     }
     info!(job_id = %job_id, meeting_id = %meeting_id, "summary job enqueued");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::build_wav_bytes_raw;
+    use crate::infrastructure::asr::StubWhisperClient;
+    use crate::infrastructure::storage::StoredMeeting;
+    use std::path::PathBuf;
+
+    struct SummaryOnlyTestClient;
+
+    impl ClaudeSummaryClient for SummaryOnlyTestClient {
+        fn supports_transcript_correction(&self) -> bool {
+            false
+        }
+
+        fn supports_untrusted_agent_workspace(&self) -> bool {
+            true
+        }
+
+        fn summarize(
+            &self,
+            _prompt: &str,
+            _workdir: Option<&std::path::Path>,
+        ) -> Result<String, SummaryError> {
+            Ok("## Summary\nshould not run".to_owned())
+        }
+    }
+
+    struct TempWorkspaceGuard {
+        base: PathBuf,
+        workspace: MeetingWorkspacePaths,
+    }
+
+    impl Drop for TempWorkspaceGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn temp_workspace(meeting_id: &str) -> TempWorkspaceGuard {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "discord_transcript_worker_ownership_{meeting_id}_{nanos}"
+        ));
+        let layout = MeetingWorkspaceLayout::new(&base);
+        let workspace = layout.for_meeting("g1", "vc", meeting_id);
+        std::fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
+        let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
+        std::fs::write(workspace.mixdown_path(), wav).expect("mixdown should be written");
+        TempWorkspaceGuard { base, workspace }
+    }
+
+    fn stopping_meeting() -> StoredMeeting {
+        StoredMeeting {
+            id: "m1".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc".to_owned(),
+            voice_channel_name: None,
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u1".to_owned(),
+            title: None,
+            status: MeetingStatus::Stopping,
+            stop_reason: None,
+            error_message: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
+        }
+    }
+
+    #[test]
+    fn stale_worker_cannot_write_transcript_files_after_losing_ownership() {
+        let mut store = InMemoryMeetingStore::new();
+        store.insert(stopping_meeting());
+        let whisper = StubWhisperClient {
+            mocked_response_json: r#"{
+              "text":"ok",
+              "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+            }"#
+            .to_owned(),
+        };
+        let client = SummaryOnlyTestClient;
+        let temp = temp_workspace("m1");
+        let workspace = temp.workspace.clone();
+        let mut ownership_checks = 0usize;
+
+        let result = process_meeting_summary_with_ownership_check(
+            &mut store,
+            &whisper,
+            &client,
+            &ProcessMeetingInput {
+                meeting_id: "m1".to_owned(),
+                job_id: Some("summary-m1".to_owned()),
+                guild_id: "g1".to_owned(),
+                voice_channel_id: "vc".to_owned(),
+                voice_channel_name: None,
+                title: None,
+                started_at: None,
+                stopped_at: None,
+                duration_seconds: None,
+                audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+                speaker_audio: vec![SpeakerAudioInput {
+                    speaker_id: "alice".to_owned(),
+                    audio_path: "audio.wav".to_owned(),
+                    offset_ms: 0,
+                }],
+                language: None,
+                workspace: workspace.clone(),
+                summary_context: SummaryContextInput::default(),
+            },
+            || {
+                ownership_checks += 1;
+                if ownership_checks == 7 {
+                    Err(WorkerError::Queue("lost summary job ownership".to_owned()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(workspace.pre_correction_transcript_path().is_file());
+        assert!(!workspace.masked_transcript_path().exists());
+        assert!(!workspace.transcript_manifest_path().exists());
+    }
 }

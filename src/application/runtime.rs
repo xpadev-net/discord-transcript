@@ -2216,25 +2216,36 @@ where
         }
     }
 
-    if let Err(err) =
-        store.set_meeting_status(meeting_id, MeetingStatus::Stopping, Some(retry_from_status))
-    {
-        warn!(
-            meeting_id,
-            job_id = %job.id,
-            phase,
-            error = %err,
-            "summary job retry cannot restore meeting to retryable state; marking job failed"
-        );
-        let _ = queue.mark_failed(job, error_message.clone());
-        mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message).map_err(
-            |store_err| {
-                format!(
-                    "{phase} retry status restore failed ({err}) and meeting failure update failed: {store_err}"
-                )
-            },
-        )?;
-        return Ok(true);
+    match store.set_meeting_status(meeting_id, MeetingStatus::Stopping, Some(retry_from_status)) {
+        Ok(()) => {}
+        Err(err @ StoreError::CasConflict { .. }) => {
+            warn!(
+                meeting_id,
+                job_id = %job.id,
+                phase,
+                error = %err,
+                "summary job retry cannot restore meeting to retryable state; failing job without touching meeting state"
+            );
+            let _ = queue.mark_failed(job, error_message);
+            return Ok(true);
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                job_id = %job.id,
+                phase,
+                error = %err,
+                "summary job retry cannot restore meeting to retryable state; marking job failed"
+            );
+            let _ = queue.mark_failed(job, error_message.clone());
+            mark_summary_meeting_failed_from_summary_state(store, meeting_id, error_message)
+                .map_err(|store_err| {
+                    format!(
+                        "{phase} retry status restore failed ({err}) and meeting failure update failed: {store_err}"
+                    )
+                })?;
+            return Ok(true);
+        }
     }
 
     match queue.retry(job, error_message.clone(), max_retries) {
@@ -2342,39 +2353,54 @@ where
         );
         return SummaryCleanupFailureDisposition::OwnershipLost;
     }
-    let reverted = store
-        .set_meeting_status(
-            &claimed_job.meeting_id,
-            MeetingStatus::Stopping,
-            Some(MeetingStatus::Summarizing),
-        )
-        .is_ok();
-    if reverted {
-        let exhausted = retry_claimed_summary_job(
-            queue,
-            claimed_job,
-            err_string.clone(),
-            summary_max_retries,
-            "summary_cleanup",
-        );
-        if exhausted {
+    match store.set_meeting_status(
+        &claimed_job.meeting_id,
+        MeetingStatus::Stopping,
+        Some(MeetingStatus::Summarizing),
+    ) {
+        Ok(()) => {}
+        Err(err @ StoreError::CasConflict { .. }) => {
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                job_id = %claimed_job.id,
+                error = %err,
+                "summary cleanup retry cannot restore meeting state; failing job without touching meeting state"
+            );
+            let _ = queue.mark_failed(claimed_job, err_string);
+            return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
+        }
+        Err(err) => {
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                job_id = %claimed_job.id,
+                error = %err,
+                "summary cleanup retry cannot restore meeting to retryable state"
+            );
+            let _ = queue.mark_failed(claimed_job, err_string.clone());
             let _ = mark_summary_meeting_failed_from_summary_state(
                 store,
                 &claimed_job.meeting_id,
                 err_string,
             );
-            SummaryCleanupFailureDisposition::TerminalStatusUpdated
-        } else {
-            SummaryCleanupFailureDisposition::RetryScheduled
+            return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
         }
-    } else {
-        let _ = queue.mark_failed(claimed_job, err_string.clone());
+    }
+    let exhausted = retry_claimed_summary_job(
+        queue,
+        claimed_job,
+        err_string.clone(),
+        summary_max_retries,
+        "summary_cleanup",
+    );
+    if exhausted {
         let _ = mark_summary_meeting_failed_from_summary_state(
             store,
             &claimed_job.meeting_id,
             err_string,
         );
         SummaryCleanupFailureDisposition::TerminalStatusUpdated
+    } else {
+        SummaryCleanupFailureDisposition::RetryScheduled
     }
 }
 
@@ -6978,9 +7004,15 @@ impl ScaffoldHandler {
             )
         } {
             let cas_err_string = cas_err.to_string();
-            // CAS failed — another process may own this meeting.  Mark the
-            // job failed so it does not stay Running forever.
-            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping→Transcribing failed; marking job failed");
+            if matches!(&cas_err, StoreError::CasConflict { .. }) {
+                warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping->Transcribing failed; failing summary job without touching meeting state");
+                {
+                    let mut queue = self.queue.lock().await;
+                    let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
+                }
+                return Err(SummaryJobRunError::Terminal(cas_err_string));
+            }
+            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "failed to set Transcribing status; marking job failed");
             {
                 let mut queue = self.queue.lock().await;
                 let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
@@ -7280,6 +7312,8 @@ impl ScaffoldHandler {
 
         // The pre-correction transcript is accurate regardless of whether the
         // optional GEC step runs, so it is always persisted.
+        self.refresh_summary_job_ownership(&claimed_job, "pre_correction_artifact")
+            .await?;
         crate::application::summary::persist_pre_correction_transcript_debug_artifact(
             &request.workspace,
             &summary_transcript,
@@ -7298,21 +7332,27 @@ impl ScaffoldHandler {
                 &speakers,
             )
         });
-        let context_manifest = match summary_context.and_then(|mut summary_context| {
-            let mut speaker_ids = summary_context_speakers.keys().collect::<Vec<_>>();
-            speaker_ids.sort();
-            summary_context.speakers = speaker_ids
-                .into_iter()
-                .filter_map(|speaker_id| summary_context_speakers.get(speaker_id).cloned())
-                .collect();
-            tokio::task::block_in_place(|| {
-                crate::application::summary::materialize_or_load_summary_context(
-                    &request,
-                    &summary_context,
-                    Some(&summary_transcript),
-                )
-            })
-        }) {
+        let context_manifest_result = match summary_context {
+            Ok(mut summary_context) => {
+                let mut speaker_ids = summary_context_speakers.keys().collect::<Vec<_>>();
+                speaker_ids.sort();
+                summary_context.speakers = speaker_ids
+                    .into_iter()
+                    .filter_map(|speaker_id| summary_context_speakers.get(speaker_id).cloned())
+                    .collect();
+                self.refresh_summary_job_ownership(&claimed_job, "summary_context_artifact")
+                    .await?;
+                tokio::task::block_in_place(|| {
+                    crate::application::summary::materialize_or_load_summary_context(
+                        &request,
+                        &summary_context,
+                        Some(&summary_transcript),
+                    )
+                })
+            }
+            Err(err) => Err(err),
+        };
+        let context_manifest = match context_manifest_result {
             Ok(value) => value,
             Err(err) => {
                 let err = err.to_string();
@@ -7383,6 +7423,8 @@ impl ScaffoldHandler {
             // about to run; otherwise the artifact would falsely imply the
             // correction step executed. Reuse the built prompt for the
             // correction call to avoid building it twice.
+            self.refresh_summary_job_ownership(&claimed_job, "correction_prompt")
+                .await?;
             let correction_prompt =
                 crate::application::summary::persist_correction_prompt_debug_artifact(
                     &request.workspace,
@@ -7430,7 +7472,15 @@ impl ScaffoldHandler {
             )
         } {
             let cas_err_string = cas_err.to_string();
-            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing→Summarizing failed; marking job failed");
+            if matches!(&cas_err, StoreError::CasConflict { .. }) {
+                warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing->Summarizing failed; failing summary job without touching meeting state");
+                {
+                    let mut queue = self.queue.lock().await;
+                    let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
+                }
+                return Err(SummaryJobRunError::Terminal(cas_err_string));
+            }
+            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "failed to set Summarizing status; marking job failed");
             {
                 let mut queue = self.queue.lock().await;
                 let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
@@ -7444,40 +7494,9 @@ impl ScaffoldHandler {
             return Err(SummaryJobRunError::Terminal(cas_err_string));
         }
 
-        let summary_result = tokio::task::block_in_place(|| {
-            let manifest = crate::application::summary::write_transcript_files(
-                &request,
-                &transcription_for_summary,
-            )?;
-            let prompt = crate::application::summary::build_summary_prompt_with_context(
-                &request,
-                &manifest,
-                Some(&context_manifest),
-            );
-            crate::application::summary::persist_summary_prompt_debug_artifact(
-                &request.workspace,
-                &prompt,
-            );
-            let agent_workspace =
-                crate::application::summary::materialize_new_summary_agent_workspace(&request)?;
-            match summary_client.summarize(&prompt, Some(agent_workspace.root())) {
-                Ok(markdown) => Ok((markdown, agent_workspace)),
-                Err(err) => {
-                    if let Err(cleanup_err) = agent_workspace.cleanup_once() {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %cleanup_err,
-                            "failed to clean summary agent workspace after summary failure"
-                        );
-                    }
-                    Err(err)
-                }
-            }
-        });
-        let (markdown, agent_workspace) = match summary_result {
-            Ok(result) => result,
-            Err(err) => {
-                let err_string = err.to_string();
+        macro_rules! return_summary_retry {
+            ($err:expr) => {{
+                let err_string = ($err).to_string();
                 let retry_result = {
                     let mut service = self.service.lock().await;
                     let mut queue = self.queue.lock().await;
@@ -7527,8 +7546,67 @@ impl ScaffoldHandler {
                     return Err(SummaryJobRunError::TerminalStatusUpdated(err_string));
                 }
                 return Err(retry_scheduled_error(&claimed_job, err_string));
-            }
+            }};
+        }
+
+        self.refresh_summary_job_ownership(&claimed_job, "summary_transcript_artifacts")
+            .await?;
+        let manifest = match tokio::task::block_in_place(|| {
+            crate::application::summary::write_transcript_files(
+                &request,
+                &transcription_for_summary,
+            )
+        }) {
+            Ok(manifest) => manifest,
+            Err(err) => return_summary_retry!(err),
         };
+        let prompt = crate::application::summary::build_summary_prompt_with_context(
+            &request,
+            &manifest,
+            Some(&context_manifest),
+        );
+        self.refresh_summary_job_ownership(&claimed_job, "summary_prompt_artifact")
+            .await?;
+        crate::application::summary::persist_summary_prompt_debug_artifact(
+            &request.workspace,
+            &prompt,
+        );
+        self.refresh_summary_job_ownership(&claimed_job, "summary_agent_workspace")
+            .await?;
+        let agent_workspace = match tokio::task::block_in_place(|| {
+            crate::application::summary::materialize_new_summary_agent_workspace(&request)
+        }) {
+            Ok(agent_workspace) => agent_workspace,
+            Err(err) => return_summary_retry!(err),
+        };
+        self.refresh_summary_job_ownership(&claimed_job, "summary_agent_run")
+            .await?;
+        let mut agent_workspace = Some(agent_workspace);
+        let markdown = match tokio::task::block_in_place(|| {
+            let workspace = agent_workspace
+                .as_ref()
+                .expect("summary agent workspace should exist before summarization");
+            match summary_client.summarize(&prompt, Some(workspace.root())) {
+                Ok(markdown) => Ok(markdown),
+                Err(err) => {
+                    if let Some(workspace) = agent_workspace.take()
+                        && let Err(cleanup_err) = workspace.cleanup_once()
+                    {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %cleanup_err,
+                            "failed to clean summary agent workspace after summary failure"
+                        );
+                    }
+                    Err(err)
+                }
+            }
+        }) {
+            Ok(markdown) => markdown,
+            Err(err) => return_summary_retry!(err),
+        };
+        let agent_workspace =
+            agent_workspace.expect("summary agent workspace should remain after success");
 
         // Persist summary markdown to DB (best-effort), then remove the
         // per-run agent workspace. The validated markdown is held in memory for
@@ -7656,6 +7734,8 @@ impl ScaffoldHandler {
             &meeting.voice_channel_id,
             &claimed_job.meeting_id,
         );
+        self.refresh_summary_job_ownership(&claimed_job, "title_persistence")
+            .await?;
         {
             let mut service = self.service.lock().await;
             if let Err(err) = service
@@ -7715,6 +7795,8 @@ impl ScaffoldHandler {
                 return Err(retry_scheduled_error(&claimed_job, err_string));
             }
         }
+        self.refresh_summary_job_ownership(&claimed_job, "title_artifact")
+            .await?;
         crate::application::summary::persist_meeting_title_debug_artifact(
             &request.workspace,
             &title,
@@ -10906,6 +10988,32 @@ mod status_message_tests {
     }
 
     #[test]
+    fn summary_cleanup_error_does_not_fail_meeting_after_state_advances() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut meeting = summarizing_meeting();
+        meeting.status = crate::domain::MeetingStatus::Posted;
+        store.insert(meeting);
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+        let user_message = summary_cleanup_failure_user_message("cleanup failed");
+
+        let disposition =
+            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message, 0);
+
+        assert_eq!(
+            disposition,
+            SummaryCleanupFailureDisposition::TerminalStatusUpdated
+        );
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+        assert_eq!(updated.retry_count, 0);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
+    }
+
+    #[test]
     fn transcript_persist_error_requeues_job_and_reverts_meeting_before_exhaustion() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         store.insert(transcribing_meeting());
@@ -10968,7 +11076,7 @@ mod status_message_tests {
     }
 
     #[test]
-    fn stale_transcript_retry_cannot_fail_posted_meeting() {
+    fn stale_transcript_retry_cannot_fail_or_dead_letter_posted_meeting() {
         let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
         let mut meeting = transcribing_meeting();
         meeting.status = crate::domain::MeetingStatus::Posted;
@@ -10994,6 +11102,34 @@ mod status_message_tests {
         assert_eq!(updated.retry_count, 0);
         let meeting = store.get("m1").expect("meeting should remain");
         assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
+        assert_eq!(meeting.error_message, None);
+    }
+
+    #[test]
+    fn stale_transcript_retry_cannot_fail_advanced_summarizing_meeting() {
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(summarizing_meeting());
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let job = running_summary_job();
+        queue.enqueue(job.clone()).expect("enqueue should succeed");
+
+        let exhausted = retry_summary_job_after_transcribing_phase_failure(
+            &mut store,
+            &mut queue,
+            &job,
+            "failed to persist transcript segments: database unavailable".to_owned(),
+            2,
+            "transcript_persist",
+            crate::domain::MeetingStatus::Transcribing,
+        )
+        .expect("advanced meeting state should be treated as stale ownership");
+
+        assert!(exhausted);
+        let updated = queue.get(&job.id).expect("job should remain");
+        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+        assert_eq!(updated.retry_count, 0);
+        let meeting = store.get("m1").expect("meeting should remain");
+        assert_eq!(meeting.status, crate::domain::MeetingStatus::Summarizing);
         assert_eq!(meeting.error_message, None);
     }
 
