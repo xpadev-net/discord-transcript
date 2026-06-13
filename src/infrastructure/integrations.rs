@@ -93,7 +93,7 @@ impl WhisperClient for CommandWhisperClient {
                 cmd.arg("-sS")
                     .arg("-X")
                     .arg("POST")
-                    .arg(format!("{}/inference", self.endpoint.trim_end_matches('/')))
+                    .arg(whisper_inference_endpoint(&self.endpoint))
                     .arg("-F")
                     .arg(format!("file=@{}", request.audio_path))
                     .arg("-F")
@@ -178,7 +178,7 @@ fn render_whisper_command_for_log(
         "-sS".to_owned(),
         "-X".to_owned(),
         "POST".to_owned(),
-        format!("{}/inference", client.endpoint.trim_end_matches('/')),
+        sanitize_whisper_endpoint_for_log(&whisper_inference_endpoint(&client.endpoint)),
         "-F".to_owned(),
         format!("file=@{}", request.audio_path),
         "-F".to_owned(),
@@ -208,6 +208,77 @@ fn render_whisper_command_for_log(
         .map(|part| quote_log_arg(part))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn whisper_inference_endpoint(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return format!("{}/inference", endpoint.trim_end_matches('/'));
+    };
+
+    let path = url.path().trim_end_matches('/');
+    let inference_path = if path.is_empty() {
+        "/inference".to_owned()
+    } else {
+        format!("{path}/inference")
+    };
+    url.set_path(&inference_path);
+    url.to_string()
+}
+
+fn sanitize_whisper_endpoint_for_log(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return "[REDACTED_INVALID_ENDPOINT_URL]".to_owned();
+    };
+
+    if !url.username().is_empty() {
+        let _ = url.set_username("REDACTED");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("REDACTED"));
+    }
+
+    let query_pairs = url
+        .query_pairs()
+        .map(|(name, value)| {
+            let value = if is_sensitive_query_name(&name) {
+                "REDACTED".into()
+            } else {
+                value
+            };
+            (name.into_owned(), value.into_owned())
+        })
+        .collect::<Vec<_>>();
+
+    if !query_pairs.is_empty() {
+        url.query_pairs_mut().clear().extend_pairs(query_pairs);
+    }
+
+    url.to_string()
+}
+
+fn is_sensitive_query_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "api-key",
+        "access_token",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "credential",
+        "credentials",
+        "authorization",
+        "auth",
+        "signature",
+        "sig",
+        "client_secret",
+        "subscription-key",
+    ]
+    .iter()
+    .any(|sensitive| normalized.contains(sensitive))
 }
 
 fn quote_log_arg(part: &str) -> String {
@@ -830,7 +901,7 @@ mod tests {
     use super::{
         AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
         AgentOutputContract, CommandWhisperClient, HarnessCliSummaryClient, IntegrationError,
-        create_temp_output_file, run_command_with_timeout,
+        create_temp_output_file, run_command_with_timeout, sanitize_whisper_endpoint_for_log,
     };
     use crate::application::summary::ClaudeSummaryClient;
     use crate::bootstrap::config::SummaryHarness;
@@ -1342,6 +1413,122 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         };
         assert!(!message.contains("sk-secret123456789"));
+    }
+
+    #[test]
+    fn whisper_command_redacts_endpoint_credentials_in_errors() {
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_endpoint_leak_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&script_path, "#!/bin/sh\nexit 7\n").expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint:
+                "https://user:password@example.test?api_key=secret&bearer_token=tok-secret&x=1"
+                    .to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        let err = client.infer(&request).expect_err("command should fail");
+        let _ = std::fs::remove_file(&script_path);
+
+        let message = match err {
+            WhisperParseError::InvalidJson(message) => message,
+            other => panic!("unexpected error: {other}"),
+        };
+        assert!(!message.contains("user:password"));
+        assert!(!message.contains("api_key=secret"));
+        assert!(!message.contains("bearer_token=tok-secret"));
+        assert!(message.contains("https://REDACTED:REDACTED@example.test/"));
+        assert!(message.contains("api_key=REDACTED"));
+        assert!(message.contains("bearer_token=REDACTED"));
+        assert!(message.contains("x=1"));
+    }
+
+    #[test]
+    fn whisper_endpoint_redaction_preserves_normal_endpoint_context() {
+        let rendered = sanitize_whisper_endpoint_for_log(
+            "https://whisper.example.test/base/path/inference?debug=true&x=1",
+        );
+
+        assert_eq!(
+            rendered,
+            "https://whisper.example.test/base/path/inference?debug=true&x=1"
+        );
+    }
+
+    #[test]
+    fn whisper_command_uses_real_endpoint_when_log_endpoint_is_redacted() {
+        let args_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_endpoint_args_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_endpoint_capture_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"text\":\"ok\",\"segments\":[{{\"speaker\":\"alice\",\"start\":0.0,\"end\":1.0,\"text\":\"hello\"}}]}}'\n",
+                args_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "https://user:password@example.test/v1?api_key=secret&x=1".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(5),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        client.infer(&request).expect("command should succeed");
+        let args = std::fs::read_to_string(&args_path).expect("args should be captured");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&args_path);
+
+        assert!(
+            args.contains("https://user:password@example.test/v1/inference?api_key=secret&x=1")
+        );
     }
 
     #[test]
