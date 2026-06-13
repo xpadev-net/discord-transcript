@@ -694,6 +694,7 @@ fn summary_artifacts_include_timing_metadata_and_reuse_it_on_retry() {
     let first_context_manifest = materialize_or_load_summary_context(
         &request,
         &SummaryContextInput::default(),
+        Some(&transcription.transcript_for_summary),
     )
     .expect("context manifest");
     let retry_request = SummaryRequest {
@@ -705,6 +706,7 @@ fn summary_artifacts_include_timing_metadata_and_reuse_it_on_retry() {
     let retry_context_manifest = materialize_or_load_summary_context(
         &retry_request,
         &SummaryContextInput::default(),
+        Some(&transcription.transcript_for_summary),
     )
     .expect("retry should reuse context manifest");
     let prompt = build_summary_prompt(&request, &transcript_manifest);
@@ -888,7 +890,7 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
         .single()
         .expect("timestamp should be valid");
-    let secret_domain_body = "SECRET_DOMAIN_BODY";
+    let secret_domain_body = "SECRET_DOMAIN_BODY Roadmap planning";
     let secret_ai_memory_body = "SECRET_AI_MEMORY_BODY";
     let secret_feedback_note = "SECRET_FEEDBACK_NOTE";
     let secret_template_body = "SECRET_TEMPLATE_BODY {{transcript_path}}";
@@ -914,13 +916,16 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
             created_at: updated_at,
             updated_at,
         }],
-        ai_memory: vec![ai_memory_note(
-            "mem-1",
-            "Prior hint",
-            secret_ai_memory_body,
-            updated_at,
-        )],
-        user_feedback: vec![accepted_feedback("fb-1", secret_feedback_note, updated_at)],
+        ai_memory: vec![{
+            let mut memory = ai_memory_note("mem-1", "Prior hint", secret_ai_memory_body, updated_at);
+            memory.source_meeting_id = Some("m1".to_owned());
+            memory
+        }],
+        user_feedback: vec![{
+            let mut feedback = accepted_feedback("fb-1", secret_feedback_note, updated_at);
+            feedback.meeting_id = Some("m1".to_owned());
+            feedback
+        }],
         person_aliases: vec![person_alias("alias-1", "Alice Example", "alice", updated_at)],
         summary_template: Some(SummaryTemplate {
             id: "st-1".to_owned(),
@@ -939,8 +944,14 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
         effective_summary_template_id: Some("st-1".to_owned()),
         effective_domain_knowledge_version_id: Some("dk-snapshot-7".to_owned()),
     };
-    let context_manifest =
-        materialize_summary_context(&request, &context).expect("context should materialize");
+    let context_manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some(
+            "Alice Example discussed Roadmap planning, Prior hint, old codename, new codename, and secret feedback.",
+        ),
+    )
+    .expect("context should materialize");
     let transcript_manifest = TranscriptManifest {
         meeting_id: "m1".to_owned(),
         guild_id: "g1".to_owned(),
@@ -958,14 +969,14 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
     let manifest_json =
         std::fs::read_to_string(request.workspace.context_manifest_path()).expect("manifest");
     assert!(manifest_json.contains("context/speaker_roster.md"));
-    assert!(manifest_json.contains("\"id\": \"dk-1\""));
+    assert!(!manifest_json.contains("\"id\": \"dk-1\""));
     assert!(manifest_json.contains("\"version\": 7"));
     assert!(manifest_json.contains("context/ai_memory.md"));
-    assert!(manifest_json.contains("\"id\": \"mem-1\""));
+    assert!(!manifest_json.contains("\"id\": \"mem-1\""));
     assert!(manifest_json.contains("context/person_aliases.md"));
-    assert!(manifest_json.contains("\"id\": \"alias-1\""));
+    assert!(!manifest_json.contains("\"id\": \"alias-1\""));
     assert!(manifest_json.contains("context/user_feedback.md"));
-    assert!(manifest_json.contains("\"id\": \"fb-1\""));
+    assert!(!manifest_json.contains("\"id\": \"fb-1\""));
     assert!(manifest_json.contains("\"id\": \"st-1\""));
     assert!(manifest_json.contains("\"version\": 3"));
     assert!(!manifest_json.contains(secret_domain_body));
@@ -1031,6 +1042,401 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
     assert!(!correction_prompt.contains(secret_domain_body));
     assert!(!correction_prompt.contains(secret_ai_memory_body));
     assert!(!correction_prompt.contains(secret_feedback_note));
+}
+
+#[test]
+fn materialized_summary_context_excludes_unrelated_private_context() {
+    let temp = unique_workspace("context_unrelated_private", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: Some("public-standup".to_owned()),
+        title: Some("Public standup".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut unrelated_memory = ai_memory_note(
+        "mem-private",
+        "Private merger",
+        "PRIVATE_UNRELATED_AI_MEMORY",
+        updated_at,
+    );
+    unrelated_memory.source_meeting_id = Some("m-private".to_owned());
+    let mut unrelated_feedback =
+        accepted_feedback("fb-private", "PRIVATE_UNRELATED_FEEDBACK", updated_at);
+    unrelated_feedback.meeting_id = Some("m-private".to_owned());
+    unrelated_feedback.original_text = Some("PRIVATE_ORIGINAL_TEXT".to_owned());
+    unrelated_feedback.corrected_text = Some("PRIVATE_CORRECTED_TEXT".to_owned());
+    let mut unrelated_alias =
+        person_alias("alias-private", "Private Person", "private_alias", updated_at);
+    unrelated_alias.discord_user_id = Some("999".to_owned());
+    unrelated_alias.source_meeting_id = Some("m-private".to_owned());
+    unrelated_alias.source_feedback_id = Some("fb-private".to_owned());
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "123".to_owned(),
+            username: Some("alice_dev".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: Some("Alice Example".to_owned()),
+        }],
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-private".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Private acquisition".to_owned(),
+            body: "PRIVATE_UNRELATED_DOMAIN_KNOWLEDGE".to_owned(),
+            active: true,
+            version: 1,
+            updated_actor_user_id: Some("actor-private".to_owned()),
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ai_memory: vec![unrelated_memory],
+        user_feedback: vec![unrelated_feedback],
+        person_aliases: vec![unrelated_alias],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("[0-1000] Alice Example: public standup covered release health"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.domain_knowledge_count, 0);
+    assert_eq!(manifest.ai_memory_count, 0);
+    assert_eq!(manifest.user_feedback_count, 0);
+    assert_eq!(manifest.person_aliases_count, 0);
+    for path in [
+        request.workspace.context_manifest_path(),
+        request.workspace.context_domain_knowledge_path(),
+        request.workspace.context_ai_memory_path(),
+        request.workspace.context_person_aliases_path(),
+        request.workspace.context_user_feedback_path(),
+    ] {
+        let rendered = std::fs::read_to_string(path).expect("context file should be readable");
+        for forbidden in [
+            "PRIVATE_UNRELATED_AI_MEMORY",
+            "PRIVATE_UNRELATED_FEEDBACK",
+            "PRIVATE_ORIGINAL_TEXT",
+            "PRIVATE_CORRECTED_TEXT",
+            "PRIVATE_UNRELATED_DOMAIN_KNOWLEDGE",
+            "mem-private",
+            "fb-private",
+            "alias-private",
+            "dk-private",
+            "m-private",
+            "999",
+            "actor-private",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "unrelated private context leaked: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn materialized_summary_context_rejects_single_common_token_overlap() {
+    let temp = unique_workspace("context_common_token_overlap", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Release health".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-common-token".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Private release plan".to_owned(),
+            body: "PRIVATE_COMMON_TOKEN_DOMAIN release unrelated acquisition details".to_owned(),
+            active: true,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ai_memory: vec![ai_memory_note(
+            "mem-common-token",
+            "Private release note",
+            "PRIVATE_COMMON_TOKEN_MEMORY release unrelated acquisition details",
+            updated_at,
+        )],
+        user_feedback: vec![{
+            let mut feedback = accepted_feedback(
+                "fb-common-token",
+                "PRIVATE_COMMON_TOKEN_FEEDBACK release unrelated acquisition details",
+                updated_at,
+            );
+            feedback.meeting_id = Some("m-private".to_owned());
+            feedback.corrected_text =
+                Some("PRIVATE_COMMON_TOKEN_GUIDANCE release unrelated".to_owned());
+            feedback
+        }],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest =
+        materialize_summary_context(&request, &context, Some("Today we discussed release health."))
+            .expect("context should materialize");
+
+    assert_eq!(manifest.domain_knowledge_count, 0);
+    assert_eq!(manifest.ai_memory_count, 0);
+    assert_eq!(manifest.user_feedback_count, 0);
+    for path in [
+        request.workspace.context_domain_knowledge_path(),
+        request.workspace.context_ai_memory_path(),
+        request.workspace.context_user_feedback_path(),
+    ] {
+        let rendered = std::fs::read_to_string(path).expect("context file should be readable");
+        assert!(!rendered.contains("PRIVATE_COMMON_TOKEN"));
+    }
+}
+
+#[test]
+fn materialized_summary_context_rejects_cross_meeting_feedback_for_same_speaker() {
+    let temp = unique_workspace("context_same_speaker_private_feedback", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Standup".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut feedback = accepted_feedback(
+        "fb-same-speaker-private",
+        "PRIVATE_SAME_SPEAKER_FEEDBACK",
+        updated_at,
+    );
+    feedback.meeting_id = Some("m-private".to_owned());
+    feedback.speaker_id = Some("123".to_owned());
+    feedback.corrected_speaker_id = Some("123".to_owned());
+    feedback.corrected_text = Some("PRIVATE_SAME_SPEAKER_GUIDANCE".to_owned());
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "123".to_owned(),
+            username: Some("alice_dev".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: Some("Alice Example".to_owned()),
+        }],
+        user_feedback: vec![feedback],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("[0-1000] Alice Example: public standup covered release health"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.user_feedback_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_user_feedback_path()).expect("feedback");
+    assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_FEEDBACK"));
+    assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_GUIDANCE"));
+    assert!(!rendered.contains("fb-same-speaker-private"));
+}
+
+#[test]
+fn materialized_summary_context_rejects_cross_meeting_feedback_phrase_overlap() {
+    let temp = unique_workspace("context_private_feedback_phrase_overlap", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Release health".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut feedback = accepted_feedback(
+        "fb-private-phrase-overlap",
+        "PRIVATE_PHRASE_OVERLAP_NOTE release health status",
+        updated_at,
+    );
+    feedback.meeting_id = Some("m-private".to_owned());
+    feedback.corrected_text = Some("PRIVATE_PHRASE_OVERLAP_GUIDANCE release health".to_owned());
+    let context = SummaryContextInput {
+        user_feedback: vec![feedback],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest =
+        materialize_summary_context(&request, &context, Some("We discussed release health today."))
+            .expect("context should materialize");
+
+    assert_eq!(manifest.user_feedback_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_user_feedback_path()).expect("feedback");
+    assert!(!rendered.contains("PRIVATE_PHRASE_OVERLAP_NOTE"));
+    assert!(!rendered.contains("PRIVATE_PHRASE_OVERLAP_GUIDANCE"));
+    assert!(!rendered.contains("fb-private-phrase-overlap"));
+}
+
+#[test]
+fn materialized_summary_context_rejects_cross_meeting_ai_memory_for_same_speaker_name() {
+    let temp = unique_workspace("context_private_ai_memory_same_speaker", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Standup".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut memory = ai_memory_note(
+        "mem-private-same-speaker",
+        "Alice Example private plan",
+        "PRIVATE_SAME_SPEAKER_AI_MEMORY Alice Example private plan",
+        updated_at,
+    );
+    memory.source_meeting_id = Some("m-private".to_owned());
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "123".to_owned(),
+            username: Some("alice_dev".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: Some("Alice Example".to_owned()),
+        }],
+        ai_memory: vec![memory],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("[0-1000] Alice Example: public standup covered release health"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.ai_memory_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");
+    assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_AI_MEMORY"));
+    assert!(!rendered.contains("mem-private-same-speaker"));
+}
+
+#[test]
+fn materialized_summary_context_rejects_cross_meeting_alias_for_same_speaker_name() {
+    let temp = unique_workspace("context_private_alias_same_speaker", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Standup".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let mut alias = person_alias(
+        "alias-private-same-speaker",
+        "Alice Example",
+        "PRIVATE_SAME_SPEAKER_ALIAS",
+        updated_at,
+    );
+    alias.discord_user_id = None;
+    alias.source_meeting_id = Some("m-private".to_owned());
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "123".to_owned(),
+            username: Some("alice_dev".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: Some("Alice Example".to_owned()),
+        }],
+        person_aliases: vec![alias],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("[0-1000] Alice Example: public standup covered release health"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.person_aliases_count, 0);
+    let rendered =
+        std::fs::read_to_string(request.workspace.context_person_aliases_path()).expect("aliases");
+    assert!(!rendered.contains("PRIVATE_SAME_SPEAKER_ALIAS"));
+    assert!(!rendered.contains("alias-private-same-speaker"));
 }
 
 #[test]
@@ -1116,8 +1522,12 @@ fn materialized_summary_context_removes_stale_optional_template_file() {
     )
     .expect("stale template should be written");
 
-    let context_manifest = materialize_summary_context(&request, &SummaryContextInput::default())
-        .expect("context should materialize");
+    let context_manifest = materialize_summary_context(
+        &request,
+        &SummaryContextInput::default(),
+        None,
+    )
+    .expect("context should materialize");
 
     assert_eq!(context_manifest.summary_template_path, None);
     assert!(!request.workspace.context_summary_template_path().exists());
@@ -1165,7 +1575,7 @@ fn materialized_summary_context_omits_inactive_template() {
     };
 
     let context_manifest =
-        materialize_summary_context(&request, &context).expect("context should materialize");
+        materialize_summary_context(&request, &context, None).expect("context should materialize");
 
     assert_eq!(context_manifest.summary_template_path, None);
     assert_eq!(context_manifest.summary_template, None);
@@ -1201,7 +1611,7 @@ fn materialized_summary_context_reuses_existing_manifest_on_retry() {
             guild_id: "g1".to_owned(),
             content_type: DomainKnowledgeContentType::ProjectContext,
             title: "First".to_owned(),
-            body: "FIRST_BODY".to_owned(),
+            body: "FIRST_BODY Alpha Launch".to_owned(),
             active: true,
             version: 1,
             updated_actor_user_id: None,
@@ -1231,10 +1641,12 @@ fn materialized_summary_context_reuses_existing_manifest_on_retry() {
         ..SummaryContextInput::default()
     };
 
-    let first_manifest = materialize_or_load_summary_context(&request, &first_context)
-        .expect("first context should materialize");
-    let second_manifest = materialize_or_load_summary_context(&request, &second_context)
-        .expect("retry should reuse manifest");
+    let first_manifest =
+        materialize_or_load_summary_context(&request, &first_context, Some("Alpha Launch"))
+            .expect("first context should materialize");
+    let second_manifest =
+        materialize_or_load_summary_context(&request, &second_context, Some("Second"))
+            .expect("retry should reuse manifest");
     let domain_context =
         std::fs::read_to_string(request.workspace.context_domain_knowledge_path())
             .expect("domain context should be readable");
@@ -1242,6 +1654,68 @@ fn materialized_summary_context_reuses_existing_manifest_on_retry() {
     assert_eq!(second_manifest.domain_knowledge_items, first_manifest.domain_knowledge_items);
     assert!(domain_context.contains("FIRST_BODY"));
     assert!(!domain_context.contains("SECOND_BODY"));
+}
+
+#[test]
+fn materialized_summary_context_regenerates_legacy_unminimized_manifest() {
+    let temp = unique_workspace("context_legacy_unminimized", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: None,
+        workspace,
+    };
+    request
+        .workspace
+        .ensure_base_dirs()
+        .expect("workspace dirs should be created");
+    std::fs::write(
+        request.workspace.context_manifest_path(),
+        r#"{
+          "meeting_id": "m1",
+          "guild_id": "g1",
+          "voice_channel_id": "vc1",
+          "generated_at": "2026-01-01T00:00:00Z",
+          "manifest_path": "context/manifest.json",
+          "speaker_roster_path": "context/speaker_roster.md",
+          "speaker_count": 0,
+          "domain_knowledge_path": "context/domain_knowledge.md",
+          "domain_knowledge_count": 0,
+          "domain_knowledge_items": [],
+          "effective_domain_knowledge_version_id": null,
+          "summary_template_path": null,
+          "summary_template": null,
+          "effective_summary_template_id": null
+        }"#,
+    )
+    .expect("legacy manifest should be written");
+    std::fs::write(
+        request.workspace.context_ai_memory_path(),
+        "PRIVATE_STALE_LEGACY_AI_MEMORY",
+    )
+    .expect("stale AI memory context should be written");
+
+    let manifest = materialize_or_load_summary_context(
+        &request,
+        &SummaryContextInput::default(),
+        Some("current transcript"),
+    )
+    .expect("legacy context should be regenerated");
+
+    assert_eq!(manifest.context_selection_version, 1);
+    assert_eq!(manifest.ai_memory_count, 0);
+    let ai_memory_context =
+        std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");
+    assert!(!ai_memory_context.contains("PRIVATE_STALE_LEGACY_AI_MEMORY"));
 }
 
 #[test]

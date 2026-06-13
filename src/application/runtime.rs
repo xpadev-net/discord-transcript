@@ -7221,6 +7221,7 @@ impl ScaffoldHandler {
                 crate::application::summary::materialize_or_load_summary_context(
                     &request,
                     &summary_context,
+                    Some(&summary_transcript),
                 )
             })
         }) {
