@@ -67,7 +67,8 @@ use crate::infrastructure::sql::{
     ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_RAW_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
     ADMIN_RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, ADMIN_RETENTION_EXPIRED_ARTIFACTS_PREVIEW_SQL,
-    ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+    ADMIN_RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
+    ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
     ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
     ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
     ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
@@ -7488,6 +7489,14 @@ async fn collect_admin_retention_cleanup_plan(
         &mut errors,
     )
     .await;
+    let debug_workspaces = query_admin_retention_workspace_rows(
+        state,
+        ADMIN_RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL,
+        &raw_ttl,
+        guild_id,
+        &mut errors,
+    )
+    .await;
     let transcript_workspaces = query_admin_retention_workspace_rows(
         state,
         ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
@@ -7510,6 +7519,7 @@ async fn collect_admin_retention_cleanup_plan(
     };
     Ok(RetentionCleanupPlan {
         raw_workspaces,
+        debug_workspaces,
         transcript_workspaces,
         summary_workspaces,
         errors,
@@ -7598,7 +7608,9 @@ async fn build_admin_retention_cleanup_preview_with_plan(
         raw_audio: !plan.raw_workspaces.is_empty(),
         transcript: !plan.transcript_workspaces.is_empty(),
         summary: !plan.summary_workspaces.is_empty(),
-        debug: !plan.raw_workspaces.is_empty() || debug_artifact_count > 0,
+        debug: !plan.raw_workspaces.is_empty()
+            || !plan.debug_workspaces.is_empty()
+            || debug_artifact_count > 0,
     };
     let preview = AdminRetentionCleanupPreviewResponse {
         guild_id: guild_id.to_owned(),
@@ -7654,6 +7666,20 @@ fn estimate_plan_filesystem_usage(
                 usage.raw_audio_bytes = usage
                     .raw_audio_bytes
                     .saturating_add(meeting_usage.raw_audio_bytes);
+                usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    meeting_id = %meeting.meeting_id,
+                    "failed to estimate retention cleanup filesystem usage"
+                );
+            }
+        }
+    }
+    for meeting in &plan.debug_workspaces {
+        match estimate_meeting_filesystem_usage(layout, meeting) {
+            Ok(meeting_usage) => {
                 usage.debug_bytes = usage.debug_bytes.saturating_add(meeting_usage.debug_bytes);
             }
             Err(err) => {
@@ -12714,7 +12740,7 @@ mod guild_api_tests {
     use crate::domain::person_alias::{PersonAliasReviewStatus, PersonAliasSourceType};
     use crate::infrastructure::sql::{
         ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL,
-        ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL,
+        ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL, ADMIN_RETENTION_DELETE_SUMMARIES_SQL,
         ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
         ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MEETING_DETAIL_SQL,
         ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, COUNT_GUILD_MEETINGS_SQL,
@@ -13899,7 +13925,6 @@ mod guild_api_tests {
             marker_index(cleanup_preview, "require_system_admin_request")
                 < marker_index(cleanup_preview, "parse_optional_json_request_body")
         );
-
         let cleanup_run = source
             .split_once("async fn api_admin_retention_cleanup_run")
             .expect("retention cleanup run handler should exist")
@@ -13937,6 +13962,18 @@ mod guild_api_tests {
             .0;
         assert!(assignment_audit.contains("-> Result<(), StatusCode>"));
         assert!(assignment_audit.contains("require_audit_event"));
+
+        let cleanup_preview_builder = source
+            .split_once("async fn build_admin_retention_cleanup_preview_with_plan")
+            .expect("retention cleanup preview builder should exist")
+            .1
+            .split_once("async fn query_admin_retention_expired_artifacts")
+            .expect("next helper should exist")
+            .0;
+        assert!(
+            cleanup_preview_builder.contains("!plan.debug_workspaces.is_empty()"),
+            "admin retention preview should report legacy debug workspace rechecks"
+        );
     }
 
     #[test]
@@ -13950,6 +13987,10 @@ mod guild_api_tests {
             ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL
                 .contains("m.status IN ('posted', 'failed', 'aborted')")
         );
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("cleared_summary_titles AS"));
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("UPDATE meetings m"));
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("m.guild_id = $2"));
+        assert!(ADMIN_RETENTION_DELETE_SUMMARIES_SQL.contains("m.stopped_at IS NOT NULL"));
         assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("WHERE id=$1"));
         assert!(ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL.contains("AND guild_id=$2"));
         assert!(
@@ -13963,6 +14004,8 @@ mod guild_api_tests {
             ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL
                 .contains("m.status IN ('posted', 'failed', 'aborted')")
         );
+        assert!(ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL.contains("cleared_summary_title AS"));
+        assert!(ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL.contains("UPDATE meetings m"));
         assert!(
             ADMIN_RETENTION_DELETE_MEETING_ARTIFACTS_BY_KIND_SQL
                 .contains("m.status IN ('posted', 'failed', 'aborted')")

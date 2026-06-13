@@ -2,10 +2,11 @@ use discord_transcript::application::retention_cleanup::{
     RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
     RETENTION_DELETE_RAW_ARTIFACTS_SQL, RETENTION_DELETE_SUMMARIES_SQL,
     RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
-    RETENTION_EXPIRED_RAW_WORKSPACES_SQL, RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
-    RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL, RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
-    ExpiredWorkspaceRow, RetentionDeletionTargets, apply_manual_meeting_filesystem_delete,
-    enforce_retention_policy, estimate_meeting_filesystem_usage, estimate_target_filesystem_usage,
+    RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL, RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
+    RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
+    RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, ExpiredWorkspaceRow, RetentionDeletionTargets,
+    apply_manual_meeting_filesystem_delete, enforce_retention_policy,
+    estimate_meeting_filesystem_usage, estimate_target_filesystem_usage,
 };
 use discord_transcript::domain::retention::RetentionPolicy;
 use discord_transcript::infrastructure::sql::{
@@ -54,6 +55,12 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
     std::fs::write(workspace.debug_dir().join("summary_prompt.txt"), b"prompt")
         .expect("write debug");
+    std::fs::create_dir_all(workspace.legacy_debug_dir()).expect("create legacy debug");
+    std::fs::write(
+        workspace.legacy_debug_dir().join("meeting_title.txt"),
+        b"legacy title",
+    )
+    .expect("write legacy debug");
     std::fs::create_dir_all(workspace.agent_runs_debug_dir().join("failed-run-1"))
         .expect("write retained agent run debug dir");
     std::fs::write(
@@ -151,12 +158,13 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     assert_eq!(report.context_dirs_removed, 1);
     assert_eq!(report.transcript_dirs_removed, 1);
     assert_eq!(report.empty_summary_dirs_removed, 1);
-    assert_eq!(report.debug_dirs_removed, 1);
+    assert_eq!(report.debug_dirs_removed, 2);
     assert_eq!(report.agent_workspace_dirs_removed, 1);
     assert_eq!(report.transcripts_marked_deleted, 3);
     assert_eq!(report.artifacts_deleted, 12);
     assert!(!workspace.audio_dir().exists());
     assert!(!workspace.debug_dir().exists());
+    assert!(!workspace.legacy_debug_dir().exists());
     assert!(!workspace.agent_workspace_parent_dir().exists());
     assert!(!workspace.speakers_dir().exists());
     assert!(!workspace.context_dir().exists());
@@ -221,6 +229,70 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
             .iter()
             .any(|(sql, params)| sql == RETENTION_DELETE_SUMMARIES_SQL
                 && params == &vec!["90".to_owned()])
+    );
+}
+
+#[test]
+fn summary_retention_delete_clears_titles_atomically_when_summary_content_expires() {
+    assert!(
+        RETENTION_DELETE_SUMMARIES_SQL.contains("cleared_summary_titles AS"),
+        "summary cleanup should clear meeting titles in the summary delete statement"
+    );
+    assert!(
+        RETENTION_DELETE_SUMMARIES_SQL.contains("UPDATE meetings m"),
+        "summary cleanup should update meetings.title as part of deleting summaries"
+    );
+    assert!(
+        RETENTION_DELETE_SUMMARIES_SQL.contains("NOT EXISTS"),
+        "title cleanup should keep titles while a non-expired summary remains"
+    );
+    assert!(
+        RETENTION_DELETE_SUMMARIES_SQL.contains("FROM summaries active_s"),
+        "title cleanup should check for active summary rows"
+    );
+    assert!(
+        RETENTION_DELETE_SUMMARIES_SQL.contains("FROM summaries expired_s"),
+        "title cleanup should only clear titles when expired summary content exists"
+    );
+    assert!(
+        RETENTION_DELETE_SUMMARIES_SQL.contains("m.stopped_at IS NOT NULL"),
+        "title cleanup should also cover stopped old meetings whose summary rows are already gone"
+    );
+}
+
+#[test]
+fn retention_cleanup_revisits_raw_cleaned_meetings_for_legacy_debug_artifacts() {
+    let (_guard, layout) = temp_layout("debug_rerun_raw_cleaned");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    std::fs::create_dir_all(workspace.legacy_debug_dir()).expect("create legacy debug");
+    std::fs::write(
+        workspace.legacy_debug_dir().join("meeting_title.txt"),
+        b"legacy title",
+    )
+    .expect("write legacy debug");
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL, &["7"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+        .expect("debug cleanup should succeed");
+
+    assert_eq!(report.raw_workspaces_scanned, 0);
+    assert_eq!(report.debug_dirs_removed, 1);
+    assert!(!workspace.legacy_debug_dir().exists());
+    assert!(
+        executor
+            .executed
+            .iter()
+            .any(|(sql, params)| sql == RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL
+                && params == &vec!["7".to_owned()])
     );
 }
 
@@ -574,6 +646,9 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
     std::fs::write(workspace.summary_dir().join("summary.md"), b"summary")
         .expect("write summary");
     std::fs::write(workspace.debug_dir().join("debug.txt"), b"debug").expect("write debug");
+    std::fs::create_dir_all(workspace.legacy_debug_dir()).expect("create legacy debug");
+    std::fs::write(workspace.legacy_debug_dir().join("legacy.txt"), b"legacy debug")
+        .expect("write legacy debug");
 
     let usage = estimate_meeting_filesystem_usage(&layout, &meeting).expect("estimate usage");
     assert!(usage.raw_audio_bytes > 0);
@@ -610,8 +685,22 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
     assert_eq!(report.agent_workspace_dirs_removed, 0);
     assert!(workspace.transcript_dir().exists());
     assert!(workspace.debug_dir().exists());
+    assert!(workspace.legacy_debug_dir().exists());
     assert!(!workspace.audio_dir().exists());
     assert!(!workspace.speakers_dir().exists());
     assert!(!workspace.context_dir().exists());
     assert!(!workspace.summary_dir().exists());
+
+    let debug_targets = RetentionDeletionTargets {
+        raw_audio: false,
+        transcript: false,
+        summary: false,
+        debug: true,
+    };
+    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, debug_targets)
+        .expect("manual debug delete succeeds");
+    assert_eq!(report.debug_dirs_removed, 2);
+    assert_eq!(report.agent_workspace_dirs_removed, 0);
+    assert!(!workspace.debug_dir().exists());
+    assert!(!workspace.legacy_debug_dir().exists());
 }

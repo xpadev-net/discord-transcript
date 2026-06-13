@@ -17,6 +17,15 @@ WHERE stopped_at IS NOT NULL
   AND retention_raw_cleaned_at IS NULL
 "#;
 
+pub const RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL: &str = r#"
+SELECT id, guild_id, voice_channel_id
+FROM meetings
+WHERE stopped_at IS NOT NULL
+  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND status IN ('posted', 'failed', 'aborted')
+  AND retention_raw_cleaned_at IS NOT NULL
+"#;
+
 // See RETENTION_EXPIRED_RAW_WORKSPACES_SQL for why this intentionally mirrors
 // the raw-audio workspace query instead of aliasing it.
 pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
@@ -80,11 +89,47 @@ WHERE t.meeting_id = m.id
 "#;
 
 pub const RETENTION_DELETE_SUMMARIES_SQL: &str = r#"
+WITH expired_summary_meetings AS (
+  SELECT m.id
+  FROM meetings m
+  WHERE m.status IN ('posted', 'failed', 'aborted')
+    AND NOT EXISTS (
+    SELECT 1
+    FROM summaries active_s
+    WHERE active_s.meeting_id = m.id
+      AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
+    )
+    AND (
+      (
+        m.stopped_at IS NOT NULL
+        AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM summaries expired_s
+        WHERE expired_s.meeting_id = m.id
+          AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+      )
+    )
+),
+cleared_summary_titles AS (
+  UPDATE meetings m
+  SET title=NULL,
+      updated_at=NOW()
+  WHERE m.title IS NOT NULL
+    AND m.id IN (SELECT id FROM expired_summary_meetings)
+  RETURNING m.id
+)
 DELETE FROM summaries s
 USING meetings m
 WHERE s.meeting_id = m.id
   AND s.created_at < NOW() - (($1 || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
+  AND (
+    m.id NOT IN (SELECT id FROM expired_summary_meetings)
+    OR m.id IN (SELECT id FROM cleared_summary_titles)
+    OR m.title IS NULL
+  )
 "#;
 
 pub const RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL: &str = r#"
@@ -199,6 +244,7 @@ impl std::error::Error for RetentionCleanupError {}
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionCleanupPlan {
     pub raw_workspaces: Vec<ExpiredWorkspaceRow>,
+    pub debug_workspaces: Vec<ExpiredWorkspaceRow>,
     pub transcript_workspaces: Vec<ExpiredWorkspaceRow>,
     pub summary_workspaces: Vec<ExpiredWorkspaceRow>,
     pub errors: Vec<String>,
@@ -309,6 +355,13 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
         &mut errors,
     );
 
+    let debug_workspaces = collect_workspace_rows(
+        executor,
+        RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL,
+        std::slice::from_ref(&raw_ttl),
+        &mut errors,
+    );
+
     let transcript_workspaces = collect_workspace_rows(
         executor,
         RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
@@ -330,6 +383,7 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
 
     RetentionCleanupPlan {
         raw_workspaces,
+        debug_workspaces,
         transcript_workspaces,
         summary_workspaces,
         errors,
@@ -391,6 +445,11 @@ pub fn apply_retention_filesystem_cleanup(
         );
         record_cleanup_result(
             &mut errors,
+            remove_dir_if_present(&workspace.legacy_debug_dir()),
+            || report.debug_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
             remove_dir_if_present(&workspace.agent_workspace_parent_dir()),
             || report.agent_workspace_dirs_removed += 1,
         );
@@ -399,6 +458,29 @@ pub fn apply_retention_filesystem_cleanup(
                 .raw_workspace_cleaned_meeting_ids
                 .push(meeting.meeting_id.clone());
         }
+    }
+
+    for meeting in &plan.debug_workspaces {
+        let workspace = workspace_layout.for_meeting(
+            &meeting.guild_id,
+            &meeting.voice_channel_id,
+            &meeting.meeting_id,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.debug_dir()),
+            || report.debug_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.legacy_debug_dir()),
+            || report.debug_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.agent_workspace_parent_dir()),
+            || report.agent_workspace_dirs_removed += 1,
+        );
     }
 
     for meeting in &plan.transcript_workspaces {
@@ -455,7 +537,9 @@ pub fn estimate_meeting_filesystem_usage(
         transcript_bytes: dir_size_if_present(&workspace.transcript_dir())?,
         summary_bytes: dir_size_if_present(&workspace.summary_dir())?,
         debug_bytes: dir_size_if_present(&workspace.debug_dir())?.saturating_add(
-            dir_size_if_present(&workspace.agent_workspace_parent_dir())?,
+            dir_size_if_present(&workspace.legacy_debug_dir())?.saturating_add(
+                dir_size_if_present(&workspace.agent_workspace_parent_dir())?,
+            ),
         ),
     })
 }
@@ -558,6 +642,11 @@ pub fn apply_manual_meeting_filesystem_delete(
         record_cleanup_result(
             &mut errors,
             remove_dir_if_present(&workspace.debug_dir()),
+            || report.debug_dirs_removed += 1,
+        );
+        record_cleanup_result(
+            &mut errors,
+            remove_dir_if_present(&workspace.legacy_debug_dir()),
             || report.debug_dirs_removed += 1,
         );
         record_cleanup_result(
