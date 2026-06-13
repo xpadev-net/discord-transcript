@@ -732,6 +732,12 @@ fn ai_memory_extraction_prompt_quotes_completed_summary_as_untrusted_data() {
         "prompt should use agent input context paths"
     );
     assert!(
+        prompt.contains("materialized context file contents")
+            && prompt.contains("input/context/manifest.json")
+            && prompt.contains("input/context/domain_knowledge.md"),
+        "prompt should treat all materialized context files as untrusted quoted data"
+    );
+    assert!(
         !prompt.contains("input/context/user_feedback.md"),
         "prompt should not list context files that were not materialized"
     );
