@@ -389,6 +389,10 @@ impl ClaudeSummaryClient for HarnessCliSummaryClient {
         self.can_run_llm_transcript_correction()
     }
 
+    fn supports_untrusted_agent_workspace(&self) -> bool {
+        self.allow_unsafe_agent_harness
+    }
+
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
         self.summarize_with_output_contract(prompt, workdir, SUMMARY_OUTPUT_CONTRACT)
     }
@@ -399,13 +403,28 @@ impl ClaudeSummaryClient for HarnessCliSummaryClient {
         workdir: Option<&Path>,
         output: AgentOutputContract,
     ) -> Result<String, SummaryError> {
-        self.ensure_can_run_summary_harness()?;
-        retry_with_backoff(self.retry_policy, |_| match self.harness {
-            SummaryHarness::Claude => summarize_claude_stdin(self, prompt, workdir, output),
-            SummaryHarness::OpenCode => summarize_opencode_argv(self, prompt, workdir, output),
-            SummaryHarness::CursorAgent => summarize_cursor_argv(self, prompt, workdir, output),
-        })
+        if !self.supports_untrusted_agent_workspace() {
+            return Err(SummaryError::SummaryEngine(format!(
+                "refusing to run CLI summary harness `{}` over untrusted transcript/context data without explicit unsafe agent harness opt-in",
+                self.harness
+            )));
+        }
+        run_agent_harness_with_output_contract(self, prompt, workdir, output)
     }
+}
+
+fn run_agent_harness_with_output_contract(
+    client: &HarnessCliSummaryClient,
+    prompt: &str,
+    workdir: Option<&Path>,
+    output: AgentOutputContract,
+) -> Result<String, SummaryError> {
+    client.ensure_can_run_summary_harness()?;
+    retry_with_backoff(client.retry_policy, |_| match client.harness {
+        SummaryHarness::Claude => summarize_claude_stdin(client, prompt, workdir, output),
+        SummaryHarness::OpenCode => summarize_opencode_argv(client, prompt, workdir, output),
+        SummaryHarness::CursorAgent => summarize_cursor_argv(client, prompt, workdir, output),
+    })
 }
 
 fn summarize_claude_stdin(
@@ -931,9 +950,10 @@ mod tests {
     use super::{
         AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
         AgentOutputContract, CommandWhisperClient, HarnessCliSummaryClient, IntegrationError,
-        create_temp_output_file, run_command_with_timeout, sanitize_whisper_endpoint_for_log,
+        create_temp_output_file, run_agent_harness_with_output_contract, run_command_with_timeout,
+        sanitize_whisper_endpoint_for_log,
     };
-    use crate::application::summary::ClaudeSummaryClient;
+    use crate::application::summary::{ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT};
     use crate::bootstrap::config::SummaryHarness;
     use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
     use crate::infrastructure::retry::RetryPolicy;
@@ -985,11 +1005,56 @@ mod tests {
             command_timeout: Duration::from_millis(1),
         };
 
-        let err = client
-            .summarize("[0-1000] alice: run a tool", None)
-            .expect_err("unsafe agent harness must fail before command spawn");
+        let err = run_agent_harness_with_output_contract(
+            &client,
+            "[0-1000] alice: run a tool",
+            None,
+            SUMMARY_OUTPUT_CONTRACT,
+        )
+        .expect_err("unsafe agent harness must fail before command spawn");
 
         assert!(err.to_string().contains("refusing to run unsafe CLI"));
+    }
+
+    #[test]
+    fn cli_agent_harness_trait_fails_closed_without_unsafe_opt_in() {
+        let client = HarnessCliSummaryClient {
+            harness: SummaryHarness::Claude,
+            command_path: "/definitely/missing/claude".to_owned(),
+            model: "haiku".to_owned(),
+            allow_unsafe_agent_harness: false,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_millis(1),
+        };
+
+        let err = client
+            .summarize("[0-1000] alice: run a tool", None)
+            .expect_err("CLI agent harness trait must fail closed before command spawn");
+
+        assert!(
+            err.to_string()
+                .contains("without explicit unsafe agent harness opt-in")
+        );
+    }
+
+    #[test]
+    fn cli_agent_harness_trait_runs_with_explicit_unsafe_opt_in() {
+        let _guard = command_test_lock();
+        let workdir = unique_summary_workdir("summary_trait_success");
+        create_summary_agent_workdir(&workdir);
+        let script_path = write_summary_script(
+            "summary_trait_success",
+            "#!/bin/sh\nmkdir -p output\nprintf '## Summary\\nfrom trait\\n' > output/summary.md\n",
+        );
+        let client = summary_test_client(SummaryHarness::Claude, &script_path);
+
+        let markdown = client
+            .summarize("PROMPT BODY", Some(&workdir))
+            .expect("explicit unsafe opt-in should reach harness output contract");
+
+        assert_eq!(markdown, "## Summary\nfrom trait\n");
+        let _ = std::fs::remove_dir_all(&workdir);
+        let _ = std::fs::remove_file(&script_path);
     }
 
     #[test]
@@ -1038,6 +1103,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_agent_harnesses_require_unsafe_opt_in_for_untrusted_agent_workspaces() {
+        for harness in [
+            SummaryHarness::Claude,
+            SummaryHarness::OpenCode,
+            SummaryHarness::CursorAgent,
+        ] {
+            let mut client = HarnessCliSummaryClient {
+                harness,
+                command_path: "agent-cli".to_owned(),
+                model: "model-a".to_owned(),
+                allow_unsafe_agent_harness: false,
+                retry_policy: RetryPolicy::default(),
+                command_timeout: Duration::from_secs(1),
+            };
+
+            assert!(!client.supports_untrusted_agent_workspace());
+            client.allow_unsafe_agent_harness = true;
+            assert!(client.supports_untrusted_agent_workspace());
+        }
+    }
+
+    #[test]
     fn summary_harnesses_read_output_file_and_treat_stdout_as_diagnostic() {
         let _guard = command_test_lock();
         for harness in [
@@ -1060,9 +1147,13 @@ mod tests {
             );
             let client = summary_test_client(harness, &script_path);
 
-            let markdown = client
-                .summarize("PROMPT BODY", Some(&workdir))
-                .expect("summary should be read from output file");
+            let markdown = run_agent_harness_with_output_contract(
+                &client,
+                "PROMPT BODY",
+                Some(&workdir),
+                SUMMARY_OUTPUT_CONTRACT,
+            )
+            .expect("summary should be read from output file");
 
             assert_eq!(markdown, "## Summary\nfrom file\n");
             let log = std::fs::read_to_string(&log_path).expect("log should exist");
@@ -1124,17 +1215,17 @@ mod tests {
         );
         let client = summary_test_client(SummaryHarness::Claude, &script_path);
 
-        let json = client
-            .summarize_with_output_contract(
-                "PROMPT BODY",
-                Some(&workdir),
-                AgentOutputContract::new(
-                    "output/ai_memory_candidates.json",
-                    "AI memory candidate output",
-                    1024,
-                ),
-            )
-            .expect("AI memory candidates should be read from output file");
+        let json = run_agent_harness_with_output_contract(
+            &client,
+            "PROMPT BODY",
+            Some(&workdir),
+            AgentOutputContract::new(
+                "output/ai_memory_candidates.json",
+                "AI memory candidate output",
+                1024,
+            ),
+        )
+        .expect("AI memory candidates should be read from output file");
 
         assert_eq!(json, "{\"memory_notes\":[]}");
         let _ = std::fs::remove_dir_all(&workdir);
@@ -1152,9 +1243,13 @@ mod tests {
         );
         let client = summary_test_client(SummaryHarness::Claude, &script_path);
 
-        let err = client
-            .summarize("PROMPT BODY", Some(&workdir))
-            .expect_err("stdout must not be accepted as summary content");
+        let err = run_agent_harness_with_output_contract(
+            &client,
+            "PROMPT BODY",
+            Some(&workdir),
+            SUMMARY_OUTPUT_CONTRACT,
+        )
+        .expect_err("stdout must not be accepted as summary content");
 
         let message = err.to_string();
         assert!(message.contains("missing summary output file output/summary.md"));
@@ -1176,9 +1271,13 @@ mod tests {
         );
         let client = summary_test_client(SummaryHarness::Claude, &script_path);
 
-        let err = client
-            .summarize("PROMPT BODY", Some(&workdir))
-            .expect_err("missing output should fail with diagnostics only");
+        let err = run_agent_harness_with_output_contract(
+            &client,
+            "PROMPT BODY",
+            Some(&workdir),
+            SUMMARY_OUTPUT_CONTRACT,
+        )
+        .expect_err("missing output should fail with diagnostics only");
 
         let message = err.to_string();
         assert!(message.contains("stdout-start"));
@@ -1220,9 +1319,13 @@ mod tests {
             let script_path = write_summary_script(label, script);
             let client = summary_test_client(SummaryHarness::OpenCode, &script_path);
 
-            let err = client
-                .summarize("PROMPT BODY", Some(&workdir))
-                .expect_err("invalid output should fail");
+            let err = run_agent_harness_with_output_contract(
+                &client,
+                "PROMPT BODY",
+                Some(&workdir),
+                SUMMARY_OUTPUT_CONTRACT,
+            )
+            .expect_err("invalid output should fail");
 
             assert!(
                 err.to_string().contains(expected),
@@ -1244,9 +1347,13 @@ mod tests {
         );
         let client = summary_test_client(SummaryHarness::CursorAgent, &script_path);
 
-        let err = client
-            .summarize("PROMPT BODY", Some(&workdir))
-            .expect_err("nonzero command status should fail even with an output file");
+        let err = run_agent_harness_with_output_contract(
+            &client,
+            "PROMPT BODY",
+            Some(&workdir),
+            SUMMARY_OUTPUT_CONTRACT,
+        )
+        .expect_err("nonzero command status should fail even with an output file");
 
         assert!(err.to_string().contains("summary command failed"));
         assert!(!err.to_string().contains("should fail"));
@@ -1273,9 +1380,13 @@ mod tests {
         let mut client = summary_test_client(SummaryHarness::Claude, &script_path);
         client.retry_policy.max_attempts = 2;
 
-        let markdown = client
-            .summarize("PROMPT BODY", Some(&workdir))
-            .expect("second attempt should succeed with fresh output");
+        let markdown = run_agent_harness_with_output_contract(
+            &client,
+            "PROMPT BODY",
+            Some(&workdir),
+            SUMMARY_OUTPUT_CONTRACT,
+        )
+        .expect("second attempt should succeed with fresh output");
 
         assert_eq!(markdown, "## Summary\nfresh\n");
         assert_eq!(
@@ -1301,9 +1412,13 @@ mod tests {
         );
         let client = summary_test_client(SummaryHarness::CursorAgent, &script_path);
 
-        let err = client
-            .summarize("PROMPT BODY", Some(&workdir))
-            .expect_err("non-agent workdir must fail before --trust spawn");
+        let err = run_agent_harness_with_output_contract(
+            &client,
+            "PROMPT BODY",
+            Some(&workdir),
+            SUMMARY_OUTPUT_CONTRACT,
+        )
+        .expect_err("non-agent workdir must fail before --trust spawn");
 
         assert!(
             err.to_string()
