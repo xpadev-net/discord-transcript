@@ -521,6 +521,16 @@ WHERE id=$1
 "#;
 
 pub const ADMIN_RETENTION_DELETE_MEETING_SUMMARIES_SQL: &str = r#"
+WITH cleared_summary_title AS (
+  UPDATE meetings m
+  SET title=NULL,
+      updated_at=NOW()
+  WHERE m.id = $1
+    AND m.guild_id = $2
+    AND m.title IS NOT NULL
+    AND m.status IN ('posted', 'failed', 'aborted')
+  RETURNING m.id
+)
 DELETE FROM summaries
 WHERE meeting_id = $1
   AND EXISTS (
@@ -529,6 +539,10 @@ WHERE meeting_id = $1
     WHERE m.id = $1
       AND m.guild_id = $2
       AND m.status IN ('posted', 'failed', 'aborted')
+      AND (
+        m.title IS NULL
+        OR m.id IN (SELECT id FROM cleared_summary_title)
+      )
   )
 "#;
 
@@ -558,6 +572,16 @@ WHERE guild_id = $2
   AND stopped_at < NOW() - (($1 || ' days')::interval)
   AND status IN ('posted', 'failed', 'aborted')
   AND retention_raw_cleaned_at IS NULL
+"#;
+
+pub const ADMIN_RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL: &str = r#"
+SELECT id, guild_id, voice_channel_id
+FROM meetings
+WHERE guild_id = $2
+  AND stopped_at IS NOT NULL
+  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND status IN ('posted', 'failed', 'aborted')
+  AND retention_raw_cleaned_at IS NOT NULL
 "#;
 
 pub const ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
@@ -645,12 +669,50 @@ WHERE t.meeting_id = m.id
 "#;
 
 pub const ADMIN_RETENTION_DELETE_SUMMARIES_SQL: &str = r#"
+WITH expired_summary_meetings AS (
+  SELECT m.id
+  FROM meetings m
+  WHERE m.guild_id = $2
+    AND m.status IN ('posted', 'failed', 'aborted')
+    AND NOT EXISTS (
+      SELECT 1
+      FROM summaries active_s
+      WHERE active_s.meeting_id = m.id
+        AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
+    )
+    AND (
+      (
+        m.stopped_at IS NOT NULL
+        AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM summaries expired_s
+        WHERE expired_s.meeting_id = m.id
+          AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+      )
+    )
+),
+cleared_summary_titles AS (
+  UPDATE meetings m
+  SET title=NULL,
+      updated_at=NOW()
+  WHERE m.title IS NOT NULL
+    AND m.guild_id = $2
+    AND m.id IN (SELECT id FROM expired_summary_meetings)
+  RETURNING m.id
+)
 DELETE FROM summaries s
 USING meetings m
 WHERE s.meeting_id = m.id
   AND m.guild_id = $2
   AND s.created_at < NOW() - (($1 || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
+  AND (
+    m.id NOT IN (SELECT id FROM expired_summary_meetings)
+    OR m.id IN (SELECT id FROM cleared_summary_titles)
+    OR m.title IS NULL
+  )
 "#;
 
 pub const ADMIN_RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL: &str = r#"
