@@ -2923,21 +2923,10 @@ struct DiscordOverwrite {
     deny: u64,
 }
 
-fn deserialize_permission_overwrites<'de, D>(
-    deserializer: D,
-) -> Result<Vec<DiscordOverwrite>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt = Option::<Vec<DiscordOverwrite>>::deserialize(deserializer)?;
-    Ok(opt.unwrap_or_default())
-}
-
 #[derive(Deserialize)]
 struct DiscordChannelFull {
     #[serde(default)]
     id: String,
-    #[serde(default, deserialize_with = "deserialize_permission_overwrites")]
     permission_overwrites: Vec<DiscordOverwrite>,
 }
 
@@ -15199,16 +15188,15 @@ mod discord_channel_full_tests {
     use uuid::Uuid;
 
     #[test]
-    fn channel_full_permission_overwrites_omitted() {
-        let ch: DiscordChannelFull = serde_json::from_str("{}").unwrap();
-        assert!(ch.permission_overwrites.is_empty());
-    }
-
-    #[test]
-    fn channel_full_permission_overwrites_null() {
-        let ch: DiscordChannelFull =
-            serde_json::from_str(r#"{"permission_overwrites":null}"#).unwrap();
-        assert!(ch.permission_overwrites.is_empty());
+    fn channel_full_permission_overwrites_required_array() {
+        for json in [
+            "{}",
+            r#"{"permission_overwrites":null}"#,
+            r#"{"permission_overwrites":{}}"#,
+        ] {
+            let result = serde_json::from_str::<DiscordChannelFull>(json);
+            assert!(result.is_err(), "{json} unexpectedly parsed");
+        }
     }
 
     #[test]
@@ -15526,6 +15514,57 @@ mod discord_channel_full_tests {
         .await;
 
         assert_eq!(result, Ok(true));
+    }
+
+    #[tokio::test]
+    async fn invalid_channel_overwrites_do_not_cache_allow() {
+        for json in [
+            "{}",
+            r#"{"permission_overwrites":null}"#,
+            r#"{"permission_overwrites":{}}"#,
+        ] {
+            let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let payload = json.to_owned();
+
+            let result = verify_meeting_access_after_row(
+                "guild".to_owned(),
+                "voice".to_owned(),
+                "guild",
+                "user",
+                &cache,
+                async move {
+                    let channel: DiscordChannelFull =
+                        serde_json::from_str(&payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                    let permissions = compute_channel_permissions(
+                        "user",
+                        "owner",
+                        "guild",
+                        &[],
+                        &[DiscordRoleFull {
+                            id: "guild".to_owned(),
+                            name: "@everyone".to_owned(),
+                            position: 0,
+                            color: 0,
+                            managed: false,
+                            hoist: false,
+                            permissions: VIEW_CHANNEL,
+                        }],
+                        &channel.permission_overwrites,
+                    );
+                    Ok(CachedChannelPermission {
+                        can_view: permissions & VIEW_CHANNEL != 0,
+                        is_admin: false,
+                    })
+                },
+            )
+            .await;
+
+            assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
+            assert!(
+                cache.read().await.is_empty(),
+                "{json} should fail before permission cache is updated"
+            );
+        }
     }
 
     #[test]
