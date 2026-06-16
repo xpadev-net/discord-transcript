@@ -11,7 +11,6 @@ use discord_transcript::infrastructure::bot_token::{
 use discord_transcript::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
 };
-use discord_transcript::infrastructure::queue::JobQueue;
 use discord_transcript::infrastructure::retry::RetryPolicy;
 use discord_transcript::infrastructure::sql::{
     CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS,
@@ -438,24 +437,13 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
                                     chunk_count,
                                 );
                             }
-                            Ok(false) => match queue.mark_done(&result.job) {
-                                Ok(()) => {
-                                    record_summary_completion_usage_observe_only(
-                                        &mut store,
-                                        &result.output.meeting_id,
-                                        &result.job_id,
-                                        chunk_count,
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        job_id = %result.job_id,
-                                        meeting_id = %result.output.meeting_id,
-                                        error = %err,
-                                        "standalone worker could not mark already-posted summary job done"
-                                    );
-                                }
-                            },
+                            Ok(false) => {
+                                tracing::warn!(
+                                    job_id = %result.job_id,
+                                    meeting_id = %result.output.meeting_id,
+                                    "standalone worker completed summary notification but job completion will retry after lease recovery"
+                                );
+                            }
                             Err(err) => {
                                 tracing::warn!(
                                     job_id = %result.job_id,

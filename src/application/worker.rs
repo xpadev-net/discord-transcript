@@ -1055,7 +1055,6 @@ where
         }
         if !summary_enabled {
             match meeting.status {
-                MeetingStatus::Posted => {}
                 MeetingStatus::Stopping => {
                     queue.heartbeat(&job)?;
                     store.set_meeting_status(
