@@ -5,6 +5,51 @@ use std::num::NonZeroU32;
 
 use crate::domain::retention::RetentionPolicy;
 
+/// Process role used to decide which config surface must be present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppRole {
+    All,
+    WebBot,
+    Worker,
+}
+
+impl AppRole {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let key = "APP_ROLE";
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "web-bot" => Ok(Self::WebBot),
+            "worker" => Ok(Self::Worker),
+            _ => Err(ConfigError::InvalidEnv {
+                key,
+                value: raw.to_owned(),
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::WebBot => "web-bot",
+            Self::Worker => "worker",
+        }
+    }
+
+    const fn requires_discord_gateway_config(self) -> bool {
+        matches!(self, Self::All | Self::WebBot)
+    }
+
+    const fn requires_summary_harness_config(self) -> bool {
+        matches!(self, Self::All | Self::Worker)
+    }
+}
+
+impl Display for AppRole {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Which CLI drives meeting summary and transcript correction (`summarize` integration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryHarness {
@@ -44,6 +89,7 @@ impl Display for SummaryHarness {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
+    pub app_role: AppRole,
     pub discord_token: String,
     pub discord_guild_id: String,
     pub whisper_endpoint: String,
@@ -102,8 +148,21 @@ impl std::error::Error for ConfigError {}
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let discord_token = required_env("DISCORD_TOKEN")?;
-        let discord_guild_id = required_env("DISCORD_GUILD_ID")?;
+        let app_role = optional_env("APP_ROLE")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| AppRole::parse(&s))
+            .transpose()?
+            .unwrap_or(AppRole::All);
+        let discord_token = if app_role.requires_discord_gateway_config() {
+            required_env("DISCORD_TOKEN")?
+        } else {
+            optional_env("DISCORD_TOKEN").unwrap_or_default()
+        };
+        let discord_guild_id = if app_role.requires_discord_gateway_config() {
+            required_env("DISCORD_GUILD_ID")?
+        } else {
+            optional_env("DISCORD_GUILD_ID").unwrap_or_default()
+        };
         let whisper_endpoint = required_env("WHISPER_ENDPOINT")?;
         let database_url = required_env("DATABASE_URL")?;
         let chunk_storage_dir = required_env("CHUNK_STORAGE_DIR")?;
@@ -116,30 +175,32 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        let (summary_command, summary_model) = if summary_enabled {
-            validate_unsafe_agent_harness_opt_in(
-                summary_harness,
-                summary_allow_unsafe_agent_harness,
-                optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-            )?;
-            resolve_summary_settings(
-                summary_harness,
-                optional_env("SUMMARY_COMMAND"),
-                || required_env("CLAUDE_COMMAND"),
-                optional_env("SUMMARY_MODEL"),
-                optional_env("CLAUDE_MODEL"),
-            )?
-        } else {
-            disabled_summary_settings(
-                summary_harness,
-                optional_env("SUMMARY_COMMAND"),
-                optional_env("CLAUDE_COMMAND"),
-                optional_env("SUMMARY_MODEL"),
-                optional_env("CLAUDE_MODEL"),
-            )
-        };
+        let (summary_command, summary_model) =
+            if summary_enabled && app_role.requires_summary_harness_config() {
+                validate_unsafe_agent_harness_opt_in(
+                    summary_harness,
+                    summary_allow_unsafe_agent_harness,
+                    optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+                )?;
+                resolve_summary_settings(
+                    summary_harness,
+                    optional_env("SUMMARY_COMMAND"),
+                    || required_env("CLAUDE_COMMAND"),
+                    optional_env("SUMMARY_MODEL"),
+                    optional_env("CLAUDE_MODEL"),
+                )?
+            } else {
+                disabled_summary_settings(
+                    summary_harness,
+                    optional_env("SUMMARY_COMMAND"),
+                    optional_env("CLAUDE_COMMAND"),
+                    optional_env("SUMMARY_MODEL"),
+                    optional_env("CLAUDE_MODEL"),
+                )
+            };
 
         Ok(Self {
+            app_role,
             discord_token,
             discord_guild_id,
             whisper_endpoint,
@@ -209,8 +270,21 @@ impl AppConfig {
     }
 
     pub fn from_map(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
-        let discord_token = required_from_map(values, "DISCORD_TOKEN")?;
-        let discord_guild_id = required_from_map(values, "DISCORD_GUILD_ID")?;
+        let app_role = optional_from_map(values, "APP_ROLE")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| AppRole::parse(&s))
+            .transpose()?
+            .unwrap_or(AppRole::All);
+        let discord_token = if app_role.requires_discord_gateway_config() {
+            required_from_map(values, "DISCORD_TOKEN")?
+        } else {
+            optional_from_map(values, "DISCORD_TOKEN").unwrap_or_default()
+        };
+        let discord_guild_id = if app_role.requires_discord_gateway_config() {
+            required_from_map(values, "DISCORD_GUILD_ID")?
+        } else {
+            optional_from_map(values, "DISCORD_GUILD_ID").unwrap_or_default()
+        };
         let whisper_endpoint = required_from_map(values, "WHISPER_ENDPOINT")?;
         let database_url = required_from_map(values, "DATABASE_URL")?;
         let chunk_storage_dir = required_from_map(values, "CHUNK_STORAGE_DIR")?;
@@ -223,30 +297,32 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        let (summary_command, summary_model) = if summary_enabled {
-            validate_unsafe_agent_harness_opt_in(
-                summary_harness,
-                summary_allow_unsafe_agent_harness,
-                optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-            )?;
-            resolve_summary_settings(
-                summary_harness,
-                optional_from_map(values, "SUMMARY_COMMAND"),
-                || required_from_map(values, "CLAUDE_COMMAND"),
-                optional_from_map(values, "SUMMARY_MODEL"),
-                optional_from_map(values, "CLAUDE_MODEL"),
-            )?
-        } else {
-            disabled_summary_settings(
-                summary_harness,
-                optional_from_map(values, "SUMMARY_COMMAND"),
-                optional_from_map(values, "CLAUDE_COMMAND"),
-                optional_from_map(values, "SUMMARY_MODEL"),
-                optional_from_map(values, "CLAUDE_MODEL"),
-            )
-        };
+        let (summary_command, summary_model) =
+            if summary_enabled && app_role.requires_summary_harness_config() {
+                validate_unsafe_agent_harness_opt_in(
+                    summary_harness,
+                    summary_allow_unsafe_agent_harness,
+                    optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+                )?;
+                resolve_summary_settings(
+                    summary_harness,
+                    optional_from_map(values, "SUMMARY_COMMAND"),
+                    || required_from_map(values, "CLAUDE_COMMAND"),
+                    optional_from_map(values, "SUMMARY_MODEL"),
+                    optional_from_map(values, "CLAUDE_MODEL"),
+                )?
+            } else {
+                disabled_summary_settings(
+                    summary_harness,
+                    optional_from_map(values, "SUMMARY_COMMAND"),
+                    optional_from_map(values, "CLAUDE_COMMAND"),
+                    optional_from_map(values, "SUMMARY_MODEL"),
+                    optional_from_map(values, "CLAUDE_MODEL"),
+                )
+            };
 
         Ok(Self {
+            app_role,
             discord_token,
             discord_guild_id,
             whisper_endpoint,
