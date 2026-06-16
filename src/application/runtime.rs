@@ -2106,7 +2106,6 @@ where
     Q: JobQueue + Send + 'static,
 {
     let heartbeat_job = job.clone();
-    let heartbeat_job_id = heartbeat_job.id.clone();
     let interval_duration = if interval_duration.is_zero() {
         Duration::from_millis(1)
     } else {
@@ -2124,7 +2123,7 @@ where
                     };
                     if let Err(err) = result {
                         warn!(
-                            job_id = %heartbeat_job_id,
+                            job_id = %heartbeat_job.id,
                             error = %err,
                             "failed to refresh summary job lease heartbeat"
                         );
