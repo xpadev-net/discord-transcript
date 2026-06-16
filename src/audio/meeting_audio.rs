@@ -2,8 +2,9 @@ use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
 use crate::audio::songbird_adapter::SsrcTracker;
 use crate::audio::wav::{
-    MAX_WAV_CHUNK_PCM_BYTES, checked_pcm_growth, pcm_byte_len_for_duration_ms, pcm_duration_ms,
-    resample_pcm_16le,
+    MAX_SUPPORTED_WAV_SAMPLE_RATE, MAX_WAV_CHUNK_PCM_BYTES, MIN_SUPPORTED_WAV_SAMPLE_RATE,
+    checked_pcm_growth, is_supported_wav_sample_rate, pcm_byte_len_for_duration_ms,
+    pcm_duration_ms, resample_pcm_16le,
 };
 use crate::infrastructure::storage_fs::sanitize_path_component;
 use crate::infrastructure::workspace::SSRC_MAPPING_FILENAME;
@@ -190,15 +191,82 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
         ));
     }
 
+    let riff_chunk_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let riff_end = 8usize
+        .checked_add(riff_chunk_size)
+        .ok_or_else(|| format!("invalid RIFF chunk size in {}", path.display()))?;
+    if riff_end > data.len() {
+        return Err(format!(
+            "truncated RIFF chunk in {}: declared {riff_chunk_size} bytes, file has {} bytes after RIFF header",
+            path.display(),
+            data.len().saturating_sub(8)
+        ));
+    }
+    if &data[12..16] != b"fmt " {
+        return Err(format!(
+            "missing fmt chunk in WAV header for {}",
+            path.display()
+        ));
+    }
+    let fmt_chunk_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    if fmt_chunk_size != 16 {
+        return Err(format!(
+            "unsupported WAV fmt chunk size for {}: {fmt_chunk_size}",
+            path.display()
+        ));
+    }
+
+    let audio_format = u16::from_le_bytes([data[20], data[21]]);
     let channels = u16::from_le_bytes([data[22], data[23]]);
     let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+    let byte_rate = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+    let block_align = u16::from_le_bytes([data[32], data[33]]);
     let bits_per_sample = u16::from_le_bytes([data[34], data[35]]);
+    if audio_format != 1 {
+        return Err(format!(
+            "unsupported WAV audio format for {}: format={audio_format}",
+            path.display()
+        ));
+    }
     if channels != 1 || bits_per_sample != 16 {
         return Err(format!(
             "unsupported WAV format for {}: channels={}, bits_per_sample={}",
             path.display(),
             channels,
             bits_per_sample
+        ));
+    }
+    if !is_supported_wav_sample_rate(sample_rate) {
+        return Err(format!(
+            "unsupported WAV sample rate for {}: sample_rate={} (supported {}..={} Hz)",
+            path.display(),
+            sample_rate,
+            MIN_SUPPORTED_WAV_SAMPLE_RATE,
+            MAX_SUPPORTED_WAV_SAMPLE_RATE
+        ));
+    }
+    let bytes_per_sample = u32::from(bits_per_sample) / 8;
+    let expected_block_align = u16::try_from(
+        u32::from(channels)
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| format!("invalid block align in {}", path.display()))?,
+    )
+    .map_err(|_| format!("invalid block align in {}", path.display()))?;
+    if block_align != expected_block_align {
+        return Err(format!(
+            "inconsistent WAV block align for {}: block_align={}, expected={expected_block_align}",
+            path.display(),
+            block_align
+        ));
+    }
+    let expected_byte_rate = sample_rate
+        .checked_mul(u32::from(expected_block_align))
+        .ok_or_else(|| format!("invalid byte rate in {}", path.display()))?;
+    if byte_rate != expected_byte_rate {
+        return Err(format!(
+            "inconsistent WAV byte rate for {}: byte_rate={}, expected={expected_byte_rate}",
+            path.display(),
+            byte_rate
         ));
     }
     if &data[36..40] != b"data" {
@@ -208,17 +276,35 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
         ));
     }
     let data_chunk_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as usize;
+    let minimum_riff_chunk_size = 36usize
+        .checked_add(data_chunk_size)
+        .ok_or_else(|| format!("invalid data chunk size in {}", path.display()))?;
+    if riff_chunk_size < minimum_riff_chunk_size {
+        return Err(format!(
+            "inconsistent WAV chunk size in {}: riff_chunk_size={}, expected at least {minimum_riff_chunk_size}",
+            path.display(),
+            riff_chunk_size
+        ));
+    }
+    if data_chunk_size > MAX_WAV_CHUNK_PCM_BYTES {
+        return Err(format!(
+            "PCM data too large in {}: {data_chunk_size} bytes (max {MAX_WAV_CHUNK_PCM_BYTES})",
+            path.display()
+        ));
+    }
     if data_chunk_size == 0 {
         return Err(format!("empty PCM data chunk in {}", path.display()));
     }
-    if !data_chunk_size.is_multiple_of(2) {
+    if !data_chunk_size.is_multiple_of(usize::from(block_align)) {
         return Err(format!(
             "invalid PCM byte length in {}: {data_chunk_size}",
             path.display()
         ));
     }
     let pcm_start = 44usize;
-    let pcm_end = pcm_start.saturating_add(data_chunk_size);
+    let pcm_end = pcm_start
+        .checked_add(data_chunk_size)
+        .ok_or_else(|| format!("invalid PCM data size in {}", path.display()))?;
     if pcm_end > data.len() {
         return Err(format!(
             "truncated PCM data in {}: expected {data_chunk_size} bytes, found {}",
