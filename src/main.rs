@@ -346,6 +346,14 @@ mod tests {
     }
 
     #[test]
+    fn database_url_with_ssl_mode_rejects_unsupported_configured_sslmode() {
+        let err = database_url_with_ssl_mode("postgresql://user:pass@localhost/db", "require")
+            .expect_err("unsupported sslmode should fail");
+
+        assert!(err.to_string().contains("DATABASE_SSL_MODE=require"));
+    }
+
+    #[test]
     fn database_url_with_ssl_mode_rejects_unsupported_embedded_sslmode() {
         let err = database_url_with_ssl_mode(
             "postgresql://user:pass@localhost/db?sslmode=require",
