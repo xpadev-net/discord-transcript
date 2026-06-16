@@ -205,7 +205,10 @@ fn merge_confidence(a: Option<f32>, a_count: u32, b: Option<f32>, b_count: u32) 
     match (a, b) {
         (Some(x), Some(y)) => {
             let total = a_count + b_count;
-            Some((x * a_count as f32 + y * b_count as f32) / total as f32)
+            Some(
+                ((x * a_count as f32 + y * b_count as f32) / total as f32)
+                    .clamp(MIN_TRANSCRIPT_CONFIDENCE, MAX_TRANSCRIPT_CONFIDENCE),
+            )
         }
         (Some(x), None) => Some(x),
         (None, Some(y)) => Some(y),

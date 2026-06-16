@@ -237,6 +237,37 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
 }
 
 #[test]
+fn normalize_segments_clamps_merged_confidence_to_unit_range() {
+    let segments = vec![
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 0,
+            end_ms: 1_000,
+            text: "hello".to_owned(),
+            confidence: Some(1.0),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 33_554_431,
+        },
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            text: "world".to_owned(),
+            confidence: Some(1.0),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 3,
+        },
+    ];
+
+    let normalized = normalize_segments(&segments, NormalizationConfig::default());
+
+    assert_eq!(normalized.len(), 1);
+    assert_eq!(normalized[0].confidence, Some(1.0));
+}
+
+#[test]
 fn normalize_segments_orders_interleaved_speakers_before_merging() {
     let segments = vec![
         TranscriptSegment {
