@@ -3,6 +3,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub const MAX_DB_TIMESTAMP_MS: u64 = i32::MAX as u64;
+pub const MIN_TRANSCRIPT_CONFIDENCE: f32 = 0.0;
+pub const MAX_TRANSCRIPT_CONFIDENCE: f32 = 1.0;
+
+pub fn is_valid_transcript_confidence(value: f32) -> bool {
+    value.is_finite() && (MIN_TRANSCRIPT_CONFIDENCE..=MAX_TRANSCRIPT_CONFIDENCE).contains(&value)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSource {

@@ -430,6 +430,44 @@ fn parse_whisper_response_extracts_segments() {
 }
 
 #[test]
+fn parse_whisper_response_accepts_confidence_boundaries() {
+    for confidence in [0.0, 1.0] {
+        let json = format!(
+            r#"{{
+              "text": "ok",
+              "segments": [
+                {{ "speaker": "alice", "start": 0.0, "end": 1.0, "text": "ok", "confidence": {confidence} }}
+              ]
+            }}"#
+        );
+
+        let parsed = parse_whisper_response(&json).expect("boundary confidence should parse");
+        assert_eq!(parsed.segments[0].confidence, Some(confidence));
+    }
+}
+
+#[test]
+fn parse_whisper_response_rejects_confidence_outside_unit_range() {
+    for confidence in [-0.2, 42.0] {
+        let json = format!(
+            r#"{{
+              "text": "bad",
+              "segments": [
+                {{ "speaker": "alice", "start": 0.0, "end": 1.0, "text": "bad", "confidence": {confidence} }}
+              ]
+            }}"#
+        );
+
+        let err = parse_whisper_response(&json)
+            .expect_err("out-of-range confidence should be rejected");
+        assert!(
+            err.to_string().contains("between 0.0 and 1.0"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
 fn parse_whisper_response_rejects_empty_object() {
     let err = parse_whisper_response("{}").expect_err("empty object must be rejected");
     assert!(err.to_string().contains("missing field"));
