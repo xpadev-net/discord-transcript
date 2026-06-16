@@ -202,6 +202,7 @@ fn sql_job_queue_parses_claimed_job_row() {
             "2".to_owned(),
             "temporary error".to_owned(),
             "token-1".to_owned(),
+            "2026-06-08T01:02:33.000Z".to_owned(),
             "2026-06-08T01:02:03.000Z".to_owned(),
         ])],
     );
@@ -218,6 +219,7 @@ fn sql_job_queue_parses_claimed_job_row() {
     assert_eq!(job.retry_count, 2);
     assert_eq!(job.error_message.as_deref(), Some("temporary error"));
     assert_eq!(job.claim_token.as_deref(), Some("token-1"));
+    assert!(job.leased_until.is_some());
     assert!(job.next_run_at.is_some());
 }
 
@@ -550,6 +552,7 @@ fn sql_job_queue_retry_returns_failed_status() {
         retry_count: 0,
         error_message: None,
         claim_token: Some("token-1".to_owned()),
+        leased_until: Some(chrono::Utc::now() + chrono::Duration::seconds(90)),
         next_run_at: None,
     };
 

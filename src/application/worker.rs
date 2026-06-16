@@ -1257,6 +1257,7 @@ pub fn enqueue_summary_job<Q: JobQueue>(
         error_message: None,
         next_run_at: None,
         claim_token: None,
+        leased_until: None,
     }) {
         Ok(()) => {}
         Err(QueueError::AlreadyExists { .. }) => return Err(WorkerError::AlreadyExists),

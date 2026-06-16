@@ -1356,7 +1356,7 @@ WHERE id=$1
   AND job_type='summarize'
   AND status='running'
   AND (
-    (leased_until IS NOT NULL AND leased_until < NOW())
+    (leased_until IS NOT NULL AND leased_until <= NOW())
     OR (
       leased_until IS NULL
       AND updated_at < NOW() - INTERVAL '15 minutes'
@@ -1371,6 +1371,8 @@ SET leased_until = NOW() + INTERVAL '90 seconds',
 WHERE id = $1
   AND claim_token = $2
   AND status = 'running'
+  AND leased_until IS NOT NULL
+  AND leased_until > NOW()
 "#;
 
 pub const RECOVERY_SUMMARY_JOB_STATUS_SQL: &str = r#"
@@ -1397,7 +1399,7 @@ WITH requeued AS (
         WHERE job_type='summarize'
           AND status='running'
           AND (
-            (leased_until IS NOT NULL AND leased_until < NOW())
+            (leased_until IS NOT NULL AND leased_until <= NOW())
             OR (
               leased_until IS NULL
               AND updated_at < NOW() - INTERVAL '15 minutes'
@@ -1447,6 +1449,7 @@ WHERE id = (
 )
 RETURNING id, meeting_id, job_type, status, retry_count, error_message,
           claim_token,
+          to_char(leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
           to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 "#;
 
@@ -1462,6 +1465,7 @@ WHERE id = $1
   AND (next_run_at IS NULL OR next_run_at <= NOW())
 RETURNING id, meeting_id, job_type, status, retry_count, error_message,
           claim_token,
+          to_char(leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
           to_char(next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at
 "#;
 
@@ -1477,6 +1481,8 @@ SET status = 'done',
 WHERE id = $1
   AND claim_token = $2
   AND status = 'running'
+  AND leased_until IS NOT NULL
+  AND leased_until > NOW()
 "#;
 
 pub const MARK_JOB_FAILED_SQL: &str = r#"
@@ -1492,6 +1498,8 @@ SET status = 'failed',
 WHERE id = $1
   AND claim_token = $3
   AND status = 'running'
+  AND leased_until IS NOT NULL
+  AND leased_until > NOW()
 "#;
 
 pub const RETRY_JOB_SQL: &str = r#"
@@ -1514,6 +1522,8 @@ SET
 WHERE id = $1
   AND claim_token = $4
   AND status = 'running'
+  AND leased_until IS NOT NULL
+  AND leased_until > NOW()
 RETURNING status
 "#;
 

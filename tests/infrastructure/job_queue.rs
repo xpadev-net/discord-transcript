@@ -19,10 +19,10 @@ use discord_transcript::infrastructure::sql_store::{
 use discord_transcript::infrastructure::storage::{
     EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoredMeeting, UsageEventStore,
 };
+use chrono::{DateTime, Duration, Utc};
 use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use chrono::{Duration, Utc};
 
 fn stopping_meeting(id: &str) -> StoredMeeting {
     meeting_with_status(id, MeetingStatus::Stopping)
@@ -195,9 +195,16 @@ fn write_nonempty_pcm_chunk(base: &Path, meeting_id: &str) {
     std::fs::write(meeting_dir.join("u1_2_1000.pcm"), vec![1_u8; 128]).expect("pcm should write");
 }
 
+fn fixed_now() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-06-16T00:00:00.000Z")
+        .expect("fixed test timestamp should parse")
+        .with_timezone(&Utc)
+}
+
 #[test]
 fn in_memory_queue_claim_done_and_retry_flow() {
-    let mut queue = InMemoryJobQueue::new();
+    let now = fixed_now();
+    let mut queue = InMemoryJobQueue::new_at(now);
     enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
 
     let claimed = queue
@@ -205,6 +212,7 @@ fn in_memory_queue_claim_done_and_retry_flow() {
         .expect("claim should succeed")
         .expect("job should exist");
     assert_eq!(claimed.status, JobStatus::Running);
+    assert_eq!(claimed.leased_until, Some(now + Duration::seconds(90)));
 
     queue
         .mark_done(&claimed)
@@ -222,10 +230,7 @@ fn in_memory_queue_claim_done_and_retry_flow() {
         .expect("retry should succeed");
     assert_eq!(status, JobStatus::Queued);
     let retried = queue.get(&claimed2.id).expect("retried job should exist");
-    assert!(
-        retried.next_run_at.is_some_and(|next_run_at| next_run_at > Utc::now()),
-        "retry should schedule a future next_run_at"
-    );
+    assert_eq!(retried.next_run_at, Some(now + Duration::seconds(30)));
     assert!(
         queue
             .claim_next(JobType::Summarize)
@@ -233,6 +238,20 @@ fn in_memory_queue_claim_done_and_retry_flow() {
             .is_none(),
         "future next_run_at should prevent a tight retry loop"
     );
+    queue.advance_now(Duration::seconds(29));
+    assert!(
+        queue
+            .claim_next(JobType::Summarize)
+            .expect("early retry claim should succeed")
+            .is_none(),
+        "retry should stay unavailable before next_run_at"
+    );
+    queue.advance_now(Duration::seconds(1));
+    let retried_claim = queue
+        .claim_next(JobType::Summarize)
+        .expect("due retry claim should succeed")
+        .expect("retry should be due exactly at next_run_at");
+    assert_eq!(retried_claim.id, "j2");
 }
 
 #[test]
@@ -247,6 +266,7 @@ fn in_memory_queue_skips_future_next_run_at() {
             retry_count: 0,
             error_message: None,
             claim_token: None,
+            leased_until: None,
             next_run_at: Some(Utc::now() + Duration::minutes(5)),
         })
         .expect("enqueue should succeed");
@@ -322,6 +342,54 @@ fn in_memory_queue_rejects_stale_claim_token() {
         queue.get("j-stale").expect("job exists").status,
         JobStatus::Running
     );
+}
+
+#[test]
+fn in_memory_queue_rejects_expired_lease_and_recovers_stale_running() {
+    let now = fixed_now();
+    let mut queue = InMemoryJobQueue::new_at(now);
+    enqueue_summary_job(&mut queue, "j-expired", "m1").expect("enqueue should succeed");
+
+    let claimed = queue
+        .claim_next(JobType::Summarize)
+        .expect("claim should succeed")
+        .expect("job should be claimed");
+    queue.advance_now(Duration::seconds(89));
+    queue
+        .heartbeat(&claimed)
+        .expect("heartbeat before lease expiry should extend ownership");
+    assert_eq!(
+        queue.get("j-expired").and_then(|job| job.leased_until),
+        Some(now + Duration::seconds(179))
+    );
+
+    queue.set_now(now + Duration::seconds(179));
+    queue
+        .heartbeat(&claimed)
+        .expect_err("heartbeat at lease expiry must fail closed");
+    queue
+        .mark_done(&claimed)
+        .expect_err("expired owner must not finish a job");
+    queue
+        .retry(&claimed, "expired".to_owned(), 2)
+        .expect_err("expired owner must not retry a job");
+    assert_eq!(
+        queue.get("j-expired").expect("job exists").status,
+        JobStatus::Running
+    );
+
+    let recovered = queue.recover_stale_running(JobType::Summarize, 25);
+    assert_eq!(recovered, vec!["m1".to_owned()]);
+    let recovered_job = queue.get("j-expired").expect("job exists");
+    assert_eq!(recovered_job.status, JobStatus::Queued);
+    assert_eq!(recovered_job.claim_token, None);
+    assert_eq!(recovered_job.leased_until, None);
+    let reclaimed = queue
+        .claim_next(JobType::Summarize)
+        .expect("reclaim should succeed")
+        .expect("recovered job should be claimable");
+    assert_eq!(reclaimed.id, "j-expired");
+    assert_ne!(reclaimed.claim_token, claimed.claim_token);
 }
 
 #[test]
@@ -802,6 +870,7 @@ fn sql_job_queue_done_job_rejects_retry() {
             Some("0".to_owned()),
             None,
             Some("token-1".to_owned()),
+            Some("2026-06-08T01:03:00.000Z".to_owned()),
             None,
         ]],
     );
@@ -853,6 +922,7 @@ fn sql_job_queue_running_job_retry_returns_queued() {
         retry_count: 0,
         error_message: None,
         claim_token: Some("token-1".to_owned()),
+        leased_until: Some(fixed_now() + Duration::seconds(90)),
         next_run_at: None,
     };
     let status = queue
@@ -879,6 +949,7 @@ fn sql_retry_schedules_backoff_and_dead_letters_on_exhaustion() {
     assert!(RETRY_JOB_SQL.contains("LEAST(900"));
     assert!(RETRY_JOB_SQL.contains("status = 'running'"));
     assert!(RETRY_JOB_SQL.contains("claim_token = $4"));
+    assert!(RETRY_JOB_SQL.contains("leased_until > NOW()"));
     assert!(RETRY_JOB_SQL.contains("dead_lettered_at"));
     assert!(RETRY_JOB_SQL.contains("finished_at"));
     assert!(RETRY_JOB_SQL.contains("leased_until = NULL"));
@@ -897,12 +968,21 @@ fn sql_running_job_mutations_require_claim_token() {
     assert!(discord_transcript::infrastructure::sql::HEARTBEAT_RUNNING_JOB_SQL.contains(
         "claim_token = $2"
     ));
+    assert!(discord_transcript::infrastructure::sql::HEARTBEAT_RUNNING_JOB_SQL.contains(
+        "leased_until > NOW()"
+    ));
+    assert!(discord_transcript::infrastructure::sql::MARK_JOB_DONE_SQL.contains(
+        "leased_until > NOW()"
+    ));
+    assert!(discord_transcript::infrastructure::sql::MARK_JOB_FAILED_SQL.contains(
+        "leased_until > NOW()"
+    ));
 }
 
 #[test]
 fn sql_ready_summary_poll_recovers_expired_running_and_due_queued_jobs() {
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("status='running'"));
-    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("leased_until < NOW()"));
+    assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("leased_until <= NOW()"));
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("claim_token=NULL"));
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("status='queued'"));
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("next_run_at <= NOW()"));

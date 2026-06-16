@@ -1067,8 +1067,8 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
             // that this claim no longer owns a running job.
             return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
-                expected: "running with matching claim token".to_owned(),
-                actual: "missing, not running, or different claim token".to_owned(),
+                expected: "running with matching active claim token".to_owned(),
+                actual: "missing, not running, different claim token, or expired lease".to_owned(),
             });
         }
         Ok(())
@@ -1083,8 +1083,8 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         if affected == 0 {
             return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
-                expected: "running with matching claim token".to_owned(),
-                actual: "missing, not running, or different claim token".to_owned(),
+                expected: "running with matching active claim token".to_owned(),
+                actual: "missing, not running, different claim token, or expired lease".to_owned(),
             });
         }
         Ok(())
@@ -1102,8 +1102,8 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         if affected == 0 {
             return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
-                expected: "running with matching claim token".to_owned(),
-                actual: "missing, not running, or different claim token".to_owned(),
+                expected: "running with matching active claim token".to_owned(),
+                actual: "missing, not running, different claim token, or expired lease".to_owned(),
             });
         }
         Ok(())
@@ -1131,8 +1131,8 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         let Some(row) = rows.into_iter().next() else {
             return Err(QueueError::InvalidState {
                 job_id: job.id.clone(),
-                expected: "running with matching claim token".to_owned(),
-                actual: "missing, not running, or different claim token".to_owned(),
+                expected: "running with matching active claim token".to_owned(),
+                actual: "missing, not running, different claim token, or expired lease".to_owned(),
             });
         };
         let status_value = row
@@ -1158,7 +1158,7 @@ fn require_job_column(
 }
 
 fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
-    if row.len() < 7 {
+    if row.len() < 9 {
         return Err(QueueError::Backend(format!(
             "invalid claimed job row length: {}",
             row.len()
@@ -1183,7 +1183,8 @@ fn parse_job_row(row: &SqlRow) -> Result<Job, QueueError> {
         retry_count,
         error_message: row.get(5).and_then(|v| v.clone()),
         claim_token: row.get(6).and_then(|v| v.clone()),
-        next_run_at: parse_optional_job_timestamp(row.get(7).and_then(|v| v.clone()))?,
+        leased_until: parse_optional_job_timestamp(row.get(7).and_then(|v| v.clone()))?,
+        next_run_at: parse_optional_job_timestamp(row.get(8).and_then(|v| v.clone()))?,
     })
 }
 
