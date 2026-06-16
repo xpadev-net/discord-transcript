@@ -109,6 +109,9 @@ async fn wait_for_gateway_bot_token_repair(revision: &mut tokio::sync::watch::Re
     if revision.changed().await.is_ok() {
         tracing::info!("retrying Discord gateway startup after guild bot token settings changed");
     } else {
+        tracing::error!(
+            "guild bot token revision channel closed; Discord gateway will remain stopped until process restart"
+        );
         std::future::pending::<()>().await;
     }
 }
@@ -293,8 +296,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayBotTokenStartDecision, database_url_with_ssl_mode, gateway_bot_token_start_decision,
-        wait_for_gateway_bot_token_repair,
+        BotTokenResolveError, GatewayBotTokenStartDecision, database_url_with_ssl_mode,
+        gateway_bot_token_start_decision, wait_for_gateway_bot_token_repair,
     };
     use discord_transcript::infrastructure::bot_token::{
         BOT_TOKEN_KEY_VERSION, BotTokenCipher, EncryptedBotToken, GuildBotTokenMetadata,
@@ -401,6 +404,20 @@ mod tests {
             decision,
             GatewayBotTokenStartDecision::Start("global-token".to_owned())
         );
+    }
+
+    #[test]
+    fn gateway_propagates_database_resolve_errors() {
+        let err = gateway_bot_token_start_decision(
+            "guild-1",
+            Err(BotTokenResolveError::Database("db down".to_owned())),
+        )
+        .expect_err("database errors should remain fatal to gateway startup");
+
+        match err {
+            BotTokenResolveError::Database(message) => assert_eq!(message, "db down"),
+            other => panic!("expected database error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
