@@ -2086,10 +2086,80 @@ enum SummaryJobRunError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const SUMMARY_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+struct SummaryJobHeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for SummaryJobHeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_summary_job_heartbeat<Q>(
+    job: &Job,
+    queue: Arc<Mutex<Q>>,
+    shutdown_token: CancellationToken,
+    interval_duration: Duration,
+) -> SummaryJobHeartbeatGuard
+where
+    Q: JobQueue + Send + 'static,
+{
+    let heartbeat_job = job.clone();
+    let heartbeat_job_id = heartbeat_job.id.clone();
+    let interval_duration = if interval_duration.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval_duration
+    };
+    let heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval_duration);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let result = {
+                        let mut queue = queue.lock().await;
+                        queue.heartbeat(&heartbeat_job)
+                    };
+                    if let Err(err) = result {
+                        warn!(
+                            job_id = %heartbeat_job_id,
+                            error = %err,
+                            "failed to refresh summary job lease heartbeat"
+                        );
+                    }
+                }
+                _ = shutdown_token.cancelled() => break,
+            }
+        }
+    });
+
+    SummaryJobHeartbeatGuard(heartbeat_task)
+}
+
 struct RuntimeSummaryJobOutput {
     job: Job,
     output: crate::application::worker::ProcessMeetingOutput,
+    heartbeat_guard: SummaryJobHeartbeatGuard,
+}
+
+async fn run_summary_job_completion_with_heartbeat<F, Fut, T>(
+    job_output: RuntimeSummaryJobOutput,
+    complete: F,
+) -> T
+where
+    F: FnOnce(Job, crate::application::worker::ProcessMeetingOutput) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let RuntimeSummaryJobOutput {
+        job,
+        output,
+        heartbeat_guard,
+    } = job_output;
+    let result = complete(job, output).await;
+    drop(heartbeat_guard);
+    result
 }
 
 impl From<String> for SummaryJobRunError {
@@ -6180,174 +6250,180 @@ impl ScaffoldHandler {
         };
         match self.process_enqueued_summary_job(&http, meeting_id).await {
             Ok(job_output) => {
-                let RuntimeSummaryJobOutput { job, output } = job_output;
-                self.refresh_summary_job_ownership(&job, "summary_post")
-                    .await
-                    .map_err(|err| match err {
-                        SummaryJobRunError::Terminal(message)
-                        | SummaryJobRunError::TerminalStatusUpdated(message)
-                        | SummaryJobRunError::NotClaimable(message)
-                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
-                    })?;
-                let summary_url = self.meeting_url(meeting_id);
-                let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
-                    vec!["会議が終了しました。要約内容がありません。".to_owned()]
-                } else {
-                    output.chunks
-                };
-                let chunks = match self.load_meeting(meeting_id).await {
-                    Ok(meeting) => summary_chunks_with_voice_channel_metadata(&meeting, chunks),
-                    Err(err) => {
-                        warn!(
-                            meeting_id = %meeting_id,
-                            error = %err,
-                            "failed to load meeting voice channel metadata for summary post"
-                        );
-                        chunks
-                    }
-                };
-                if let Err(err) =
-                    post_summary_to_report_channel(&http, report_channel_id, &chunks).await
-                {
-                    let error_message = format!("summary posting failed: {err}");
-                    let exhausted = {
-                        let mut service = self.service.lock().await;
-                        let mut queue = self.queue.lock().await;
-                        retry_summary_job_after_posting_failure(
-                            &mut service.store,
-                            &mut *queue,
-                            meeting_id,
-                            &job,
-                            error_message,
-                            self.summary_max_retries,
-                        )
+                let summary_usage =
+                    run_summary_job_completion_with_heartbeat(job_output, |job, output| async move {
+                    self.refresh_summary_job_ownership(&job, "summary_post")
+                        .await
+                        .map_err(|err| match err {
+                            SummaryJobRunError::Terminal(message)
+                            | SummaryJobRunError::TerminalStatusUpdated(message)
+                            | SummaryJobRunError::NotClaimable(message)
+                            | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                        })?;
+                    let summary_url = self.meeting_url(meeting_id);
+                    let chunks = if output.chunks.iter().all(|c| c.trim().is_empty()) {
+                        vec!["会議が終了しました。要約内容がありません。".to_owned()]
+                    } else {
+                        output.chunks
                     };
-                    let exhausted = exhausted.map_err(|state_err| format!("{err}; {state_err}"))?;
-                    if let Err(status_err) = self
+                    let chunks = match self.load_meeting(meeting_id).await {
+                        Ok(meeting) => summary_chunks_with_voice_channel_metadata(&meeting, chunks),
+                        Err(err) => {
+                            warn!(
+                                meeting_id = %meeting_id,
+                                error = %err,
+                                "failed to load meeting voice channel metadata for summary post"
+                            );
+                            chunks
+                        }
+                    };
+                    if let Err(err) =
+                        post_summary_to_report_channel(&http, report_channel_id, &chunks).await
+                    {
+                        let error_message = format!("summary posting failed: {err}");
+                        let exhausted = {
+                            let mut service = self.service.lock().await;
+                            let mut queue = self.queue.lock().await;
+                            retry_summary_job_after_posting_failure(
+                                &mut service.store,
+                                &mut *queue,
+                                meeting_id,
+                                &job,
+                                error_message,
+                                self.summary_max_retries,
+                            )
+                        };
+                        let exhausted =
+                            exhausted.map_err(|state_err| format!("{err}; {state_err}"))?;
+                        if let Err(status_err) = self
+                            .update_status_message(
+                                &http,
+                                meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: "summary_post",
+                                    error: &err,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                meeting_id = %meeting_id,
+                                error = %status_err,
+                                "failed to update status message after summary posting failure"
+                            );
+                        }
+                        if !exhausted {
+                            self.spawn_summary_retry_after(
+                                Arc::clone(&http),
+                                meeting_id.to_owned(),
+                                summary_retry_after_for_job(&job),
+                            );
+                        }
+                        if exhausted
+                            && self
+                                .meeting_status_is(meeting_id, MeetingStatus::Failed)
+                                .await
+                        {
+                            let _ = post_failure_to_report_channel(
+                                &http,
+                                report_channel_id,
+                                meeting_id,
+                                &err,
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
+                    self.refresh_summary_job_ownership(&job, "summary_post_success")
+                        .await
+                        .map_err(|err| match err {
+                            SummaryJobRunError::Terminal(message)
+                            | SummaryJobRunError::TerminalStatusUpdated(message)
+                            | SummaryJobRunError::NotClaimable(message)
+                            | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                        })?;
+                    // Post meeting URL if PUBLIC_BASE_URL is configured
+                    if let Some(ref url) = summary_url {
+                        let url_msg = format!("詳細はこちら: {url}");
+                        if let Err(err) =
+                            post_summary_to_report_channel(&http, report_channel_id, &[url_msg])
+                                .await
+                        {
+                            warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
+                        }
+                    }
+                    self.refresh_summary_job_ownership(&job, "summary_post_finalize")
+                        .await
+                        .map_err(|err| match err {
+                            SummaryJobRunError::Terminal(message)
+                            | SummaryJobRunError::TerminalStatusUpdated(message)
+                            | SummaryJobRunError::NotClaimable(message)
+                            | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                        })?;
+                    if let Err(err) = self
                         .update_status_message(
                             &http,
                             meeting_id,
-                            StatusMessageUpdate::Failed {
-                                phase: "summary_post",
-                                error: &err,
+                            StatusMessageUpdate::SummaryCompleted {
+                                summary_url: summary_url.clone(),
                             },
                         )
                         .await
                     {
                         warn!(
                             meeting_id = %meeting_id,
-                            error = %status_err,
-                            "failed to update status message after summary posting failure"
-                        );
-                    }
-                    if !exhausted {
-                        self.spawn_summary_retry_after(
-                            Arc::clone(&http),
-                            meeting_id.to_owned(),
-                            summary_retry_after_for_job(&job),
-                        );
-                    }
-                    if exhausted
-                        && self
-                            .meeting_status_is(meeting_id, MeetingStatus::Failed)
-                            .await
-                    {
-                        let _ = post_failure_to_report_channel(
-                            &http,
-                            report_channel_id,
-                            meeting_id,
-                            &err,
-                        )
-                        .await;
-                    }
-                    return Err(err);
-                }
-                self.refresh_summary_job_ownership(&job, "summary_post_success")
-                    .await
-                    .map_err(|err| match err {
-                        SummaryJobRunError::Terminal(message)
-                        | SummaryJobRunError::TerminalStatusUpdated(message)
-                        | SummaryJobRunError::NotClaimable(message)
-                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
-                    })?;
-                // Post meeting URL if PUBLIC_BASE_URL is configured
-                if let Some(ref url) = summary_url {
-                    let url_msg = format!("詳細はこちら: {url}");
-                    if let Err(err) =
-                        post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await
-                    {
-                        warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
-                    }
-                }
-                self.refresh_summary_job_ownership(&job, "summary_post_finalize")
-                    .await
-                    .map_err(|err| match err {
-                        SummaryJobRunError::Terminal(message)
-                        | SummaryJobRunError::TerminalStatusUpdated(message)
-                        | SummaryJobRunError::NotClaimable(message)
-                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
-                    })?;
-                if let Err(err) = self
-                    .update_status_message(
-                        &http,
-                        meeting_id,
-                        StatusMessageUpdate::SummaryCompleted {
-                            summary_url: summary_url.clone(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(
-                        meeting_id = %meeting_id,
-                        error = %err,
-                        "failed to update status message after summary completion"
-                    );
-                }
-                self.refresh_summary_job_ownership(&job, "summary_status_finalize")
-                    .await
-                    .map_err(|err| match err {
-                        SummaryJobRunError::Terminal(message)
-                        | SummaryJobRunError::TerminalStatusUpdated(message)
-                        | SummaryJobRunError::NotClaimable(message)
-                        | SummaryJobRunError::RetryScheduled { message, .. } => message,
-                    })?;
-                // Mark meeting as Posted and job as Done only after successful posting.
-                // This order prevents data loss: if posting fails, the job stays
-                // Running and can be recovered on restart.
-                // Trade-off: if a concurrent recovery resets the status between
-                // posting and this CAS, the CAS will fail and the summary may be
-                // posted again on the next recovery cycle. Idempotent double-post
-                // is preferred over losing the summary entirely.
-                let mut service = self.service.lock().await;
-                service
-                    .store
-                    .set_meeting_status(
-                        meeting_id,
-                        MeetingStatus::Posted,
-                        Some(MeetingStatus::Summarizing),
-                    )
-                    .map_err(|err| err.to_string())?;
-                service
-                    .store
-                    .set_error_message(meeting_id, None)
-                    .map_err(|err| err.to_string())?;
-                drop(service);
-                let mut summary_job_done = true;
-                let job_id = job.id.clone();
-                {
-                    let mut queue = self.queue.lock().await;
-                    if let Err(err) = queue.mark_done(&job) {
-                        error!(
-                            job_id = %job_id,
-                            meeting_id = %meeting_id,
                             error = %err,
-                            "failed to mark summary job as done — job may be re-processed on restart"
+                            "failed to update status message after summary completion"
                         );
-                        summary_job_done = false;
                     }
-                }
-                if summary_job_done {
-                    self.record_summary_run_usage(meeting_id, &job_id, chunks.len())
+                    self.refresh_summary_job_ownership(&job, "summary_status_finalize")
+                        .await
+                        .map_err(|err| match err {
+                            SummaryJobRunError::Terminal(message)
+                            | SummaryJobRunError::TerminalStatusUpdated(message)
+                            | SummaryJobRunError::NotClaimable(message)
+                            | SummaryJobRunError::RetryScheduled { message, .. } => message,
+                        })?;
+                    // Mark meeting as Posted and job as Done only after successful posting.
+                    // This order prevents data loss: if posting fails, the job stays
+                    // Running and can be recovered on restart.
+                    // Trade-off: if a concurrent recovery resets the status between
+                    // posting and this CAS, the CAS will fail and the summary may be
+                    // posted again on the next recovery cycle. Idempotent double-post
+                    // is preferred over losing the summary entirely.
+                    let mut service = self.service.lock().await;
+                    service
+                        .store
+                        .set_meeting_status(
+                            meeting_id,
+                            MeetingStatus::Posted,
+                            Some(MeetingStatus::Summarizing),
+                        )
+                        .map_err(|err| err.to_string())?;
+                    service
+                        .store
+                        .set_error_message(meeting_id, None)
+                        .map_err(|err| err.to_string())?;
+                    drop(service);
+                    let mut summary_job_done = true;
+                    let job_id = job.id.clone();
+                    {
+                        let mut queue = self.queue.lock().await;
+                        if let Err(err) = queue.mark_done(&job) {
+                            error!(
+                                job_id = %job_id,
+                                meeting_id = %meeting_id,
+                                error = %err,
+                                "failed to mark summary job as done — job may be re-processed on restart"
+                            );
+                            summary_job_done = false;
+                        }
+                    }
+                    Ok(summary_job_done.then_some((job_id, chunks.len())))
+                })
+                .await?;
+                if let Some((job_id, chunk_count)) = summary_usage {
+                    self.record_summary_run_usage(meeting_id, &job_id, chunk_count)
                         .await;
                 }
                 Ok(())
@@ -6774,39 +6850,12 @@ impl ScaffoldHandler {
             );
         }
 
-        let heartbeat_job = claimed_job.clone();
-        let heartbeat_job_id = heartbeat_job.id.clone();
-        let heartbeat_queue = self.queue.clone();
-        let heartbeat_shutdown = self.shutdown_token.clone();
-        let heartbeat_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let result = {
-                            let mut queue = heartbeat_queue.lock().await;
-                            queue.heartbeat(&heartbeat_job)
-                        };
-                        if let Err(err) = result {
-                            warn!(
-                                job_id = %heartbeat_job_id,
-                                error = %err,
-                                "failed to refresh summary job lease heartbeat"
-                            );
-                        }
-                    }
-                    _ = heartbeat_shutdown.cancelled() => break,
-                }
-            }
-        });
-        struct SummaryJobHeartbeatGuard(tokio::task::JoinHandle<()>);
-        impl Drop for SummaryJobHeartbeatGuard {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-        let _heartbeat_guard = SummaryJobHeartbeatGuard(heartbeat_task);
+        let heartbeat_guard = spawn_summary_job_heartbeat(
+            &claimed_job,
+            Arc::clone(&self.queue),
+            self.shutdown_token.clone(),
+            SUMMARY_JOB_HEARTBEAT_INTERVAL,
+        );
 
         let final_segments = {
             let mut service = self.service.lock().await;
@@ -7819,6 +7868,7 @@ impl ScaffoldHandler {
                 chunks,
             },
             job: claimed_job,
+            heartbeat_guard,
         })
     }
 
@@ -9822,6 +9872,285 @@ mod status_message_tests {
             claim_token: Some("token-m1".to_owned()),
             next_run_at: None,
         }
+    }
+
+    struct LeaseAwareSummaryJobState {
+        inner: StdMutex<LeaseAwareSummaryJobInner>,
+        heartbeat_notify: Notify,
+    }
+
+    struct LeaseAwareSummaryJobInner {
+        status: crate::domain::JobStatus,
+        claim_token: Option<String>,
+        lease_expires_at: Instant,
+        heartbeat_attempts: usize,
+        heartbeat_count: usize,
+        ready_polls: usize,
+        second_claims: usize,
+        done_count: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LeaseAwareSummaryJobSnapshot {
+        status: crate::domain::JobStatus,
+        heartbeat_attempts: usize,
+        heartbeat_count: usize,
+        ready_polls: usize,
+        second_claims: usize,
+        done_count: usize,
+    }
+
+    impl LeaseAwareSummaryJobState {
+        fn new(initial_lease: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                inner: StdMutex::new(LeaseAwareSummaryJobInner {
+                    status: crate::domain::JobStatus::Running,
+                    claim_token: Some("token-m1".to_owned()),
+                    lease_expires_at: Instant::now() + initial_lease,
+                    heartbeat_attempts: 0,
+                    heartbeat_count: 0,
+                    ready_polls: 0,
+                    second_claims: 0,
+                    done_count: 0,
+                }),
+                heartbeat_notify: Notify::new(),
+            })
+        }
+
+        fn snapshot(&self) -> LeaseAwareSummaryJobSnapshot {
+            let inner = self
+                .inner
+                .lock()
+                .expect("lease state lock should not poison");
+            LeaseAwareSummaryJobSnapshot {
+                status: inner.status,
+                heartbeat_attempts: inner.heartbeat_attempts,
+                heartbeat_count: inner.heartbeat_count,
+                ready_polls: inner.ready_polls,
+                second_claims: inner.second_claims,
+                done_count: inner.done_count,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeaseAwareSummaryJobExecutor {
+        state: Arc<LeaseAwareSummaryJobState>,
+        lease_duration: Duration,
+    }
+
+    impl LeaseAwareSummaryJobExecutor {
+        fn new(state: Arc<LeaseAwareSummaryJobState>, lease_duration: Duration) -> Self {
+            Self {
+                state,
+                lease_duration,
+            }
+        }
+
+        fn claimed_job_row(claim_token: &str) -> crate::infrastructure::sql_store::SqlRow {
+            vec![
+                Some("summary-m1".to_owned()),
+                Some("m1".to_owned()),
+                Some("summarize".to_owned()),
+                Some("running".to_owned()),
+                Some("0".to_owned()),
+                None,
+                Some(claim_token.to_owned()),
+                None,
+            ]
+        }
+    }
+
+    impl SqlExecutor for LeaseAwareSummaryJobExecutor {
+        fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String> {
+            let mut inner = self
+                .state
+                .inner
+                .lock()
+                .expect("lease state lock should not poison");
+            if sql == crate::infrastructure::sql::HEARTBEAT_RUNNING_JOB_SQL {
+                inner.heartbeat_attempts += 1;
+                if params.first().is_some_and(|value| value == "summary-m1")
+                    && params.get(1) == inner.claim_token.as_ref()
+                    && inner.status == crate::domain::JobStatus::Running
+                {
+                    inner.lease_expires_at = Instant::now() + self.lease_duration;
+                    inner.heartbeat_count += 1;
+                    drop(inner);
+                    self.state.heartbeat_notify.notify_waiters();
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
+            if sql == crate::infrastructure::sql::MARK_JOB_DONE_SQL {
+                if params.first().is_some_and(|value| value == "summary-m1")
+                    && params.get(1) == inner.claim_token.as_ref()
+                    && inner.status == crate::domain::JobStatus::Running
+                {
+                    inner.status = crate::domain::JobStatus::Done;
+                    inner.claim_token = None;
+                    inner.done_count += 1;
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
+            Ok(0)
+        }
+
+        fn query_active_meeting(
+            &mut self,
+            _guild_id: &str,
+        ) -> Result<Option<crate::infrastructure::storage::StoredMeeting>, String> {
+            Ok(None)
+        }
+
+        fn query_rows(
+            &mut self,
+            sql: &str,
+            params: &[String],
+        ) -> Result<Vec<crate::infrastructure::sql_store::SqlRow>, String> {
+            let mut inner = self
+                .state
+                .inner
+                .lock()
+                .expect("lease state lock should not poison");
+            if sql == crate::infrastructure::sql::RECOVERY_READY_SUMMARY_JOBS_SQL {
+                inner.ready_polls += 1;
+                if inner.status == crate::domain::JobStatus::Running
+                    && Instant::now() >= inner.lease_expires_at
+                {
+                    inner.status = crate::domain::JobStatus::Queued;
+                    inner.claim_token = None;
+                    return Ok(vec![vec![Some("m1".to_owned())]]);
+                }
+                if inner.status == crate::domain::JobStatus::Queued {
+                    return Ok(vec![vec![Some("m1".to_owned())]]);
+                }
+                return Ok(Vec::new());
+            }
+            if sql == crate::infrastructure::sql::CLAIM_JOB_BY_ID_SQL
+                && params.first().is_some_and(|value| value == "summary-m1")
+                && inner.status == crate::domain::JobStatus::Queued
+            {
+                let claim_token = params
+                    .get(1)
+                    .cloned()
+                    .ok_or_else(|| "claim token missing".to_owned())?;
+                inner.status = crate::domain::JobStatus::Running;
+                inner.claim_token = Some(claim_token.clone());
+                inner.lease_expires_at = Instant::now() + self.lease_duration;
+                inner.second_claims += 1;
+                return Ok(vec![Self::claimed_job_row(&claim_token)]);
+            }
+            Ok(Vec::new())
+        }
+
+        fn run_migration(&mut self, _migration_sql: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    async fn wait_for_heartbeats(state: &LeaseAwareSummaryJobState, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state.snapshot().heartbeat_count >= expected {
+                    break;
+                }
+                state.heartbeat_notify.notified().await;
+            }
+        })
+        .await
+        .expect("summary heartbeat should run before timeout");
+    }
+
+    #[tokio::test]
+    async fn summary_heartbeat_output_guard_prevents_ready_reclaim_during_delayed_posting() {
+        let state = LeaseAwareSummaryJobState::new(Duration::from_millis(10));
+        let queue = Arc::new(tokio::sync::Mutex::new(SqlJobQueue::new(
+            LeaseAwareSummaryJobExecutor::new(Arc::clone(&state), Duration::from_millis(50)),
+        )));
+        let posted_messages = Arc::new(AtomicUsize::new(0));
+        let job = running_summary_job();
+        let job_output = RuntimeSummaryJobOutput {
+            job: job.clone(),
+            output: crate::application::worker::ProcessMeetingOutput {
+                meeting_id: "m1".to_owned(),
+                title: "Weekly sync".to_owned(),
+                markdown: "Summary".to_owned(),
+                chunks: vec!["Summary".to_owned()],
+            },
+            heartbeat_guard: spawn_summary_job_heartbeat(
+                &job,
+                Arc::clone(&queue),
+                CancellationToken::new(),
+                Duration::from_millis(5),
+            ),
+        };
+
+        let heartbeat_attempts_at_done = run_summary_job_completion_with_heartbeat(job_output, {
+            let queue = Arc::clone(&queue);
+            let state = Arc::clone(&state);
+            let posted_messages = Arc::clone(&posted_messages);
+            move |posted_job, output| async move {
+                wait_for_heartbeats(&state, 2).await;
+                sleep(Duration::from_millis(30)).await;
+                let ready_during_post = {
+                    let mut queue = queue.lock().await;
+                    queue
+                        .ready_summary_meeting_ids()
+                        .expect("ready poll should succeed")
+                };
+                assert!(
+                    ready_during_post.is_empty(),
+                    "fresh heartbeat lease must keep delayed posting from being requeued"
+                );
+                let duplicate_job = {
+                    let mut queue = queue.lock().await;
+                    queue
+                        .claim_by_id(&posted_job.id)
+                        .expect("duplicate claim attempt should not fail")
+                };
+                if let Some(duplicate_job) = duplicate_job {
+                    posted_messages.fetch_add(1, Ordering::SeqCst);
+                    let mut queue = queue.lock().await;
+                    queue
+                        .mark_done(&duplicate_job)
+                        .expect("duplicate owner would be able to finish");
+                }
+
+                for _chunk in output
+                    .chunks
+                    .iter()
+                    .filter(|chunk| !chunk.trim().is_empty())
+                {
+                    posted_messages.fetch_add(1, Ordering::SeqCst);
+                }
+                assert_eq!(
+                    posted_messages.load(Ordering::SeqCst),
+                    1,
+                    "summary should be posted once"
+                );
+
+                let mut queue = queue.lock().await;
+                queue
+                    .mark_done(&posted_job)
+                    .expect("current owner should mark the job done");
+                state.snapshot().heartbeat_attempts
+            }
+        })
+        .await;
+
+        sleep(Duration::from_millis(20)).await;
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.status, crate::domain::JobStatus::Done);
+        assert_eq!(snapshot.done_count, 1);
+        assert_eq!(snapshot.ready_polls, 1);
+        assert_eq!(snapshot.second_claims, 0);
+        assert_eq!(posted_messages.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            snapshot.heartbeat_attempts, heartbeat_attempts_at_done,
+            "heartbeat task should stop after the output guard is dropped"
+        );
     }
 
     fn recording_meeting() -> crate::infrastructure::storage::StoredMeeting {
