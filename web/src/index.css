@@ -1044,6 +1044,13 @@ button {
   border-radius: 8px;
 }
 
+.audio-load-error {
+  margin-top: 10px;
+  color: var(--speaker-2);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
 .audio-placeholder {
   color: var(--text-secondary);
   font-size: 0.9rem;

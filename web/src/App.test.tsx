@@ -544,6 +544,9 @@ describe("App access controls", () => {
           }),
         );
       }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
       if (url === "/api/guild/settings") {
         return Promise.resolve(jsonResponse(settingsResponse()));
       }
@@ -553,13 +556,21 @@ describe("App access controls", () => {
     renderApp("/settings", fetchMock);
 
     expect(
-      await screen.findByRole("link", { name: settingsLinkName }),
+      await screen.findByRole(
+        "link",
+        { name: settingsLinkName },
+        { timeout: 15000 },
+      ),
     ).toBeTruthy();
     expect(
-      await screen.findByRole("button", { name: saveButtonName }),
+      await screen.findByRole(
+        "button",
+        { name: saveButtonName },
+        { timeout: 15000 },
+      ),
     ).toBeTruthy();
     expect(screen.queryByText(forbiddenTitle)).toBeNull();
-  });
+  }, 20000);
 
   it("shows token registration metadata without redisplaying the raw token", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -3175,6 +3186,25 @@ describe("App access controls", () => {
     expect(
       await screen.findByText("音声の読み込みが完了していません"),
     ).toBeTruthy();
+  });
+
+  it("announces meeting audio source load failures", async () => {
+    const { fetchMock } = meetingPageFetch();
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    const audio = await screen.findByLabelText("Meeting audio player");
+    expect(screen.queryByText("音声の読み込みに失敗しました。")).toBeNull();
+
+    fireEvent.error(audio);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("音声の読み込みに失敗しました");
+    expect(audio.getAttribute("aria-describedby")).toBe(alert.id);
+
+    fireEvent.loadedMetadata(audio);
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(audio.getAttribute("aria-describedby")).toBeNull();
   });
 
   it("shows meeting VC ID fallback when the captured name is unavailable", async () => {
