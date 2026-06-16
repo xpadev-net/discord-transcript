@@ -108,6 +108,7 @@ impl AppConfig {
         let database_url = required_env("DATABASE_URL")?;
         let chunk_storage_dir = required_env("CHUNK_STORAGE_DIR")?;
 
+        let summary_enabled = optional_env_parse_bool("SUMMARY_ENABLED", true)?;
         let summary_harness = optional_env("SUMMARY_HARNESS")
             .filter(|s| !s.trim().is_empty())
             .map(|s| SummaryHarness::parse(&s))
@@ -115,18 +116,28 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        validate_unsafe_agent_harness_opt_in(
-            summary_harness,
-            summary_allow_unsafe_agent_harness,
-            optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-        )?;
-        let (summary_command, summary_model) = resolve_summary_settings(
-            summary_harness,
-            optional_env("SUMMARY_COMMAND"),
-            || required_env("CLAUDE_COMMAND"),
-            optional_env("SUMMARY_MODEL"),
-            optional_env("CLAUDE_MODEL"),
-        )?;
+        let (summary_command, summary_model) = if summary_enabled {
+            validate_unsafe_agent_harness_opt_in(
+                summary_harness,
+                summary_allow_unsafe_agent_harness,
+                optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+            )?;
+            resolve_summary_settings(
+                summary_harness,
+                optional_env("SUMMARY_COMMAND"),
+                || required_env("CLAUDE_COMMAND"),
+                optional_env("SUMMARY_MODEL"),
+                optional_env("CLAUDE_MODEL"),
+            )?
+        } else {
+            disabled_summary_settings(
+                summary_harness,
+                optional_env("SUMMARY_COMMAND"),
+                optional_env("CLAUDE_COMMAND"),
+                optional_env("SUMMARY_MODEL"),
+                optional_env("CLAUDE_MODEL"),
+            )
+        };
 
         Ok(Self {
             discord_token,
@@ -136,7 +147,7 @@ impl AppConfig {
             summary_command,
             summary_model,
             summary_allow_unsafe_agent_harness,
-            summary_enabled: optional_env_parse_bool("SUMMARY_ENABLED", true)?,
+            summary_enabled,
             database_url,
             database_ssl_mode: optional_env("DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
@@ -205,6 +216,7 @@ impl AppConfig {
         let database_url = required_from_map(values, "DATABASE_URL")?;
         let chunk_storage_dir = required_from_map(values, "CHUNK_STORAGE_DIR")?;
 
+        let summary_enabled = optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?;
         let summary_harness = optional_from_map(values, "SUMMARY_HARNESS")
             .filter(|s| !s.trim().is_empty())
             .map(|s| SummaryHarness::parse(&s))
@@ -212,18 +224,28 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        validate_unsafe_agent_harness_opt_in(
-            summary_harness,
-            summary_allow_unsafe_agent_harness,
-            optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-        )?;
-        let (summary_command, summary_model) = resolve_summary_settings(
-            summary_harness,
-            optional_from_map(values, "SUMMARY_COMMAND"),
-            || required_from_map(values, "CLAUDE_COMMAND"),
-            optional_from_map(values, "SUMMARY_MODEL"),
-            optional_from_map(values, "CLAUDE_MODEL"),
-        )?;
+        let (summary_command, summary_model) = if summary_enabled {
+            validate_unsafe_agent_harness_opt_in(
+                summary_harness,
+                summary_allow_unsafe_agent_harness,
+                optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+            )?;
+            resolve_summary_settings(
+                summary_harness,
+                optional_from_map(values, "SUMMARY_COMMAND"),
+                || required_from_map(values, "CLAUDE_COMMAND"),
+                optional_from_map(values, "SUMMARY_MODEL"),
+                optional_from_map(values, "CLAUDE_MODEL"),
+            )?
+        } else {
+            disabled_summary_settings(
+                summary_harness,
+                optional_from_map(values, "SUMMARY_COMMAND"),
+                optional_from_map(values, "CLAUDE_COMMAND"),
+                optional_from_map(values, "SUMMARY_MODEL"),
+                optional_from_map(values, "CLAUDE_MODEL"),
+            )
+        };
 
         Ok(Self {
             discord_token,
@@ -233,7 +255,7 @@ impl AppConfig {
             summary_command,
             summary_model,
             summary_allow_unsafe_agent_harness,
-            summary_enabled: optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?,
+            summary_enabled,
             database_url,
             database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
                 .unwrap_or_else(|| "disable".to_owned()),
@@ -395,6 +417,35 @@ fn resolve_summary_settings(
     }
 
     Ok((command, model))
+}
+
+fn disabled_summary_settings(
+    harness: SummaryHarness,
+    summary_command: Option<String>,
+    claude_command: Option<String>,
+    summary_model: Option<String>,
+    claude_model: Option<String>,
+) -> (String, String) {
+    let command = summary_command
+        .or_else(|| {
+            if harness == SummaryHarness::Claude {
+                claude_command
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let mut model = if harness == SummaryHarness::OpenCode {
+        summary_model.unwrap_or_default()
+    } else {
+        summary_model.or(claude_model).unwrap_or_default()
+    };
+    if model.trim().is_empty() && harness == SummaryHarness::Claude {
+        model = "haiku".to_owned();
+    }
+
+    (command, model)
 }
 
 fn required_env(key: &'static str) -> Result<String, ConfigError> {

@@ -47,10 +47,48 @@ impl Display for WhisperParseError {
 
 impl std::error::Error for WhisperParseError {}
 
+#[cfg(test)]
 fn message_contains_http_status(message: &str, status: u16) -> bool {
+    http_status_from_message(message) == Some(status)
+}
+
+fn http_status_from_message(message: &str) -> Option<u16> {
     let lower = message.to_ascii_lowercase();
-    let spaced = format!(" {status} ");
-    lower.contains(&spaced) || lower.contains(&format!(" {status}\r"))
+    for marker in ["http_status=", "status="] {
+        if let Some(status) = parse_status_after_marker(&lower, marker) {
+            return Some(status);
+        }
+    }
+    if let Some(status) = parse_status_after_marker(&lower, "http status ") {
+        return Some(status);
+    }
+    if let Some(index) = lower.find("http/") {
+        return first_status_token(&lower[index..]);
+    }
+    None
+}
+
+fn parse_status_after_marker(message: &str, marker: &str) -> Option<u16> {
+    let index = message.find(marker)? + marker.len();
+    let digits = message[index..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    parse_http_status_token(&digits)
+}
+
+fn first_status_token(message: &str) -> Option<u16> {
+    message
+        .split(|ch: char| !ch.is_ascii_digit())
+        .find_map(parse_http_status_token)
+}
+
+fn parse_http_status_token(token: &str) -> Option<u16> {
+    if token.len() != 3 {
+        return None;
+    }
+    let status = token.parse::<u16>().ok()?;
+    if status <= 599 { Some(status) } else { None }
 }
 
 impl WhisperParseError {
@@ -58,13 +96,21 @@ impl WhisperParseError {
         match self {
             Self::InvalidSegment(_) => false,
             Self::InvalidJson(message) => {
+                if message.starts_with("malformed successful whisper response")
+                    || message.starts_with("non-retriable whisper command")
+                {
+                    return false;
+                }
+                if message.starts_with("retriable whisper transport failure") {
+                    return true;
+                }
+                if let Some(status) = http_status_from_message(message) {
+                    return status == 0 || status == 429 || (500..=599).contains(&status);
+                }
                 if !message.contains("whisper command failed") {
                     return true;
                 }
-                const NON_RETRIABLE_STATUS: &[u16] = &[400, 401, 403, 404, 405, 413, 415, 422];
-                !NON_RETRIABLE_STATUS
-                    .iter()
-                    .any(|code| message_contains_http_status(message, *code))
+                true
             }
         }
     }
@@ -121,6 +167,16 @@ mod is_retriable_tests {
         assert!(
             WhisperParseError::InvalidJson(
                 "whisper command failed: status=429 HTTP/1.1 429 Too Many Requests".to_owned()
+            )
+            .is_retriable()
+        );
+    }
+
+    #[test]
+    fn malformed_successful_json_is_not_retriable() {
+        assert!(
+            !WhisperParseError::InvalidJson(
+                "malformed successful whisper response: missing field `text`".to_owned()
             )
             .is_retriable()
         );
