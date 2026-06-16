@@ -69,6 +69,4 @@ CMD ["discord-transcript"]
 
 FROM runtime-base AS production
 
-USER app
-WORKDIR /app
 CMD ["discord-transcript"]

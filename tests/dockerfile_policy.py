@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import shlex
 from pathlib import Path
 
 
@@ -15,7 +16,7 @@ def logical_instructions(contents: str) -> list[str]:
 
     for raw_line in contents.splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
 
         current = f"{current} {line}".strip()
@@ -55,22 +56,33 @@ def global_npm_install_specs(instruction: str) -> list[str]:
         return []
 
     specs: list[str] = []
-    for command in instruction.split(";"):
-        normalized = command.replace('"', "").replace("'", "")
-        words = normalized.split()
-        try:
-            npm_index = words.index("npm")
-        except ValueError:
+    words = shlex.split(instruction)
+    index = 1
+    while index < len(words):
+        if words[index] != "npm":
+            index += 1
             continue
 
-        install_index = npm_index + 1
+        install_index = index + 1
         if install_index >= len(words) or words[install_index] not in {"install", "i"}:
-            continue
-        if "-g" not in words and "--global" not in words:
+            index += 1
             continue
 
-        for word in words[install_index + 1 :]:
-            if word in {"-g", "--global", "&&", "||"} or word.startswith("-"):
+        command = []
+        index = install_index + 1
+        while index < len(words) and words[index] not in {"&&", "||", ";"}:
+            word = words[index].removesuffix(";")
+            if word:
+                command.append(word)
+            if words[index].endswith(";"):
+                break
+            index += 1
+
+        if "-g" not in command and "--global" not in command:
+            continue
+
+        for word in command:
+            if word in {"-g", "--global"} or word.startswith("-"):
                 continue
             if "=" in word and not word.startswith("@"):
                 continue
