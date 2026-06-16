@@ -30,14 +30,17 @@ use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoreError, UsageEventStore,
 };
-use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
+use crate::infrastructure::workspace::{
+    AGENT_SUMMARY_OUTPUT_FILENAME, MeetingWorkspaceLayout, MeetingWorkspacePaths,
+};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,7 @@ pub enum WorkerError {
     Queue(String),
     Store(String),
     Summary(String),
+    Completion(String),
     /// A summary job with the same ID was already present in the queue.
     /// The caller should treat this as "a claimable job already exists" and
     /// proceed to claim it rather than treating it as a fatal error.
@@ -85,6 +89,7 @@ impl Display for WorkerError {
             Self::Queue(err) => write!(f, "queue error: {err}"),
             Self::Store(err) => write!(f, "store error: {err}"),
             Self::Summary(err) => write!(f, "summary error: {err}"),
+            Self::Completion(err) => write!(f, "summary completion error: {err}"),
             Self::AlreadyExists => write!(f, "summary job already exists in queue"),
         }
     }
@@ -707,6 +712,12 @@ where
             return Err(WorkerError::from(err));
         }
     };
+    ensure_owned()?;
+    if let Err(err) = persist_generated_summary_markdown(&request.workspace, &markdown) {
+        error!(meeting_id = %input.meeting_id, error = %err, "generated summary persistence failed");
+        revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
+        return Err(WorkerError::from(err));
+    }
     if store.supports_ai_memory_extraction() {
         match extract_ai_memory_candidates(
             claude,
@@ -906,10 +917,88 @@ pub(crate) fn markdown_with_title_for_post(title: &str, markdown: &str) -> Strin
     format!("# {title}\n\n{}", markdown.trim_start())
 }
 
+pub(crate) fn persist_generated_summary_markdown(
+    workspace: &MeetingWorkspacePaths,
+    markdown: &str,
+) -> Result<(), SummaryError> {
+    let summary_dir = workspace.summary_dir();
+    fs::create_dir_all(&summary_dir).map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to prepare generated summary directory {}: {err}",
+            summary_dir.display()
+        ))
+    })?;
+    let summary_path = summary_dir.join(AGENT_SUMMARY_OUTPUT_FILENAME);
+    fs::write(&summary_path, markdown).map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to persist generated summary {}: {err}",
+            summary_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessJobResult {
     pub job_id: String,
+    pub job: Job,
     pub output: ProcessMeetingOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryUrlNotification {
+    NotConfigured,
+    Posted,
+    FailedBestEffort,
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryStatusNotification {
+    Updated,
+    FailedBestEffort,
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryNotificationReceipt {
+    posted_chunk_count: NonZeroUsize,
+    pub url_notification: SummaryUrlNotification,
+    pub status_notification: SummaryStatusNotification,
+}
+
+impl SummaryNotificationReceipt {
+    pub fn new(
+        posted_chunk_count: usize,
+        url_notification: SummaryUrlNotification,
+        status_notification: SummaryStatusNotification,
+    ) -> Result<Self, WorkerError> {
+        let posted_chunk_count = NonZeroUsize::new(posted_chunk_count).ok_or_else(|| {
+            WorkerError::Completion(
+                "summary completion requires at least one successful Discord post chunk".to_owned(),
+            )
+        })?;
+        if url_notification == SummaryUrlNotification::NotAttempted {
+            return Err(WorkerError::Completion(
+                "summary completion requires an explicit meeting URL notification outcome"
+                    .to_owned(),
+            ));
+        }
+        if status_notification == SummaryStatusNotification::NotAttempted {
+            return Err(WorkerError::Completion(
+                "summary completion requires an explicit status message update outcome".to_owned(),
+            ));
+        }
+        Ok(Self {
+            posted_chunk_count,
+            url_notification,
+            status_notification,
+        })
+    }
+
+    pub fn posted_chunk_count(self) -> usize {
+        self.posted_chunk_count.get()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1057,24 +1146,14 @@ where
     match result {
         Ok(Some(output)) => {
             queue.heartbeat(&job)?;
-            // Set meeting status first: if this fails the job stays Running
-            // and can be retried. The reverse order (mark_done first) would
-            // leave the meeting stuck in Summarizing with no way to recover.
-            store.set_meeting_status(
-                &job.meeting_id,
-                MeetingStatus::Posted,
-                Some(MeetingStatus::Summarizing),
-            )?;
-            queue.mark_done(&job)?;
-            record_summary_run_usage_observe_only(
-                store,
-                &job.meeting_id,
-                &job.id,
-                output.chunks.len(),
+            info!(
+                job_id = %job.id,
+                meeting_id = %job.meeting_id,
+                "summary job generated; awaiting notification before completion"
             );
-            info!(job_id = %job.id, "summary job marked done");
             Ok(Some(ProcessJobResult {
-                job_id: job.id,
+                job_id: job.id.clone(),
+                job,
                 output,
             }))
         }
@@ -1102,6 +1181,55 @@ where
                 );
             }
             Err(err)
+        }
+    }
+}
+
+/// Finalize a generated summary job after user-facing notification has been
+/// attempted according to the current runtime contract.
+///
+/// This helper only owns the meeting/job completion transition. It does not
+/// record `SummaryRuns` usage; callers should record usage after `Ok(true)`
+/// with their surface-specific recorder or
+/// [`record_summary_completion_usage_observe_only`].
+pub fn complete_summary_job_after_notification<S, Q>(
+    store: &mut S,
+    queue: &mut Q,
+    job: &Job,
+    receipt: SummaryNotificationReceipt,
+) -> Result<bool, WorkerError>
+where
+    S: MeetingStore,
+    Q: JobQueue,
+{
+    let posted_chunk_count = receipt.posted_chunk_count();
+    queue.heartbeat(job)?;
+    // Set meeting status first: if this fails the job stays Running and can be
+    // retried. The reverse order (mark_done first) would leave the meeting
+    // stuck in Summarizing with no way to recover.
+    store.set_meeting_status(
+        &job.meeting_id,
+        MeetingStatus::Posted,
+        Some(MeetingStatus::Summarizing),
+    )?;
+    store.set_error_message(&job.meeting_id, None)?;
+    match queue.mark_done(job) {
+        Ok(()) => {
+            info!(
+                job_id = %job.id,
+                posted_chunk_count,
+                "summary job marked done after notification"
+            );
+            Ok(true)
+        }
+        Err(err) => {
+            error!(
+                job_id = %job.id,
+                meeting_id = %job.meeting_id,
+                error = %err,
+                "failed to mark summary job as done after notification"
+            );
+            Ok(false)
         }
     }
 }
@@ -1165,7 +1293,7 @@ fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: New
     }
 }
 
-fn record_summary_run_usage_observe_only<S: MeetingStore>(
+pub fn record_summary_completion_usage_observe_only<S: MeetingStore>(
     store: &mut S,
     meeting_id: &str,
     job_id: &str,

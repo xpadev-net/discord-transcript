@@ -15,7 +15,9 @@ use crate::application::retention_cleanup::{
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::{
-    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+    SummaryNotificationReceipt, SummaryStatusNotification, SummaryUrlNotification,
+    complete_summary_job_after_notification, enqueue_summary_job,
+    mark_summary_meeting_failed_from_summary_state,
 };
 use crate::audio::meeting_audio::{
     ProcessedAudioChunk, build_speaker_audio_inputs,
@@ -6501,17 +6503,22 @@ impl ScaffoldHandler {
                             | SummaryJobRunError::TerminalStatusUpdated(message)
                             | SummaryJobRunError::NotClaimable(message)
                             | SummaryJobRunError::RetryScheduled { message, .. } => message,
-                        })?;
+                    })?;
                     // Post meeting URL if PUBLIC_BASE_URL is configured
-                    if let Some(ref url) = summary_url {
+                    let url_notification = if let Some(ref url) = summary_url {
                         let url_msg = format!("詳細はこちら: {url}");
                         if let Err(err) =
                             post_summary_to_report_channel(&http, report_channel_id, &[url_msg])
                                 .await
                         {
                             warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
+                            SummaryUrlNotification::FailedBestEffort
+                        } else {
+                            SummaryUrlNotification::Posted
                         }
-                    }
+                    } else {
+                        SummaryUrlNotification::NotConfigured
+                    };
                     self.refresh_summary_job_ownership(&job, "summary_post_finalize")
                         .await
                         .map_err(|err| match err {
@@ -6520,7 +6527,7 @@ impl ScaffoldHandler {
                             | SummaryJobRunError::NotClaimable(message)
                             | SummaryJobRunError::RetryScheduled { message, .. } => message,
                         })?;
-                    if let Err(err) = self
+                    let status_notification = if let Err(err) = self
                         .update_status_message(
                             &http,
                             meeting_id,
@@ -6535,7 +6542,10 @@ impl ScaffoldHandler {
                             error = %err,
                             "failed to update status message after summary completion"
                         );
-                    }
+                        SummaryStatusNotification::FailedBestEffort
+                    } else {
+                        SummaryStatusNotification::Updated
+                    };
                     self.refresh_summary_job_ownership(&job, "summary_status_finalize")
                         .await
                         .map_err(|err| match err {
@@ -6551,34 +6561,24 @@ impl ScaffoldHandler {
                     // posting and this CAS, the CAS will fail and the summary may be
                     // posted again on the next recovery cycle. Idempotent double-post
                     // is preferred over losing the summary entirely.
-                    let mut service = self.service.lock().await;
-                    service
-                        .store
-                        .set_meeting_status(
-                            meeting_id,
-                            MeetingStatus::Posted,
-                            Some(MeetingStatus::Summarizing),
-                        )
-                        .map_err(|err| err.to_string())?;
-                    service
-                        .store
-                        .set_error_message(meeting_id, None)
-                        .map_err(|err| err.to_string())?;
-                    drop(service);
-                    let mut summary_job_done = true;
                     let job_id = job.id.clone();
-                    {
+                    let receipt = SummaryNotificationReceipt::new(
+                        chunks.len(),
+                        url_notification,
+                        status_notification,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    let summary_job_done = {
+                        let mut service = self.service.lock().await;
                         let mut queue = self.queue.lock().await;
-                        if let Err(err) = queue.mark_done(&job) {
-                            error!(
-                                job_id = %job_id,
-                                meeting_id = %meeting_id,
-                                error = %err,
-                                "failed to mark summary job as done — job may be re-processed on restart"
-                            );
-                            summary_job_done = false;
-                        }
-                    }
+                        complete_summary_job_after_notification(
+                            &mut service.store,
+                            &mut *queue,
+                            &job,
+                            receipt,
+                        )
+                        .map_err(|err| err.to_string())?
+                    };
                     Ok(summary_job_done.then_some((job_id, chunks.len())))
                 })
                 .await?;
