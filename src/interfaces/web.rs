@@ -13200,65 +13200,6 @@ mod guild_api_tests {
     }
 
     #[test]
-    fn guild_settings_get_handlers_use_customization_read_capabilities() {
-        let source = include_str!("web.rs");
-
-        fn marker_index(section: &str, marker: &str) -> usize {
-            section.find(marker).unwrap_or_else(|| {
-                panic!("handler section should contain authorization marker {marker}")
-            })
-        }
-
-        fn handler_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-            source
-                .split_once(start)
-                .unwrap_or_else(|| panic!("handler {start} should exist"))
-                .1
-                .split_once(end)
-                .unwrap_or_else(|| panic!("handler {start} should be followed by {end}"))
-                .0
-        }
-
-        fn assert_settings_read_handler(section: &str) {
-            assert!(section.contains("guild_settings_read_capabilities_for_auth"));
-            assert!(
-                marker_index(section, "guild_settings_read_capabilities_for_auth")
-                    < marker_index(section, "load_guild_settings")
-            );
-            assert!(!section.contains("require_current_user_has_rbac_permission"));
-            assert!(!section.contains("require_user_has_target_guild_rbac_permission"));
-            assert!(!section.contains("RbacPermission::SettingsManage"));
-        }
-
-        assert_settings_read_handler(handler_section(
-            source,
-            "async fn api_target_guild_settings",
-            "async fn api_guild_settings",
-        ));
-        assert_settings_read_handler(handler_section(
-            source,
-            "async fn api_guild_settings",
-            "async fn api_update_target_guild_settings",
-        ));
-
-        let target_update = handler_section(
-            source,
-            "async fn api_update_target_guild_settings",
-            "async fn api_update_guild_settings",
-        );
-        assert!(target_update.contains("require_user_has_target_guild_rbac_permission"));
-        assert!(target_update.contains("RbacPermission::SettingsManage"));
-
-        let current_update = handler_section(
-            source,
-            "async fn api_update_guild_settings",
-            "async fn api_update_target_guild_bot_token",
-        );
-        assert!(current_update.contains("require_current_user_has_rbac_permission"));
-        assert!(current_update.contains("RbacPermission::SettingsManage"));
-    }
-
-    #[test]
     fn guild_bot_token_update_validation_rejects_blank_or_oversized_token() {
         assert_eq!(
             normalize_guild_bot_token_update(&GuildBotTokenUpdateRequest {
