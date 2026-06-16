@@ -12,6 +12,8 @@ pub enum AudioError {
     InvalidPcmLength(usize),
     PcmTooLarge(usize),
     PcmAssemblyTooLarge { attempted: usize, max: usize },
+    UnsupportedSampleRate(u32),
+    InvalidWavFormat(&'static str),
 }
 
 impl Display for AudioError {
@@ -20,7 +22,7 @@ impl Display for AudioError {
             Self::InvalidPcmLength(length) => {
                 write!(
                     f,
-                    "invalid PCM byte length (must be multiple of 2): {length}"
+                    "invalid PCM byte length (must align to complete sample frames): {length}"
                 )
             }
             Self::PcmTooLarge(length) => {
@@ -35,6 +37,13 @@ impl Display for AudioError {
                     "PCM assembly too large: attempted {attempted} bytes (max {max})"
                 )
             }
+            Self::UnsupportedSampleRate(sample_rate) => {
+                write!(
+                    f,
+                    "unsupported WAV sample rate: {sample_rate} Hz (supported {MIN_SUPPORTED_WAV_SAMPLE_RATE}..={MAX_SUPPORTED_WAV_SAMPLE_RATE} Hz)"
+                )
+            }
+            Self::InvalidWavFormat(reason) => write!(f, "invalid WAV format: {reason}"),
         }
     }
 }
@@ -42,6 +51,14 @@ impl Display for AudioError {
 impl std::error::Error for AudioError {}
 
 pub const MAX_WAV_CHUNK_PCM_BYTES: usize = 64 * 1024 * 1024;
+// Low synthetic rates are used by focused tests; the safety-critical bounds are
+// rejecting zero and capping extreme headers before timeline/allocation math.
+pub const MIN_SUPPORTED_WAV_SAMPLE_RATE: u32 = 1;
+pub const MAX_SUPPORTED_WAV_SAMPLE_RATE: u32 = 192_000;
+
+pub fn is_supported_wav_sample_rate(sample_rate: u32) -> bool {
+    (MIN_SUPPORTED_WAV_SAMPLE_RATE..=MAX_SUPPORTED_WAV_SAMPLE_RATE).contains(&sample_rate)
+}
 
 pub fn build_wav_chunk(frames: &[BufferedFrame], sample_rate: u32) -> Result<WavChunk, AudioError> {
     let mut pcm = Vec::new();
@@ -230,13 +247,37 @@ fn build_wav_bytes(
     channels: u16,
     bits_per_sample: u16,
 ) -> Result<Vec<u8>, AudioError> {
+    if !is_supported_wav_sample_rate(sample_rate) {
+        return Err(AudioError::UnsupportedSampleRate(sample_rate));
+    }
+    if channels == 0 {
+        return Err(AudioError::InvalidWavFormat(
+            "channel count must be greater than zero",
+        ));
+    }
+    if bits_per_sample == 0 || !bits_per_sample.is_multiple_of(8) {
+        return Err(AudioError::InvalidWavFormat(
+            "bits per sample must be a non-zero multiple of 8",
+        ));
+    }
+
+    let bytes_per_sample = u32::from(bits_per_sample) / 8;
+    let block_align_u32 = u32::from(channels)
+        .checked_mul(bytes_per_sample)
+        .ok_or(AudioError::InvalidWavFormat("block align overflow"))?;
+    let block_align = u16::try_from(block_align_u32)
+        .map_err(|_| AudioError::InvalidWavFormat("block align exceeds WAV header range"))?;
+    let byte_rate = sample_rate
+        .checked_mul(block_align_u32)
+        .ok_or(AudioError::InvalidWavFormat("byte rate overflow"))?;
+    if !pcm_16le.len().is_multiple_of(usize::from(block_align)) {
+        return Err(AudioError::InvalidPcmLength(pcm_16le.len()));
+    }
     // WAV uses u32 for both subchunk2_size and chunk_size (= 36 + subchunk2_size).
     // Reject PCM data that would overflow either field.
     if pcm_16le.len() > (u32::MAX - 36) as usize {
         return Err(AudioError::PcmTooLarge(pcm_16le.len()));
     }
-    let byte_rate = sample_rate * channels as u32 * (bits_per_sample as u32 / 8);
-    let block_align = channels * (bits_per_sample / 8);
     let subchunk2_size = pcm_16le.len() as u32;
     let chunk_size = 36 + subchunk2_size;
 
