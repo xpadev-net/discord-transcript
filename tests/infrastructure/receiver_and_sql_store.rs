@@ -408,9 +408,14 @@ fn recording_insert_ignores_stopping_row_when_recovering_active_conflict() {
             started_by_user_id: "u2".to_owned(),
             effective_settings: None,
         })
-        .expect_err("missing blocker should not report stopping meeting");
+        .expect_err("missing blocker should return sanitized active conflict");
 
-    assert!(matches!(err, StoreError::Backend(_)));
+    assert_eq!(
+        err,
+        StoreError::ActiveMeetingExists {
+            meeting_id: "new".to_owned()
+        }
+    );
 }
 
 #[test]

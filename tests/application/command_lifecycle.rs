@@ -6,7 +6,9 @@ use discord_transcript::application::stop::StopOutcome;
 use discord_transcript::domain::MeetingStatus;
 use discord_transcript::domain::StopReason;
 use discord_transcript::domain::authz::UserRole;
-use discord_transcript::infrastructure::storage::{InMemoryMeetingStore, StoredMeeting};
+use discord_transcript::infrastructure::storage::{
+    CreateMeetingRequest, InMemoryMeetingStore, MeetingStore, StoreError, StoredMeeting,
+};
 use std::time::Duration;
 
 fn default_permissions() -> PermissionSet {
@@ -227,6 +229,51 @@ fn record_start_allows_when_previous_meeting_is_stopping() {
 }
 
 #[test]
+fn in_memory_store_rejects_second_recording_blocker_for_same_guild() {
+    let mut store = InMemoryMeetingStore::new();
+    store
+        .create_meeting_as_recording(create_request("recording", "g1"))
+        .expect("first recording should be stored");
+
+    let err = store
+        .create_scheduled_meeting(create_request("scheduled", "g1"))
+        .expect_err("scheduled blocker should conflict with recording");
+
+    assert_eq!(
+        err,
+        StoreError::ActiveMeetingExists {
+            meeting_id: "recording".to_owned()
+        }
+    );
+}
+
+#[test]
+fn in_memory_store_allows_recording_when_same_guild_meeting_is_stopping() {
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(StoredMeeting {
+        id: "stopping-meeting".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc-1".to_owned(),
+        voice_channel_name: None,
+        report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        title: None,
+        status: MeetingStatus::Stopping,
+        stop_reason: None,
+        error_message: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+    });
+
+    store
+        .create_meeting_as_recording(create_request("new-recording", "g1"))
+        .expect("stopping meeting should not block recording creation");
+}
+
+#[test]
 fn record_stop_is_idempotent_for_same_meeting() {
     use discord_transcript::application::stop::stop_meeting;
 
@@ -284,6 +331,20 @@ fn record_stop_is_idempotent_for_same_meeting() {
     // Verify original stop_reason was preserved
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.stop_reason, Some(StopReason::Manual));
+}
+
+fn create_request(id: &str, guild_id: &str) -> CreateMeetingRequest {
+    CreateMeetingRequest {
+        id: id.to_owned(),
+        guild_id: guild_id.to_owned(),
+        voice_channel_id: format!("vc-{id}"),
+        voice_channel_name: None,
+        report_channel_id: "report-chan".to_owned(),
+        status_message_channel_id: None,
+        status_message_id: None,
+        started_by_user_id: "u1".to_owned(),
+        effective_settings: None,
+    }
 }
 
 #[test]

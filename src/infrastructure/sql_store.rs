@@ -212,7 +212,7 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
                 Ok(Some(active)) => StoreError::ActiveMeetingExists {
                     meeting_id: active.id,
                 },
-                Ok(None) => StoreError::Backend(err),
+                Ok(None) => StoreError::ActiveMeetingExists { meeting_id },
                 Err(query_err) => query_err,
             };
         }

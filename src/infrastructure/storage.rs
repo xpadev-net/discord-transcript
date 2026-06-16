@@ -304,6 +304,16 @@ impl InMemoryMeetingStore {
             MeetingStatus::Scheduled | MeetingStatus::Recording | MeetingStatus::Stopping
         )
     }
+
+    fn active_recording_blocker(&self, guild_id: &str) -> Option<&StoredMeeting> {
+        self.meetings.values().find(|meeting| {
+            meeting.guild_id == guild_id
+                && matches!(
+                    meeting.status,
+                    MeetingStatus::Scheduled | MeetingStatus::Recording
+                )
+        })
+    }
 }
 
 impl UsageEventStore for InMemoryMeetingStore {
@@ -448,6 +458,11 @@ impl MeetingStore for InMemoryMeetingStore {
                 meeting_id: request.id,
             });
         }
+        if let Some(active) = self.active_recording_blocker(&request.guild_id) {
+            return Err(StoreError::ActiveMeetingExists {
+                meeting_id: active.id.clone(),
+            });
+        }
 
         let meeting_id = request.id.clone();
         let effective_settings = request.effective_settings.clone();
@@ -482,6 +497,11 @@ impl MeetingStore for InMemoryMeetingStore {
         if self.meetings.contains_key(&request.id) {
             return Err(StoreError::AlreadyExists {
                 meeting_id: request.id,
+            });
+        }
+        if let Some(active) = self.active_recording_blocker(&request.guild_id) {
+            return Err(StoreError::ActiveMeetingExists {
+                meeting_id: active.id.clone(),
             });
         }
 
