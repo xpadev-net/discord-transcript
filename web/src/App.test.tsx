@@ -3193,9 +3193,11 @@ describe("App access controls", () => {
     renderApp("/meetings/meeting-1", fetchMock);
 
     const audio = await screen.findByLabelText("Meeting audio player");
-    expect(screen.queryByText("音声の読み込みに失敗しました。")).toBeNull();
+    const source = audio.querySelector("source");
+    expect(source).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
 
-    fireEvent.error(audio);
+    fireEvent.error(source as HTMLSourceElement);
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("音声の読み込みに失敗しました");

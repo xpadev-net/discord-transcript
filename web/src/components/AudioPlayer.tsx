@@ -27,9 +27,12 @@ export const AudioPlayer = forwardRef<HTMLAudioElement, AudioPlayerProps>(
           aria-describedby={loadError ? errorId : undefined}
           onLoadStart={() => setFailedSrc(null)}
           onLoadedMetadata={() => setFailedSrc(null)}
-          onError={() => setFailedSrc(src)}
         >
-          <source src={src} type="audio/wav" />
+          <source
+            src={src}
+            type="audio/wav"
+            onError={() => setFailedSrc(src)}
+          />
           {captionsSrc ? (
             <track
               kind="captions"
