@@ -258,9 +258,26 @@ fn active_meeting_unique_index_migration_is_registered() {
         ),
         "stopping meetings must remain non-blocking for new recording starts"
     );
+    assert!(
+        MIGRATIONS
+            .iter()
+            .any(|migration| migration.version == "0028_active_meeting_unique_index")
+    );
+}
+
+#[test]
+fn schema_constrains_transcript_confidence_to_unit_range() {
+    let initial_schema = INITIAL_SCHEMA_SQL;
+    let incremental_schema = INCREMENTAL_MIGRATIONS_SQL;
+
+    assert!(initial_schema.contains("transcripts_confidence_check"));
+    assert!(initial_schema.contains("confidence >= 0.0 AND confidence <= 1.0"));
+    assert!(incremental_schema.contains("transcripts_confidence_check"));
+    assert!(incremental_schema.contains("confidence >= 0.0 AND confidence <= 1.0"));
+    assert!(incremental_schema.contains("NOT VALID"));
     assert_eq!(
         MIGRATIONS.last().expect("latest migration").version,
-        "0028_active_meeting_unique_index"
+        "0029_transcript_confidence_check"
     );
 }
 
