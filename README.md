@@ -50,7 +50,7 @@ done
 
 | 変数名 | デフォルト | 説明 |
 |--------|-----------|------|
-| `DATABASE_SSL_MODE` | `disable` | PostgreSQL の SSL モード |
+| `DATABASE_SSL_MODE` | `disable` | PostgreSQL の SSL モード。現時点では TLS 接続を実装していないため `disable` のみ対応し、`require` など他の値では起動を拒否します。 |
 | `SUMMARY_MAX_RETRIES` | `3` | 要約ジョブの最大リトライ回数 |
 | `INTEGRATION_RETRY_MAX_ATTEMPTS` | `3` | 外部連携の最大リトライ回数 |
 | `INTEGRATION_RETRY_INITIAL_DELAY_MS` | `200` | リトライ初回遅延 (ms) |

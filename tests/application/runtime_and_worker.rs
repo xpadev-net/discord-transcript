@@ -1694,12 +1694,18 @@ fn app_config_rejects_zero_auto_stop_grace() {
 }
 
 #[test]
-fn app_config_supports_optional_ssl_mode() {
+fn app_config_rejects_unsupported_ssl_mode() {
     let mut values = base_env();
     values.insert("DATABASE_SSL_MODE".to_owned(), "require".to_owned());
 
-    let config = AppConfig::from_map(&values).expect("config should load");
-    assert_eq!(config.database_ssl_mode, "require");
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "DATABASE_SSL_MODE",
+            value: "require".to_owned()
+        }
+    );
 }
 
 #[test]
