@@ -1425,6 +1425,146 @@ describe("App access controls", () => {
     );
   });
 
+  it("opens domain knowledge customization for domain-only RBAC users", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "domain-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_manage_domain_knowledge: true,
+            can_manage_summary_templates: false,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            is_admin: false,
+            can_manage_settings: false,
+            can_manage_domain_knowledge: true,
+            can_manage_summary_templates: false,
+          }),
+        );
+      }
+      if (url === "/api/guild/domain-knowledge?include_archived=true") {
+        return Promise.resolve(jsonResponse([domainKnowledgeItem()]));
+      }
+      if (url === "/api/guild/ai-memory?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/feedback?status=open") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url === "/api/guild/person-aliases?include_archived=true") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    expect(
+      await screen.findByRole(
+        "link",
+        { name: settingsLinkName },
+        { timeout: 15000 },
+      ),
+    ).toBeTruthy();
+    expect(await screen.findByText("AI カスタマイズ")).toBeTruthy();
+    expect(screen.getByText("有効: Project Alpha v1")).toBeTruthy();
+    expect(screen.getByText("AIメモ")).toBeTruthy();
+    expect(screen.queryByText("要約テンプレート")).toBeNull();
+    expect(screen.queryByText("Discordロール権限")).toBeNull();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: saveButtonName,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "更新" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/guild/domain-knowledge?include_archived=true",
+        expect.anything(),
+      ),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/summary-templates?include_archived=true",
+      expect.anything(),
+    );
+  });
+
+  it("opens summary template customization for template-only RBAC users", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "template-1",
+            guild_id: "guild-1",
+            is_admin: false,
+            can_manage_settings: false,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/settings") {
+        return Promise.resolve(
+          jsonResponse({
+            ...settingsResponse(),
+            is_admin: false,
+            can_manage_settings: false,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: true,
+          }),
+        );
+      }
+      if (url === "/api/guild/summary-templates?include_archived=true") {
+        return Promise.resolve(jsonResponse([summaryTemplate()]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/settings", fetchMock);
+
+    expect(await screen.findByText("AI カスタマイズ")).toBeTruthy();
+    expect(screen.getByText("有効: Default summary v1")).toBeTruthy();
+    expect(screen.queryByText("ドメイン知識")).toBeNull();
+    expect(screen.queryByText("AIメモ")).toBeNull();
+    expect(screen.queryByText("Discordロール権限")).toBeNull();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: saveButtonName,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "更新" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/guild/summary-templates?include_archived=true",
+        expect.anything(),
+      ),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/guild/domain-knowledge?include_archived=true",
+      expect.anything(),
+    );
+  });
+
   it("renders AI memory, feedback queue, and person alias settings for admins", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();

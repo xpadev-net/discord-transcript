@@ -5869,6 +5869,20 @@ async fn require_user_has_target_guild_rbac_permission(
     }
 }
 
+async fn require_user_can_access_target_guild(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    guild_id: &str,
+) -> Result<AuthConfig, StatusCode> {
+    require_active_target_guild_installation(state, guild_id).await?;
+    let discord_guilds = load_current_user_discord_guilds(state, user_id).await?;
+    if !user_can_access_target_guild(&discord_guilds, guild_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(target_auth_config(auth, guild_id))
+}
+
 async fn require_user_is_target_guild_admin(
     state: &WebState,
     auth: &AuthConfig,
@@ -5918,6 +5932,35 @@ async fn guild_settings_capabilities_for_auth(
         can_manage_domain_knowledge,
         can_manage_summary_templates,
     })
+}
+
+fn guild_settings_read_allowed(capabilities: &GuildSettingsCapabilities) -> bool {
+    capabilities.can_manage_settings
+        || capabilities.can_manage_domain_knowledge
+        || capabilities.can_manage_summary_templates
+}
+
+async fn guild_settings_read_capabilities_for_auth(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<GuildSettingsCapabilities, StatusCode> {
+    let can_manage_settings = current_user_has_rbac_permission_for_auth(
+        state,
+        auth,
+        user_id,
+        RbacPermission::SettingsManage,
+        false,
+        false,
+    )
+    .await?;
+    let capabilities =
+        guild_settings_capabilities_for_auth(state, auth, user_id, can_manage_settings).await?;
+    if guild_settings_read_allowed(&capabilities) {
+        Ok(capabilities)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 #[cfg(test)]
@@ -8676,16 +8719,10 @@ async fn api_target_guild_settings(
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
-        &state,
-        auth,
-        &user_id,
-        &guild_id,
-        RbacPermission::SettingsManage,
-    )
-    .await?;
+    let target_auth =
+        require_user_can_access_target_guild(&state, auth, &user_id, &guild_id).await?;
     let capabilities =
-        guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true).await?;
+        guild_settings_read_capabilities_for_auth(&state, &target_auth, &user_id).await?;
     let stored = load_guild_settings(&state, &target_auth.guild_id).await?;
 
     Ok(Json(guild_settings_response(
@@ -8700,9 +8737,7 @@ async fn api_guild_settings(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
-    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true).await?;
+    let capabilities = guild_settings_read_capabilities_for_auth(&state, auth, &user_id).await?;
     let stored = load_guild_settings(&state, &auth.guild_id).await?;
 
     Ok(Json(guild_settings_response(
@@ -12751,7 +12786,7 @@ mod guild_api_tests {
         discord_user_guilds_api_status, guild_admin_member_status_decision,
         guild_admin_permission_cache_key, guild_admin_required_result,
         guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
-        guild_settings_response, meeting_feedback_create_audit_detail,
+        guild_settings_read_allowed, guild_settings_response, meeting_feedback_create_audit_detail,
         meeting_feedback_idempotency_key, normalize_admin_guild_plan_assignment_list_query,
         normalize_admin_guild_plan_assignment_request, normalize_admin_plan_quota_request,
         normalize_admin_plan_request, normalize_ai_memory_request,
@@ -13129,6 +13164,98 @@ mod guild_api_tests {
         assert!(response.can_manage_settings);
         assert!(response.can_manage_domain_knowledge);
         assert!(response.can_manage_summary_templates);
+    }
+
+    #[test]
+    fn guild_settings_read_allows_customization_only_capabilities() {
+        for capabilities in [
+            GuildSettingsCapabilities {
+                is_admin: false,
+                can_manage_settings: true,
+                can_manage_domain_knowledge: false,
+                can_manage_summary_templates: false,
+            },
+            GuildSettingsCapabilities {
+                is_admin: false,
+                can_manage_settings: false,
+                can_manage_domain_knowledge: true,
+                can_manage_summary_templates: false,
+            },
+            GuildSettingsCapabilities {
+                is_admin: false,
+                can_manage_settings: false,
+                can_manage_domain_knowledge: false,
+                can_manage_summary_templates: true,
+            },
+        ] {
+            assert!(guild_settings_read_allowed(&capabilities));
+        }
+
+        assert!(!guild_settings_read_allowed(&GuildSettingsCapabilities {
+            is_admin: false,
+            can_manage_settings: false,
+            can_manage_domain_knowledge: false,
+            can_manage_summary_templates: false,
+        }));
+    }
+
+    #[test]
+    fn guild_settings_get_handlers_use_customization_read_capabilities() {
+        let source = include_str!("web.rs");
+
+        fn marker_index(section: &str, marker: &str) -> usize {
+            section.find(marker).unwrap_or_else(|| {
+                panic!("handler section should contain authorization marker {marker}")
+            })
+        }
+
+        fn handler_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("handler {start} should exist"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("handler {start} should be followed by {end}"))
+                .0
+        }
+
+        fn assert_settings_read_handler(section: &str) {
+            assert!(section.contains("guild_settings_read_capabilities_for_auth"));
+            assert!(
+                marker_index(section, "guild_settings_read_capabilities_for_auth")
+                    < marker_index(section, "load_guild_settings")
+            );
+            assert!(!section.contains("require_current_user_has_rbac_permission"));
+            assert!(!section.contains("require_user_has_target_guild_rbac_permission"));
+            assert!(!section.contains("RbacPermission::SettingsManage"));
+        }
+
+        assert_settings_read_handler(handler_section(
+            source,
+            "async fn api_target_guild_settings",
+            "async fn api_guild_settings",
+        ));
+        assert_settings_read_handler(handler_section(
+            source,
+            "async fn api_guild_settings",
+            "async fn api_update_target_guild_settings",
+        ));
+
+        let target_update = handler_section(
+            source,
+            "async fn api_update_target_guild_settings",
+            "async fn api_update_guild_settings",
+        );
+        assert!(target_update.contains("require_user_has_target_guild_rbac_permission"));
+        assert!(target_update.contains("RbacPermission::SettingsManage"));
+
+        let current_update = handler_section(
+            source,
+            "async fn api_update_guild_settings",
+            "async fn api_update_target_guild_bot_token",
+        );
+        assert!(current_update.contains("require_current_user_has_rbac_permission"));
+        assert!(current_update.contains("RbacPermission::SettingsManage"));
     }
 
     #[test]
