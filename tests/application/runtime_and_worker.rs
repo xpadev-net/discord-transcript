@@ -38,6 +38,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 struct TempWorkspaceGuard {
     base: PathBuf,
@@ -95,6 +96,9 @@ fn base_env() -> HashMap<String, String> {
     );
     values
 }
+
+const CONFIG_FROM_ENV_CHILD: &str = "DISCORD_TRANSCRIPT_CONFIG_FROM_ENV_CHILD";
+const CONFIG_FROM_ENV_CHILD_VALUE: &str = "summary-disabled-from-env";
 
 fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value should be nonzero")
@@ -1155,6 +1159,66 @@ fn app_config_loads_from_map() {
     assert!(config.whisper_resample_to_16k);
     assert_eq!(config.operational_metrics_bearer_token, None);
     assert_eq!(config.guild_bot_token_encryption_key, None);
+}
+
+#[test]
+fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_settings() {
+    let mut values = required_env_values();
+    values.remove("CLAUDE_COMMAND");
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+
+    assert!(!config.summary_enabled);
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "haiku");
+    assert!(!config.summary_allow_unsafe_agent_harness);
+}
+
+#[test]
+fn app_config_loads_from_env_when_summary_disabled_without_summary_harness_settings() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref() == Ok(CONFIG_FROM_ENV_CHILD_VALUE) {
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
+        .arg("app_config_from_env_child_loads_summary_disabled_without_summary_harness_settings")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env_clear()
+        .env(CONFIG_FROM_ENV_CHILD, CONFIG_FROM_ENV_CHILD_VALUE)
+        .env("DISCORD_TOKEN", "token")
+        .env("DISCORD_GUILD_ID", "guild")
+        .env("WHISPER_ENDPOINT", "http://whisper")
+        .env("DATABASE_URL", "postgres://localhost/db")
+        .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
+        .env("SUMMARY_ENABLED", "false")
+        .output()
+        .expect("child config test should run");
+
+    assert!(
+        output.status.success(),
+        "child config test failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn app_config_from_env_child_loads_summary_disabled_without_summary_harness_settings() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref() != Ok(CONFIG_FROM_ENV_CHILD_VALUE) {
+        return;
+    }
+
+    let config = AppConfig::from_env().expect("config should load");
+
+    assert!(!config.summary_enabled);
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "haiku");
+    assert!(!config.summary_allow_unsafe_agent_harness);
 }
 
 #[test]
