@@ -15,7 +15,7 @@ use discord_transcript::application::worker::{
     LOAD_MEETING_SPEAKERS_SQL, ProcessMeetingInput, SummaryContextStore, process_meeting_summary,
 };
 use discord_transcript::audio::build_wav_bytes_raw;
-use discord_transcript::bootstrap::config::{AppConfig, ConfigError, SummaryHarness};
+use discord_transcript::bootstrap::config::{AppConfig, AppRole, ConfigError, SummaryHarness};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
 use discord_transcript::domain::ai_memory::AiMemoryTag;
@@ -99,6 +99,8 @@ fn base_env() -> HashMap<String, String> {
 
 const CONFIG_FROM_ENV_CHILD: &str = "DISCORD_TRANSCRIPT_CONFIG_FROM_ENV_CHILD";
 const CONFIG_FROM_ENV_CHILD_VALUE: &str = "summary-disabled-from-env";
+const WEB_BOT_ROLE_CONFIG_FROM_ENV_CHILD_VALUE: &str = "web-bot-role-from-env";
+const WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE: &str = "worker-role-from-env";
 
 fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value should be nonzero")
@@ -1131,6 +1133,7 @@ fn app_config_loads_from_map() {
     let values = base_env();
 
     let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.app_role, AppRole::All);
     assert_eq!(config.discord_token, "token");
     assert_eq!(config.discord_guild_id, "guild");
     assert_eq!(config.whisper_endpoint, "http://whisper");
@@ -1177,6 +1180,91 @@ fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_setti
 }
 
 #[test]
+fn app_config_web_bot_role_does_not_require_summary_harness_settings() {
+    let mut values = required_env_values();
+    values.insert("APP_ROLE".to_owned(), "web-bot".to_owned());
+    values.remove("CLAUDE_COMMAND");
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+
+    assert_eq!(config.app_role, AppRole::WebBot);
+    assert_eq!(config.discord_token, "token");
+    assert_eq!(config.discord_guild_id, "guild");
+    assert!(config.summary_enabled);
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "haiku");
+    assert!(!config.summary_allow_unsafe_agent_harness);
+}
+
+#[test]
+fn app_config_web_bot_role_still_requires_discord_gateway_credentials() {
+    let mut values = required_env_values();
+    values.insert("APP_ROLE".to_owned(), "web-bot".to_owned());
+    values.remove("DISCORD_TOKEN");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "DISCORD_TOKEN"
+        }
+    );
+}
+
+#[test]
+fn app_config_worker_role_does_not_require_discord_gateway_credentials() {
+    let mut values = base_env();
+    values.insert("APP_ROLE".to_owned(), "worker".to_owned());
+    values.remove("DISCORD_TOKEN");
+    values.remove("DISCORD_GUILD_ID");
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+
+    assert_eq!(config.app_role, AppRole::Worker);
+    assert_eq!(config.discord_token, "");
+    assert_eq!(config.discord_guild_id, "");
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "claude");
+    assert_eq!(config.summary_model, "haiku");
+    assert!(config.summary_allow_unsafe_agent_harness);
+}
+
+#[test]
+fn app_config_worker_role_still_requires_summary_harness_settings() {
+    let mut values = required_env_values();
+    values.insert("APP_ROLE".to_owned(), "worker".to_owned());
+    values.remove("DISCORD_TOKEN");
+    values.remove("DISCORD_GUILD_ID");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS"
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_invalid_app_role() {
+    let mut values = base_env();
+    values.insert("APP_ROLE".to_owned(), "web".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "APP_ROLE",
+            value: "web".to_owned()
+        }
+    );
+}
+
+#[test]
 fn app_config_loads_from_env_when_summary_disabled_without_summary_harness_settings() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref() == Ok(CONFIG_FROM_ENV_CHILD_VALUE) {
         return;
@@ -1204,6 +1292,109 @@ fn app_config_loads_from_env_when_summary_disabled_without_summary_harness_setti
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn app_config_loads_from_env_for_web_bot_role_without_summary_harness_settings() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        == Ok(WEB_BOT_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
+        .arg("app_config_from_env_child_loads_web_bot_role_without_summary_harness_settings")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env_clear()
+        .env(CONFIG_FROM_ENV_CHILD, WEB_BOT_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
+        .env("APP_ROLE", "web-bot")
+        .env("DISCORD_TOKEN", "token")
+        .env("DISCORD_GUILD_ID", "guild")
+        .env("WHISPER_ENDPOINT", "http://whisper")
+        .env("DATABASE_URL", "postgres://localhost/db")
+        .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
+        .output()
+        .expect("child config test should run");
+
+    assert!(
+        output.status.success(),
+        "child config test failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn app_config_loads_from_env_for_worker_role_without_discord_gateway_credentials() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref() == Ok(WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
+        .arg("app_config_from_env_child_loads_worker_role_without_discord_gateway_credentials")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env_clear()
+        .env(CONFIG_FROM_ENV_CHILD, WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
+        .env("APP_ROLE", "worker")
+        .env("WHISPER_ENDPOINT", "http://whisper")
+        .env("CLAUDE_COMMAND", "claude")
+        .env("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", "true")
+        .env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE", "local-dev")
+        .env("DATABASE_URL", "postgres://localhost/db")
+        .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
+        .output()
+        .expect("child config test should run");
+
+    assert!(
+        output.status.success(),
+        "child config test failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn app_config_from_env_child_loads_web_bot_role_without_summary_harness_settings() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        != Ok(WEB_BOT_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let config = AppConfig::from_env().expect("config should load");
+
+    assert_eq!(config.app_role, AppRole::WebBot);
+    assert_eq!(config.discord_token, "token");
+    assert_eq!(config.discord_guild_id, "guild");
+    assert!(config.summary_enabled);
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "haiku");
+    assert!(!config.summary_allow_unsafe_agent_harness);
+}
+
+#[test]
+fn app_config_from_env_child_loads_worker_role_without_discord_gateway_credentials() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        != Ok(WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let config = AppConfig::from_env().expect("config should load");
+
+    assert_eq!(config.app_role, AppRole::Worker);
+    assert_eq!(config.discord_token, "");
+    assert_eq!(config.discord_guild_id, "");
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "claude");
+    assert_eq!(config.summary_model, "haiku");
+    assert!(config.summary_allow_unsafe_agent_harness);
 }
 
 #[test]
