@@ -237,6 +237,37 @@ fn normalize_segments_merges_speaker_and_marks_noisy() {
 }
 
 #[test]
+fn normalize_segments_clamps_merged_confidence_to_unit_range() {
+    let segments = vec![
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 0,
+            end_ms: 1_000,
+            text: "hello".to_owned(),
+            confidence: Some(1.0),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 33_554_431,
+        },
+        TranscriptSegment {
+            speaker_id: "alice".to_owned(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            text: "world".to_owned(),
+            confidence: Some(1.0),
+            is_noisy: false,
+            source: TranscriptSource::Voice,
+            merged_count: 3,
+        },
+    ];
+
+    let normalized = normalize_segments(&segments, NormalizationConfig::default());
+
+    assert_eq!(normalized.len(), 1);
+    assert_eq!(normalized[0].confidence, Some(1.0));
+}
+
+#[test]
 fn normalize_segments_orders_interleaved_speakers_before_merging() {
     let segments = vec![
         TranscriptSegment {
@@ -427,6 +458,44 @@ fn parse_whisper_response_extracts_segments() {
     assert_eq!(parsed.segments[0].end_ms, 1_200);
     assert_eq!(parsed.segments[1].speaker_id, "unknown");
     assert_eq!(parsed.raw_body, json);
+}
+
+#[test]
+fn parse_whisper_response_accepts_confidence_boundaries() {
+    for confidence in [0.0, 1.0] {
+        let json = format!(
+            r#"{{
+              "text": "ok",
+              "segments": [
+                {{ "speaker": "alice", "start": 0.0, "end": 1.0, "text": "ok", "confidence": {confidence} }}
+              ]
+            }}"#
+        );
+
+        let parsed = parse_whisper_response(&json).expect("boundary confidence should parse");
+        assert_eq!(parsed.segments[0].confidence, Some(confidence));
+    }
+}
+
+#[test]
+fn parse_whisper_response_rejects_confidence_outside_unit_range() {
+    for confidence in [-0.2, 42.0] {
+        let json = format!(
+            r#"{{
+              "text": "bad",
+              "segments": [
+                {{ "speaker": "alice", "start": 0.0, "end": 1.0, "text": "bad", "confidence": {confidence} }}
+              ]
+            }}"#
+        );
+
+        let err = parse_whisper_response(&json)
+            .expect_err("out-of-range confidence should be rejected");
+        assert!(
+            err.to_string().contains("between 0.0 and 1.0"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[test]
