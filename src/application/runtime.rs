@@ -2088,11 +2088,24 @@ enum SummaryJobRunError {
 
 const SUMMARY_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-struct SummaryJobHeartbeatGuard(tokio::task::JoinHandle<()>);
+struct SummaryJobHeartbeatGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SummaryJobHeartbeatGuard {
+    async fn stop(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
 
 impl Drop for SummaryJobHeartbeatGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -2134,7 +2147,9 @@ where
         }
     });
 
-    SummaryJobHeartbeatGuard(heartbeat_task)
+    SummaryJobHeartbeatGuard {
+        handle: Some(heartbeat_task),
+    }
 }
 
 struct RuntimeSummaryJobOutput {
@@ -2157,7 +2172,7 @@ where
         heartbeat_guard,
     } = job_output;
     let result = complete(job, output).await;
-    drop(heartbeat_guard);
+    heartbeat_guard.stop().await;
     result
 }
 
@@ -10086,13 +10101,15 @@ mod status_message_tests {
             ),
         };
 
-        let heartbeat_attempts_at_done = run_summary_job_completion_with_heartbeat(job_output, {
+        run_summary_job_completion_with_heartbeat(job_output, {
             let queue = Arc::clone(&queue);
             let state = Arc::clone(&state);
             let posted_messages = Arc::clone(&posted_messages);
             move |posted_job, output| async move {
                 wait_for_heartbeats(&state, 2).await;
+                let heartbeat_count_before_delay = state.snapshot().heartbeat_count;
                 sleep(Duration::from_millis(30)).await;
+                wait_for_heartbeats(&state, heartbeat_count_before_delay + 1).await;
                 let ready_during_post = {
                     let mut queue = queue.lock().await;
                     queue
@@ -10134,11 +10151,11 @@ mod status_message_tests {
                 queue
                     .mark_done(&posted_job)
                     .expect("current owner should mark the job done");
-                state.snapshot().heartbeat_attempts
             }
         })
         .await;
 
+        let heartbeat_attempts_after_stop = state.snapshot().heartbeat_attempts;
         sleep(Duration::from_millis(20)).await;
         let snapshot = state.snapshot();
         assert_eq!(snapshot.status, crate::domain::JobStatus::Done);
@@ -10147,7 +10164,7 @@ mod status_message_tests {
         assert_eq!(snapshot.second_claims, 0);
         assert_eq!(posted_messages.load(Ordering::SeqCst), 1);
         assert_eq!(
-            snapshot.heartbeat_attempts, heartbeat_attempts_at_done,
+            snapshot.heartbeat_attempts, heartbeat_attempts_after_stop,
             "heartbeat task should stop after the output guard is dropped"
         );
     }
