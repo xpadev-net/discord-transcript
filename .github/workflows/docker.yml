@@ -30,12 +30,14 @@ jobs:
       source_sha: ${{ steps.policy.outputs.source_sha }}
 
     steps:
-      - name: Checkout release tag
-        if: github.event_name == 'release'
+      - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Validate Dockerfile policy
+        run: python3 tests/dockerfile_policy.py
 
       - name: Validate publish policy
         id: policy
