@@ -47,6 +47,7 @@ impl Display for WhisperParseError {
 
 impl std::error::Error for WhisperParseError {}
 
+#[cfg(test)]
 fn message_contains_http_status(message: &str, status: u16) -> bool {
     http_status_from_message(message) == Some(status)
 }
