@@ -630,6 +630,15 @@ fn worker_job_processing_does_not_run_disabled_summary_snapshot() {
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Posted
     );
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage should list");
+    assert!(
+        !usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::SummaryRuns),
+        "disabled summary jobs must not record summary run usage"
+    );
 }
 
 #[test]
@@ -675,6 +684,54 @@ fn worker_job_processing_marks_disabled_summary_done_when_meeting_already_posted
     assert_eq!(
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Posted
+    );
+}
+
+#[test]
+fn worker_job_processing_marks_posted_meeting_job_done_without_rerunning_summary() {
+    let base = unique_temp_dir("worker_already_posted");
+    write_dummy_chunk(base.path(), "m1");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(meeting_with_status("m1", MeetingStatus::Posted));
+
+    let whisper = RecordingWhisperClient::new();
+    let claude = RecordingSummaryClient {
+        calls: RefCell::new(0),
+    };
+
+    let result = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 2,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: Some("option-en".to_owned()),
+            resample_to_16k: true,
+        },
+    )
+    .expect("posted meeting job should be consumed without work");
+
+    assert!(result.is_none());
+    assert!(whisper.requests.borrow().is_empty(), "ASR should not run");
+    assert_eq!(*claude.calls.borrow(), 0, "summary should not run");
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
+        JobStatus::Done
+    );
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage should list");
+    assert!(
+        usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::SummaryRuns
+                && event.job_id.as_deref() == Some("j1"))
     );
 }
 
