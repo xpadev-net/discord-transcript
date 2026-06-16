@@ -81,6 +81,38 @@ fn database_url_ssl_mode(database_url: &str) -> Option<&str> {
         .find_map(|(key, value)| (key == "sslmode").then_some(value))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatewayBotTokenStartDecision {
+    Start(String),
+    WaitForRepair,
+}
+
+fn gateway_bot_token_start_decision(
+    guild_id: &str,
+    resolved: Result<String, BotTokenResolveError>,
+) -> Result<GatewayBotTokenStartDecision, BotTokenResolveError> {
+    match resolved {
+        Ok(token) => Ok(GatewayBotTokenStartDecision::Start(token)),
+        Err(BotTokenResolveError::Database(err)) => Err(BotTokenResolveError::Database(err)),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                guild_id = %guild_id,
+                "stored guild bot token could not be resolved; Discord gateway will stay stopped until token settings are repaired"
+            );
+            Ok(GatewayBotTokenStartDecision::WaitForRepair)
+        }
+    }
+}
+
+async fn wait_for_gateway_bot_token_repair(revision: &mut tokio::sync::watch::Receiver<u64>) {
+    if revision.changed().await.is_ok() {
+        tracing::info!("retrying Discord gateway startup after guild bot token settings changed");
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn apply_pending_migrations(
     db_client: &tokio_postgres::Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -223,25 +255,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // If a token update lands between this mark and the DB resolve below,
         // this run may start once with the token read by this iteration, then
         // observes the revision change and restarts on the next loop.
-        let effective_discord_token = match resolve_effective_bot_token(
-            &db_client,
+        let effective_discord_token = match gateway_bot_token_start_decision(
             &config.discord_guild_id,
-            &config.discord_token,
-            guild_bot_token_cipher.as_deref(),
-        )
-        .await
-        {
-            Ok(token) => token,
-            Err(BotTokenResolveError::Database(err)) => {
-                return Err(BotTokenResolveError::Database(err).into());
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    guild_id = %config.discord_guild_id,
-                    "failed to resolve stored guild bot token for gateway; using global token so settings recovery stays online"
-                );
-                config.discord_token.clone()
+            resolve_effective_bot_token(
+                &db_client,
+                &config.discord_guild_id,
+                &config.discord_token,
+                guild_bot_token_cipher.as_deref(),
+            )
+            .await,
+        )? {
+            GatewayBotTokenStartDecision::Start(token) => token,
+            GatewayBotTokenStartDecision::WaitForRepair => {
+                wait_for_gateway_bot_token_repair(&mut runtime_bot_token_revision_rx).await;
+                continue;
             }
         };
         let mut runtime_config = config.clone();
@@ -265,7 +292,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::database_url_with_ssl_mode;
+    use super::{
+        GatewayBotTokenStartDecision, database_url_with_ssl_mode, gateway_bot_token_start_decision,
+        wait_for_gateway_bot_token_repair,
+    };
+    use discord_transcript::infrastructure::bot_token::{
+        BOT_TOKEN_KEY_VERSION, BotTokenCipher, EncryptedBotToken, GuildBotTokenMetadata,
+        StoredGuildBotToken, resolve_bot_token_from_record,
+    };
+
+    fn stored(encrypted: EncryptedBotToken) -> StoredGuildBotToken {
+        StoredGuildBotToken {
+            encrypted,
+            metadata: GuildBotTokenMetadata {
+                updated_at: None,
+                last_validated_at: None,
+                bot_user_id: None,
+                bot_username: None,
+            },
+        }
+    }
 
     #[test]
     fn database_url_with_ssl_mode_appends_query_param_separator() {
@@ -305,5 +351,70 @@ mod tests {
         .expect_err("unsupported sslmode should fail");
 
         assert!(err.to_string().contains("sslmode=require"));
+    }
+
+    #[test]
+    fn gateway_waits_for_repair_when_stored_token_has_missing_cipher() {
+        let cipher = BotTokenCipher::new("secret key material").expect("cipher");
+        let encrypted = cipher
+            .encrypt_for_guild("guild-1", "guild-token")
+            .expect("encrypt");
+        let resolved = resolve_bot_token_from_record(
+            "guild-1",
+            "global-token",
+            Some(&stored(encrypted)),
+            None,
+        );
+
+        let decision = gateway_bot_token_start_decision("guild-1", resolved)
+            .expect("missing cipher should wait, not fail fatal");
+
+        assert_eq!(decision, GatewayBotTokenStartDecision::WaitForRepair);
+    }
+
+    #[test]
+    fn gateway_waits_for_repair_when_stored_token_ciphertext_is_bad() {
+        let cipher = BotTokenCipher::new("secret key material").expect("cipher");
+        let encrypted = EncryptedBotToken {
+            ciphertext: "not valid base64!".to_owned(),
+            nonce: "AAAAAAAAAAAAAAAA".to_owned(),
+            key_version: BOT_TOKEN_KEY_VERSION.to_owned(),
+        };
+        let stored = stored(encrypted);
+        let resolved =
+            resolve_bot_token_from_record("guild-1", "global-token", Some(&stored), Some(&cipher));
+
+        let decision = gateway_bot_token_start_decision("guild-1", resolved)
+            .expect("crypto errors should wait, not fail fatal");
+
+        assert_eq!(decision, GatewayBotTokenStartDecision::WaitForRepair);
+    }
+
+    #[test]
+    fn gateway_starts_with_global_token_when_stored_token_absent() {
+        let resolved = resolve_bot_token_from_record("guild-1", "global-token", None, None);
+
+        let decision = gateway_bot_token_start_decision("guild-1", resolved)
+            .expect("absent stored token should use global fallback");
+
+        assert_eq!(
+            decision,
+            GatewayBotTokenStartDecision::Start("global-token".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_wait_for_repair_returns_after_token_revision_changes() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(0u64);
+        receiver.borrow_and_update();
+
+        sender.send_replace(1);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_gateway_bot_token_repair(&mut receiver),
+        )
+        .await
+        .expect("token revision change should wake gateway repair wait");
     }
 }
