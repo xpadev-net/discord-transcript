@@ -7,7 +7,7 @@ use discord_transcript::audio::meeting_audio::{
     ProcessedAudioChunk, build_speaker_audio_inputs, build_speaker_audio_inputs_excluding_processed_chunks,
     load_chunks,
 };
-use discord_transcript::audio::wav::resample_pcm_16le;
+use discord_transcript::audio::wav::{MAX_SUPPORTED_WAV_SAMPLE_RATE, resample_pcm_16le};
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::fs;
 use std::fs::File;
@@ -29,6 +29,18 @@ fn i16_pcm(samples: &[i16]) -> Vec<u8> {
         out.extend_from_slice(&sample.to_le_bytes());
     }
     out
+}
+
+fn write_u16_header(wav: &mut [u8], offset: usize, value: u16) {
+    wav[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_header(wav: &mut [u8], offset: usize, value: u32) {
+    wav[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn valid_48k_wav_for_header_tests() -> Vec<u8> {
+    build_wav_bytes_raw(&i16_pcm(&[1, -1, 2, -2]), 48_000, 1, 16).unwrap()
 }
 
 #[test]
@@ -257,6 +269,14 @@ fn build_wav_chunk_rejects_far_future_gap_before_allocating() {
 }
 
 #[test]
+fn build_wav_bytes_raw_rejects_unaligned_pcm_payload() {
+    let err = build_wav_bytes_raw(&[0, 0, 0], 48_000, 1, 16)
+        .expect_err("odd PCM byte length should be rejected");
+
+    assert!(err.to_string().contains("invalid PCM byte length"));
+}
+
+#[test]
 fn speaker_audio_does_not_normalize_pcm_amplitude() {
     let base = unique_temp_dir("no_normalize");
     fs::create_dir_all(&base).expect("dir should be created");
@@ -462,6 +482,81 @@ fn load_chunks_skips_truncated_wav_and_builds_mixdown_from_remaining_chunks() {
     let outputs = build_speaker_audio_inputs(&base, false).expect("speaker audio should succeed");
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].speaker_id, "alice");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn load_chunks_skips_invalid_header_values_and_keeps_valid_48k_wav() {
+    let base = unique_temp_dir("skip_invalid_headers");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let valid = valid_48k_wav_for_header_tests();
+    fs::write(base.join("alice_1_0.wav"), &valid).unwrap();
+
+    let mut zero_rate = valid_48k_wav_for_header_tests();
+    write_u32_header(&mut zero_rate, 24, 0);
+    write_u32_header(&mut zero_rate, 28, 0);
+    fs::write(base.join("badzero_1_0.wav"), zero_rate).unwrap();
+
+    let unsupported_rate = MAX_SUPPORTED_WAV_SAMPLE_RATE + 1;
+    let mut unsupported_high_rate = valid_48k_wav_for_header_tests();
+    write_u32_header(&mut unsupported_high_rate, 24, unsupported_rate);
+    write_u32_header(&mut unsupported_high_rate, 28, unsupported_rate * 2);
+    fs::write(
+        base.join("badunsupportedrate_1_0.wav"),
+        unsupported_high_rate,
+    )
+    .unwrap();
+
+    let mut huge_rate = valid_48k_wav_for_header_tests();
+    write_u32_header(&mut huge_rate, 24, u32::MAX);
+    fs::write(base.join("badhuge_1_0.wav"), huge_rate).unwrap();
+
+    let mut bad_format = valid_48k_wav_for_header_tests();
+    write_u16_header(&mut bad_format, 20, 3);
+    fs::write(base.join("badformat_1_0.wav"), bad_format).unwrap();
+
+    let mut bad_byte_rate = valid_48k_wav_for_header_tests();
+    write_u32_header(&mut bad_byte_rate, 28, 1);
+    fs::write(base.join("badbyterate_1_0.wav"), bad_byte_rate).unwrap();
+
+    let mut bad_block_align = valid_48k_wav_for_header_tests();
+    write_u16_header(&mut bad_block_align, 32, 4);
+    fs::write(base.join("badalign_1_0.wav"), bad_block_align).unwrap();
+
+    let mut bad_chunk_size = valid_48k_wav_for_header_tests();
+    write_u32_header(&mut bad_chunk_size, 4, 35);
+    fs::write(base.join("badchunksize_1_0.wav"), bad_chunk_size).unwrap();
+
+    let chunks = load_chunks(&base).expect("valid 48k chunk should survive invalid neighbors");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_id, "alice");
+    assert_eq!(chunks[0].sample_rate, 48_000);
+    assert_eq!(chunks[0].duration_ms, 0);
+    assert_eq!(chunks[0].pcm, i16_pcm(&[1, -1, 2, -2]));
+
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should use the valid chunk");
+    let mixdown_wav = fs::read(mixdown).expect("mixdown wav should be readable");
+    assert_eq!(
+        u32::from_le_bytes([
+            mixdown_wav[24],
+            mixdown_wav[25],
+            mixdown_wav[26],
+            mixdown_wav[27]
+        ]),
+        48_000
+    );
+    assert_eq!(
+        u32::from_le_bytes([
+            mixdown_wav[40],
+            mixdown_wav[41],
+            mixdown_wav[42],
+            mixdown_wav[43]
+        ]) as usize,
+        i16_pcm(&[1, -1, 2, -2]).len()
+    );
 
     let _ = fs::remove_dir_all(base);
 }
