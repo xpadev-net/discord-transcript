@@ -1,4 +1,6 @@
-use crate::domain::transcript::{MAX_DB_TIMESTAMP_MS, TranscriptSegment, TranscriptSource};
+use crate::domain::transcript::{
+    MAX_DB_TIMESTAMP_MS, TranscriptSegment, TranscriptSource, is_valid_transcript_confidence,
+};
 use serde::Deserialize;
 use std::fmt::{Debug, Display, Formatter};
 
@@ -303,10 +305,10 @@ fn validate_segment_timing(
         )));
     }
     if let Some(confidence) = confidence
-        && !confidence.is_finite()
+        && !is_valid_transcript_confidence(confidence)
     {
         return Err(WhisperParseError::InvalidSegment(format!(
-            "segment {index} confidence must be finite"
+            "segment {index} confidence must be between 0.0 and 1.0"
         )));
     }
     Ok(())

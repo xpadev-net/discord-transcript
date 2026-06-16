@@ -77,7 +77,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -499,6 +499,93 @@ pub fn meeting_audio_path(
         .mixdown_path()
         .to_string_lossy()
         .to_string()
+}
+
+pub(crate) fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
+    let entries = match fs::read_dir(meeting_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "failed to read meeting dir {}: {err}",
+                meeting_dir.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        let is_candidate = matches!(ext.as_deref(), Some("wav"))
+            && path.file_stem().and_then(|stem| stem.to_str()) != Some("mixdown");
+        if !is_candidate {
+            continue;
+        }
+        let size = entry
+            .metadata()
+            .map_err(|err| format!("failed to read metadata {}: {err}", path.display()))?
+            .len();
+        if size > 44 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoverableAudioDir {
+    path: PathBuf,
+    is_legacy: bool,
+}
+
+fn recoverable_audio_dir_with_legacy_fallback(
+    primary_dir: PathBuf,
+    legacy_dir: PathBuf,
+) -> Result<Option<RecoverableAudioDir>, String> {
+    let primary_error = match has_nonempty_audio_chunk(&primary_dir) {
+        Ok(true) => {
+            return Ok(Some(RecoverableAudioDir {
+                path: primary_dir,
+                is_legacy: false,
+            }));
+        }
+        Ok(false) => None,
+        Err(err) => Some(err),
+    };
+    match has_nonempty_audio_chunk(&legacy_dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(err) = primary_error {
+                return Err(err);
+            }
+            return Ok(None);
+        }
+        Err(legacy_err) => {
+            if let Some(primary_err) = primary_error {
+                return Err(format!(
+                    "{primary_err}; legacy fallback also failed: {legacy_err}"
+                ));
+            }
+            return Err(legacy_err);
+        }
+    }
+    Ok(Some(RecoverableAudioDir {
+        path: legacy_dir,
+        is_legacy: true,
+    }))
+}
+
+fn recovery_can_resume_from_final_transcript(status: MeetingStatus) -> bool {
+    matches!(
+        status,
+        MeetingStatus::Stopping | MeetingStatus::Transcribing | MeetingStatus::Summarizing
+    )
 }
 
 fn flush_session_for_teardown<S: ChunkStorage>(
@@ -4745,26 +4832,85 @@ impl ScaffoldHandler {
         };
 
         for snapshot in snapshots {
-            let meeting = self.load_meeting(&snapshot.meeting_id).await.ok();
+            let meeting = {
+                let mut service = self.service.lock().await;
+                match service.store.get_meeting(&snapshot.meeting_id) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %snapshot.meeting_id,
+                            error = %err,
+                            "failed to load meeting during startup recovery; deferring snapshot"
+                        );
+                        continue;
+                    }
+                }
+            };
             let workspace = meeting.as_ref().map(|m| self.workspace_for_meeting(m));
-            let audio_dir = workspace
-                .as_ref()
-                .map(|w| w.audio_dir())
-                .filter(|dir| dir.is_dir())
-                .unwrap_or_else(|| {
-                    crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
-                        &self.chunk_storage_dir,
-                    )
-                    .legacy_meeting_dir(&snapshot.meeting_id)
-                });
-            let has_recording_file = audio_dir.is_dir()
-                && fs::read_dir(&audio_dir)
-                    .map(|entries| {
-                        entries.filter_map(Result::ok).any(|e| {
-                            e.path().extension().and_then(|ext| ext.to_str()) == Some("wav")
-                        })
-                    })
-                    .unwrap_or(false);
+            let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
+                &self.chunk_storage_dir,
+            );
+            let legacy_dir = layout.legacy_meeting_dir(&snapshot.meeting_id);
+            let mut audio_discovery_failed = false;
+            let recoverable_audio = match workspace.as_ref().map(|w| w.audio_dir()) {
+                Some(primary_dir) => {
+                    match recoverable_audio_dir_with_legacy_fallback(primary_dir, legacy_dir) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            audio_discovery_failed = true;
+                            warn!(
+                                meeting_id = %snapshot.meeting_id,
+                                error = %err,
+                                "failed to inspect recording files during startup recovery"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => match has_nonempty_audio_chunk(&legacy_dir) {
+                    Ok(true) => Some(RecoverableAudioDir {
+                        path: legacy_dir,
+                        is_legacy: true,
+                    }),
+                    Ok(false) => None,
+                    Err(err) => {
+                        audio_discovery_failed = true;
+                        warn!(
+                            meeting_id = %snapshot.meeting_id,
+                            error = %err,
+                            "failed to inspect legacy recording files during startup recovery"
+                        );
+                        None
+                    }
+                },
+            };
+            let has_final_transcript_rows = if recoverable_audio.is_none()
+                && recovery_can_resume_from_final_transcript(snapshot.status)
+            {
+                let mut service = self.service.lock().await;
+                match final_transcript_rows_exist(&mut service.store.executor, &snapshot.meeting_id)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %snapshot.meeting_id,
+                            error = %err,
+                            "failed to inspect final transcript rows during startup recovery"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if audio_discovery_failed && !has_final_transcript_rows {
+                warn!(
+                    meeting_id = %snapshot.meeting_id,
+                    "skipping startup recovery for meeting after audio discovery failure"
+                );
+                continue;
+            }
+            let has_recording_file = recoverable_audio.is_some() || has_final_transcript_rows;
             let voice_connected = snapshot
                 .voice_channel_id
                 .and_then(|voice_channel_id| {
@@ -6793,41 +6939,6 @@ impl ScaffoldHandler {
         workspace
             .ensure_base_dirs()
             .map_err(|err| format!("failed to prepare workspace: {err}"))?;
-        let (meeting_dir, using_legacy_audio) = {
-            let primary_dir = workspace.audio_dir();
-            let primary_has_chunks = fs::read_dir(&primary_dir)
-                .map(|entries| {
-                    entries.filter_map(Result::ok).any(|entry| {
-                        let path = entry.path();
-                        path.file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .map(|stem| stem != "mixdown")
-                            .unwrap_or(false)
-                            && path
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
-                    })
-                })
-                .unwrap_or(false);
-            if primary_has_chunks {
-                (primary_dir, false)
-            } else {
-                let legacy_dir = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
-                    &self.chunk_storage_dir,
-                )
-                .legacy_meeting_dir(&meeting.id);
-                (legacy_dir, true)
-            }
-        };
-        if using_legacy_audio {
-            warn!(
-                meeting_id = %meeting.id,
-                path = %meeting_dir.display(),
-                "falling back to legacy mixdown path"
-            );
-        }
-
         let claimed_job = {
             let mut queue = self.queue.lock().await;
             let claimed_job = queue.claim_by_id(&job_id).map_err(|err| err.to_string())?;
@@ -6886,7 +6997,14 @@ impl ScaffoldHandler {
             }
         };
         let recovered_from_final_segments = !final_segments.is_empty();
-        let (audio_path, live_segments, completed_live_chunks) = if recovered_from_final_segments {
+        enum SummaryInputSource {
+            FinalTranscript,
+            Audio {
+                meeting_dir: PathBuf,
+                completed_live_chunks: Vec<ProcessedAudioChunk>,
+            },
+        }
+        let (audio_path, live_segments, summary_input_source) = if recovered_from_final_segments {
             (
                 workspace
                     .audio_dir()
@@ -6894,9 +7012,77 @@ impl ScaffoldHandler {
                     .to_string_lossy()
                     .to_string(),
                 Vec::new(),
-                Vec::new(),
+                SummaryInputSource::FinalTranscript,
             )
         } else {
+            let primary_dir = workspace.audio_dir();
+            let legacy_dir = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
+                &self.chunk_storage_dir,
+            )
+            .legacy_meeting_dir(&meeting.id);
+            let audio_dir = match recoverable_audio_dir_with_legacy_fallback(
+                primary_dir.clone(),
+                legacy_dir.clone(),
+            ) {
+                Ok(Some(audio_dir)) => audio_dir,
+                Ok(None) => {
+                    let err_string = format!(
+                        "no non-empty audio chunks found for meeting {} in {} or {}",
+                        meeting.id,
+                        primary_dir.display(),
+                        legacy_dir.display()
+                    );
+                    let mut queue = self.queue.lock().await;
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "audio_discovery",
+                    );
+                    drop(queue);
+                    if exhausted {
+                        let mut service = self.service.lock().await;
+                        let _ = mark_summary_meeting_failed_from_summary_state(
+                            &mut service.store,
+                            &claimed_job.meeting_id,
+                            err_string.clone(),
+                        );
+                        return Err(SummaryJobRunError::Terminal(err_string));
+                    }
+                    return Err(retry_scheduled_error(&claimed_job, err_string));
+                }
+                Err(err) => {
+                    let err_string = format!("audio discovery failed: {err}");
+                    let mut queue = self.queue.lock().await;
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "audio_discovery",
+                    );
+                    drop(queue);
+                    if exhausted {
+                        let mut service = self.service.lock().await;
+                        let _ = mark_summary_meeting_failed_from_summary_state(
+                            &mut service.store,
+                            &claimed_job.meeting_id,
+                            err_string.clone(),
+                        );
+                        return Err(SummaryJobRunError::Terminal(err_string));
+                    }
+                    return Err(retry_scheduled_error(&claimed_job, err_string));
+                }
+            };
+            let meeting_dir = audio_dir.path;
+            if audio_dir.is_legacy {
+                warn!(
+                    meeting_id = %meeting.id,
+                    path = %meeting_dir.display(),
+                    "falling back to legacy mixdown path"
+                );
+            }
             let audio_path = match merge_user_chunks_to_mixdown(
                 &meeting_dir,
                 effective_settings.whisper_resample_to_16k,
@@ -6977,7 +7163,14 @@ impl ScaffoldHandler {
                 (live_segments, completed_live_chunks)
             };
 
-            (audio_path, live_segments, completed_live_chunks)
+            (
+                audio_path,
+                live_segments,
+                SummaryInputSource::Audio {
+                    meeting_dir,
+                    completed_live_chunks,
+                },
+            )
         };
 
         if recovered_from_final_segments {
@@ -6987,16 +7180,22 @@ impl ScaffoldHandler {
             );
         }
 
-        let speaker_audio = match if !final_segments.is_empty() {
-            Ok(Vec::new())
-        } else if completed_live_chunks.is_empty() {
-            build_speaker_audio_inputs(&meeting_dir, effective_settings.whisper_resample_to_16k)
-        } else {
-            build_speaker_audio_inputs_excluding_processed_chunks(
-                &meeting_dir,
+        let speaker_audio = match match &summary_input_source {
+            SummaryInputSource::FinalTranscript => Ok(Vec::new()),
+            SummaryInputSource::Audio {
+                meeting_dir,
+                completed_live_chunks,
+            } if completed_live_chunks.is_empty() => {
+                build_speaker_audio_inputs(meeting_dir, effective_settings.whisper_resample_to_16k)
+            }
+            SummaryInputSource::Audio {
+                meeting_dir,
+                completed_live_chunks,
+            } => build_speaker_audio_inputs_excluding_processed_chunks(
+                meeting_dir,
                 effective_settings.whisper_resample_to_16k,
-                &completed_live_chunks,
-            )
+                completed_live_chunks,
+            ),
         } {
             Ok(value) => value,
             Err(err) => {
@@ -7104,9 +7303,17 @@ impl ScaffoldHandler {
             );
         }
 
-        let transcription = if recovered_from_final_segments {
+        let has_completed_live_chunks = matches!(
+            &summary_input_source,
+            SummaryInputSource::Audio {
+                completed_live_chunks,
+                ..
+            } if !completed_live_chunks.is_empty()
+        );
+        let transcription = if matches!(&summary_input_source, SummaryInputSource::FinalTranscript)
+        {
             crate::application::summary::build_transcription_output(final_segments.clone())
-        } else if request.speaker_audio.is_empty() && !completed_live_chunks.is_empty() {
+        } else if request.speaker_audio.is_empty() && has_completed_live_chunks {
             crate::application::summary::build_transcription_output(live_segments.clone())
         } else {
             tokio::task::block_in_place(|| {
@@ -9590,6 +9797,133 @@ mod status_message_tests {
         assert_eq!(
             parse_meeting_status("corrupt"),
             Err("unknown meeting status: corrupt".to_owned())
+        );
+    }
+
+    struct RuntimeTempDir {
+        path: PathBuf,
+    }
+
+    impl Drop for RuntimeTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn runtime_temp_dir(label: &str) -> RuntimeTempDir {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        RuntimeTempDir {
+            path: std::env::temp_dir().join(format!("discord_transcript_runtime_{label}_{nanos}")),
+        }
+    }
+
+    fn write_test_wav(path: &std::path::Path) {
+        let wav = crate::audio::build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16)
+            .expect("wav should build");
+        std::fs::write(path, wav).expect("wav should be written");
+    }
+
+    #[test]
+    fn audio_chunk_predicate_ignores_mixdown_and_empty_files() {
+        let temp = runtime_temp_dir("audio_predicate");
+        let audio_dir = temp.path.join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir should be created");
+        write_test_wav(&audio_dir.join("mixdown.wav"));
+        std::fs::write(audio_dir.join("user-empty.wav"), []).expect("empty wav should be written");
+
+        assert_eq!(has_nonempty_audio_chunk(&audio_dir), Ok(false));
+
+        std::fs::write(audio_dir.join("user-corrupt.WAV"), vec![0; 45])
+            .expect("non-empty wav should be written");
+
+        assert_eq!(has_nonempty_audio_chunk(&audio_dir), Ok(true));
+    }
+
+    #[test]
+    fn startup_recovery_final_transcript_fallback_is_summary_pipeline_only() {
+        assert!(recovery_can_resume_from_final_transcript(
+            crate::domain::MeetingStatus::Stopping
+        ));
+        assert!(recovery_can_resume_from_final_transcript(
+            crate::domain::MeetingStatus::Transcribing
+        ));
+        assert!(recovery_can_resume_from_final_transcript(
+            crate::domain::MeetingStatus::Summarizing
+        ));
+        assert!(!recovery_can_resume_from_final_transcript(
+            crate::domain::MeetingStatus::Recording
+        ));
+    }
+
+    #[test]
+    fn startup_recovery_uses_nonempty_legacy_audio_when_primary_is_empty() {
+        let temp = runtime_temp_dir("legacy_recovery");
+        let mut meeting = recording_meeting();
+        meeting.status = crate::domain::MeetingStatus::Stopping;
+        let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&temp.path);
+        let workspace =
+            layout.for_meeting(&meeting.guild_id, &meeting.voice_channel_id, &meeting.id);
+        std::fs::create_dir_all(workspace.audio_dir()).expect("primary audio dir should exist");
+        let legacy_dir = layout.legacy_meeting_dir(&meeting.id);
+        std::fs::create_dir_all(&legacy_dir).expect("legacy audio dir should exist");
+        write_test_wav(&legacy_dir.join("user-1.wav"));
+
+        let recovered_audio =
+            recoverable_audio_dir_with_legacy_fallback(workspace.audio_dir(), legacy_dir.clone())
+                .expect("audio lookup should succeed");
+
+        assert_eq!(
+            recovered_audio,
+            Some(RecoverableAudioDir {
+                path: legacy_dir,
+                is_legacy: true,
+            })
+        );
+
+        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        store.insert(meeting.clone());
+        let effect = run_recovery(
+            &mut store,
+            &RecoveryCandidate {
+                meeting_id: meeting.id,
+                status: crate::domain::MeetingStatus::Stopping,
+                voice_connected: false,
+                has_recording_file: recovered_audio.is_some(),
+            },
+        )
+        .expect("recovery should succeed");
+
+        assert_eq!(
+            effect,
+            RecoveryEffect::SummaryRequeued {
+                meeting_id: "m1".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn audio_dir_fallback_uses_legacy_when_primary_read_fails() {
+        let temp = runtime_temp_dir("legacy_recovery_primary_error");
+        std::fs::create_dir_all(&temp.path).expect("temp root should exist");
+        let primary_file = temp.path.join("audio");
+        std::fs::write(&primary_file, b"not a directory").expect("primary file should be written");
+        let legacy_dir = temp.path.join("legacy");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy audio dir should exist");
+        write_test_wav(&legacy_dir.join("user-1.wav"));
+
+        let recovered_audio =
+            recoverable_audio_dir_with_legacy_fallback(primary_file, legacy_dir.clone())
+                .expect("legacy fallback should succeed after primary read error");
+
+        assert_eq!(
+            recovered_audio,
+            Some(RecoverableAudioDir {
+                path: legacy_dir,
+                is_legacy: true,
+            })
         );
     }
 

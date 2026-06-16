@@ -3,6 +3,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub const MAX_DB_TIMESTAMP_MS: u64 = i32::MAX as u64;
+pub const MIN_TRANSCRIPT_CONFIDENCE: f32 = 0.0;
+pub const MAX_TRANSCRIPT_CONFIDENCE: f32 = 1.0;
+
+pub fn is_valid_transcript_confidence(value: f32) -> bool {
+    value.is_finite() && (MIN_TRANSCRIPT_CONFIDENCE..=MAX_TRANSCRIPT_CONFIDENCE).contains(&value)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSource {
@@ -199,7 +205,10 @@ fn merge_confidence(a: Option<f32>, a_count: u32, b: Option<f32>, b_count: u32) 
     match (a, b) {
         (Some(x), Some(y)) => {
             let total = a_count + b_count;
-            Some((x * a_count as f32 + y * b_count as f32) / total as f32)
+            Some(
+                ((x * a_count as f32 + y * b_count as f32) / total as f32)
+                    .clamp(MIN_TRANSCRIPT_CONFIDENCE, MAX_TRANSCRIPT_CONFIDENCE),
+            )
         }
         (Some(x), None) => Some(x),
         (None, Some(y)) => Some(y),

@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS transcripts (
     confidence DOUBLE PRECISION,
     is_noisy BOOLEAN NOT NULL DEFAULT FALSE,
     source TEXT NOT NULL DEFAULT 'voice',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT transcripts_confidence_check CHECK (
+        confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_meeting
