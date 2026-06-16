@@ -28,8 +28,10 @@ import type {
   GuildRbacRoleGrant,
   GuildRbacRoleGrantUpdateRequest,
   GuildSettingsResponse,
+  MeetingListItem,
   MeetingListResponse,
   MeetingResponse,
+  MeetingVoiceChannel,
   MeResponse,
   PersonAlias,
   PersonAliasReviewStatus,
@@ -201,13 +203,115 @@ function handleAdminResponse<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function invalidMeetingListResponse(): Error {
+  return new Error("会議一覧のレスポンス形式が不正です");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isNullableNumber(value: unknown): value is number | null {
+  return (
+    value === null || (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function parseMeetingListItem(value: unknown): MeetingListItem | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.id !== "string" ||
+    !isNullableString(value.title) ||
+    typeof value.status !== "string" ||
+    !isNullableString(value.started_at) ||
+    !isNullableString(value.stopped_at) ||
+    !isNullableNumber(value.duration_seconds) ||
+    !isNullableString(value.stop_reason) ||
+    typeof value.voice_channel_id !== "string" ||
+    !isNullableString(value.voice_channel_name)
+  ) {
+    return null;
+  }
+  return {
+    id: value.id,
+    title: value.title,
+    status: value.status,
+    started_at: value.started_at,
+    stopped_at: value.stopped_at,
+    duration_seconds: value.duration_seconds,
+    stop_reason: value.stop_reason,
+    voice_channel_id: value.voice_channel_id,
+    voice_channel_name: value.voice_channel_name,
+  };
+}
+
+function parseMeetingVoiceChannel(value: unknown): MeetingVoiceChannel | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (typeof value.id !== "string" || typeof value.label !== "string") {
+    return null;
+  }
+  return { id: value.id, label: value.label };
+}
+
+function parseMeetingListResponse(payload: unknown): MeetingListResponse {
+  if (
+    !isRecord(payload) ||
+    typeof payload.guild_id !== "string" ||
+    !Array.isArray(payload.meetings) ||
+    !Array.isArray(payload.voice_channels) ||
+    !isFiniteNumber(payload.page) ||
+    !isFiniteNumber(payload.limit) ||
+    !isFiniteNumber(payload.total)
+  ) {
+    throw invalidMeetingListResponse();
+  }
+  const meetings: MeetingListItem[] = [];
+  for (const meeting of payload.meetings) {
+    const parsed = parseMeetingListItem(meeting);
+    if (!parsed) {
+      throw invalidMeetingListResponse();
+    }
+    meetings.push(parsed);
+  }
+
+  const voiceChannels: MeetingVoiceChannel[] = [];
+  for (const channel of payload.voice_channels) {
+    const parsed = parseMeetingVoiceChannel(channel);
+    if (!parsed) {
+      throw invalidMeetingListResponse();
+    }
+    voiceChannels.push(parsed);
+  }
+
+  return {
+    guild_id: payload.guild_id,
+    meetings,
+    voice_channels: voiceChannels,
+    page: payload.page,
+    limit: payload.limit,
+    total: payload.total,
+  };
+}
+
 function handleGuildMeetingsResponse(
   response: Response,
 ): Promise<MeetingListResponse> {
   if (response.status === 403) {
     throw new Error("forbidden");
   }
-  return handleResponse<MeetingListResponse>(response);
+  return handleResponse<unknown>(response).then(parseMeetingListResponse);
 }
 
 function handleGuildJobsResponse(response: Response): Promise<GuildJob[]> {

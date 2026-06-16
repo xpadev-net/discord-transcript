@@ -10,6 +10,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { buildLoginRedirectUrl } from "./lib/api";
+import { DashboardPage } from "./pages/DashboardPage";
 
 const settingsLinkName = "\u8a2d\u5b9a";
 const saveButtonName = "\u4fdd\u5b58";
@@ -2071,6 +2072,36 @@ describe("App access controls", () => {
     expect(screen.getByRole("table")).toBeTruthy();
   });
 
+  it("shows dashboard error UI for malformed meeting list responses", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        return Promise.resolve(
+          jsonResponse({
+            ...meetingsResponse("guild-1"),
+            meetings: null,
+          }),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <MemoryRouter>
+        <DashboardPage
+          selectedGuildId="guild-1"
+          selectedGuildName="Guild One"
+        />
+      </MemoryRouter>,
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("会議一覧のレスポンス形式が不正です");
+    expect(screen.queryByText("表示エラーが発生しました")).toBeNull();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
   it("renders the guild selector with installed guilds selectable", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
@@ -2139,15 +2170,13 @@ describe("App access controls", () => {
         return Promise.resolve(
           jsonResponse(
             meetingsResponse("guild-2", [
-              {
+              meetingItem({
                 id: "meeting-2",
                 title: "Guild Two meeting",
-                status: "completed",
                 started_at: "2026-06-01T00:00:00Z",
                 stopped_at: "2026-06-01T00:10:00Z",
                 duration_seconds: 600,
-                stop_reason: null,
-              },
+              }),
             ]),
           ),
         );
@@ -2505,15 +2534,13 @@ describe("App access controls", () => {
         return Promise.resolve(
           jsonResponse(
             meetingsResponse("guild-2", [
-              {
+              meetingItem({
                 id: "meeting-2",
                 title: "Guild Two meeting",
-                status: "completed",
                 started_at: "2026-06-01T00:00:00Z",
                 stopped_at: "2026-06-01T00:10:00Z",
                 duration_seconds: 600,
-                stop_reason: null,
-              },
+              }),
             ]),
           ),
         );
@@ -2532,15 +2559,13 @@ describe("App access controls", () => {
     staleGuildOne.resolve(
       jsonResponse(
         meetingsResponse("guild-1", [
-          {
+          meetingItem({
             id: "meeting-1",
             title: "Guild One stale meeting",
-            status: "completed",
             started_at: "2026-06-01T00:00:00Z",
             stopped_at: "2026-06-01T00:10:00Z",
             duration_seconds: 600,
-            stop_reason: null,
-          },
+          }),
         ]),
       ),
     );
