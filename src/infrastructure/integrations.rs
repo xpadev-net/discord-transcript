@@ -19,12 +19,38 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_COMMAND_OUTPUT_STREAM_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const COMMAND_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl Display for CommandOutputStream {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdout => write!(f, "stdout"),
+            Self::Stderr => write!(f, "stderr"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegrationError {
     Io(String),
-    NonZeroExit { code: i32, stderr: String },
-    Timeout { timeout: Duration },
+    NonZeroExit {
+        code: i32,
+        stderr: String,
+    },
+    Timeout {
+        timeout: Duration,
+    },
+    OutputTooLarge {
+        stream: CommandOutputStream,
+        limit: u64,
+    },
     InvalidUtf8,
     Parse(String),
 }
@@ -38,6 +64,9 @@ impl Display for IntegrationError {
             }
             Self::Timeout { timeout } => {
                 write!(f, "command timed out after {} seconds", timeout.as_secs())
+            }
+            Self::OutputTooLarge { stream, limit } => {
+                write!(f, "command {stream} exceeded {limit} bytes")
             }
             Self::InvalidUtf8 => write!(f, "invalid utf8 output from command"),
             Self::Parse(err) => write!(f, "parse error: {err}"),
@@ -81,7 +110,7 @@ impl WhisperClient for CommandWhisperClient {
         &self,
         request: &WhisperInferenceRequest,
     ) -> Result<WhisperTranscriptionResult, WhisperParseError> {
-        let output = retry_with_backoff_if(
+        retry_with_backoff_if(
             self.retry_policy,
             |_| {
                 let effective_prompt =
@@ -91,6 +120,8 @@ impl WhisperClient for CommandWhisperClient {
                 let mut cmd = Command::new(&self.curl_bin);
                 // Keep this argument order in sync with `render_whisper_command_for_log`.
                 cmd.arg("-sS")
+                    .arg("-w")
+                    .arg(r"\n%{http_code}")
                     .arg("-X")
                     .arg("POST")
                     .arg(whisper_inference_endpoint(&self.endpoint))
@@ -112,36 +143,145 @@ impl WhisperClient for CommandWhisperClient {
                 cmd.arg("-F")
                     .arg(format!("temperature={}", self.temperature));
 
-                run_command_with_timeout(&mut cmd, None, self.command_timeout)
-                    .map_err(|err| {
-                        WhisperParseError::InvalidJson(format!(
-                            "whisper command failed before execution: command={command_for_log}, error={err}"
-                        ))
-                    })
-                    .and_then(|output| {
-                        if output.status.success() {
-                            Ok(output)
-                        } else {
-                            Err(WhisperParseError::InvalidJson(format!(
-                                "whisper command failed: command={command_for_log}, status={:?}, stderr={}",
-                                output.status.code(),
-                                sanitize_output(&output.stderr)
-                            )))
-                        }
-                    })
+                run_whisper_command(&mut cmd, &command_for_log, self.command_timeout)
             },
             |err| err.is_retriable(),
-        )?;
+        )
+    }
+}
 
-        let body = String::from_utf8(output.stdout)
-            .map_err(|err| WhisperParseError::InvalidJson(err.to_string()))?;
-        parse_whisper_response(&body).map_err(|err| match err {
-            WhisperParseError::InvalidJson(message) => WhisperParseError::InvalidJson(format!(
-                "{message} (response body length: {} bytes)",
-                body.len()
-            )),
-            other => other,
-        })
+struct WhisperCurlResponse {
+    status: Option<u16>,
+    body: Vec<u8>,
+}
+
+fn run_whisper_command(
+    command: &mut Command,
+    command_for_log: &str,
+    timeout: Duration,
+) -> Result<WhisperTranscriptionResult, WhisperParseError> {
+    let output = run_command_with_timeout(command, None, timeout)
+        .map_err(|err| whisper_command_integration_error(command_for_log, err))?;
+    let response = split_curl_status_trailer(output.stdout);
+
+    if let Some(status) = response.status {
+        if !(200..=299).contains(&status) {
+            return Err(whisper_http_status_error(
+                command_for_log,
+                output.status.code(),
+                Some(status),
+                &output.stderr,
+                &response.body,
+            ));
+        }
+        if !output.status.success() {
+            return Err(whisper_transport_error(
+                command_for_log,
+                output.status.code(),
+                Some(status),
+                &output.stderr,
+                &response.body,
+            ));
+        }
+    } else if !output.status.success() {
+        return Err(whisper_http_status_error(
+            command_for_log,
+            output.status.code(),
+            None,
+            &output.stderr,
+            &response.body,
+        ));
+    }
+
+    parse_successful_whisper_body(response.body)
+}
+
+fn whisper_command_integration_error(
+    command_for_log: &str,
+    err: IntegrationError,
+) -> WhisperParseError {
+    let prefix = if matches!(err, IntegrationError::OutputTooLarge { .. }) {
+        "non-retriable whisper command failed before execution"
+    } else {
+        "whisper command failed before execution"
+    };
+    WhisperParseError::InvalidJson(format!("{prefix}: command={command_for_log}, error={err}"))
+}
+
+fn whisper_http_status_error(
+    command_for_log: &str,
+    exit_status: Option<i32>,
+    http_status: Option<u16>,
+    stderr: &[u8],
+    body: &[u8],
+) -> WhisperParseError {
+    let status = http_status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    WhisperParseError::InvalidJson(format!(
+        "whisper command failed: command={command_for_log}, exit_status={exit_status:?}, http_status={status}, stderr={}, body={}",
+        sanitize_output(stderr),
+        sanitize_output(body)
+    ))
+}
+
+fn whisper_transport_error(
+    command_for_log: &str,
+    exit_status: Option<i32>,
+    http_code: Option<u16>,
+    stderr: &[u8],
+    body: &[u8],
+) -> WhisperParseError {
+    let http_code = http_code
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    WhisperParseError::InvalidJson(format!(
+        "retriable whisper transport failure: command={command_for_log}, exit_status={exit_status:?}, http_code={http_code}, stderr={}, body={}",
+        sanitize_output(stderr),
+        sanitize_output(body)
+    ))
+}
+
+fn parse_successful_whisper_body(
+    body: Vec<u8>,
+) -> Result<WhisperTranscriptionResult, WhisperParseError> {
+    let body_len = body.len();
+    let body = String::from_utf8(body).map_err(|err| {
+        WhisperParseError::InvalidJson(format!(
+            "malformed successful whisper response: invalid UTF-8: {err} (response body length: {body_len} bytes)"
+        ))
+    })?;
+    parse_whisper_response(&body).map_err(|err| match err {
+        WhisperParseError::InvalidJson(message) => WhisperParseError::InvalidJson(format!(
+            "malformed successful whisper response: {message} (response body length: {} bytes)",
+            body.len()
+        )),
+        other => other,
+    })
+}
+
+fn split_curl_status_trailer(mut stdout: Vec<u8>) -> WhisperCurlResponse {
+    let Some(newline_index) = stdout.iter().rposition(|byte| *byte == b'\n') else {
+        return WhisperCurlResponse {
+            status: None,
+            body: stdout,
+        };
+    };
+    let status_bytes = &stdout[newline_index + 1..];
+    if status_bytes.len() != 3 || !status_bytes.iter().all(u8::is_ascii_digit) {
+        return WhisperCurlResponse {
+            status: None,
+            body: stdout,
+        };
+    }
+
+    let status = status_bytes
+        .iter()
+        .fold(0u16, |acc, byte| acc * 10 + u16::from(byte - b'0'));
+    stdout.truncate(newline_index);
+    WhisperCurlResponse {
+        status: Some(status),
+        body: stdout,
     }
 }
 
@@ -176,6 +316,8 @@ fn render_whisper_command_for_log(
     let mut parts = vec![
         client.curl_bin.clone(),
         "-sS".to_owned(),
+        "-w".to_owned(),
+        r"\n%{http_code}".to_owned(),
         "-X".to_owned(),
         "POST".to_owned(),
         sanitize_whisper_endpoint_for_log(&whisper_inference_endpoint(&client.endpoint)),
@@ -740,6 +882,20 @@ pub fn run_command_with_timeout(
     stdin_input: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<Output, IntegrationError> {
+    run_command_with_timeout_and_output_limit(
+        command,
+        stdin_input,
+        timeout,
+        DEFAULT_COMMAND_OUTPUT_STREAM_MAX_BYTES,
+    )
+}
+
+fn run_command_with_timeout_and_output_limit(
+    command: &mut Command,
+    stdin_input: Option<&[u8]>,
+    timeout: Duration,
+    output_stream_max_bytes: u64,
+) -> Result<Output, IntegrationError> {
     let temp_paths = CommandOutputTempPaths::new();
     let stdout_file = temp_paths
         .create_stdout()
@@ -747,6 +903,7 @@ pub fn run_command_with_timeout(
     let stderr_file = match temp_paths.create_stderr() {
         Ok(file) => file,
         Err(err) => {
+            drop(stdout_file);
             temp_paths.cleanup();
             return Err(IntegrationError::Io(err.to_string()));
         }
@@ -755,6 +912,8 @@ pub fn run_command_with_timeout(
         Some(input) => match temp_paths.create_stdin(input) {
             Ok(file) => Some(file),
             Err(err) => {
+                drop(stdout_file);
+                drop(stderr_file);
                 temp_paths.cleanup();
                 return Err(IntegrationError::Io(err.to_string()));
             }
@@ -765,6 +924,9 @@ pub fn run_command_with_timeout(
     let stdout_clone = match stdout_file.try_clone() {
         Ok(file) => file,
         Err(err) => {
+            drop(stdin_file);
+            drop(stdout_file);
+            drop(stderr_file);
             temp_paths.cleanup();
             return Err(IntegrationError::Io(err.to_string()));
         }
@@ -772,6 +934,9 @@ pub fn run_command_with_timeout(
     let stderr_clone = match stderr_file.try_clone() {
         Ok(file) => file,
         Err(err) => {
+            drop(stdin_file);
+            drop(stdout_file);
+            drop(stderr_file);
             temp_paths.cleanup();
             return Err(IntegrationError::Io(err.to_string()));
         }
@@ -788,17 +953,45 @@ pub fn run_command_with_timeout(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
+            release_command_stdio(command);
+            drop(stdout_file);
+            drop(stderr_file);
             temp_paths.cleanup();
             return Err(IntegrationError::Io(err.to_string()));
         }
     };
+    release_command_stdio(command);
 
     let started = Instant::now();
     let status = loop {
+        match temp_paths.output_stream_exceeding_limit(output_stream_max_bytes) {
+            Ok(Some(stream)) => {
+                kill_child_process_group(&mut child);
+                let _ = child.wait();
+                drop(stdout_file);
+                drop(stderr_file);
+                temp_paths.cleanup();
+                return Err(IntegrationError::OutputTooLarge {
+                    stream,
+                    limit: output_stream_max_bytes,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                kill_child_process_group(&mut child);
+                let _ = child.wait();
+                drop(stdout_file);
+                drop(stderr_file);
+                temp_paths.cleanup();
+                return Err(IntegrationError::Io(err.to_string()));
+            }
+        }
         match child.try_wait() {
             Err(err) => {
                 kill_child_process_group(&mut child);
                 let _ = child.wait();
+                drop(stdout_file);
+                drop(stderr_file);
                 temp_paths.cleanup();
                 return Err(IntegrationError::Io(err.to_string()));
             }
@@ -806,27 +999,47 @@ pub fn run_command_with_timeout(
             Ok(None) if started.elapsed() >= timeout => {
                 kill_child_process_group(&mut child);
                 let _ = child.wait();
+                drop(stdout_file);
+                drop(stderr_file);
                 temp_paths.cleanup();
                 return Err(IntegrationError::Timeout { timeout });
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(COMMAND_OUTPUT_POLL_INTERVAL),
         }
     };
 
     drop(stdout_file);
     drop(stderr_file);
-    let stdout = match temp_paths.read_stdout() {
+    let stdout = match temp_paths.read_stdout(output_stream_max_bytes) {
         Ok(stdout) => stdout,
+        Err(CommandOutputReadError::TooLarge) => {
+            kill_child_process_group(&mut child);
+            let _ = child.wait();
+            temp_paths.cleanup();
+            return Err(IntegrationError::OutputTooLarge {
+                stream: CommandOutputStream::Stdout,
+                limit: output_stream_max_bytes,
+            });
+        }
         Err(err) => {
             temp_paths.cleanup();
-            return Err(IntegrationError::Io(err.to_string()));
+            return Err(IntegrationError::Io(err.into_io_error().to_string()));
         }
     };
-    let stderr = match temp_paths.read_stderr() {
+    let stderr = match temp_paths.read_stderr(output_stream_max_bytes) {
         Ok(stderr) => stderr,
+        Err(CommandOutputReadError::TooLarge) => {
+            kill_child_process_group(&mut child);
+            let _ = child.wait();
+            temp_paths.cleanup();
+            return Err(IntegrationError::OutputTooLarge {
+                stream: CommandOutputStream::Stderr,
+                limit: output_stream_max_bytes,
+            });
+        }
         Err(err) => {
             temp_paths.cleanup();
-            return Err(IntegrationError::Io(err.to_string()));
+            return Err(IntegrationError::Io(err.into_io_error().to_string()));
         }
     };
     temp_paths.cleanup();
@@ -836,6 +1049,13 @@ pub fn run_command_with_timeout(
         stdout,
         stderr,
     })
+}
+
+fn release_command_stdio(command: &mut Command) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 }
 
 #[cfg(unix)]
@@ -912,12 +1132,27 @@ impl CommandOutputTempPaths {
         create_temp_output_file(&self.stderr)
     }
 
-    fn read_stdout(&self) -> std::io::Result<Vec<u8>> {
-        read_temp_output_file(&self.stdout)
+    fn read_stdout(&self, max_bytes: u64) -> Result<Vec<u8>, CommandOutputReadError> {
+        read_temp_output_file(&self.stdout, max_bytes)
     }
 
-    fn read_stderr(&self) -> std::io::Result<Vec<u8>> {
-        read_temp_output_file(&self.stderr)
+    fn read_stderr(&self, max_bytes: u64) -> Result<Vec<u8>, CommandOutputReadError> {
+        read_temp_output_file(&self.stderr, max_bytes)
+    }
+
+    fn output_stream_exceeding_limit(
+        &self,
+        max_bytes: u64,
+    ) -> std::io::Result<Option<CommandOutputStream>> {
+        for (stream, path) in [
+            (CommandOutputStream::Stdout, &self.stdout),
+            (CommandOutputStream::Stderr, &self.stderr),
+        ] {
+            if fs::metadata(path)?.len() > max_bytes {
+                return Ok(Some(stream));
+            }
+        }
+        Ok(None)
     }
 
     fn cleanup(&self) {
@@ -938,10 +1173,35 @@ fn create_temp_output_file(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-fn read_temp_output_file(path: &Path) -> std::io::Result<Vec<u8>> {
+enum CommandOutputReadError {
+    Io(std::io::Error),
+    TooLarge,
+}
+
+impl CommandOutputReadError {
+    fn into_io_error(self) -> std::io::Error {
+        match self {
+            Self::Io(err) => err,
+            Self::TooLarge => std::io::Error::other("command output exceeded byte limit"),
+        }
+    }
+}
+
+impl From<std::io::Error> for CommandOutputReadError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+fn read_temp_output_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CommandOutputReadError> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CommandOutputReadError::TooLarge);
+    }
     Ok(bytes)
 }
 
@@ -949,14 +1209,16 @@ fn read_temp_output_file(path: &Path) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::{
         AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
-        AgentOutputContract, CommandWhisperClient, HarnessCliSummaryClient, IntegrationError,
-        create_temp_output_file, run_agent_harness_with_output_contract, run_command_with_timeout,
-        sanitize_whisper_endpoint_for_log,
+        AgentOutputContract, CommandOutputReadError, CommandOutputStream, CommandWhisperClient,
+        HarnessCliSummaryClient, IntegrationError, create_temp_output_file, read_temp_output_file,
+        run_agent_harness_with_output_contract, run_command_with_timeout,
+        run_command_with_timeout_and_output_limit, sanitize_whisper_endpoint_for_log,
     };
     use crate::application::summary::{ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT};
     use crate::bootstrap::config::SummaryHarness;
     use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
     use crate::infrastructure::retry::RetryPolicy;
+    use std::io::Write;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -987,6 +1249,78 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "hello\n");
         assert_eq!(String::from_utf8(output.stderr).unwrap(), "err\n");
+    }
+
+    #[test]
+    fn command_runner_rejects_cap_plus_one_stdout_and_kills_command() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf '12345678901234567'; sleep 5");
+
+        let started = Instant::now();
+        let result = run_command_with_timeout_and_output_limit(
+            &mut command,
+            None,
+            Duration::from_secs(5),
+            16,
+        );
+
+        assert!(matches!(
+            result,
+            Err(IntegrationError::OutputTooLarge {
+                stream: CommandOutputStream::Stdout,
+                limit: 16
+            })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output cap should kill the command instead of waiting for sleep"
+        );
+    }
+
+    #[test]
+    fn command_runner_rejects_cap_plus_one_stderr_and_kills_command() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '12345678901234567' >&2; sleep 5");
+
+        let started = Instant::now();
+        let result = run_command_with_timeout_and_output_limit(
+            &mut command,
+            None,
+            Duration::from_secs(5),
+            16,
+        );
+
+        assert!(matches!(
+            result,
+            Err(IntegrationError::OutputTooLarge {
+                stream: CommandOutputStream::Stderr,
+                limit: 16
+            })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output cap should kill the command instead of waiting for sleep"
+        );
+    }
+
+    #[test]
+    fn command_output_read_rejects_cap_plus_one_after_command_exit() {
+        let path = std::env::temp_dir().join(format!(
+            "discord_transcript_read_cap_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = create_temp_output_file(&path).expect("temp output should be created");
+        file.write_all(b"12345678901234567")
+            .expect("temp output should be written");
+        drop(file);
+
+        let result = read_temp_output_file(&path, 16);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(result, Err(CommandOutputReadError::TooLarge)));
     }
 
     #[test]
@@ -1904,6 +2238,296 @@ mod tests {
         let _ = std::fs::remove_file(&marker_path);
 
         assert!(err.to_string().contains("missing field"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn whisper_http_503_retries_then_accepts_valid_json() {
+        let _guard = command_test_lock();
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_http_503_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_http_503_retry_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nattempts=$(cat '{}' 2>/dev/null || printf 0)\nattempts=$((attempts + 1))\nprintf '%s' \"$attempts\" > '{}'\nif [ \"$attempts\" -eq 1 ]; then\nprintf '{{\"error\":\"busy\"}}\\n503'\nexit 0\nfi\nprintf '{{\"text\":\"ok\",\"segments\":[{{\"speaker\":\"alice\",\"start\":0.0,\"end\":1.0,\"text\":\"hello\"}}]}}\\n200'\n",
+                marker_path.display(),
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        let result = client
+            .infer(&request)
+            .expect("503 should retry and the second 200 response should parse");
+        let attempts = std::fs::read_to_string(&marker_path).expect("marker should be written");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert_eq!(result.text, "ok");
+        assert_eq!(attempts, "2");
+    }
+
+    #[test]
+    fn whisper_http_429_retries_then_accepts_valid_json() {
+        let _guard = command_test_lock();
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_http_429_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_http_429_retry_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nattempts=$(cat '{}' 2>/dev/null || printf 0)\nattempts=$((attempts + 1))\nprintf '%s' \"$attempts\" > '{}'\nif [ \"$attempts\" -eq 1 ]; then\nprintf '{{\"error\":\"rate limited\"}}\\n429'\nexit 0\nfi\nprintf '{{\"text\":\"ok\",\"segments\":[{{\"speaker\":\"alice\",\"start\":0.0,\"end\":1.0,\"text\":\"hello\"}}]}}\\n200'\n",
+                marker_path.display(),
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        let result = client
+            .infer(&request)
+            .expect("429 should retry and the second 200 response should parse");
+        let attempts = std::fs::read_to_string(&marker_path).expect("marker should be written");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert_eq!(result.text, "ok");
+        assert_eq!(attempts, "2");
+    }
+
+    #[test]
+    fn whisper_http_400_does_not_retry_command() {
+        let _guard = command_test_lock();
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_http_400_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_http_400_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf '{{\"error\":\"bad request\"}}\\n400'\n",
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        let err = client
+            .infer(&request)
+            .expect_err("400 should fail without retrying");
+        let attempts = std::fs::read_to_string(&marker_path)
+            .expect("marker should be written")
+            .len();
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert!(err.to_string().contains("http_status=400"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn whisper_timeout_retries_then_accepts_valid_json() {
+        let _guard = command_test_lock();
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_timeout_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_timeout_retry_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nattempts=$(cat '{}' 2>/dev/null || printf 0)\nattempts=$((attempts + 1))\nprintf '%s' \"$attempts\" > '{}'\nif [ \"$attempts\" -eq 1 ]; then sleep 2; fi\nprintf '{{\"text\":\"ok\",\"segments\":[{{\"speaker\":\"alice\",\"start\":0.0,\"end\":1.0,\"text\":\"hello\"}}]}}\\n200'\n",
+                marker_path.display(),
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_millis(500),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        let result = client
+            .infer(&request)
+            .expect("timeout should retry and the second response should parse");
+        let attempts = std::fs::read_to_string(&marker_path).expect("marker should be written");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert_eq!(result.text, "ok");
+        assert_eq!(attempts, "2");
+    }
+
+    #[test]
+    fn whisper_malformed_http_200_json_does_not_retry_command() {
+        let _guard = command_test_lock();
+        let marker_path = std::env::temp_dir().join(format!(
+            "discord_transcript_whisper_malformed_200_retry_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "discord_transcript_curl_malformed_200_{}_{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf '{{}}\\n200'\n",
+                marker_path.display()
+            ),
+        )
+        .expect("script should be written");
+        make_executable(&script_path);
+
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: script_path.to_string_lossy().to_string(),
+            retry_policy: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = WhisperInferenceRequest {
+            audio_path: "audio.wav".to_owned(),
+            language: None,
+            prompt: None,
+        };
+
+        let err = client
+            .infer(&request)
+            .expect_err("malformed 200 JSON should fail without retrying");
+        let attempts = std::fs::read_to_string(&marker_path)
+            .expect("marker should be written")
+            .len();
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert!(
+            err.to_string()
+                .contains("malformed successful whisper response")
+        );
         assert_eq!(attempts, 1);
     }
 
