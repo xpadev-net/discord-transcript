@@ -50,6 +50,7 @@ done
 
 | 変数名 | デフォルト | 説明 |
 |--------|-----------|------|
+| `APP_ROLE` | `all` | 起動ロール。`all` は従来互換、`web-bot` は Web/API と Discord gateway のみ、`worker` は standalone summary worker のみを起動します。`web-bot` では要約 CLI 設定を要求せず、`worker` では Discord gateway credentials を要求しません。 |
 | `DATABASE_SSL_MODE` | `disable` | PostgreSQL の SSL モード。現時点では TLS 接続を実装していないため `disable` のみ対応し、`require` など他の値では起動を拒否します。 |
 | `SUMMARY_MAX_RETRIES` | `3` | 要約ジョブの最大リトライ回数 |
 | `INTEGRATION_RETRY_MAX_ATTEMPTS` | `3` | 外部連携の最大リトライ回数 |
@@ -65,6 +66,8 @@ done
 | `SUMMARY_MODEL` | 未設定 | `CLAUDE_MODEL` より優先。**`opencode` では必須**（`provider/model` 形式。例: `anthropic/claude-3-5-haiku-20241022`） |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 | `OPERATIONAL_METRICS_BEARER_TOKEN` | 未設定 | `/metricsz` の Bearer 認証トークン。未設定時は `/metricsz` を無効化します。 |
+
+Docker Compose で worker profile を使ってプロセスを分ける場合は、既定互換の `all` ではなく `APP_ROLE=web-bot docker compose --profile worker up` のように app 側を `web-bot` で起動してください。
 
 > **Note:** 要約 CLI harness はワークスペースや環境へアクセスできるため、既定では起動を拒否します。ローカル検証で使う場合は `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示してください。production-like な profile では unsafe opt-in があっても起動しません。文字起こし補正（LLM によるトランスクリプト整形）は全文プロンプトを扱うため、unsafe opt-in 後も built-in CLI harness では実行しません。
 

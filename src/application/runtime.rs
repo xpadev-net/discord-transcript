@@ -26,7 +26,7 @@ use crate::audio::meeting_audio::{
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{PersistedChunk, RecordingSession};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
-use crate::bootstrap::config::{AppConfig, SummaryHarness};
+use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness};
 use crate::domain::authz::{
     MemberRoleSource, RbacPermission, RbacSubject, UserRole, resolve_rbac_permission,
 };
@@ -3022,6 +3022,7 @@ pub async fn run_bot(
         ssrc_tracker_reset_gate: Arc::new(Mutex::new(())),
         background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_running: Arc::new(AtomicBool::new(false)),
+        summary_job_processing_enabled: summary_job_processing_enabled_for_role(config.app_role),
         shutting_down: Arc::new(AtomicBool::new(false)),
         shutdown_token: CancellationToken::new(),
         task_tracker: TaskTracker::new(),
@@ -3068,7 +3069,9 @@ pub async fn run_bot(
         .await
         .map_err(|err| RuntimeError::ClientInit(err.to_string()))?;
     let shard_manager = Arc::clone(&client.shard_manager);
-    handler.spawn_summary_job_wakeup_listener(Arc::clone(&client.http), summary_job_wakeups);
+    if handler.summary_job_processing_enabled {
+        handler.spawn_summary_job_wakeup_listener(Arc::clone(&client.http), summary_job_wakeups);
+    }
 
     tokio::select! {
         result = client.start() => {
@@ -3213,6 +3216,7 @@ struct ScaffoldHandler {
     ssrc_tracker_reset_gate: Arc<Mutex<()>>,
     background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_running: Arc<AtomicBool>,
+    summary_job_processing_enabled: bool,
     shutting_down: Arc<AtomicBool>,
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
@@ -3236,6 +3240,10 @@ struct ScaffoldHandler {
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
     bot_admin_user_ids: HashSet<String>,
+}
+
+fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
+    role == AppRole::All
 }
 
 impl ScaffoldHandler {
@@ -3308,6 +3316,9 @@ impl ScaffoldHandler {
         meeting_id: String,
         retry_after: Duration,
     ) {
+        if !self.summary_job_processing_enabled {
+            return;
+        }
         let handler = self.clone();
         let shutdown_token = handler.shutdown_token.clone();
         self.spawn_background(async move {
@@ -4694,6 +4705,7 @@ impl EventHandler for ScaffoldHandler {
                     "auto stop triggered due to empty voice channel"
                 );
                 if summary_job_enqueued
+                    && handler.summary_job_processing_enabled
                     && let Err(err) = run_summary_background(
                         &handler,
                         Arc::clone(&ctx_for_task.http),
@@ -6361,7 +6373,7 @@ impl ScaffoldHandler {
                         "failed to update status message after manual stop"
                     );
                 }
-                if summary_job_enqueued {
+                if summary_job_enqueued && self.summary_job_processing_enabled {
                     // Spawn summary processing in background — transcription and
                     // AI summarization can take minutes, far beyond the interaction
                     // response window, and should not block the command reply.
@@ -9195,7 +9207,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 "failed to update status message after driver disconnect stop"
                             );
                         }
-                        if summary_job_enqueued {
+                        if summary_job_enqueued && runtime.summary_job_processing_enabled {
                             tokio::select! {
                                 summary_result = run_summary_background(
                                     &runtime,
@@ -9601,6 +9613,13 @@ mod status_message_tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn summary_job_processing_runs_only_in_all_role() {
+        assert!(summary_job_processing_enabled_for_role(AppRole::All));
+        assert!(!summary_job_processing_enabled_for_role(AppRole::WebBot));
+        assert!(!summary_job_processing_enabled_for_role(AppRole::Worker));
+    }
 
     #[test]
     fn runtime_rbac_allows_role_granted_recording_commands() {

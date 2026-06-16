@@ -1037,10 +1037,23 @@ where
         let effective_settings = store
             .get_effective_meeting_settings(&job.meeting_id)
             .map_err(WorkerError::from)?;
-        if effective_settings
+        let summary_enabled = effective_settings
             .as_ref()
-            .is_some_and(|settings| !settings.summary_enabled)
-        {
+            .is_none_or(|settings| settings.summary_enabled);
+        if meeting.status == MeetingStatus::Posted {
+            queue.heartbeat(&job)?;
+            queue.mark_done(&job)?;
+            if summary_enabled {
+                record_summary_completion_usage_observe_only(store, &job.meeting_id, &job.id, 0);
+            }
+            info!(
+                job_id = %job.id,
+                meeting_id = %job.meeting_id,
+                "summary job marked done because meeting is already posted"
+            );
+            return Ok(None);
+        }
+        if !summary_enabled {
             match meeting.status {
                 MeetingStatus::Posted => {}
                 MeetingStatus::Stopping => {

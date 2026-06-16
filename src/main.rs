@@ -1,15 +1,30 @@
 use discord_transcript::application::runtime::{BotRunExit, SummaryJobWakeups, run_bot};
-use discord_transcript::bootstrap::config::AppConfig;
+use discord_transcript::application::worker::{
+    ProcessJobResult, SummaryJobOptions, SummaryNotificationReceipt, SummaryStatusNotification,
+    SummaryUrlNotification, WorkerError, complete_summary_job_after_notification,
+    process_next_summary_job, record_summary_completion_usage_observe_only,
+};
+use discord_transcript::bootstrap::config::{AppConfig, AppRole};
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
+use discord_transcript::infrastructure::integrations::{
+    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
+};
+use discord_transcript::infrastructure::queue::JobQueue;
+use discord_transcript::infrastructure::retry::RetryPolicy;
 use discord_transcript::infrastructure::sql::{
     CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS,
     SELECT_SCHEMA_MIGRATION_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, migration_transaction_sql,
 };
+use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, SqlMeetingStore};
+use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
 use discord_transcript::interfaces::web;
+use serenity::all::{ChannelId, EditMessage};
+use serenity::http::Http;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_postgres::NoTls;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -153,7 +168,13 @@ async fn apply_pending_migrations_locked(
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
+    match runtime_entrypoints_for_role(config.app_role) {
+        RuntimeEntrypoints::WebBot => run_web_and_gateway(config).await,
+        RuntimeEntrypoints::Worker => run_standalone_worker(config).await,
+    }
+}
 
+async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Establish async DB connection for the web server
     let db_url = database_url_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
     let (db_client, db_connection) = tokio_postgres::connect(&db_url, NoTls).await?;
@@ -293,12 +314,400 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEntrypoints {
+    WebBot,
+    Worker,
+}
+
+fn runtime_entrypoints_for_role(role: AppRole) -> RuntimeEntrypoints {
+    match role {
+        AppRole::All | AppRole::WebBot => RuntimeEntrypoints::WebBot,
+        AppRole::Worker => RuntimeEntrypoints::Worker,
+    }
+}
+
+async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!(app_role = %config.app_role, "starting standalone summary worker");
+
+    let migration_executor =
+        PgSqlExecutor::connect_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
+    let mut migration_store = SqlMeetingStore::new(migration_executor);
+    migration_store.apply_pending_migrations()?;
+
+    let mut store = SqlMeetingStore::new(PgSqlExecutor::connect_with_ssl_mode(
+        &config.database_url,
+        &config.database_ssl_mode,
+    )?);
+    let mut queue = SqlJobQueue::new(PgSqlExecutor::connect_with_ssl_mode(
+        &config.database_url,
+        &config.database_ssl_mode,
+    )?);
+    let token_db_url = database_url_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
+    let (token_db_client, token_db_connection) =
+        tokio_postgres::connect(&token_db_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = token_db_connection.await {
+            tracing::error!(error = %err, "worker bot token db connection lost");
+        }
+    });
+    let guild_bot_token_cipher = config
+        .guild_bot_token_encryption_key
+        .as_deref()
+        .map(BotTokenCipher::new)
+        .transpose()?;
+    let retry_policy = RetryPolicy {
+        max_attempts: config.integration_retry_max_attempts,
+        initial_delay: Duration::from_millis(config.integration_retry_initial_delay_ms),
+        backoff_multiplier: config.integration_retry_backoff_multiplier,
+        max_delay: Duration::from_millis(config.integration_retry_max_delay_ms),
+    };
+    let whisper = CommandWhisperClient {
+        endpoint: config.whisper_endpoint.clone(),
+        curl_bin: "curl".to_owned(),
+        retry_policy,
+        beam_size: config.whisper_beam_size,
+        suppress_non_speech: config.whisper_suppress_non_speech,
+        prompt: config.whisper_prompt.clone(),
+        vad: config.whisper_vad,
+        temperature: config.whisper_temperature,
+        command_timeout: DEFAULT_COMMAND_TIMEOUT,
+    };
+    let summary_client = HarnessCliSummaryClient {
+        harness: config.summary_harness,
+        command_path: config.summary_command.clone(),
+        model: config.summary_model.clone(),
+        allow_unsafe_agent_harness: config.summary_allow_unsafe_agent_harness,
+        retry_policy,
+        command_timeout: DEFAULT_COMMAND_TIMEOUT,
+    };
+    let options = SummaryJobOptions {
+        max_retries: config.summary_max_retries,
+        audio_base_dir: config.chunk_storage_dir.clone(),
+        language: config.whisper_language.clone(),
+        resample_to_16k: config.whisper_resample_to_16k,
+    };
+    let mut idle_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
+
+    loop {
+        tokio::select! {
+            () = shutdown_signal() => {
+                tracing::info!("shutdown signal received");
+                break;
+            }
+            () = &mut idle_sleep => {
+                if let Err(err) = queue.ready_summary_meeting_ids() {
+                    tracing::warn!(
+                        error = %err,
+                        "standalone worker failed to recover stale running summary jobs"
+                    );
+                }
+                match process_next_summary_job(
+                    &mut store,
+                    &mut queue,
+                    &whisper,
+                    &summary_client,
+                    &options,
+                ) {
+                    Ok(Some(result)) => {
+                        let chunk_count = result.output.chunks.len();
+                        let completion_result =
+                            match notify_standalone_worker_summary(
+                                &config,
+                                &token_db_client,
+                                guild_bot_token_cipher.as_ref(),
+                                &mut store,
+                                &result,
+                            )
+                            .await
+                            {
+                                Ok(receipt) => complete_summary_job_after_notification(
+                                    &mut store,
+                                    &mut queue,
+                                    &result.job,
+                                    receipt,
+                                ),
+                                Err(err) => Err(err),
+                            };
+                        match completion_result {
+                            Ok(true) => {
+                                record_summary_completion_usage_observe_only(
+                                    &mut store,
+                                    &result.output.meeting_id,
+                                    &result.job_id,
+                                    chunk_count,
+                                );
+                            }
+                            Ok(false) => match queue.mark_done(&result.job) {
+                                Ok(()) => {
+                                    record_summary_completion_usage_observe_only(
+                                        &mut store,
+                                        &result.output.meeting_id,
+                                        &result.job_id,
+                                        chunk_count,
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        job_id = %result.job_id,
+                                        meeting_id = %result.output.meeting_id,
+                                        error = %err,
+                                        "standalone worker could not mark already-posted summary job done"
+                                    );
+                                }
+                            },
+                            Err(err) => {
+                                tracing::warn!(
+                                    job_id = %result.job_id,
+                                    meeting_id = %result.output.meeting_id,
+                                    error = %err,
+                                    "standalone worker could not complete generated summary job"
+                                );
+                            }
+                        }
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now());
+                    }
+                    Ok(None) => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "standalone worker summary job attempt failed");
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn notify_standalone_worker_summary(
+    config: &AppConfig,
+    token_db_client: &tokio_postgres::Client,
+    guild_bot_token_cipher: Option<&BotTokenCipher>,
+    store: &mut SqlMeetingStore<PgSqlExecutor>,
+    result: &ProcessJobResult,
+) -> Result<SummaryNotificationReceipt, WorkerError> {
+    let meeting = store
+        .get_meeting(&result.output.meeting_id)
+        .map_err(WorkerError::from)?
+        .ok_or_else(|| {
+            WorkerError::Completion(format!(
+                "meeting not found while notifying summary: {}",
+                result.output.meeting_id
+            ))
+        })?;
+    let token = resolve_effective_bot_token(
+        token_db_client,
+        &meeting.guild_id,
+        &config.discord_token,
+        guild_bot_token_cipher,
+    )
+    .await
+    .map_err(|err| {
+        WorkerError::Completion(format!(
+            "failed to resolve bot token for summary notification: {err}"
+        ))
+    })?;
+    if token.trim().is_empty() {
+        return Err(WorkerError::Completion(
+            "no global or guild bot token is configured; generated summary is waiting for Discord notification"
+                .to_owned(),
+        ));
+    }
+    let report_channel_id = meeting.report_channel_id.parse::<u64>().map_err(|err| {
+        WorkerError::Completion(format!(
+            "invalid report channel id for meeting {}: {}",
+            result.output.meeting_id, err
+        ))
+    })?;
+    let http = Http::new(&token);
+
+    let chunks = summary_chunks_with_voice_channel_metadata(&meeting, result.output.chunks.clone());
+    post_summary_to_report_channel(&http, report_channel_id, &chunks)
+        .await
+        .map_err(WorkerError::Completion)?;
+
+    let url_notification =
+        if let Some(url) = meeting_url(config.public_base_url.as_deref(), &meeting.id) {
+            let url_msg = format!("詳細はこちら: {url}");
+            match post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await {
+                Ok(()) => SummaryUrlNotification::Posted,
+                Err(err) => {
+                    tracing::warn!(
+                        meeting_id = %meeting.id,
+                        error = %err,
+                        "failed to post meeting URL from standalone worker"
+                    );
+                    SummaryUrlNotification::FailedBestEffort
+                }
+            }
+        } else {
+            SummaryUrlNotification::NotConfigured
+        };
+
+    let status_notification =
+        match upsert_summary_completed_status_message(&http, store, &meeting.id, config).await {
+            Ok(()) => SummaryStatusNotification::Updated,
+            Err(err) => {
+                tracing::warn!(
+                    meeting_id = %meeting.id,
+                    error = %err,
+                    "failed to update summary status message from standalone worker"
+                );
+                SummaryStatusNotification::FailedBestEffort
+            }
+        };
+
+    SummaryNotificationReceipt::new(chunks.len(), url_notification, status_notification)
+}
+
+fn meeting_url(public_base_url: Option<&str>, meeting_id: &str) -> Option<String> {
+    public_base_url
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+        .map(|base_url| format!("{}/meetings/{}", base_url.trim_end_matches('/'), meeting_id))
+}
+
+fn meeting_voice_channel_display(meeting: &StoredMeeting) -> String {
+    meeting
+        .voice_channel_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("VC ID: {}", meeting.voice_channel_id))
+}
+
+fn summary_chunks_with_voice_channel_metadata(
+    meeting: &StoredMeeting,
+    chunks: Vec<String>,
+) -> Vec<String> {
+    let display = meeting_voice_channel_display(meeting);
+    let has_name = meeting
+        .voice_channel_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .is_some();
+    let header = if has_name {
+        format!("VC: {display} ({})", meeting.voice_channel_id)
+    } else {
+        display
+    };
+    let mut with_metadata = Vec::with_capacity(chunks.len().saturating_add(1));
+    with_metadata.push(header);
+    with_metadata.extend(chunks);
+    with_metadata
+}
+
+async fn post_summary_to_report_channel(
+    http: &Http,
+    report_channel_id: u64,
+    chunks: &[String],
+) -> Result<(), String> {
+    let channel = ChannelId::new(report_channel_id);
+    for chunk in chunks {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        channel
+            .say(http, chunk)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn upsert_summary_completed_status_message(
+    http: &Http,
+    store: &mut SqlMeetingStore<PgSqlExecutor>,
+    meeting_id: &str,
+    config: &AppConfig,
+) -> Result<(), String> {
+    let metadata = store
+        .get_status_message_metadata(meeting_id)
+        .map_err(|err| err.to_string())?;
+    let channel_id_str = metadata
+        .status_message_channel_id
+        .as_deref()
+        .unwrap_or(&metadata.report_channel_id);
+    let channel_id = channel_id_str.parse::<u64>().map_err(|err| {
+        format!(
+            "invalid status message channel id: meeting_id={meeting_id}, value={channel_id_str}, error={err}"
+        )
+    })?;
+    let content = format_summary_completed_status_message(
+        meeting_id,
+        meeting_url(config.public_base_url.as_deref(), meeting_id).as_deref(),
+    );
+    let channel = ChannelId::new(channel_id);
+
+    let message_id = match metadata.status_message_id.as_deref() {
+        Some(message_id_str) => match message_id_str.parse::<u64>() {
+            Ok(message_id) => {
+                channel
+                    .edit_message(http, message_id, EditMessage::new().content(&content))
+                    .await
+                    .map_err(|err| err.to_string())?;
+                message_id
+            }
+            Err(err) => {
+                tracing::warn!(
+                    meeting_id,
+                    message_id = message_id_str,
+                    error = %err,
+                    "invalid status message id, recreating status message from standalone worker"
+                );
+                channel
+                    .say(http, &content)
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .id
+                    .get()
+            }
+        },
+        None => channel
+            .say(http, &content)
+            .await
+            .map_err(|err| err.to_string())?
+            .id
+            .get(),
+    };
+
+    store
+        .set_status_message(meeting_id, channel_id.to_string(), message_id.to_string())
+        .map_err(|err| err.to_string())
+}
+
+fn format_summary_completed_status_message(meeting_id: &str, summary_url: Option<&str>) -> String {
+    let base = format!("要約が完了しました\nmeeting_id={meeting_id}");
+    summary_url.map_or(base.clone(), |url| format!("{base}\n詳細ページ: {url}"))
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BotTokenResolveError, GatewayBotTokenStartDecision, database_url_with_ssl_mode,
-        gateway_bot_token_start_decision, wait_for_gateway_bot_token_repair,
+        BotTokenResolveError, GatewayBotTokenStartDecision, RuntimeEntrypoints,
+        database_url_with_ssl_mode, gateway_bot_token_start_decision, runtime_entrypoints_for_role,
+        wait_for_gateway_bot_token_repair,
     };
+    use discord_transcript::bootstrap::config::AppRole;
     use discord_transcript::infrastructure::bot_token::{
         BOT_TOKEN_KEY_VERSION, BotTokenCipher, EncryptedBotToken, GuildBotTokenMetadata,
         StoredGuildBotToken, resolve_bot_token_from_record,
@@ -441,5 +850,21 @@ mod tests {
         )
         .await
         .expect("token revision change should wake gateway repair wait");
+    }
+
+    #[test]
+    fn runtime_entrypoints_select_role_specific_process_surfaces() {
+        assert_eq!(
+            runtime_entrypoints_for_role(AppRole::All),
+            RuntimeEntrypoints::WebBot
+        );
+        assert_eq!(
+            runtime_entrypoints_for_role(AppRole::WebBot),
+            RuntimeEntrypoints::WebBot
+        );
+        assert_eq!(
+            runtime_entrypoints_for_role(AppRole::Worker),
+            RuntimeEntrypoints::Worker
+        );
     }
 }
