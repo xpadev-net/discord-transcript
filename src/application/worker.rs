@@ -1185,6 +1185,13 @@ where
     }
 }
 
+/// Finalize a generated summary job after user-facing notification has been
+/// attempted according to the current runtime contract.
+///
+/// This helper only owns the meeting/job completion transition. It does not
+/// record `SummaryRuns` usage; callers should record usage after `Ok(true)`
+/// with their surface-specific recorder or
+/// [`record_summary_completion_usage_observe_only`].
 pub fn complete_summary_job_after_notification<S, Q>(
     store: &mut S,
     queue: &mut Q,
@@ -1284,6 +1291,53 @@ fn record_usage_event_observe_only<S: UsageEventStore>(store: &mut S, event: New
             "failed to append usage event; continuing in observe-only mode"
         );
     }
+}
+
+pub fn record_summary_completion_usage_observe_only<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    job_id: &str,
+    chunk_count: usize,
+) {
+    let meeting = match store.get_meeting(meeting_id) {
+        Ok(Some(meeting)) => meeting,
+        Ok(None) => {
+            warn!(meeting_id, "meeting missing while recording summary usage");
+            return;
+        }
+        Err(err) => {
+            warn!(
+                meeting_id,
+                error = %err,
+                "failed to load meeting for summary usage"
+            );
+            return;
+        }
+    };
+    record_usage_event_observe_only(
+        store,
+        NewUsageEvent {
+            id: format!("usage:summary_runs:{meeting_id}"),
+            tenant_id: None,
+            guild_id: meeting.guild_id.clone(),
+            meeting_id: Some(meeting_id.to_owned()),
+            job_id: Some(job_id.to_owned()),
+            resource_type: Some("meeting".to_owned()),
+            resource_id: Some(meeting_id.to_owned()),
+            metric: UsageMetric::SummaryRuns,
+            quantity: 1,
+            detail_json: UsageDetailJson::new(serde_json::json!({
+                "chunk_count": chunk_count,
+                "surface": "process_next_summary_job_done"
+            }))
+            .expect("usage detail must be a JSON object"),
+            observed_at: Utc::now(),
+        },
+    );
+    // Unlike the scaffold path, the batch worker observes synchronously.
+    // The aggregate includes the summary_runs event just written above,
+    // giving the desired post-completion usage snapshot.
+    observe_worker_completion_entitlement(store, &meeting.guild_id);
 }
 
 pub(crate) fn observe_worker_completion_entitlement<S: UsageEventStore>(

@@ -2,7 +2,7 @@ use discord_transcript::application::summary::StubClaudeSummaryClient;
 use discord_transcript::application::worker::{
     SummaryJobOptions, SummaryNotificationReceipt, SummaryStatusNotification,
     SummaryUrlNotification, complete_summary_job_after_notification, enqueue_summary_job,
-    process_next_summary_job,
+    process_next_summary_job, record_summary_completion_usage_observe_only,
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus};
 use discord_transcript::domain::usage::UsageMetric;
@@ -481,6 +481,22 @@ fn worker_job_processing_waits_for_notification_before_completion() {
     assert_eq!(
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Posted
+    );
+    record_summary_completion_usage_observe_only(
+        &mut store,
+        &result.job.meeting_id,
+        &result.job.id,
+        result.output.chunks.len(),
+    );
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage should list");
+    assert!(
+        usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::SummaryRuns
+                && event.quantity == 1
+                && event.job_id.as_deref() == Some("j1"))
     );
 }
 
@@ -982,6 +998,26 @@ fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() 
     assert_eq!(
         queue.get("j1").expect("job should exist").status,
         JobStatus::Running
+    );
+
+    let receipt = SummaryNotificationReceipt::new(
+        result.output.chunks.len(),
+        SummaryUrlNotification::NotConfigured,
+        SummaryStatusNotification::Updated,
+    )
+    .expect("notification receipt should be valid");
+    let completed =
+        complete_summary_job_after_notification(&mut store, &mut queue, &result.job, receipt)
+            .expect("legacy fallback completion should succeed after notification");
+
+    assert!(completed);
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
+        JobStatus::Done
+    );
+    assert_eq!(
+        store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Posted
     );
 }
 
