@@ -102,6 +102,9 @@ impl From<StoreError> for CommandError {
     fn from(value: StoreError) -> Self {
         match value {
             StoreError::AlreadyExists { meeting_id } => Self::AlreadyExists { meeting_id },
+            StoreError::ActiveMeetingExists { meeting_id } => {
+                Self::ActiveMeetingExists { meeting_id }
+            }
             other => Self::Store(other.to_string()),
         }
     }
