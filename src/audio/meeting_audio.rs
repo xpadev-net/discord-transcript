@@ -245,13 +245,7 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
             MAX_SUPPORTED_WAV_SAMPLE_RATE
         ));
     }
-    let bytes_per_sample = u32::from(bits_per_sample) / 8;
-    let expected_block_align = u16::try_from(
-        u32::from(channels)
-            .checked_mul(bytes_per_sample)
-            .ok_or_else(|| format!("invalid block align in {}", path.display()))?,
-    )
-    .map_err(|_| format!("invalid block align in {}", path.display()))?;
+    let expected_block_align = channels * (bits_per_sample / 8);
     if block_align != expected_block_align {
         return Err(format!(
             "inconsistent WAV block align for {}: block_align={}, expected={expected_block_align}",
@@ -276,20 +270,18 @@ fn read_wav_pcm(path: &Path) -> Result<(u32, Vec<u8>), String> {
         ));
     }
     let data_chunk_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as usize;
-    let minimum_riff_chunk_size = 36usize
-        .checked_add(data_chunk_size)
-        .ok_or_else(|| format!("invalid data chunk size in {}", path.display()))?;
+    if data_chunk_size > MAX_WAV_CHUNK_PCM_BYTES {
+        return Err(format!(
+            "PCM data too large in {}: {data_chunk_size} bytes (max {MAX_WAV_CHUNK_PCM_BYTES})",
+            path.display()
+        ));
+    }
+    let minimum_riff_chunk_size = 36usize + data_chunk_size;
     if riff_chunk_size < minimum_riff_chunk_size {
         return Err(format!(
             "inconsistent WAV chunk size in {}: riff_chunk_size={}, expected at least {minimum_riff_chunk_size}",
             path.display(),
             riff_chunk_size
-        ));
-    }
-    if data_chunk_size > MAX_WAV_CHUNK_PCM_BYTES {
-        return Err(format!(
-            "PCM data too large in {}: {data_chunk_size} bytes (max {MAX_WAV_CHUNK_PCM_BYTES})",
-            path.display()
         ));
     }
     if data_chunk_size == 0 {
