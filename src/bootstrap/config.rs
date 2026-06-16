@@ -149,8 +149,7 @@ impl AppConfig {
             summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
-            database_ssl_mode: optional_env("DATABASE_SSL_MODE")
-                .unwrap_or_else(|| "disable".to_owned()),
+            database_ssl_mode: parse_database_ssl_mode(optional_env("DATABASE_SSL_MODE"))?,
             chunk_storage_dir,
             auto_stop_grace_seconds: optional_env_parse_u64_nonzero("AUTO_STOP_GRACE_SECONDS")?
                 .unwrap_or(60),
@@ -257,8 +256,10 @@ impl AppConfig {
             summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
-            database_ssl_mode: optional_from_map(values, "DATABASE_SSL_MODE")
-                .unwrap_or_else(|| "disable".to_owned()),
+            database_ssl_mode: parse_database_ssl_mode(optional_from_map(
+                values,
+                "DATABASE_SSL_MODE",
+            ))?,
             chunk_storage_dir,
             auto_stop_grace_seconds: optional_from_map_parse_u64_nonzero(
                 values,
@@ -354,6 +355,18 @@ fn parse_csv_list(value: Option<String>) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_database_ssl_mode(value: Option<String>) -> Result<String, ConfigError> {
+    let value = value.unwrap_or_else(|| "disable".to_owned());
+    if value == "disable" {
+        Ok(value)
+    } else {
+        Err(ConfigError::InvalidEnv {
+            key: "DATABASE_SSL_MODE",
+            value,
+        })
+    }
 }
 
 fn validate_unsafe_agent_harness_opt_in(
