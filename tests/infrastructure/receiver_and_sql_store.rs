@@ -4,12 +4,14 @@ use discord_transcript::domain::StopReason;
 use discord_transcript::domain::{JobStatus, JobType};
 use discord_transcript::infrastructure::queue::{Job, JobQueue};
 use discord_transcript::infrastructure::sql::{
-    CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
-    MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_MEETING_STATUS_CAS_SQL,
-    UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    ACTIVE_MEETING_UNIQUE_INDEX_NAME, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL,
+    FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL, INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL,
+    LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
+    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
-    FakeSqlExecutor, SqlJobQueue, SqlMeetingStore, sql_row_from_strings,
+    FakeSqlExecutor, SqlJobQueue, SqlMeetingStore, UNIQUE_VIOLATION_PREFIX, sql_row_from_strings,
+    unique_violation_constraint,
 };
 use discord_transcript::infrastructure::storage::{
     CreateMeetingRequest, MeetingStore, StoreError, StoredMeeting,
@@ -242,6 +244,216 @@ fn schema_defines_enum_check_constraints() {
 }
 
 #[test]
+fn active_meeting_unique_index_migration_is_registered() {
+    let schema = INCREMENTAL_MIGRATIONS_SQL;
+
+    assert!(schema.contains("idx_meetings_one_active_blocking_per_guild"));
+    assert!(schema.contains("WHERE status IN ('scheduled', 'recording')"));
+    assert!(schema.contains("ranked_blocking_meetings"));
+    assert!(schema.contains("CASE WHEN status = 'recording' THEN 0 ELSE 1 END"));
+    assert!(schema.contains("WHEN ranked_blocking_meetings.status = 'recording'"));
+    assert!(
+        !schema.contains(
+            "idx_meetings_one_active_blocking_per_guild\n    ON meetings (guild_id)\n    WHERE status IN ('scheduled', 'recording', 'stopping')"
+        ),
+        "stopping meetings must remain non-blocking for new recording starts"
+    );
+    assert_eq!(
+        MIGRATIONS.last().expect("latest migration").version,
+        "0028_active_meeting_unique_index"
+    );
+}
+
+#[test]
+fn unique_violation_constraint_requires_exact_prefixed_identity() {
+    let error = format!(
+        "{UNIQUE_VIOLATION_PREFIX}{ACTIVE_MEETING_UNIQUE_INDEX_NAME}: duplicate key value"
+    );
+
+    assert_eq!(
+        unique_violation_constraint(&error),
+        Some(ACTIVE_MEETING_UNIQUE_INDEX_NAME)
+    );
+    assert_eq!(
+        unique_violation_constraint(
+            "duplicate key value violates unique constraint idx_meetings_one_active_blocking_per_guild"
+        ),
+        None
+    );
+}
+
+#[test]
+fn scheduled_insert_unique_index_conflict_returns_active_blocker() {
+    let mut executor = FakeSqlExecutor::default();
+    let insert_error_key = format!(
+        "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'scheduled')|{}",
+        "new\u{1f}g1\u{1f}vc-new\u{1f}\u{1f}c1\u{1f}\u{1f}\u{1f}u2"
+    );
+    executor.execute_error.insert(
+        insert_error_key,
+        format!("{UNIQUE_VIOLATION_PREFIX}{ACTIVE_MEETING_UNIQUE_INDEX_NAME}: duplicate key"),
+    );
+    executor.query_rows_result.insert(
+        format!("{FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL}|g1"),
+        vec![meeting_row("existing", "g1", "recording")],
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let err = store
+        .create_scheduled_meeting(CreateMeetingRequest {
+            id: "new".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc-new".to_owned(),
+            voice_channel_name: None,
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u2".to_owned(),
+            effective_settings: None,
+        })
+        .expect_err("active unique conflict should surface active blocker");
+
+    assert_eq!(
+        err,
+        StoreError::ActiveMeetingExists {
+            meeting_id: "existing".to_owned()
+        }
+    );
+}
+
+#[test]
+fn recording_insert_unique_index_conflict_returns_active_blocker() {
+    let mut executor = FakeSqlExecutor::default();
+    let insert_error_key = format!(
+        "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'recording')|{}",
+        "new\u{1f}g1\u{1f}vc-new\u{1f}\u{1f}c1\u{1f}\u{1f}\u{1f}u2"
+    );
+    executor.execute_error.insert(
+        insert_error_key,
+        format!("{UNIQUE_VIOLATION_PREFIX}{ACTIVE_MEETING_UNIQUE_INDEX_NAME}: duplicate key"),
+    );
+    executor.query_rows_result.insert(
+        format!("{FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL}|g1"),
+        vec![meeting_row("existing", "g1", "recording")],
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let err = store
+        .create_meeting_as_recording(CreateMeetingRequest {
+            id: "new".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc-new".to_owned(),
+            voice_channel_name: None,
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u2".to_owned(),
+            effective_settings: None,
+        })
+        .expect_err("active unique conflict should surface active blocker");
+
+    assert_eq!(
+        err,
+        StoreError::ActiveMeetingExists {
+            meeting_id: "existing".to_owned()
+        }
+    );
+}
+
+#[test]
+fn recording_insert_ignores_stopping_row_when_recovering_active_conflict() {
+    let mut executor = FakeSqlExecutor::default();
+    let insert_error_key = format!(
+        "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'recording')|{}",
+        "new\u{1f}g1\u{1f}vc-new\u{1f}\u{1f}c1\u{1f}\u{1f}\u{1f}u2"
+    );
+    executor.execute_error.insert(
+        insert_error_key,
+        format!("{UNIQUE_VIOLATION_PREFIX}{ACTIVE_MEETING_UNIQUE_INDEX_NAME}: duplicate key"),
+    );
+    executor
+        .query_rows_result
+        .insert(format!("{FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL}|g1"), vec![]);
+    executor.active_by_guild.insert(
+        "g1".to_owned(),
+        StoredMeeting {
+            id: "stopping-meeting".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc-old".to_owned(),
+            voice_channel_name: None,
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u1".to_owned(),
+            title: None,
+            status: MeetingStatus::Stopping,
+            stop_reason: None,
+            error_message: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
+        },
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let err = store
+        .create_meeting_as_recording(CreateMeetingRequest {
+            id: "new".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc-new".to_owned(),
+            voice_channel_name: None,
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u2".to_owned(),
+            effective_settings: None,
+        })
+        .expect_err("missing blocker should return sanitized active conflict");
+
+    assert_eq!(
+        err,
+        StoreError::ActiveMeetingExists {
+            meeting_id: "new".to_owned()
+        }
+    );
+}
+
+#[test]
+fn recording_insert_other_unique_violation_stays_duplicate_id_error() {
+    let mut executor = FakeSqlExecutor::default();
+    let insert_error_key = format!(
+        "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'recording')|{}",
+        "new\u{1f}g1\u{1f}vc-new\u{1f}\u{1f}c1\u{1f}\u{1f}\u{1f}u2"
+    );
+    executor.execute_error.insert(
+        insert_error_key,
+        format!("{UNIQUE_VIOLATION_PREFIX}meetings_pkey: duplicate key"),
+    );
+
+    let mut store = SqlMeetingStore::new(executor);
+    let err = store
+        .create_meeting_as_recording(CreateMeetingRequest {
+            id: "new".to_owned(),
+            guild_id: "g1".to_owned(),
+            voice_channel_id: "vc-new".to_owned(),
+            voice_channel_name: None,
+            report_channel_id: "c1".to_owned(),
+            status_message_channel_id: None,
+            status_message_id: None,
+            started_by_user_id: "u2".to_owned(),
+            effective_settings: None,
+        })
+        .expect_err("primary-key unique violation should stay duplicate id");
+
+    assert_eq!(
+        err,
+        StoreError::AlreadyExists {
+            meeting_id: "new".to_owned()
+        }
+    );
+}
+
+#[test]
 fn pending_migrations_skip_versions_recorded_in_schema_migrations() {
     let mut executor = FakeSqlExecutor::default();
     for migration in MIGRATIONS {
@@ -434,6 +646,30 @@ fn meeting_row_for_title_test(
         Some("u1".to_owned()),
         title,
         Some("recording".to_owned()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+}
+
+fn meeting_row(
+    id: &str,
+    guild_id: &str,
+    status: &str,
+) -> discord_transcript::infrastructure::sql_store::SqlRow {
+    vec![
+        Some(id.to_owned()),
+        Some(guild_id.to_owned()),
+        Some("vc1".to_owned()),
+        None,
+        Some("c1".to_owned()),
+        None,
+        None,
+        Some("u1".to_owned()),
+        None,
+        Some(status.to_owned()),
         None,
         None,
         None,
