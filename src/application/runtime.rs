@@ -10218,6 +10218,7 @@ mod status_message_tests {
             retry_count: 0,
             error_message: None,
             claim_token: Some("token-m1".to_owned()),
+            leased_until: Some(chrono::Utc::now() + chrono::Duration::seconds(90)),
             next_run_at: None,
         }
     }
@@ -10304,6 +10305,7 @@ mod status_message_tests {
                 Some("0".to_owned()),
                 None,
                 Some(claim_token.to_owned()),
+                Some("2999-01-01T00:00:00.000Z".to_owned()),
                 None,
             ]
         }
