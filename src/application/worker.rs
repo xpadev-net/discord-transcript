@@ -1,7 +1,7 @@
 use crate::application::ai_memory_extraction::{
     AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
-use crate::application::runtime::merge_user_chunks_to_mixdown;
+use crate::application::runtime::{has_nonempty_audio_chunk, merge_user_chunks_to_mixdown};
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
     TranscriptionOutput, build_correction_prompt_with_context, build_summary_prompt_with_context,
@@ -38,7 +38,6 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -911,43 +910,6 @@ pub(crate) fn markdown_with_title_for_post(title: &str, markdown: &str) -> Strin
 pub struct ProcessJobResult {
     pub job_id: String,
     pub output: ProcessMeetingOutput,
-}
-
-fn has_nonempty_audio_chunk(meeting_dir: &Path) -> Result<bool, String> {
-    let entries = match std::fs::read_dir(meeting_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(format!(
-                "failed to read meeting dir {}: {err}",
-                meeting_dir.display()
-            ));
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
-        let path = entry.path();
-        if path.is_dir() {
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase());
-        let is_candidate = matches!(ext.as_deref(), Some("wav"))
-            && path.file_stem().and_then(|stem| stem.to_str()) != Some("mixdown");
-        if !is_candidate {
-            continue;
-        }
-        let size = entry
-            .metadata()
-            .map_err(|err| format!("failed to read metadata {}: {err}", path.display()))?
-            .len();
-        if size > 44 {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
