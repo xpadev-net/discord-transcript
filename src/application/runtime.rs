@@ -4832,7 +4832,20 @@ impl ScaffoldHandler {
         };
 
         for snapshot in snapshots {
-            let meeting = self.load_meeting(&snapshot.meeting_id).await.ok();
+            let meeting = {
+                let mut service = self.service.lock().await;
+                match service.store.get_meeting(&snapshot.meeting_id) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %snapshot.meeting_id,
+                            error = %err,
+                            "failed to load meeting during startup recovery; deferring snapshot"
+                        );
+                        continue;
+                    }
+                }
+            };
             let workspace = meeting.as_ref().map(|m| self.workspace_for_meeting(m));
             let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
                 &self.chunk_storage_dir,
@@ -9888,6 +9901,29 @@ mod status_message_tests {
             RecoveryEffect::SummaryRequeued {
                 meeting_id: "m1".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn audio_dir_fallback_uses_legacy_when_primary_read_fails() {
+        let temp = runtime_temp_dir("legacy_recovery_primary_error");
+        std::fs::create_dir_all(&temp.path).expect("temp root should exist");
+        let primary_file = temp.path.join("audio");
+        std::fs::write(&primary_file, b"not a directory").expect("primary file should be written");
+        let legacy_dir = temp.path.join("legacy");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy audio dir should exist");
+        write_test_wav(&legacy_dir.join("user-1.wav"));
+
+        let recovered_audio =
+            recoverable_audio_dir_with_legacy_fallback(primary_file, legacy_dir.clone())
+                .expect("legacy fallback should succeed after primary read error");
+
+        assert_eq!(
+            recovered_audio,
+            Some(RecoverableAudioDir {
+                path: legacy_dir,
+                is_legacy: true,
+            })
         );
     }
 
