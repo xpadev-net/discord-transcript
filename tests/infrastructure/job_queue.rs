@@ -1,6 +1,8 @@
 use discord_transcript::application::summary::StubClaudeSummaryClient;
 use discord_transcript::application::worker::{
-    SummaryJobOptions, enqueue_summary_job, process_next_summary_job,
+    SummaryJobOptions, SummaryNotificationReceipt, SummaryStatusNotification,
+    SummaryUrlNotification, complete_summary_job_after_notification, enqueue_summary_job,
+    process_next_summary_job,
 };
 use discord_transcript::domain::{JobStatus, JobType, MeetingStatus};
 use discord_transcript::domain::usage::UsageMetric;
@@ -393,7 +395,7 @@ fn in_memory_queue_rejects_expired_lease_and_recovers_stale_running() {
 }
 
 #[test]
-fn worker_job_processing_marks_done_on_success() {
+fn worker_job_processing_waits_for_notification_before_completion() {
     let base = unique_temp_dir("worker_success");
     write_dummy_chunk(base.path(), "m1");
 
@@ -431,25 +433,97 @@ fn worker_job_processing_marks_done_on_success() {
     assert_eq!(result.job_id, "j1");
     assert_eq!(
         queue.get("j1").expect("job should exist").status,
+        JobStatus::Running
+    );
+    assert_eq!(
+        store.get("m1").expect("meeting should exist").status,
+        MeetingStatus::Summarizing
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            base.path()
+                .join("workspaces/g1/vc1/m1/summary/summary.md")
+        )
+        .expect("generated summary should be durable"),
+        "## Summary\ndone"
+    );
+    let usage = store
+        .list_recent_usage_events(None, Some("g1"), 10)
+        .expect("usage should list");
+    assert!(
+        !usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::SummaryRuns),
+        "summary run usage must wait for notification completion"
+    );
+    assert!(
+        usage
+            .iter()
+            .any(|event| event.metric == UsageMetric::AsrSeconds
+                && event.job_id.as_deref() == Some("j1"))
+    );
+
+    let receipt = SummaryNotificationReceipt::new(
+        result.output.chunks.len(),
+        SummaryUrlNotification::NotConfigured,
+        SummaryStatusNotification::Updated,
+    )
+    .expect("notification receipt should be valid");
+    let completed =
+        complete_summary_job_after_notification(&mut store, &mut queue, &result.job, receipt)
+            .expect("completion should succeed after notification");
+
+    assert!(completed);
+    assert_eq!(
+        queue.get("j1").expect("job should exist").status,
         JobStatus::Done
     );
     assert_eq!(
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Posted
     );
-    let usage = store
-        .list_recent_usage_events(None, Some("g1"), 10)
-        .expect("usage should list");
+}
+
+#[test]
+fn summary_completion_receipt_requires_post_url_and_status_outcomes() {
+    let zero_chunks = SummaryNotificationReceipt::new(
+        0,
+        SummaryUrlNotification::NotConfigured,
+        SummaryStatusNotification::Updated,
+    )
+    .expect_err("zero posted chunks must not complete a summary job");
     assert!(
-        usage
-            .iter()
-            .any(|event| event.metric == UsageMetric::SummaryRuns
-                && event.quantity == 1
-                && event.job_id.as_deref() == Some("j1"))
+        zero_chunks
+            .to_string()
+            .contains("at least one successful Discord post chunk"),
+        "unexpected error: {zero_chunks}"
     );
-    assert!(usage.iter().any(|event| {
-        event.metric == UsageMetric::AsrSeconds && event.job_id.as_deref() == Some("j1")
-    }));
+
+    let missing_url = SummaryNotificationReceipt::new(
+        1,
+        SummaryUrlNotification::NotAttempted,
+        SummaryStatusNotification::Updated,
+    )
+    .expect_err("URL notification outcome must be explicit");
+    assert!(
+        missing_url
+            .to_string()
+            .contains("meeting URL notification outcome"),
+        "unexpected error: {missing_url}"
+    );
+
+    let missing_status = SummaryNotificationReceipt::new(
+        1,
+        SummaryUrlNotification::NotConfigured,
+        SummaryStatusNotification::NotAttempted,
+    )
+    .expect_err("status notification outcome must be explicit");
+    assert!(
+        missing_status
+            .to_string()
+            .contains("status message update outcome"),
+        "unexpected error: {missing_status}"
+    );
 }
 
 #[test]
@@ -636,6 +710,61 @@ fn worker_job_processing_rejects_disabled_summary_for_non_terminal_pipeline_stat
         store.get("m1").expect("meeting should exist").status,
         MeetingStatus::Failed
     );
+}
+
+#[test]
+fn worker_job_processing_requeues_when_generated_summary_persistence_fails() {
+    let base = unique_temp_dir("worker_summary_persist_failure");
+    write_dummy_chunk(base.path(), "m1");
+    let summary_output_path =
+        discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout::new(base.path())
+            .for_meeting("g1", "vc1", "m1")
+            .summary_dir()
+            .join("summary.md");
+    std::fs::create_dir_all(&summary_output_path)
+        .expect("directory at summary output path should force write failure");
+
+    let mut queue = InMemoryJobQueue::new();
+    enqueue_summary_job(&mut queue, "j1", "m1").expect("enqueue should succeed");
+
+    let mut store = InMemoryMeetingStore::new();
+    store.insert(stopping_meeting("m1"));
+
+    let whisper = StubWhisperClient {
+        mocked_response_json: r#"{
+          "text":"ok",
+          "segments":[{"speaker":"alice","start":0.0,"end":1.0,"text":"hello"}]
+        }"#
+        .to_owned(),
+    };
+    let claude = StubClaudeSummaryClient {
+        mocked_markdown: "## Summary\ndone".to_owned(),
+    };
+
+    let err = process_next_summary_job(
+        &mut store,
+        &mut queue,
+        &whisper,
+        &claude,
+        &SummaryJobOptions {
+            max_retries: 2,
+            audio_base_dir: base.path().to_string_lossy().to_string(),
+            language: None,
+            resample_to_16k: false,
+        },
+    )
+    .expect_err("summary persistence failure should retry");
+
+    assert!(
+        err.to_string()
+            .contains("failed to persist generated summary"),
+        "unexpected error: {err}"
+    );
+    let job = queue.get("j1").expect("job exists");
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!(job.retry_count, 1);
+    let saved = store.get("m1").expect("meeting exists");
+    assert_eq!(saved.status, MeetingStatus::Stopping);
 }
 
 #[test]
@@ -852,7 +981,7 @@ fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() 
     assert_eq!(result.job_id, "j1");
     assert_eq!(
         queue.get("j1").expect("job should exist").status,
-        JobStatus::Done
+        JobStatus::Running
     );
 }
 
