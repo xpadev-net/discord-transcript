@@ -127,6 +127,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0027_meeting_voice_channel_name",
         sql: include_str!("../../migrations/0027_meeting_voice_channel_name.sql"),
     },
+    Migration {
+        version: "0028_active_meeting_unique_index",
+        sql: include_str!("../../migrations/0028_active_meeting_unique_index.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -195,6 +199,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0026_job_claim_token.sql"),
     "\n",
     include_str!("../../migrations/0027_meeting_voice_channel_name.sql"),
+    "\n",
+    include_str!("../../migrations/0028_active_meeting_unique_index.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1801,6 +1807,22 @@ SELECT id, NULLIF($9,''), $10::TEXT::BOOLEAN, $11::TEXT::INTEGER,
        $18::TEXT::INTEGER, NULLIF($19,'')::TEXT::INTEGER,
        $20::TEXT::BOOLEAN, NULLIF($21,''), NULLIF($22,''), NOW()
 FROM inserted_meeting
+"#;
+
+pub const ACTIVE_MEETING_UNIQUE_INDEX_NAME: &str = "idx_meetings_one_active_blocking_per_guild";
+
+pub const FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL: &str = r#"
+SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id,
+       status_message_channel_id, status_message_id, started_by_user_id,
+       title, status, stop_reason, error_message,
+       to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS started_at,
+       to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stopped_at,
+       meeting_duration_seconds
+FROM meetings
+WHERE guild_id = $1
+  AND status IN ('scheduled', 'recording')
+ORDER BY started_at DESC
+LIMIT 1
 "#;
 
 pub const INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL: &str = r#"

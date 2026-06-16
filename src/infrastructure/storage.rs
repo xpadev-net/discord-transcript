@@ -22,6 +22,9 @@ pub enum StoreError {
     AlreadyExists {
         meeting_id: String,
     },
+    ActiveMeetingExists {
+        meeting_id: String,
+    },
     Backend(String),
     NotFound {
         meeting_id: String,
@@ -38,6 +41,9 @@ impl Display for StoreError {
         match self {
             Self::AlreadyExists { meeting_id } => {
                 write!(f, "meeting already exists: {meeting_id}")
+            }
+            Self::ActiveMeetingExists { meeting_id } => {
+                write!(f, "an active meeting already exists: {meeting_id}")
             }
             Self::Backend(err) => {
                 write!(f, "store backend error: {err}")

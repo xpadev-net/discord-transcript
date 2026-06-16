@@ -26,10 +26,11 @@ use crate::domain::usage::{NewUsageEvent, UsageAggregate, UsageEvent, UsageMetri
 use crate::domain::{JobStatus, JobType};
 use crate::infrastructure::queue::{Job, JobQueue, QueueError, require_claim_token};
 use crate::infrastructure::sql::{
-    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, AGGREGATE_RECENT_USAGE_SQL,
-    ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL,
-    ARCHIVE_SUMMARY_TEMPLATE_SQL, BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL,
-    CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL, ENQUEUE_JOB_SQL,
+    ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ACTIVATE_SUMMARY_TEMPLATE_SQL, ACTIVE_MEETING_UNIQUE_INDEX_NAME,
+    AGGREGATE_RECENT_USAGE_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL,
+    ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
+    BACKFILL_DEFAULT_TENANTS_FROM_EXISTING_GUILDS_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
+    CREATE_SCHEMA_MIGRATIONS_SQL, ENQUEUE_JOB_SQL, FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL,
     GET_ACTIVE_SUMMARY_TEMPLATE_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL,
     GET_EFFECTIVE_MEETING_SETTINGS_SQL, GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL,
     GET_SUMMARY_TEMPLATE_SQL, HEARTBEAT_RUNNING_JOB_SQL, INSERT_AI_MEMORY_NOTE_SQL,
@@ -63,6 +64,15 @@ const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64 / 1_000_000;
 /// (unique_violation). Callers can check `err.starts_with(UNIQUE_VIOLATION_PREFIX)`
 /// instead of locale-dependent string matching.
 pub const UNIQUE_VIOLATION_PREFIX: &str = "UNIQUE_VIOLATION: ";
+const UNIQUE_VIOLATION_CONSTRAINT_SEPARATOR: &str = ": ";
+
+pub fn unique_violation_constraint(error: &str) -> Option<&str> {
+    error
+        .strip_prefix(UNIQUE_VIOLATION_PREFIX)?
+        .split_once(UNIQUE_VIOLATION_CONSTRAINT_SEPARATOR)
+        .map(|(constraint, _)| constraint)
+        .filter(|constraint| !constraint.is_empty())
+}
 
 pub type SqlRow = Vec<Option<String>>;
 
@@ -189,6 +199,46 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         }
         self.executor
             .run_migration(&migration_transaction_sql(migration))
+    }
+
+    fn map_active_meeting_insert_error(
+        &mut self,
+        err: String,
+        meeting_id: String,
+        guild_id: String,
+    ) -> StoreError {
+        if unique_violation_constraint(&err) == Some(ACTIVE_MEETING_UNIQUE_INDEX_NAME) {
+            return match self.find_active_recording_blocker_by_guild(&guild_id) {
+                Ok(Some(active)) => StoreError::ActiveMeetingExists {
+                    meeting_id: active.id,
+                },
+                Ok(None) => StoreError::Backend(err),
+                Err(query_err) => query_err,
+            };
+        }
+
+        if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
+            StoreError::AlreadyExists { meeting_id }
+        } else {
+            StoreError::Backend(err)
+        }
+    }
+
+    fn find_active_recording_blocker_by_guild(
+        &mut self,
+        guild_id: &str,
+    ) -> Result<Option<StoredMeeting>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL,
+                &[guild_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        sql_row_to_stored_meeting(&row, &format!("guild_id={guild_id}")).map(Some)
     }
 
     pub fn list_rbac_role_grants_for_member_roles(
@@ -2092,45 +2142,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        if row.len() < 15 {
-            return Err(StoreError::Backend(format!(
-                "invalid meeting row length for id={meeting_id}: {}",
-                row.len()
-            )));
-        }
-        let require = |idx: usize, field: &str| -> Result<String, StoreError> {
-            row.get(idx)
-                .and_then(|v| v.clone())
-                .ok_or_else(|| StoreError::Backend(format!("{field} is NULL for id={meeting_id}")))
-        };
-        let status_raw = require(9, "status")?;
-        let status = MeetingStatus::parse_str(&status_raw).ok_or_else(|| {
-            StoreError::Backend(format!(
-                "invalid meeting status for id={meeting_id}: {status_raw}"
-            ))
-        })?;
-        let stop_reason = parse_stop_reason_column(
-            row.get(10).and_then(|v| v.clone()),
-            &format!("meeting_id={meeting_id}"),
-        )
-        .map_err(StoreError::Backend)?;
-        Ok(Some(StoredMeeting {
-            id: require(0, "id")?,
-            guild_id: require(1, "guild_id")?,
-            voice_channel_id: require(2, "voice_channel_id")?,
-            voice_channel_name: row.get(3).and_then(|v| v.clone()),
-            report_channel_id: require(4, "report_channel_id")?,
-            status_message_channel_id: row.get(5).and_then(|v| v.clone()),
-            status_message_id: row.get(6).and_then(|v| v.clone()),
-            started_by_user_id: require(7, "started_by_user_id")?,
-            title: row.get(8).and_then(|v| v.clone()),
-            status,
-            stop_reason,
-            error_message: row.get(11).and_then(|v| v.clone()),
-            started_at: parse_optional_rfc3339(row.get(12).and_then(|v| v.clone())),
-            stopped_at: parse_optional_rfc3339(row.get(13).and_then(|v| v.clone())),
-            duration_seconds: parse_optional_u64(row.get(14).and_then(|v| v.clone())),
-        }))
+        sql_row_to_stored_meeting(&row, &format!("id={meeting_id}")).map(Some)
     }
 
     fn create_scheduled_meeting(
@@ -2138,43 +2150,34 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
         let meeting_id = request.id.clone();
+        let guild_id = request.guild_id.clone();
         if let Some(settings) = request.effective_settings.clone() {
             let params = create_meeting_with_settings_params(request, settings);
-            self.executor
-                .execute(
-                    INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
-                    &params,
-                )
-                .map_err(|err| {
-                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
-                        StoreError::AlreadyExists { meeting_id }
-                    } else {
-                        StoreError::Backend(err)
-                    }
-                })?;
+            let result = self.executor.execute(
+                INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+                &params,
+            );
+            if let Err(err) = result {
+                return Err(self.map_active_meeting_insert_error(err, meeting_id, guild_id));
+            }
         } else {
             let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'scheduled')";
-            self.executor
-                .execute(
-                    sql,
-                    &[
-                        request.id,
-                        request.guild_id,
-                        request.voice_channel_id,
-                        request.voice_channel_name.unwrap_or_default(),
-                        request.report_channel_id,
-                        request.status_message_channel_id.unwrap_or_default(),
-                        request.status_message_id.unwrap_or_default(),
-                        request.started_by_user_id,
-                    ],
-                )
-                .map_err(|err| {
-                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
-                        StoreError::AlreadyExists { meeting_id }
-                    } else {
-                        StoreError::Backend(err)
-                    }
-                })?;
+            let result = self.executor.execute(
+                sql,
+                &[
+                    request.id,
+                    request.guild_id,
+                    request.voice_channel_id,
+                    request.voice_channel_name.unwrap_or_default(),
+                    request.report_channel_id,
+                    request.status_message_channel_id.unwrap_or_default(),
+                    request.status_message_id.unwrap_or_default(),
+                    request.started_by_user_id,
+                ],
+            );
+            if let Err(err) = result {
+                return Err(self.map_active_meeting_insert_error(err, meeting_id, guild_id));
+            }
         }
         Ok(())
     }
@@ -2184,43 +2187,34 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         request: CreateMeetingRequest,
     ) -> Result<(), StoreError> {
         let meeting_id = request.id.clone();
+        let guild_id = request.guild_id.clone();
         if let Some(settings) = request.effective_settings.clone() {
             let params = create_meeting_with_settings_params(request, settings);
-            self.executor
-                .execute(
-                    INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
-                    &params,
-                )
-                .map_err(|err| {
-                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
-                        StoreError::AlreadyExists { meeting_id }
-                    } else {
-                        StoreError::Backend(err)
-                    }
-                })?;
+            let result = self.executor.execute(
+                INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
+                &params,
+            );
+            if let Err(err) = result {
+                return Err(self.map_active_meeting_insert_error(err, meeting_id, guild_id));
+            }
         } else {
             let sql = "INSERT INTO meetings(id,guild_id,voice_channel_id,voice_channel_name,report_channel_id,status_message_channel_id,status_message_id,started_by_user_id,status) VALUES($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,'recording')";
-            self.executor
-                .execute(
-                    sql,
-                    &[
-                        request.id,
-                        request.guild_id,
-                        request.voice_channel_id,
-                        request.voice_channel_name.unwrap_or_default(),
-                        request.report_channel_id,
-                        request.status_message_channel_id.unwrap_or_default(),
-                        request.status_message_id.unwrap_or_default(),
-                        request.started_by_user_id,
-                    ],
-                )
-                .map_err(|err| {
-                    if err.starts_with(UNIQUE_VIOLATION_PREFIX) {
-                        StoreError::AlreadyExists { meeting_id }
-                    } else {
-                        StoreError::Backend(err)
-                    }
-                })?;
+            let result = self.executor.execute(
+                sql,
+                &[
+                    request.id,
+                    request.guild_id,
+                    request.voice_channel_id,
+                    request.voice_channel_name.unwrap_or_default(),
+                    request.report_channel_id,
+                    request.status_message_channel_id.unwrap_or_default(),
+                    request.status_message_id.unwrap_or_default(),
+                    request.started_by_user_id,
+                ],
+            );
+            if let Err(err) = result {
+                return Err(self.map_active_meeting_insert_error(err, meeting_id, guild_id));
+            }
         }
         Ok(())
     }
@@ -2539,7 +2533,11 @@ impl SqlExecutor for PgSqlExecutor {
             s.spawn(|| {
                 runtime.block_on(client.execute(sql, &bind)).map_err(|err| {
                     if err.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-                        format!("{UNIQUE_VIOLATION_PREFIX}{err}")
+                        let constraint = err
+                            .as_db_error()
+                            .and_then(|db_err| db_err.constraint())
+                            .unwrap_or("");
+                        format!("{UNIQUE_VIOLATION_PREFIX}{constraint}: {err}")
                     } else {
                         err.to_string()
                     }
@@ -2648,6 +2646,50 @@ fn row_to_stored_meeting(row: &Row) -> Result<StoredMeeting, String> {
             .ok()
             .flatten()
             .and_then(|value| u64::try_from(value).ok()),
+    })
+}
+
+fn sql_row_to_stored_meeting(row: &SqlRow, context: &str) -> Result<StoredMeeting, StoreError> {
+    if row.len() < 15 {
+        return Err(StoreError::Backend(format!(
+            "invalid meeting row length for {context}: {}",
+            row.len()
+        )));
+    }
+    let require = |idx: usize, field: &str| -> Result<String, StoreError> {
+        row.get(idx)
+            .and_then(|v| v.clone())
+            .ok_or_else(|| StoreError::Backend(format!("{field} is NULL for {context}")))
+    };
+    let meeting_id = require(0, "id")?;
+    let status_raw = require(9, "status")?;
+    let status = MeetingStatus::parse_str(&status_raw).ok_or_else(|| {
+        StoreError::Backend(format!(
+            "invalid meeting status for meeting_id={meeting_id}: {status_raw}"
+        ))
+    })?;
+    let stop_reason = parse_stop_reason_column(
+        row.get(10).and_then(|v| v.clone()),
+        &format!("meeting_id={meeting_id}"),
+    )
+    .map_err(StoreError::Backend)?;
+
+    Ok(StoredMeeting {
+        id: meeting_id,
+        guild_id: require(1, "guild_id")?,
+        voice_channel_id: require(2, "voice_channel_id")?,
+        voice_channel_name: row.get(3).and_then(|v| v.clone()),
+        report_channel_id: require(4, "report_channel_id")?,
+        status_message_channel_id: row.get(5).and_then(|v| v.clone()),
+        status_message_id: row.get(6).and_then(|v| v.clone()),
+        started_by_user_id: require(7, "started_by_user_id")?,
+        title: row.get(8).and_then(|v| v.clone()),
+        status,
+        stop_reason,
+        error_message: row.get(11).and_then(|v| v.clone()),
+        started_at: parse_optional_rfc3339(row.get(12).and_then(|v| v.clone())),
+        stopped_at: parse_optional_rfc3339(row.get(13).and_then(|v| v.clone())),
+        duration_seconds: parse_optional_u64(row.get(14).and_then(|v| v.clone())),
     })
 }
 
