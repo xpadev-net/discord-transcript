@@ -9,7 +9,7 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| 要約用 CLI | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示したローカル検証用途のみ（既定 harness は Claude） |
+| 要約用 CLI | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示したローカル検証用途のみ（既定 harness は Claude、production Docker image には同梱しません） |
 
 ## 環境構築
 
@@ -68,17 +68,20 @@ done
 
 > **Note:** 要約 CLI harness はワークスペースや環境へアクセスできるため、既定では起動を拒否します。ローカル検証で使う場合は `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示してください。production-like な profile では unsafe opt-in があっても起動しません。文字起こし補正（LLM によるトランスクリプト整形）は全文プロンプトを扱うため、unsafe opt-in 後も built-in CLI harness では実行しません。
 
-Docker Compose の通常サービスは、ホストの LLM 認証ディレクトリをマウントしません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する unsafe override file を明示的に追加してください。これらの override file は認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
+Docker Compose の通常サービスは、要約用 CLI やホストの LLM 認証ディレクトリを含めません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する unsafe override file を明示的に追加してください。Claude Code のローカル検証では `unsafe-claude` Docker target を使い、固定バージョン・integrity・`claude --version` 検証付きで CLI を追加します。これらの override file は認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.unsafe-claude.yml up app
+# Claude Code local unsafe harness image
+docker compose -f docker-compose.dev.yml -f docker-compose.unsafe-claude.yml up app
+
+# OpenCode / Cursor require a trusted derived image or mounted binary with SUMMARY_COMMAND set.
 docker compose -f docker-compose.yml -f docker-compose.unsafe-opencode.yml up app
 docker compose -f docker-compose.yml -f docker-compose.unsafe-cursor.yml up app
 ```
 
 Compose の `app` は Discord voice (songbird) の UDP 通信のため host network を使います。Web UI は既定で `127.0.0.1` に bind します。外部公開する場合は、リバースプロキシなどの公開経路を決めた上で `WEB_BIND_HOST` を明示的に変更してください。`migrate` は compose network 上の `db:5432` に接続するため host network を使いません。
 
-公開 GHCR イメージはネットワークインストーラの実行を避けるため Cursor Agent CLI を同梱しません。Docker で `cursor_agent` / `opencode` harness を使う場合は、検証済みの CLI を含む派生イメージを作るか、信頼できる方法でバイナリを配置し、`SUMMARY_COMMAND` に明示的なパスを設定してください。
+公開 GHCR イメージはネットワークインストーラや registry の最新状態に依存しないため、Claude Code / Cursor Agent CLI / OpenCode を同梱しません。Docker で CLI harness を使う場合は、ローカル検証専用の `unsafe-claude` target を使うか、検証済みの CLI を含む派生イメージを作るか、信頼できる方法でバイナリを配置し、`SUMMARY_COMMAND` に明示的なパスを設定してください。
 
 ### ワークスペース構造
 
@@ -201,7 +204,7 @@ cargo build --release
 - 全ての必須環境変数が設定されていること
 - PostgreSQL に接続可能で、マイグレーションが適用済みであること
 - whisper.cpp サーバーが起動していること
-- 要約用 CLI（既定なら Claude）がインストール・認証済みであること
+- 要約用 CLI（既定なら Claude）がインストール・認証済みであること（production Docker image には同梱しません）
 - `CHUNK_STORAGE_DIR` で指定したディレクトリが存在し、書き込み可能であること
 
 ### systemd によるサービス化 (例)
