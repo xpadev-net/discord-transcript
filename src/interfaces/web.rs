@@ -5931,11 +5931,37 @@ fn validate_authorized_guild_settings_update(
 
 #[cfg(test)]
 fn validate_authorized_guild_bot_token_update(
-    is_admin: bool,
+    can_manage_settings: bool,
     request: &GuildBotTokenUpdateRequest,
 ) -> Result<String, StatusCode> {
-    guild_admin_required_result(is_admin)?;
+    if !can_manage_settings {
+        return Err(StatusCode::FORBIDDEN);
+    }
     normalize_guild_bot_token_update(request)
+}
+
+#[cfg(test)]
+fn validate_authorized_domain_knowledge_create(
+    can_manage_domain_knowledge: bool,
+    request: &DomainKnowledgeUpsertRequest,
+) -> Result<NormalizedDomainKnowledgeRequest, StatusCode> {
+    if !can_manage_domain_knowledge {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    normalize_domain_knowledge_request(request)
+}
+
+#[cfg(test)]
+fn validate_authorized_domain_knowledge_update(
+    can_manage_domain_knowledge: bool,
+    item_id: &str,
+    request: &DomainKnowledgeUpsertRequest,
+) -> Result<NormalizedDomainKnowledgeRequest, StatusCode> {
+    if !can_manage_domain_knowledge {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    validate_domain_knowledge_item_id(item_id)?;
+    normalize_domain_knowledge_request(request)
 }
 
 fn oauth_access_token_expires_at(expires_in: Option<u64>) -> Instant {
@@ -9100,7 +9126,6 @@ async fn api_create_domain_knowledge(
     headers: HeaderMap,
     Json(request): Json<DomainKnowledgeUpsertRequest>,
 ) -> Result<(StatusCode, Json<DomainKnowledgeItemResponse>), StatusCode> {
-    let normalized = normalize_domain_knowledge_request(&request)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     require_current_user_has_rbac_permission(
         &state,
@@ -9108,6 +9133,7 @@ async fn api_create_domain_knowledge(
         RbacPermission::DomainKnowledgeManage,
     )
     .await?;
+    let normalized = normalize_domain_knowledge_request(&request)?;
     let id = Uuid::new_v4().to_string();
     let content_type = normalized.content_type.as_str().to_owned();
     let active = normalized.active.unwrap_or(true).to_string();
@@ -9156,8 +9182,6 @@ async fn api_update_domain_knowledge(
     headers: HeaderMap,
     Json(request): Json<DomainKnowledgeUpsertRequest>,
 ) -> Result<Json<DomainKnowledgeItemResponse>, StatusCode> {
-    validate_domain_knowledge_item_id(&item_id)?;
-    let normalized = normalize_domain_knowledge_request(&request)?;
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     require_current_user_has_rbac_permission(
         &state,
@@ -9165,6 +9189,8 @@ async fn api_update_domain_knowledge(
         RbacPermission::DomainKnowledgeManage,
     )
     .await?;
+    validate_domain_knowledge_item_id(&item_id)?;
+    let normalized = normalize_domain_knowledge_request(&request)?;
     let content_type = normalized.content_type.as_str().to_owned();
     let active = normalized
         .active
@@ -10609,10 +10635,7 @@ async fn api_update_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    require_current_user_is_guild_admin(&state, &user_id)
-        .await
-        .map_err(|status| status.into_response())?;
-    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
         .await
         .map_err(|status| status.into_response())?;
     let token = normalize_guild_bot_token_update(&request).map_err(|status| {
@@ -10622,6 +10645,9 @@ async fn api_update_guild_bot_token(
             "Discord bot token is required.",
         )
     })?;
+    let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
+        .await
+        .map_err(|status| status.into_response())?;
 
     let cipher = state.guild_bot_token_cipher.as_ref().ok_or_else(|| {
         api_error_response(
@@ -12741,6 +12767,7 @@ mod guild_api_tests {
         permissions_for_grant, rbac_audit_detail, rbac_permission_catalog,
         system_admin_bearer_token, target_auth_config, target_guild_has_active_installation,
         target_guild_rbac_path, target_guild_settings_path, user_can_access_target_guild,
+        validate_authorized_domain_knowledge_create, validate_authorized_domain_knowledge_update,
         validate_authorized_guild_bot_token_update, validate_authorized_guild_settings_update,
         validate_authorized_summary_template_request, validate_domain_knowledge_item_id,
         validate_guild_settings_update, validate_rbac_role_exists, validate_resource_id,
@@ -13145,9 +13172,12 @@ mod guild_api_tests {
     }
 
     #[test]
-    fn guild_bot_token_update_checks_admin_before_token_validation() {
+    fn guild_bot_token_update_checks_settings_manage_before_token_validation() {
         let request = GuildBotTokenUpdateRequest {
             bot_token: "   ".to_owned(),
+        };
+        let oversized = GuildBotTokenUpdateRequest {
+            bot_token: "x".repeat(4097),
         };
 
         assert_eq!(
@@ -13155,7 +13185,51 @@ mod guild_api_tests {
             Err(StatusCode::FORBIDDEN)
         );
         assert_eq!(
+            validate_authorized_guild_bot_token_update(false, &oversized),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
             validate_authorized_guild_bot_token_update(true, &request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_authorized_guild_bot_token_update(true, &oversized),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn domain_knowledge_mutations_check_permission_before_request_validation() {
+        let request = DomainKnowledgeUpsertRequest {
+            content_type: "secret".to_owned(),
+            title: "Title".to_owned(),
+            body: "   ".to_owned(),
+            active: Some(true),
+        };
+
+        assert_eq!(
+            validate_authorized_domain_knowledge_create(false, &request),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_authorized_domain_knowledge_create(true, &request),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_authorized_domain_knowledge_update(false, "bad/id", &request),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_authorized_domain_knowledge_update(
+                true,
+                "item-1",
+                &DomainKnowledgeUpsertRequest {
+                    content_type: "project_context".to_owned(),
+                    title: "   ".to_owned(),
+                    body: "Body".to_owned(),
+                    active: Some(true),
+                },
+            ),
             Err(StatusCode::BAD_REQUEST)
         );
     }
@@ -13320,7 +13394,7 @@ mod guild_api_tests {
     }
 
     #[test]
-    fn sensitive_rbac_and_bot_token_handlers_require_guild_admin() {
+    fn sensitive_rbac_and_bot_token_handlers_authorize_before_mutation() {
         let source = include_str!("web.rs");
 
         fn marker_index(section: &str, marker: &str) -> usize {
@@ -13348,6 +13422,16 @@ mod guild_api_tests {
             assert!(!section.contains("require_current_user_has_rbac_permission"));
             assert!(!section.contains("current_user_has_rbac_permission_for_auth"));
             assert!(!section.contains("RbacPermission::SettingsManage"));
+        }
+
+        fn assert_current_settings_manage_handler(section: &str, operation_marker: &str) {
+            assert!(section.contains("require_current_user_has_rbac_permission"));
+            assert!(section.contains("RbacPermission::SettingsManage"));
+            assert!(
+                marker_index(section, "require_current_user_has_rbac_permission")
+                    < marker_index(section, operation_marker)
+            );
+            assert!(!section.contains("require_current_user_is_guild_admin"));
         }
 
         fn assert_sensitive_target_handler(section: &str, operation_marker: &str) {
@@ -13425,7 +13509,7 @@ mod guild_api_tests {
             ),
             "load_guild_settings",
         );
-        assert_sensitive_current_handler(
+        assert_current_settings_manage_handler(
             handler_section(
                 source,
                 "async fn api_update_guild_bot_token",
@@ -13742,6 +13826,52 @@ mod guild_api_tests {
                 marker_index(section, write_marker) < marker_index(section, "record_audit_event")
             );
         }
+
+        let bot_token_update = handler_section(
+            source,
+            "async fn api_update_guild_bot_token",
+            "async fn api_delete_guild_bot_token",
+        );
+        assert!(
+            marker_index(bot_token_update, "require_current_user_has_rbac_permission")
+                < marker_index(bot_token_update, "normalize_guild_bot_token_update")
+        );
+
+        let create_domain_knowledge = handler_section(
+            source,
+            "async fn api_create_domain_knowledge",
+            "async fn api_update_domain_knowledge",
+        );
+        assert!(
+            marker_index(
+                create_domain_knowledge,
+                "require_current_user_has_rbac_permission"
+            ) < marker_index(
+                create_domain_knowledge,
+                "normalize_domain_knowledge_request"
+            )
+        );
+
+        let update_domain_knowledge = handler_section(
+            source,
+            "async fn api_update_domain_knowledge",
+            "async fn api_activate_domain_knowledge",
+        );
+        assert!(
+            marker_index(
+                update_domain_knowledge,
+                "require_current_user_has_rbac_permission"
+            ) < marker_index(update_domain_knowledge, "validate_domain_knowledge_item_id")
+        );
+        assert!(
+            marker_index(
+                update_domain_knowledge,
+                "require_current_user_has_rbac_permission"
+            ) < marker_index(
+                update_domain_knowledge,
+                "normalize_domain_knowledge_request"
+            )
+        );
 
         let promote = source
             .split_once("async fn api_promote_ai_memory_to_domain_knowledge")
