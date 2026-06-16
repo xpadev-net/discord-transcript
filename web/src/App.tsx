@@ -41,6 +41,20 @@ function canManageCurrentGuildSettings(me: MeResponse | null): boolean {
   return me?.can_manage_settings ?? me?.is_admin ?? false;
 }
 
+function canCustomizeCurrentGuildSettings(me: MeResponse | null): boolean {
+  return (
+    (me?.can_manage_domain_knowledge ?? false) ||
+    (me?.can_manage_summary_templates ?? false) ||
+    (me?.is_admin ?? false)
+  );
+}
+
+function canAccessCurrentGuildSettings(me: MeResponse | null): boolean {
+  return (
+    canManageCurrentGuildSettings(me) || canCustomizeCurrentGuildSettings(me)
+  );
+}
+
 function canViewCurrentGuildUsage(me: MeResponse | null): boolean {
   return me?.can_view_usage ?? me?.is_admin ?? false;
 }
@@ -170,9 +184,9 @@ export function App() {
   const canUseSelectedGuildSettings = selectedGuild
     ? canSelectGuild(selectedGuild) &&
       (selectedGuild.guild_id === me?.guild_id
-        ? canManageCurrentGuildSettings(me)
+        ? canAccessCurrentGuildSettings(me)
         : true)
-    : canManageCurrentGuildSettings(me) && selectedGuildId === me?.guild_id;
+    : canAccessCurrentGuildSettings(me) && selectedGuildId === me?.guild_id;
   const canUseCurrentGuildAdminViews = canViewCurrentGuildAdmin(me);
   const canUseCurrentGuildUsageAdmin = canViewCurrentGuildUsage(me);
   const canUseCurrentGuildRetentionAdmin =
@@ -226,8 +240,8 @@ export function App() {
           path="/settings"
           element={
             <SettingsRoute
-              isAdmin={
-                canManageCurrentGuildSettings(me) &&
+              canAccess={
+                canAccessCurrentGuildSettings(me) &&
                 selectedGuildId === me?.guild_id
               }
               loading={loadingMe || loadingGuilds}
@@ -434,7 +448,7 @@ function SystemAdminRoute(props: AdminRouteProps) {
 }
 
 interface SettingsRouteProps {
-  isAdmin: boolean;
+  canAccess: boolean;
   loading: boolean;
   forbidden: boolean;
   error: boolean;
@@ -442,7 +456,7 @@ interface SettingsRouteProps {
 }
 
 function SettingsRoute({
-  isAdmin,
+  canAccess,
   loading,
   forbidden,
   error,
@@ -471,7 +485,7 @@ function SettingsRoute({
     );
   }
 
-  if (forbidden || !isAdmin) {
+  if (forbidden || !canAccess) {
     return (
       <main className="settings-page">
         <ForbiddenState />
@@ -514,7 +528,7 @@ function TargetSettingsRoute({
   const targetIsAdmin =
     targetGuild !== null
       ? canSelectGuild(targetGuild)
-      : canFallbackToCurrentGuild && canManageCurrentGuildSettings(me);
+      : canFallbackToCurrentGuild && canAccessCurrentGuildSettings(me);
 
   useEffect(() => {
     if (
