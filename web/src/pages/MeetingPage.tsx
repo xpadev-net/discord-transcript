@@ -394,7 +394,9 @@ function inProgressMessage(status: string | undefined): string | null {
 
 export function MeetingPage() {
   const { meetingId } = useParams<{ meetingId: string }>();
-  const audioRef = useRef<HTMLAudioElement>(null);
+  const [audioElement, setAudioElement] = useState<HTMLAudioElement | null>(
+    null,
+  );
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const feedbackSubmitControllerRef = useRef<AbortController | null>(null);
   const feedbackReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -414,7 +416,7 @@ export function MeetingPage() {
     retrySummary,
   } = useMeetingData(meetingId);
   const { activeIndex, seekTo, seekNotice } = useAudioSync(
-    audioRef,
+    audioElement,
     transcriptContainerRef,
     transcript,
   );
@@ -625,7 +627,7 @@ export function MeetingPage() {
           {showAudioAndDebug ? (
             <AudioPlayer
               key={meetingId}
-              ref={audioRef}
+              ref={setAudioElement}
               src={meetingId ? getAudioUrl(meetingId) : ""}
             />
           ) : (
