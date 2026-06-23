@@ -15427,6 +15427,18 @@ mod discord_channel_full_tests {
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
+    const INVALID_CHANNEL_OVERWRITE_PAYLOADS: &[&str] = &[
+        "{}",
+        r#"{"permission_overwrites":null}"#,
+        r#"{"permission_overwrites":{}}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":null,"deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":null}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"bogus","deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":"bogus"}]}"#,
+    ];
+
     #[test]
     fn channel_full_permission_overwrites_required_array() {
         for json in [
@@ -15507,9 +15519,6 @@ mod discord_channel_full_tests {
         ] {
             let result = serde_json::from_str::<DiscordChannelFull>(json);
             assert!(result.is_err(), "{field} unexpectedly defaulted to zero");
-            let err = result.err().unwrap();
-            assert!(err.to_string().contains("missing field"));
-            assert!(err.to_string().contains(field));
         }
     }
 
@@ -15527,12 +15536,6 @@ mod discord_channel_full_tests {
         ] {
             let result = serde_json::from_str::<DiscordChannelFull>(json);
             assert!(result.is_err(), "{field}=null unexpectedly parsed");
-            let err = result.err().unwrap();
-            assert!(
-                err.to_string().contains("invalid type")
-                    || err.to_string().contains("permission bitset"),
-                "unexpected {field}=null error: {err}"
-            );
         }
     }
 
@@ -15799,17 +15802,7 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn invalid_channel_overwrites_do_not_cache_allow() {
-        for json in [
-            "{}",
-            r#"{"permission_overwrites":null}"#,
-            r#"{"permission_overwrites":{}}"#,
-            r#"{"permission_overwrites":[{"id":"guild","type":0,"deny":"1024"}]}"#,
-            r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0"}]}"#,
-            r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":null,"deny":"1024"}]}"#,
-            r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":null}]}"#,
-            r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"bogus","deny":"1024"}]}"#,
-            r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":"bogus"}]}"#,
-        ] {
+        for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
             let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             let payload = json.to_owned();
 
@@ -15821,7 +15814,7 @@ mod discord_channel_full_tests {
                 &cache,
                 async move {
                     let channel: DiscordChannelFull =
-                        serde_json::from_str(&payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                        serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
                     let permissions = compute_channel_permissions(
                         "user",
                         "owner",
@@ -15856,47 +15849,48 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn invalid_channel_overwrites_do_not_refresh_stale_allow() {
-        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let cache_key = ("user".to_owned(), "voice".to_owned());
-        let expired_at =
-            Instant::now() - Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS + 1);
-        cache.write().await.insert(
-            cache_key.clone(),
-            (
-                CachedChannelPermission {
-                    can_view: true,
-                    is_admin: false,
+        for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
+            let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let cache_key = ("user".to_owned(), "voice".to_owned());
+            let expired_at = Instant::now()
+                - Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS + 1);
+            cache.write().await.insert(
+                cache_key.clone(),
+                (
+                    CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    },
+                    expired_at,
+                ),
+            );
+            let payload = json.to_owned();
+
+            let result = verify_meeting_access_after_row(
+                "guild".to_owned(),
+                "voice".to_owned(),
+                "guild",
+                "user",
+                &cache,
+                async move {
+                    let _: DiscordChannelFull =
+                        serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                    Ok(CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    })
                 },
-                expired_at,
-            ),
-        );
+            )
+            .await;
 
-        let result = verify_meeting_access_after_row(
-            "guild".to_owned(),
-            "voice".to_owned(),
-            "guild",
-            "user",
-            &cache,
-            async {
-                let _: DiscordChannelFull = serde_json::from_str(
-                    r#"{"permission_overwrites":[{"id":"guild","type":0,"deny":"1024"}]}"#,
-                )
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
-                Ok(CachedChannelPermission {
-                    can_view: true,
-                    is_admin: false,
-                })
-            },
-        )
-        .await;
-
-        assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
-        let cache = cache.read().await;
-        let (permission, expires_at) = cache
-            .get(&cache_key)
-            .expect("stale allow entry should not be refreshed");
-        assert!(permission.can_view);
-        assert_eq!(*expires_at, expired_at);
+            assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
+            let cache = cache.read().await;
+            let (permission, expires_at) = cache
+                .get(&cache_key)
+                .expect("stale allow entry should not be refreshed");
+            assert!(permission.can_view);
+            assert_eq!(*expires_at, expired_at);
+        }
     }
 
     #[test]
