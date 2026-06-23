@@ -346,24 +346,36 @@ fn speaker_audio_keeps_existing_outputs_when_rebuild_fails() {
 }
 
 #[test]
-fn speaker_audio_rejects_sanitized_filename_collisions_before_overwrite() {
-    let root = unique_temp_dir("speaker_collision");
+fn speaker_audio_keeps_encoded_user_ids_in_distinct_outputs() {
+    let root = unique_temp_dir("speaker_noncolliding");
     let workspace =
         MeetingWorkspaceLayout::new(root.to_string_lossy().as_ref()).for_meeting("g1", "vc1", "m1");
     fs::create_dir_all(workspace.audio_dir()).expect("audio dir should be created");
     fs::create_dir_all(workspace.speakers_dir()).expect("speaker dir should be created");
 
-    let existing_output = workspace.speakers_dir().join("ab_speaker.wav");
-    fs::write(&existing_output, b"existing").expect("existing speaker wav should be written");
-
     let wav = build_wav_bytes_raw(&i16_pcm(&[1]), 1_000, 1, 16).unwrap();
-    fs::write(workspace.audio_dir().join("a:b_1_0.wav"), &wav).unwrap();
+    fs::write(workspace.audio_dir().join("a%2Fb_1_0.wav"), &wav).unwrap();
     fs::write(workspace.audio_dir().join("ab_1_0.wav"), &wav).unwrap();
 
-    let err = build_speaker_audio_inputs(&workspace.audio_dir(), false)
-        .expect_err("sanitized output collision should fail");
-    assert!(err.contains("speaker audio output filename collision"));
-    assert_eq!(fs::read(&existing_output).unwrap(), b"existing");
+    let outputs = build_speaker_audio_inputs(&workspace.audio_dir(), false)
+        .expect("encoded speaker IDs should not collide");
+    let slash = outputs
+        .iter()
+        .find(|output| output.speaker_id == "a/b")
+        .expect("slash speaker should be decoded");
+    let plain = outputs
+        .iter()
+        .find(|output| output.speaker_id == "ab")
+        .expect("plain speaker should remain distinct");
+
+    assert_eq!(
+        PathBuf::from(&slash.audio_path),
+        workspace.speakers_dir().join("a%2Fb_speaker.wav")
+    );
+    assert_eq!(
+        PathBuf::from(&plain.audio_path),
+        workspace.speakers_dir().join("ab_speaker.wav")
+    );
 
     let _ = fs::remove_dir_all(root);
 }

@@ -96,7 +96,10 @@ use crate::infrastructure::sql::{
     UPSERT_GUILD_RBAC_ROLE_GRANT_SQL, UPSERT_GUILD_SETTINGS_SQL,
 };
 use crate::infrastructure::sql_store::{audit_event_params, usage_event_params};
-use crate::infrastructure::storage_fs::sanitize_path_component;
+use crate::infrastructure::storage_fs::{
+    decode_sanitized_path_component, legacy_sanitize_path_component, sanitize_path_component,
+    sanitize_path_component_candidates,
+};
 use crate::infrastructure::workspace::{
     DEBUG_CORRECTION_PROMPT_FILENAME, DEBUG_DIR, DEBUG_MEETING_TITLE_FILENAME,
     DEBUG_MIXDOWN_WHISPER_FILENAME, DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME,
@@ -11413,16 +11416,13 @@ async fn api_speakers(
                 nickname: nickname.clone(),
                 display_name: display_name.clone(),
             };
-            let safe_speaker = sanitize_path_component(&speaker_id);
-            let filename = format!("{safe_speaker}_speaker.wav");
-            let primary_path = primary_speakers_dir.join(&filename);
-            let legacy_path = legacy_speakers_dir.join(&filename);
+            let audio_paths = speaker_audio_path_candidates(
+                &primary_speakers_dir,
+                &legacy_speakers_dir,
+                &speaker_id,
+            );
             async move {
-                let (primary_exists, legacy_exists) = tokio::join!(
-                    tokio::fs::try_exists(&primary_path),
-                    tokio::fs::try_exists(&legacy_path),
-                );
-                let has_audio = primary_exists.unwrap_or(false) || legacy_exists.unwrap_or(false);
+                let has_audio = first_existing_path(audio_paths).await.is_some();
                 SpeakerAudioResponse {
                     speaker_id,
                     username,
@@ -11476,18 +11476,14 @@ async fn api_speaker_audio(
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
     let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
-    let safe_speaker = sanitize_path_component(&speaker_id);
-    let filename = format!("{safe_speaker}_speaker.wav");
-    let primary = workspace.speakers_dir().join(&filename);
-    let legacy = layout
-        .legacy_meeting_dir(&meeting_id)
-        .join("speakers")
-        .join(&filename);
-    let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
-        primary
-    } else {
-        legacy
-    };
+    let legacy_speakers_dir = layout.legacy_meeting_dir(&meeting_id).join("speakers");
+    let path = first_existing_path(speaker_audio_path_candidates(
+        &workspace.speakers_dir(),
+        &legacy_speakers_dir,
+        &speaker_id,
+    ))
+    .await
+    .ok_or(StatusCode::NOT_FOUND)?;
 
     let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -11743,26 +11739,20 @@ async fn api_debug_manifest(
             };
             let label_base = profile.display_label();
             let safe_speaker = sanitize_path_component(&speaker_id);
-
             let speaker_filename = format!("{safe_speaker}_speaker.wav");
-            let primary_speaker_path = primary_speakers_dir.join(&speaker_filename);
-            let legacy_speaker_path = legacy_speakers_dir.join(&speaker_filename);
-            let whisper_path = workspace.whisper_response_path_for_sanitized(&safe_speaker);
-            let whisper_legacy_path =
-                legacy_debug_whisper_dir(&workspace).join(format!("{safe_speaker}.json"));
+            let speaker_paths = speaker_audio_path_candidates(
+                &primary_speakers_dir,
+                &legacy_speakers_dir,
+                &speaker_id,
+            );
+            let whisper_paths = whisper_debug_path_candidates(&workspace, &speaker_id);
             async move {
-                let (primary_exists, legacy_exists, whisper_exists, whisper_legacy_exists) = tokio::join!(
-                    tokio::fs::try_exists(&primary_speaker_path),
-                    tokio::fs::try_exists(&legacy_speaker_path),
-                    tokio::fs::try_exists(&whisper_path),
-                    tokio::fs::try_exists(&whisper_legacy_path),
-                );
                 (
                     safe_speaker,
                     label_base,
                     speaker_filename,
-                    primary_exists.unwrap_or(false) || legacy_exists.unwrap_or(false),
-                    whisper_exists.unwrap_or(false) || whisper_legacy_exists.unwrap_or(false),
+                    first_existing_path(speaker_paths).await.is_some(),
+                    first_existing_path(whisper_paths).await.is_some(),
                 )
             }
         })
@@ -11798,7 +11788,10 @@ async fn api_debug_manifest(
             label: format!("Whisper送信音声 ({label_base})"),
             category: "audio",
             available: speaker_available,
-            download_url: format!("{base_url}/speaker_audio~{safe_speaker}"),
+            download_url: format!(
+                "{base_url}/{}",
+                percent_encode(&format!("speaker_audio~{safe_speaker}"))
+            ),
             filename: speaker_filename,
             content_type: "audio/wav",
         });
@@ -11809,7 +11802,10 @@ async fn api_debug_manifest(
                 label: format!("Whisperレスポンス ({label_base})"),
                 category: "whisper",
                 available: whisper_available,
-                download_url: format!("{base_url}/whisper~{safe_speaker}"),
+                download_url: format!(
+                    "{base_url}/{}",
+                    percent_encode(&format!("whisper~{safe_speaker}"))
+                ),
                 filename: format!("whisper_{safe_speaker}.json"),
                 content_type: "application/json",
             });
@@ -12096,21 +12092,20 @@ async fn resolve_debug_artifact(
     let legacy_dir = layout.legacy_meeting_dir(meeting_id);
 
     if let Some((kind, raw_value)) = artifact_id.split_once('~') {
-        // Pass the raw value through the same sanitizer used at write time so
-        // we cannot escape the workspace via crafted artifact_ids.
-        let safe = sanitize_path_component(raw_value);
+        let speaker_id =
+            artifact_speaker_id_from_component(raw_value).ok_or(StatusCode::NOT_FOUND)?;
+        let safe = sanitize_path_component(&speaker_id);
         match kind {
             "speaker_audio" => {
                 let filename = format!("{safe}_speaker.wav");
-                let primary = workspace.speakers_dir().join(&filename);
-                let legacy = legacy_dir.join("speakers").join(&filename);
-                let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
-                    primary
-                } else if tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
-                    legacy
-                } else {
-                    return Err(StatusCode::NOT_FOUND);
-                };
+                let legacy_speakers_dir = legacy_dir.join("speakers");
+                let path = first_existing_path(speaker_audio_path_candidates(
+                    &workspace.speakers_dir(),
+                    &legacy_speakers_dir,
+                    &speaker_id,
+                ))
+                .await
+                .ok_or(StatusCode::NOT_FOUND)?;
                 return Ok(DebugArtifactSource::File {
                     path,
                     filename,
@@ -12118,9 +12113,10 @@ async fn resolve_debug_artifact(
                 });
             }
             "whisper" => {
-                let primary = workspace.whisper_response_path_for_sanitized(&safe);
-                let legacy = legacy_debug_whisper_dir(&workspace).join(format!("{safe}.json"));
-                let path = existing_debug_path(primary, legacy).await?;
+                let path =
+                    first_existing_path(whisper_debug_path_candidates(&workspace, &speaker_id))
+                        .await
+                        .ok_or(StatusCode::NOT_FOUND)?;
                 return Ok(DebugArtifactSource::File {
                     path,
                     filename: format!("whisper_{safe}.json"),
@@ -12224,6 +12220,57 @@ async fn resolve_debug_artifact(
             }
         }
     })
+}
+
+fn artifact_speaker_id_from_component(component: &str) -> Option<String> {
+    decode_sanitized_path_component(component).or_else(|| {
+        if legacy_sanitize_path_component(component) == component {
+            Some(component.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn speaker_audio_path_candidates(
+    primary_speakers_dir: &std::path::Path,
+    legacy_speakers_dir: &std::path::Path,
+    speaker_id: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for safe in sanitize_path_component_candidates(speaker_id) {
+        let filename = format!("{safe}_speaker.wav");
+        push_unique_path(&mut paths, primary_speakers_dir.join(&filename));
+        push_unique_path(&mut paths, legacy_speakers_dir.join(filename));
+    }
+    paths
+}
+
+fn whisper_debug_path_candidates(
+    workspace: &MeetingWorkspacePaths,
+    speaker_id: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut paths = workspace.whisper_response_path_candidates(speaker_id);
+    let legacy_dir = legacy_debug_whisper_dir(workspace);
+    for safe in sanitize_path_component_candidates(speaker_id) {
+        push_unique_path(&mut paths, legacy_dir.join(format!("{safe}.json")));
+    }
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+async fn first_existing_path(paths: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    for path in paths {
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn legacy_debug_dir(workspace: &MeetingWorkspacePaths) -> std::path::PathBuf {
@@ -15367,9 +15414,9 @@ mod discord_channel_full_tests {
         AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS, CachedChannelPermission, DiscordChannelFull,
         DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
         PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS, PermissionCache,
-        VIEW_CHANNEL, authorize_debug_artifact_download, build_content_disposition,
-        compute_channel_permissions, debug_artifact_requires_admin, debug_download_dedupe_bucket,
-        debug_download_usage_event_id, existing_debug_path,
+        VIEW_CHANNEL, artifact_speaker_id_from_component, authorize_debug_artifact_download,
+        build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
+        debug_download_dedupe_bucket, debug_download_usage_event_id, existing_debug_path,
         guild_meeting_channel_visible_after_row, meeting_access_from_row,
         raw_debug_artifact_permission, should_sample_audit_retention_cleanup,
         verify_meeting_access_after_row,
@@ -15776,6 +15823,24 @@ mod discord_channel_full_tests {
         assert!(!debug_artifact_requires_admin("speaker_audio~speaker-1"));
         assert!(!debug_artifact_requires_admin("transcript_post_correction"));
         assert!(!debug_artifact_requires_admin("transcript_manifest"));
+    }
+
+    #[test]
+    fn dynamic_debug_artifact_ids_accept_new_and_legacy_speaker_components() {
+        assert_eq!(
+            artifact_speaker_id_from_component("a%2Fb").as_deref(),
+            Some("a/b")
+        );
+        assert_eq!(
+            artifact_speaker_id_from_component("ユーザー").as_deref(),
+            Some("ユーザー")
+        );
+        assert_eq!(
+            artifact_speaker_id_from_component("a_b").as_deref(),
+            Some("a_b")
+        );
+        assert_eq!(artifact_speaker_id_from_component("a%2fb"), None);
+        assert_eq!(artifact_speaker_id_from_component("../secret"), None);
     }
 
     #[test]

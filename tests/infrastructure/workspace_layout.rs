@@ -47,6 +47,23 @@ fn workspace_paths_do_not_collide_between_meetings() {
 }
 
 #[test]
+fn workspace_paths_do_not_collapse_encoded_components() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("workspace_encoded_collision_{nanos}"));
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let slash = layout.for_meeting("guild/id", "channel/id", "meeting/id");
+    let underscore = layout.for_meeting("guild_id", "channel_id", "meeting_id");
+
+    assert_ne!(slash.root(), underscore.root());
+    assert_ne!(slash.debug_root(), underscore.debug_root());
+    assert!(slash.root().ends_with(Path::new("guild%2Fid/channel%2Fid/meeting%2Fid")));
+    assert!(underscore.root().ends_with(Path::new("guild_id/channel_id/meeting_id")));
+}
+
+#[test]
 fn debug_paths_are_isolated_from_workspace_root() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -165,6 +182,24 @@ fn legacy_meeting_dir_filtered_dotdot_does_not_escape_base_dir() {
 }
 
 #[test]
+fn legacy_meeting_dir_uses_pre_encoding_component_for_existing_artifacts() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("legacy_component_regression_{nanos}"));
+    let layout = MeetingWorkspaceLayout::new(&base);
+
+    assert_eq!(
+        layout
+            .legacy_meeting_dir("meeting/id")
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("meeting_id")
+    );
+}
+
+#[test]
 fn raw_whisper_response_path_filtered_dotdot_stays_under_debug_dir() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -181,6 +216,47 @@ fn raw_whisper_response_path_filtered_dotdot_stays_under_debug_dir() {
         whisper_path.file_name().and_then(|name| name.to_str()),
         Some("..json")
     );
+}
+
+#[test]
+fn raw_whisper_response_paths_do_not_collapse_speaker_ids() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("whisper_encoded_collision_{nanos}"));
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g", "vc", "m");
+    let slash = workspace.whisper_response_path("a/b");
+    let underscore = workspace.whisper_response_path("a_b");
+
+    assert_ne!(slash, underscore);
+    assert_eq!(
+        slash.file_name().and_then(|name| name.to_str()),
+        Some("a%2Fb.json")
+    );
+    assert_eq!(
+        underscore.file_name().and_then(|name| name.to_str()),
+        Some("a_b.json")
+    );
+}
+
+#[test]
+fn whisper_response_path_candidates_keep_legacy_lookup_after_encoding_change() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("whisper_legacy_candidates_{nanos}"));
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g", "vc", "m");
+    let candidates = workspace.whisper_response_path_candidates("a/b");
+    let file_names: Vec<_> = candidates
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .collect();
+
+    assert_eq!(file_names, vec!["a%2Fb.json", "a_b.json"]);
 }
 
 #[test]
