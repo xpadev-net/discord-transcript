@@ -3531,6 +3531,125 @@ describe("App access controls", () => {
     expect(screen.getByText("ライブ更新中")).toBeTruthy();
   });
 
+  it("shows transcript panel retry UI for malformed live segment events", async () => {
+    let latestSource: MockEventSource | null = null;
+    const sources: MockEventSource[] = [];
+    let recoverOnRetry = false;
+    class MockEventSource {
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      close = vi.fn();
+      private listeners = new Map<
+        string,
+        Array<(event: MessageEvent<string>) => void>
+      >();
+
+      constructor(_url: string, _options?: EventSourceInit) {
+        latestSource = this;
+        sources.push(this);
+      }
+
+      addEventListener(
+        type: string,
+        listener: EventListenerOrEventListenerObject,
+      ) {
+        if (typeof listener !== "function") {
+          return;
+        }
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener as (event: MessageEvent<string>) => void);
+        this.listeners.set(type, listeners);
+      }
+
+      emit(type: string, data: string) {
+        for (const listener of this.listeners.get(type) ?? []) {
+          listener(new MessageEvent(type, { data }));
+        }
+      }
+    }
+    const liveTranscriptResponse = (segments: unknown[] = []) => ({
+      ...transcriptResponse(segments),
+      status: "recording",
+      is_final: false,
+      updated_at: null,
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/meetings/meeting-1") {
+        return Promise.resolve(
+          jsonResponse(meetingResponse({ status: "recording" })),
+        );
+      }
+      if (url === "/api/meetings/meeting-1/transcript") {
+        if (recoverOnRetry) {
+          return Promise.resolve(
+            jsonResponse(
+              liveTranscriptResponse([
+                transcriptSegment({ text: "Recovered SSE transcript" }),
+              ]),
+            ),
+          );
+        }
+        return Promise.resolve(jsonResponse(liveTranscriptResponse()));
+      }
+      if (url === "/api/meetings/meeting-1/summary") {
+        return Promise.resolve(jsonResponse({ markdown: null }));
+      }
+      if (url === "/api/meetings/meeting-1/debug/manifest") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    await waitFor(() => expect(latestSource).toBeTruthy());
+    act(() => {
+      latestSource?.emit(
+        "segments",
+        JSON.stringify({
+          segments: null,
+          status: "recording",
+          is_final: false,
+          updated_at: null,
+        }),
+      );
+    });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("文字起こしの取得に失敗しました");
+    expect(
+      screen.queryByText("トランスクリプトの表示に失敗しました"),
+    ).toBeNull();
+
+    recoverOnRetry = true;
+    fireEvent.click(within(alert).getByRole("button", { name: "再試行" }));
+
+    expect(await screen.findByText("Recovered SSE transcript")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    await waitFor(() => expect(sources.length).toBeGreaterThan(1));
+    act(() => {
+      latestSource?.onopen?.(new Event("open"));
+    });
+    expect(
+      screen.queryByText("文字起こしのライブ更新に失敗しました"),
+    ).toBeNull();
+    expect(screen.getByText("ライブ更新中")).toBeTruthy();
+  });
+
   it("announces meeting audio source load failures", async () => {
     const { fetchMock } = meetingPageFetch();
     renderApp("/meetings/meeting-1", fetchMock);

@@ -318,7 +318,16 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
           }
           setTranscriptStreamState("open");
           setTranscriptStreamError(null);
-        } catch {
+        } catch (err: unknown) {
+          if (isTranscriptResponseValidationError(err)) {
+            closeStream();
+            setTranscriptStreamState("error");
+            setTranscriptStreamError(null);
+            setTranscriptError(
+              transcriptFetchErrorMessage(transcriptRetryCount),
+            );
+            return;
+          }
           setTranscriptStreamState("error");
           setTranscriptStreamError(
             "\u6587\u5b57\u8d77\u3053\u3057\u66f4\u65b0\u306e\u89e3\u6790\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
