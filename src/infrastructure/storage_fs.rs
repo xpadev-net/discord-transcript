@@ -95,6 +95,50 @@ fn write_chunk_atomically(file_path: &Path, bytes: &[u8]) -> Result<(), ChunkSto
 }
 
 pub fn sanitize_path_component(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if is_plain_path_component_byte(byte) {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+
+    match encoded.as_str() {
+        "" => "%EMPTY".to_owned(),
+        "." => "%2E".to_owned(),
+        ".." => "%2E%2E".to_owned(),
+        _ => encoded,
+    }
+}
+
+pub fn sanitize_path_component_candidates(input: &str) -> Vec<String> {
+    let primary = sanitize_path_component(input);
+    let legacy = legacy_sanitize_path_component(input);
+    if legacy == primary {
+        vec![primary]
+    } else {
+        vec![primary, legacy]
+    }
+}
+
+pub fn decode_sanitized_path_component(component: &str) -> Option<String> {
+    if component == "%EMPTY" {
+        return Some(String::new());
+    }
+
+    let bytes = percent_decode_component(component)?;
+    let decoded = String::from_utf8(bytes).ok()?;
+    if sanitize_path_component(&decoded) == component {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
+#[doc(hidden)]
+pub fn legacy_sanitize_path_component(input: &str) -> String {
     let sanitized: String = input
         .replace(['/', '\\'], "_")
         .replace("..", "_")
@@ -110,6 +154,38 @@ pub fn sanitize_path_component(input: &str) -> String {
         return format!("unknown_{hash:016x}");
     }
     sanitized
+}
+
+fn is_plain_path_component_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'
+    )
+}
+
+fn percent_decode_component(component: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(component.len());
+    let mut input = component.as_bytes().iter().copied();
+    while let Some(byte) = input.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let high = input.next()?;
+        let low = input.next()?;
+        bytes.push(hex_value(high)?.checked_mul(16)? + hex_value(low)?);
+    }
+    Some(bytes)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    // Only uppercase hex is accepted so decoding enforces the canonical
+    // `%XX` form produced by sanitize_path_component.
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Cheap, deterministic hash for filesystem-safe fallback names.

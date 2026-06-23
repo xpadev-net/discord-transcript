@@ -6,7 +6,9 @@ use crate::audio::wav::{
     checked_pcm_growth, is_supported_wav_sample_rate, pcm_byte_len_for_duration_ms,
     pcm_duration_ms, resample_pcm_16le,
 };
-use crate::infrastructure::storage_fs::sanitize_path_component;
+use crate::infrastructure::storage_fs::{
+    decode_sanitized_path_component, sanitize_path_component, sanitize_path_component_candidates,
+};
 use crate::infrastructure::workspace::SSRC_MAPPING_FILENAME;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -165,7 +167,7 @@ fn parse_chunk_filename(path: &Path) -> Result<ParsedFilename, String> {
     let start_ms = start_part.and_then(|s| s.parse::<u64>().ok());
 
     Ok(ParsedFilename {
-        user_id: user_part.to_owned(),
+        user_id: decode_sanitized_path_component(user_part).unwrap_or_else(|| user_part.to_owned()),
         sequence,
         start_ms,
     })
@@ -391,14 +393,15 @@ fn load_ssrc_mapping(meeting_dir: &Path) -> HashMap<String, String> {
             return HashMap::new();
         }
     };
-    tracker
-        .all_mappings()
-        .iter()
-        .map(|(ssrc, user_id)| {
-            let sanitized_key = sanitize_path_component(&SsrcTracker::fallback_key(*ssrc));
-            (sanitized_key, user_id.clone())
-        })
-        .collect()
+    let mut lookup = HashMap::new();
+    for (ssrc, user_id) in tracker.all_mappings() {
+        let fallback_key = SsrcTracker::fallback_key(*ssrc);
+        lookup.insert(fallback_key.clone(), user_id.clone());
+        for sanitized_key in sanitize_path_component_candidates(&fallback_key) {
+            lookup.insert(sanitized_key, user_id.clone());
+        }
+    }
+    lookup
 }
 
 pub fn build_speaker_audio_inputs(

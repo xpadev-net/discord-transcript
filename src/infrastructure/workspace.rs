@@ -1,4 +1,6 @@
-use crate::infrastructure::storage_fs::sanitize_path_component;
+use crate::infrastructure::storage_fs::{
+    legacy_sanitize_path_component, sanitize_path_component, sanitize_path_component_candidates,
+};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -195,7 +197,8 @@ impl MeetingWorkspaceLayout {
     }
 
     pub fn legacy_meeting_dir(&self, meeting_id: &str) -> PathBuf {
-        self.base_dir.join(sanitize_path_component(meeting_id))
+        self.base_dir
+            .join(legacy_sanitize_path_component(meeting_id))
     }
 }
 
@@ -265,10 +268,16 @@ impl MeetingWorkspacePaths {
         self.whisper_response_path_for_sanitized(&sanitize_path_component(speaker_id))
     }
 
+    pub fn whisper_response_path_candidates(&self, speaker_id: &str) -> Vec<PathBuf> {
+        sanitize_path_component_candidates(speaker_id)
+            .into_iter()
+            .map(|safe_speaker_id| self.whisper_response_path_for_sanitized(&safe_speaker_id))
+            .collect()
+    }
+
     /// Lower-level path builder for callers that already hold a value
-    /// produced by [`sanitize_path_component`]. Avoids a redundant
-    /// idempotent re-sanitization. Prefer [`whisper_response_path`] when
-    /// the input may be raw.
+    /// produced by [`sanitize_path_component`]. Prefer
+    /// [`whisper_response_path`] when the input may be raw.
     pub fn whisper_response_path_for_sanitized(&self, safe_speaker_id: &str) -> PathBuf {
         self.whisper_debug_dir()
             .join(format!("{safe_speaker_id}.json"))

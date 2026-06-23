@@ -840,6 +840,49 @@ fn transcription_passes_meeting_prompt_to_per_speaker_whisper_requests() {
 }
 
 #[test]
+fn transcription_persists_colliding_speaker_debug_responses_separately() {
+    let whisper = RecordingWhisperClient::new();
+    let temp = unique_workspace("whisper_debug_collision", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Collision check".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![
+            SpeakerAudioInput {
+                speaker_id: "a/b".to_owned(),
+                audio_path: "slash.wav".to_owned(),
+                offset_ms: 0,
+            },
+            SpeakerAudioInput {
+                speaker_id: "a_b".to_owned(),
+                audio_path: "underscore.wav".to_owned(),
+                offset_ms: 1_000,
+            },
+        ],
+        language: Some("en".to_owned()),
+        workspace: workspace.clone(),
+    };
+
+    run_transcription(&whisper, &request).expect("transcription should succeed");
+
+    let slash_path = workspace.whisper_response_path("a/b");
+    let underscore_path = workspace.whisper_response_path("a_b");
+    assert_ne!(slash_path, underscore_path);
+    assert!(slash_path.exists(), "slash speaker debug JSON should exist");
+    assert!(
+        underscore_path.exists(),
+        "underscore speaker debug JSON should exist"
+    );
+}
+
+#[test]
 fn transcription_passes_meeting_prompt_to_mixdown_whisper_request() {
     let whisper = RecordingWhisperClient::new();
     let temp = unique_workspace("whisper_prompt_mixdown", "m1");
