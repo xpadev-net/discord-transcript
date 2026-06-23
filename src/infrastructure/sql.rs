@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 "#;
 
 pub const LOCK_SCHEMA_MIGRATIONS_SQL: &str = "SELECT pg_advisory_lock(760918997406360681)";
+pub const ROLLBACK_SCHEMA_MIGRATIONS_SQL: &str = "ROLLBACK";
 pub const UNLOCK_SCHEMA_MIGRATIONS_SQL: &str = "SELECT pg_advisory_unlock(760918997406360681)";
 
 pub const SELECT_SCHEMA_MIGRATION_SQL: &str = "SELECT 1 FROM schema_migrations WHERE version = $1";
