@@ -83,6 +83,12 @@ function isNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("404");
 }
 
+function transcriptFetchErrorMessage(retryAttempt: number): string {
+  return retryAttempt > 0
+    ? "\u6587\u5b57\u8d77\u3053\u3057\u306e\u518d\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+    : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
+}
+
 export function useMeetingData(meetingId: string | undefined): MeetingData {
   const [meeting, setMeeting] = useState<MeetingResponse | null>(null);
   const [transcript, setTranscript] = useState<TranscriptSegment[] | null>(
@@ -173,11 +179,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       })
       .catch(() => {
         if (!controller.signal.aborted) {
-          setTranscriptError(
-            retryAttempt > 0
-              ? "\u6587\u5b57\u8d77\u3053\u3057\u306e\u518d\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
-              : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
-          );
+          setTranscriptError(transcriptFetchErrorMessage(retryAttempt));
         }
       });
     return () => controller.abort();
@@ -268,7 +270,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
             setTranscriptStreamState("error");
             setTranscriptStreamError(null);
             setTranscriptError(
-              "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+              transcriptFetchErrorMessage(transcriptRetryCount),
             );
             return;
           }
