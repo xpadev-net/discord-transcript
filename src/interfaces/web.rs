@@ -2914,15 +2914,9 @@ struct DiscordOverwrite {
     id: String,
     #[serde(rename = "type")]
     type_: DiscordOverwriteType,
-    #[serde(
-        default = "zero_permission_bits",
-        deserialize_with = "deserialize_permission_bits"
-    )]
+    #[serde(deserialize_with = "deserialize_permission_bits")]
     allow: u64,
-    #[serde(
-        default = "zero_permission_bits",
-        deserialize_with = "deserialize_permission_bits"
-    )]
+    #[serde(deserialize_with = "deserialize_permission_bits")]
     deny: u64,
 }
 
@@ -15433,6 +15427,18 @@ mod discord_channel_full_tests {
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
+    const INVALID_CHANNEL_OVERWRITE_PAYLOADS: &[&str] = &[
+        "{}",
+        r#"{"permission_overwrites":null}"#,
+        r#"{"permission_overwrites":{}}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":null,"deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":null}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"bogus","deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":"bogus"}]}"#,
+    ];
+
     #[test]
     fn channel_full_permission_overwrites_required_array() {
         for json in [
@@ -15484,22 +15490,53 @@ mod discord_channel_full_tests {
     }
 
     #[test]
-    fn overwrite_allow_deny_numeric_and_partial() {
+    fn overwrite_allow_deny_accept_strings_and_numbers() {
         let ch: DiscordChannelFull = serde_json::from_str(
             r#"{"permission_overwrites":[
                 {"id":"10","type":1,"allow":1024,"deny":0},
-                {"id":"20","type":0,"allow":"1"},
-                {"id":"30","type":0,"deny":"2"}
+                {"id":"20","type":0,"allow":"1","deny":"0"}
             ]}"#,
         )
         .unwrap();
-        assert_eq!(ch.permission_overwrites.len(), 3);
+        assert_eq!(ch.permission_overwrites.len(), 2);
         assert_eq!(ch.permission_overwrites[0].allow, 1024);
         assert_eq!(ch.permission_overwrites[0].deny, 0);
         assert_eq!(ch.permission_overwrites[1].allow, 1);
         assert_eq!(ch.permission_overwrites[1].deny, 0);
-        assert_eq!(ch.permission_overwrites[2].allow, 0);
-        assert_eq!(ch.permission_overwrites[2].deny, 2);
+    }
+
+    #[test]
+    fn overwrite_allow_deny_required_in_each_entry() {
+        for (field, json) in [
+            (
+                "allow",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"deny":"2"}]}"#,
+            ),
+            (
+                "deny",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"allow":"1"}]}"#,
+            ),
+        ] {
+            let result = serde_json::from_str::<DiscordChannelFull>(json);
+            assert!(result.is_err(), "{field} unexpectedly defaulted to zero");
+        }
+    }
+
+    #[test]
+    fn overwrite_allow_deny_null_rejected() {
+        for (field, json) in [
+            (
+                "allow",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"allow":null,"deny":"0"}]}"#,
+            ),
+            (
+                "deny",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"allow":"1","deny":null}]}"#,
+            ),
+        ] {
+            let result = serde_json::from_str::<DiscordChannelFull>(json);
+            assert!(result.is_err(), "{field}=null unexpectedly parsed");
+        }
     }
 
     #[test]
@@ -15520,8 +15557,9 @@ mod discord_channel_full_tests {
     fn overwrite_invalid_permission_bitsets_rejected() {
         for field in ["allow", "deny"] {
             for value in [r#""not-a-number""#, r#""-1""#, "-1"] {
+                let other_field = if field == "allow" { "deny" } else { "allow" };
                 let json = format!(
-                    r#"{{"permission_overwrites":[{{"id":"1","type":0,"{field}":{value}}}]}}"#
+                    r#"{{"permission_overwrites":[{{"id":"1","type":0,"{field}":{value},"{other_field}":"0"}}]}}"#
                 );
                 let result = serde_json::from_str::<DiscordChannelFull>(&json);
                 assert!(
@@ -15764,11 +15802,7 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn invalid_channel_overwrites_do_not_cache_allow() {
-        for json in [
-            "{}",
-            r#"{"permission_overwrites":null}"#,
-            r#"{"permission_overwrites":{}}"#,
-        ] {
+        for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
             let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             let payload = json.to_owned();
 
@@ -15780,7 +15814,7 @@ mod discord_channel_full_tests {
                 &cache,
                 async move {
                     let channel: DiscordChannelFull =
-                        serde_json::from_str(&payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                        serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
                     let permissions = compute_channel_permissions(
                         "user",
                         "owner",
@@ -15810,6 +15844,52 @@ mod discord_channel_full_tests {
                 cache.read().await.is_empty(),
                 "{json} should fail before permission cache is updated"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_channel_overwrites_do_not_refresh_stale_allow() {
+        for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
+            let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let cache_key = ("user".to_owned(), "voice".to_owned());
+            let expired_at = Instant::now()
+                - Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS + 1);
+            cache.write().await.insert(
+                cache_key.clone(),
+                (
+                    CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    },
+                    expired_at,
+                ),
+            );
+            let payload = json.to_owned();
+
+            let result = verify_meeting_access_after_row(
+                "guild".to_owned(),
+                "voice".to_owned(),
+                "guild",
+                "user",
+                &cache,
+                async move {
+                    let _: DiscordChannelFull =
+                        serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                    Ok(CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    })
+                },
+            )
+            .await;
+
+            assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
+            let cache = cache.read().await;
+            let (permission, expires_at) = cache
+                .get(&cache_key)
+                .expect("stale allow entry should not be refreshed");
+            assert!(permission.can_view);
+            assert_eq!(*expires_at, expired_at);
         }
     }
 
