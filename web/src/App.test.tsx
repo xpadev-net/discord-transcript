@@ -10,7 +10,7 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { buildLoginRedirectUrl } from "./lib/api";
+import { buildLoginRedirectUrl, normalizeTranscriptResponse } from "./lib/api";
 import { DashboardPage } from "./pages/DashboardPage";
 
 const settingsLinkName = "\u8a2d\u5b9a";
@@ -533,6 +533,37 @@ afterEach(() => {
 });
 
 describe("App access controls", () => {
+  it("validates transcript response payloads before normalization", () => {
+    const segment = transcriptSegment();
+
+    expect(normalizeTranscriptResponse([segment])).toEqual({
+      segments: [segment],
+      status: "unknown",
+      is_final: false,
+      updated_at: null,
+    });
+    expect(normalizeTranscriptResponse(transcriptResponse([segment]))).toEqual(
+      transcriptResponse([segment]),
+    );
+
+    expect(() => normalizeTranscriptResponse({})).toThrow(
+      "文字起こしのレスポンス形式が不正です",
+    );
+    expect(() =>
+      normalizeTranscriptResponse({
+        segments: null,
+        status: "posted",
+        is_final: true,
+        updated_at: null,
+      }),
+    ).toThrow("文字起こしのレスポンス形式が不正です");
+    expect(() =>
+      normalizeTranscriptResponse(
+        transcriptResponse([transcriptSegment({ start_ms: "5000" })]),
+      ),
+    ).toThrow("文字起こしのレスポンス形式が不正です");
+  });
+
   it("shows settings navigation and controls for guild admins", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
@@ -3327,6 +3358,177 @@ describe("App access controls", () => {
     expect(
       await screen.findByText("音声の読み込みが完了していません"),
     ).toBeTruthy();
+  });
+
+  it("shows transcript panel retry UI for malformed responses and recovers", async () => {
+    let transcriptAttempts = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/meetings/meeting-1") {
+        return Promise.resolve(jsonResponse(meetingResponse()));
+      }
+      if (url === "/api/meetings/meeting-1/transcript") {
+        transcriptAttempts += 1;
+        if (transcriptAttempts === 1) {
+          return Promise.resolve(
+            jsonResponse({
+              segments: null,
+              status: "posted",
+              is_final: true,
+              updated_at: null,
+            }),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            transcriptResponse([
+              transcriptSegment({ text: "Recovered transcript" }),
+            ]),
+          ),
+        );
+      }
+      if (url === "/api/meetings/meeting-1/summary") {
+        return Promise.resolve(jsonResponse({ markdown: null }));
+      }
+      if (url === "/api/meetings/meeting-1/debug/manifest") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("文字起こしの取得に失敗しました");
+    expect(
+      screen.queryByText("トランスクリプトの表示に失敗しました"),
+    ).toBeNull();
+    expect(screen.queryByText("Alpha term")).toBeNull();
+
+    fireEvent.click(within(alert).getByRole("button", { name: "再試行" }));
+
+    expect(await screen.findByText("Recovered transcript")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(transcriptAttempts).toBe(2);
+  });
+
+  it("shows transcript panel retry UI for malformed live reconnect checks", async () => {
+    let latestSource: MockEventSource | null = null;
+    const sources: MockEventSource[] = [];
+    let failAccessCheck = false;
+    let recoverOnRetry = false;
+    class MockEventSource {
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      close = vi.fn();
+
+      constructor(_url: string, _options?: EventSourceInit) {
+        latestSource = this;
+        sources.push(this);
+      }
+
+      addEventListener(
+        _type: string,
+        _listener: EventListenerOrEventListenerObject,
+      ) {}
+    }
+    const liveTranscriptResponse = (segments: unknown[] = []) => ({
+      ...transcriptResponse(segments),
+      status: "recording",
+      is_final: false,
+      updated_at: null,
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/meetings/meeting-1") {
+        return Promise.resolve(
+          jsonResponse(meetingResponse({ status: "recording" })),
+        );
+      }
+      if (url === "/api/meetings/meeting-1/transcript") {
+        if (failAccessCheck) {
+          failAccessCheck = false;
+          return Promise.resolve(
+            jsonResponse({
+              segments: null,
+              status: "recording",
+              is_final: false,
+              updated_at: null,
+            }),
+          );
+        }
+        if (recoverOnRetry) {
+          return Promise.resolve(
+            jsonResponse(
+              liveTranscriptResponse([
+                transcriptSegment({ text: "Recovered live transcript" }),
+              ]),
+            ),
+          );
+        }
+        return Promise.resolve(jsonResponse(liveTranscriptResponse()));
+      }
+      if (url === "/api/meetings/meeting-1/summary") {
+        return Promise.resolve(jsonResponse({ markdown: null }));
+      }
+      if (url === "/api/meetings/meeting-1/debug/manifest") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    await waitFor(() => expect(latestSource).toBeTruthy());
+    failAccessCheck = true;
+    act(() => {
+      latestSource?.onerror?.(new Event("error"));
+    });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("文字起こしの取得に失敗しました");
+    expect(
+      screen.queryByText("トランスクリプトの表示に失敗しました"),
+    ).toBeNull();
+
+    recoverOnRetry = true;
+    fireEvent.click(within(alert).getByRole("button", { name: "再試行" }));
+
+    expect(await screen.findByText("Recovered live transcript")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    await waitFor(() => expect(sources.length).toBeGreaterThan(1));
+    act(() => {
+      latestSource?.onopen?.(new Event("open"));
+    });
+    expect(
+      screen.queryByText("文字起こしのライブ更新に失敗しました"),
+    ).toBeNull();
+    expect(screen.getByText("ライブ更新中")).toBeTruthy();
   });
 
   it("announces meeting audio source load failures", async () => {

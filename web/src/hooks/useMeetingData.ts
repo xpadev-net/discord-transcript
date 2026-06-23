@@ -4,6 +4,7 @@ import {
   fetchSummary,
   fetchTranscript,
   getTranscriptEventsUrl,
+  isTranscriptResponseValidationError,
   normalizeTranscriptResponse,
 } from "../lib/api";
 import { isLiveMeetingStatus } from "../lib/meetingStatus";
@@ -262,6 +263,15 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
             );
             return;
           }
+          if (isTranscriptResponseValidationError(err)) {
+            closeStream();
+            setTranscriptStreamState("error");
+            setTranscriptStreamError(null);
+            setTranscriptError(
+              "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
+            );
+            return;
+          }
           scheduleReconnect();
         });
     };
@@ -270,7 +280,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       if (closed) {
         return;
       }
-      setTranscriptStreamState(attempt === 0 ? "connecting" : "reconnecting");
+      setTranscriptStreamState(
+        attempt === 0 && transcriptRetryCount === 0
+          ? "connecting"
+          : "reconnecting",
+      );
       setTranscriptStreamError(null);
       source = new EventSource(getTranscriptEventsUrl(meetingId), {
         withCredentials: true,
@@ -286,9 +300,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         const message = event as MessageEvent<string>;
         try {
           const response = normalizeTranscriptResponse(
-            JSON.parse(message.data) as
-              | TranscriptSegment[]
-              | TranscriptResponse,
+            JSON.parse(message.data),
           );
           applyTranscriptStatus(response);
           if (response.segments.length > 0) {
@@ -357,7 +369,12 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       closeStream();
       setTranscriptStreamState("closed");
     };
-  }, [meetingId, shouldStreamTranscript, applyTranscriptStatus]);
+  }, [
+    meetingId,
+    shouldStreamTranscript,
+    transcriptRetryCount,
+    applyTranscriptStatus,
+  ]);
 
   useEffect(() => {
     const retryAttempt = summaryRetryCount;
