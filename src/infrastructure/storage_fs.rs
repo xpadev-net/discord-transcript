@@ -179,6 +179,8 @@ fn percent_decode_component(component: &str) -> Option<Vec<u8>> {
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
+    // Only uppercase hex is accepted so decoding enforces the canonical
+    // `%XX` form produced by sanitize_path_component.
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'A'..=b'F' => Some(byte - b'A' + 10),

@@ -12265,8 +12265,9 @@ fn push_unique_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBu
 }
 
 async fn first_existing_path(paths: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
-    for path in paths {
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    let exists = futures_util::future::join_all(paths.iter().map(tokio::fs::try_exists)).await;
+    for (path, exists) in paths.into_iter().zip(exists) {
+        if exists.unwrap_or(false) {
             return Some(path);
         }
     }
