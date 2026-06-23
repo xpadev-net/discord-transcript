@@ -4,7 +4,7 @@ import type { TranscriptSegment } from "../lib/types";
 const SCROLL_COOLDOWN_MS = 3000;
 
 export function useAudioSync(
-  audioRef: React.RefObject<HTMLAudioElement | null>,
+  audioElement: HTMLAudioElement | null,
   containerRef: React.RefObject<HTMLDivElement | null>,
   segments: TranscriptSegment[] | null,
 ) {
@@ -57,7 +57,7 @@ export function useAudioSync(
 
   // Sync active segment with audio time
   useEffect(() => {
-    const audio = audioRef.current;
+    const audio = audioElement;
     if (!audio || !segments || segments.length === 0) return;
 
     const handleTimeUpdate = () => {
@@ -98,7 +98,7 @@ export function useAudioSync(
 
     audio.addEventListener("timeupdate", handleTimeUpdate);
     return () => audio.removeEventListener("timeupdate", handleTimeUpdate);
-  }, [audioRef, containerRef, segments]);
+  }, [audioElement, containerRef, segments]);
 
   const showSeekNotice = useCallback((message: string) => {
     setSeekNotice(message);
@@ -112,7 +112,7 @@ export function useAudioSync(
 
   const seekTo = useCallback(
     (startMs: number) => {
-      const audio = audioRef.current;
+      const audio = audioElement;
       if (!audio) {
         showSeekNotice(
           "\u97f3\u58f0\u30d7\u30ec\u30fc\u30e4\u30fc\u304c\u5229\u7528\u3067\u304d\u307e\u305b\u3093",
@@ -152,7 +152,7 @@ export function useAudioSync(
         );
       });
     },
-    [audioRef, showSeekNotice],
+    [audioElement, showSeekNotice],
   );
 
   useEffect(() => {

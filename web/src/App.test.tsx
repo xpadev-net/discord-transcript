@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -3347,6 +3348,62 @@ describe("App access controls", () => {
 
     expect(screen.queryByRole("alert")).toBeNull();
     expect(audio.getAttribute("aria-describedby")).toBeNull();
+  });
+
+  it("syncs active transcript segments when audio mounts after transcript data", async () => {
+    const delayedMeeting = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      if (url === "/api/meetings/meeting-1") {
+        return delayedMeeting.promise;
+      }
+      if (url === "/api/meetings/meeting-1/transcript") {
+        return Promise.resolve(jsonResponse(transcriptResponse()));
+      }
+      if (url === "/api/meetings/meeting-1/summary") {
+        return Promise.resolve(jsonResponse({ markdown: null }));
+      }
+      if (url === "/api/meetings/meeting-1/debug/manifest") {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    expect(await screen.findByText("Alpha term")).toBeTruthy();
+    expect(screen.queryByLabelText("Meeting audio player")).toBeNull();
+    const segmentButton = screen.getByText("Alpha term").closest("button");
+    expect(segmentButton).toBeTruthy();
+    expect(segmentButton?.className.split(" ")).not.toContain("active");
+    const transcriptContainer = segmentButton?.closest(".transcript-container");
+    expect(transcriptContainer).toBeTruthy();
+
+    await act(async () => {
+      delayedMeeting.resolve(jsonResponse(meetingResponse()));
+    });
+
+    const audio = (await screen.findByLabelText(
+      "Meeting audio player",
+    )) as HTMLAudioElement;
+    fireEvent.wheel(transcriptContainer as Element);
+    audio.currentTime = 6;
+    fireEvent.timeUpdate(audio);
+
+    await waitFor(() =>
+      expect(segmentButton?.className.split(" ")).toContain("active"),
+    );
   });
 
   it("shows meeting VC ID fallback when the captured name is unavailable", async () => {
