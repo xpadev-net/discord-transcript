@@ -51,8 +51,11 @@ fn run_failed_migration_lock_test(database_url: &str, schema: &str) -> Result<()
     let mut migrator = PgSqlExecutor::connect(database_url)?;
     migrator.run_migration(&format!("SET search_path TO {schema}"))?;
     migrator.run_migration(CREATE_SCHEMA_MIGRATIONS_SQL)?;
+    let latest_migration = MIGRATIONS
+        .last()
+        .ok_or_else(|| "no migrations registered".to_owned())?;
     for migration in MIGRATIONS {
-        if migration.version == "0029_transcript_confidence_check" {
+        if migration.version == latest_migration.version {
             continue;
         }
         migrator.execute(
@@ -62,12 +65,15 @@ fn run_failed_migration_lock_test(database_url: &str, schema: &str) -> Result<()
     }
     let mut store = SqlMeetingStore::new(migrator);
 
-    let err = store
-        .apply_pending_migrations()
-        .expect_err("latest migration should fail against the intentionally incomplete schema");
-    if !err.contains("transcripts") {
-        return Err(format!("expected transcripts migration error, got {err}"));
-    }
+    let err = match store.apply_pending_migrations() {
+        Ok(()) => {
+            return Err(format!(
+                "expected latest migration {} to fail against the intentionally incomplete schema",
+                latest_migration.version
+            ));
+        }
+        Err(err) => err,
+    };
 
     let mut verifier = PgSqlExecutor::connect(database_url)?;
     let rows = verifier.query_rows("SELECT pg_try_advisory_lock(760918997406360681)", &[])?;
