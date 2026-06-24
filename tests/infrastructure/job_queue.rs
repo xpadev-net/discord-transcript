@@ -10,7 +10,7 @@ use discord_transcript::infrastructure::asr::{
     StubWhisperClient, WhisperClient, WhisperInferenceRequest, WhisperParseError,
     WhisperTranscriptionResult, parse_whisper_response,
 };
-use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue};
+use discord_transcript::infrastructure::queue::{InMemoryJobQueue, JobQueue, QueueError};
 use discord_transcript::infrastructure::sql::{
     ADMIN_CANCEL_JOB_SQL, ADMIN_RETRY_JOB_SQL, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL,
     RECOVERY_READY_SUMMARY_JOBS_SQL, RETRY_JOB_SQL,
@@ -1210,6 +1210,92 @@ fn sql_ready_summary_poll_recovers_expired_running_and_due_queued_jobs() {
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("status='queued'"));
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("next_run_at <= NOW()"));
     assert!(RECOVERY_READY_SUMMARY_JOBS_SQL.contains("LIMIT 25"));
+}
+
+#[test]
+fn sql_ready_summary_meeting_ids_parses_non_null_meeting_ids() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        format!("{RECOVERY_READY_SUMMARY_JOBS_SQL}|"),
+        vec![
+            sql_row_from_strings(vec!["m1".to_owned()]),
+            sql_row_from_strings(vec!["m2".to_owned()]),
+        ],
+    );
+
+    let mut queue = SqlJobQueue::new(executor);
+    let meeting_ids = queue
+        .ready_summary_meeting_ids()
+        .expect("ready summary rows should parse");
+
+    assert_eq!(meeting_ids, vec!["m1".to_owned(), "m2".to_owned()]);
+}
+
+#[test]
+fn sql_ready_summary_meeting_ids_accepts_empty_result_set() {
+    let mut queue = SqlJobQueue::new(FakeSqlExecutor::default());
+
+    let meeting_ids = queue
+        .ready_summary_meeting_ids()
+        .expect("no ready rows should be a successful empty poll");
+
+    assert!(meeting_ids.is_empty());
+}
+
+#[test]
+fn sql_ready_summary_meeting_ids_propagates_executor_error() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_error.insert(
+        format!("{RECOVERY_READY_SUMMARY_JOBS_SQL}|"),
+        "database unavailable".to_owned(),
+    );
+
+    let mut queue = SqlJobQueue::new(executor);
+    let err = queue
+        .ready_summary_meeting_ids()
+        .expect_err("executor errors should be reported");
+
+    assert!(matches!(
+        err,
+        QueueError::Backend(message) if message.contains("database unavailable")
+    ));
+}
+
+#[test]
+fn sql_ready_summary_meeting_ids_rejects_null_meeting_id() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        format!("{RECOVERY_READY_SUMMARY_JOBS_SQL}|"),
+        vec![vec![None]],
+    );
+
+    let mut queue = SqlJobQueue::new(executor);
+    let err = queue
+        .ready_summary_meeting_ids()
+        .expect_err("NULL meeting_id should be reported, not dropped");
+
+    assert!(matches!(
+        err,
+        QueueError::Backend(message) if message.contains("ready summary meeting_id is NULL")
+    ));
+}
+
+#[test]
+fn sql_ready_summary_meeting_ids_rejects_missing_meeting_id_column() {
+    let mut executor = FakeSqlExecutor::default();
+    executor
+        .query_rows_result
+        .insert(format!("{RECOVERY_READY_SUMMARY_JOBS_SQL}|"), vec![vec![]]);
+
+    let mut queue = SqlJobQueue::new(executor);
+    let err = queue
+        .ready_summary_meeting_ids()
+        .expect_err("missing meeting_id column should be reported, not dropped");
+
+    assert!(matches!(
+        err,
+        QueueError::Backend(message) if message.contains("invalid ready summary row length")
+    ));
 }
 
 #[test]

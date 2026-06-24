@@ -1003,15 +1003,32 @@ impl<E: SqlExecutor> SqlJobQueue<E> {
     }
 
     pub fn ready_summary_meeting_ids(&mut self) -> Result<Vec<String>, QueueError> {
-        self.executor
+        let rows = self
+            .executor
             .query_rows(RECOVERY_READY_SUMMARY_JOBS_SQL, &[])
-            .map(|rows| {
-                rows.into_iter()
-                    .filter_map(|row| row.first().and_then(|value| value.clone()))
-                    .collect()
-            })
-            .map_err(QueueError::Backend)
+            .map_err(QueueError::Backend)?;
+        rows.into_iter()
+            .enumerate()
+            .map(|(idx, row)| parse_ready_summary_meeting_id_row(&row, idx))
+            .collect()
     }
+}
+
+fn parse_ready_summary_meeting_id_row(
+    row: &SqlRow,
+    row_index: usize,
+) -> Result<String, QueueError> {
+    if row.len() != 1 {
+        return Err(QueueError::Backend(format!(
+            "invalid ready summary row length at row {row_index}: {}",
+            row.len()
+        )));
+    }
+    row[0].clone().ok_or_else(|| {
+        QueueError::Backend(format!(
+            "ready summary meeting_id is NULL at row {row_index}"
+        ))
+    })
 }
 
 impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
