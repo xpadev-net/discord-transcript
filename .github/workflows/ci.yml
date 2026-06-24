@@ -83,6 +83,20 @@ jobs:
     needs: workflow-policy
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: discord_transcript_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d discord_transcript_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout
@@ -105,6 +119,11 @@ jobs:
 
       - name: cargo fmt (check)
         run: cargo fmt --all -- --check
+
+      - name: cargo test Postgres SQL contract smoke
+        env:
+          DISCORD_TRANSCRIPT_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/discord_transcript_test
+        run: cargo test --locked --test postgres_sql_contract_smoke -- --nocapture
 
       - name: cargo clippy (deny warnings)
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
