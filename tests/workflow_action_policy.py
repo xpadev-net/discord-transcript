@@ -10,8 +10,10 @@ CI_WORKFLOW = ".github/workflows/ci.yml"
 WORKFLOW_SUFFIXES = {".yaml", ".yml"}
 USES_RE = re.compile(r"^\s*uses:\s*(?P<value>[^#\s]+)")
 COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
-JOB_HEADER_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*$")
+JOB_HEADER_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(#.*)?$")
 PATH_FILTER_RE = re.compile(r"^\s*paths(?:-ignore)?:\s*")
+DOCKER_BUILD_COMMAND = "docker buildx build"
+DOCKER_PUSH_COMMANDS = ("docker push", "docker image push")
 
 
 def read_repo_file(path: str) -> str:
@@ -100,9 +102,20 @@ def workflow_job_block(contents: str, job_name: str) -> tuple[int, str]:
     raise AssertionError(f"CI workflow must define a {job_name} job")
 
 
-def shell_continuation_command(lines: list[str], index: int, marker_offset: int) -> str:
+def workflow_shell_command(line: str) -> str:
+    stripped = line.strip()
+    if not stripped.startswith("run:"):
+        return stripped
+
+    command = stripped.removeprefix("run:").strip()
+    if command in {"|", ">"}:
+        return ""
+    return command.strip("\"'")
+
+
+def shell_continuation_command(lines: list[str], index: int, first_command: str) -> str:
     parts: list[str] = []
-    current = lines[index][marker_offset:].strip()
+    current = first_command.strip()
 
     while True:
         continued = current.endswith("\\")
@@ -141,16 +154,27 @@ def step_has_if_guard(step: str) -> bool:
     )
 
 
+def docker_push_command_lines(job: str, start_line: int) -> list[str]:
+    lines: list[str] = []
+
+    for offset, line in enumerate(job.splitlines()):
+        command = workflow_shell_command(line)
+        if any(command.startswith(push_command) for push_command in DOCKER_PUSH_COMMANDS):
+            lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {line.strip()}")
+
+    return lines
+
+
 def ci_docker_build_commands(ci: str, start_line: int = 1) -> list[tuple[int, list[str]]]:
     commands: list[tuple[int, list[str]]] = []
     lines = ci.splitlines()
 
     for offset, line in enumerate(lines):
-        marker_offset = line.find("docker buildx build")
-        if marker_offset == -1:
+        first_command = workflow_shell_command(line)
+        if not first_command.startswith(DOCKER_BUILD_COMMAND):
             continue
 
-        command = shell_continuation_command(lines, offset, marker_offset)
+        command = shell_continuation_command(lines, offset, first_command)
         try:
             words = shlex.split(command)
         except ValueError:
@@ -174,7 +198,16 @@ def command_pushes_image(words: list[str]) -> bool:
         "--push" in words
         or any(word.startswith("--push=") for word in words)
         or any("push=true" in word for word in words)
-        or any("type=registry" in word for word in words)
+        or any(
+            ("--output" in word or "--cache-to" in word) and "type=registry" in word
+            for word in words
+        )
+        or any(
+            word in {"--output", "--cache-to"}
+            and index + 1 < len(words)
+            and "type=registry" in words[index + 1]
+            for index, word in enumerate(words)
+        )
     )
 
 
@@ -218,7 +251,12 @@ def assert_ci_runs_pr_docker_build_without_push() -> None:
     assert (
         "docker/build-push-action@" not in docker_job
     ), "PR Docker builds must use docker buildx build directly, without push actions"
-    assert "docker push" not in docker_job, "PR Docker builds must not push images"
+
+    push_commands = docker_push_command_lines(docker_job, docker_job_line)
+    if push_commands:
+        raise SystemExit(
+            "PR Docker builds must not push images:\n" + "\n".join(push_commands)
+        )
 
     guarded_lines = [
         f"{CI_WORKFLOW}:{line_number}: {line.strip()}"
