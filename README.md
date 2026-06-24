@@ -22,16 +22,21 @@ cd discord-transcript
 
 ### 2. データベースのセットアップ
 
-PostgreSQL にデータベースを作成し、マイグレーションを適用します。
+PostgreSQL にデータベースを作成し、アプリの migration runner でマイグレーションを適用します。手動 migration の正規手順は `discord-transcript migrate` です。runner は適用済みの version を `schema_migrations` に記録するため、次回起動時の migration は no-op になります。
 
 ```bash
 createdb discord_transcript
-migration_files=$(find migrations -maxdepth 1 -name "*.sql" | sort)
-[ -n "$migration_files" ] || { echo "No migration files found in migrations/"; exit 1; }
-printf '%s\n' "$migration_files" | while IFS= read -r f; do
-  psql -d discord_transcript -f "$f" || exit 1
-done
+export DATABASE_URL=postgresql://localhost/discord_transcript
+cargo run --locked -- migrate
 ```
+
+リリース済みバイナリを直接使う場合も、同じ runner を実行します。
+
+```bash
+DATABASE_URL=postgresql://user:pass@localhost/discord_transcript discord-transcript migrate
+```
+
+SQL ファイルを個別に `psql` で適用する手順は通常の運用手順ではありません。やむを得ず実施する場合は、適用した migration version を同じ順序で `schema_migrations` に記録し、直後に `discord-transcript migrate` を実行して pending migration がないことを確認してください。`schema_migrations` が未記録のままだと、起動時の runner は未適用と判断して non-idempotent な migration を再実行する可能性があります。
 
 ### 3. 環境変数の設定
 
