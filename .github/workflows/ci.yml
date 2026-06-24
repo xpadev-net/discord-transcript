@@ -60,11 +60,17 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Validate Cargo lockfile policy
+        run: python3 tests/cargo_lock_policy.py
+
+      - name: cargo metadata (locked)
+        run: cargo metadata --locked --all-features --format-version 1 > /dev/null
+
       - name: cargo fmt (check)
         run: cargo fmt --all -- --check
 
       - name: cargo clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features

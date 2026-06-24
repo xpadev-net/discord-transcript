@@ -6,9 +6,9 @@ pre-commit:
       run: cargo fmt --all -- --check
     clippy:
       glob: "**/*.rs"
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 pre-push:
   commands:
     test:
-      run: cargo test --workspace --all-targets --all-features
+      run: cargo test --locked --workspace --all-targets --all-features
