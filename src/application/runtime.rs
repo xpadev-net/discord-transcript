@@ -10449,6 +10449,32 @@ mod status_message_tests {
         ));
     }
 
+    #[test]
+    fn claimed_summary_job_validation_stops_wrong_type_from_in_memory_claim() {
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+        let mut job = running_summary_job();
+        job.job_type = crate::domain::JobType::Cleanup;
+        job.status = crate::domain::JobStatus::Queued;
+        job.claim_token = None;
+        job.leased_until = None;
+        queue.enqueue(job).expect("test job should enqueue");
+
+        let claimed_job = queue
+            .claim_by_id("summary-m1")
+            .expect("claim should succeed")
+            .expect("in-memory queue can still claim by id alone");
+
+        let err = validate_claimed_summary_job(claimed_job, "m1")
+            .expect_err("runtime guard should reject wrong-type in-memory claims");
+
+        assert!(matches!(
+            err,
+            SummaryJobRunError::NotClaimable(message)
+                if message.contains("job_type=cleanup")
+                    && message.contains("job_id=summary-m1")
+        ));
+    }
+
     struct LeaseAwareSummaryJobState {
         inner: StdMutex<LeaseAwareSummaryJobInner>,
         heartbeat_notify: Notify,
