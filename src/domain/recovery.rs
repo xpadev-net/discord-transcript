@@ -5,6 +5,7 @@ pub struct RecoveryCandidate {
     pub meeting_id: String,
     pub status: MeetingStatus,
     pub voice_connected: bool,
+    pub has_local_session: bool,
     pub has_recording_file: bool,
 }
 
@@ -19,7 +20,7 @@ pub enum RecoveryAction {
 pub fn decide_recovery_action(candidate: &RecoveryCandidate) -> RecoveryAction {
     match candidate.status {
         MeetingStatus::Recording => {
-            if candidate.voice_connected {
+            if candidate.voice_connected && candidate.has_local_session {
                 RecoveryAction::Noop
             } else if candidate.has_recording_file {
                 RecoveryAction::ConfirmStopClientDisconnect

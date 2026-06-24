@@ -61,6 +61,7 @@ fn recovery_decision_matches_mvp_rules() {
         meeting_id: "m1".to_owned(),
         status: MeetingStatus::Recording,
         voice_connected: false,
+        has_local_session: false,
         has_recording_file: true,
     };
     assert_eq!(
@@ -72,6 +73,7 @@ fn recovery_decision_matches_mvp_rules() {
         meeting_id: "m2".to_owned(),
         status: MeetingStatus::Stopping,
         voice_connected: false,
+        has_local_session: false,
         has_recording_file: true,
     };
     assert_eq!(
@@ -83,6 +85,7 @@ fn recovery_decision_matches_mvp_rules() {
         meeting_id: "m3".to_owned(),
         status: MeetingStatus::Recording,
         voice_connected: false,
+        has_local_session: false,
         has_recording_file: false,
     };
     assert_eq!(
