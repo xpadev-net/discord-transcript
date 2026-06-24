@@ -4,16 +4,22 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-COVERED_WORKFLOWS = (
-    ".github/workflows/ci.yml",
-    ".github/workflows/docker.yml",
-)
+WORKFLOW_DIR = ROOT / ".github/workflows"
+WORKFLOW_SUFFIXES = {".yaml", ".yml"}
 USES_RE = re.compile(r"^\s*uses:\s*(?P<value>[^#\s]+)")
 COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 
 
 def read_repo_file(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
+
+
+def covered_workflows() -> list[str]:
+    return sorted(
+        str(path.relative_to(ROOT))
+        for path in WORKFLOW_DIR.iterdir()
+        if path.is_file() and path.suffix in WORKFLOW_SUFFIXES
+    )
 
 
 def workflow_uses_entries(path: str) -> list[tuple[int, str]]:
@@ -40,8 +46,11 @@ def is_sha_pinned_action(ref: str) -> bool:
 def assert_workflow_actions_are_sha_pinned() -> None:
     errors: list[str] = []
     seen_entries = 0
+    workflows = covered_workflows()
 
-    for path in COVERED_WORKFLOWS:
+    assert workflows, "expected at least one workflow file to keep this policy live"
+
+    for path in workflows:
         for line_number, action_ref in workflow_uses_entries(path):
             seen_entries += 1
             if not is_sha_pinned_action(action_ref):
