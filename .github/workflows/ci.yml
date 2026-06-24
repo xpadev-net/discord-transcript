@@ -26,6 +26,28 @@ jobs:
       - name: Validate workflow action pinning policy
         run: python3 tests/workflow_action_policy.py
 
+      - name: Validate Dockerfile policy
+        run: python3 tests/dockerfile_policy.py
+
+  docker-image:
+    name: docker image build
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build Docker builder target
+        run: docker buildx build --progress=plain --target builder .
+
+      - name: Build Docker production image
+        run: docker buildx build --progress=plain --target production --tag discord-transcript:ci --load .
+
   frontend:
     name: frontend checks
     needs: workflow-policy
