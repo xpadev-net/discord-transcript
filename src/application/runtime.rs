@@ -24,7 +24,7 @@ use crate::audio::meeting_audio::{
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
 };
 use crate::audio::receiver::ReceiverConfig;
-use crate::audio::recording_session::{PersistedChunk, RecordingSession};
+use crate::audio::recording_session::{FlushResult, PersistedChunk, RecordingSession};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
 use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness};
 use crate::domain::authz::{
@@ -596,18 +596,19 @@ fn flush_session_for_teardown<S: ChunkStorage>(
     phase: &str,
 ) -> Result<(), String> {
     match session.flush_all() {
-        Ok(result) if result.failed.is_empty() => Ok(()),
+        Ok(result) if audio_flush_incomplete_error(&result, "final").is_none() => Ok(()),
         Ok(result) => {
+            let err = audio_flush_incomplete_error(&result, "final")
+                .expect("incomplete flush should produce an error");
             warn!(
                 guild_id = %guild_id,
                 failed = result.failed.len(),
+                dropped_chunks = result.audio_loss.dropped_chunks,
+                dropped_bytes = result.audio_loss.dropped_bytes,
                 phase,
-                "some chunks failed to persist during final flush; retaining session for retry"
+                "final audio flush incomplete; retaining session for teardown handling"
             );
-            Err(format!(
-                "failed to persist {} final audio chunk(s)",
-                result.failed.len()
-            ))
+            Err(err)
         }
         Err(err) => {
             // Recorder errors leave in-flight recorder buffers undrained. Treat
@@ -625,12 +626,31 @@ fn flush_removed_session_after_stop<S: ChunkStorage>(
     _phase: &str,
 ) -> Result<(), String> {
     match session.flush_all() {
-        Ok(result) if result.failed.is_empty() => Ok(()),
-        Ok(result) => Err(format!(
-            "failed to persist {} tail audio chunk(s)",
-            result.failed.len()
-        )),
+        Ok(result) if audio_flush_incomplete_error(&result, "tail").is_none() => Ok(()),
+        Ok(result) => Err(audio_flush_incomplete_error(&result, "tail")
+            .expect("incomplete flush should produce an error")),
         Err(err) => Err(err.to_string()),
+    }
+}
+
+fn audio_flush_incomplete_error(result: &FlushResult, phase: &str) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !result.audio_loss.is_empty() {
+        reasons.push(format!(
+            "lost {} {phase} audio chunk(s) ({} bytes) from the pending failed audio retry buffer",
+            result.audio_loss.dropped_chunks, result.audio_loss.dropped_bytes
+        ));
+    }
+    if !result.failed.is_empty() {
+        reasons.push(format!(
+            "failed to persist {} {phase} audio chunk(s)",
+            result.failed.len()
+        ));
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
     }
 }
 
@@ -866,6 +886,51 @@ fn mark_recording_failed_after_teardown_exhaustion<S: MeetingStore>(
             error = %err,
             "failed to persist teardown exhaustion error message after marking recording failed"
         );
+    }
+    Ok(())
+}
+
+fn mark_stopped_recording_failed_after_audio_loss<S: MeetingStore>(
+    store: &mut S,
+    meeting_id: &str,
+    error_message: &str,
+) -> Result<(), StoreError> {
+    for expected in [
+        MeetingStatus::Stopping,
+        MeetingStatus::Transcribing,
+        MeetingStatus::Summarizing,
+        MeetingStatus::Posted,
+    ] {
+        match store.set_meeting_status(meeting_id, MeetingStatus::Failed, Some(expected)) {
+            Ok(()) => {
+                store.set_error_message(meeting_id, Some(error_message.to_owned()))?;
+                return Ok(());
+            }
+            Err(StoreError::CasConflict { .. }) => continue,
+            Err(StoreError::NotFound { .. }) => {
+                debug!(
+                    meeting_id,
+                    "meeting not found while marking stopped recording failed after audio loss"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some(meeting) = store.get_meeting(meeting_id)? {
+        if meeting.status == MeetingStatus::Failed {
+            debug!(
+                meeting_id,
+                "meeting already failed while marking stopped recording failed after audio loss"
+            );
+        } else {
+            warn!(
+                meeting_id,
+                status = ?meeting.status,
+                "stopped recording audio loss reached meeting in unexpected status"
+            );
+        }
     }
     Ok(())
 }
@@ -4352,7 +4417,7 @@ impl EventHandler for ScaffoldHandler {
                             let reset_guard =
                                 Arc::clone(&handler.ssrc_tracker_reset_gate).lock_owned().await;
                             drop(lifecycle_permit);
-                            handler
+                            if let Err(err) = handler
                                 .leave_after_recording_stop(
                                     &ctx_for_task,
                                     &guild_for_task,
@@ -4361,7 +4426,16 @@ impl EventHandler for ScaffoldHandler {
                                     removed_session,
                                     reset_guard,
                                 )
-                                .await;
+                                .await
+                            {
+                                warn!(
+                                    guild_id = %guild_for_task,
+                                    meeting_id = expected_meeting_id_ref,
+                                    error = %err,
+                                    "auto-stop tail audio flush incomplete; marked recording failed"
+                                );
+                                return;
+                            }
                             break result;
                         }
                         Err(RecordingTeardownError::FinalFlush(err)) => {
@@ -5393,7 +5467,7 @@ impl ScaffoldHandler {
         phase: &str,
         mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
         _reset_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) {
+    ) -> Result<(), String> {
         // Stop has already won the DB transition, so leave voice even if
         // another cleanup path removed the local session first. Terminal
         // absence cleanup only leaves when it removed the matching session,
@@ -5404,11 +5478,14 @@ impl ScaffoldHandler {
             leave_voice_with_timeout(manager.as_ref(), self.guild_id, meeting_id, phase).await;
         }
 
-        if let Some(session) = removed_session.as_mut()
+        let tail_flush_error = if let Some(session) = removed_session.as_mut()
             && let Err(err) = flush_removed_session_after_stop(session, guild_key, phase)
         {
             warn_removed_session_flush_failure(guild_key, phase, &err);
-        }
+            Some(err)
+        } else {
+            None
+        };
 
         let final_tracker = {
             let _voice_event_guard = self.voice_event_gate.write().await;
@@ -5418,6 +5495,42 @@ impl ScaffoldHandler {
         if let Some(session) = &removed_session {
             session.persist_ssrc_mapping(&final_tracker);
         }
+
+        if let Some(err) = tail_flush_error {
+            let error_message = format!("tail audio flush incomplete after {phase}: {err}");
+            {
+                let mut service = self.service.lock().await;
+                mark_stopped_recording_failed_after_audio_loss(
+                    &mut service.store,
+                    meeting_id,
+                    &error_message,
+                )
+                .map_err(|mark_err| {
+                    format!("{error_message}; failed to mark meeting failed: {mark_err}")
+                })?;
+            }
+            if let Err(status_err) = self
+                .update_status_message(
+                    &ctx.http,
+                    meeting_id,
+                    StatusMessageUpdate::Failed {
+                        phase,
+                        error: &error_message,
+                    },
+                )
+                .await
+            {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id,
+                    error = %status_err,
+                    "failed to update status message after stopped recording audio loss"
+                );
+            }
+            return Err(error_message);
+        }
+
+        Ok(())
     }
 
     async fn remove_local_recording_state_after_terminal_absence(
@@ -6506,7 +6619,7 @@ impl ScaffoldHandler {
             removed_session,
             reset_guard,
         )
-        .await;
+        .await?;
 
         {
             let result = stop_result;
@@ -9128,7 +9241,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             .lock_owned()
                                             .await;
                                     drop(lifecycle_permit);
-                                    runtime
+                                    if let Err(err) = runtime
                                         .leave_after_recording_stop(
                                             &ctx_for_task,
                                             &guild_key,
@@ -9137,7 +9250,16 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             removed_session,
                                             reset_guard,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        warn!(
+                                            guild_id = %guild_key,
+                                            meeting_id = expected_meeting_id_ref,
+                                            error = %err,
+                                            "driver-disconnect tail audio flush incomplete; marked recording failed"
+                                        );
+                                        return;
+                                    }
                                     break result;
                                 }
                                 Err(RecordingTeardownError::FinalFlush(err)) => {
@@ -9412,7 +9534,9 @@ pub fn ingest_voice_frames_into_session(
                 tracing::warn!(
                     failed_count = result.failed.len(),
                     newly_failed = result.newly_failed,
-                    "some audio chunks could not be persisted during ingest flush"
+                    dropped_chunks = result.audio_loss.dropped_chunks,
+                    dropped_bytes = result.audio_loss.dropped_bytes,
+                    "some audio chunks could not be persisted or were dropped during ingest flush"
                 );
             }
             result.persisted
@@ -12343,6 +12467,63 @@ mod status_message_tests {
     #[test]
     fn driver_disconnect_final_flush_failure_blocks_teardown_and_can_retry() {
         assert_final_flush_failure_is_retryable("driver disconnect");
+    }
+
+    #[test]
+    fn final_flush_reports_dropped_pending_failed_audio() {
+        let mut session = session_with_one_flaky_chunk(1);
+        session.set_pending_failed_chunk_limit_for_tests(1);
+
+        let err = flush_session_for_teardown(&mut session, "g1", "manual stop")
+            .expect_err("dropped pending audio should block successful teardown");
+
+        assert!(err.contains("lost 1 final audio chunk"));
+        assert!(err.contains("pending failed audio retry buffer"));
+
+        let err = flush_session_for_teardown(&mut session, "g1", "manual stop")
+            .expect_err("audio loss should remain visible after pending chunks are gone");
+        assert!(err.contains("lost 1 final audio chunk"));
+    }
+
+    #[test]
+    fn removed_session_flush_reports_dropped_tail_audio() {
+        let mut session = session_with_one_flaky_chunk(1);
+        session.set_pending_failed_chunk_limit_for_tests(1);
+
+        let err = flush_removed_session_after_stop(&mut session, "g1", "manual stop")
+            .expect_err("dropped tail audio should be surfaced");
+
+        assert!(err.contains("lost 1 tail audio chunk"));
+        assert!(err.contains("pending failed audio retry buffer"));
+    }
+
+    #[test]
+    fn stopped_tail_audio_loss_marks_post_stop_statuses_failed() {
+        for status in [
+            MeetingStatus::Stopping,
+            MeetingStatus::Transcribing,
+            MeetingStatus::Summarizing,
+            MeetingStatus::Posted,
+        ] {
+            let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            let mut meeting = recording_meeting();
+            meeting.status = status;
+            store.insert(meeting);
+
+            mark_stopped_recording_failed_after_audio_loss(
+                &mut store,
+                "m1",
+                "lost 1 tail audio chunk",
+            )
+            .expect("audio loss should mark the stopped meeting failed");
+
+            let meeting = store.get("m1").expect("meeting should exist");
+            assert_eq!(meeting.status, MeetingStatus::Failed);
+            assert_eq!(
+                meeting.error_message.as_deref(),
+                Some("lost 1 tail audio chunk")
+            );
+        }
     }
 
     #[test]
