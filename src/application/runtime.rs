@@ -596,19 +596,20 @@ fn flush_session_for_teardown<S: ChunkStorage>(
     phase: &str,
 ) -> Result<(), String> {
     match session.flush_all() {
-        Ok(result) if audio_flush_incomplete_error(&result, "final").is_none() => Ok(()),
         Ok(result) => {
-            let err = audio_flush_incomplete_error(&result, "final")
-                .expect("incomplete flush should produce an error");
-            warn!(
-                guild_id = %guild_id,
-                failed = result.failed.len(),
-                dropped_chunks = result.audio_loss.dropped_chunks,
-                dropped_bytes = result.audio_loss.dropped_bytes,
-                phase,
-                "final audio flush incomplete; retaining session for teardown handling"
-            );
-            Err(err)
+            if let Some(err) = audio_flush_incomplete_error(&result, "final") {
+                warn!(
+                    guild_id = %guild_id,
+                    failed = result.failed.len(),
+                    cumulative_dropped_chunks = result.audio_loss.dropped_chunks,
+                    cumulative_dropped_bytes = result.audio_loss.dropped_bytes,
+                    phase,
+                    "final audio flush incomplete; retaining session for teardown handling"
+                );
+                Err(err)
+            } else {
+                Ok(())
+            }
         }
         Err(err) => {
             // Recorder errors leave in-flight recorder buffers undrained. Treat
@@ -626,9 +627,10 @@ fn flush_removed_session_after_stop<S: ChunkStorage>(
     _phase: &str,
 ) -> Result<(), String> {
     match session.flush_all() {
-        Ok(result) if audio_flush_incomplete_error(&result, "tail").is_none() => Ok(()),
-        Ok(result) => Err(audio_flush_incomplete_error(&result, "tail")
-            .expect("incomplete flush should produce an error")),
+        Ok(result) => match audio_flush_incomplete_error(&result, "tail") {
+            Some(err) => Err(err),
+            None => Ok(()),
+        },
         Err(err) => Err(err.to_string()),
     }
 }
@@ -9534,8 +9536,8 @@ pub fn ingest_voice_frames_into_session(
                 tracing::warn!(
                     failed_count = result.failed.len(),
                     newly_failed = result.newly_failed,
-                    dropped_chunks = result.audio_loss.dropped_chunks,
-                    dropped_bytes = result.audio_loss.dropped_bytes,
+                    cumulative_dropped_chunks = result.audio_loss.dropped_chunks,
+                    cumulative_dropped_bytes = result.audio_loss.dropped_bytes,
                     "some audio chunks could not be persisted or were dropped during ingest flush"
                 );
             }
