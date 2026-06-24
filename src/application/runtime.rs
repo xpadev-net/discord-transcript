@@ -2414,6 +2414,53 @@ fn retry_scheduled_error(job: &Job, message: String) -> SummaryJobRunError {
     }
 }
 
+fn handle_summary_status_transition_failure<Q>(
+    queue: &mut Q,
+    job: &Job,
+    err: StoreError,
+    transition: &str,
+) -> SummaryJobRunError
+where
+    Q: JobQueue,
+{
+    let err_string = err.to_string();
+    if matches!(&err, StoreError::CasConflict { .. }) {
+        warn!(
+            meeting_id = %job.meeting_id,
+            job_id = %job.id,
+            transition,
+            error = %err,
+            "summary status transition CAS failed; failing summary job without touching meeting state"
+        );
+        let _ = queue.mark_failed(job, err_string.clone());
+        return SummaryJobRunError::Terminal(err_string);
+    }
+
+    warn!(
+        meeting_id = %job.meeting_id,
+        job_id = %job.id,
+        transition,
+        error = %err,
+        "summary status transition store error; retrying summary job without marking meeting failed"
+    );
+    let max_retries = job.retry_count.saturating_add(1).min(i32::MAX as u32);
+    let exhausted =
+        retry_claimed_summary_job(queue, job, err_string.clone(), max_retries, transition);
+    if exhausted {
+        warn!(
+            meeting_id = %job.meeting_id,
+            job_id = %job.id,
+            transition,
+            "summary status transition backend retry unexpectedly exhausted"
+        );
+        return SummaryJobRunError::NotClaimable(format!(
+            "summary status transition retry unexpectedly exhausted during {transition}"
+        ));
+    }
+
+    retry_scheduled_error(job, err_string)
+}
+
 fn validate_claimed_summary_job(
     job: Job,
     expected_meeting_id: &str,
@@ -7571,27 +7618,13 @@ impl ScaffoldHandler {
                 Some(MeetingStatus::Stopping),
             )
         } {
-            let cas_err_string = cas_err.to_string();
-            if matches!(&cas_err, StoreError::CasConflict { .. }) {
-                warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Stopping->Transcribing failed; failing summary job without touching meeting state");
-                {
-                    let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
-                }
-                return Err(SummaryJobRunError::Terminal(cas_err_string));
-            }
-            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "failed to set Transcribing status; marking job failed");
-            {
-                let mut queue = self.queue.lock().await;
-                let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
-            }
-            let mut service = self.service.lock().await;
-            let _ = mark_summary_meeting_failed_from_summary_state(
-                &mut service.store,
-                &claimed_job.meeting_id,
-                cas_err_string.clone(),
-            );
-            return Err(SummaryJobRunError::Terminal(cas_err_string));
+            let mut queue = self.queue.lock().await;
+            return Err(handle_summary_status_transition_failure(
+                &mut *queue,
+                &claimed_job,
+                cas_err,
+                "Stopping->Transcribing",
+            ));
         }
 
         if let Err(err) = self
@@ -8047,27 +8080,13 @@ impl ScaffoldHandler {
                 Some(MeetingStatus::Transcribing),
             )
         } {
-            let cas_err_string = cas_err.to_string();
-            if matches!(&cas_err, StoreError::CasConflict { .. }) {
-                warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "CAS Transcribing->Summarizing failed; failing summary job without touching meeting state");
-                {
-                    let mut queue = self.queue.lock().await;
-                    let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
-                }
-                return Err(SummaryJobRunError::Terminal(cas_err_string));
-            }
-            warn!(meeting_id = %claimed_job.meeting_id, error = %cas_err, "failed to set Summarizing status; marking job failed");
-            {
-                let mut queue = self.queue.lock().await;
-                let _ = queue.mark_failed(&claimed_job, cas_err_string.clone());
-            }
-            let mut service = self.service.lock().await;
-            let _ = mark_summary_meeting_failed_from_summary_state(
-                &mut service.store,
-                &claimed_job.meeting_id,
-                cas_err_string.clone(),
-            );
-            return Err(SummaryJobRunError::Terminal(cas_err_string));
+            let mut queue = self.queue.lock().await;
+            return Err(handle_summary_status_transition_failure(
+                &mut *queue,
+                &claimed_job,
+                cas_err,
+                "Transcribing->Summarizing",
+            ));
         }
 
         macro_rules! return_summary_retry {
@@ -9911,7 +9930,7 @@ mod status_message_tests {
     use super::*;
     use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
     use crate::domain::authz::RbacRoleGrant;
-    use crate::infrastructure::sql_store::{FakeSqlExecutor, SqlExecutor};
+    use crate::infrastructure::sql_store::{FakeSqlExecutor, SqlExecutor, SqlJobQueue};
     use crate::infrastructure::storage_fs::{ChunkStorageError, SavedChunk};
     use serenity::async_trait;
     use std::sync::{
@@ -10556,6 +10575,138 @@ mod status_message_tests {
             claim_token: Some("token-m1".to_owned()),
             leased_until: Some(chrono::Utc::now() + chrono::Duration::seconds(90)),
             next_run_at: None,
+        }
+    }
+
+    #[test]
+    fn summary_status_transition_backend_error_retries_without_failing_meeting() {
+        for (status, transition) in [
+            (
+                crate::domain::MeetingStatus::Stopping,
+                "Stopping->Transcribing",
+            ),
+            (
+                crate::domain::MeetingStatus::Transcribing,
+                "Transcribing->Summarizing",
+            ),
+        ] {
+            let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            let mut meeting = summarizing_meeting();
+            meeting.status = status;
+            store.insert(meeting);
+            let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+            let mut job = running_summary_job();
+            job.retry_count = 42;
+            queue.enqueue(job.clone()).expect("test job should enqueue");
+
+            let err = handle_summary_status_transition_failure(
+                &mut queue,
+                &job,
+                StoreError::Backend("status update unavailable".to_owned()),
+                transition,
+            );
+
+            assert!(matches!(
+                err,
+                SummaryJobRunError::RetryScheduled { message, .. }
+                    if message.contains("store backend error: status update unavailable")
+            ));
+            let updated = queue.get(&job.id).expect("job should remain");
+            assert_eq!(updated.status, crate::domain::JobStatus::Queued);
+            assert_eq!(updated.retry_count, 43);
+            assert_eq!(
+                updated.error_message.as_deref(),
+                Some("store backend error: status update unavailable")
+            );
+            assert!(updated.claim_token.is_none());
+            assert!(updated.leased_until.is_none());
+            assert!(updated.next_run_at.is_some());
+
+            let meeting = store.get("m1").expect("meeting should remain");
+            assert_eq!(meeting.status, status);
+            assert_eq!(meeting.error_message, None);
+        }
+    }
+
+    #[test]
+    fn summary_status_transition_backend_retry_limit_fits_sql_integer() {
+        let mut executor = FakeSqlExecutor::default();
+        executor.query_rows_result.insert(
+            format!("{}|*", crate::infrastructure::sql::RETRY_JOB_SQL),
+            vec![vec![Some("queued".to_owned())]],
+        );
+        let mut queue = SqlJobQueue::new(executor);
+        let mut job = running_summary_job();
+        job.retry_count = 42;
+
+        let err = handle_summary_status_transition_failure(
+            &mut queue,
+            &job,
+            StoreError::Backend("status update unavailable".to_owned()),
+            "Stopping->Transcribing",
+        );
+
+        assert!(matches!(
+            err,
+            SummaryJobRunError::RetryScheduled { message, .. }
+                if message.contains("store backend error: status update unavailable")
+        ));
+        let (_, params) = queue
+            .executor
+            .executed
+            .iter()
+            .find(|(sql, _)| sql == crate::infrastructure::sql::RETRY_JOB_SQL)
+            .expect("status transition backend error should retry SQL queue");
+        assert_eq!(params[2], "43");
+    }
+
+    #[test]
+    fn summary_status_transition_cas_conflict_fails_job_without_failing_meeting() {
+        for (status, transition) in [
+            (
+                crate::domain::MeetingStatus::Stopping,
+                "Stopping->Transcribing",
+            ),
+            (
+                crate::domain::MeetingStatus::Transcribing,
+                "Transcribing->Summarizing",
+            ),
+        ] {
+            let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+            let mut meeting = summarizing_meeting();
+            meeting.status = status;
+            store.insert(meeting);
+            let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+            let job = running_summary_job();
+            queue.enqueue(job.clone()).expect("test job should enqueue");
+
+            let err = handle_summary_status_transition_failure(
+                &mut queue,
+                &job,
+                StoreError::CasConflict {
+                    meeting_id: "m1".to_owned(),
+                },
+                transition,
+            );
+
+            assert!(matches!(
+                err,
+                SummaryJobRunError::Terminal(message)
+                    if message.contains("meeting status does not match expected value: m1")
+            ));
+            let updated = queue.get(&job.id).expect("job should remain");
+            assert_eq!(updated.status, crate::domain::JobStatus::Failed);
+            assert_eq!(updated.retry_count, 0);
+            assert_eq!(
+                updated.error_message.as_deref(),
+                Some("meeting status does not match expected value: m1")
+            );
+            assert!(updated.claim_token.is_none());
+            assert!(updated.leased_until.is_none());
+
+            let meeting = store.get("m1").expect("meeting should remain");
+            assert_eq!(meeting.status, status);
+            assert_eq!(meeting.error_message, None);
         }
     }
 
