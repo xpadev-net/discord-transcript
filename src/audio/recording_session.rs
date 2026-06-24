@@ -28,6 +28,24 @@ pub struct FlushResult {
     pub persisted: Vec<PersistedChunk>,
     pub failed: Vec<FailedChunk>,
     pub newly_failed: usize,
+    pub audio_loss: AudioLoss,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLoss {
+    pub dropped_chunks: usize,
+    pub dropped_bytes: usize,
+}
+
+impl AudioLoss {
+    pub fn is_empty(self) -> bool {
+        self.dropped_chunks == 0 && self.dropped_bytes == 0
+    }
+
+    fn record_drop(&mut self, chunks: usize, bytes: usize) {
+        self.dropped_chunks = self.dropped_chunks.saturating_add(chunks);
+        self.dropped_bytes = self.dropped_bytes.saturating_add(bytes);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +79,8 @@ pub struct RecordingSession<S: ChunkStorage> {
     storage: S,
     per_user_seq: HashMap<String, u64>,
     pending_failed_chunks: Vec<RecorderOutputChunk>,
+    audio_loss: AudioLoss,
+    max_pending_failed_chunk_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +125,8 @@ impl<S: ChunkStorage> RecordingSession<S> {
             storage,
             per_user_seq: HashMap::new(),
             pending_failed_chunks: Vec::new(),
+            audio_loss: AudioLoss::default(),
+            max_pending_failed_chunk_bytes: MAX_PENDING_FAILED_CHUNK_BYTES,
         }
     }
 
@@ -135,6 +157,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
                 persisted: vec![],
                 failed: vec![],
                 newly_failed: 0,
+                audio_loss: self.audio_loss,
             };
         }
         let existing_pending_count = self.pending_failed_chunks.len();
@@ -147,6 +170,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
             persisted: result.persisted,
             failed: self.pending_failed_metadata(),
             newly_failed: result.newly_failed,
+            audio_loss: self.audio_loss,
         }
     }
 
@@ -163,14 +187,14 @@ impl<S: ChunkStorage> RecordingSession<S> {
             .iter()
             .map(|chunk| chunk.wav.bytes.len())
             .sum();
-        if total_bytes <= MAX_PENDING_FAILED_CHUNK_BYTES {
+        if total_bytes <= self.max_pending_failed_chunk_bytes {
             return;
         }
 
         let mut drop_count = 0usize;
         let mut drop_bytes = 0usize;
         for chunk in &self.pending_failed_chunks {
-            if total_bytes <= MAX_PENDING_FAILED_CHUNK_BYTES {
+            if total_bytes <= self.max_pending_failed_chunk_bytes {
                 break;
             }
             let size = chunk.wav.bytes.len();
@@ -181,12 +205,13 @@ impl<S: ChunkStorage> RecordingSession<S> {
 
         if drop_count > 0 {
             self.pending_failed_chunks.drain(0..drop_count);
+            self.audio_loss.record_drop(drop_count, drop_bytes);
             tracing::warn!(
                 meeting_id = %self.meeting_id,
                 dropped_chunks = drop_count,
                 dropped_bytes = drop_bytes,
                 retained_bytes = total_bytes,
-                max_bytes = MAX_PENDING_FAILED_CHUNK_BYTES,
+                max_bytes = self.max_pending_failed_chunk_bytes,
                 "pending failed audio chunk buffer exceeded memory limit; dropped oldest chunks"
             );
         }
@@ -280,6 +305,11 @@ impl<S: ChunkStorage> RecordingSession<S> {
         }
         moved
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_failed_chunk_limit_for_tests(&mut self, max_bytes: usize) {
+        self.max_pending_failed_chunk_bytes = max_bytes;
+    }
 }
 
 impl RecordingSession<LocalChunkStorage> {
@@ -320,5 +350,100 @@ impl RecordingSession<LocalChunkStorage> {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::storage_fs::SavedChunk;
+    use std::path::PathBuf;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug, Clone)]
+    struct FlakyMemoryChunkStorage {
+        failures_remaining: Arc<AtomicUsize>,
+    }
+
+    impl ChunkStorage for FlakyMemoryChunkStorage {
+        fn save_chunk(
+            &self,
+            _meeting_id: &str,
+            user_id: &str,
+            sequence: u64,
+            start_ms: u64,
+            bytes: &[u8],
+        ) -> Result<SavedChunk, ChunkStorageError> {
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    if value > 0 { Some(value - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err(ChunkStorageError::Io("injected failure".to_owned()));
+            }
+            Ok(SavedChunk {
+                path: PathBuf::from(format!("{user_id}_{sequence}_{start_ms}.wav")),
+                size_bytes: bytes.len(),
+            })
+        }
+    }
+
+    fn test_session(failures: Arc<AtomicUsize>) -> RecordingSession<FlakyMemoryChunkStorage> {
+        RecordingSession::new(
+            "meeting-1".to_owned(),
+            FlakyMemoryChunkStorage {
+                failures_remaining: failures,
+            },
+            ReceiverConfig {
+                chunk_duration: std::time::Duration::from_secs(20),
+                silence_flush_duration: std::time::Duration::from_secs(30),
+            },
+            48_000,
+        )
+    }
+
+    fn ingest_test_frame(
+        session: &mut RecordingSession<FlakyMemoryChunkStorage>,
+        timestamp_ms: u64,
+    ) {
+        session.ingest_frame(
+            "u1",
+            BufferedFrame {
+                timestamp_ms,
+                pcm_16le_bytes: vec![0, 0, 1, 0],
+            },
+        );
+    }
+
+    #[test]
+    fn dropped_pending_failed_chunks_are_reported_after_later_successful_flush() {
+        let failures = Arc::new(AtomicUsize::new(1));
+        let mut session = test_session(Arc::clone(&failures));
+        session.set_pending_failed_chunk_limit_for_tests(1);
+
+        ingest_test_frame(&mut session, 1_000);
+        let dropped = session.flush_all().expect("flush should not fail hard");
+
+        assert_eq!(dropped.newly_failed, 1);
+        assert!(dropped.failed.is_empty());
+        assert_eq!(dropped.audio_loss.dropped_chunks, 1);
+        assert!(dropped.audio_loss.dropped_bytes > 0);
+
+        failures.store(0, Ordering::SeqCst);
+        ingest_test_frame(&mut session, 2_000);
+        let recovered = session.flush_all().expect("later flush should succeed");
+
+        assert_eq!(recovered.persisted.len(), 1);
+        assert!(recovered.failed.is_empty());
+        assert_eq!(recovered.audio_loss.dropped_chunks, 1);
+        assert_eq!(
+            recovered.audio_loss.dropped_bytes,
+            dropped.audio_loss.dropped_bytes
+        );
     }
 }
