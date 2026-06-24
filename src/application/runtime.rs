@@ -1023,6 +1023,46 @@ fn remove_matching_recording_session_for_meeting<S: ChunkStorage>(
     }
 }
 
+fn has_matching_local_recovery_session<S: ChunkStorage>(
+    sessions: &HashMap<String, RecordingSession<S>>,
+    guild_key: &str,
+    expected_meeting_id: &str,
+) -> bool {
+    sessions
+        .get(guild_key)
+        .is_some_and(|session| session.meeting_id == expected_meeting_id)
+}
+
+fn startup_recovery_needs_missing_session_voice_leave(
+    candidate: &RecoveryCandidate,
+    effect: &RecoveryEffect,
+) -> bool {
+    candidate.status == MeetingStatus::Recording
+        && candidate.voice_connected
+        && !candidate.has_local_session
+        && !matches!(effect, RecoveryEffect::Noop { .. })
+}
+
+async fn leave_startup_recovered_voice_without_local_session<
+    L: RecordingVoiceLeaveDependency + Sync,
+>(
+    voice_leave: &L,
+    guild_id: GuildId,
+    candidate: &RecoveryCandidate,
+    effect: &RecoveryEffect,
+) -> Option<RecordingVoiceLeaveOutcome> {
+    if !startup_recovery_needs_missing_session_voice_leave(candidate, effect) {
+        return None;
+    }
+    voice_leave
+        .leave_recording_voice_with_timeout(
+            guild_id,
+            &candidate.meeting_id,
+            "startup recovery missing local session",
+        )
+        .await
+}
+
 fn clear_local_recording_state_maps_after_terminal_absence(
     auto_stop_states: &mut HashMap<String, AutoStopState>,
     live_transcription_titles: &mut HashMap<String, Option<String>>,
@@ -4925,17 +4965,40 @@ impl ScaffoldHandler {
                 continue;
             }
             let has_recording_file = recoverable_audio.is_some() || has_final_transcript_rows;
+            let recovery_guild_key = meeting
+                .as_ref()
+                .map(|meeting| meeting.guild_id.clone())
+                .unwrap_or_else(|| self.guild_id.get().to_string());
             let voice_connected = snapshot
                 .voice_channel_id
                 .and_then(|voice_channel_id| {
                     is_bot_connected_to_voice_channel(ctx, self.guild_id, voice_channel_id)
                 })
                 .unwrap_or(false);
+            let has_local_session = if meeting.is_some() {
+                let sessions = self.sessions.lock().await;
+                has_matching_local_recovery_session(
+                    &sessions,
+                    &recovery_guild_key,
+                    &snapshot.meeting_id,
+                )
+            } else {
+                false
+            };
             let candidate = RecoveryCandidate {
                 meeting_id: snapshot.meeting_id.clone(),
                 status: snapshot.status,
                 voice_connected,
+                has_local_session,
                 has_recording_file,
+            };
+            let startup_voice_teardown_permit = if candidate.status == MeetingStatus::Recording
+                && candidate.voice_connected
+                && !candidate.has_local_session
+            {
+                Some(self.recording_lifecycle_write_permit().await)
+            } else {
+                None
             };
 
             let effect = {
@@ -4952,6 +5015,24 @@ impl ScaffoldHandler {
                     }
                 }
             };
+            if startup_voice_teardown_permit.is_some()
+                && self
+                    .startup_recovery_voice_leave_still_targets_meeting(
+                        &recovery_guild_key,
+                        &snapshot.meeting_id,
+                    )
+                    .await
+            {
+                let voice_leave = ContextRecordingVoiceLeave { ctx };
+                leave_startup_recovered_voice_without_local_session(
+                    &voice_leave,
+                    self.guild_id,
+                    &candidate,
+                    &effect,
+                )
+                .await;
+            }
+            drop(startup_voice_teardown_permit);
 
             match effect {
                 RecoveryEffect::SummaryRequeued { .. }
@@ -5145,6 +5226,45 @@ impl ScaffoldHandler {
             voice_event_gate: &self.voice_event_gate,
             ssrc_tracker: &self.ssrc_tracker,
             ssrc_tracker_reset_gate: &self.ssrc_tracker_reset_gate,
+        }
+    }
+
+    async fn startup_recovery_voice_leave_still_targets_meeting(
+        &self,
+        guild_key: &str,
+        expected_meeting_id: &str,
+    ) -> bool {
+        {
+            let sessions = self.sessions.lock().await;
+            if sessions.contains_key(guild_key) {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id = expected_meeting_id,
+                    "skipping startup recovery voice leave because local session state changed"
+                );
+                return false;
+            }
+        }
+        match self.active_meeting_id_result().await {
+            Ok(Some(active_meeting_id)) if active_meeting_id != expected_meeting_id => {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id = expected_meeting_id,
+                    active_meeting_id = %active_meeting_id,
+                    "skipping startup recovery voice leave because a different meeting is active"
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(err) => {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id = expected_meeting_id,
+                    error = %err,
+                    "skipping startup recovery voice leave after active meeting revalidation failed"
+                );
+                false
+            }
         }
     }
 
@@ -9878,6 +9998,17 @@ mod status_message_tests {
     }
 
     #[test]
+    fn startup_recovery_local_session_presence_requires_matching_meeting() {
+        let mut session = session_with_one_flaky_chunk(0);
+        session.meeting_id = "m1".to_owned();
+        let sessions = HashMap::from([("g1".to_owned(), session)]);
+
+        assert!(has_matching_local_recovery_session(&sessions, "g1", "m1"));
+        assert!(!has_matching_local_recovery_session(&sessions, "g1", "m2"));
+        assert!(!has_matching_local_recovery_session(&sessions, "g2", "m1"));
+    }
+
+    #[test]
     fn startup_recovery_uses_nonempty_legacy_audio_when_primary_is_empty() {
         let temp = runtime_temp_dir("legacy_recovery");
         let mut meeting = recording_meeting();
@@ -9910,6 +10041,7 @@ mod status_message_tests {
                 meeting_id: meeting.id,
                 status: crate::domain::MeetingStatus::Stopping,
                 voice_connected: false,
+                has_local_session: false,
                 has_recording_file: recovered_audio.is_some(),
             },
         )
@@ -10988,6 +11120,60 @@ mod status_message_tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_missing_local_session_voice_teardown_leaves_after_stop_effect() {
+        let voice = StubVoiceGateway::default();
+        let voice_leave = Some(&voice);
+        let candidate = RecoveryCandidate {
+            meeting_id: "m1".to_owned(),
+            status: MeetingStatus::Recording,
+            voice_connected: true,
+            has_local_session: false,
+            has_recording_file: true,
+        };
+        let effect = RecoveryEffect::StopConfirmedClientDisconnect {
+            meeting_id: "m1".to_owned(),
+        };
+
+        let outcome = leave_startup_recovered_voice_without_local_session(
+            &voice_leave,
+            GuildId::new(1),
+            &candidate,
+            &effect,
+        )
+        .await;
+
+        assert_eq!(outcome, Some(RecordingVoiceLeaveOutcome::Succeeded));
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_voice_teardown_keeps_connected_local_session_noop_alive() {
+        let voice = StubVoiceGateway::default();
+        let voice_leave = Some(&voice);
+        let candidate = RecoveryCandidate {
+            meeting_id: "m1".to_owned(),
+            status: MeetingStatus::Recording,
+            voice_connected: true,
+            has_local_session: true,
+            has_recording_file: false,
+        };
+        let effect = RecoveryEffect::Noop {
+            meeting_id: "m1".to_owned(),
+        };
+
+        let outcome = leave_startup_recovered_voice_without_local_session(
+            &voice_leave,
+            GuildId::new(1),
+            &candidate,
+            &effect,
+        )
+        .await;
+
+        assert_eq!(outcome, None);
+        assert_eq!(voice.leaves.load(Ordering::SeqCst), 0);
     }
 
     fn ignore_ssrc_mapping_persistence<C: ChunkStorage>(

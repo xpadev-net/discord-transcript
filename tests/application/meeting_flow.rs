@@ -87,6 +87,7 @@ fn meeting_flow_runs_recovery_recording_summary_and_retention() {
         meeting_id: "m1".to_owned(),
         status: discord_transcript::domain::MeetingStatus::Stopping,
         voice_connected: false,
+        has_local_session: false,
         has_recording_file: true,
     };
     let summary_input = ProcessMeetingInput {

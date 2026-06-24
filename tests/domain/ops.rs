@@ -61,6 +61,7 @@ fn recovery_runner_marks_failed_when_recording_missing_file() {
             meeting_id: "m1".to_owned(),
             status: MeetingStatus::Recording,
             voice_connected: false,
+            has_local_session: false,
             has_recording_file: false,
         },
     )
@@ -75,6 +76,45 @@ fn recovery_runner_marks_failed_when_recording_missing_file() {
     let saved = store.get("m1").expect("meeting should exist");
     assert_eq!(saved.status, MeetingStatus::Failed);
     assert!(saved.error_message.is_some());
+}
+
+#[test]
+fn recovery_noops_for_connected_recording_with_local_session() {
+    let action = decide_recovery_action(&RecoveryCandidate {
+        meeting_id: "m1".to_owned(),
+        status: MeetingStatus::Recording,
+        voice_connected: true,
+        has_local_session: true,
+        has_recording_file: false,
+    });
+
+    assert_eq!(action, RecoveryAction::Noop);
+}
+
+#[test]
+fn recovery_stops_connected_recording_without_local_session_when_audio_exists() {
+    let action = decide_recovery_action(&RecoveryCandidate {
+        meeting_id: "m1".to_owned(),
+        status: MeetingStatus::Recording,
+        voice_connected: true,
+        has_local_session: false,
+        has_recording_file: true,
+    });
+
+    assert_eq!(action, RecoveryAction::ConfirmStopClientDisconnect);
+}
+
+#[test]
+fn recovery_fails_connected_recording_without_local_session_when_audio_is_missing() {
+    let action = decide_recovery_action(&RecoveryCandidate {
+        meeting_id: "m1".to_owned(),
+        status: MeetingStatus::Recording,
+        voice_connected: true,
+        has_local_session: false,
+        has_recording_file: false,
+    });
+
+    assert_eq!(action, RecoveryAction::MarkFailedMissingRecording);
 }
 
 #[test]
@@ -290,6 +330,7 @@ fn recovery_runner_requeues_asr_for_stopping_meeting() {
             meeting_id: "m1".to_owned(),
             status: MeetingStatus::Stopping,
             voice_connected: false,
+            has_local_session: false,
             has_recording_file: true,
         },
     )
@@ -316,6 +357,7 @@ fn recovery_requeues_summary_for_stopping_with_recording() {
         meeting_id: "m1".to_owned(),
         status: MeetingStatus::Stopping,
         voice_connected: false,
+        has_local_session: false,
         has_recording_file: true,
     });
     assert_eq!(action, RecoveryAction::RequeueSummary);
@@ -334,6 +376,7 @@ fn recovery_resets_transcribing_to_stopping_and_requeues() {
             meeting_id: "m1".to_owned(),
             status: MeetingStatus::Transcribing,
             voice_connected: false,
+            has_local_session: false,
             has_recording_file: true,
         },
     )
@@ -363,6 +406,7 @@ fn recovery_resets_summarizing_to_stopping_and_requeues() {
             meeting_id: "m1".to_owned(),
             status: MeetingStatus::Summarizing,
             voice_connected: false,
+            has_local_session: false,
             has_recording_file: true,
         },
     )
@@ -384,6 +428,7 @@ fn recovery_marks_failed_for_transcribing_without_recording() {
         meeting_id: "m1".to_owned(),
         status: MeetingStatus::Transcribing,
         voice_connected: false,
+        has_local_session: false,
         has_recording_file: false,
     });
     assert_eq!(action, RecoveryAction::MarkFailedMissingRecording);
