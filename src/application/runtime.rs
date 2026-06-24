@@ -1063,6 +1063,31 @@ async fn leave_startup_recovered_voice_without_local_session<
         .await
 }
 
+fn warn_startup_recovery_voice_leave_outcome(
+    guild_key: &str,
+    meeting_id: &str,
+    outcome: Option<RecordingVoiceLeaveOutcome>,
+) {
+    match outcome {
+        Some(RecordingVoiceLeaveOutcome::Succeeded) => {}
+        Some(outcome) => {
+            warn!(
+                guild_id = %guild_key,
+                meeting_id,
+                outcome = ?outcome,
+                "startup recovery voice leave did not complete cleanly"
+            );
+        }
+        None => {
+            warn!(
+                guild_id = %guild_key,
+                meeting_id,
+                "startup recovery could not inspect voice manager for missing local session leave"
+            );
+        }
+    }
+}
+
 fn clear_local_recording_state_maps_after_terminal_absence(
     auto_stop_states: &mut HashMap<String, AutoStopState>,
     live_transcription_titles: &mut HashMap<String, Option<String>>,
@@ -5024,13 +5049,18 @@ impl ScaffoldHandler {
                     .await
             {
                 let voice_leave = ContextRecordingVoiceLeave { ctx };
-                leave_startup_recovered_voice_without_local_session(
+                let leave_outcome = leave_startup_recovered_voice_without_local_session(
                     &voice_leave,
                     self.guild_id,
                     &candidate,
                     &effect,
                 )
                 .await;
+                warn_startup_recovery_voice_leave_outcome(
+                    &recovery_guild_key,
+                    &snapshot.meeting_id,
+                    leave_outcome,
+                );
             }
             drop(startup_voice_teardown_permit);
 
@@ -5236,10 +5266,16 @@ impl ScaffoldHandler {
     ) -> bool {
         {
             let sessions = self.sessions.lock().await;
-            if sessions.contains_key(guild_key) {
+            // Any session under this guild means local lifecycle ownership
+            // changed after the recovery candidate was built: a matching
+            // session resumed this meeting, while a different session belongs
+            // to a successor recording. In both cases, startup recovery must
+            // not leave the guild voice connection.
+            if let Some(session) = sessions.get(guild_key) {
                 warn!(
                     guild_id = %guild_key,
                     meeting_id = expected_meeting_id,
+                    local_session_meeting_id = %session.meeting_id,
                     "skipping startup recovery voice leave because local session state changed"
                 );
                 return false;
