@@ -55,7 +55,7 @@ use crate::infrastructure::storage::{
     StatusMessageMetadata, StopTransition, StoreError, StoredMeeting, UsageEventStore,
 };
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
 
@@ -97,6 +97,7 @@ pub struct FakeSqlExecutor {
     pub query_rows_error: HashMap<String, String>,
     pub execute_result: HashMap<String, u64>,
     pub execute_error: HashMap<String, String>,
+    pub run_migration_success: HashSet<String>,
     pub run_migration_error: HashMap<String, String>,
     pub strict_unregistered_sql: bool,
 }
@@ -183,6 +184,13 @@ impl SqlExecutor for FakeSqlExecutor {
         self.executed.push((migration_sql.to_owned(), Vec::new()));
         if let Some(err) = self.run_migration_error.get(migration_sql) {
             return Err(err.clone());
+        }
+        if self.strict_unregistered_sql && !self.run_migration_success.contains(migration_sql) {
+            return Err(Self::unregistered_sql_error(
+                "run_migration",
+                migration_sql,
+                &[],
+            ));
         }
         Ok(())
     }

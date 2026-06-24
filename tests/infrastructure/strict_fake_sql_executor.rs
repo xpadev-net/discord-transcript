@@ -41,6 +41,19 @@ fn strict_fake_query_rows_rejects_unregistered_sql() {
 }
 
 #[test]
+fn strict_fake_run_migration_rejects_unregistered_sql() {
+    let mut executor = FakeSqlExecutor::strict();
+
+    let err = executor
+        .run_migration("ALTER TABLE meetings ADD COLUMN smoke TEXT")
+        .expect_err("strict fake should reject unregistered migration");
+
+    assert!(err.contains("unregistered fake run_migration"));
+    assert!(err.contains("ALTER TABLE meetings ADD COLUMN smoke TEXT"));
+    assert_eq!(executor.executed.len(), 1);
+}
+
+#[test]
 fn strict_fake_execute_uses_registered_exact_and_wildcard_results() {
     let mut executor = FakeSqlExecutor::strict();
     executor.execute_result.insert(
@@ -98,6 +111,18 @@ fn strict_fake_query_rows_uses_registered_exact_and_wildcard_results() {
 }
 
 #[test]
+fn strict_fake_run_migration_uses_registered_success() {
+    let mut executor = FakeSqlExecutor::strict();
+    executor
+        .run_migration_success
+        .insert("CREATE TABLE smoke(id TEXT PRIMARY KEY)".to_owned());
+
+    executor
+        .run_migration("CREATE TABLE smoke(id TEXT PRIMARY KEY)")
+        .expect("registered migration should succeed");
+}
+
+#[test]
 fn default_fake_remains_permissive_for_legacy_tests() {
     let mut executor = FakeSqlExecutor::default();
 
@@ -107,6 +132,9 @@ fn default_fake_remains_permissive_for_legacy_tests() {
     let rows = executor
         .query_rows("SELECT id FROM meetings", &[])
         .expect("default fake query should remain permissive");
+    executor
+        .run_migration("ALTER TABLE meetings ADD COLUMN smoke TEXT")
+        .expect("default fake migration should remain permissive");
 
     assert_eq!(affected, 1);
     assert_eq!(rows, Vec::<SqlRow>::new());
