@@ -305,9 +305,28 @@ def assert_ci_runs_pr_docker_build_without_push() -> None:
     ), "PR CI must load the production image locally instead of pushing it"
 
 
+def assert_ci_runs_postgres_sql_contract_smoke() -> None:
+    ci = read_repo_file(CI_WORKFLOW)
+    _, rust_job = workflow_job_block(ci, "rust")
+
+    assert "services:" in rust_job, "Rust CI must define services for Postgres smoke"
+    assert "postgres:" in rust_job, "Rust CI must define a postgres service"
+    assert "image: postgres:" in rust_job, "Postgres smoke must use a postgres service image"
+    assert (
+        "--health-cmd" in rust_job and "pg_isready" in rust_job
+    ), "Postgres service must have a readiness health check"
+    assert (
+        "DISCORD_TRANSCRIPT_TEST_DATABASE_URL:" in rust_job
+    ), "Postgres smoke must set DISCORD_TRANSCRIPT_TEST_DATABASE_URL"
+    assert (
+        "cargo test --locked --test postgres_sql_contract_smoke" in rust_job
+    ), "Rust CI must run the Postgres SQL contract smoke test with --locked"
+
+
 def main() -> None:
     assert_workflow_actions_are_sha_pinned()
     assert_ci_runs_pr_docker_build_without_push()
+    assert_ci_runs_postgres_sql_contract_smoke()
     print("Workflow action and PR Docker build policy checks passed.")
 
 

@@ -55,7 +55,7 @@ use crate::infrastructure::storage::{
     StatusMessageMetadata, StopTransition, StoreError, StoredMeeting, UsageEventStore,
 };
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tokio_postgres::{Client as PgClient, NoTls, Row};
 
@@ -97,24 +97,57 @@ pub struct FakeSqlExecutor {
     pub query_rows_error: HashMap<String, String>,
     pub execute_result: HashMap<String, u64>,
     pub execute_error: HashMap<String, String>,
+    pub run_migration_success: HashSet<String>,
     pub run_migration_error: HashMap<String, String>,
+    pub strict_unregistered_sql: bool,
+}
+
+impl FakeSqlExecutor {
+    pub fn strict() -> Self {
+        Self {
+            strict_unregistered_sql: true,
+            ..Self::default()
+        }
+    }
+
+    fn sql_key(sql: &str, params: &[String]) -> String {
+        format!("{}|{}", sql, params.join("\u{1f}"))
+    }
+
+    fn wildcard_sql_key(sql: &str) -> String {
+        format!("{sql}|*")
+    }
+
+    fn unregistered_sql_error(kind: &str, sql: &str, params: &[String]) -> String {
+        format!("unregistered fake {kind}: sql={sql:?}, params={params:?}")
+    }
 }
 
 impl SqlExecutor for FakeSqlExecutor {
     fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String> {
         self.executed.push((sql.to_owned(), params.to_vec()));
-        let key = format!("{}|{}", sql, params.join("\u{1f}"));
-        if let Some(err) = self.execute_error.get(&key) {
+        let key = Self::sql_key(sql, params);
+        let wildcard_key = Self::wildcard_sql_key(sql);
+        if let Some(err) = self
+            .execute_error
+            .get(&key)
+            .or_else(|| self.execute_error.get(&wildcard_key))
+        {
             return Err(err.clone());
         }
         // Wildcard keys support SQL whose params include generated values such as
         // claim tokens. They intentionally bypass exact parameter arity checks.
-        let wildcard_key = format!("{sql}|*");
-        Ok(*self
+        if let Some(result) = self
             .execute_result
             .get(&key)
             .or_else(|| self.execute_result.get(&wildcard_key))
-            .unwrap_or(&1))
+        {
+            return Ok(*result);
+        }
+        if self.strict_unregistered_sql {
+            return Err(Self::unregistered_sql_error("execute", sql, params));
+        }
+        Ok(1)
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
@@ -123,25 +156,41 @@ impl SqlExecutor for FakeSqlExecutor {
 
     fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<SqlRow>, String> {
         self.executed.push((sql.to_owned(), params.to_vec()));
-        let key = format!("{}|{}", sql, params.join("\u{1f}"));
-        if let Some(err) = self.query_rows_error.get(&key) {
+        let key = Self::sql_key(sql, params);
+        let wildcard_key = Self::wildcard_sql_key(sql);
+        if let Some(err) = self
+            .query_rows_error
+            .get(&key)
+            .or_else(|| self.query_rows_error.get(&wildcard_key))
+        {
             return Err(err.clone());
         }
         // Wildcard keys support SQL whose params include generated values such as
         // claim tokens. They intentionally bypass exact parameter arity checks.
-        let wildcard_key = format!("{sql}|*");
-        Ok(self
+        if let Some(result) = self
             .query_rows_result
             .get(&key)
             .or_else(|| self.query_rows_result.get(&wildcard_key))
-            .cloned()
-            .unwrap_or_default())
+        {
+            return Ok(result.clone());
+        }
+        if self.strict_unregistered_sql {
+            return Err(Self::unregistered_sql_error("query_rows", sql, params));
+        }
+        Ok(Vec::new())
     }
 
     fn run_migration(&mut self, migration_sql: &str) -> Result<(), String> {
         self.executed.push((migration_sql.to_owned(), Vec::new()));
         if let Some(err) = self.run_migration_error.get(migration_sql) {
             return Err(err.clone());
+        }
+        if self.strict_unregistered_sql && !self.run_migration_success.contains(migration_sql) {
+            return Err(Self::unregistered_sql_error(
+                "run_migration",
+                migration_sql,
+                &[],
+            ));
         }
         Ok(())
     }
