@@ -326,6 +326,12 @@ enum GuildAdminCheck {
     RateLimited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildAdminFallback {
+    Strict,
+    SettingsRecovery,
+}
+
 impl GuildAdminCheck {
     fn into_status_result(self) -> Result<bool, StatusCode> {
         match self {
@@ -2629,7 +2635,11 @@ async fn check_guild_admin_permission_with_bot_auth(
     }
 
     // Fast path: check if user is guild owner
-    let guild = get_guild_info_with_bot_auth(state, auth, bot_auth).await?;
+    let guild = if use_cache {
+        get_guild_info_with_bot_auth(state, auth, bot_auth).await?
+    } else {
+        fetch_guild_info_with_bot_auth(state, auth, bot_auth).await?
+    };
     if user_id == guild.owner_id {
         if use_cache {
             cache_guild_admin_permission(state, &auth.guild_id, user_id, true).await;
@@ -2746,6 +2756,33 @@ async fn check_guild_admin_permission_for_settings(
     check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false)
         .await
         .and_then(GuildAdminCheck::into_status_result)
+}
+
+async fn check_guild_admin_permission_strict(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+    check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, false)
+        .await
+        .and_then(GuildAdminCheck::into_status_result)
+}
+
+async fn check_guild_admin_permission_with_fallback(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    fallback: GuildAdminFallback,
+) -> Result<bool, StatusCode> {
+    match fallback {
+        GuildAdminFallback::Strict => {
+            check_guild_admin_permission_strict(state, auth, user_id).await
+        }
+        GuildAdminFallback::SettingsRecovery => {
+            check_guild_admin_permission_for_settings(state, auth, user_id).await
+        }
+    }
 }
 
 fn should_retry_settings_admin_check_with_global(
@@ -2914,15 +2951,9 @@ struct DiscordOverwrite {
     id: String,
     #[serde(rename = "type")]
     type_: DiscordOverwriteType,
-    #[serde(
-        default = "zero_permission_bits",
-        deserialize_with = "deserialize_permission_bits"
-    )]
+    #[serde(deserialize_with = "deserialize_permission_bits")]
     allow: u64,
-    #[serde(
-        default = "zero_permission_bits",
-        deserialize_with = "deserialize_permission_bits"
-    )]
+    #[serde(deserialize_with = "deserialize_permission_bits")]
     deny: u64,
 }
 
@@ -5685,6 +5716,14 @@ async fn current_user_is_guild_admin_for_auth(
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
+    check_guild_admin_permission_strict(state, auth, user_id).await
+}
+
+async fn current_user_is_guild_admin_for_settings_recovery(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<bool, StatusCode> {
     check_guild_admin_permission_for_settings(state, auth, user_id).await
 }
 
@@ -5701,6 +5740,16 @@ async fn require_current_user_is_guild_admin(
     user_id: &str,
 ) -> Result<(), StatusCode> {
     guild_admin_required_result(current_user_is_guild_admin(state, user_id).await?)
+}
+
+async fn require_current_user_is_guild_admin_for_settings_recovery(
+    state: &WebState,
+    user_id: &str,
+) -> Result<(), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    guild_admin_required_result(
+        current_user_is_guild_admin_for_settings_recovery(state, auth, user_id).await?,
+    )
 }
 
 async fn fetch_member_roles_for_rbac(
@@ -5783,7 +5832,49 @@ async fn current_user_has_rbac_permission_for_auth(
     has_channel_view: bool,
     is_meeting_starter: bool,
 ) -> Result<bool, StatusCode> {
-    let is_admin = check_guild_admin_permission_for_settings(state, auth, user_id).await?;
+    current_user_has_rbac_permission_for_auth_with_fallback(
+        state,
+        auth,
+        user_id,
+        permission,
+        has_channel_view,
+        is_meeting_starter,
+        GuildAdminFallback::Strict,
+    )
+    .await
+}
+
+async fn current_user_has_rbac_permission_for_settings_recovery(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    permission: RbacPermission,
+    has_channel_view: bool,
+    is_meeting_starter: bool,
+) -> Result<bool, StatusCode> {
+    current_user_has_rbac_permission_for_auth_with_fallback(
+        state,
+        auth,
+        user_id,
+        permission,
+        has_channel_view,
+        is_meeting_starter,
+        GuildAdminFallback::SettingsRecovery,
+    )
+    .await
+}
+
+async fn current_user_has_rbac_permission_for_auth_with_fallback(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    permission: RbacPermission,
+    has_channel_view: bool,
+    is_meeting_starter: bool,
+    fallback: GuildAdminFallback,
+) -> Result<bool, StatusCode> {
+    let is_admin =
+        check_guild_admin_permission_with_fallback(state, auth, user_id, fallback).await?;
     if is_admin {
         return Ok(true);
     }
@@ -5843,20 +5934,32 @@ async fn require_current_user_has_rbac_permission(
     }
 }
 
-async fn require_user_has_target_guild_rbac_permission(
+async fn require_current_user_has_rbac_permission_for_settings_recovery(
+    state: &WebState,
+    user_id: &str,
+    permission: RbacPermission,
+) -> Result<(), StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if current_user_has_rbac_permission_for_settings_recovery(
+        state, auth, user_id, permission, false, false,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+async fn require_user_has_target_guild_rbac_permission_for_settings_recovery(
     state: &WebState,
     auth: &AuthConfig,
     user_id: &str,
     guild_id: &str,
     permission: RbacPermission,
 ) -> Result<AuthConfig, StatusCode> {
-    require_active_target_guild_installation(state, guild_id).await?;
-    let discord_guilds = load_current_user_discord_guilds(state, user_id).await?;
-    if !user_can_access_target_guild(&discord_guilds, guild_id) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let target_auth = target_auth_config(auth, guild_id);
-    if current_user_has_rbac_permission_for_auth(
+    let target_auth = require_user_can_access_target_guild(state, auth, user_id, guild_id).await?;
+    if current_user_has_rbac_permission_for_settings_recovery(
         state,
         &target_auth,
         user_id,
@@ -5892,14 +5995,22 @@ async fn require_user_is_target_guild_admin(
     user_id: &str,
     guild_id: &str,
 ) -> Result<AuthConfig, StatusCode> {
-    require_active_target_guild_installation(state, guild_id).await?;
-    let discord_guilds = load_current_user_discord_guilds(state, user_id).await?;
-    if !user_can_access_target_guild(&discord_guilds, guild_id) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let target_auth = target_auth_config(auth, guild_id);
+    let target_auth = require_user_can_access_target_guild(state, auth, user_id, guild_id).await?;
     guild_admin_required_result(
         current_user_is_guild_admin_for_auth(state, &target_auth, user_id).await?,
+    )?;
+    Ok(target_auth)
+}
+
+async fn require_user_is_target_guild_admin_for_settings_recovery(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    guild_id: &str,
+) -> Result<AuthConfig, StatusCode> {
+    let target_auth = require_user_can_access_target_guild(state, auth, user_id, guild_id).await?;
+    guild_admin_required_result(
+        current_user_is_guild_admin_for_settings_recovery(state, &target_auth, user_id).await?,
     )?;
     Ok(target_auth)
 }
@@ -5911,7 +6022,7 @@ async fn guild_settings_capabilities_for_auth(
     can_manage_settings: bool,
 ) -> Result<GuildSettingsCapabilities, StatusCode> {
     let is_admin = check_guild_admin_permission_for_settings(state, auth, user_id).await?;
-    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_auth(
+    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_settings_recovery(
         state,
         auth,
         user_id,
@@ -5920,7 +6031,7 @@ async fn guild_settings_capabilities_for_auth(
         false,
     )
     .await?;
-    let can_manage_summary_templates = current_user_has_rbac_permission_for_auth(
+    let can_manage_summary_templates = current_user_has_rbac_permission_for_settings_recovery(
         state,
         auth,
         user_id,
@@ -5948,7 +6059,7 @@ async fn guild_settings_read_capabilities_for_auth(
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<GuildSettingsCapabilities, StatusCode> {
-    let can_manage_settings = current_user_has_rbac_permission_for_auth(
+    let can_manage_settings = current_user_has_rbac_permission_for_settings_recovery(
         state,
         auth,
         user_id,
@@ -6192,7 +6303,7 @@ async fn api_me(
 ) -> Result<Json<CurrentUserResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let is_admin = check_guild_admin_permission_for_settings(&state, auth, &user_id).await?;
-    let can_manage_settings = current_user_has_rbac_permission_for_auth(
+    let can_manage_settings = current_user_has_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -6201,7 +6312,7 @@ async fn api_me(
         false,
     )
     .await?;
-    let can_view_usage = current_user_has_rbac_permission_for_auth(
+    let can_view_usage = current_user_has_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -6210,7 +6321,7 @@ async fn api_me(
         false,
     )
     .await?;
-    let can_view_admin = current_user_has_rbac_permission_for_auth(
+    let can_view_admin = current_user_has_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -6219,7 +6330,7 @@ async fn api_me(
         false,
     )
     .await?;
-    let can_reprocess_meetings = current_user_has_rbac_permission_for_auth(
+    let can_reprocess_meetings = current_user_has_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -6228,7 +6339,7 @@ async fn api_me(
         false,
     )
     .await?;
-    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_auth(
+    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -6237,7 +6348,7 @@ async fn api_me(
         false,
     )
     .await?;
-    let can_manage_summary_templates = current_user_has_rbac_permission_for_auth(
+    let can_manage_summary_templates = current_user_has_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -8759,7 +8870,7 @@ async fn api_update_target_guild_settings(
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let guild_id = normalize_target_guild_id(&guild_id)?;
-    let target_auth = require_user_has_target_guild_rbac_permission(
+    let target_auth = require_user_has_target_guild_rbac_permission_for_settings_recovery(
         &state,
         auth,
         &user_id,
@@ -8829,8 +8940,12 @@ async fn api_update_guild_settings(
     Json(request): Json<GuildSettingsUpdateRequest>,
 ) -> Result<Json<GuildSettingsResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await?;
+    require_current_user_has_rbac_permission_for_settings_recovery(
+        &state,
+        &user_id,
+        RbacPermission::SettingsManage,
+    )
+    .await?;
     let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true).await?;
     validate_guild_settings_update(&request)?;
 
@@ -10494,9 +10609,10 @@ async fn api_update_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
-        .await
-        .map_err(|status| status.into_response())?;
+    let target_auth =
+        require_user_is_target_guild_admin_for_settings_recovery(&state, auth, &user_id, &guild_id)
+            .await
+            .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
@@ -10600,9 +10716,10 @@ async fn api_delete_target_guild_bot_token(
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
     let guild_id = normalize_target_guild_id(&guild_id).map_err(|status| status.into_response())?;
-    let target_auth = require_user_is_target_guild_admin(&state, auth, &user_id, &guild_id)
-        .await
-        .map_err(|status| status.into_response())?;
+    let target_auth =
+        require_user_is_target_guild_admin_for_settings_recovery(&state, auth, &user_id, &guild_id)
+            .await
+            .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, &target_auth, &user_id, true)
         .await
         .map_err(|status| status.into_response())?;
@@ -10673,9 +10790,13 @@ async fn api_update_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::SettingsManage)
-        .await
-        .map_err(|status| status.into_response())?;
+    require_current_user_has_rbac_permission_for_settings_recovery(
+        &state,
+        &user_id,
+        RbacPermission::SettingsManage,
+    )
+    .await
+    .map_err(|status| status.into_response())?;
     let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
@@ -10773,7 +10894,7 @@ async fn api_delete_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    require_current_user_is_guild_admin(&state, &user_id)
+    require_current_user_is_guild_admin_for_settings_recovery(&state, &user_id)
         .await
         .map_err(|status| status.into_response())?;
     let capabilities = guild_settings_capabilities_for_auth(&state, auth, &user_id, true)
@@ -15123,6 +15244,120 @@ mod guild_api_tests {
     }
 
     #[test]
+    fn data_rbac_uses_strict_admin_without_settings_recovery_fallback() {
+        let source = include_str!("web.rs");
+        let admin_with_bot_auth = source
+            .split_once("async fn check_guild_admin_permission_with_bot_auth")
+            .expect("admin helper should exist")
+            .1
+            .split_once("async fn check_guild_admin_permission_for_settings")
+            .expect("settings admin helper should follow admin helper")
+            .0;
+        assert!(admin_with_bot_auth.contains("if use_cache"));
+        assert!(admin_with_bot_auth.contains("get_guild_info_with_bot_auth"));
+        assert!(admin_with_bot_auth.contains("fetch_guild_info_with_bot_auth"));
+
+        let strict_admin = source
+            .split_once("async fn check_guild_admin_permission_strict")
+            .expect("strict admin helper should exist")
+            .1
+            .split_once("async fn check_guild_admin_permission_with_fallback")
+            .expect("fallback dispatcher should follow strict admin helper")
+            .0;
+        assert!(strict_admin.contains("&bot_auth, false"));
+
+        let strict_rbac = source
+            .split_once("async fn current_user_has_rbac_permission_for_auth(")
+            .expect("strict RBAC helper should exist")
+            .1
+            .split_once("async fn current_user_has_rbac_permission_for_settings_recovery")
+            .expect("settings recovery RBAC helper should follow strict helper")
+            .0;
+        assert!(strict_rbac.contains("GuildAdminFallback::Strict"));
+        assert!(!strict_rbac.contains("GuildAdminFallback::SettingsRecovery"));
+        assert!(!strict_rbac.contains("check_guild_admin_permission_for_settings"));
+
+        let meetings = source
+            .split_once("async fn list_guild_meetings_for_auth")
+            .expect("guild meetings helper should exist")
+            .1
+            .split_once("async fn resolve_visible_meeting_channel_ids_for_query")
+            .expect("guild meetings helper should precede visible-channel helper")
+            .0;
+        assert!(meetings.contains("current_user_has_rbac_permission_for_auth"));
+        assert!(!meetings.contains("current_user_has_rbac_permission_for_settings_recovery"));
+        assert!(!meetings.contains("check_guild_admin_permission_for_settings"));
+    }
+
+    #[test]
+    fn settings_recovery_fallback_routes_are_explicitly_named() {
+        let source = include_str!("web.rs");
+
+        fn handler_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("handler {start} should exist"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("handler {start} should be followed by {end}"))
+                .0
+        }
+
+        assert!(
+            handler_section(source, "async fn api_me", "async fn api_me_guilds")
+                .contains("current_user_has_rbac_permission_for_settings_recovery")
+        );
+        assert!(
+            handler_section(
+                source,
+                "async fn api_update_target_guild_settings",
+                "async fn api_update_guild_settings",
+            )
+            .contains("require_user_has_target_guild_rbac_permission_for_settings_recovery")
+        );
+        assert!(
+            handler_section(
+                source,
+                "async fn api_update_guild_settings",
+                "async fn api_target_guild_rbac",
+            )
+            .contains("require_current_user_has_rbac_permission_for_settings_recovery")
+        );
+        assert!(
+            handler_section(
+                source,
+                "async fn api_update_target_guild_bot_token",
+                "async fn api_delete_target_guild_bot_token",
+            )
+            .contains("require_user_is_target_guild_admin_for_settings_recovery")
+        );
+        assert!(
+            handler_section(
+                source,
+                "async fn api_delete_target_guild_bot_token",
+                "async fn api_update_guild_bot_token",
+            )
+            .contains("require_user_is_target_guild_admin_for_settings_recovery")
+        );
+        assert!(
+            handler_section(
+                source,
+                "async fn api_update_guild_bot_token",
+                "async fn api_delete_guild_bot_token",
+            )
+            .contains("require_current_user_has_rbac_permission_for_settings_recovery")
+        );
+        assert!(
+            handler_section(
+                source,
+                "async fn api_delete_guild_bot_token",
+                "async fn invalidate_discord_caches",
+            )
+            .contains("require_current_user_is_guild_admin_for_settings_recovery")
+        );
+    }
+
+    #[test]
     fn guild_meetings_pagination_is_bounded() {
         assert_eq!(
             normalize_guild_meetings_pagination(&GuildMeetingsQuery {
@@ -15433,6 +15668,18 @@ mod discord_channel_full_tests {
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
+    const INVALID_CHANNEL_OVERWRITE_PAYLOADS: &[&str] = &[
+        "{}",
+        r#"{"permission_overwrites":null}"#,
+        r#"{"permission_overwrites":{}}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":null,"deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":null}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"bogus","deny":"1024"}]}"#,
+        r#"{"permission_overwrites":[{"id":"guild","type":0,"allow":"0","deny":"bogus"}]}"#,
+    ];
+
     #[test]
     fn channel_full_permission_overwrites_required_array() {
         for json in [
@@ -15484,22 +15731,53 @@ mod discord_channel_full_tests {
     }
 
     #[test]
-    fn overwrite_allow_deny_numeric_and_partial() {
+    fn overwrite_allow_deny_accept_strings_and_numbers() {
         let ch: DiscordChannelFull = serde_json::from_str(
             r#"{"permission_overwrites":[
                 {"id":"10","type":1,"allow":1024,"deny":0},
-                {"id":"20","type":0,"allow":"1"},
-                {"id":"30","type":0,"deny":"2"}
+                {"id":"20","type":0,"allow":"1","deny":"0"}
             ]}"#,
         )
         .unwrap();
-        assert_eq!(ch.permission_overwrites.len(), 3);
+        assert_eq!(ch.permission_overwrites.len(), 2);
         assert_eq!(ch.permission_overwrites[0].allow, 1024);
         assert_eq!(ch.permission_overwrites[0].deny, 0);
         assert_eq!(ch.permission_overwrites[1].allow, 1);
         assert_eq!(ch.permission_overwrites[1].deny, 0);
-        assert_eq!(ch.permission_overwrites[2].allow, 0);
-        assert_eq!(ch.permission_overwrites[2].deny, 2);
+    }
+
+    #[test]
+    fn overwrite_allow_deny_required_in_each_entry() {
+        for (field, json) in [
+            (
+                "allow",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"deny":"2"}]}"#,
+            ),
+            (
+                "deny",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"allow":"1"}]}"#,
+            ),
+        ] {
+            let result = serde_json::from_str::<DiscordChannelFull>(json);
+            assert!(result.is_err(), "{field} unexpectedly defaulted to zero");
+        }
+    }
+
+    #[test]
+    fn overwrite_allow_deny_null_rejected() {
+        for (field, json) in [
+            (
+                "allow",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"allow":null,"deny":"0"}]}"#,
+            ),
+            (
+                "deny",
+                r#"{"permission_overwrites":[{"id":"20","type":0,"allow":"1","deny":null}]}"#,
+            ),
+        ] {
+            let result = serde_json::from_str::<DiscordChannelFull>(json);
+            assert!(result.is_err(), "{field}=null unexpectedly parsed");
+        }
     }
 
     #[test]
@@ -15520,8 +15798,9 @@ mod discord_channel_full_tests {
     fn overwrite_invalid_permission_bitsets_rejected() {
         for field in ["allow", "deny"] {
             for value in [r#""not-a-number""#, r#""-1""#, "-1"] {
+                let other_field = if field == "allow" { "deny" } else { "allow" };
                 let json = format!(
-                    r#"{{"permission_overwrites":[{{"id":"1","type":0,"{field}":{value}}}]}}"#
+                    r#"{{"permission_overwrites":[{{"id":"1","type":0,"{field}":{value},"{other_field}":"0"}}]}}"#
                 );
                 let result = serde_json::from_str::<DiscordChannelFull>(&json);
                 assert!(
@@ -15764,11 +16043,7 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn invalid_channel_overwrites_do_not_cache_allow() {
-        for json in [
-            "{}",
-            r#"{"permission_overwrites":null}"#,
-            r#"{"permission_overwrites":{}}"#,
-        ] {
+        for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
             let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             let payload = json.to_owned();
 
@@ -15780,7 +16055,7 @@ mod discord_channel_full_tests {
                 &cache,
                 async move {
                     let channel: DiscordChannelFull =
-                        serde_json::from_str(&payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                        serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
                     let permissions = compute_channel_permissions(
                         "user",
                         "owner",
@@ -15810,6 +16085,52 @@ mod discord_channel_full_tests {
                 cache.read().await.is_empty(),
                 "{json} should fail before permission cache is updated"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_channel_overwrites_do_not_refresh_stale_allow() {
+        for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
+            let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let cache_key = ("user".to_owned(), "voice".to_owned());
+            let expired_at = Instant::now()
+                - Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS + 1);
+            cache.write().await.insert(
+                cache_key.clone(),
+                (
+                    CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    },
+                    expired_at,
+                ),
+            );
+            let payload = json.to_owned();
+
+            let result = verify_meeting_access_after_row(
+                "guild".to_owned(),
+                "voice".to_owned(),
+                "guild",
+                "user",
+                &cache,
+                async move {
+                    let _: DiscordChannelFull =
+                        serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                    Ok(CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    })
+                },
+            )
+            .await;
+
+            assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
+            let cache = cache.read().await;
+            let (permission, expires_at) = cache
+                .get(&cache_key)
+                .expect("stale allow entry should not be refreshed");
+            assert!(permission.can_view);
+            assert_eq!(*expires_at, expired_at);
         }
     }
 

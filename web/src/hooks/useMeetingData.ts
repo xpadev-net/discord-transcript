@@ -4,6 +4,7 @@ import {
   fetchSummary,
   fetchTranscript,
   getTranscriptEventsUrl,
+  isTranscriptResponseValidationError,
   normalizeTranscriptResponse,
 } from "../lib/api";
 import { isLiveMeetingStatus } from "../lib/meetingStatus";
@@ -80,6 +81,26 @@ function isForbiddenError(error: unknown): boolean {
 
 function isNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("404");
+}
+
+function transcriptFetchErrorMessage(retryAttempt: number): string {
+  return retryAttempt > 0
+    ? "\u6587\u5b57\u8d77\u3053\u3057\u306e\u518d\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
+    : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
+}
+
+function streamEventCode(data: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return "unknown";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "unknown";
+  }
+  const code = "code" in parsed ? parsed.code : undefined;
+  return typeof code === "string" ? code : "unknown";
 }
 
 export function useMeetingData(meetingId: string | undefined): MeetingData {
@@ -172,11 +193,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       })
       .catch(() => {
         if (!controller.signal.aborted) {
-          setTranscriptError(
-            retryAttempt > 0
-              ? "\u6587\u5b57\u8d77\u3053\u3057\u306e\u518d\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f"
-              : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
-          );
+          setTranscriptError(transcriptFetchErrorMessage(retryAttempt));
         }
       });
     return () => controller.abort();
@@ -262,6 +279,15 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
             );
             return;
           }
+          if (isTranscriptResponseValidationError(err)) {
+            closeStream();
+            setTranscriptStreamState("error");
+            setTranscriptStreamError(null);
+            setTranscriptError(
+              transcriptFetchErrorMessage(transcriptRetryCount),
+            );
+            return;
+          }
           scheduleReconnect();
         });
     };
@@ -270,7 +296,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       if (closed) {
         return;
       }
-      setTranscriptStreamState(attempt === 0 ? "connecting" : "reconnecting");
+      setTranscriptStreamState(
+        attempt === 0 && transcriptRetryCount === 0
+          ? "connecting"
+          : "reconnecting",
+      );
       setTranscriptStreamError(null);
       source = new EventSource(getTranscriptEventsUrl(meetingId), {
         withCredentials: true,
@@ -286,9 +316,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         const message = event as MessageEvent<string>;
         try {
           const response = normalizeTranscriptResponse(
-            JSON.parse(message.data) as
-              | TranscriptSegment[]
-              | TranscriptResponse,
+            JSON.parse(message.data),
           );
           applyTranscriptStatus(response);
           if (response.segments.length > 0) {
@@ -304,7 +332,16 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
           }
           setTranscriptStreamState("open");
           setTranscriptStreamError(null);
-        } catch {
+        } catch (err: unknown) {
+          if (isTranscriptResponseValidationError(err)) {
+            closeStream();
+            setTranscriptStreamState("error");
+            setTranscriptStreamError(null);
+            setTranscriptError(
+              transcriptFetchErrorMessage(transcriptRetryCount),
+            );
+            return;
+          }
           setTranscriptStreamState("error");
           setTranscriptStreamError(
             "\u6587\u5b57\u8d77\u3053\u3057\u66f4\u65b0\u306e\u89e3\u6790\u306b\u5931\u6557\u3057\u307e\u3057\u305f",
@@ -314,12 +351,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
 
       source.addEventListener("stream-error", (event) => {
         const message = event as MessageEvent<string>;
-        let code = "unknown";
-        try {
-          code = (JSON.parse(message.data) as { code?: string }).code ?? code;
-        } catch {
-          // Keep the generic error code.
-        }
+        const code = streamEventCode(message.data);
         if (code === "forbidden") {
           closeStream();
           setTranscriptStreamState("forbidden");
@@ -342,6 +374,31 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         );
       });
 
+      source.addEventListener("stream-closed", (event) => {
+        if (closed) {
+          return;
+        }
+        const message = event as MessageEvent<string>;
+        const code = streamEventCode(message.data);
+        closeStream();
+        if (code === "idle_timeout") {
+          setTranscriptStreamState("closed");
+          setTranscriptStreamError(null);
+          return;
+        }
+        if (code === "error_limit") {
+          setTranscriptStreamState("error");
+          setTranscriptStreamError(
+            "\u6587\u5b57\u8d77\u3053\u3057\u306e\u30e9\u30a4\u30d6\u66f4\u65b0\u3067\u30a8\u30e9\u30fc\u304c\u7d9a\u3044\u305f\u305f\u3081\u505c\u6b62\u3057\u307e\u3057\u305f",
+          );
+          return;
+        }
+        setTranscriptStreamState("error");
+        setTranscriptStreamError(
+          "\u6587\u5b57\u8d77\u3053\u3057\u306e\u30e9\u30a4\u30d6\u66f4\u65b0\u304c\u505c\u6b62\u3057\u307e\u3057\u305f",
+        );
+      });
+
       source.onerror = () => {
         if (closed) {
           return;
@@ -357,7 +414,12 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       closeStream();
       setTranscriptStreamState("closed");
     };
-  }, [meetingId, shouldStreamTranscript, applyTranscriptStatus]);
+  }, [
+    meetingId,
+    shouldStreamTranscript,
+    transcriptRetryCount,
+    applyTranscriptStatus,
+  ]);
 
   useEffect(() => {
     const retryAttempt = summaryRetryCount;

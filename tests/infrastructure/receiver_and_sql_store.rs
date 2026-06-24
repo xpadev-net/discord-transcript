@@ -7,7 +7,7 @@ use discord_transcript::infrastructure::sql::{
     ACTIVE_MEETING_UNIQUE_INDEX_NAME, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL,
     FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL, INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL,
     LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
-    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    ROLLBACK_SCHEMA_MIGRATIONS_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, SqlMeetingStore, UNIQUE_VIOLATION_PREFIX, sql_row_from_strings,
@@ -531,6 +531,50 @@ fn pending_migrations_apply_and_record_unseen_versions() {
     assert!(applied_sql[0].contains(
         "INSERT INTO schema_migrations (version) VALUES ('0001_mvp_schema')"
     ));
+}
+
+#[test]
+fn pending_migrations_roll_back_before_unlock_after_migration_failure() {
+    let failing_migration_sql = discord_transcript::infrastructure::sql::migration_transaction_sql(
+        *MIGRATIONS.first().expect("migration should exist"),
+    );
+    let mut executor = FakeSqlExecutor::default();
+    executor.run_migration_error.insert(
+        failing_migration_sql.clone(),
+        "migration exploded".to_owned(),
+    );
+    executor.run_migration_error.insert(
+        ROLLBACK_SCHEMA_MIGRATIONS_SQL.to_owned(),
+        "rollback cleanup failed".to_owned(),
+    );
+    executor.run_migration_error.insert(
+        UNLOCK_SCHEMA_MIGRATIONS_SQL.to_owned(),
+        "unlock cleanup failed".to_owned(),
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    let err = store
+        .apply_pending_migrations()
+        .expect_err("migration failure should be returned");
+
+    assert_eq!(err, "migration exploded");
+    let executed_sql: Vec<&str> = store
+        .executor
+        .executed
+        .iter()
+        .map(|(sql, _)| sql.as_str())
+        .collect();
+    assert_eq!(
+        executed_sql,
+        vec![
+            LOCK_SCHEMA_MIGRATIONS_SQL,
+            CREATE_SCHEMA_MIGRATIONS_SQL,
+            SELECT_SCHEMA_MIGRATION_SQL,
+            failing_migration_sql.as_str(),
+            ROLLBACK_SCHEMA_MIGRATIONS_SQL,
+            UNLOCK_SCHEMA_MIGRATIONS_SQL,
+        ]
+    );
 }
 
 #[test]

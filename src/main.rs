@@ -14,7 +14,8 @@ use discord_transcript::infrastructure::integrations::{
 use discord_transcript::infrastructure::retry::RetryPolicy;
 use discord_transcript::infrastructure::sql::{
     CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS,
-    SELECT_SCHEMA_MIGRATION_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, migration_transaction_sql,
+    ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    migration_transaction_sql,
 };
 use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
@@ -135,12 +136,17 @@ async fn apply_pending_migrations(
 ) -> Result<(), Box<dyn std::error::Error>> {
     db_client.batch_execute(LOCK_SCHEMA_MIGRATIONS_SQL).await?;
     let result = apply_pending_migrations_locked(db_client).await;
-    let unlock_result = db_client.batch_execute(UNLOCK_SCHEMA_MIGRATIONS_SQL).await;
-    match (result, unlock_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err.into()),
-        (Ok(()), Ok(())) => Ok(()),
+    if let Err(err) = result {
+        let _ = db_client
+            .batch_execute(ROLLBACK_SCHEMA_MIGRATIONS_SQL)
+            .await;
+        let _ = db_client.batch_execute(UNLOCK_SCHEMA_MIGRATIONS_SQL).await;
+        return Err(err);
     }
+    db_client
+        .batch_execute(UNLOCK_SCHEMA_MIGRATIONS_SQL)
+        .await?;
+    Ok(())
 }
 
 async fn apply_pending_migrations_locked(

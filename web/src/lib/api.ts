@@ -37,6 +37,7 @@ import type {
   PersonAliasReviewStatus,
   PersonAliasUpsertRequest,
   SpeakerAudioInfo,
+  SpeakerResponse,
   SummaryResponse,
   SummaryTemplate,
   SummaryTemplateUpsertRequest,
@@ -207,6 +208,23 @@ function invalidMeetingListResponse(): Error {
   return new Error("会議一覧のレスポンス形式が不正です");
 }
 
+class TranscriptResponseValidationError extends Error {
+  constructor() {
+    super("文字起こしのレスポンス形式が不正です");
+    this.name = "TranscriptResponseValidationError";
+  }
+}
+
+function invalidTranscriptResponse(): TranscriptResponseValidationError {
+  return new TranscriptResponseValidationError();
+}
+
+export function isTranscriptResponseValidationError(
+  error: unknown,
+): error is TranscriptResponseValidationError {
+  return error instanceof TranscriptResponseValidationError;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -223,6 +241,12 @@ function isNullableNumber(value: unknown): value is number | null {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isTranscriptSegmentSource(
+  value: unknown,
+): value is TranscriptSegment["source"] {
+  return value === "voice" || value === "vc_text";
 }
 
 function parseMeetingListItem(value: unknown): MeetingListItem | null {
@@ -1093,15 +1117,82 @@ export function fetchMeeting(
   );
 }
 
+function parseSpeakerResponse(value: unknown): SpeakerResponse | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.id !== "string" ||
+    !isNullableString(value.username) ||
+    !isNullableString(value.nickname) ||
+    !isNullableString(value.display_name) ||
+    typeof value.display_label !== "string"
+  ) {
+    return null;
+  }
+  return {
+    id: value.id,
+    username: value.username,
+    nickname: value.nickname,
+    display_name: value.display_name,
+    display_label: value.display_label,
+  };
+}
+
+function parseTranscriptSegment(value: unknown): TranscriptSegment | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const speaker = parseSpeakerResponse(value.speaker);
+  if (
+    (value.id !== undefined && typeof value.id !== "string") ||
+    typeof value.speaker_id !== "string" ||
+    !speaker ||
+    !isFiniteNumber(value.start_ms) ||
+    !isFiniteNumber(value.end_ms) ||
+    typeof value.text !== "string" ||
+    !isNullableNumber(value.confidence) ||
+    typeof value.is_noisy !== "boolean" ||
+    !isTranscriptSegmentSource(value.source)
+  ) {
+    return null;
+  }
+
+  const segment: TranscriptSegment = {
+    speaker_id: value.speaker_id,
+    speaker,
+    start_ms: value.start_ms,
+    end_ms: value.end_ms,
+    text: value.text,
+    confidence: value.confidence,
+    is_noisy: value.is_noisy,
+    source: value.source,
+  };
+  if (typeof value.id === "string") {
+    segment.id = value.id;
+  }
+  return segment;
+}
+
+function parseTranscriptSegments(payload: unknown[]): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = [];
+  for (const segment of payload) {
+    const parsed = parseTranscriptSegment(segment);
+    if (!parsed) {
+      throw invalidTranscriptResponse();
+    }
+    segments.push(parsed);
+  }
+  return segments;
+}
+
 export function fetchTranscript(
   meetingId: string,
   signal?: AbortSignal,
 ): Promise<TranscriptResponse> {
   return fetch(`${basePath(meetingId)}/transcript`, { signal }).then(
     (response) =>
-      handleResponse<TranscriptSegment[] | TranscriptResponse>(response).then(
-        normalizeTranscriptResponse,
-      ),
+      handleResponse<unknown>(response).then(normalizeTranscriptResponse),
   );
 }
 
@@ -1115,17 +1206,31 @@ export function fetchTranscriptState(
 }
 
 export function normalizeTranscriptResponse(
-  response: TranscriptSegment[] | TranscriptResponse,
+  response: unknown,
 ): TranscriptResponse {
   if (Array.isArray(response)) {
     return {
-      segments: response,
+      segments: parseTranscriptSegments(response),
       status: "unknown",
       is_final: false,
       updated_at: null,
     };
   }
-  return response;
+  if (
+    !isRecord(response) ||
+    !Array.isArray(response.segments) ||
+    typeof response.status !== "string" ||
+    typeof response.is_final !== "boolean" ||
+    !isNullableString(response.updated_at)
+  ) {
+    throw invalidTranscriptResponse();
+  }
+  return {
+    segments: parseTranscriptSegments(response.segments),
+    status: response.status,
+    is_final: response.is_final,
+    updated_at: response.updated_at,
+  };
 }
 
 export function getTranscriptEventsUrl(meetingId: string): string {

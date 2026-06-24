@@ -43,11 +43,12 @@ use crate::infrastructure::sql::{
     LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
     MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
     RECOVERY_READY_SUMMARY_JOBS_SQL, RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
-    RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
-    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
-    UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
-    UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL, migration_transaction_sql,
+    RETRY_JOB_SQL, ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL,
+    SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
+    UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+    migration_transaction_sql,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -96,6 +97,7 @@ pub struct FakeSqlExecutor {
     pub query_rows_error: HashMap<String, String>,
     pub execute_result: HashMap<String, u64>,
     pub execute_error: HashMap<String, String>,
+    pub run_migration_error: HashMap<String, String>,
 }
 
 impl SqlExecutor for FakeSqlExecutor {
@@ -138,6 +140,9 @@ impl SqlExecutor for FakeSqlExecutor {
 
     fn run_migration(&mut self, migration_sql: &str) -> Result<(), String> {
         self.executed.push((migration_sql.to_owned(), Vec::new()));
+        if let Some(err) = self.run_migration_error.get(migration_sql) {
+            return Err(err.clone());
+        }
         Ok(())
     }
 }
@@ -173,12 +178,12 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
     pub fn apply_pending_migrations(&mut self) -> Result<(), String> {
         self.executor.run_migration(LOCK_SCHEMA_MIGRATIONS_SQL)?;
         let result = self.apply_pending_migrations_locked();
-        let unlock_result = self.executor.run_migration(UNLOCK_SCHEMA_MIGRATIONS_SQL);
-        match (result, unlock_result) {
-            (Err(err), _) => Err(err),
-            (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(())) => Ok(()),
+        if let Err(err) = result {
+            let _ = self.executor.run_migration(ROLLBACK_SCHEMA_MIGRATIONS_SQL);
+            let _ = self.executor.run_migration(UNLOCK_SCHEMA_MIGRATIONS_SQL);
+            return Err(err);
         }
+        self.executor.run_migration(UNLOCK_SCHEMA_MIGRATIONS_SQL)
     }
 
     fn apply_pending_migrations_locked(&mut self) -> Result<(), String> {
