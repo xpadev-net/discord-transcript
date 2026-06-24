@@ -42,7 +42,7 @@ use crate::domain::usage::{
     EntitlementAction, EntitlementEvaluator, NewUsageEvent, UsageDetailJson, UsageMetric,
     UsageSnapshot, recording_minutes_from_seconds,
 };
-use crate::domain::{MeetingStatus, StopReason};
+use crate::domain::{JobType, MeetingStatus, StopReason};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
@@ -2345,6 +2345,36 @@ fn retry_scheduled_error(job: &Job, message: String) -> SummaryJobRunError {
         message,
         retry_after: summary_retry_after_for_job(job),
     }
+}
+
+fn validate_claimed_summary_job(
+    job: Job,
+    expected_meeting_id: &str,
+) -> Result<Job, SummaryJobRunError> {
+    if job.job_type != JobType::Summarize {
+        warn!(
+            expected_meeting_id,
+            processed_meeting_id = %job.meeting_id,
+            job_id = %job.id,
+            claimed_job_type = %job.job_type.as_str(),
+            expected_job_type = %JobType::Summarize.as_str(),
+            "claimed deterministic summary job with unexpected job type"
+        );
+        return Err(SummaryJobRunError::NotClaimable(format!(
+            "summary job claim returned unexpected job_type={} for job_id={}",
+            job.job_type.as_str(),
+            job.id
+        )));
+    }
+    if job.meeting_id != expected_meeting_id {
+        warn!(
+            expected_meeting_id,
+            processed_meeting_id = %job.meeting_id,
+            job_id = %job.id,
+            "processed summary job for different meeting"
+        );
+    }
+    Ok(job)
 }
 
 fn retry_summary_job_after_posting_failure<S, Q>(
@@ -7134,14 +7164,7 @@ impl ScaffoldHandler {
                 "summary job was not available for job_id={job_id}"
             )));
         };
-        if claimed_job.meeting_id != meeting_id {
-            warn!(
-                expected_meeting_id = %meeting_id,
-                processed_meeting_id = %claimed_job.meeting_id,
-                job_id = %claimed_job.id,
-                "processed summary job for different meeting"
-            );
-        }
+        let claimed_job = validate_claimed_summary_job(claimed_job, meeting_id)?;
 
         let heartbeat_guard = spawn_summary_job_heartbeat(
             &claimed_job,
@@ -10408,6 +10431,22 @@ mod status_message_tests {
             leased_until: Some(chrono::Utc::now() + chrono::Duration::seconds(90)),
             next_run_at: None,
         }
+    }
+
+    #[test]
+    fn claimed_summary_job_validation_rejects_non_summarize_job_type() {
+        let mut job = running_summary_job();
+        job.job_type = crate::domain::JobType::Cleanup;
+
+        let err = validate_claimed_summary_job(job, "m1")
+            .expect_err("non-summarize summary-id claim should be rejected");
+
+        assert!(matches!(
+            err,
+            SummaryJobRunError::NotClaimable(message)
+                if message.contains("job_type=cleanup")
+                    && message.contains("job_id=summary-m1")
+        ));
     }
 
     struct LeaseAwareSummaryJobState {

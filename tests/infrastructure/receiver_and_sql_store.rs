@@ -4,7 +4,7 @@ use discord_transcript::domain::StopReason;
 use discord_transcript::domain::{JobStatus, JobType};
 use discord_transcript::infrastructure::queue::{Job, JobQueue};
 use discord_transcript::infrastructure::sql::{
-    ACTIVE_MEETING_UNIQUE_INDEX_NAME, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL,
+    ACTIVE_MEETING_UNIQUE_INDEX_NAME, CLAIM_JOB_BY_ID_SQL, CLAIM_JOB_SQL, CREATE_SCHEMA_MIGRATIONS_SQL,
     FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL, INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL,
     LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
     ROLLBACK_SCHEMA_MIGRATIONS_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
@@ -221,6 +221,44 @@ fn sql_job_queue_parses_claimed_job_row() {
     assert_eq!(job.claim_token.as_deref(), Some("token-1"));
     assert!(job.leased_until.is_some());
     assert!(job.next_run_at.is_some());
+}
+
+#[test]
+fn sql_job_queue_claim_by_id_binds_expected_summary_job_type() {
+    let mut executor = FakeSqlExecutor::default();
+    let claim_key = format!("{}|*", CLAIM_JOB_BY_ID_SQL);
+    executor.query_rows_result.insert(
+        claim_key,
+        vec![sql_row_from_strings(vec![
+            "summary-m1".to_owned(),
+            "m1".to_owned(),
+            "summarize".to_owned(),
+            "running".to_owned(),
+            "0".to_owned(),
+            "".to_owned(),
+            "token-1".to_owned(),
+            "2026-06-08T01:02:33.000Z".to_owned(),
+            "2026-06-08T01:02:03.000Z".to_owned(),
+        ])],
+    );
+
+    let mut queue = SqlJobQueue::new(executor);
+    let job = queue
+        .claim_by_id("summary-m1")
+        .expect("claim should succeed")
+        .expect("job should exist");
+
+    assert_eq!(job.job_type, JobType::Summarize);
+    let (sql, params) = queue
+        .executor
+        .executed
+        .first()
+        .expect("claim query should be recorded");
+    assert_eq!(sql, CLAIM_JOB_BY_ID_SQL);
+    assert_eq!(params.len(), 3);
+    assert_eq!(params[0], "summary-m1");
+    assert!(!params[1].is_empty(), "claim token should be generated");
+    assert_eq!(params[2], JobType::Summarize.as_str());
 }
 
 #[test]

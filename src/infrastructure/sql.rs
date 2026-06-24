@@ -1462,6 +1462,7 @@ SET status = 'running',
     next_run_at = NULL,
     updated_at = NOW()
 WHERE id = $1
+  AND job_type = $3
   AND status = 'queued'
   AND (next_run_at IS NULL OR next_run_at <= NOW())
 RETURNING id, meeting_id, job_type, status, retry_count, error_message,

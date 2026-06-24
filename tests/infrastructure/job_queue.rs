@@ -1159,6 +1159,7 @@ fn sql_claims_only_due_queued_jobs() {
     assert!(CLAIM_JOB_SQL.contains("status = 'queued'"));
     assert!(CLAIM_JOB_SQL.contains("next_run_at IS NULL OR next_run_at <= NOW()"));
     assert!(CLAIM_JOB_SQL.contains("FOR UPDATE SKIP LOCKED"));
+    assert!(CLAIM_JOB_BY_ID_SQL.contains("job_type = $3"));
     assert!(CLAIM_JOB_BY_ID_SQL.contains("status = 'queued'"));
     assert!(CLAIM_JOB_BY_ID_SQL.contains("next_run_at IS NULL OR next_run_at <= NOW()"));
     assert!(!CLAIM_JOB_SQL.contains("'failed'"));
