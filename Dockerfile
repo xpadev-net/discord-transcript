@@ -15,11 +15,11 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release --locked && rm -rf src
 
 COPY src/ src/
 COPY migrations/ migrations/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 FROM node:24-bookworm-slim AS runtime-base
 
