@@ -120,12 +120,12 @@ brew install lefthook              # macOS
 lefthook install
 ```
 
-インストール後、`git commit` 時に `cargo fmt --check` と `cargo clippy` が、`git push` 時に `cargo test` が自動実行されます。
+インストール後、`git commit` 時に `cargo fmt --check` と `cargo clippy --locked` が、`git push` 時に `cargo test --locked` が自動実行されます。
 
 ### 5. ビルド
 
 ```bash
-cargo build --release
+cargo build --release --locked
 ```
 
 ビルド成果物は `target/release/discord-transcript` に生成されます。
@@ -134,7 +134,7 @@ cargo build --release
 
 ```bash
 # 環境変数を設定済みの状態で
-cargo run --release
+cargo run --release --locked
 
 # または直接バイナリを実行
 ./target/release/discord-transcript
@@ -177,10 +177,10 @@ cargo run --release
 
 ```bash
 # 全テスト実行
-cargo test --workspace --all-targets --all-features
+cargo test --locked --workspace --all-targets --all-features
 
 # 特定のテストファイルを実行
-cargo test --test mvp_core
+cargo test --locked --test mvp_core
 ```
 
 テストではインメモリのストア・スタブクライアントを使用するため、外部サービスは不要です。
@@ -190,15 +190,16 @@ cargo test --test mvp_core
 GitHub Actions で push / PR 時に以下が自動実行されます。
 
 - `cargo fmt --all -- --check` (フォーマットチェック)
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` (Lint)
-- `cargo test --workspace --all-targets --all-features` (テスト)
+- `cargo metadata --locked --all-features --format-version 1 > /dev/null` (lockfile 検証)
+- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` (Lint)
+- `cargo test --locked --workspace --all-targets --all-features` (テスト)
 
 ## デプロイ
 
 ### バイナリデプロイ
 
 ```bash
-cargo build --release
+cargo build --release --locked
 # target/release/discord-transcript をサーバーに配置
 ```
 
