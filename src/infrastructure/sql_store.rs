@@ -1049,7 +1049,14 @@ impl<E: SqlExecutor> JobQueue for SqlJobQueue<E> {
         let claim_token = uuid::Uuid::new_v4().to_string();
         let rows = self
             .executor
-            .query_rows(CLAIM_JOB_BY_ID_SQL, &[job_id.to_owned(), claim_token])
+            .query_rows(
+                CLAIM_JOB_BY_ID_SQL,
+                &[
+                    job_id.to_owned(),
+                    claim_token,
+                    JobType::Summarize.as_str().to_owned(),
+                ],
+            )
             .map_err(QueueError::Backend)?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
