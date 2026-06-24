@@ -580,10 +580,51 @@ function installTranscriptEventSourceMock() {
   };
 }
 
+function liveMeetingStreamFetch() {
+  let transcriptRequests = 0;
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url = input.toString();
+    if (url === "/api/me") {
+      return Promise.resolve(
+        jsonResponse({
+          user_id: "member-1",
+          guild_id: "guild-1",
+          is_admin: false,
+        }),
+      );
+    }
+    if (url === "/api/me/guilds") {
+      return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+    }
+    if (url === "/api/meetings/meeting-1") {
+      return Promise.resolve(
+        jsonResponse(meetingResponse({ status: "recording" })),
+      );
+    }
+    if (url === "/api/meetings/meeting-1/transcript") {
+      transcriptRequests += 1;
+      return Promise.resolve(jsonResponse(recordingTranscriptResponse()));
+    }
+    if (url === "/api/meetings/meeting-1/summary") {
+      return Promise.resolve(jsonResponse({ markdown: null }));
+    }
+    if (url === "/api/meetings/meeting-1/debug/manifest") {
+      return Promise.resolve(jsonResponse([]));
+    }
+    return Promise.resolve(emptyResponse(404));
+  });
+
+  return {
+    fetchMock,
+    transcriptRequests: () => transcriptRequests,
+  };
+}
+
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("App access controls", () => {
@@ -3706,38 +3747,7 @@ describe("App access controls", () => {
 
   it("stops live transcript reconnect checks after idle timeout stream closure", async () => {
     const eventSources = installTranscriptEventSourceMock();
-    let transcriptRequests = 0;
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
-      const url = input.toString();
-      if (url === "/api/me") {
-        return Promise.resolve(
-          jsonResponse({
-            user_id: "member-1",
-            guild_id: "guild-1",
-            is_admin: false,
-          }),
-        );
-      }
-      if (url === "/api/me/guilds") {
-        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
-      }
-      if (url === "/api/meetings/meeting-1") {
-        return Promise.resolve(
-          jsonResponse(meetingResponse({ status: "recording" })),
-        );
-      }
-      if (url === "/api/meetings/meeting-1/transcript") {
-        transcriptRequests += 1;
-        return Promise.resolve(jsonResponse(recordingTranscriptResponse()));
-      }
-      if (url === "/api/meetings/meeting-1/summary") {
-        return Promise.resolve(jsonResponse({ markdown: null }));
-      }
-      if (url === "/api/meetings/meeting-1/debug/manifest") {
-        return Promise.resolve(jsonResponse([]));
-      }
-      return Promise.resolve(emptyResponse(404));
-    });
+    const { fetchMock, transcriptRequests } = liveMeetingStreamFetch();
 
     renderApp("/meetings/meeting-1", fetchMock);
 
@@ -3749,7 +3759,7 @@ describe("App access controls", () => {
     if (!source) {
       throw new Error("EventSource was not created");
     }
-    const requestsBeforeClose = transcriptRequests;
+    const requestsBeforeClose = transcriptRequests();
 
     act(() => {
       source.emit("stream-closed", JSON.stringify({ code: "idle_timeout" }));
@@ -3757,45 +3767,14 @@ describe("App access controls", () => {
     });
 
     expect(source.close).toHaveBeenCalledTimes(1);
-    expect(transcriptRequests).toBe(requestsBeforeClose);
+    expect(transcriptRequests()).toBe(requestsBeforeClose);
     expect(eventSources.sources).toHaveLength(1);
     expect(screen.queryByText("接続が切れました。再接続しています")).toBeNull();
   });
 
   it("shows explicit live transcript error after error limit stream closure", async () => {
     const eventSources = installTranscriptEventSourceMock();
-    let transcriptRequests = 0;
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
-      const url = input.toString();
-      if (url === "/api/me") {
-        return Promise.resolve(
-          jsonResponse({
-            user_id: "member-1",
-            guild_id: "guild-1",
-            is_admin: false,
-          }),
-        );
-      }
-      if (url === "/api/me/guilds") {
-        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
-      }
-      if (url === "/api/meetings/meeting-1") {
-        return Promise.resolve(
-          jsonResponse(meetingResponse({ status: "recording" })),
-        );
-      }
-      if (url === "/api/meetings/meeting-1/transcript") {
-        transcriptRequests += 1;
-        return Promise.resolve(jsonResponse(recordingTranscriptResponse()));
-      }
-      if (url === "/api/meetings/meeting-1/summary") {
-        return Promise.resolve(jsonResponse({ markdown: null }));
-      }
-      if (url === "/api/meetings/meeting-1/debug/manifest") {
-        return Promise.resolve(jsonResponse([]));
-      }
-      return Promise.resolve(emptyResponse(404));
-    });
+    const { fetchMock, transcriptRequests } = liveMeetingStreamFetch();
 
     renderApp("/meetings/meeting-1", fetchMock);
 
@@ -3807,7 +3786,7 @@ describe("App access controls", () => {
     if (!source) {
       throw new Error("EventSource was not created");
     }
-    const requestsBeforeClose = transcriptRequests;
+    const requestsBeforeClose = transcriptRequests();
 
     act(() => {
       source.emit("stream-closed", JSON.stringify({ code: "error_limit" }));
@@ -3820,7 +3799,7 @@ describe("App access controls", () => {
       ),
     ).toBeTruthy();
     expect(source.close).toHaveBeenCalledTimes(1);
-    expect(transcriptRequests).toBe(requestsBeforeClose);
+    expect(transcriptRequests()).toBe(requestsBeforeClose);
     expect(eventSources.sources).toHaveLength(1);
   });
 
