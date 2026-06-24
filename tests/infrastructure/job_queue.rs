@@ -1243,6 +1243,25 @@ fn sql_ready_summary_meeting_ids_accepts_empty_result_set() {
 }
 
 #[test]
+fn sql_ready_summary_meeting_ids_propagates_executor_error() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_error.insert(
+        format!("{RECOVERY_READY_SUMMARY_JOBS_SQL}|"),
+        "database unavailable".to_owned(),
+    );
+
+    let mut queue = SqlJobQueue::new(executor);
+    let err = queue
+        .ready_summary_meeting_ids()
+        .expect_err("executor errors should be reported");
+
+    assert!(matches!(
+        err,
+        QueueError::Backend(message) if message.contains("database unavailable")
+    ));
+}
+
+#[test]
 fn sql_ready_summary_meeting_ids_rejects_null_meeting_id() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
