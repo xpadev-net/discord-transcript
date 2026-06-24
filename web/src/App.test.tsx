@@ -526,10 +526,105 @@ function meetingPageFetch(
   };
 }
 
+function recordingTranscriptResponse(segments: unknown[] = []) {
+  return {
+    ...transcriptResponse(segments),
+    status: "recording",
+    is_final: false,
+    updated_at: null,
+  };
+}
+
+function installTranscriptEventSourceMock() {
+  let latestSource: MockTranscriptEventSource | null = null;
+  const sources: MockTranscriptEventSource[] = [];
+
+  class MockTranscriptEventSource {
+    onopen: ((event: Event) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    close = vi.fn();
+    private listeners = new Map<
+      string,
+      Array<(event: MessageEvent<string>) => void>
+    >();
+
+    constructor(_url: string, _options?: EventSourceInit) {
+      latestSource = this;
+      sources.push(this);
+    }
+
+    addEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+    ) {
+      if (typeof listener !== "function") {
+        return;
+      }
+      const listeners = this.listeners.get(type) ?? [];
+      listeners.push(listener as (event: MessageEvent<string>) => void);
+      this.listeners.set(type, listeners);
+    }
+
+    emit(type: string, data: string) {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener(new MessageEvent(type, { data }));
+      }
+    }
+  }
+
+  vi.stubGlobal("EventSource", MockTranscriptEventSource);
+
+  return {
+    latestSource: () => latestSource,
+    sources,
+  };
+}
+
+function liveMeetingStreamFetch() {
+  let transcriptRequests = 0;
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url = input.toString();
+    if (url === "/api/me") {
+      return Promise.resolve(
+        jsonResponse({
+          user_id: "member-1",
+          guild_id: "guild-1",
+          is_admin: false,
+        }),
+      );
+    }
+    if (url === "/api/me/guilds") {
+      return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+    }
+    if (url === "/api/meetings/meeting-1") {
+      return Promise.resolve(
+        jsonResponse(meetingResponse({ status: "recording" })),
+      );
+    }
+    if (url === "/api/meetings/meeting-1/transcript") {
+      transcriptRequests += 1;
+      return Promise.resolve(jsonResponse(recordingTranscriptResponse()));
+    }
+    if (url === "/api/meetings/meeting-1/summary") {
+      return Promise.resolve(jsonResponse({ markdown: null }));
+    }
+    if (url === "/api/meetings/meeting-1/debug/manifest") {
+      return Promise.resolve(jsonResponse([]));
+    }
+    return Promise.resolve(emptyResponse(404));
+  });
+
+  return {
+    fetchMock,
+    transcriptRequests: () => transcriptRequests,
+  };
+}
+
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("App access controls", () => {
@@ -3648,6 +3743,64 @@ describe("App access controls", () => {
       screen.queryByText("文字起こしのライブ更新に失敗しました"),
     ).toBeNull();
     expect(screen.getByText("ライブ更新中")).toBeTruthy();
+  });
+
+  it("stops live transcript reconnect checks after idle timeout stream closure", async () => {
+    const eventSources = installTranscriptEventSourceMock();
+    const { fetchMock, transcriptRequests } = liveMeetingStreamFetch();
+
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    await waitFor(() => expect(eventSources.latestSource()).toBeTruthy());
+    expect(
+      await screen.findByText("文字起こしの到着を待っています"),
+    ).toBeTruthy();
+    const source = eventSources.latestSource();
+    if (!source) {
+      throw new Error("EventSource was not created");
+    }
+    const requestsBeforeClose = transcriptRequests();
+
+    act(() => {
+      source.emit("stream-closed", JSON.stringify({ code: "idle_timeout" }));
+      source.onerror?.(new Event("error"));
+    });
+
+    expect(source.close).toHaveBeenCalledTimes(1);
+    expect(transcriptRequests()).toBe(requestsBeforeClose);
+    expect(eventSources.sources).toHaveLength(1);
+    expect(screen.queryByText("接続が切れました。再接続しています")).toBeNull();
+  });
+
+  it("shows explicit live transcript error after error limit stream closure", async () => {
+    const eventSources = installTranscriptEventSourceMock();
+    const { fetchMock, transcriptRequests } = liveMeetingStreamFetch();
+
+    renderApp("/meetings/meeting-1", fetchMock);
+
+    await waitFor(() => expect(eventSources.latestSource()).toBeTruthy());
+    expect(
+      await screen.findByText("文字起こしの到着を待っています"),
+    ).toBeTruthy();
+    const source = eventSources.latestSource();
+    if (!source) {
+      throw new Error("EventSource was not created");
+    }
+    const requestsBeforeClose = transcriptRequests();
+
+    act(() => {
+      source.emit("stream-closed", JSON.stringify({ code: "error_limit" }));
+      source.onerror?.(new Event("error"));
+    });
+
+    expect(
+      await screen.findByText(
+        "文字起こしのライブ更新でエラーが続いたため停止しました",
+      ),
+    ).toBeTruthy();
+    expect(source.close).toHaveBeenCalledTimes(1);
+    expect(transcriptRequests()).toBe(requestsBeforeClose);
+    expect(eventSources.sources).toHaveLength(1);
   });
 
   it("announces meeting audio source load failures", async () => {
