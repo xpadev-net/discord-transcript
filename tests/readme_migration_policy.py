@@ -10,8 +10,18 @@ def read_repo_file(path: str) -> str:
 
 
 def section_between(contents: str, start: str, end: str) -> str:
-    start_index = contents.index(start)
-    end_index = contents.index(end, start_index)
+    try:
+        start_index = contents.index(start)
+    except ValueError as exc:
+        raise AssertionError(f"Section heading not found in README: {start!r}") from exc
+
+    try:
+        end_index = contents.index(end, start_index)
+    except ValueError as exc:
+        raise AssertionError(
+            f"Section heading not found in README after {start!r}: {end!r}"
+        ) from exc
+
     return contents[start_index:end_index]
 
 
@@ -31,6 +41,9 @@ def fenced_code_blocks(markdown: str) -> list[str]:
 
         if in_block:
             current.append(line)
+
+    if in_block:
+        blocks.append("\n".join(current))
 
     return blocks
 
