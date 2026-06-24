@@ -17,7 +17,7 @@ SEPARATOR_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
 
 
 def read_repo_file(path: str) -> str:
-    return (ROOT / path).read_text()
+    return (ROOT / path).read_text(encoding="utf-8")
 
 
 def command_segment(source_line: str, offset: int) -> str:
@@ -60,7 +60,10 @@ def assert_covered_cargo_commands_use_locked() -> None:
         contents = read_repo_file(path)
         for match in CARGO_COMMAND_RE.finditer(contents):
             line, source_line = line_at(contents, match.start())
-            if path.endswith((".yml", ".yaml")) and source_line.strip().startswith("- name:"):
+            stripped_line = source_line.strip()
+            if stripped_line.startswith("#") or (
+                path.endswith((".yml", ".yaml")) and stripped_line.startswith("- name:")
+            ):
                 continue
 
             command = command_segment(source_line, line_offset(contents, match.start()))
@@ -69,14 +72,16 @@ def assert_covered_cargo_commands_use_locked() -> None:
 
             errors.append(f"{path}:{line}: missing --locked in `{command}`")
 
-    assert not errors, "\n".join(errors)
+    if errors:
+        raise SystemExit("\n".join(errors))
 
 
 def assert_ci_runs_locked_metadata_check() -> None:
     ci = read_repo_file(".github/workflows/ci.yml")
     for match in CARGO_COMMAND_RE.finditer(ci):
         _, source_line = line_at(ci, match.start())
-        if source_line.strip().startswith("- name:"):
+        stripped_line = source_line.strip()
+        if stripped_line.startswith("#") or stripped_line.startswith("- name:"):
             continue
 
         words = cargo_words(
@@ -89,7 +94,7 @@ def assert_ci_runs_locked_metadata_check() -> None:
         ):
             return
 
-    assert False, (
+    raise SystemExit(
         "CI must independently validate Cargo.lock with "
         "cargo metadata --locked --all-features"
     )
