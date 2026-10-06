@@ -2706,6 +2706,25 @@ where
     }
 }
 
+/// Best-effort removal of a persisted summary's agent workspace. Cleanup
+/// failure after persistence must not change the job outcome (no retry, no
+/// meeting status change): the agent can tamper with the workspace to force
+/// a failure, and letting it escalate would turn cleanup into repeated LLM
+/// work. Workspace roots that fail validation (e.g. the inode was replaced)
+/// are left for startup retention cleanup instead of being deleted blindly.
+fn cleanup_agent_workspace_after_persist(
+    meeting_id: &str,
+    agent_workspace: crate::infrastructure::workspace::AgentWorkspace,
+) {
+    if let Err(err) = agent_workspace.cleanup_once() {
+        warn!(
+            meeting_id = %meeting_id,
+            error = %err,
+            "failed to clean summary agent workspace after summary persistence; leaving stale workspace for retention cleanup"
+        );
+    }
+}
+
 fn recover_summary_job_for_startup<E: SqlExecutor>(
     queue: &mut SqlJobQueue<E>,
     job_id: &str,
@@ -8147,15 +8166,8 @@ impl ScaffoldHandler {
         // best-effort housekeeping. A prompt-injected agent can tamper with
         // the cleanup marker or other workspace contents to make cleanup
         // fail; reverting the meeting and requeueing the job here would let
-        // the agent turn cleanup into a repeated-LLM-work DoS. Retained
-        // workspaces are covered by startup retention cleanup.
-        if let Err(err) = agent_workspace.cleanup_once() {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                error = %err,
-                "failed to clean summary agent workspace after summary persistence; leaving stale workspace for retention cleanup"
-            );
-        }
+        // the agent turn cleanup into a repeated-LLM-work DoS.
+        cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, agent_workspace);
 
         let ai_memory_extraction_supported = {
             let service = self.service.lock().await;
@@ -12062,6 +12074,79 @@ mod status_message_tests {
             meeting.error_message.as_deref(),
             Some("summary posting failed: discord 500")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_persist_workspace_cleanup_removes_workspace_with_tampered_marker() {
+        let temp = runtime_temp_dir("post_persist_cleanup_tampered_marker");
+        let meeting_root = temp.path.join("meeting");
+        let agent_root = meeting_root.join("agent").join("run-1");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root");
+        let source = meeting_root.join("transcript.md");
+        std::fs::write(&source, "transcript").expect("source");
+        let agent_workspace = crate::infrastructure::workspace::AgentWorkspaceBuilder::new(
+            &meeting_root,
+            &agent_root,
+        )
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+        // A prompt-injected agent rewriting the cleanup marker must not be
+        // able to keep transcript copies on disk: the workspace inode is
+        // unchanged, so cleanup still removes it.
+        std::fs::write(
+            agent_root
+                .join(crate::infrastructure::workspace::AGENT_CURSOR_DIR)
+                .join(".cleanup-token"),
+            "tampered-marker",
+        )
+        .expect("tamper cleanup marker");
+
+        cleanup_agent_workspace_after_persist("m1", agent_workspace);
+
+        assert!(!agent_root.exists());
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("source remains"),
+            "transcript"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_persist_workspace_cleanup_failure_does_not_propagate() {
+        let temp = runtime_temp_dir("post_persist_cleanup_failure");
+        let meeting_root = temp.path.join("meeting");
+        let agent_root = meeting_root.join("agent").join("run-1");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root");
+        let source = meeting_root.join("transcript.md");
+        std::fs::write(&source, "transcript").expect("source");
+        let agent_workspace = crate::infrastructure::workspace::AgentWorkspaceBuilder::new(
+            &meeting_root,
+            &agent_root,
+        )
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+        // A root swapped for a symlink must be refused rather than
+        // traversed, and the failure must not propagate to the job.
+        std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
+        let symlink_target = temp.path.join("unrelated");
+        std::fs::create_dir_all(&symlink_target).expect("target dir");
+        std::fs::write(symlink_target.join("unrelated.txt"), "do not delete").expect("target file");
+        std::os::unix::fs::symlink(&symlink_target, &agent_root).expect("symlink swap");
+
+        cleanup_agent_workspace_after_persist("m1", agent_workspace);
+
+        assert!(
+            std::fs::symlink_metadata(&agent_root)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(symlink_target.join("unrelated.txt").is_file());
     }
 
     #[test]

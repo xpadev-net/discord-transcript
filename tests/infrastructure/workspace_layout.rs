@@ -650,7 +650,7 @@ fn agent_workspace_cleanup_refuses_replaced_root() {
 
 #[cfg(unix)]
 #[test]
-fn agent_workspace_cleanup_refuses_oversized_cleanup_marker() {
+fn agent_workspace_cleanup_removes_despite_oversized_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_oversized_marker");
     let meeting_root = base.join("meeting");
     let agent_root = meeting_root.join("agent").join("run-1");
@@ -669,18 +669,20 @@ fn agent_workspace_cleanup_refuses_oversized_cleanup_marker() {
     )
     .expect("overwrite cleanup marker");
 
-    let err = agent_workspace
+    // The marker is tampered but the workspace inode is unchanged, so an
+    // agent must not be able to strand transcripts by corrupting the marker.
+    agent_workspace
         .cleanup()
-        .expect_err("cleanup should reject oversized marker");
+        .expect("cleanup should remove workspace despite oversized marker");
 
-    assert!(err.to_string().contains("identity changed"));
-    assert!(agent_root.exists());
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
 }
 
 #[cfg(unix)]
 #[test]
-fn agent_workspace_cleanup_refuses_malformed_cleanup_marker() {
+fn agent_workspace_cleanup_removes_despite_malformed_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_malformed_marker");
     let meeting_root = base.join("meeting");
     let agent_root = meeting_root.join("agent").join("run-1");
@@ -699,18 +701,18 @@ fn agent_workspace_cleanup_refuses_malformed_cleanup_marker() {
     )
     .expect("overwrite cleanup marker");
 
-    let err = agent_workspace
+    agent_workspace
         .cleanup()
-        .expect_err("cleanup should reject malformed marker");
+        .expect("cleanup should remove workspace despite malformed marker");
 
-    assert!(err.to_string().contains("identity changed"));
-    assert!(agent_root.exists());
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
 }
 
 #[cfg(unix)]
 #[test]
-fn agent_workspace_cleanup_refuses_missing_cleanup_marker() {
+fn agent_workspace_cleanup_removes_despite_missing_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_missing_marker");
     let meeting_root = base.join("meeting");
     let agent_root = meeting_root.join("agent").join("run-1");
@@ -726,12 +728,12 @@ fn agent_workspace_cleanup_refuses_missing_cleanup_marker() {
     std::fs::remove_file(agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"))
         .expect("remove cleanup marker");
 
-    let err = agent_workspace
+    agent_workspace
         .cleanup()
-        .expect_err("cleanup should reject missing marker");
+        .expect("cleanup should remove workspace despite missing marker");
 
-    assert!(err.to_string().contains("identity changed"));
-    assert!(agent_root.exists());
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
 }
 

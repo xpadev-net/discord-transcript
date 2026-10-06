@@ -7,6 +7,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use tracing::warn;
 
 pub const WORKSPACES_ROOT_DIR: &str = "workspaces";
 pub const DEBUG_ARTIFACTS_ROOT_DIR: &str = "debug-artifacts";
@@ -673,21 +675,44 @@ fn validate_root_identity(
     path: &Path,
     expected: &AgentWorkspaceRootIdentity,
 ) -> Result<(), AgentWorkspaceError> {
-    match root_identity(path) {
-        Ok(actual) if &actual == expected => Ok(()),
-        Ok(_) | Err(AgentWorkspaceError::InvalidPath { .. }) => {
-            Err(AgentWorkspaceError::InvalidPath {
-                path: path.to_path_buf(),
-                reason: "agent workspace root identity changed before cleanup",
-            })
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root identity changed before cleanup",
+        },
+        _ => AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        },
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root must be a real directory",
+        });
+    }
+    if metadata.dev() != expected.dev || metadata.ino() != expected.ino {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root identity changed before cleanup",
+        });
+    }
+    // The inode is unchanged, so this is still the directory tree
+    // materialized at build time. A marker that fails validation after that
+    // only proves the agent tampered with it; refusing to delete here would
+    // let the agent strand transcript copies on disk, so warn and continue
+    // with removal.
+    match read_cleanup_marker(path) {
+        Ok(marker) if marker == expected.cleanup_marker => Ok(()),
+        _ => {
+            warn!(
+                path = %path.display(),
+                "agent workspace cleanup marker validation failed on unchanged root; removing workspace anyway"
+            );
+            Ok(())
         }
-        Err(AgentWorkspaceError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            Err(AgentWorkspaceError::InvalidPath {
-                path: path.to_path_buf(),
-                reason: "agent workspace root identity changed before cleanup",
-            })
-        }
-        Err(err) => Err(err),
     }
 }
 
