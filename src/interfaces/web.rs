@@ -151,7 +151,7 @@ FROM job_counts, meeting_counts, live_chunk_counts
 // ---------- State ----------
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
-const PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS: u64 = 15;
+const PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS: u64 = 5;
 const MEMBERSHIP_CACHE_TTL_SECS: u64 = 5;
 const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 5;
 const GUILD_CACHE_TTL_SECS: u64 = 15;
@@ -177,7 +177,7 @@ const DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS: i64 = 15 * 60;
 const MEETING_TITLE_DISPLAY_MAX_CHARS: usize = 80;
 const AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS: u128 = 100;
 
-type PermissionCache =
+pub type PermissionCache =
     Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
 type GuildCache = Arc<tokio::sync::RwLock<GuildCacheState>>;
 type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
@@ -1484,9 +1484,18 @@ fn should_retry_settings_membership_check_with_global(result: &Result<bool, Stat
     )
 }
 
-async fn invalidate_permission_cache_for_user(cache: &PermissionCache, user_id: &str) {
+pub async fn invalidate_permission_cache_for_user(cache: &PermissionCache, user_id: &str) {
     let mut cache = cache.write().await;
     cache.retain(|(uid, _), _| uid != user_id);
+}
+
+pub async fn invalidate_permission_cache_for_channel(cache: &PermissionCache, channel_id: &str) {
+    let mut cache = cache.write().await;
+    cache.retain(|(_, cid), _| cid != channel_id);
+}
+
+pub async fn clear_permission_cache(cache: &PermissionCache) {
+    cache.write().await.clear();
 }
 
 // ========== Auth: handlers ==========
@@ -15651,11 +15660,12 @@ mod discord_channel_full_tests {
         DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
         PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS, PermissionCache,
         VIEW_CHANNEL, artifact_speaker_id_from_component, authorize_debug_artifact_download,
-        build_content_disposition, compute_channel_permissions, debug_artifact_requires_admin,
-        debug_download_dedupe_bucket, debug_download_usage_event_id, existing_debug_path,
-        guild_meeting_channel_visible_after_row, meeting_access_from_row,
-        raw_debug_artifact_permission, should_sample_audit_retention_cleanup,
-        verify_meeting_access_after_row,
+        build_content_disposition, clear_permission_cache, compute_channel_permissions,
+        debug_artifact_requires_admin, debug_download_dedupe_bucket, debug_download_usage_event_id,
+        existing_debug_path, guild_meeting_channel_visible_after_row,
+        invalidate_permission_cache_for_channel, invalidate_permission_cache_for_user,
+        meeting_access_from_row, raw_debug_artifact_permission,
+        should_sample_audit_retention_cleanup, verify_meeting_access_after_row,
     };
     use crate::domain::authz::RbacPermission;
     use axum::http::StatusCode;
@@ -16039,6 +16049,58 @@ mod discord_channel_full_tests {
         .await;
 
         assert_eq!(result, Ok(true));
+    }
+
+    #[tokio::test]
+    async fn permission_cache_invalidation_selects_user_channel_or_everything() {
+        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let allow = CachedChannelPermission {
+            can_view: true,
+            is_admin: false,
+        };
+        {
+            let mut guard = cache.write().await;
+            for key in [
+                ("user-1", "chan-1"),
+                ("user-2", "chan-1"),
+                ("user-1", "chan-2"),
+            ] {
+                guard.insert(
+                    (key.0.to_owned(), key.1.to_owned()),
+                    (
+                        allow,
+                        Instant::now()
+                            + Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS),
+                    ),
+                );
+            }
+        }
+
+        invalidate_permission_cache_for_channel(&cache, "chan-1").await;
+        {
+            let guard = cache.read().await;
+            assert_eq!(guard.len(), 1);
+            assert!(guard.contains_key(&("user-1".to_owned(), "chan-2".to_owned())));
+        }
+
+        invalidate_permission_cache_for_user(&cache, "user-1").await;
+        assert!(cache.read().await.is_empty());
+
+        {
+            let mut guard = cache.write().await;
+            for key in [("user-1", "chan-1"), ("user-2", "chan-2")] {
+                guard.insert(
+                    (key.0.to_owned(), key.1.to_owned()),
+                    (
+                        allow,
+                        Instant::now()
+                            + Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS),
+                    ),
+                );
+            }
+        }
+        clear_permission_cache(&cache).await;
+        assert!(cache.read().await.is_empty());
     }
 
     #[tokio::test]
