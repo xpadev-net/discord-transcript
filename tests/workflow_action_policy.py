@@ -13,9 +13,11 @@ COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 JOB_HEADER_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(#.*)?$")
 PATH_FILTER_RE = re.compile(r"^\s*paths(?:-ignore)?:\s*")
 DOCKER_BUILD_COMMAND = "docker buildx build"
-DOCKER_PUSH_IN_COMMAND_RE = re.compile(
-    r"(?:^|[\s;&|(])(?:sudo\s+)?docker\s+(?:image\s+)?push(?:\s|$)"
-)
+RUN_PREFIXES = ("run:", "- run:")
+RUN_BLOCK_MARKERS = {"|", ">", "|-", ">-", "|+", ">+"}
+# Characters that always separate shell words, so `docker(push)`-style
+# lookalikes cannot hide a push at a word edge.
+SHELL_WORD_EDGE_CHARS = ";&|()"
 
 
 def read_repo_file(path: str) -> str:
@@ -156,23 +158,90 @@ def step_has_if_guard(step: str) -> bool:
     )
 
 
+def strip_shell_comment(command: str) -> str:
+    """Return the command up to the first real POSIX shell comment.
+
+    `#` only opens a comment at the start of a word — a mid-word hash such
+    as a URL fragment is literal — and never inside quotes.
+    """
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if in_single:
+            in_single = char != "'"
+        elif in_double:
+            if char == "\\":
+                index += 1
+            else:
+                in_double = char != '"'
+        elif char == "'":
+            in_single = True
+        elif char == '"':
+            in_double = True
+        elif char == "\\":
+            index += 1
+        elif char == "#" and (
+            index == 0 or command[index - 1] in " \t" + SHELL_WORD_EDGE_CHARS
+        ):
+            return command[:index]
+        index += 1
+    return command
+
+
+def words_invoke_docker_push(words: list[str]) -> bool:
+    normalized = [word.strip(SHELL_WORD_EDGE_CHARS) for word in words]
+    for index, word in enumerate(normalized):
+        if word != "docker":
+            continue
+        rest = normalized[index + 1 : index + 3]
+        if rest[:1] == ["push"] or rest[:2] == ["image", "push"]:
+            return True
+    return False
+
+
 def command_invokes_docker_push(command: str) -> bool:
-    # Parse as shell first so `sh -c "docker push ..."`, inline comments and
-    # quoted strings resolve to their real tokens; fall back to raw words.
+    comment_stripped = strip_shell_comment(command)
     try:
-        words = shlex.split(command, comments=True)
+        words = shlex.split(comment_stripped)
     except ValueError:
-        words = command.split()
-    return bool(DOCKER_PUSH_IN_COMMAND_RE.search(" ".join(words)))
+        words = comment_stripped.split()
+    if words_invoke_docker_push(words):
+        return True
+    # Command-string wrappers keep the invocation inside one quoted word;
+    # only arguments of shell-eval flags are executed, so only those get a
+    # nested scan — quoted display text elsewhere stays inert.
+    for index, word in enumerate(words):
+        if word == "-c" and index + 1 < len(words):
+            if command_invokes_docker_push(words[index + 1]):
+                return True
+    return False
 
 
 def docker_push_command_lines(job: str, start_line: int) -> list[str]:
     lines: list[str] = []
+    raw_lines = job.splitlines()
+    run_block_indent: int | None = None
 
-    for offset, line in enumerate(job.splitlines()):
-        command = workflow_shell_command(line)
-        if command_invokes_docker_push(command):
-            lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {line.strip()}")
+    for offset, line in enumerate(raw_lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if run_block_indent is not None:
+            if indent > run_block_indent:
+                if stripped and command_invokes_docker_push(stripped):
+                    lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {stripped}")
+                continue
+            run_block_indent = None
+        for prefix in RUN_PREFIXES:
+            if not stripped.startswith(prefix):
+                continue
+            command = stripped.removeprefix(prefix).strip().strip("\"'")
+            if not command or command in RUN_BLOCK_MARKERS:
+                run_block_indent = indent
+            elif command_invokes_docker_push(command):
+                lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {stripped}")
+            break
 
     return lines
 
@@ -317,6 +386,42 @@ def assert_ci_runs_pr_docker_build_without_push() -> None:
     ), "PR CI must load the production image locally instead of pushing it"
 
 
+def self_test_command_invokes_docker_push() -> None:
+    invokes_cases = [
+        "docker push example/image:latest",
+        "docker image push example/image:latest",
+        "docker buildx build --target production --load . && docker push example/image:latest",
+        "docker buildx build --load . || docker push example/image:latest",
+        "docker buildx build --load .; docker push example/image:latest",
+        "docker buildx build --load . | docker push example/image:latest",
+        "(docker push example/image:latest)",
+        "sudo docker push example/image:latest",
+        "xargs docker push",
+        "sh -c 'docker push example/image:latest'",
+        "sh -c 'docker buildx build --load . && docker push example/image:latest'",
+        "docker buildx build --build-arg URL=https://example.test/#fragment --load . && docker push example/image:latest",
+        "docker buildx build --load . && docker push example/image:latest # publish",
+    ]
+    inert_cases = [
+        "docker buildx build --target production --load .",
+        "echo 'docker push example/image:latest'",
+        'echo "docker push example/image:latest"',
+        "docker push-notify example/image:latest",
+        "docker image prune --force",
+        "echo done # docker push example/image:latest",
+        "echo done; # docker push example/image:latest",
+        "docker buildx build --build-arg URL=https://example.test/#fragment --load .",
+    ]
+    for command in invokes_cases:
+        assert command_invokes_docker_push(command), (
+            f"expected docker push to be detected: {command}"
+        )
+    for command in inert_cases:
+        assert not command_invokes_docker_push(command), (
+            f"expected no docker push: {command}"
+        )
+
+
 def assert_ci_runs_postgres_sql_contract_smoke() -> None:
     ci = read_repo_file(CI_WORKFLOW)
     _, rust_job = workflow_job_block(ci, "rust")
@@ -336,6 +441,7 @@ def assert_ci_runs_postgres_sql_contract_smoke() -> None:
 
 
 def main() -> None:
+    self_test_command_invokes_docker_push()
     assert_workflow_actions_are_sha_pinned()
     assert_ci_runs_pr_docker_build_without_push()
     assert_ci_runs_postgres_sql_contract_smoke()
