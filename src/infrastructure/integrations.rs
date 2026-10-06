@@ -1298,10 +1298,9 @@ mod tests {
         AGENT_CLAUDE_DIR, AGENT_CLAUDE_MCP_CONFIG_FILENAME, AGENT_CLAUDE_SETTINGS_FILENAME,
         AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR,
         AGENT_OPENCODE_CONFIG_FILENAME, AGENT_OUTPUT_DIR, AgentOutputContract,
-        CommandOutputReadError, CommandOutputStream, CommandWhisperClient,
-        HarnessCliSummaryClient, IntegrationError, create_temp_output_file,
-        prepare_agent_command_environment, read_temp_output_file,
-        run_agent_harness_with_output_contract, run_command_with_timeout,
+        CommandOutputReadError, CommandOutputStream, CommandWhisperClient, HarnessCliSummaryClient,
+        IntegrationError, create_temp_output_file, prepare_agent_command_environment,
+        read_temp_output_file, run_agent_harness_with_output_contract, run_command_with_timeout,
         run_command_with_timeout_and_output_limit, sanitize_whisper_endpoint_for_log,
     };
     use crate::application::summary::{ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT};
