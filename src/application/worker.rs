@@ -139,6 +139,13 @@ where
                             error = %err,
                             "failed to refresh summary job lease heartbeat"
                         );
+                        // Non-backend failures mean the claim is definitively
+                        // lost (expired lease, another worker claimed it, or
+                        // the job is terminal); beating again cannot restore
+                        // ownership, so treat the job as lost and stop.
+                        if !matches!(err, QueueError::Backend(_)) {
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_token.cancelled() => break,
@@ -1105,6 +1112,28 @@ where
     let Some(job) = queue.claim_next(JobType::Summarize)? else {
         return Ok(None);
     };
+    process_claimed_summary_job(store, queue, job, whisper, claude, options)
+}
+
+/// Process a summary job the caller has already claimed. Separating the claim
+/// from the work lets the caller arm a lease heartbeat before the
+/// (potentially long) transcription and summary generation starts — a single
+/// command can run longer than the lease and would otherwise be reclaimed by
+/// another worker mid-generation.
+pub fn process_claimed_summary_job<S, Q, W, C>(
+    store: &mut S,
+    queue: &mut Q,
+    job: Job,
+    whisper: &W,
+    claude: &C,
+    options: &SummaryJobOptions,
+) -> Result<Option<ProcessJobResult>, WorkerError>
+where
+    S: MeetingStore + SummaryContextStore + AiMemoryExtractionStore,
+    Q: JobQueue,
+    W: WhisperClient,
+    C: ClaudeSummaryClient,
+{
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");
 
     let result = (|| {

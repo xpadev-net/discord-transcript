@@ -2,16 +2,18 @@ use discord_transcript::application::runtime::{BotRunExit, SummaryJobWakeups, ru
 use discord_transcript::application::worker::{
     ProcessJobResult, SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobOptions,
     SummaryNotificationReceipt, SummaryStatusNotification, SummaryUrlNotification, WorkerError,
-    complete_summary_job_after_notification, process_next_summary_job,
+    complete_summary_job_after_notification, process_claimed_summary_job,
     record_summary_completion_usage_observe_only, spawn_summary_job_heartbeat,
 };
 use discord_transcript::bootstrap::config::{AppConfig, AppRole};
+use discord_transcript::domain::JobType;
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use discord_transcript::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
 };
+use discord_transcript::infrastructure::queue::JobQueue;
 use discord_transcript::infrastructure::retry::RetryPolicy;
 use discord_transcript::infrastructure::sql::{
     CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS,
@@ -347,12 +349,19 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         &config.database_url,
         &config.database_ssl_mode,
     )?);
-    // The queue is shared with a per-job heartbeat task that keeps the claimed
-    // job's lease alive while the worker performs the (potentially long)
-    // Discord notification phase — the same guard the in-bot runtime uses.
+    // `queue` is shared with the per-job heartbeat task that keeps the claimed
+    // job's lease alive while the worker runs the (potentially long) processing
+    // and notification phases — the same guard the in-bot runtime uses.
+    // `process_queue` is a dedicated connection for the synchronous processing
+    // phase: it is borrowed for the whole duration, so heartbeats must go
+    // through the shared `queue` instead or they would starve behind it.
     let queue = Arc::new(Mutex::new(SqlJobQueue::new(
         PgSqlExecutor::connect_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?,
     )));
+    let mut process_queue = SqlJobQueue::new(PgSqlExecutor::connect_with_ssl_mode(
+        &config.database_url,
+        &config.database_ssl_mode,
+    )?);
     let worker_shutdown = CancellationToken::new();
     let token_db_url = database_url_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
     let (token_db_client, token_db_connection) =
@@ -414,82 +423,98 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
                         "standalone worker failed to recover stale running summary jobs"
                     );
                 }
-                let job_result = {
+                let claimed = {
                     let mut queue_guard = queue.lock().await;
-                    process_next_summary_job(
-                        &mut store,
-                        &mut *queue_guard,
-                        &whisper,
-                        &summary_client,
-                        &options,
-                    )
+                    queue_guard.claim_next(JobType::Summarize)
                 };
-                match job_result {
-                    Ok(Some(result)) => {
-                        let chunk_count = result.output.chunks.len();
-                        // Discord notification may take far longer than the job
-                        // lease (hundreds of messages under rate limits), so the
-                        // lease must be refreshed in the background or the job
-                        // expires mid-flight and is rerun by a later pass.
+                match claimed {
+                    Ok(Some(job)) => {
+                        // Arm the lease heartbeat as soon as the job is
+                        // claimed: transcription and summary generation can
+                        // run longer than the 90-second lease, so without the
+                        // background refresh a still-running generation would
+                        // expire and be reclaimed by another worker.
                         let heartbeat_guard = spawn_summary_job_heartbeat(
-                            &result.job,
+                            &job,
                             Arc::clone(&queue),
                             worker_shutdown.clone(),
                             SUMMARY_JOB_HEARTBEAT_INTERVAL,
                         );
-                        let notify_result = notify_standalone_worker_summary(
-                            &config,
-                            &token_db_client,
-                            guild_bot_token_cipher.as_ref(),
+                        let job_result = process_claimed_summary_job(
                             &mut store,
-                            &result,
-                        )
-                        .await;
-                        heartbeat_guard.stop().await;
-                        let completion_result = match notify_result {
-                            Ok(receipt) => {
-                                let mut queue_guard = queue.lock().await;
-                                complete_summary_job_after_notification(
+                            &mut process_queue,
+                            job,
+                            &whisper,
+                            &summary_client,
+                            &options,
+                        );
+                        match job_result {
+                            Ok(Some(result)) => {
+                                let chunk_count = result.output.chunks.len();
+                                let notify_result = notify_standalone_worker_summary(
+                                    &config,
+                                    &token_db_client,
+                                    guild_bot_token_cipher.as_ref(),
                                     &mut store,
-                                    &mut *queue_guard,
-                                    &result.job,
-                                    receipt,
+                                    &result,
                                 )
+                                .await;
+                                heartbeat_guard.stop().await;
+                                let completion_result = match notify_result {
+                                    Ok(receipt) => {
+                                        let mut queue_guard = queue.lock().await;
+                                        complete_summary_job_after_notification(
+                                            &mut store,
+                                            &mut *queue_guard,
+                                            &result.job,
+                                            receipt,
+                                        )
+                                    }
+                                    Err(err) => Err(err),
+                                };
+                                match completion_result {
+                                    Ok(true) => {
+                                        record_summary_completion_usage_observe_only(
+                                            &mut store,
+                                            &result.output.meeting_id,
+                                            &result.job_id,
+                                            chunk_count,
+                                        );
+                                    }
+                                    Ok(false) => {
+                                        tracing::warn!(
+                                            job_id = %result.job_id,
+                                            meeting_id = %result.output.meeting_id,
+                                            "standalone worker completed summary notification but job completion will retry after lease recovery"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            job_id = %result.job_id,
+                                            meeting_id = %result.output.meeting_id,
+                                            error = %err,
+                                            "standalone worker could not complete generated summary job"
+                                        );
+                                    }
+                                }
+                                idle_sleep.as_mut().reset(tokio::time::Instant::now());
                             }
-                            Err(err) => Err(err),
-                        };
-                        match completion_result {
-                            Ok(true) => {
-                                record_summary_completion_usage_observe_only(
-                                    &mut store,
-                                    &result.output.meeting_id,
-                                    &result.job_id,
-                                    chunk_count,
-                                );
-                            }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    job_id = %result.job_id,
-                                    meeting_id = %result.output.meeting_id,
-                                    "standalone worker completed summary notification but job completion will retry after lease recovery"
-                                );
+                            Ok(None) => {
+                                heartbeat_guard.stop().await;
+                                idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                             }
                             Err(err) => {
-                                tracing::warn!(
-                                    job_id = %result.job_id,
-                                    meeting_id = %result.output.meeting_id,
-                                    error = %err,
-                                    "standalone worker could not complete generated summary job"
-                                );
+                                heartbeat_guard.stop().await;
+                                tracing::warn!(error = %err, "standalone worker summary job attempt failed");
+                                idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                             }
                         }
-                        idle_sleep.as_mut().reset(tokio::time::Instant::now());
                     }
                     Ok(None) => {
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, "standalone worker summary job attempt failed");
+                        tracing::warn!(error = %err, "standalone worker summary job claim failed");
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                     }
                 }
