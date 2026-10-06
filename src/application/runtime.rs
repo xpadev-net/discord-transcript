@@ -7941,6 +7941,7 @@ impl ScaffoldHandler {
                 &speakers,
             )
         });
+        let mut retained_summary_context = None;
         let context_manifest_result = match summary_context {
             Ok(mut summary_context) => {
                 let mut speaker_ids = summary_context_speakers.keys().collect::<Vec<_>>();
@@ -7951,13 +7952,19 @@ impl ScaffoldHandler {
                     .collect();
                 self.refresh_summary_job_ownership(&claimed_job, "summary_context_artifact")
                     .await?;
-                tokio::task::block_in_place(|| {
+                let manifest_result = tokio::task::block_in_place(|| {
                     crate::application::summary::materialize_or_load_summary_context(
                         &request,
                         &summary_context,
                         Some(&summary_transcript),
                     )
-                })
+                });
+                // Keep the raw context for the post-summary verbatim-leak
+                // check; the agent can read materialized context files, so
+                // the check compares output against the source bodies, not
+                // the (agent-tamperable) files on disk.
+                retained_summary_context = Some(summary_context);
+                manifest_result
             }
             Err(err) => Err(err),
         };
@@ -8200,6 +8207,16 @@ impl ScaffoldHandler {
             Ok(markdown) => markdown,
             Err(err) => return_summary_retry!(err),
         };
+        if let Some(context) = retained_summary_context.as_ref()
+            && let Some(leaked_kind) =
+                crate::application::summary::summary_output_verbatim_context_leak(
+                    &markdown, context,
+                )
+        {
+            return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(
+                format!("summary output quoted materialized {leaked_kind} verbatim")
+            ));
+        }
         let agent_workspace =
             agent_workspace.expect("summary agent workspace should remain after success");
 

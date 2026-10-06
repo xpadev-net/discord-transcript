@@ -2001,3 +2001,126 @@ fn summary_prompt_template_renders_custom_template() {
         "Summarize input/transcript/transcript_masked.md with input/transcript/manifest.json in en."
     );
 }
+
+#[test]
+fn summary_output_verbatim_context_leak_flags_long_copies() {
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+    let domain_body = "internal roadmap codename glass harbor migration deadline confidential project schedule q3 launch window budget review approvals";
+    let template_body = "a very long custom summary template instruction body that an agent should never echo back into the generated markdown output verbatim";
+    let context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-1".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Roadmap".to_owned(),
+            body: domain_body.to_owned(),
+            active: true,
+            version: 7,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        summary_template: Some(SummaryTemplate {
+            id: "st-1".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            name: "Exec".to_owned(),
+            template: template_body.to_owned(),
+            active: true,
+            version: 3,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }),
+        ai_memory: vec![ai_memory_note(
+            "mem-1",
+            "Hint",
+            "prior meeting decided the rollout order is alpha beta gamma",
+            updated_at,
+        )],
+        ..Default::default()
+    };
+
+    // Verbatim 15+ word run of a domain knowledge body.
+    let leaked = format!("Here is context: {domain_body} thanks");
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &leaked, &context
+        ),
+        Some("domain knowledge")
+    );
+
+    // Whole short-but-long-enough template body.
+    let short_template = SummaryContextInput {
+        summary_template: Some(SummaryTemplate {
+            template: "x".repeat(130),
+            ..context.summary_template.clone().unwrap()
+        }),
+        ..Default::default()
+    };
+    let leaked_short = format!("intro {} outro", "x".repeat(130));
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &leaked_short,
+            &short_template
+        ),
+        Some("summary template")
+    );
+}
+
+#[test]
+fn summary_output_verbatim_context_leak_allows_paraphrase_and_inactive() {
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+    let inactive_body = "dormant archived knowledge that must never matter one two three four five six seven";
+    let context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-old".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Old".to_owned(),
+            body: inactive_body.to_owned(),
+            active: false,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: Some(updated_at),
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ..Default::default()
+    };
+
+    // Archived/inactive bodies are never materialized, so quoting them is not
+    // attributed to context exfiltration.
+    let quoted = format!("quoting anyway: {inactive_body}");
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &quoted, &context
+        ),
+        None
+    );
+
+    let active_context = SummaryContextInput {
+        ai_memory: vec![ai_memory_note(
+            "mem-1",
+            "Hint",
+            "rollout order alpha beta gamma delta epsilon zeta eta theta",
+            updated_at,
+        )],
+        ..Default::default()
+    };
+    let paraphrased = "the rollout goes alpha first, then beta, gamma, and the rest follow";
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            paraphrased,
+            &active_context
+        ),
+        None
+    );
+}

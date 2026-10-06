@@ -712,6 +712,17 @@ where
             return Err(WorkerError::from(err));
         }
     };
+    if let Some(leaked_kind) = crate::application::summary::summary_output_verbatim_context_leak(
+        &markdown,
+        &input.summary_context,
+    ) {
+        let err = SummaryError::SummaryEngine(format!(
+            "summary output quoted materialized {leaked_kind} verbatim"
+        ));
+        error!(meeting_id = %input.meeting_id, error = %err, "summary output verbatim context leak rejected");
+        revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
+        return Err(WorkerError::from(err));
+    }
     ensure_owned()?;
     if let Err(err) = persist_generated_summary_markdown(&request.workspace, &markdown) {
         error!(meeting_id = %input.meeting_id, error = %err, "generated summary persistence failed");
