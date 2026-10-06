@@ -2172,6 +2172,26 @@ fn summary_output_verbatim_context_leak_ignores_unmaterialized_feedback_original
         ),
         None
     );
+
+    // A short verbatim *note* is explanatory guidance, not an applied
+    // correction — a verbatim dump of it is still a leak.
+    let note_guidance = "harbor migration refers to the staging cutover";
+    let context_with_short_note = SummaryContextInput {
+        user_feedback: vec![TranscriptFeedback {
+            original_text: None,
+            corrected_text: None,
+            note: Some(note_guidance.to_owned()),
+            ..accepted_feedback("fb-4", "note", updated_at)
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &format!("per notes, {note_guidance}"),
+            &context_with_short_note
+        ),
+        Some("user feedback note")
+    );
 }
 
 #[test]

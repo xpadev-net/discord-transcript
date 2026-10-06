@@ -846,6 +846,7 @@ pub struct MaterializedLeakCheckBody {
 const LEAK_KIND_DOMAIN_KNOWLEDGE: &str = "domain knowledge";
 const LEAK_KIND_AI_MEMORY: &str = "AI memory note";
 const LEAK_KIND_USER_FEEDBACK: &str = "user feedback";
+const LEAK_KIND_USER_FEEDBACK_NOTE: &str = "user feedback note";
 const LEAK_KIND_SUMMARY_TEMPLATE: &str = "summary template";
 
 fn leak_kind_static(kind: &str) -> Option<&'static str> {
@@ -853,6 +854,7 @@ fn leak_kind_static(kind: &str) -> Option<&'static str> {
         LEAK_KIND_DOMAIN_KNOWLEDGE,
         LEAK_KIND_AI_MEMORY,
         LEAK_KIND_USER_FEEDBACK,
+        LEAK_KIND_USER_FEEDBACK_NOTE,
         LEAK_KIND_SUMMARY_TEMPLATE,
     ]
     .into_iter()
@@ -860,12 +862,15 @@ fn leak_kind_static(kind: &str) -> Option<&'static str> {
 }
 
 /// Whether whole-body containment flags this body kind. Confidential store
-/// bodies must never appear verbatim, but template boilerplate and applied
-/// feedback are expected inside valid output, so only the long verbatim
-/// window applies to them — flagging a short run would reject compliant
-/// summaries on every retry.
+/// bodies and feedback guidance notes must never appear verbatim, but
+/// template boilerplate and accepted corrections are expected inside valid
+/// output, so only the long verbatim window applies to them — flagging a
+/// short run would reject compliant summaries on every retry.
 fn leak_body_short_match(kind: &str) -> bool {
-    matches!(kind, LEAK_KIND_DOMAIN_KNOWLEDGE | LEAK_KIND_AI_MEMORY)
+    matches!(
+        kind,
+        LEAK_KIND_DOMAIN_KNOWLEDGE | LEAK_KIND_AI_MEMORY | LEAK_KIND_USER_FEEDBACK_NOTE
+    )
 }
 
 /// Bodies selected for materialization, as they appear to the agent.
@@ -888,14 +893,18 @@ fn leak_check_bodies_from_parts<'a>(
             body: note.body.clone(),
         }))
         .chain(user_feedback.flat_map(|feedback| {
-            [feedback.note.as_ref(), feedback.corrected_text.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|text| MaterializedLeakCheckBody {
-                    kind: LEAK_KIND_USER_FEEDBACK.to_owned(),
+            [
+                (LEAK_KIND_USER_FEEDBACK_NOTE, feedback.note.as_ref()),
+                (LEAK_KIND_USER_FEEDBACK, feedback.corrected_text.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(kind, text)| {
+                text.map(|text| MaterializedLeakCheckBody {
+                    kind: kind.to_owned(),
                     body: text.clone(),
                 })
-                .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
         }))
         .chain(
             summary_template
