@@ -686,18 +686,15 @@ fn decide_auto_stop_grace_expiry(non_bot_member_count: Option<usize>) -> GraceEx
     }
 }
 
-fn decide_driver_disconnect_grace_expiry(
-    reconnected: Option<bool>,
-    non_bot_member_count: Option<usize>,
-) -> GraceExpiryDecision {
-    match (reconnected, non_bot_member_count) {
-        (Some(false), Some(0)) => GraceExpiryDecision::Stop,
-        (Some(true), _) => GraceExpiryDecision::Cancel,
-        // Bot is still disconnected after grace, but members are present. Do
-        // not auto-stop an occupied recording; a later empty-channel grace or
-        // manual stop can end it.
-        (Some(false), Some(_)) => GraceExpiryDecision::Cancel,
-        _ => GraceExpiryDecision::Reschedule,
+fn decide_driver_disconnect_grace_expiry(reconnected: Option<bool>) -> GraceExpiryDecision {
+    match reconnected {
+        Some(true) => GraceExpiryDecision::Cancel,
+        // The bot is still disconnected after grace, so the recording cannot
+        // capture anything regardless of who remains in the channel. Leaving
+        // the meeting in Recording state would block every later recording
+        // until a manual stop or process restart.
+        Some(false) => GraceExpiryDecision::Stop,
+        None => GraceExpiryDecision::Reschedule,
     }
 }
 
@@ -9407,12 +9404,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 runtime.guild_id,
                                 target_voice_channel_id,
                             );
-                            let non_bot = count_non_bot_members_in_target_voice(
-                                &ctx_for_task,
-                                runtime.guild_id,
-                                target_voice_channel_id,
-                            );
-                            match decide_driver_disconnect_grace_expiry(reconnected, non_bot) {
+                            match decide_driver_disconnect_grace_expiry(reconnected) {
                                 GraceExpiryDecision::Reschedule => {
                                     let terminal_error = driver_disconnect_cache_miss_terminal_error(
                                         &mut grace_cache_misses,
@@ -13013,29 +13005,19 @@ mod status_message_tests {
     }
 
     #[test]
-    fn driver_disconnect_cache_miss_reschedules_instead_of_stopping() {
+    fn driver_disconnect_grace_expiry_stops_when_still_disconnected() {
         assert_eq!(
-            decide_driver_disconnect_grace_expiry(None, Some(0)),
+            decide_driver_disconnect_grace_expiry(None),
             GraceExpiryDecision::Reschedule
         );
         assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(false), None),
-            GraceExpiryDecision::Reschedule
-        );
-        assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(true), Some(0)),
+            decide_driver_disconnect_grace_expiry(Some(true)),
             GraceExpiryDecision::Cancel
         );
+        // Whether or not non-bot occupants remain, a still-disconnected bot
+        // cannot record; stop the meeting instead of leaving it active.
         assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(true), None),
-            GraceExpiryDecision::Cancel
-        );
-        assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(false), Some(1)),
-            GraceExpiryDecision::Cancel
-        );
-        assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(false), Some(0)),
+            decide_driver_disconnect_grace_expiry(Some(false)),
             GraceExpiryDecision::Stop
         );
     }
