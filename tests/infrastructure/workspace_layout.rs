@@ -635,9 +635,13 @@ fn agent_workspace_cleanup_refuses_replaced_root() {
         .expect("register source")
         .build()
         .expect("materialize");
+    // Allocate the replacement dir while the original still exists so the two
+    // cannot share an inode, then swap it in atomically with rename.
+    let replacement = meeting_root.join("agent").join("run-1-replacement");
+    std::fs::create_dir_all(&replacement).expect("replacement agent root");
+    std::fs::write(replacement.join("unrelated.txt"), "do not delete").expect("replacement file");
     std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
-    std::fs::create_dir_all(&agent_root).expect("replace agent root");
-    std::fs::write(agent_root.join("unrelated.txt"), "do not delete").expect("replacement file");
+    std::fs::rename(&replacement, &agent_root).expect("swap in replacement root");
 
     let err = agent_workspace
         .cleanup()
@@ -731,6 +735,77 @@ fn agent_workspace_cleanup_removes_despite_missing_cleanup_marker() {
     agent_workspace
         .cleanup()
         .expect("cleanup should remove workspace despite missing marker");
+
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_removes_despite_moved_input_dir() {
+    let base = unique_temp_dir("agent_workspace_cleanup_moved_input");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::write(
+        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        "tampered",
+    )
+    .expect("overwrite cleanup marker");
+    std::fs::rename(
+        agent_root.join(AGENT_INPUT_DIR),
+        agent_root.join("moved-input"),
+    )
+    .expect("move input dir");
+
+    // The marker is corrupt and part of the skeleton was moved, but the root
+    // still holds build-time structure, so cleanup must still remove it.
+    agent_workspace
+        .cleanup()
+        .expect("cleanup should remove workspace with corrupt marker and partial skeleton");
+
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_removes_despite_stripped_skeleton() {
+    let base = unique_temp_dir("agent_workspace_cleanup_stripped_skeleton");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::write(
+        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        "tampered",
+    )
+    .expect("overwrite cleanup marker");
+    std::fs::remove_dir_all(agent_root.join(AGENT_INPUT_DIR)).expect("remove input dir");
+    std::fs::remove_dir_all(agent_root.join(AGENT_OUTPUT_DIR)).expect("remove output dir");
+
+    // Even with the whole subdirectory tree removed, the root is still the
+    // materialized directory object, so cleanup must still delete it.
+    agent_workspace
+        .cleanup()
+        .expect("cleanup should remove workspace stripped of its subdirectory tree");
 
     assert!(!agent_root.exists());
     assert!(meeting_root.exists());

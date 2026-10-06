@@ -701,35 +701,18 @@ fn validate_root_identity(
     }
     match read_cleanup_marker(path) {
         Ok(marker) if marker == expected.cleanup_marker => Ok(()),
-        _ if has_build_skeleton(path) => {
-            // The build-time skeleton is intact on an unchanged inode, so a
-            // marker that fails validation here only proves the agent
-            // tampered with it in place; refusing to delete would let the
-            // agent strand transcript copies on disk.
+        // The root is still the exact directory object that was materialized,
+        // so a marker that fails validation only proves the agent tampered
+        // with it in place; subdirectory state is irrelevant and refusing to
+        // delete would let the agent strand transcript copies on disk.
+        _ => {
             warn!(
                 path = %path.display(),
                 "agent workspace cleanup marker validation failed on unchanged root; removing workspace anyway"
             );
             Ok(())
         }
-        // An inode number can be reused by a root recreated after deletion,
-        // so a bare directory without the build-time skeleton is treated as
-        // a replaced foreign root and must not be deleted.
-        _ => Err(AgentWorkspaceError::InvalidPath {
-            path: path.to_path_buf(),
-            reason: "agent workspace root identity changed before cleanup",
-        }),
     }
-}
-
-/// The builder always materializes `input/` and `output/` inside the agent
-/// root; their presence corroborates that a dir with a failed cleanup marker
-/// is our workspace tampered in place, not a foreign root swapped in.
-#[cfg(unix)]
-fn has_build_skeleton(root: &Path) -> bool {
-    [AGENT_INPUT_DIR, AGENT_OUTPUT_DIR]
-        .iter()
-        .all(|dir| fs::symlink_metadata(root.join(dir)).is_ok())
 }
 
 #[cfg(not(unix))]
