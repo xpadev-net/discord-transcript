@@ -9846,7 +9846,7 @@ const MAX_VOICE_CHANNEL_NAME_CHARS: usize = 100;
 fn sanitize_voice_channel_name(name: &str) -> Option<String> {
     let sanitized = name
         .chars()
-        .filter(|ch| !ch.is_control() && !matches!(*ch as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF))
+        .filter(|ch| !ch.is_control() && !matches!(*ch as u32, 0x00AD | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF))
         .take(MAX_VOICE_CHANNEL_NAME_CHARS)
         .collect::<String>();
     (!sanitized.trim().is_empty()).then_some(sanitized)
@@ -14693,9 +14693,11 @@ mod status_message_tests {
 
     #[test]
     fn voice_channel_name_sanitize_strips_hidden_format_chars() {
-        let sanitized = sanitize_voice_channel_name("stand\u{200B}up\u{202E}room\u{0007}");
+        let sanitized = sanitize_voice_channel_name(
+            "stand\u{200B}up\u{202E}room\u{0007}\u{2066}iso\u{2069}\u{00AD}late",
+        );
 
-        assert_eq!(sanitized.as_deref(), Some("standuproom"));
+        assert_eq!(sanitized.as_deref(), Some("standuproomisolate"));
     }
 
     #[test]
