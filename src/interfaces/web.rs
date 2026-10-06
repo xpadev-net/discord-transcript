@@ -384,6 +384,10 @@ pub struct WebState {
     membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     transcript_sse_limiter: TranscriptSseLimiter,
+    /// Ensures at most one audit-retention prune query is in flight; without
+    /// it every sampled audit write can enqueue an unbounded backlog of
+    /// detached DB tasks.
+    audit_cleanup_in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
     pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
@@ -420,6 +424,7 @@ impl WebState {
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             transcript_sse_limiter: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            audit_cleanup_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
             summary_job_wakeups,
@@ -496,13 +501,40 @@ async fn persist_audit_event(
     Ok(())
 }
 
+/// Acquire the single audit-retention-prune slot. Returns false while a
+/// prune is already running; callers must release via
+/// `end_audit_retention_cleanup` after the spawned task finishes.
+fn try_begin_audit_retention_cleanup(in_flight: &std::sync::atomic::AtomicBool) -> bool {
+    in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+fn end_audit_retention_cleanup(in_flight: &std::sync::atomic::AtomicBool) {
+    in_flight.store(false, std::sync::atomic::Ordering::Release);
+}
+
 fn spawn_audit_retention_cleanup(state: &WebState) {
     if !should_sample_audit_retention_cleanup(Uuid::new_v4().as_u128()) {
         return;
     }
+    // Cap the backlog at one in-flight prune: an authorized member can
+    // trigger audit writes (and therefore sampled cleanups) as fast as they
+    // can send requests, so without this gate the detached tasks accumulate
+    // unboundedly against the DB.
+    if !try_begin_audit_retention_cleanup(&state.audit_cleanup_in_flight) {
+        return;
+    }
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(err) = state.db.execute(PRUNE_STALE_AUDIT_EVENTS_SQL, &[]).await {
+        let result = state.db.execute(PRUNE_STALE_AUDIT_EVENTS_SQL, &[]).await;
+        end_audit_retention_cleanup(&state.audit_cleanup_in_flight);
+        if let Err(err) = result {
             warn!(error = %err, "failed to prune stale audit events");
         }
     });
@@ -16245,6 +16277,16 @@ mod discord_channel_full_tests {
         assert!(!should_sample_audit_retention_cleanup(
             reachable_multiple + 1
         ));
+    }
+
+    #[test]
+    fn audit_retention_cleanup_slot_allows_only_one_in_flight() {
+        let in_flight = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(super::try_begin_audit_retention_cleanup(&in_flight));
+        assert!(!super::try_begin_audit_retention_cleanup(&in_flight));
+        super::end_audit_retention_cleanup(&in_flight);
+        assert!(super::try_begin_audit_retention_cleanup(&in_flight));
     }
 
     #[tokio::test]
