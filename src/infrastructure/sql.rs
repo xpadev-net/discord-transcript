@@ -136,6 +136,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0029_transcript_confidence_check",
         sql: include_str!("../../migrations/0029_transcript_confidence_check.sql"),
     },
+    Migration {
+        version: "0030_summaries_context_selection_version",
+        sql: include_str!("../../migrations/0030_summaries_context_selection_version.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -208,6 +212,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0028_active_meeting_unique_index.sql"),
     "\n",
     include_str!("../../migrations/0029_transcript_confidence_check.sql"),
+    "\n",
+    include_str!("../../migrations/0030_summaries_context_selection_version.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1624,9 +1630,11 @@ RETURNING j.id,
 "#;
 
 pub const INSERT_SUMMARY_SQL: &str = r#"
-INSERT INTO summaries (id, meeting_id, version, markdown)
-VALUES ($1, $2, 1, $3)
-ON CONFLICT (meeting_id, version) DO UPDATE SET markdown = EXCLUDED.markdown
+INSERT INTO summaries (id, meeting_id, version, markdown, context_selection_version)
+VALUES ($1, $2, 1, $3, $4::TEXT::INTEGER)
+ON CONFLICT (meeting_id, version) DO UPDATE SET
+    markdown = EXCLUDED.markdown,
+    context_selection_version = EXCLUDED.context_selection_version
 "#;
 
 pub const UPSERT_MEETING_SPEAKER_SQL: &str = r#"

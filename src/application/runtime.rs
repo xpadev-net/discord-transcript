@@ -3315,8 +3315,8 @@ async fn wait_for_bot_token_revision_change(revision: &mut watch::Receiver<u64>)
     }
 }
 
-fn load_runtime_summary_context(
-    store: &mut SqlMeetingStore<PgSqlExecutor>,
+fn load_runtime_summary_context<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
     meeting_id: &str,
     guild_id: &str,
     effective_settings: &EffectiveMeetingSettings,
@@ -3347,8 +3347,15 @@ fn load_runtime_summary_context(
         );
     }
     let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+        // Bounded candidate lists; see load_summary_context in worker.rs.
         let ai_memory = store
-            .list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)
+            .list_ai_memory_notes(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                None,
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
             .map_err(|err| {
                 crate::application::summary::SummaryError::SummaryEngine(format!(
                     "failed to load AI memory for meeting {meeting_id}: {err}"
@@ -3360,6 +3367,7 @@ fn load_runtime_summary_context(
                 guild_id,
                 Some(TranscriptFeedbackStatus::Accepted),
                 None,
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
             )
             .map_err(|err| {
                 crate::application::summary::SummaryError::SummaryEngine(format!(
@@ -3372,6 +3380,7 @@ fn load_runtime_summary_context(
                 guild_id,
                 false,
                 Some(PersonAliasReviewStatus::Accepted),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
             )
             .map_err(|err| {
                 crate::application::summary::SummaryError::SummaryEngine(format!(
@@ -8264,7 +8273,12 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(
                 crate::infrastructure::sql::INSERT_SUMMARY_SQL,
-                &[summary_id, claimed_job.meeting_id.clone(), markdown.clone()],
+                &[
+                    summary_id,
+                    claimed_job.meeting_id.clone(),
+                    markdown.clone(),
+                    crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION.to_string(),
+                ],
             ) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
@@ -14766,5 +14780,57 @@ mod status_message_tests {
             assert!(message.contains("https://example.test/meetings/meeting-1"));
             assert!(message.contains("meeting_id=meeting-1"));
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_context_tests {
+    use super::*;
+    use crate::application::worker::{
+        assert_summary_context_scope, register_summary_context_scope_fakes,
+    };
+    use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+    fn test_effective_settings() -> EffectiveMeetingSettings {
+        EffectiveMeetingSettings {
+            whisper_language: None,
+            whisper_vad: false,
+            whisper_beam_size: 1,
+            whisper_suppress_non_speech: false,
+            whisper_prompt: None,
+            whisper_temperature: 0.0,
+            whisper_resample_to_16k: true,
+            auto_stop_grace_seconds: 0,
+            retention_raw_audio_ttl_days: 0,
+            retention_transcript_ttl_days: 0,
+            retention_summary_ttl_days: None,
+            summary_enabled: true,
+            summary_template_id: None,
+            domain_knowledge_version_id: None,
+        }
+    }
+
+    #[test]
+    fn load_runtime_summary_context_scopes_records_to_same_channel() {
+        // Loader-level coverage: candidate rows flow through the real SQL call
+        // path (bounded list queries, tenant resolution, channel scoping)
+        // instead of being fed to the scope helper directly.
+        let mut executor = FakeSqlExecutor::default();
+        register_summary_context_scope_fakes(&mut executor);
+        let mut store = SqlMeetingStore::new(executor);
+        let settings = test_effective_settings();
+
+        let context = load_runtime_summary_context(&mut store, "m1", "g1", &settings, &[])
+            .expect("runtime summary context should load");
+
+        assert_summary_context_scope(&context);
+        assert!(
+            context.speakers.is_empty(),
+            "runtime path returns no speaker list"
+        );
+        assert!(
+            context.summary_template.is_none(),
+            "no active summary template is registered"
+        );
     }
 }

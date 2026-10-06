@@ -1,0 +1,2 @@
+ALTER TABLE summaries
+ADD COLUMN IF NOT EXISTS context_selection_version INTEGER NOT NULL DEFAULT 1;

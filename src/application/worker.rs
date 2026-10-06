@@ -189,18 +189,29 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         }
         let tenant = self.resolve_tenant_by_guild(guild_id)?;
         let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
-            let ai_memory = self.list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)?;
+            // Each candidate list is bounded so a guild accumulating records
+            // cannot make context loading unbounded; per-scope caps keep the
+            // anchor channel lookup below at a fixed maximum size as well.
+            let ai_memory = self.list_ai_memory_notes(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                None,
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
+            )?;
             let user_feedback = self.list_transcript_feedback(
                 &tenant.tenant_id,
                 guild_id,
                 Some(TranscriptFeedbackStatus::Accepted),
                 None,
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
             )?;
             let person_aliases = self.list_person_aliases(
                 &tenant.tenant_id,
                 guild_id,
                 false,
                 Some(PersonAliasReviewStatus::Accepted),
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
             )?;
             let allowed_meetings = summary_context_allowed_meeting_ids(
                 self,
@@ -267,10 +278,19 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
     }
 }
 
-const SUMMARY_CONTEXT_MEETING_CHANNEL_SQL: &str =
+pub(crate) const SUMMARY_CONTEXT_MEETING_CHANNEL_SQL: &str =
     "SELECT voice_channel_id FROM meetings WHERE id=$1 AND guild_id=$2";
-const SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL: &str = "SELECT id, voice_channel_id FROM meetings \
+pub(crate) const SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL: &str = "SELECT id, voice_channel_id FROM meetings \
              WHERE guild_id=$1 AND id = ANY(string_to_array($2, ','))";
+
+/// Maximum rows loaded per candidate list (AI memory, feedback, aliases) for
+/// summary context scoping. Keeps each summary job's context lookup bounded
+/// regardless of how large the guild's record set grows.
+pub(crate) const SUMMARY_CONTEXT_LIST_LIMIT: u32 = 500;
+
+/// Maximum anchor meeting ids sent to the channel lookup in a single query.
+/// Bounds the comma-joined parameter size even if candidate lists grow.
+pub(crate) const SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT: usize = 1500;
 
 /// Returns the meeting ids whose records may be materialized into a summary's
 /// context: the meeting being summarized plus every anchor meeting that was
@@ -304,6 +324,9 @@ pub(crate) fn summary_context_allowed_meeting_ids<'a, E: SqlExecutor>(
         .into_iter()
         .collect::<Vec<_>>();
     anchor_list.sort_unstable();
+    // Sorting first keeps the surviving subset deterministic; anchors beyond
+    // the cap are excluded from the allowed set (fail closed).
+    anchor_list.truncate(SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT);
     if anchor_list.is_empty() {
         return Ok(allowed);
     }
@@ -322,6 +345,114 @@ pub(crate) fn summary_context_allowed_meeting_ids<'a, E: SqlExecutor>(
         }
     }
     Ok(allowed)
+}
+
+/// Registers the fake rows for the shared summary-context fixture: tenant
+/// "t1"/guild "g1" whose candidates anchor to meeting "m1" (the summarized
+/// meeting), "m2" (same voice channel "vc1"), "m3" (other channel "vc2"), and
+/// unanchored rows. Used by the worker- and runtime-path loader tests so both
+/// loaders exercise identical records through their full SQL call paths.
+#[cfg(test)]
+pub(crate) fn register_summary_context_scope_fakes(
+    executor: &mut crate::infrastructure::sql_store::FakeSqlExecutor,
+) {
+    use crate::infrastructure::sql::{
+        LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+        RESOLVE_TENANT_BY_GUILD_SQL,
+    };
+    use crate::infrastructure::sql_store::{
+        ai_memory_note_row, person_alias_row, sql_key, sql_row_from_strings,
+        tenant_installation_row, transcript_feedback_row,
+    };
+
+    // The store builds bounded queries by appending `LIMIT {limit}` to the
+    // base list SQL; register under the same derived text.
+    let ai_memory_sql = format!("{LIST_AI_MEMORY_NOTES_SQL}LIMIT {SUMMARY_CONTEXT_LIST_LIMIT}\n");
+    let feedback_sql =
+        format!("{LIST_TRANSCRIPT_FEEDBACK_SQL}LIMIT {SUMMARY_CONTEXT_LIST_LIMIT}\n");
+    let aliases_sql = format!("{LIST_PERSON_ALIASES_SQL}LIMIT {SUMMARY_CONTEXT_LIST_LIMIT}\n");
+    executor.query_rows_result.insert(
+        sql_key(RESOLVE_TENANT_BY_GUILD_SQL, &["g1"]),
+        vec![tenant_installation_row("t1", "g1")],
+    );
+    executor.query_rows_result.insert(
+        sql_key(&ai_memory_sql, &["t1", "g1", "false", ""]),
+        vec![
+            ai_memory_note_row("n1", "t1", "g1", Some("m1")),
+            ai_memory_note_row("n2", "t1", "g1", Some("m2")),
+            ai_memory_note_row("n3", "t1", "g1", Some("m3")),
+            ai_memory_note_row("n4", "t1", "g1", None),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_key(&feedback_sql, &["t1", "g1", "accepted", ""]),
+        vec![
+            transcript_feedback_row("f1", "t1", "g1", Some("m1")),
+            transcript_feedback_row("f2", "t1", "g1", Some("m3")),
+            transcript_feedback_row("f3", "t1", "g1", None),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_key(&aliases_sql, &["t1", "g1", "false", "accepted"]),
+        vec![
+            person_alias_row("a1", "t1", "g1", Some("m2")),
+            person_alias_row("a2", "t1", "g1", Some("m3")),
+            person_alias_row("a3", "t1", "g1", None),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
+        vec![sql_row_from_strings(vec!["vc1".to_owned()])],
+    );
+    executor.query_rows_result.insert(
+        sql_key(SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL, &["g1", "m2,m3"]),
+        vec![
+            sql_row_from_strings(vec!["m2".to_owned(), "vc1".to_owned()]),
+            sql_row_from_strings(vec!["m3".to_owned(), "vc2".to_owned()]),
+        ],
+    );
+}
+
+/// Asserts that a loader kept only records anchored to the summarized meeting
+/// or to same-channel meetings, dropping cross-channel and unanchored rows.
+#[cfg(test)]
+pub(crate) fn assert_summary_context_scope(
+    context: &crate::application::summary::SummaryContextInput,
+) {
+    let ai_memory_ids = context
+        .ai_memory
+        .iter()
+        .map(|note| note.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        ai_memory_ids,
+        HashSet::from(["n1", "n2"]),
+        "AI memory must keep only the current meeting and same-channel anchors"
+    );
+    let feedback_ids = context
+        .user_feedback
+        .iter()
+        .map(|feedback| feedback.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        feedback_ids,
+        HashSet::from(["f1"]),
+        "feedback must keep only the current meeting anchor"
+    );
+    let alias_ids = context
+        .person_aliases
+        .iter()
+        .map(|alias| alias.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        alias_ids,
+        HashSet::from(["a1"]),
+        "aliases must keep only the same-channel anchor"
+    );
+    assert!(
+        context.domain_knowledge.is_empty(),
+        "domain knowledge is never materialized into summary context"
+    );
 }
 
 pub(crate) fn upsert_vc_participant_alias_candidates_for_guild<E: SqlExecutor>(
@@ -1723,5 +1854,31 @@ mod tests {
                 .expect("scope should resolve");
 
         assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
+    }
+
+    #[test]
+    fn load_summary_context_scopes_records_to_same_channel() {
+        use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+        // Loader-level coverage: candidate rows flow through the real SQL call
+        // path (bounded list queries, tenant resolution, channel scoping)
+        // instead of being fed to the scope helper directly.
+        let mut executor = FakeSqlExecutor::default();
+        register_summary_context_scope_fakes(&mut executor);
+        let mut store = SqlMeetingStore::new(executor);
+
+        let context = store
+            .load_summary_context("m1", "g1", None)
+            .expect("summary context should load");
+
+        assert_summary_context_scope(&context);
+        assert!(
+            context.speakers.is_empty(),
+            "no meeting speaker rows are registered for m1"
+        );
+        assert!(
+            context.summary_template.is_none(),
+            "no active summary template is registered"
+        );
     }
 }

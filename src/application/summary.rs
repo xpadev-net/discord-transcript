@@ -129,7 +129,10 @@ impl AgentOutputContract {
 
 pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
     AgentOutputContract::new("output/summary.md", "summary output", 1024 * 1024);
-const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
+/// Version of the context-selection policy that produced a summary's
+/// materialized context and its persisted markdown. Summaries persisted under
+/// an older policy are not served to channel viewers (see web.rs).
+pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {
