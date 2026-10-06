@@ -310,6 +310,7 @@ struct RecordingStopTeardownResult {
     summary_job_deferred: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stop_and_enqueue_summary_job_for_teardown<S, Q>(
     service: &mut BotCommandService<S>,
     queue: &mut Q,
@@ -5472,6 +5473,7 @@ impl ScaffoldHandler {
         Ok((stop_result, removed_session))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn leave_after_recording_stop(
         &self,
         ctx: &Context,
