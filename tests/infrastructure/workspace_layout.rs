@@ -375,6 +375,26 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
         ]
     );
 
+    let cursor_config = assert_agent_workspace_lockdown_configs(
+        &agent_root,
+        agent_workspace.cursor_config_path(),
+    );
+    assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
+    assert!(cursor_config.contains("Read(input/context/manifest.json)"));
+    assert!(cursor_config.contains("Write(output/summary.md)"));
+    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Asserts the deny-by-default lockdown config every agent workspace must
+/// materialize: Claude settings deny-list + hook/MCP shutdown, empty MCP
+/// servers, and the opencode permission tree. Returns the cursor cli.json
+/// contents so callers can additionally check harness-specific allow rules.
+fn assert_agent_workspace_lockdown_configs(
+    agent_root: &std::path::Path,
+    cursor_config_path: &std::path::Path,
+) -> String {
     let claude_settings: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(agent_root.join(".claude/settings.json"))
             .expect("claude settings"),
@@ -455,20 +475,15 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
         );
     }
 
-    let cursor_config = std::fs::read_to_string(agent_workspace.cursor_config_path())
-        .expect("cursor config");
-    assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
-    assert!(cursor_config.contains("Read(input/context/manifest.json)"));
-    assert!(cursor_config.contains("Write(output/summary.md)"));
+    let cursor_config =
+        std::fs::read_to_string(cursor_config_path).expect("cursor config");
     assert!(cursor_config.contains("Read(.env)"));
     assert!(cursor_config.contains("Read(.cursor/.cleanup-token)"));
     assert!(cursor_config.contains("Read(debug/**)"));
     assert!(cursor_config.contains("Read(../**)"));
     assert!(cursor_config.contains("Write(input/**)"));
     assert!(cursor_config.contains("Shell(*)"));
-    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
-
-    std::fs::remove_dir_all(&base).ok();
+    cursor_config
 }
 
 #[cfg(unix)]
@@ -518,6 +533,10 @@ fn ai_memory_agent_workspace_materializes_same_lockdown_configs() {
     assert!(agent_root.join("input/transcript/transcript_masked.md").is_file());
     assert!(agent_workspace.output_dir().is_dir());
     assert!(agent_workspace.cursor_config_path().is_file());
+    assert_agent_workspace_lockdown_configs(
+        &agent_root,
+        agent_workspace.cursor_config_path(),
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }
