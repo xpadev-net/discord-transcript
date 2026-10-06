@@ -1607,17 +1607,8 @@ describe("App access controls", () => {
     expect(screen.getByText("AIメモ")).toBeTruthy();
     expect(screen.queryByText("要約テンプレート")).toBeNull();
     expect(screen.queryByText("Discordロール権限")).toBeNull();
-    expect(
-      (
-        screen.getByRole("button", {
-          name: saveButtonName,
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: "更新" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expect(screen.queryByRole("button", { name: saveButtonName })).toBeNull();
+    expect(screen.queryByRole("button", { name: "更新" })).toBeNull();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/guild/domain-knowledge?include_archived=true",
@@ -1669,17 +1660,8 @@ describe("App access controls", () => {
     expect(screen.queryByText("ドメイン知識")).toBeNull();
     expect(screen.queryByText("AIメモ")).toBeNull();
     expect(screen.queryByText("Discordロール権限")).toBeNull();
-    expect(
-      (
-        screen.getByRole("button", {
-          name: saveButtonName,
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: "更新" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expect(screen.queryByRole("button", { name: saveButtonName })).toBeNull();
+    expect(screen.queryByRole("button", { name: "更新" })).toBeNull();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/guild/summary-templates?include_archived=true",

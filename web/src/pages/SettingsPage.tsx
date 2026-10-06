@@ -2518,7 +2518,7 @@ export function SettingsPage({
 
       {message ? <output className="settings-success">{message}</output> : null}
 
-      {form ? (
+      {form && canEdit ? (
         <form className="settings-form" onSubmit={handleSubmit}>
           <section className="settings-section">
             <h2>{"\u8981\u7d04"}</h2>
@@ -3967,7 +3967,7 @@ export function SettingsPage({
         </section>
       ) : null}
 
-      {settings ? (
+      {settings && canEdit ? (
         <section className="settings-section">
           <h2>{"Discord Bot"}</h2>
           <div className="settings-token-status-row">
