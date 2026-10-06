@@ -13,7 +13,9 @@ COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 JOB_HEADER_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(#.*)?$")
 PATH_FILTER_RE = re.compile(r"^\s*paths(?:-ignore)?:\s*")
 DOCKER_BUILD_COMMAND = "docker buildx build"
-DOCKER_PUSH_COMMANDS = ("docker push", "docker image push")
+DOCKER_PUSH_IN_COMMAND_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:sudo\s+)?docker\s+(?:image\s+)?push(?:\s|$)"
+)
 
 
 def read_repo_file(path: str) -> str:
@@ -154,12 +156,22 @@ def step_has_if_guard(step: str) -> bool:
     )
 
 
+def command_invokes_docker_push(command: str) -> bool:
+    # Parse as shell first so `sh -c "docker push ..."`, inline comments and
+    # quoted strings resolve to their real tokens; fall back to raw words.
+    try:
+        words = shlex.split(command, comments=True)
+    except ValueError:
+        words = command.split()
+    return bool(DOCKER_PUSH_IN_COMMAND_RE.search(" ".join(words)))
+
+
 def docker_push_command_lines(job: str, start_line: int) -> list[str]:
     lines: list[str] = []
 
     for offset, line in enumerate(job.splitlines()):
         command = workflow_shell_command(line)
-        if any(command.startswith(push_command) for push_command in DOCKER_PUSH_COMMANDS):
+        if command_invokes_docker_push(command):
             lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {line.strip()}")
 
     return lines
