@@ -158,6 +158,36 @@ pub fn migration_transaction_sql(migration: Migration) -> String {
     )
 }
 
+/// Statements to execute for a migration, in order. Most migrations run as
+/// one transactional batch. A migration containing `CONCURRENTLY` (e.g.
+/// `CREATE INDEX CONCURRENTLY`) cannot run inside a transaction — not even
+/// the implicit one wrapping multi-statement simple queries — so each of
+/// its `;`-terminated statements executes separately and the version row
+/// is recorded last.
+pub fn migration_statements(migration: Migration) -> Vec<String> {
+    if !migration.sql.contains("CONCURRENTLY") {
+        return vec![migration_transaction_sql(migration)];
+    }
+    let mut statements: Vec<String> = migration
+        .sql
+        .split(";\n")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part.ends_with(';') {
+                part.to_owned()
+            } else {
+                format!("{part};")
+            }
+        })
+        .collect();
+    statements.push(format!(
+        "INSERT INTO schema_migrations (version) VALUES ({}) ON CONFLICT (version) DO NOTHING;",
+        sql_literal(migration.version),
+    ));
+    statements
+}
+
 /// Incremental migrations applied after the initial schema.
 /// Each statement must be idempotent (IF NOT EXISTS / IF EXISTS).
 pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(

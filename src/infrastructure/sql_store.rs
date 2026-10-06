@@ -48,7 +48,7 @@ use crate::infrastructure::sql::{
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
     UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
     UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
-    migration_transaction_sql,
+    migration_statements,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -368,8 +368,10 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         {
             return Ok(());
         }
-        self.executor
-            .run_migration(&migration_transaction_sql(migration))
+        for statement in migration_statements(migration) {
+            self.executor.run_migration(&statement)?;
+        }
+        Ok(())
     }
 
     fn map_active_meeting_insert_error(

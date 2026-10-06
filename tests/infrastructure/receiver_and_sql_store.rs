@@ -557,18 +557,19 @@ fn pending_migrations_apply_and_record_unseen_versions() {
         store.executor.executed.last().expect("unlock").0,
         UNLOCK_SCHEMA_MIGRATIONS_SQL
     );
+    // Every migration ends by recording its version row — transactional
+    // migrations do so inside the batch, non-transactional ones (e.g.
+    // CREATE INDEX CONCURRENTLY) as their own final statement.
     let applied_sql: Vec<&str> = store
         .executor
         .executed
         .iter()
         .map(|(sql, _)| sql.as_str())
-        .filter(|sql| sql.starts_with("BEGIN;"))
+        .filter(|sql| sql.contains("INSERT INTO schema_migrations (version)"))
         .collect();
     assert_eq!(applied_sql.len(), MIGRATIONS.len());
     assert!(applied_sql[0].contains("CREATE TABLE IF NOT EXISTS meetings"));
-    assert!(applied_sql[0].contains(
-        "INSERT INTO schema_migrations (version) VALUES ('0001_mvp_schema')"
-    ));
+    assert!(applied_sql[0].contains("VALUES ('0001_mvp_schema')"));
 }
 
 #[test]
