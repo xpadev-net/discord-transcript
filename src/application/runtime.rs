@@ -294,6 +294,7 @@ where
         caller_role,
         expected_meeting_id,
         reason,
+        false,
     )
     .map(|result| result.stop_result)
     .map_err(|err| err.to_string())
@@ -303,6 +304,10 @@ where
 struct RecordingStopTeardownResult {
     stop_result: crate::application::bot::StopCommandResult,
     summary_job_enqueued: bool,
+    /// The summary job was deliberately not enqueued because the final audio
+    /// flush failed; the caller must enqueue it only after the tail flush
+    /// saves the pending chunks (or mark the meeting failed).
+    summary_job_deferred: bool,
 }
 
 fn stop_and_enqueue_summary_job_for_teardown<S, Q>(
@@ -313,6 +318,7 @@ fn stop_and_enqueue_summary_job_for_teardown<S, Q>(
     caller_role: UserRole,
     expected_meeting_id: Option<&str>,
     reason: StopReason,
+    defer_summary_enqueue: bool,
 ) -> Result<RecordingStopTeardownResult, TeardownStopError>
 where
     S: MeetingStore,
@@ -385,9 +391,20 @@ where
             return Ok(RecordingStopTeardownResult {
                 stop_result,
                 summary_job_enqueued: false,
+                summary_job_deferred: false,
             });
         }
         let job_id = format!("summary-{}", stop_result.meeting_id);
+        if defer_summary_enqueue {
+            // A failed final flush leaves chunks only in memory; the job must
+            // not become claimable until the post-leave tail flush saves them
+            // (or the meeting is marked failed after the audio is lost).
+            return Ok(RecordingStopTeardownResult {
+                stop_result,
+                summary_job_enqueued: false,
+                summary_job_deferred: true,
+            });
+        }
         match enqueue_summary_job(queue, &job_id, &stop_result.meeting_id) {
             Ok(()) => {
                 info!(
@@ -408,12 +425,14 @@ where
         return Ok(RecordingStopTeardownResult {
             stop_result,
             summary_job_enqueued: true,
+            summary_job_deferred: false,
         });
     }
 
     Ok(RecordingStopTeardownResult {
         stop_result,
         summary_job_enqueued: false,
+        summary_job_deferred: false,
     })
 }
 
@@ -934,6 +953,82 @@ fn mark_stopped_recording_failed_after_audio_loss<S: MeetingStore>(
         }
     }
     Ok(())
+}
+
+/// Outcome of the post-leave bookkeeping for a stopped recording.
+#[derive(Debug)]
+enum StoppedRecordingFinalize {
+    /// Tail flush saved the pending chunks and any deferred job is enqueued.
+    Done,
+    /// Tail flush succeeded but the deferred summary job could not be enqueued.
+    DeferredEnqueueFailed(String),
+    /// The tail flush failed; the meeting was marked failed, or the mark
+    /// failed and a background retry must record the loss.
+    AudioLost {
+        error_message: String,
+        mark_retry_needed: bool,
+    },
+}
+
+/// Persist the outcome of a stopped recording's post-leave tail flush.
+/// When the summary job was deferred because the pre-leave flush failed, it is
+/// enqueued only after the tail flush confirms the chunks were saved; a failed
+/// tail flush marks the meeting failed instead so lost audio is never claimed
+/// by a summary worker.
+fn finalize_stopped_recording_after_flush<S, Q>(
+    service: &mut BotCommandService<S>,
+    queue: &mut Q,
+    meeting_id: &str,
+    summary_job_deferred: bool,
+    tail_flush_error: Option<String>,
+    phase: &str,
+) -> StoppedRecordingFinalize
+where
+    S: MeetingStore,
+    Q: crate::infrastructure::queue::JobQueue,
+{
+    match tail_flush_error {
+        Some(err) => {
+            let error_message = format!("tail audio flush incomplete after {phase}: {err}");
+            let mark_retry_needed = mark_stopped_recording_failed_after_audio_loss(
+                &mut service.store,
+                meeting_id,
+                &error_message,
+            )
+            .is_err();
+            StoppedRecordingFinalize::AudioLost {
+                error_message,
+                mark_retry_needed,
+            }
+        }
+        None => {
+            if !summary_job_deferred {
+                return StoppedRecordingFinalize::Done;
+            }
+            let job_id = format!("summary-{meeting_id}");
+            match enqueue_summary_job(queue, &job_id, meeting_id) {
+                Ok(()) => {
+                    info!(
+                        meeting_id = %meeting_id,
+                        job_id = %job_id,
+                        "summary job enqueued after tail flush"
+                    );
+                    StoppedRecordingFinalize::Done
+                }
+                Err(crate::application::worker::WorkerError::AlreadyExists) => {
+                    debug!(
+                        meeting_id = %meeting_id,
+                        job_id = %job_id,
+                        "summary job already exists after tail flush"
+                    );
+                    StoppedRecordingFinalize::Done
+                }
+                Err(err) => StoppedRecordingFinalize::DeferredEnqueueFailed(format!(
+                    "failed to enqueue summary job after tail flush: {err}"
+                )),
+            }
+        }
+    }
 }
 
 fn mark_recording_start_failed_after_setup_error<S: MeetingStore>(
@@ -4500,6 +4595,7 @@ impl EventHandler for ScaffoldHandler {
                                     &guild_for_task,
                                     expected_meeting_id_ref,
                                     "auto-stop",
+                                    result.summary_job_deferred,
                                     removed_session,
                                     reset_guard,
                                 )
@@ -5293,6 +5389,7 @@ impl ScaffoldHandler {
         ),
         RecordingTeardownError,
     > {
+        let mut final_flush_failed = false;
         {
             let _voice_event_guard = self.voice_event_gate.write().await;
             let tracker = {
@@ -5313,6 +5410,7 @@ impl ScaffoldHandler {
                 if let Err(err) =
                     flush_session_for_teardown(session, request.guild_key, request.phase)
                 {
+                    final_flush_failed = true;
                     warn!(
                         guild_id = %request.guild_key,
                         meeting_id = %request.expected_meeting_id,
@@ -5338,6 +5436,7 @@ impl ScaffoldHandler {
                 request.caller_role,
                 Some(request.expected_meeting_id),
                 request.reason,
+                final_flush_failed,
             )
             .map_err(RecordingTeardownError::Stop)?
         };
@@ -5379,6 +5478,7 @@ impl ScaffoldHandler {
         guild_key: &str,
         meeting_id: &str,
         phase: &str,
+        summary_job_deferred: bool,
         mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
         _reset_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), String> {
@@ -5410,41 +5510,144 @@ impl ScaffoldHandler {
             session.persist_ssrc_mapping(&final_tracker);
         }
 
-        if let Some(err) = tail_flush_error {
-            let error_message = format!("tail audio flush incomplete after {phase}: {err}");
-            {
-                let mut service = self.service.lock().await;
-                mark_stopped_recording_failed_after_audio_loss(
-                    &mut service.store,
-                    meeting_id,
-                    &error_message,
-                )
-                .map_err(|mark_err| {
-                    format!("{error_message}; failed to mark meeting failed: {mark_err}")
-                })?;
-            }
-            if let Err(status_err) = self
-                .update_status_message(
-                    &ctx.http,
-                    meeting_id,
-                    StatusMessageUpdate::Failed {
+        let finalize = {
+            let mut service = self.service.lock().await;
+            let mut queue = self.queue.lock().await;
+            finalize_stopped_recording_after_flush(
+                &mut service,
+                &mut *queue,
+                meeting_id,
+                summary_job_deferred,
+                tail_flush_error,
+                phase,
+            )
+        };
+        match finalize {
+            StoppedRecordingFinalize::Done => Ok(()),
+            StoppedRecordingFinalize::DeferredEnqueueFailed(err) => Err(err),
+            StoppedRecordingFinalize::AudioLost {
+                error_message,
+                mark_retry_needed,
+            } => {
+                if mark_retry_needed {
+                    warn!(
+                        guild_id = %guild_key,
+                        meeting_id = %meeting_id,
+                        "failed to record audio loss; retrying in background"
+                    );
+                    self.spawn_stopped_audio_loss_mark_retry(
+                        Arc::clone(&ctx.http),
+                        guild_key,
+                        meeting_id,
                         phase,
-                        error: &error_message,
-                    },
-                )
-                .await
-            {
-                warn!(
-                    guild_id = %guild_key,
-                    meeting_id,
-                    error = %status_err,
-                    "failed to update status message after stopped recording audio loss"
-                );
+                        error_message.clone(),
+                    );
+                }
+                if let Err(status_err) = self
+                    .update_status_message(
+                        &ctx.http,
+                        meeting_id,
+                        StatusMessageUpdate::Failed {
+                            phase,
+                            error: &error_message,
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        guild_id = %guild_key,
+                        meeting_id,
+                        error = %status_err,
+                        "failed to update status message after stopped recording audio loss"
+                    );
+                }
+                Err(error_message)
             }
-            return Err(error_message);
         }
+    }
 
-        Ok(())
+    /// The audio-loss record is the only durable trace that chunks were
+    /// dropped; keep retrying it in the background so a transient store
+    /// failure cannot leave the meeting stuck in Stopping with the loss
+    /// unrecorded. Runs after voice leave, so no voice resources are held.
+    fn spawn_stopped_audio_loss_mark_retry(
+        &self,
+        http: Arc<Http>,
+        guild_key: &str,
+        meeting_id: &str,
+        phase: &str,
+        error_message: String,
+    ) {
+        let handler = self.clone();
+        let guild_key = guild_key.to_owned();
+        let meeting_id = meeting_id.to_owned();
+        let phase = phase.to_owned();
+        self.spawn_background(async move {
+            let policy = handler.integration_retry_policy;
+            let multiplier = policy.backoff_multiplier.max(1);
+            let mut delay = policy.initial_delay;
+            for attempt in 1..=policy.max_attempts {
+                sleep(delay).await;
+                let mark_result = {
+                    let mut service = handler.service.lock().await;
+                    mark_stopped_recording_failed_after_audio_loss(
+                        &mut service.store,
+                        &meeting_id,
+                        &error_message,
+                    )
+                };
+                match mark_result {
+                    Ok(()) => {
+                        info!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            attempt,
+                            "recorded audio loss after stopped-recording retry"
+                        );
+                        if let Err(status_err) = handler
+                            .update_status_message(
+                                &http,
+                                &meeting_id,
+                                StatusMessageUpdate::Failed {
+                                    phase: &phase,
+                                    error: &error_message,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                guild_id = %guild_key,
+                                meeting_id = %meeting_id,
+                                error = %status_err,
+                                "failed to update status message after retried audio-loss mark"
+                            );
+                        }
+                        return;
+                    }
+                    Err(err) if attempt < policy.max_attempts => {
+                        warn!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            attempt,
+                            error = %err,
+                            "audio-loss mark retry failed; retrying"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "audio-loss mark retries exhausted"
+                        );
+                    }
+                }
+                delay = delay
+                    .checked_mul(multiplier)
+                    .unwrap_or(policy.max_delay)
+                    .min(policy.max_delay);
+            }
+        });
     }
 
     async fn remove_local_recording_state_after_terminal_absence(
@@ -6466,6 +6669,7 @@ impl ScaffoldHandler {
         let (
             stop_result,
             summary_job_enqueued,
+            summary_job_deferred,
             removed_session,
             authorized_meeting_id,
             reset_guard,
@@ -6516,10 +6720,12 @@ impl ScaffoldHandler {
                 .map_err(|err| err.to_string())?;
             let reset_guard = Arc::clone(&self.ssrc_tracker_reset_gate).lock_owned().await;
             let summary_job_enqueued = stop_result.summary_job_enqueued;
+            let summary_job_deferred = stop_result.summary_job_deferred;
             let stop_result = stop_result.stop_result;
             (
                 stop_result,
                 summary_job_enqueued,
+                summary_job_deferred,
                 removed_session,
                 authorized_meeting_id,
                 reset_guard,
@@ -6530,6 +6736,7 @@ impl ScaffoldHandler {
             &guild_key,
             &authorized_meeting_id,
             "manual stop",
+            summary_job_deferred,
             removed_session,
             reset_guard,
         )
@@ -9125,6 +9332,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             &guild_key,
                                             expected_meeting_id_ref,
                                             "driver disconnect",
+                                            result.summary_job_deferred,
                                             removed_session,
                                             reset_guard,
                                         )
@@ -12701,6 +12909,7 @@ mod status_message_tests {
             UserRole::BotAdmin,
             Some("m1"),
             StopReason::AutoEmpty,
+            false,
         )
         .expect_err("missing active meeting should be typed as target absence");
 
@@ -12757,6 +12966,7 @@ mod status_message_tests {
             UserRole::BotAdmin,
             Some("m1"),
             StopReason::AutoEmpty,
+            false,
         )
         .expect("summary-disabled teardown should stop cleanly");
 
@@ -12778,6 +12988,131 @@ mod status_message_tests {
         assert_eq!(
             meeting.duration_seconds,
             Some(recording_duration_seconds(&meeting).unwrap())
+        );
+    }
+
+    #[test]
+    fn deferred_summary_job_waits_for_successful_tail_flush() {
+        let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut service = BotCommandService::new(store);
+        service
+            .handle_record_start(StartCommandInput {
+                meeting_id: "m1".to_owned(),
+                guild_id: "g1".to_owned(),
+                user_id: "u1".to_owned(),
+                command_channel_id: "tc1".to_owned(),
+                user_voice_channel_id: Some("vc1".to_owned()),
+                user_voice_channel_name: None,
+                permissions: PermissionSet {
+                    can_connect_voice: true,
+                    can_send_messages: true,
+                },
+                caller_role: UserRole::GuildAdmin,
+                effective_settings: None,
+            })
+            .expect("recording should start");
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+
+        let result = stop_and_enqueue_summary_job_for_teardown(
+            &mut service,
+            &mut queue,
+            "g1",
+            "u1",
+            UserRole::BotAdmin,
+            Some("m1"),
+            StopReason::Manual,
+            true,
+        )
+        .expect("teardown should succeed while the summary job is deferred");
+
+        assert!(result.summary_job_deferred);
+        assert!(!result.summary_job_enqueued);
+        assert!(
+            queue.get("summary-m1").is_none(),
+            "deferred job must not be claimable while chunks are only in memory"
+        );
+
+        match finalize_stopped_recording_after_flush(
+            &mut service,
+            &mut queue,
+            "m1",
+            result.summary_job_deferred,
+            None,
+            "manual stop",
+        ) {
+            StoppedRecordingFinalize::Done => {}
+            other => panic!("successful tail flush should finalize cleanly: {other:?}"),
+        }
+        assert!(
+            queue.get("summary-m1").is_some(),
+            "deferred job must become claimable once the tail flush saves the chunks"
+        );
+    }
+
+    #[test]
+    fn tail_flush_failure_marks_meeting_failed_without_summary_job() {
+        let store = crate::infrastructure::storage::InMemoryMeetingStore::new();
+        let mut service = BotCommandService::new(store);
+        service
+            .handle_record_start(StartCommandInput {
+                meeting_id: "m1".to_owned(),
+                guild_id: "g1".to_owned(),
+                user_id: "u1".to_owned(),
+                command_channel_id: "tc1".to_owned(),
+                user_voice_channel_id: Some("vc1".to_owned()),
+                user_voice_channel_name: None,
+                permissions: PermissionSet {
+                    can_connect_voice: true,
+                    can_send_messages: true,
+                },
+                caller_role: UserRole::GuildAdmin,
+                effective_settings: None,
+            })
+            .expect("recording should start");
+        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
+
+        let result = stop_and_enqueue_summary_job_for_teardown(
+            &mut service,
+            &mut queue,
+            "g1",
+            "u1",
+            UserRole::BotAdmin,
+            Some("m1"),
+            StopReason::Manual,
+            true,
+        )
+        .expect("teardown should succeed while the summary job is deferred");
+        assert!(result.summary_job_deferred);
+
+        match finalize_stopped_recording_after_flush(
+            &mut service,
+            &mut queue,
+            "m1",
+            result.summary_job_deferred,
+            Some("failed to persist 1 tail audio chunk".to_owned()),
+            "manual stop",
+        ) {
+            StoppedRecordingFinalize::AudioLost {
+                error_message,
+                mark_retry_needed,
+            } => {
+                assert!(
+                    !mark_retry_needed,
+                    "a successful mark should not request a retry"
+                );
+                assert!(error_message.contains("tail audio flush incomplete"));
+            }
+            other => panic!("expected audio-loss resolution, got {other:?}"),
+        }
+        let meeting = service
+            .store
+            .get_meeting("m1")
+            .expect("meeting lookup should succeed")
+            .expect("meeting should remain");
+        assert_eq!(meeting.status, MeetingStatus::Failed);
+        assert!(
+            queue.get("summary-m1").is_none(),
+            "no summary job may be enqueued when the tail audio is lost"
         );
     }
 
@@ -12816,6 +13151,7 @@ mod status_message_tests {
                 UserRole::BotAdmin,
                 Some(meeting_id),
                 reason,
+                false,
             )
             .expect("stop should finalize timing metadata");
 
