@@ -14,7 +14,27 @@ JOB_HEADER_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\s*(#.*)?$")
 PATH_FILTER_RE = re.compile(r"^\s*paths(?:-ignore)?:\s*")
 DOCKER_BUILD_COMMAND = "docker buildx build"
 RUN_PREFIXES = ("run:", "- run:")
-RUN_BLOCK_MARKERS = {"|", ">", "|-", ">-", "|+", ">+"}
+# YAML block scalar headers: `|`/`>` plus optional chomping/indentation
+# indicators and trailing comments (`run: |`, `run: >-`, `run: |2`,
+# `run: | # build image`).
+RUN_BLOCK_RE = re.compile(r"^[|>][+\-0-9]*\s*(?:#.*)?$")
+# Programs that hand their remaining arguments to another command.
+COMMAND_WRAPPERS = {
+    "builtin", "chroot", "command", "doas", "env", "exec", "ionice", "nice",
+    "nohup", "setsid", "stdbuf", "sudo", "time", "timeout", "watch", "xargs",
+}
+# Programs whose `-c` (or combined short option containing c) argument is
+# executed as a command string.
+COMMAND_STRING_PROGRAMS = {
+    "ash", "bash", "busybox", "dash", "ksh", "mksh", "sh", "su", "yash", "zsh",
+}
+ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+WRAPPER_VALUE_TOKEN_RE = re.compile(r"^[0-9]+(\.[0-9]+)?[A-Za-z]*$")
+SINGLE_DASH_CLUSTER_RE = re.compile(r"^-[a-zA-Z]+$")
+# docker global options that take a separate value before the subcommand.
+DOCKER_VALUE_FLAGS = {
+    "-H", "--host", "-l", "--log-level", "-c", "--context", "--config",
+}
 # Characters that always separate shell words, so `docker(push)`-style
 # lookalikes cannot hide a push at a word edge.
 SHELL_WORD_EDGE_CHARS = ";&|()"
@@ -190,32 +210,161 @@ def strip_shell_comment(command: str) -> str:
     return command
 
 
-def words_invoke_docker_push(words: list[str]) -> bool:
-    normalized = [word.strip(SHELL_WORD_EDGE_CHARS) for word in words]
-    for index, word in enumerate(normalized):
-        if word != "docker":
+def split_shell_segments(command: str) -> list[str]:
+    """Split a shell line into command segments at unquoted operators.
+
+    `;`, `&`, `|`, `||`, `&&`, newlines, parentheses, and backticks all end
+    a command even without surrounding whitespace, so `.;docker push`
+    yields a `docker push` segment.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if in_single:
+            if char == "'":
+                in_single = False
+            current.append(char)
+        elif in_double:
+            if char == "\\":
+                current.append(char)
+                index += 1
+                if index < len(command):
+                    current.append(command[index])
+            else:
+                if char == '"':
+                    in_double = False
+                current.append(char)
+        elif char == "'":
+            in_single = True
+            current.append(char)
+        elif char == '"':
+            in_double = True
+            current.append(char)
+        elif char == "\\":
+            current.append(char)
+            index += 1
+            if index < len(command):
+                current.append(command[index])
+        elif char in ";&|()\n`":
+            segments.append("".join(current))
+            current = []
+            while index + 1 < len(command) and command[index + 1] in ";&|":
+                index += 1
+        else:
+            current.append(char)
+        index += 1
+    segments.append("".join(current))
+    return segments
+
+
+def command_word(word: str) -> str:
+    return word.rsplit("/", 1)[-1] if word else ""
+
+
+def command_start_indices(words: list[str]) -> list[int]:
+    """Indices where a new command can start inside one shell segment.
+
+    Only words in command position are checked, so `echo docker push`
+    stays inert while `sudo`, `env`, `timeout 5`, or `VAR=value` prefixes
+    still reveal the docker invocation that follows them.
+    """
+    starts: list[int] = []
+    index = 0
+    while index < len(words) and ENV_ASSIGN_RE.match(words[index]):
+        index += 1
+    if index < len(words):
+        starts.append(index)
+    while index < len(words):
+        if command_word(words[index]) not in COMMAND_WRAPPERS:
+            index += 1
             continue
-        rest = normalized[index + 1 : index + 3]
-        if rest[:1] == ["push"] or rest[:2] == ["image", "push"]:
+        index += 1
+        # Skip wrapper options plus their values and value-like tokens
+        # (e.g. `timeout 5`, `nice -n 5`, `env FOO=1`) until the command.
+        while index < len(words) and (
+            (words[index].startswith("-") and words[index] != "-")
+            or ENV_ASSIGN_RE.match(words[index])
+            or WRAPPER_VALUE_TOKEN_RE.match(words[index])
+        ):
+            index += 1
+        if index < len(words):
+            starts.append(index)
+    return starts
+
+
+def words_invoke_docker_push(words: list[str]) -> bool:
+    for start in command_start_indices(words):
+        if start >= len(words) or command_word(words[start]) != "docker":
+            continue
+        index = start + 1
+        while index < len(words):
+            token = words[index]
+            if token in DOCKER_VALUE_FLAGS:
+                index += 2
+            elif token.startswith("-") and token != "-":
+                index += 1
+            else:
+                break
+        tail = words[index : index + 2]
+        if tail[:1] == ["push"] or tail[:2] == ["image", "push"]:
             return True
     return False
 
 
-def command_invokes_docker_push(command: str) -> bool:
-    comment_stripped = strip_shell_comment(command)
-    try:
-        words = shlex.split(comment_stripped)
-    except ValueError:
-        words = comment_stripped.split()
-    if words_invoke_docker_push(words):
-        return True
-    # Command-string wrappers keep the invocation inside one quoted word;
-    # only arguments of shell-eval flags are executed, so only those get a
-    # nested scan — quoted display text elsewhere stays inert.
+def nested_command_invokes_docker_push(words: list[str], depth: int) -> bool:
+    """Scan for command strings passed to shell-style programs.
+
+    `sh -c 'cmd'`, `bash -lc 'cmd'`, `su -c 'cmd'`, and `eval 'cmd'` all
+    execute a nested command; combined short-option clusters like `-lc`
+    count because the trailing `c` consumes the next argument.
+    """
     for index, word in enumerate(words):
-        if word == "-c" and index + 1 < len(words):
-            if command_invokes_docker_push(words[index + 1]):
+        head = command_word(word)
+        if head == "eval":
+            for argument in words[index + 1 :]:
+                if command_invokes_docker_push(argument, depth + 1):
+                    return True
+            continue
+        if head not in COMMAND_STRING_PROGRAMS:
+            continue
+        for cursor in range(index + 1, len(words)):
+            token = words[cursor]
+            if token.startswith("--") or not SINGLE_DASH_CLUSTER_RE.match(token):
+                continue
+            cluster = token[1:]
+            if "c" not in cluster:
+                continue
+            nested = cluster.split("c", 1)[1]
+            if not nested:
+                if cursor + 1 >= len(words):
+                    continue
+                nested = words[cursor + 1]
+            if command_invokes_docker_push(nested, depth + 1):
                 return True
+    return False
+
+
+def command_invokes_docker_push(command: str, depth: int = 0) -> bool:
+    if depth > 4:
+        return False
+    comment_stripped = strip_shell_comment(command)
+    for segment in split_shell_segments(comment_stripped):
+        if not segment.strip():
+            continue
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        if words_invoke_docker_push(words):
+            return True
+        # Quoted command strings stay inert unless they are the argument a
+        # shell-style program executes, so only those get a nested scan.
+        if nested_command_invokes_docker_push(words, depth):
+            return True
     return False
 
 
@@ -228,8 +377,10 @@ def docker_push_command_lines(job: str, start_line: int) -> list[str]:
         stripped = line.strip()
         indent = len(line) - len(line.lstrip())
         if run_block_indent is not None:
+            if not stripped:
+                continue  # blank lines stay inside a block scalar
             if indent > run_block_indent:
-                if stripped and command_invokes_docker_push(stripped):
+                if command_invokes_docker_push(stripped):
                     lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {stripped}")
                 continue
             run_block_indent = None
@@ -237,7 +388,7 @@ def docker_push_command_lines(job: str, start_line: int) -> list[str]:
             if not stripped.startswith(prefix):
                 continue
             command = stripped.removeprefix(prefix).strip().strip("\"'")
-            if not command or command in RUN_BLOCK_MARKERS:
+            if not command or RUN_BLOCK_RE.match(command):
                 run_block_indent = indent
             elif command_invokes_docker_push(command):
                 lines.append(f"{CI_WORKFLOW}:{start_line + offset}: {stripped}")
@@ -401,16 +552,37 @@ def self_test_command_invokes_docker_push() -> None:
         "sh -c 'docker buildx build --load . && docker push example/image:latest'",
         "docker buildx build --build-arg URL=https://example.test/#fragment --load . && docker push example/image:latest",
         "docker buildx build --load . && docker push example/image:latest # publish",
+        "docker buildx build --target production --load .;docker push example/image:latest",
+        "docker buildx build --load . ;docker push example/image:latest",
+        "bash -lc 'docker push example/image:latest'",
+        "bash -ec 'docker push example/image:latest'",
+        "su -c 'docker push example/image:latest'",
+        "eval 'docker push example/image:latest'",
+        "time docker push example/image:latest",
+        "timeout 60 docker push example/image:latest",
+        "env FOO=1 docker push example/image:latest",
+        "nice -n 5 docker push example/image:latest",
+        "FOO=bar docker push example/image:latest",
+        "$(docker push example/image:latest)",
+        "`docker push example/image:latest`",
+        "/usr/bin/docker push example/image:latest",
+        "docker --log-level debug push example/image:latest",
+        "docker image push --all-tags example/image",
     ]
     inert_cases = [
         "docker buildx build --target production --load .",
         "echo 'docker push example/image:latest'",
         'echo "docker push example/image:latest"',
+        "echo docker push example/image:latest",
         "docker push-notify example/image:latest",
         "docker image prune --force",
         "echo done # docker push example/image:latest",
         "echo done; # docker push example/image:latest",
         "docker buildx build --build-arg URL=https://example.test/#fragment --load .",
+        "bash -lc 'echo docker push example/image:latest'",
+        "docker run alpine sh -c 'echo docker push example/image:latest'",
+        "grep -c docker /var/log/build.log",
+        "timeout 5 echo docker push example/image:latest",
     ]
     for command in invokes_cases:
         assert command_invokes_docker_push(command), (
@@ -420,6 +592,37 @@ def self_test_command_invokes_docker_push() -> None:
         assert not command_invokes_docker_push(command), (
             f"expected no docker push: {command}"
         )
+
+
+def self_test_docker_push_command_lines() -> None:
+    sneaky_job = """
+      - name: build and push
+        run: | # build image
+          docker buildx build --load .
+
+          docker push example/image:latest
+      - name: indented push
+        run: |2
+          docker push example/image:latest
+    """
+    detected = docker_push_command_lines(sneaky_job, 1)
+    assert len(detected) == 2, (
+        f"expected both pushes to be detected despite comments/blank lines: {detected}"
+    )
+
+    safe_job = """
+      - name: build
+        run: |
+          docker buildx build --target production --load .
+      - name: docs
+        run: echo 'docker push example/image:latest'
+      - name: notes
+        run: >
+          explains how docker push works
+    """
+    assert not docker_push_command_lines(safe_job, 1), (
+        "expected quoted/displayed text and non-push lines to stay inert"
+    )
 
 
 def assert_ci_runs_postgres_sql_contract_smoke() -> None:
@@ -442,6 +645,7 @@ def assert_ci_runs_postgres_sql_contract_smoke() -> None:
 
 def main() -> None:
     self_test_command_invokes_docker_push()
+    self_test_docker_push_command_lines()
     assert_workflow_actions_are_sha_pinned()
     assert_ci_runs_pr_docker_build_without_push()
     assert_ci_runs_postgres_sql_contract_smoke()
