@@ -10790,13 +10790,9 @@ async fn api_update_guild_bot_token(
         .auth
         .as_ref()
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
-    require_current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        &user_id,
-        RbacPermission::SettingsManage,
-    )
-    .await
-    .map_err(|status| status.into_response())?;
+    require_current_user_is_guild_admin_for_settings_recovery(&state, &user_id)
+        .await
+        .map_err(|status| status.into_response())?;
     let token = normalize_guild_bot_token_update(&request).map_err(|status| {
         api_error_response(
             status,
@@ -13661,16 +13657,6 @@ mod guild_api_tests {
             assert!(!section.contains("RbacPermission::SettingsManage"));
         }
 
-        fn assert_current_settings_manage_handler(section: &str, operation_marker: &str) {
-            assert!(section.contains("require_current_user_has_rbac_permission"));
-            assert!(section.contains("RbacPermission::SettingsManage"));
-            assert!(
-                marker_index(section, "require_current_user_has_rbac_permission")
-                    < marker_index(section, operation_marker)
-            );
-            assert!(!section.contains("require_current_user_is_guild_admin"));
-        }
-
         fn assert_sensitive_target_handler(section: &str, operation_marker: &str) {
             assert!(section.contains("require_user_is_target_guild_admin"));
             assert!(
@@ -13746,7 +13732,7 @@ mod guild_api_tests {
             ),
             "load_guild_settings",
         );
-        assert_current_settings_manage_handler(
+        assert_sensitive_current_handler(
             handler_section(
                 source,
                 "async fn api_update_guild_bot_token",
@@ -14070,7 +14056,7 @@ mod guild_api_tests {
             "async fn api_delete_guild_bot_token",
         );
         assert!(
-            marker_index(bot_token_update, "require_current_user_has_rbac_permission")
+            marker_index(bot_token_update, "require_current_user_is_guild_admin")
                 < marker_index(bot_token_update, "normalize_guild_bot_token_update")
         );
 
@@ -15345,7 +15331,7 @@ mod guild_api_tests {
                 "async fn api_update_guild_bot_token",
                 "async fn api_delete_guild_bot_token",
             )
-            .contains("require_current_user_has_rbac_permission_for_settings_recovery")
+            .contains("require_current_user_is_guild_admin_for_settings_recovery")
         );
         assert!(
             handler_section(
