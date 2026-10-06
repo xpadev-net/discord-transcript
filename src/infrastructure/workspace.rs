@@ -31,8 +31,12 @@ pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
 pub const AGENT_INPUT_DIR: &str = "input";
 pub const AGENT_OUTPUT_DIR: &str = "output";
 pub const AGENT_CURSOR_DIR: &str = ".cursor";
+pub const AGENT_CLAUDE_DIR: &str = ".claude";
 pub const AGENT_WORKSPACE_PARENT_DIR: &str = "agent";
 pub const AGENT_CURSOR_CONFIG_FILENAME: &str = "cli.json";
+pub const AGENT_CLAUDE_SETTINGS_FILENAME: &str = "settings.json";
+pub const AGENT_CLAUDE_MCP_CONFIG_FILENAME: &str = "mcp_servers.json";
+pub const AGENT_OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
 pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
 
 #[cfg(unix)]
@@ -156,6 +160,23 @@ struct CursorCliConfig {
 #[derive(Debug, Serialize)]
 struct CursorPermissions {
     allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeSettingsConfig {
+    permissions: ClaudePermissions,
+    #[serde(rename = "disableAllHooks")]
+    disable_all_hooks: bool,
+    #[serde(rename = "enableAllProjectMcpServers")]
+    enable_all_project_mcp_servers: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudePermissions {
+    allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ask: Vec<String>,
     deny: Vec<String>,
 }
 
@@ -516,6 +537,15 @@ impl AgentWorkspaceBuilder {
             allowed_reads,
             permission_path(expected_output_relative),
         )?;
+        write_claude_settings_config(
+            &self.agent_root,
+            Path::new(AGENT_CLAUDE_DIR).join(AGENT_CLAUDE_SETTINGS_FILENAME),
+        )?;
+        write_claude_mcp_config(
+            &self.agent_root,
+            Path::new(AGENT_CLAUDE_DIR).join(AGENT_CLAUDE_MCP_CONFIG_FILENAME),
+        )?;
+        write_opencode_config(&self.agent_root, Path::new(AGENT_OPENCODE_CONFIG_FILENAME))?;
 
         Ok(AgentWorkspace {
             root: self.agent_root,
@@ -1066,9 +1096,7 @@ fn create_new_file_under_agent_root(
         Ok(unsafe { fs::File::from_raw_fd(fd) })
     }
 
-    let relative_path = validate_agent_relative_path(relative_path, AGENT_INPUT_DIR)
-        .or_else(|_| validate_agent_relative_path(relative_path, AGENT_OUTPUT_DIR))
-        .or_else(|_| validate_agent_relative_path(relative_path, AGENT_CURSOR_DIR))?;
+    let relative_path = validate_agent_writable_path(relative_path)?;
     let full_path = agent_root.join(&relative_path);
     let components = relative_path.components().collect::<Vec<_>>();
     let (file_component, parent_components) =
@@ -1151,6 +1179,16 @@ fn validate_agent_relative_path(
     Ok(path.to_path_buf())
 }
 
+fn validate_agent_writable_path(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
+    if path == Path::new(AGENT_OPENCODE_CONFIG_FILENAME) {
+        return Ok(path.to_path_buf());
+    }
+    validate_agent_relative_path(path, AGENT_INPUT_DIR)
+        .or_else(|_| validate_agent_relative_path(path, AGENT_OUTPUT_DIR))
+        .or_else(|_| validate_agent_relative_path(path, AGENT_CURSOR_DIR))
+        .or_else(|_| validate_agent_relative_path(path, AGENT_CLAUDE_DIR))
+}
+
 fn permission_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -1178,11 +1216,104 @@ fn write_cursor_config(
                 cleanup_marker_deny_rule(),
                 "Read(debug/**)".to_owned(),
                 "Read(../**)".to_owned(),
+                "Read(.claude/**)".to_owned(),
+                "Read(opencode.json)".to_owned(),
                 "Write(input/**)".to_owned(),
+                "Write(.cursor/**)".to_owned(),
+                "Write(.claude/**)".to_owned(),
+                "Write(opencode.json)".to_owned(),
                 "Shell(*)".to_owned(),
             ],
         },
     };
+    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+/// Write Claude Code project settings that keep the harness to a minimal,
+/// file-only toolset. Deny rules cannot be overridden by user-level allow
+/// rules, so dangerous tools stay blocked even when the operator's global
+/// Claude settings would otherwise permit them.
+fn write_claude_settings_config(
+    agent_root: &Path,
+    relative_path: impl AsRef<Path>,
+) -> Result<(), AgentWorkspaceError> {
+    let config = ClaudeSettingsConfig {
+        permissions: ClaudePermissions {
+            allow: vec![
+                format!("Read(./{AGENT_INPUT_DIR}/**)"),
+                format!("Write(./{AGENT_OUTPUT_DIR}/**)"),
+            ],
+            ask: vec!["Glob".to_owned(), "Grep".to_owned()],
+            deny: vec![
+                "Read(../**)".to_owned(),
+                "Read(.env*)".to_owned(),
+                "Read(**/.env*)".to_owned(),
+                format!("Read(./{AGENT_CURSOR_DIR}/**)"),
+                format!("Read(./{AGENT_CLAUDE_DIR}/**)"),
+                format!("Read(./{AGENT_OPENCODE_CONFIG_FILENAME})"),
+                "Write(../**)".to_owned(),
+                format!("Write(./{AGENT_INPUT_DIR}/**)"),
+                format!("Write(./{AGENT_CURSOR_DIR}/**)"),
+                format!("Write(./{AGENT_CLAUDE_DIR}/**)"),
+                format!("Write(./{AGENT_OPENCODE_CONFIG_FILENAME})"),
+                "Edit".to_owned(),
+                "MultiEdit".to_owned(),
+                "NotebookEdit".to_owned(),
+                "Bash".to_owned(),
+                "WebFetch".to_owned(),
+                "WebSearch".to_owned(),
+                "Task".to_owned(),
+            ],
+        },
+        disable_all_hooks: true,
+        enable_all_project_mcp_servers: false,
+    };
+    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+/// Write an empty Claude MCP config referenced by `--mcp-config` +
+/// `--strict-mcp-config` so no MCP servers from any other scope can load.
+fn write_claude_mcp_config(
+    agent_root: &Path,
+    relative_path: impl AsRef<Path>,
+) -> Result<(), AgentWorkspaceError> {
+    let json = serde_json::to_vec_pretty(&serde_json::json!({ "mcpServers": {} }))
+        .map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+/// Write an OpenCode project config that denies every tool/action by default
+/// and re-allows only the file operations the summarization contract needs
+/// inside the generated workspace. `opencode run` is non-interactive, so
+/// anything not explicitly allowed cannot be approved at runtime.
+fn write_opencode_config(
+    agent_root: &Path,
+    relative_path: impl AsRef<Path>,
+) -> Result<(), AgentWorkspaceError> {
+    let config = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "permission": {
+            "*": "deny",
+            "read": {
+                "*": "deny",
+                format!("{AGENT_INPUT_DIR}/**"): "allow",
+                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
+            },
+            "glob": "allow",
+            "grep": "allow",
+            "edit": {
+                "*": "deny",
+                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
+            },
+            "bash": "deny",
+            "webfetch": "deny",
+            "task": "deny",
+            "external_directory": "deny",
+            "doom_loop": "deny",
+        },
+    });
     let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
     write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
 }

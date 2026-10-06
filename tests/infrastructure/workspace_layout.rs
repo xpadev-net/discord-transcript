@@ -361,6 +361,8 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
     assert_eq!(
         top_level_entries,
         vec![
+            ".claude/mcp_servers.json",
+            ".claude/settings.json",
             ".cursor/.cleanup-token",
             ".cursor/cli.json",
             "input/context/manifest.json",
@@ -368,8 +370,89 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
             "input/context/summary_template.txt",
             "input/transcript/manifest.json",
             "input/transcript/transcript_masked.md",
+            "opencode.json",
         ]
     );
+
+    let claude_settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent_root.join(".claude/settings.json"))
+            .expect("claude settings"),
+    )
+    .expect("claude settings parses");
+    let claude_permissions = claude_settings["permissions"].as_object().unwrap();
+    assert_eq!(
+        claude_permissions["allow"],
+        serde_json::json!(["Read(./input/**)", "Write(./output/**)"])
+    );
+    let claude_deny = claude_permissions["deny"].as_array().unwrap();
+    for rule in [
+        "Bash",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Read(../**)",
+        "Read(.env*)",
+        "Read(**/.env*)",
+        "Read(./.cursor/**)",
+        "Read(./.claude/**)",
+        "Read(./opencode.json)",
+        "Write(../**)",
+        "Write(./input/**)",
+        "Write(./.cursor/**)",
+        "Write(./.claude/**)",
+        "Write(./opencode.json)",
+    ] {
+        assert!(
+            claude_deny.iter().any(|entry| entry.as_str() == Some(rule)),
+            "claude deny list must include {rule}: {claude_deny:?}"
+        );
+    }
+    assert_eq!(claude_settings["disableAllHooks"], serde_json::json!(true));
+    assert_eq!(
+        claude_settings["enableAllProjectMcpServers"],
+        serde_json::json!(false)
+    );
+    let claude_mcp: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent_root.join(".claude/mcp_servers.json"))
+            .expect("mcp config"),
+    )
+    .expect("mcp config parses");
+    assert!(claude_mcp["mcpServers"].as_object().unwrap().is_empty());
+    let opencode_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent_root.join("opencode.json")).expect("opencode config"),
+    )
+    .expect("opencode config parses");
+    let permissions = opencode_config["permission"].as_object().unwrap();
+    assert_eq!(permissions["*"], serde_json::json!("deny"));
+    let read_rules = permissions["read"].as_object().unwrap();
+    assert_eq!(read_rules["*"], serde_json::json!("deny"));
+    assert_eq!(read_rules["input/**"], serde_json::json!("allow"));
+    assert_eq!(read_rules["output/**"], serde_json::json!("allow"));
+    let edit_rules = permissions["edit"].as_object().unwrap();
+    assert_eq!(edit_rules["*"], serde_json::json!("deny"));
+    assert_eq!(edit_rules["output/**"], serde_json::json!("allow"));
+    for key in [
+        "bash",
+        "webfetch",
+        "task",
+        "external_directory",
+        "doom_loop",
+    ] {
+        assert_eq!(
+            permissions[key],
+            serde_json::json!("deny"),
+            "{key} must be denied"
+        );
+    }
+    for key in ["read", "glob", "grep"] {
+        assert!(
+            permissions.contains_key(key),
+            "{key} must be present in permission config"
+        );
+    }
 
     let cursor_config = std::fs::read_to_string(agent_workspace.cursor_config_path())
         .expect("cursor config");
