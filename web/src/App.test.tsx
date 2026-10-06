@@ -1607,9 +1607,7 @@ describe("App access controls", () => {
     expect(screen.getByText("AIメモ")).toBeTruthy();
     expect(screen.queryByText("要約テンプレート")).toBeNull();
     expect(screen.queryByText("Discordロール権限")).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: saveButtonName }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: saveButtonName })).toBeNull();
     expect(screen.queryByRole("button", { name: "更新" })).toBeNull();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -1662,9 +1660,7 @@ describe("App access controls", () => {
     expect(screen.queryByText("ドメイン知識")).toBeNull();
     expect(screen.queryByText("AIメモ")).toBeNull();
     expect(screen.queryByText("Discordロール権限")).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: saveButtonName }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: saveButtonName })).toBeNull();
     expect(screen.queryByRole("button", { name: "更新" })).toBeNull();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
