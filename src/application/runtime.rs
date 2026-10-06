@@ -5526,7 +5526,16 @@ impl ScaffoldHandler {
         };
         match finalize {
             StoppedRecordingFinalize::Done => Ok(()),
-            StoppedRecordingFinalize::DeferredEnqueueFailed(err) => Err(err),
+            StoppedRecordingFinalize::DeferredEnqueueFailed(err) => {
+                warn!(
+                    guild_id = %guild_key,
+                    meeting_id = %meeting_id,
+                    error = %err,
+                    "deferred summary job enqueue failed; retrying in background"
+                );
+                self.spawn_deferred_summary_job_enqueue_retry(guild_key, meeting_id, phase);
+                Err(err)
+            }
             StoppedRecordingFinalize::AudioLost {
                 error_message,
                 mark_retry_needed,
@@ -5566,6 +5575,68 @@ impl ScaffoldHandler {
                 Err(error_message)
             }
         }
+    }
+
+    /// A failed deferred enqueue would leave the meeting in Stopping with
+    /// saved audio but no summary job; the 30-second ready-job poll only
+    /// finds existing jobs, so retry the write in the background.
+    fn spawn_deferred_summary_job_enqueue_retry(
+        &self,
+        guild_key: &str,
+        meeting_id: &str,
+        phase: &str,
+    ) {
+        let handler = self.clone();
+        let guild_key = guild_key.to_owned();
+        let meeting_id = meeting_id.to_owned();
+        let phase = phase.to_owned();
+        self.spawn_background(async move {
+            let policy = handler.integration_retry_policy;
+            let multiplier = policy.backoff_multiplier.max(1);
+            let mut delay = policy.initial_delay;
+            let job_id = format!("summary-{meeting_id}");
+            for attempt in 1..=policy.max_attempts {
+                sleep(delay).await;
+                let enqueue_result = {
+                    let mut queue = handler.queue.lock().await;
+                    enqueue_summary_job(&mut *queue, &job_id, &meeting_id)
+                };
+                match enqueue_result {
+                    Ok(()) | Err(crate::application::worker::WorkerError::AlreadyExists) => {
+                        info!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            job_id = %job_id,
+                            attempt,
+                            "deferred summary job enqueued after retry"
+                        );
+                        return;
+                    }
+                    Err(err) if attempt < policy.max_attempts => {
+                        warn!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            phase = %phase,
+                            attempt,
+                            error = %err,
+                            "deferred summary job enqueue retry failed; retrying"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            guild_id = %guild_key,
+                            meeting_id = %meeting_id,
+                            error = %err,
+                            "deferred summary job enqueue retries exhausted"
+                        );
+                    }
+                }
+                delay = delay
+                    .checked_mul(multiplier)
+                    .unwrap_or(policy.max_delay)
+                    .min(policy.max_delay);
+            }
+        });
     }
 
     /// The audio-loss record is the only durable trace that chunks were
