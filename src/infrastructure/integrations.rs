@@ -431,20 +431,30 @@ fn is_sensitive_query_name(name: &str) -> bool {
         return true;
     }
 
-    // Split into words on non-alphanumeric separators and on lower→upper
-    // (camelCase) boundaries so `accessToken` or `clientSecret` still hit a
-    // sensitive word even though the normalized name has no separator.
+    // Split into words on non-alphanumeric separators, on lower→upper
+    // (camelCase) boundaries, and on acronym→word boundaries (an uppercase
+    // run's last letter before a lowercase, e.g. `APISecret` → `API` +
+    // `Secret`) so `accessToken`, `clientSecret`, or `clientAPISecret` still
+    // hit a sensitive word even though the normalized name has no separator.
     let mut word = String::new();
+    let mut chars = name.chars().peekable();
     let mut prev_was_lower_or_digit = false;
-    for ch in name.chars() {
+    let mut prev_was_upper = false;
+    while let Some(ch) = chars.next() {
         if ch.is_ascii_alphanumeric() {
-            if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !word.is_empty() {
+            let acronym_boundary =
+                prev_was_upper && chars.peek().is_some_and(|next| next.is_ascii_lowercase());
+            if ch.is_ascii_uppercase()
+                && (prev_was_lower_or_digit || acronym_boundary)
+                && !word.is_empty()
+            {
                 if is_sensitive_word(&word) {
                     return true;
                 }
                 word.clear();
             }
             prev_was_lower_or_digit = !ch.is_ascii_uppercase();
+            prev_was_upper = ch.is_ascii_uppercase();
             word.push(ch.to_ascii_lowercase());
         } else {
             if is_sensitive_word(&word) {
@@ -452,6 +462,7 @@ fn is_sensitive_query_name(name: &str) -> bool {
             }
             word.clear();
             prev_was_lower_or_digit = false;
+            prev_was_upper = false;
         }
     }
     is_sensitive_word(&word)
@@ -1971,12 +1982,12 @@ mod tests {
     #[test]
     fn whisper_endpoint_redaction_catches_camel_case_secret_params() {
         let rendered = sanitize_whisper_endpoint_for_log(
-            "https://whisper.example.test/inference?accessToken=tok-1&clientSecret=sec-2&apiKey=key-3&sessionToken=s-4&awsSecretAccessKey=k-5&debug=true&designMode=on",
+            "https://whisper.example.test/inference?accessToken=tok-1&clientSecret=sec-2&apiKey=key-3&sessionToken=s-4&awsSecretAccessKey=k-5&clientAPISecret=sec-6&debug=true&designMode=on",
         );
 
         assert_eq!(
             rendered,
-            "https://whisper.example.test/inference?accessToken=REDACTED&clientSecret=REDACTED&apiKey=REDACTED&sessionToken=REDACTED&awsSecretAccessKey=REDACTED&debug=true&designMode=on"
+            "https://whisper.example.test/inference?accessToken=REDACTED&clientSecret=REDACTED&apiKey=REDACTED&sessionToken=REDACTED&awsSecretAccessKey=REDACTED&clientAPISecret=REDACTED&debug=true&designMode=on"
         );
     }
 
