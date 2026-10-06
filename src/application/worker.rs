@@ -189,14 +189,18 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         }
         let tenant = self.resolve_tenant_by_guild(guild_id)?;
         let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
-            // Each candidate list is bounded so a guild accumulating records
-            // cannot make context loading unbounded; per-scope caps keep the
-            // anchor channel lookup below at a fixed maximum size as well.
+            // The eligible-anchor set is resolved first so the candidate lists
+            // can pre-filter by anchor in SQL: the per-list LIMIT then applies
+            // to eligible records only, so guild-wide records can neither make
+            // the lookup unbounded nor crowd out eligible context.
+            let allowed_meetings = summary_context_allowed_meeting_ids(self, meeting_id, guild_id)?;
+            let anchor_csv = summary_context_anchor_csv(&allowed_meetings);
             let ai_memory = self.list_ai_memory_notes(
                 &tenant.tenant_id,
                 guild_id,
                 false,
                 None,
+                Some(&anchor_csv),
                 Some(SUMMARY_CONTEXT_LIST_LIMIT),
             )?;
             let user_feedback = self.list_transcript_feedback(
@@ -204,6 +208,7 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
                 guild_id,
                 Some(TranscriptFeedbackStatus::Accepted),
                 None,
+                Some(&anchor_csv),
                 Some(SUMMARY_CONTEXT_LIST_LIMIT),
             )?;
             let person_aliases = self.list_person_aliases(
@@ -211,25 +216,8 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
                 guild_id,
                 false,
                 Some(PersonAliasReviewStatus::Accepted),
+                Some(&anchor_csv),
                 Some(SUMMARY_CONTEXT_LIST_LIMIT),
-            )?;
-            let allowed_meetings = summary_context_allowed_meeting_ids(
-                self,
-                meeting_id,
-                guild_id,
-                ai_memory
-                    .iter()
-                    .filter_map(|note| note.source_meeting_id.as_deref())
-                    .chain(
-                        user_feedback
-                            .iter()
-                            .filter_map(|feedback| feedback.meeting_id.as_deref()),
-                    )
-                    .chain(
-                        person_aliases
-                            .iter()
-                            .filter_map(|alias| alias.source_meeting_id.as_deref()),
-                    ),
             )?;
             (
                 ai_memory
@@ -280,8 +268,8 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
 
 pub(crate) const SUMMARY_CONTEXT_MEETING_CHANNEL_SQL: &str =
     "SELECT voice_channel_id FROM meetings WHERE id=$1 AND guild_id=$2";
-pub(crate) const SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL: &str = "SELECT id, voice_channel_id FROM meetings \
-             WHERE guild_id=$1 AND id = ANY(string_to_array($2, ','))";
+pub(crate) const SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL: &str = "SELECT id FROM meetings \
+             WHERE guild_id=$1 AND voice_channel_id=$2 AND id <> $3 ORDER BY id";
 
 /// Maximum rows loaded per candidate list (AI memory, feedback, aliases) for
 /// summary context scoping. Keeps each summary job's context lookup bounded
@@ -293,16 +281,15 @@ pub(crate) const SUMMARY_CONTEXT_LIST_LIMIT: u32 = 500;
 pub(crate) const SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT: usize = 1500;
 
 /// Returns the meeting ids whose records may be materialized into a summary's
-/// context: the meeting being summarized plus every anchor meeting that was
-/// recorded in the same voice channel. Summary consumers are the viewers of
-/// that channel (verify_meeting_access), so context from meetings in other
-/// channels — or records with no meeting anchor — would cross the channel
-/// authorization boundary.
-pub(crate) fn summary_context_allowed_meeting_ids<'a, E: SqlExecutor>(
+/// context: the meeting being summarized plus every meeting recorded in the
+/// same voice channel. Summary consumers are the viewers of that channel
+/// (verify_meeting_access), so context from meetings in other channels — or
+/// records with no meeting anchor — would cross the channel authorization
+/// boundary.
+pub(crate) fn summary_context_allowed_meeting_ids<E: SqlExecutor>(
     store: &mut SqlMeetingStore<E>,
     meeting_id: &str,
     guild_id: &str,
-    anchors: impl Iterator<Item = &'a str>,
 ) -> Result<HashSet<String>, StoreError> {
     let mut allowed = HashSet::from([meeting_id.to_owned()]);
     let current = store
@@ -312,39 +299,39 @@ pub(crate) fn summary_context_allowed_meeting_ids<'a, E: SqlExecutor>(
             &[meeting_id.to_owned(), guild_id.to_owned()],
         )
         .map_err(StoreError::Backend)?;
-    let current_channel = current
+    let Some(channel) = current
         .first()
-        .and_then(|row| row.first().cloned().flatten());
-    let Some(channel) = current_channel else {
+        .and_then(|row| row.first().cloned().flatten())
+    else {
+        // The meeting's channel cannot be proven, so only the current meeting
+        // anchor is allowed.
         return Ok(allowed);
     };
-    let mut anchor_list = anchors
-        .filter(|id| *id != meeting_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    anchor_list.sort_unstable();
-    // Sorting first keeps the surviving subset deterministic; anchors beyond
-    // the cap are excluded from the allowed set (fail closed).
-    anchor_list.truncate(SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT);
-    if anchor_list.is_empty() {
-        return Ok(allowed);
-    }
+    // Ordering by id before the cap keeps the surviving subset deterministic;
+    // meetings beyond the cap are excluded from the allowed set (fail closed).
+    let same_channel_sql = format!(
+        "{SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL} LIMIT {SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT}"
+    );
     let rows = store
         .executor
         .query_rows(
-            SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL,
-            &[guild_id.to_owned(), anchor_list.join(",")],
+            &same_channel_sql,
+            &[guild_id.to_owned(), channel, meeting_id.to_owned()],
         )
         .map_err(StoreError::Backend)?;
-    for row in rows {
-        if row.get(1).and_then(|cell| cell.as_deref()) == Some(channel.as_str())
-            && let Some(id) = row.first().and_then(|cell| cell.clone())
-        {
-            allowed.insert(id);
-        }
-    }
+    allowed.extend(
+        rows.into_iter()
+            .filter_map(|row| row.into_iter().next().flatten()),
+    );
     Ok(allowed)
+}
+
+/// Serializes the allowed meeting set as a sorted CSV so the scoped list
+/// queries bind a deterministic `string_to_array` parameter.
+pub(crate) fn summary_context_anchor_csv(allowed: &HashSet<String>) -> String {
+    let mut ids = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.join(",")
 }
 
 /// Registers the fake rows for the shared summary-context fixture: tenant
@@ -365,18 +352,24 @@ pub(crate) fn register_summary_context_scope_fakes(
         tenant_installation_row, transcript_feedback_row,
     };
 
-    // The store builds bounded queries by appending `LIMIT {limit}` to the
-    // base list SQL; register under the same derived text.
-    let ai_memory_sql = format!("{LIST_AI_MEMORY_NOTES_SQL}LIMIT {SUMMARY_CONTEXT_LIST_LIMIT}\n");
-    let feedback_sql =
-        format!("{LIST_TRANSCRIPT_FEEDBACK_SQL}LIMIT {SUMMARY_CONTEXT_LIST_LIMIT}\n");
-    let aliases_sql = format!("{LIST_PERSON_ALIASES_SQL}LIMIT {SUMMARY_CONTEXT_LIST_LIMIT}\n");
+    // The loaders resolve the channel first, then bind the allowed meeting
+    // set into the list queries so LIMIT applies after the anchor filter.
+    let same_channel_sql = format!(
+        "{SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL} LIMIT {SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT}"
+    );
+    let list_limit = SUMMARY_CONTEXT_LIST_LIMIT.to_string();
+    // Sorted CSV of the allowed set: m1 (current) + m2 (same channel); m3 is
+    // excluded by the same-channel query below.
+    let anchor_csv = "m1,m2";
     executor.query_rows_result.insert(
         sql_key(RESOLVE_TENANT_BY_GUILD_SQL, &["g1"]),
         vec![tenant_installation_row("t1", "g1")],
     );
     executor.query_rows_result.insert(
-        sql_key(&ai_memory_sql, &["t1", "g1", "false", ""]),
+        sql_key(
+            LIST_AI_MEMORY_NOTES_SQL,
+            &["t1", "g1", "false", "", anchor_csv, &list_limit],
+        ),
         vec![
             ai_memory_note_row("n1", "t1", "g1", Some("m1")),
             ai_memory_note_row("n2", "t1", "g1", Some("m2")),
@@ -385,7 +378,10 @@ pub(crate) fn register_summary_context_scope_fakes(
         ],
     );
     executor.query_rows_result.insert(
-        sql_key(&feedback_sql, &["t1", "g1", "accepted", ""]),
+        sql_key(
+            LIST_TRANSCRIPT_FEEDBACK_SQL,
+            &["t1", "g1", "accepted", "", anchor_csv, &list_limit],
+        ),
         vec![
             transcript_feedback_row("f1", "t1", "g1", Some("m1")),
             transcript_feedback_row("f2", "t1", "g1", Some("m3")),
@@ -393,7 +389,10 @@ pub(crate) fn register_summary_context_scope_fakes(
         ],
     );
     executor.query_rows_result.insert(
-        sql_key(&aliases_sql, &["t1", "g1", "false", "accepted"]),
+        sql_key(
+            LIST_PERSON_ALIASES_SQL,
+            &["t1", "g1", "false", "accepted", anchor_csv, &list_limit],
+        ),
         vec![
             person_alias_row("a1", "t1", "g1", Some("m2")),
             person_alias_row("a2", "t1", "g1", Some("m3")),
@@ -404,12 +403,11 @@ pub(crate) fn register_summary_context_scope_fakes(
         sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
         vec![sql_row_from_strings(vec!["vc1".to_owned()])],
     );
+    // m3's meeting lives in vc2, so the database only returns m2 for the
+    // same-channel lookup.
     executor.query_rows_result.insert(
-        sql_key(SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL, &["g1", "m2,m3"]),
-        vec![
-            sql_row_from_strings(vec!["m2".to_owned(), "vc1".to_owned()]),
-            sql_row_from_strings(vec!["m3".to_owned(), "vc2".to_owned()]),
-        ],
+        sql_key(&same_channel_sql, &["g1", "vc1", "m1"]),
+        vec![sql_row_from_strings(vec!["m2".to_owned()])],
     );
 }
 
@@ -1781,61 +1779,46 @@ mod tests {
         assert!(!workspace.transcript_manifest_path().exists());
     }
 
-    fn sql_key(sql: &str, params: &[&str]) -> String {
-        format!("{}|{}", sql, params.join("\u{1f}"))
-    }
-
     #[test]
     fn summary_context_allowed_meeting_ids_restricts_to_same_channel() {
-        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
+        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_key, sql_row_from_strings};
 
         let mut executor = FakeSqlExecutor::default();
         executor.query_rows_result.insert(
             sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
             vec![sql_row_from_strings(vec!["vc1".to_owned()])],
         );
+        let same_channel_sql = format!(
+            "{SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL} LIMIT {SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT}"
+        );
+        // The meetings table only holds m2 (vc1) and m3 (vc2) besides m1, so
+        // the database returns just the same-channel id.
         executor.query_rows_result.insert(
-            sql_key(SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL, &["g1", "m2,m3,m4,m5"]),
-            vec![
-                sql_row_from_strings(vec!["m2".to_owned(), "vc1".to_owned()]),
-                sql_row_from_strings(vec!["m3".to_owned(), "vc2".to_owned()]),
-                sql_row_from_strings(vec!["m4".to_owned(), "vc1".to_owned()]),
-            ],
+            sql_key(&same_channel_sql, &["g1", "vc1", "m1"]),
+            vec![sql_row_from_strings(vec!["m2".to_owned()])],
         );
         let mut store = SqlMeetingStore::new(executor);
 
-        let allowed = summary_context_allowed_meeting_ids(
-            &mut store,
-            "m1",
-            "g1",
-            ["m2", "m3", "m4", "m5"].into_iter(),
-        )
-        .expect("scope should resolve");
+        let allowed = summary_context_allowed_meeting_ids(&mut store, "m1", "g1")
+            .expect("scope should resolve");
 
-        assert!(allowed.contains("m1"));
-        assert!(allowed.contains("m2"));
-        assert!(
-            !allowed.contains("m3"),
-            "different channel must be excluded"
-        );
-        assert!(allowed.contains("m4"));
-        assert!(!allowed.contains("m5"), "unknown anchor must be excluded");
+        assert_eq!(allowed, HashSet::from(["m1".to_owned(), "m2".to_owned()]));
     }
 
     #[test]
-    fn summary_context_allowed_meeting_ids_limits_to_current_meeting_without_channel() {
-        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
+    fn summary_context_allowed_meeting_ids_limits_to_current_meeting_without_siblings() {
+        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_key, sql_row_from_strings};
 
         let mut executor = FakeSqlExecutor::default();
         executor.query_rows_result.insert(
             sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
             vec![sql_row_from_strings(vec!["vc1".to_owned()])],
         );
+        // No other meetings exist in the channel -> unregistered query.
         let mut store = SqlMeetingStore::new(executor);
 
-        let allowed =
-            summary_context_allowed_meeting_ids(&mut store, "m1", "g1", std::iter::empty())
-                .expect("scope should resolve");
+        let allowed = summary_context_allowed_meeting_ids(&mut store, "m1", "g1")
+            .expect("scope should resolve");
 
         assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
     }
@@ -1849,9 +1832,8 @@ mod tests {
         let executor = FakeSqlExecutor::default();
         let mut store = SqlMeetingStore::new(executor);
 
-        let allowed =
-            summary_context_allowed_meeting_ids(&mut store, "m1", "g1", ["m2"].into_iter())
-                .expect("scope should resolve");
+        let allowed = summary_context_allowed_meeting_ids(&mut store, "m1", "g1")
+            .expect("scope should resolve");
 
         assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
     }

@@ -3347,13 +3347,25 @@ fn load_runtime_summary_context<E: SqlExecutor>(
         );
     }
     let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
-        // Bounded candidate lists; see load_summary_context in worker.rs.
+        // The eligible-anchor set is resolved first so the candidate lists
+        // can pre-filter by anchor in SQL; see load_summary_context in
+        // worker.rs.
+        let allowed_meetings = crate::application::worker::summary_context_allowed_meeting_ids(
+            store, meeting_id, guild_id,
+        )
+        .map_err(|err| {
+            crate::application::summary::SummaryError::SummaryEngine(format!(
+                "failed to resolve summary context scope for meeting {meeting_id}: {err}"
+            ))
+        })?;
+        let anchor_csv = crate::application::worker::summary_context_anchor_csv(&allowed_meetings);
         let ai_memory = store
             .list_ai_memory_notes(
                 &tenant.tenant_id,
                 guild_id,
                 false,
                 None,
+                Some(&anchor_csv),
                 Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
             )
             .map_err(|err| {
@@ -3367,6 +3379,7 @@ fn load_runtime_summary_context<E: SqlExecutor>(
                 guild_id,
                 Some(TranscriptFeedbackStatus::Accepted),
                 None,
+                Some(&anchor_csv),
                 Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
             )
             .map_err(|err| {
@@ -3380,6 +3393,7 @@ fn load_runtime_summary_context<E: SqlExecutor>(
                 guild_id,
                 false,
                 Some(PersonAliasReviewStatus::Accepted),
+                Some(&anchor_csv),
                 Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
             )
             .map_err(|err| {
@@ -3387,29 +3401,6 @@ fn load_runtime_summary_context<E: SqlExecutor>(
                     "failed to load person aliases for meeting {meeting_id}: {err}"
                 ))
             })?;
-        let allowed_meetings = crate::application::worker::summary_context_allowed_meeting_ids(
-            store,
-            meeting_id,
-            guild_id,
-            ai_memory
-                .iter()
-                .filter_map(|note| note.source_meeting_id.as_deref())
-                .chain(
-                    user_feedback
-                        .iter()
-                        .filter_map(|feedback| feedback.meeting_id.as_deref()),
-                )
-                .chain(
-                    person_aliases
-                        .iter()
-                        .filter_map(|alias| alias.source_meeting_id.as_deref()),
-                ),
-        )
-        .map_err(|err| {
-            crate::application::summary::SummaryError::SummaryEngine(format!(
-                "failed to resolve summary context scope for meeting {meeting_id}: {err}"
-            ))
-        })?;
         (
             ai_memory
                 .into_iter()

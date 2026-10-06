@@ -125,6 +125,7 @@ impl<E: SqlExecutor> AiMemoryExtractionStore for SqlMeetingStore<E> {
             false,
             Some(AiMemorySourceType::AiMeetingExtraction),
             None,
+            None,
         )?;
         if existing_extraction_notes
             .iter()

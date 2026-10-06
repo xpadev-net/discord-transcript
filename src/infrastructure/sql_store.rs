@@ -718,12 +718,16 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         parse_domain_knowledge_row(&row).map(Some)
     }
 
+    /// `anchor_meeting_ids` is an optional comma-separated allowlist bound to
+    /// `source_meeting_id = ANY(string_to_array($5, ','))` so the anchor
+    /// filter runs before `LIMIT` in the database.
     pub fn list_ai_memory_notes(
         &mut self,
         tenant_id: &str,
         guild_id: &str,
         include_archived: bool,
         source_type: Option<AiMemorySourceType>,
+        anchor_meeting_ids: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<AiMemoryNote>, StoreError> {
         let params = vec![
@@ -733,17 +737,12 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             source_type
                 .map(|source_type| source_type.as_str().to_owned())
                 .unwrap_or_default(),
+            anchor_meeting_ids.unwrap_or_default().to_owned(),
+            limit.map(|limit| limit.to_string()).unwrap_or_default(),
         ];
-        // LIMIT is interpolated from a u32, so no extra bind parameter is
-        // needed and injection is impossible.
-        let sql = if let Some(limit) = limit {
-            format!("{LIST_AI_MEMORY_NOTES_SQL}LIMIT {limit}\n")
-        } else {
-            LIST_AI_MEMORY_NOTES_SQL.to_owned()
-        };
         let rows = self
             .executor
-            .query_rows(&sql, &params)
+            .query_rows(LIST_AI_MEMORY_NOTES_SQL, &params)
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_ai_memory_note_row).collect()
     }
@@ -871,12 +870,16 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         parse_transcript_feedback_row(&row)
     }
 
+    /// `anchor_meeting_ids` is an optional comma-separated allowlist bound to
+    /// `meeting_id = ANY(string_to_array($5, ','))` so the anchor filter runs
+    /// before `LIMIT` in the database.
     pub fn list_transcript_feedback(
         &mut self,
         tenant_id: &str,
         guild_id: &str,
         status: Option<TranscriptFeedbackStatus>,
         feedback_type: Option<TranscriptFeedbackType>,
+        anchor_meeting_ids: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<TranscriptFeedback>, StoreError> {
         let params = vec![
@@ -888,15 +891,12 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             feedback_type
                 .map(|feedback_type| feedback_type.as_str().to_owned())
                 .unwrap_or_default(),
+            anchor_meeting_ids.unwrap_or_default().to_owned(),
+            limit.map(|limit| limit.to_string()).unwrap_or_default(),
         ];
-        let sql = if let Some(limit) = limit {
-            format!("{LIST_TRANSCRIPT_FEEDBACK_SQL}LIMIT {limit}\n")
-        } else {
-            LIST_TRANSCRIPT_FEEDBACK_SQL.to_owned()
-        };
         let rows = self
             .executor
-            .query_rows(&sql, &params)
+            .query_rows(LIST_TRANSCRIPT_FEEDBACK_SQL, &params)
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_transcript_feedback_row).collect()
     }
@@ -918,12 +918,16 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         parse_transcript_feedback_row(&row).map(Some)
     }
 
+    /// `anchor_meeting_ids` is an optional comma-separated allowlist bound to
+    /// `source_meeting_id = ANY(string_to_array($5, ','))` so the anchor
+    /// filter runs before `LIMIT` in the database.
     pub fn list_person_aliases(
         &mut self,
         tenant_id: &str,
         guild_id: &str,
         include_archived: bool,
         review_status: Option<PersonAliasReviewStatus>,
+        anchor_meeting_ids: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<PersonAlias>, StoreError> {
         let params = vec![
@@ -933,15 +937,12 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
             review_status
                 .map(|status| status.as_str().to_owned())
                 .unwrap_or_default(),
+            anchor_meeting_ids.unwrap_or_default().to_owned(),
+            limit.map(|limit| limit.to_string()).unwrap_or_default(),
         ];
-        let sql = if let Some(limit) = limit {
-            format!("{LIST_PERSON_ALIASES_SQL}LIMIT {limit}\n")
-        } else {
-            LIST_PERSON_ALIASES_SQL.to_owned()
-        };
         let rows = self
             .executor
-            .query_rows(&sql, &params)
+            .query_rows(LIST_PERSON_ALIASES_SQL, &params)
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_person_alias_row).collect()
     }

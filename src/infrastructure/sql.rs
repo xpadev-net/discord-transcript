@@ -2419,7 +2419,10 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND ($3::TEXT::BOOLEAN OR archived_at IS NULL)
   AND (NULLIF($4, '') IS NULL OR source_type = $4)
+  AND (NULLIF($5, '') IS NULL
+       OR source_meeting_id = ANY(string_to_array($5, ',')))
 ORDER BY pinned DESC, updated_at DESC, id DESC
+LIMIT NULLIF($6, '')::TEXT::INTEGER
 "#;
 
 pub const GET_AI_MEMORY_NOTE_SQL: &str = r#"
@@ -2607,7 +2610,10 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND (NULLIF($3, '') IS NULL OR status = $3)
   AND (NULLIF($4, '') IS NULL OR feedback_type = $4)
+  AND (NULLIF($5, '') IS NULL
+       OR meeting_id = ANY(string_to_array($5, ',')))
 ORDER BY created_at DESC, id DESC
+LIMIT NULLIF($6, '')::TEXT::INTEGER
 "#;
 
 pub const INSERT_TRANSCRIPT_FEEDBACK_SQL: &str = r#"
@@ -2746,7 +2752,10 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND ($3::TEXT::BOOLEAN OR archived_at IS NULL)
   AND (NULLIF($4, '') IS NULL OR review_status = $4)
+  AND (NULLIF($5, '') IS NULL
+       OR source_meeting_id = ANY(string_to_array($5, ',')))
 ORDER BY active DESC, updated_at DESC, id DESC
+LIMIT NULLIF($6, '')::TEXT::INTEGER
 "#;
 
 pub const INSERT_PERSON_ALIAS_SQL: &str = r#"
