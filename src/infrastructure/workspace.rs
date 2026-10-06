@@ -1296,23 +1296,22 @@ fn write_opencode_config(
         "$schema": "https://opencode.ai/config.json",
         "permission": {
             "*": "deny",
-            "read": "allow",
+            "read": {
+                "*": "deny",
+                format!("{AGENT_INPUT_DIR}/**"): "allow",
+                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
+            },
             "glob": "allow",
             "grep": "allow",
             "edit": {
                 "*": "deny",
                 format!("{AGENT_OUTPUT_DIR}/**"): "allow",
             },
-            "write": {
-                "*": "deny",
-                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
-            },
-            "patch": "deny",
             "bash": "deny",
             "webfetch": "deny",
             "task": "deny",
             "external_directory": "deny",
-            "doomloop": "deny",
+            "doom_loop": "deny",
         },
     });
     let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;

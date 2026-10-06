@@ -1670,6 +1670,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&workdir);
             let _ = std::fs::remove_file(&script_path);
         }
+        // SAFETY: paired with the set_var at the top of this test.
+        unsafe {
+            std::env::remove_var("DISCORD_TRANSCRIPT_TEST_SECRET");
+        }
     }
 
     #[test]
