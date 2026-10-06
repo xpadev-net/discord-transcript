@@ -208,7 +208,10 @@ pub fn resample_pcm_16le(input: &[u8], from_rate: u32, to_rate: u32) -> (Vec<u8>
     (output, to_rate)
 }
 
-const RESAMPLE_FIR_TAPS: usize = 45;
+/// Half of this span of input samples reaches every FIR output sample, so
+/// resampling regions separated by less than `RESAMPLE_FIR_TAPS` input
+/// samples influence each other.
+pub const RESAMPLE_FIR_TAPS: usize = 45;
 
 /// Generate a low-pass FIR filter using a Blackman-windowed sinc function.
 fn lowpass_fir_coefficients(taps: usize, cutoff_hz: f64, sample_rate: f64) -> Vec<f64> {

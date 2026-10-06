@@ -607,6 +607,44 @@ fn mixdown_skips_chunks_beyond_meeting_wall_clock_cap() {
 }
 
 #[test]
+fn mixdown_writes_audio_at_wallclock_offsets_across_long_gap() {
+    let base = unique_temp_dir("gap_offsets");
+    fs::create_dir_all(&base).expect("dir should be created");
+
+    let sample_rate = 48_000usize;
+    let speaker_a = build_wav_bytes_raw(&i16_pcm(&vec![1000i16; sample_rate]), 48_000, 1, 16)
+        .expect("speaker A wav should build");
+    fs::write(base.join("alice_1_1000.wav"), &speaker_a).unwrap();
+    // 5-second silence between the two speakers' chunks (meeting starts at
+    // the earliest positive start_ms = 1000ms).
+    let speaker_b = build_wav_bytes_raw(&i16_pcm(&vec![2000i16; sample_rate]), 48_000, 1, 16)
+        .expect("speaker B wav should build");
+    fs::write(base.join("bob_2_6000.wav"), &speaker_b).unwrap();
+
+    let mixdown =
+        merge_user_chunks_to_mixdown(&base, false).expect("mixdown should bridge the silence gap");
+    let wav = fs::read(mixdown).expect("mixdown wav should be readable");
+
+    let data_size = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
+    assert_eq!(
+        data_size,
+        6 * sample_rate * 2,
+        "mixdown should span six seconds including the silence gap"
+    );
+    assert_eq!(wav.len(), 44 + data_size);
+
+    let sample_at = |ms: usize| {
+        let i = 44 + (ms * sample_rate / 1000) * 2;
+        i16::from_le_bytes([wav[i], wav[i + 1]])
+    };
+    assert_eq!(sample_at(500), 1000, "speaker A audio at the start");
+    assert_eq!(sample_at(2500), 0, "silence gap stays zero-filled");
+    assert_eq!(sample_at(5500), 2000, "speaker B audio after the gap");
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn load_chunks_reports_skipped_count_when_all_chunks_are_corrupt() {
     let base = unique_temp_dir("all_corrupt");
     fs::create_dir_all(&base).expect("dir should be created");
