@@ -680,6 +680,15 @@ fn decide_auto_stop_grace_expiry(non_bot_member_count: Option<usize>) -> GraceEx
     }
 }
 
+/// Member count a `voice_state_update` event feeds to the auto-stop state
+/// machine. A cache miss (`None`) feeds `0` — treated as possibly empty —
+/// so a lost empty-channel update still arms the grace timer; the fire-time
+/// re-check then decides whether to actually stop, so a miss can never stop
+/// a recording by itself.
+fn auto_stop_event_member_count(cached_count: Option<usize>) -> usize {
+    cached_count.unwrap_or(0)
+}
+
 fn decide_driver_disconnect_grace_expiry(
     reconnected: Option<bool>,
     non_bot_member_count: Option<usize>,
@@ -4159,21 +4168,16 @@ impl EventHandler for ScaffoldHandler {
         // empty channel, reschedules while the cache stays unavailable, and
         // bounds the outage into a marked failure rather than a stuck
         // recording.
-        let non_bot = match count_non_bot_members_in_target_voice(
-            &ctx,
-            self.guild_id,
-            target_voice_channel_id,
-        ) {
-            Some(non_bot) => non_bot,
-            None => {
-                warn!(
-                    guild_id = %self.guild_id,
-                    target_voice_channel_id,
-                    "voice state cache unavailable; arming auto-stop grace timer so the fire-time check decides"
-                );
-                0
-            }
-        };
+        let cached_non_bot =
+            count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id);
+        if cached_non_bot.is_none() {
+            warn!(
+                guild_id = %self.guild_id,
+                target_voice_channel_id,
+                "voice state cache unavailable; arming auto-stop grace timer so the fire-time check decides"
+            );
+        }
+        let non_bot = auto_stop_event_member_count(cached_non_bot);
         let active_meeting_id = active_voice_channel.meeting_id;
         let grace = self
             .auto_stop_grace_for_meeting(Some(&active_meeting_id))
@@ -12774,6 +12778,30 @@ mod status_message_tests {
         assert_eq!(
             decide_auto_stop_grace_expiry(Some(0)),
             GraceExpiryDecision::Stop
+        );
+    }
+
+    #[test]
+    fn voice_state_update_cache_miss_arms_timer_until_occupied_recheck() {
+        let mut state =
+            AutoStopState::new_for_meeting(Duration::from_secs(30), Some("m1".to_owned()));
+
+        // A voice-state cache miss feeds 0 so the empty-channel grace timer
+        // arms instead of the event being dropped entirely.
+        assert_eq!(
+            state.on_non_bot_member_count_changed(auto_stop_event_member_count(None)),
+            AutoStopSignal::StartTimer
+        );
+        // A second miss while the timer is in flight does not arm another.
+        assert_eq!(
+            state.on_non_bot_member_count_changed(auto_stop_event_member_count(None)),
+            AutoStopSignal::AlreadyWaiting
+        );
+        // Once the cache recovers with members present, the next event
+        // cancels the pending stop.
+        assert_eq!(
+            state.on_non_bot_member_count_changed(auto_stop_event_member_count(Some(2))),
+            AutoStopSignal::Cancelled
         );
     }
 
