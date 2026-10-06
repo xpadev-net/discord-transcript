@@ -1166,7 +1166,7 @@ fn app_config_loads_from_map() {
 
 #[test]
 fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_settings() {
-    let mut values = required_env_values();
+    let mut values = base_env();
     values.remove("CLAUDE_COMMAND");
     values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
 
@@ -1176,7 +1176,48 @@ fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_setti
     assert_eq!(config.summary_harness, SummaryHarness::Claude);
     assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "haiku");
-    assert!(!config.summary_allow_unsafe_agent_harness);
+    assert!(config.summary_allow_unsafe_agent_harness);
+}
+
+#[test]
+fn app_config_rejects_missing_unsafe_opt_in_even_when_summary_disabled() {
+    // SUMMARY_ENABLED only defaults new meeting settings; stored or per-guild
+    // summary_enabled=true values can still enqueue jobs, so harness-capable
+    // roles must always acknowledge the unsafe agent opt-in.
+    let mut values = required_env_values();
+    values.remove("CLAUDE_COMMAND");
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+    values.remove("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail closed");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS"
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_missing_unsafe_profile_even_when_summary_disabled() {
+    let mut values = required_env_values();
+    values.remove("CLAUDE_COMMAND");
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+    values.insert(
+        "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
+        "true".to_owned(),
+    );
+    values.remove("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail closed");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"
+        }
+    );
 }
 
 #[test]
@@ -1282,6 +1323,8 @@ fn app_config_loads_from_env_when_summary_disabled_without_summary_harness_setti
         .env("DATABASE_URL", "postgres://localhost/db")
         .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
         .env("SUMMARY_ENABLED", "false")
+        .env("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", "true")
+        .env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE", "local-dev")
         .output()
         .expect("child config test should run");
 
@@ -1409,7 +1452,7 @@ fn app_config_from_env_child_loads_summary_disabled_without_summary_harness_sett
     assert_eq!(config.summary_harness, SummaryHarness::Claude);
     assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "haiku");
-    assert!(!config.summary_allow_unsafe_agent_harness);
+    assert!(config.summary_allow_unsafe_agent_harness);
 }
 
 #[test]
