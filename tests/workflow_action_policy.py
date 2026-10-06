@@ -41,9 +41,9 @@ WRAPPER_VALUE_FLAGS = {
     # `sudo -E` or `watch -t` consume nothing, so listing them would hide
     # the real command word behind a supposed option value.
     "sudo": {
-        "-C", "-D", "-g", "-h", "-p", "-r", "-T", "-t", "-U", "-u",
-        "--chdir", "--close-from", "--group", "--host", "--other-user",
-        "--prompt", "--role", "--type", "--user",
+        "-C", "-D", "-g", "-h", "-p", "-r", "-R", "-T", "-t", "-U", "-u",
+        "--chdir", "--chroot", "--close-from", "--group", "--host",
+        "--other-user", "--prompt", "--role", "--type", "--user",
     },
     "time": {"-f", "-o", "--format", "--output"},
     "timeout": {"-k", "-s", "--kill-after", "--signal"},
@@ -325,14 +325,28 @@ def command_start_indices(words: list[str]) -> list[int]:
         # until the command.
         while index < len(words):
             token = words[index]
-            # A cluster ending in a value flag consumes the next argument
-            # too (`sudo -Eu root docker push x`).
-            if token in value_flags or (
-                SINGLE_DASH_CLUSTER_RE.match(token)
-                and f"-{token[-1]}" in value_flags
-            ):
+            if token in value_flags:
                 index += 2
-            elif (
+                continue
+            if SINGLE_DASH_CLUSTER_RE.match(token):
+                # Inside a short-option cluster, the first option that takes
+                # a value swallows the REST of the cluster when it has one
+                # (`-uroot`) or the next argument when it is last (`-Eu`).
+                cluster = token[1:]
+                value_at = next(
+                    (
+                        position
+                        for position, char in enumerate(cluster)
+                        if f"-{char}" in value_flags
+                    ),
+                    None,
+                )
+                if value_at is not None and value_at == len(cluster) - 1:
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if (
                 (token.startswith("-") and token != "-")
                 or ENV_ASSIGN_RE.match(token)
                 or WRAPPER_VALUE_TOKEN_RE.match(token)
@@ -626,6 +640,8 @@ def self_test_command_invokes_docker_push() -> None:
         "if true; then docker push example/image:latest; fi",
         "sudo -E docker push example/image:latest",
         "sudo -Eu root docker push example/image:latest",
+        "sudo -uroot docker push example/image:latest",
+        "sudo -R / docker push example/image:latest",
         "watch -t docker push example/image:latest",
         "while read -r tag; do docker push example/image:$tag; done",
         "eval docker push example/image:latest",
