@@ -101,6 +101,8 @@ const CONFIG_FROM_ENV_CHILD: &str = "DISCORD_TRANSCRIPT_CONFIG_FROM_ENV_CHILD";
 const CONFIG_FROM_ENV_CHILD_VALUE: &str = "summary-disabled-from-env";
 const WEB_BOT_ROLE_CONFIG_FROM_ENV_CHILD_VALUE: &str = "web-bot-role-from-env";
 const WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE: &str = "worker-role-from-env";
+const MISSING_UNSAFE_OPT_IN_FROM_ENV_CHILD_VALUE: &str = "missing-unsafe-opt-in-from-env";
+const MISSING_UNSAFE_PROFILE_FROM_ENV_CHILD_VALUE: &str = "missing-unsafe-profile-from-env";
 
 fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value should be nonzero")
@@ -1166,7 +1168,7 @@ fn app_config_loads_from_map() {
 
 #[test]
 fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_settings() {
-    let mut values = required_env_values();
+    let mut values = base_env();
     values.remove("CLAUDE_COMMAND");
     values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
 
@@ -1176,7 +1178,48 @@ fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_setti
     assert_eq!(config.summary_harness, SummaryHarness::Claude);
     assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "haiku");
-    assert!(!config.summary_allow_unsafe_agent_harness);
+    assert!(config.summary_allow_unsafe_agent_harness);
+}
+
+#[test]
+fn app_config_rejects_missing_unsafe_opt_in_even_when_summary_disabled() {
+    // SUMMARY_ENABLED only defaults new meeting settings; stored or per-guild
+    // summary_enabled=true values can still enqueue jobs, so harness-capable
+    // roles must always acknowledge the unsafe agent opt-in.
+    let mut values = required_env_values();
+    values.remove("CLAUDE_COMMAND");
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+    values.remove("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail closed");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS"
+        }
+    );
+}
+
+#[test]
+fn app_config_rejects_missing_unsafe_profile_even_when_summary_disabled() {
+    let mut values = required_env_values();
+    values.remove("CLAUDE_COMMAND");
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+    values.insert(
+        "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
+        "true".to_owned(),
+    );
+    values.remove("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail closed");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"
+        }
+    );
 }
 
 #[test]
@@ -1282,6 +1325,8 @@ fn app_config_loads_from_env_when_summary_disabled_without_summary_harness_setti
         .env("DATABASE_URL", "postgres://localhost/db")
         .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
         .env("SUMMARY_ENABLED", "false")
+        .env("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", "true")
+        .env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE", "local-dev")
         .output()
         .expect("child config test should run");
 
@@ -1359,6 +1404,77 @@ fn app_config_loads_from_env_for_worker_role_without_discord_gateway_credentials
 }
 
 #[test]
+fn app_config_rejects_from_env_missing_unsafe_opt_in_even_when_summary_disabled() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        == Ok(MISSING_UNSAFE_OPT_IN_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
+        .arg("app_config_from_env_child_rejects_missing_unsafe_opt_in_even_when_summary_disabled")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env_clear()
+        .env(
+            CONFIG_FROM_ENV_CHILD,
+            MISSING_UNSAFE_OPT_IN_FROM_ENV_CHILD_VALUE,
+        )
+        .env("DISCORD_TOKEN", "token")
+        .env("DISCORD_GUILD_ID", "guild")
+        .env("WHISPER_ENDPOINT", "http://whisper")
+        .env("DATABASE_URL", "postgres://localhost/db")
+        .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
+        .env("SUMMARY_ENABLED", "false")
+        .output()
+        .expect("child config test should run");
+
+    assert!(
+        output.status.success(),
+        "child config test failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn app_config_rejects_from_env_missing_unsafe_profile_even_when_summary_disabled() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        == Ok(MISSING_UNSAFE_PROFILE_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
+        .arg("app_config_from_env_child_rejects_missing_unsafe_profile_even_when_summary_disabled")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env_clear()
+        .env(
+            CONFIG_FROM_ENV_CHILD,
+            MISSING_UNSAFE_PROFILE_FROM_ENV_CHILD_VALUE,
+        )
+        .env("DISCORD_TOKEN", "token")
+        .env("DISCORD_GUILD_ID", "guild")
+        .env("WHISPER_ENDPOINT", "http://whisper")
+        .env("DATABASE_URL", "postgres://localhost/db")
+        .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
+        .env("SUMMARY_ENABLED", "false")
+        .env("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", "true")
+        .output()
+        .expect("child config test should run");
+
+    assert!(
+        output.status.success(),
+        "child config test failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn app_config_from_env_child_loads_web_bot_role_without_summary_harness_settings() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
         != Ok(WEB_BOT_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
@@ -1409,7 +1525,46 @@ fn app_config_from_env_child_loads_summary_disabled_without_summary_harness_sett
     assert_eq!(config.summary_harness, SummaryHarness::Claude);
     assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "haiku");
-    assert!(!config.summary_allow_unsafe_agent_harness);
+    assert!(config.summary_allow_unsafe_agent_harness);
+}
+
+// The from_map() missing-setting tests above exercise the in-memory path;
+// from_env() reads the production environment through a separate path, so a
+// regression that skips either rejection there must also be caught.
+#[test]
+fn app_config_from_env_child_rejects_missing_unsafe_opt_in_even_when_summary_disabled() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        != Ok(MISSING_UNSAFE_OPT_IN_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let err = AppConfig::from_env().expect_err("config should fail closed");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS"
+        }
+    );
+}
+
+#[test]
+fn app_config_from_env_child_rejects_missing_unsafe_profile_even_when_summary_disabled() {
+    if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
+        != Ok(MISSING_UNSAFE_PROFILE_FROM_ENV_CHILD_VALUE)
+    {
+        return;
+    }
+
+    let err = AppConfig::from_env().expect_err("config should fail closed");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"
+        }
+    );
 }
 
 #[test]
