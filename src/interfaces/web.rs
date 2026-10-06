@@ -435,6 +435,7 @@ fn audio_range_rate_limited_response() -> Response {
         .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
 }
 
+#[allow(clippy::result_large_err)]
 async fn check_audio_range_rate_limit(state: &WebState, user_id: &str) -> Result<(), Response> {
     let mut limiter = state.audio_range_limiter.lock().await;
     if limiter.allow(user_id) {
@@ -7928,6 +7929,7 @@ fn estimate_plan_filesystem_usage(
     Ok(usage)
 }
 
+#[allow(clippy::result_large_err)]
 async fn apply_admin_retention_database_cleanup(
     state: &WebState,
     guild_id: &str,
@@ -8169,6 +8171,7 @@ async fn build_admin_retention_meeting_delete_preview(
     })
 }
 
+#[allow(clippy::result_large_err)]
 async fn apply_admin_retention_meeting_database_delete(
     state: &WebState,
     guild_id: &str,
@@ -10606,6 +10609,7 @@ async fn api_archive_summary_template(
     Ok(Json(response))
 }
 
+#[allow(clippy::result_large_err)]
 async fn api_update_target_guild_bot_token(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -10714,6 +10718,7 @@ async fn api_update_target_guild_bot_token(
     )))
 }
 
+#[allow(clippy::result_large_err)]
 async fn api_delete_target_guild_bot_token(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -10789,6 +10794,7 @@ async fn api_delete_target_guild_bot_token(
     )))
 }
 
+#[allow(clippy::result_large_err)]
 async fn api_update_guild_bot_token(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -10894,6 +10900,7 @@ async fn api_update_guild_bot_token(
     )))
 }
 
+#[allow(clippy::result_large_err)]
 async fn api_delete_guild_bot_token(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
