@@ -8,7 +8,9 @@ use crate::infrastructure::asr::{
 };
 use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff, retry_with_backoff_if};
 use crate::infrastructure::workspace::{
-    AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
+    AGENT_CLAUDE_DIR, AGENT_CLAUDE_MCP_CONFIG_FILENAME, AGENT_CLAUDE_SETTINGS_FILENAME,
+    AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR,
+    AGENT_OPENCODE_CONFIG_FILENAME, AGENT_OUTPUT_DIR,
 };
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -578,8 +580,28 @@ fn summarize_claude_stdin(
     let workdir = require_agent_workdir(workdir)?;
     remove_stale_agent_output(workdir, output_contract)?;
     let mut command = Command::new(&client.command_path);
-    command.arg("--model").arg(&client.model).arg("-p");
-    scrub_agent_command_environment(&mut command);
+    command
+        .arg("--model")
+        .arg(&client.model)
+        .arg("-p")
+        // Restrict the session to file reads under input/ and writes under
+        // output/; shell, web, edit, and task tools never reach the model.
+        .arg("--tools")
+        .arg("Read,Write")
+        .arg("--allowedTools")
+        .arg(format!("Read(./{AGENT_INPUT_DIR}/**)"))
+        .arg(format!("Write(./{AGENT_OUTPUT_DIR}/**)"))
+        // Keep MCP servers/tools from user or project scopes out entirely.
+        .arg("--disallowedTools")
+        .arg("mcp__*")
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg(
+            workdir
+                .join(AGENT_CLAUDE_DIR)
+                .join(AGENT_CLAUDE_MCP_CONFIG_FILENAME),
+        );
+    prepare_agent_command_environment(&mut command);
     command.current_dir(workdir);
     let output = run_command_with_timeout(
         &mut command,
@@ -621,7 +643,13 @@ fn summarize_opencode_argv(
         .arg(&client.model)
         .arg(prompt)
         .stdin(std::process::Stdio::null());
-    scrub_agent_command_environment(&mut command);
+    prepare_agent_command_environment(&mut command);
+    // Pin OpenCode to the workspace-local deny-by-default permission config
+    // instead of any operator-level config file.
+    command.env(
+        "OPENCODE_CONFIG",
+        workdir.join(AGENT_OPENCODE_CONFIG_FILENAME),
+    );
     command.current_dir(workdir);
     let output = run_command_with_timeout(&mut command, None, client.command_timeout)
         .map_err(summary_integration_error)?;
@@ -661,7 +689,7 @@ fn summarize_cursor_argv(
         command.arg("--model").arg(&client.model);
     }
     command.stdin(std::process::Stdio::null());
-    scrub_agent_command_environment(&mut command);
+    prepare_agent_command_environment(&mut command);
     command.current_dir(workdir);
     let output = run_command_with_timeout(&mut command, None, client.command_timeout)
         .map_err(summary_integration_error)?;
@@ -683,6 +711,10 @@ fn summarize_cursor_argv(
 }
 
 fn require_agent_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> {
+    // Marker check: only workspaces materialized by AgentWorkspaceBuilder may
+    // be handed to an agent harness. The config files below pin each harness to
+    // a deny-by-default tool/permission surface, so requiring them here also
+    // proves the restrictions are in place before the CLI starts.
     let workdir = workdir.ok_or_else(|| {
         SummaryError::SummaryEngine("summary harness: workdir not provided".to_owned())
     })?;
@@ -692,9 +724,18 @@ fn require_agent_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> 
             .join(AGENT_CURSOR_DIR)
             .join(AGENT_CURSOR_CONFIG_FILENAME)
             .is_file()
+        || !workdir
+            .join(AGENT_CLAUDE_DIR)
+            .join(AGENT_CLAUDE_SETTINGS_FILENAME)
+            .is_file()
+        || !workdir
+            .join(AGENT_CLAUDE_DIR)
+            .join(AGENT_CLAUDE_MCP_CONFIG_FILENAME)
+            .is_file()
+        || !workdir.join(AGENT_OPENCODE_CONFIG_FILENAME).is_file()
     {
         return Err(SummaryError::SummaryEngine(
-            "summary harness: workdir missing expected agent workspace markers (input/, output/, .cursor/cli.json)".to_owned(),
+            "summary harness: workdir missing expected agent workspace markers (input/, output/, .cursor/cli.json, .claude/settings.json, .claude/mcp_servers.json, opencode.json)".to_owned(),
         ));
     }
     Ok(workdir)
@@ -835,29 +876,75 @@ fn agent_output_validation_failed(
     ))
 }
 
-fn scrub_agent_command_environment(command: &mut Command) {
-    for (key, _) in std::env::vars() {
-        if is_sensitive_env_key(&key) {
-            command.env_remove(key);
+/// Environment variable names forwarded to the agent harness process.
+/// Everything else in the bot environment (Discord token, database URL,
+/// session/encryption secrets, OAuth client secrets, arbitrary credentials
+/// like `AWS_SECRET_ACCESS_KEY`, ...) is dropped before spawning the CLI so a
+/// prompt-injected agent cannot read or exfiltrate them through `env`.
+///
+/// LLM-provider credentials stay on the list because the harness needs its own
+/// authentication to call the model API; they are operator-supplied values,
+/// not bot secrets. Keep this list minimal and document any addition.
+const AGENT_ENV_ALLOWLIST: &[&str] = &[
+    // Process basics required by any spawned CLI.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    // XDG locations the harness CLIs consult for config/data dirs.
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    // TLS roots for HTTPS calls to the model API.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    // Operator-controlled egress proxy configuration.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    // Harness authentication and endpoint configuration. These are the
+    // agent's own LLM credentials, never bot-owned secrets.
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR",
+    "CURSOR_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GEMINI_API_KEY",
+    // Credential *files/profile names* for Bedrock-style auth (paths, not the
+    // secret material itself; raw secret vars such as AWS_SECRET_ACCESS_KEY
+    // are deliberately not forwarded).
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+];
+
+fn prepare_agent_command_environment(command: &mut Command) {
+    command.env_clear();
+    for &key in AGENT_ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
         }
     }
-}
-
-fn is_sensitive_env_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.ends_with("_KEY")
-        || upper.contains("API_KEY")
-        || matches!(
-            upper.as_str(),
-            "DATABASE_URL"
-                | "DISCORD_CLIENT_SECRET"
-                | "WEB_SESSION_SECRET"
-                | "GUILD_BOT_TOKEN_ENCRYPTION_KEY"
-                | "OPERATIONAL_METRICS_BEARER_TOKEN"
-        )
 }
 
 fn summary_command_failed(
@@ -1208,9 +1295,12 @@ fn read_temp_output_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Command
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
-        AgentOutputContract, CommandOutputReadError, CommandOutputStream, CommandWhisperClient,
-        HarnessCliSummaryClient, IntegrationError, create_temp_output_file, read_temp_output_file,
+        AGENT_CLAUDE_DIR, AGENT_CLAUDE_MCP_CONFIG_FILENAME, AGENT_CLAUDE_SETTINGS_FILENAME,
+        AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR,
+        AGENT_OPENCODE_CONFIG_FILENAME, AGENT_OUTPUT_DIR, AgentOutputContract,
+        CommandOutputReadError, CommandOutputStream, CommandWhisperClient,
+        HarnessCliSummaryClient, IntegrationError, create_temp_output_file,
+        prepare_agent_command_environment, read_temp_output_file,
         run_agent_harness_with_output_contract, run_command_with_timeout,
         run_command_with_timeout_and_output_limit, sanitize_whisper_endpoint_for_log,
     };
@@ -1461,6 +1551,11 @@ mod tests {
     #[test]
     fn summary_harnesses_read_output_file_and_treat_stdout_as_diagnostic() {
         let _guard = command_test_lock();
+        // SAFETY: the command test lock serializes environment mutation against
+        // the other tests in this module that spawn summary harnesses.
+        unsafe {
+            std::env::set_var("DISCORD_TRANSCRIPT_TEST_SECRET", "x");
+        }
         for harness in [
             SummaryHarness::Claude,
             SummaryHarness::OpenCode,
@@ -1470,13 +1565,15 @@ mod tests {
             create_summary_agent_workdir(&workdir);
             let log_path = workdir.join("command.log");
             let stdin_path = workdir.join("stdin.log");
+            let env_path = workdir.join("env.log");
             let script_path = write_summary_script(
                 "summary_success",
                 &format!(
-                    "#!/bin/sh\npwd > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\ncat > '{}'\nprintf 'stdout summary must be ignored\\n'\nmkdir -p output\nprintf '## Summary\\nfrom file\\n' > output/summary.md\n",
+                    "#!/bin/sh\npwd > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\ncat > '{}'\nenv > '{}'\nprintf 'stdout summary must be ignored\\n'\nmkdir -p output\nprintf '## Summary\\nfrom file\\n' > output/summary.md\n",
                     log_path.display(),
                     log_path.display(),
-                    stdin_path.display()
+                    stdin_path.display(),
+                    env_path.display()
                 ),
             );
             let client = summary_test_client(harness, &script_path);
@@ -1500,7 +1597,27 @@ mod tests {
             );
             match harness {
                 SummaryHarness::Claude => {
-                    assert_eq!(lines[1..], ["--model", "model-a", "-p"]);
+                    let mcp_config = workdir
+                        .join(AGENT_CLAUDE_DIR)
+                        .join(AGENT_CLAUDE_MCP_CONFIG_FILENAME);
+                    assert_eq!(
+                        lines[1..],
+                        [
+                            "--model",
+                            "model-a",
+                            "-p",
+                            "--tools",
+                            "Read,Write",
+                            "--allowedTools",
+                            "Read(./input/**)",
+                            "Write(./output/**)",
+                            "--disallowedTools",
+                            "mcp__*",
+                            "--strict-mcp-config",
+                            "--mcp-config",
+                            mcp_config.to_str().expect("utf8 mcp config path"),
+                        ]
+                    );
                     assert_eq!(
                         std::fs::read_to_string(&stdin_path).expect("stdin should be captured"),
                         "PROMPT BODY"
@@ -1531,6 +1648,24 @@ mod tests {
                         ""
                     );
                 }
+            }
+
+            let env_log = std::fs::read_to_string(&env_path).expect("env log should exist");
+            assert!(
+                !env_log.contains("DISCORD_TRANSCRIPT_TEST_SECRET"),
+                "bot env must not leak into the agent process: {env_log}"
+            );
+            assert!(
+                !env_log.contains("DATABASE_URL"),
+                "database credentials must not leak into the agent process: {env_log}"
+            );
+            if harness == SummaryHarness::OpenCode {
+                assert!(env_log.contains(&format!(
+                    "OPENCODE_CONFIG={}",
+                    workdir
+                        .join(AGENT_OPENCODE_CONFIG_FILENAME)
+                        .to_string_lossy()
+                )));
             }
 
             let _ = std::fs::remove_dir_all(&workdir);
@@ -1764,6 +1899,43 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&workdir);
         let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn agent_command_environment_is_allowlist_based() {
+        let _guard = command_test_lock();
+        // SAFETY: the command test lock serializes environment mutation against
+        // the other tests in this module that spawn summary harnesses.
+        unsafe {
+            std::env::set_var("DISCORD_TRANSCRIPT_ALLOWLIST_TEST_SECRET", "x");
+            std::env::set_var("DISCORD_TRANSCRIPT_ALLOWLIST_TEST_PATH", "env-test-path");
+        }
+        let mut command = Command::new("true");
+        prepare_agent_command_environment(&mut command);
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !envs
+                .iter()
+                .any(|(key, _)| key == "DISCORD_TRANSCRIPT_ALLOWLIST_TEST_SECRET"),
+            "non-allowlisted env vars must be dropped: {envs:?}"
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "PATH" && value.is_some()),
+            "PATH should survive the allowlist: {envs:?}"
+        );
+        unsafe {
+            std::env::remove_var("DISCORD_TRANSCRIPT_ALLOWLIST_TEST_SECRET");
+            std::env::remove_var("DISCORD_TRANSCRIPT_ALLOWLIST_TEST_PATH");
+        }
     }
 
     #[test]
@@ -2649,6 +2821,23 @@ mod tests {
             "{}",
         )
         .expect("cursor config");
+        std::fs::create_dir_all(workdir.join(AGENT_CLAUDE_DIR)).expect("claude dir");
+        std::fs::write(
+            workdir
+                .join(AGENT_CLAUDE_DIR)
+                .join(AGENT_CLAUDE_SETTINGS_FILENAME),
+            "{}",
+        )
+        .expect("claude settings");
+        std::fs::write(
+            workdir
+                .join(AGENT_CLAUDE_DIR)
+                .join(AGENT_CLAUDE_MCP_CONFIG_FILENAME),
+            "{}",
+        )
+        .expect("claude mcp config");
+        std::fs::write(workdir.join(AGENT_OPENCODE_CONFIG_FILENAME), "{}")
+            .expect("opencode config");
     }
 
     fn command_test_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -361,6 +361,8 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
     assert_eq!(
         top_level_entries,
         vec![
+            ".claude/mcp_servers.json",
+            ".claude/settings.json",
             ".cursor/.cleanup-token",
             ".cursor/cli.json",
             "input/context/manifest.json",
@@ -368,8 +370,25 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
             "input/context/summary_template.txt",
             "input/transcript/manifest.json",
             "input/transcript/transcript_masked.md",
+            "opencode.json",
         ]
     );
+
+    let claude_settings =
+        std::fs::read_to_string(agent_root.join(".claude/settings.json")).expect("claude settings");
+    assert!(claude_settings.contains("Read(./input/**)"));
+    assert!(claude_settings.contains("Write(./output/**)"));
+    assert!(claude_settings.contains("Read(../**)"));
+    assert!(claude_settings.contains("\"Bash\""));
+    assert!(claude_settings.contains("disableAllHooks"));
+    assert!(claude_settings.contains("enableAllProjectMcpServers"));
+    let claude_mcp =
+        std::fs::read_to_string(agent_root.join(".claude/mcp_servers.json")).expect("mcp config");
+    assert!(claude_mcp.contains("\"mcpServers\""));
+    let opencode_config =
+        std::fs::read_to_string(agent_root.join("opencode.json")).expect("opencode config");
+    assert!(opencode_config.contains("\"bash\": \"deny\""));
+    assert!(opencode_config.contains("\"external_directory\": \"deny\""));
 
     let cursor_config = std::fs::read_to_string(agent_workspace.cursor_config_path())
         .expect("cursor config");
