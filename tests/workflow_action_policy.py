@@ -34,17 +34,20 @@ WRAPPER_VALUE_FLAGS = {
     "chroot": {"--groups", "--userspec"},
     "doas": {"-C", "-u"},
     "env": {"-C", "-S", "-u", "--chdir", "--split-string", "--unset"},
-    "ionice": {"-c", "-n", "-p", "-t"},
+    "ionice": {"-c", "-n", "-p"},
     "nice": {"-n", "--adjustment"},
     "stdbuf": {"-e", "-i", "-o"},
+    # Only options that take a separate value belong here; flags like
+    # `sudo -E` or `watch -t` consume nothing, so listing them would hide
+    # the real command word behind a supposed option value.
     "sudo": {
-        "-A", "-b", "-C", "-D", "-E", "-g", "-h", "-p", "-R", "-r", "-T",
-        "-t", "-U", "-u", "--askpass", "--chdir", "--close-from", "--group",
-        "--host", "--other-user", "--prompt", "--role", "--type", "--user",
+        "-C", "-D", "-g", "-h", "-p", "-r", "-T", "-t", "-U", "-u",
+        "--chdir", "--close-from", "--group", "--host", "--other-user",
+        "--prompt", "--role", "--type", "--user",
     },
     "time": {"-f", "-o", "--format", "--output"},
     "timeout": {"-k", "-s", "--kill-after", "--signal"},
-    "watch": {"-d", "-e", "-g", "-n", "-p", "-t", "-x"},
+    "watch": {"-n", "--interval"},
     "xargs": {
         "-d", "-I", "-L", "-n", "-P", "-s", "-J", "--delimiter",
         "--max-args", "--max-chars", "--max-lines", "--max-procs", "--replace",
@@ -322,7 +325,12 @@ def command_start_indices(words: list[str]) -> list[int]:
         # until the command.
         while index < len(words):
             token = words[index]
-            if token in value_flags:
+            # A cluster ending in a value flag consumes the next argument
+            # too (`sudo -Eu root docker push x`).
+            if token in value_flags or (
+                SINGLE_DASH_CLUSTER_RE.match(token)
+                and f"-{token[-1]}" in value_flags
+            ):
                 index += 2
             elif (
                 (token.startswith("-") and token != "-")
@@ -616,6 +624,9 @@ def self_test_command_invokes_docker_push() -> None:
         "timeout -k 2 60 docker push example/image:latest",
         "xargs -I img docker push img",
         "if true; then docker push example/image:latest; fi",
+        "sudo -E docker push example/image:latest",
+        "sudo -Eu root docker push example/image:latest",
+        "watch -t docker push example/image:latest",
         "while read -r tag; do docker push example/image:$tag; done",
         "eval docker push example/image:latest",
         "eval docker buildx build --load . && docker push example/image:latest",
@@ -637,6 +648,8 @@ def self_test_command_invokes_docker_push() -> None:
         "sudo -u root echo docker push example/image:latest",
         "eval echo docker push example/image:latest",
         "if true; then echo docker push example/image:latest; fi",
+        "sudo -E echo docker push example/image:latest",
+        "watch -t echo docker push example/image:latest",
     ]
     for command in invokes_cases:
         assert command_invokes_docker_push(command), (
