@@ -755,6 +755,15 @@ fn api_sql_mutations_scope_by_tenant_and_guild_and_preserve_review_state_machine
 }
 
 #[test]
+fn list_transcript_feedback_sql_is_bounded() {
+    // The admin list endpoint and summary-context loaders share this query;
+    // an unbounded scan over accumulated feedback rows is a retrieval-cost
+    // DoS lever. Keep a deterministic newest-first cap.
+    assert!(LIST_TRANSCRIPT_FEEDBACK_SQL.contains("ORDER BY created_at DESC, id DESC"));
+    assert!(LIST_TRANSCRIPT_FEEDBACK_SQL.contains("LIMIT"));
+}
+
+#[test]
 fn meeting_feedback_sql_guards_duplicate_retries_and_daily_quota() {
     assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("idempotency_key"));
     assert!(INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL.contains("$17"));
