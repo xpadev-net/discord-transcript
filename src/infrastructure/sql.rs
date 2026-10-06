@@ -168,19 +168,33 @@ pub fn migration_statements(migration: Migration) -> Vec<String> {
     if !migration.sql.contains("CONCURRENTLY") {
         return vec![migration_transaction_sql(migration)];
     }
-    let mut statements: Vec<String> = migration
-        .sql
-        .split(";\n")
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            if part.ends_with(';') {
-                part.to_owned()
-            } else {
-                format!("{part};")
+    // Split at `;` that end a line, except inside `$$`-quoted bodies
+    // (e.g. DO blocks), whose inner semicolons belong to the same
+    // statement.
+    let mut statements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_dollar_quote = false;
+    for line in migration.sql.split_inclusive('\n') {
+        // An odd number of `$$` markers on the line toggles the quote.
+        if line.matches("$$").count() % 2 == 1 {
+            in_dollar_quote = !in_dollar_quote;
+        }
+        let trimmed = line.trim();
+        if !in_dollar_quote && trimmed.ends_with(';') && !trimmed.starts_with("--") {
+            let part = format!("{current}{line}");
+            let part = part.trim();
+            if !part.is_empty() {
+                statements.push(part.to_owned());
             }
-        })
-        .collect();
+            current.clear();
+        } else {
+            current.push_str(line);
+        }
+    }
+    let tail = current.trim();
+    if !tail.is_empty() {
+        statements.push(tail.to_owned());
+    }
     statements.push(format!(
         "INSERT INTO schema_migrations (version) VALUES ({}) ON CONFLICT (version) DO NOTHING;",
         sql_literal(migration.version),
