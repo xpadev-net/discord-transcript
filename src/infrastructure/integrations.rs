@@ -431,26 +431,48 @@ fn is_sensitive_query_name(name: &str) -> bool {
         return true;
     }
 
-    normalized
-        .split('_')
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            matches!(
-                token,
-                "token"
-                    | "secret"
-                    | "password"
-                    | "passwd"
-                    | "pwd"
-                    | "credential"
-                    | "credentials"
-                    | "authorization"
-                    | "auth"
-                    | "signature"
-                    | "sig"
-                    | "key"
-            )
-        })
+    // Split into words on non-alphanumeric separators and on lower→upper
+    // (camelCase) boundaries so `accessToken` or `clientSecret` still hit a
+    // sensitive word even though the normalized name has no separator.
+    let mut word = String::new();
+    let mut prev_was_lower_or_digit = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !word.is_empty() {
+                if is_sensitive_word(&word) {
+                    return true;
+                }
+                word.clear();
+            }
+            prev_was_lower_or_digit = !ch.is_ascii_uppercase();
+            word.push(ch.to_ascii_lowercase());
+        } else {
+            if is_sensitive_word(&word) {
+                return true;
+            }
+            word.clear();
+            prev_was_lower_or_digit = false;
+        }
+    }
+    is_sensitive_word(&word)
+}
+
+fn is_sensitive_word(word: &str) -> bool {
+    matches!(
+        word,
+        "token"
+            | "secret"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "auth"
+            | "signature"
+            | "sig"
+            | "key"
+    )
 }
 
 fn quote_log_arg(part: &str) -> String {
@@ -1944,6 +1966,18 @@ mod tests {
         assert!(message.contains("bearer_token=REDACTED"));
         assert!(message.contains("key=REDACTED"));
         assert!(message.contains("x=1"));
+    }
+
+    #[test]
+    fn whisper_endpoint_redaction_catches_camel_case_secret_params() {
+        let rendered = sanitize_whisper_endpoint_for_log(
+            "https://whisper.example.test/inference?accessToken=tok-1&clientSecret=sec-2&apiKey=key-3&sessionToken=s-4&awsSecretAccessKey=k-5&debug=true&designMode=on",
+        );
+
+        assert_eq!(
+            rendered,
+            "https://whisper.example.test/inference?accessToken=REDACTED&clientSecret=REDACTED&apiKey=REDACTED&sessionToken=REDACTED&awsSecretAccessKey=REDACTED&debug=true&designMode=on"
+        );
     }
 
     #[test]
