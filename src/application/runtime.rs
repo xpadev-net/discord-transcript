@@ -2879,14 +2879,32 @@ fn duration_until_utc(next_run_at: DateTime<Utc>) -> Duration {
 /// Place every chunk on a shared wall-clock timeline so speakers with
 /// different join times (and thus independent per-user sequence numbers)
 /// stay aligned in the mixdown. `meeting_start_ms` anchors t=0 of the output.
-fn mix_chunks_by_wallclock(
+/// An overlap-connected group of chunk placements on the shared meeting
+/// timeline. Mixing cluster-by-cluster keeps peak memory proportional to the
+/// audio that actually overlaps, not the meeting's wall-clock span — a few
+/// chunks spread across hours no longer forces a dense multi-GB `vec![0i32; span]`
+/// allocation (plus the equally dense f64 resample buffer) during
+/// `merge_user_chunks_to_mixdown`.
+struct MixdownCluster<'a> {
+    /// Start offset in input-rate samples, relative to the meeting start.
+    start_samples: usize,
+    /// End offset (exclusive) in input-rate samples.
+    end_samples: usize,
+    /// (offset_samples, chunk) placements belonging to this cluster.
+    chunks: Vec<(usize, &'a crate::audio::meeting_audio::LoadedChunk)>,
+}
+
+fn mixdown_clusters(
     chunks: &[crate::audio::meeting_audio::LoadedChunk],
     sample_rate: u32,
-) -> Vec<u8> {
+) -> Vec<MixdownCluster<'_>> {
     use crate::audio::meeting_audio::MAX_MEETING_AUDIO_SPAN_MS;
 
     let meeting_start_ms = compute_meeting_start_ms(chunks);
-    let mut placements = Vec::new();
+    let cap_samples = ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128)
+        / 1_000u128) as usize;
+
+    let mut placements: Vec<(usize, usize, &crate::audio::meeting_audio::LoadedChunk)> = Vec::new();
     for chunk in chunks {
         let offset_ms = chunk.start_ms.saturating_sub(meeting_start_ms);
         if offset_ms > MAX_MEETING_AUDIO_SPAN_MS {
@@ -2900,35 +2918,54 @@ fn mix_chunks_by_wallclock(
         }
         let offset_samples =
             ((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize;
-        placements.push((offset_samples, chunk));
-    }
-    let total_samples = placements
-        .iter()
-        .map(|(offset, chunk)| *offset + chunk.pcm.len() / 2)
-        .max()
-        .unwrap_or(0);
-    let capped_total_samples = total_samples.min(
-        ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128) / 1_000u128)
-            as usize,
-    );
-
-    let mut mixed = vec![0i32; capped_total_samples];
-    for (offset_samples, chunk) in placements {
         let chunk_samples = chunk.pcm.len() / 2;
-        let usable_samples = chunk_samples.min(capped_total_samples.saturating_sub(offset_samples));
+        let usable_samples = chunk_samples.min(cap_samples.saturating_sub(offset_samples));
         if usable_samples < chunk_samples {
             warn!(
                 start_ms = chunk.start_ms,
                 offset_samples,
                 chunk_samples,
                 usable_samples,
-                capped_total_samples,
+                capped_total_samples = cap_samples,
                 "truncating chunk PCM tail beyond meeting wall-clock cap"
             );
         }
+        if usable_samples == 0 {
+            continue;
+        }
+        placements.push((offset_samples, offset_samples + usable_samples, chunk));
+    }
+    placements.sort_by_key(|(start, ..)| *start);
+
+    let mut clusters: Vec<MixdownCluster> = Vec::new();
+    for (start, end, chunk) in placements {
+        match clusters.last_mut() {
+            Some(cluster) if start <= cluster.end_samples => {
+                cluster.end_samples = cluster.end_samples.max(end);
+                cluster.chunks.push((start, chunk));
+            }
+            _ => clusters.push(MixdownCluster {
+                start_samples: start,
+                end_samples: end,
+                chunks: vec![(start, chunk)],
+            }),
+        }
+    }
+    clusters
+}
+
+/// Mix one cluster's chunks into i16 PCM covering
+/// `[cluster.start_samples, cluster.end_samples)`. The i32 accumulation
+/// buffer is only as large as the cluster's overlap span.
+fn mix_cluster_pcm(cluster: &MixdownCluster) -> Vec<u8> {
+    let span = cluster.end_samples - cluster.start_samples;
+    let mut mixed = vec![0i32; span];
+    for (offset_samples, chunk) in &cluster.chunks {
+        let base = offset_samples - cluster.start_samples;
+        let usable_samples = (cluster.end_samples - offset_samples).min(chunk.pcm.len() / 2);
         for i in 0..usable_samples {
             let sample = i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;
-            mixed[offset_samples + i] = mixed[offset_samples + i].saturating_add(sample);
+            mixed[base + i] = mixed[base + i].saturating_add(sample);
         }
     }
 
@@ -2940,12 +2977,141 @@ fn mix_chunks_by_wallclock(
     out
 }
 
+#[cfg(test)]
+fn mix_chunks_by_wallclock(
+    chunks: &[crate::audio::meeting_audio::LoadedChunk],
+    sample_rate: u32,
+) -> Vec<u8> {
+    // Dense test-only reassembly of the cluster mix: verifies that clusters
+    // tile the same timeline the previous single-buffer implementation used.
+    let clusters = mixdown_clusters(chunks, sample_rate);
+    let total_samples = clusters
+        .iter()
+        .map(|cluster| cluster.end_samples)
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![0u8; total_samples * 2];
+    for cluster in &clusters {
+        let pcm = mix_cluster_pcm(cluster);
+        let start = cluster.start_samples * 2;
+        out[start..start + pcm.len()].copy_from_slice(&pcm);
+    }
+    out
+}
+
+fn mixdown_wav_header(sample_rate: u32, data_size: u32) -> [u8; 44] {
+    let mut header = [0u8; 44];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(36u32 + data_size).to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM format
+    header[22..24].copy_from_slice(&1u16.to_le_bytes()); // mono
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&sample_rate.saturating_mul(2).to_le_bytes());
+    header[32..34].copy_from_slice(&2u16.to_le_bytes()); // block align
+    header[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits per sample
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_size.to_le_bytes());
+    header
+}
+
+const MIXDOWN_SILENCE_BLOCK: [u8; 8192] = [0u8; 8192];
+
+/// Stream the mixdown WAV to disk cluster-by-cluster so neither the mixing
+/// buffer nor the output buffer scales with meeting wall-clock length.
+/// Silence between clusters is written as zero-filled gaps from a small
+/// reusable block.
+fn write_mixdown_wav(
+    path: &std::path::Path,
+    clusters: &[MixdownCluster],
+    sample_rate: u32,
+    resample_to_16k: bool,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let (out_rate, resample) = if resample_to_16k && sample_rate == 48_000 {
+        (16_000u32, true)
+    } else {
+        if resample_to_16k {
+            warn!(
+                sample_rate,
+                "mixdown resampling skipped: unsupported sample rate (expected 48000)"
+            );
+        }
+        (sample_rate, false)
+    };
+
+    let mut file = std::io::BufWriter::new(
+        fs::File::create(path).map_err(|err| format!("failed to create mixdown: {err}"))?,
+    );
+    // Placeholder sizes; patched once the total data size is known.
+    file.write_all(&mixdown_wav_header(out_rate, 0))
+        .map_err(|err| format!("failed to write mixdown header: {err}"))?;
+
+    let mut out_samples_written = 0usize;
+    for cluster in clusters {
+        // Convert the cluster start from input-rate to output-rate samples.
+        let out_start = ((cluster.start_samples as u128).saturating_mul(out_rate as u128)
+            / sample_rate as u128) as usize;
+        let mut gap_bytes = out_start.saturating_sub(out_samples_written) * 2;
+        while gap_bytes > 0 {
+            let n = gap_bytes.min(MIXDOWN_SILENCE_BLOCK.len());
+            file.write_all(&MIXDOWN_SILENCE_BLOCK[..n])
+                .map_err(|err| format!("failed to write mixdown silence: {err}"))?;
+            gap_bytes -= n;
+        }
+        if out_start < out_samples_written {
+            // Sub-sample rounding overlap; keep stream position authoritative.
+            warn!(
+                out_start,
+                out_samples_written, "skipping overlapped mixdown cluster region"
+            );
+        }
+        let mixed = mix_cluster_pcm(cluster);
+        let out_pcm = if resample {
+            crate::audio::wav::resample_pcm_16le(&mixed, sample_rate, out_rate).0
+        } else {
+            mixed
+        };
+        let offset_bytes = out_start * 2;
+        let written_bytes = out_samples_written * 2;
+        if offset_bytes < written_bytes {
+            file.seek(SeekFrom::Start(44 + offset_bytes as u64))
+                .map_err(|err| format!("failed to seek mixdown output: {err}"))?;
+        }
+        file.write_all(&out_pcm)
+            .map_err(|err| format!("failed to write mixdown audio: {err}"))?;
+        out_samples_written = out_samples_written.max(out_start + out_pcm.len() / 2);
+    }
+    file.flush()
+        .map_err(|err| format!("failed to flush mixdown: {err}"))?;
+
+    let data_size = u64::try_from(out_samples_written * 2)
+        .map_err(|_| "mixdown PCM size overflow".to_owned())?;
+    if data_size > (u32::MAX - 36) as u64 {
+        return Err(format!(
+            "mixdown exceeds WAV size limit ({data_size} bytes > {} bytes)",
+            u32::MAX - 36
+        ));
+    }
+    let data_size = data_size as u32;
+    let mut file = file
+        .into_inner()
+        .map_err(|err| format!("failed to finalize mixdown stream: {err}"))?;
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&(36u32 + data_size).to_le_bytes()))
+        .and_then(|_| file.seek(SeekFrom::Start(40)))
+        .and_then(|_| file.write_all(&data_size.to_le_bytes()))
+        .map_err(|err| format!("failed to patch mixdown header: {err}"))?;
+    Ok(())
+}
+
 pub fn merge_user_chunks_to_mixdown(
     audio_dir: &std::path::Path,
     resample_to_16k: bool,
 ) -> Result<String, String> {
-    use crate::audio::build_wav_bytes_raw;
-
     let mixdown_path = audio_dir.join("mixdown.wav");
 
     let chunks = load_chunks(audio_dir)?;
@@ -2954,24 +3120,8 @@ pub fn merge_user_chunks_to_mixdown(
         return Err("mixed sample rates are not supported for mixdown".to_owned());
     }
 
-    let all_pcm = mix_chunks_by_wallclock(&chunks, sample_rate);
-
-    let (final_pcm, final_rate) = if resample_to_16k {
-        let (pcm, rate) = crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000);
-        if rate != 16_000 {
-            warn!(
-                sample_rate,
-                "mixdown resampling skipped: unsupported sample rate (expected 48000)"
-            );
-        }
-        (pcm, rate)
-    } else {
-        (all_pcm, sample_rate)
-    };
-    let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
-        .map_err(|err| format!("failed to build mixdown WAV: {err}"))?;
-    fs::write(&mixdown_path, &wav_bytes)
-        .map_err(|err| format!("failed to write mixdown: {err}"))?;
+    let clusters = mixdown_clusters(&chunks, sample_rate);
+    write_mixdown_wav(&mixdown_path, &clusters, sample_rate, resample_to_16k)?;
 
     Ok(mixdown_path.to_string_lossy().to_string())
 }
