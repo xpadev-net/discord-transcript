@@ -2942,7 +2942,14 @@ fn mixdown_clusters(
     let mut clusters: Vec<MixdownCluster> = Vec::new();
     for (start, end, chunk) in placements {
         match clusters.last_mut() {
-            Some(cluster) if start <= cluster.end_samples => {
+            Some(cluster)
+                if start.saturating_sub(cluster.end_samples)
+                    < 2 * crate::audio::wav::RESAMPLE_FIR_TAPS =>
+            {
+                // Gaps shorter than the resampler's FIR reach would make a
+                // per-cluster resample treat real neighbor audio as silence;
+                // merging keeps the filter context identical to a single
+                // continuous resample and costs only the tiny gap span.
                 cluster.end_samples = cluster.end_samples.max(end);
                 cluster.chunks.push((start, chunk));
             }
@@ -3021,6 +3028,42 @@ fn mixdown_wav_header(sample_rate: u32, data_size: u32) -> [u8; 44] {
 
 const MIXDOWN_SILENCE_BLOCK: [u8; 8192] = [0u8; 8192];
 
+/// Number of output PCM samples the clusters would produce; used to reject
+/// wall-clock-huge meetings before gigabytes of silence hit the disk.
+fn planned_mixdown_out_samples(
+    clusters: &[MixdownCluster],
+    sample_rate: u32,
+    out_rate: u32,
+) -> u64 {
+    clusters
+        .iter()
+        .map(|cluster| {
+            let out_start = (cluster.start_samples as u128).saturating_mul(out_rate as u128)
+                / sample_rate as u128;
+            let in_span = (cluster.end_samples - cluster.start_samples) as u128;
+            let out_span = in_span.saturating_mul(out_rate as u128) / sample_rate as u128;
+            out_start.saturating_add(out_span) as u64
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Fallback resampler for clips too short for the FIR path: decimates
+/// input samples so a tiny clip is still stored at the output rate instead
+/// of being mislabeled.
+fn decimate_pcm_16le(pcm: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
+    let samples = pcm.len() / 2;
+    let out_samples = (samples as u64).saturating_mul(to_rate as u64) / from_rate.max(1) as u64;
+    let mut out = Vec::with_capacity(out_samples as usize * 2);
+    for i in 0..out_samples {
+        let src = ((i * from_rate as u64) / to_rate as u64) as usize;
+        if src < samples {
+            out.extend_from_slice(&pcm[src * 2..src * 2 + 2]);
+        }
+    }
+    out
+}
+
 /// Stream the mixdown WAV to disk cluster-by-cluster so neither the mixing
 /// buffer nor the output buffer scales with meeting wall-clock length.
 /// Silence between clusters is written as zero-filled gaps from a small
@@ -3031,8 +3074,6 @@ fn write_mixdown_wav(
     sample_rate: u32,
     resample_to_16k: bool,
 ) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom, Write};
-
     let (out_rate, resample) = if resample_to_16k && sample_rate == 48_000 {
         (16_000u32, true)
     } else {
@@ -3044,6 +3085,33 @@ fn write_mixdown_wav(
         }
         (sample_rate, false)
     };
+
+    // Reject wall-clock-huge meetings up front: a nearly-day-long gap would
+    // otherwise fill the disk with silence before the size check could run.
+    let planned_samples = planned_mixdown_out_samples(clusters, sample_rate, out_rate);
+    let planned_bytes = planned_samples.saturating_mul(2);
+    if planned_bytes > (u32::MAX - 36) as u64 {
+        return Err(format!(
+            "mixdown exceeds WAV size limit ({planned_bytes} bytes > {} bytes)",
+            u32::MAX - 36
+        ));
+    }
+
+    let result = write_mixdown_wav_stream(path, clusters, sample_rate, out_rate, resample);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn write_mixdown_wav_stream(
+    path: &std::path::Path,
+    clusters: &[MixdownCluster],
+    sample_rate: u32,
+    out_rate: u32,
+    resample: bool,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
 
     let mut file = std::io::BufWriter::new(
         fs::File::create(path).map_err(|err| format!("failed to create mixdown: {err}"))?,
@@ -3073,7 +3141,15 @@ fn write_mixdown_wav(
         }
         let mixed = mix_cluster_pcm(cluster);
         let out_pcm = if resample {
-            crate::audio::wav::resample_pcm_16le(&mixed, sample_rate, out_rate).0
+            let (resampled, actual_rate) =
+                crate::audio::wav::resample_pcm_16le(&mixed, sample_rate, out_rate);
+            if actual_rate != out_rate {
+                // The FIR needs a minimum-length clip; decimate shorter ones
+                // so the WAV's 16 kHz label stays truthful.
+                decimate_pcm_16le(&resampled, actual_rate, out_rate)
+            } else {
+                resampled
+            }
         } else {
             mixed
         };
