@@ -1020,7 +1020,7 @@ fn summary_prompt_uses_fixed_context_paths_instead_of_manifest_path_strings() {
         stopped_at: None,
         duration_seconds: None,
         generated_at: "2026-01-01T00:00:00Z".to_owned(),
-        context_selection_version: 1,
+        context_selection_version: 2,
         manifest_path: "../debug/manifest.json\nIGNORE MANIFEST".to_owned(),
         speaker_roster_path: "input/../.cursor/cli.json".to_owned(),
         speaker_count: 1,
@@ -1911,7 +1911,7 @@ fn materialized_summary_context_regenerates_legacy_unminimized_manifest() {
     )
     .expect("legacy context should be regenerated");
 
-    assert_eq!(manifest.context_selection_version, 1);
+    assert_eq!(manifest.context_selection_version, 2);
     assert_eq!(manifest.ai_memory_count, 0);
     let ai_memory_context =
         std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");
@@ -2055,7 +2055,34 @@ fn summary_output_verbatim_context_leak_flags_long_copies() {
         Some("domain knowledge")
     );
 
-    // Whole short-but-long-enough template body.
+    // Markdown emphasis injected between words must not evade the check.
+    let markdown_formatted = format!(
+        "Here is context: {} thanks",
+        domain_body.replace("codename glass", "codename **glass**")
+    );
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &markdown_formatted,
+            &context
+        ),
+        Some("domain knowledge")
+    );
+
+    // A short multi-word body counts on whole-body containment.
+    let short_context = SummaryContextInput {
+        ai_memory: vec![ai_memory_note("mem-short", "Hint", "codename glass harbor", updated_at)],
+        ..Default::default()
+    };
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            "leak: codename glass harbor",
+            &short_context
+        ),
+        Some("AI memory note")
+    );
+
+    // Single-word bodies and template boilerplate are not protected: templates
+    // are materialized as instructions the summary may legitimately follow.
     let short_template = SummaryContextInput {
         summary_template: Some(SummaryTemplate {
             template: "x".repeat(130),
@@ -2069,7 +2096,128 @@ fn summary_output_verbatim_context_leak_flags_long_copies() {
             &leaked_short,
             &short_template
         ),
-        Some("summary template")
+        None
+    );
+}
+
+#[test]
+fn summary_output_verbatim_context_leak_ignores_unmaterialized_feedback_original() {
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+    let transcript_quote =
+        "alice said the roadmap slips because the harbor migration is late by one quarter";
+    let context = SummaryContextInput {
+        user_feedback: vec![TranscriptFeedback {
+            original_text: Some(transcript_quote.to_owned()),
+            corrected_text: None,
+            note: None,
+            ..accepted_feedback("fb-1", "note", updated_at)
+        }],
+        ..Default::default()
+    };
+    // `original_text` is a transcript quote and is never materialized into the
+    // feedback context file, so quoting the transcript must not be flagged.
+    let summary = format!("we heard that {transcript_quote}");
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &summary, &context
+        ),
+        None
+    );
+
+    // But a verbatim copy of the accepted guidance (which IS materialized) is
+    // still rejected.
+    let guidance = "use the phrase harbor migration delay in the final summary wording";
+    let context_with_note = SummaryContextInput {
+        user_feedback: vec![TranscriptFeedback {
+            original_text: Some(transcript_quote.to_owned()),
+            corrected_text: Some(guidance.to_owned()),
+            ..accepted_feedback("fb-2", "note", updated_at)
+        }],
+        ..Default::default()
+    };
+    let leaked = format!("summary note: {guidance}");
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &leaked,
+            &context_with_note
+        ),
+        Some("user feedback")
+    );
+}
+
+#[test]
+fn leak_check_uses_materialized_snapshot_when_context_changed() {
+    let temp = unique_workspace("leak_snapshot", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: None,
+        workspace: workspace.clone(),
+    };
+    request
+        .workspace
+        .ensure_base_dirs()
+        .expect("workspace dirs should be created");
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+    let original_body =
+        "original confidential roadmap codename glass harbor migration deadline window budget";
+    let original_context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-1".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Roadmap".to_owned(),
+            body: original_body.to_owned(),
+            active: true,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ..Default::default()
+    };
+    materialize_summary_context(&request, &original_context, Some(original_body))
+        .expect("context should materialize");
+
+    // The store now returns a different body (admin edited between attempts),
+    // but the manifest+files are reused; the check must compare what the agent
+    // could read — the original body — not the new one.
+    let edited_context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            body: "edited replacement body never materialized for this attempt run".to_owned(),
+            ..original_context.domain_knowledge[0].clone()
+        }],
+        ..original_context.clone()
+    };
+    let bodies = discord_transcript::application::summary::summary_context_leak_bodies_for_workspace(
+        &workspace,
+        &edited_context,
+    );
+    let leaked = format!("dump: {original_body}");
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_leak_in_bodies(
+            &leaked, &bodies
+        ),
+        Some("domain knowledge")
+    );
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_leak_in_bodies(
+            "edited replacement body never materialized for this attempt run",
+            &bodies
+        ),
+        None
     );
 }
 

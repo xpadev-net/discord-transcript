@@ -8212,8 +8212,15 @@ impl ScaffoldHandler {
         };
         if let Some(context) = retained_summary_context.as_ref()
             && let Some(leaked_kind) =
-                crate::application::summary::summary_output_verbatim_context_leak(
-                    &markdown, context,
+                crate::application::summary::summary_output_verbatim_leak_in_bodies(
+                    &markdown,
+                    // Compare the bodies materialized for this attempt (the
+                    // manifest snapshot), not the freshly loaded context —
+                    // retries can reuse older context files after edits.
+                    &crate::application::summary::summary_context_leak_bodies_for_workspace(
+                        &request.workspace,
+                        context,
+                    ),
                 )
         {
             return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(

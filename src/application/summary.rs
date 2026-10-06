@@ -129,7 +129,10 @@ impl AgentOutputContract {
 
 pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
     AgentOutputContract::new("output/summary.md", "summary output", 1024 * 1024);
-const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 1;
+// v2: materialization also snapshots the protected context bodies used by
+// the verbatim-leak check, so retries compare the bodies the agent actually
+// received instead of whatever the store holds at check time.
+const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {
@@ -789,91 +792,211 @@ pub fn materialize_summary_context(
     };
     write_json_file(&manifest_path, &manifest, "summary context manifest")?;
 
+    // Snapshot the protected bodies exactly as materialized so the leak check
+    // compares the context this attempt's agent could read, even if the store
+    // is edited before a later attempt reuses this manifest.
+    write_json_file(
+        &request.workspace.context_leak_check_bodies_path(),
+        &leak_check_bodies_from_parts(
+            domain_knowledge.iter(),
+            ai_memory.iter(),
+            user_feedback.iter(),
+        ),
+        "summary context leak-check bodies",
+    )?;
+
     Ok(manifest)
 }
 
-/// Minimum normalized length of a protected context body before a verbatim
-/// substring match is meaningful. Shorter strings (names, one-line
-/// corrections) legitimately reappear in summaries.
-const CONTEXT_LEAK_MIN_BODY_CHARS: usize = 120;
+/// Minimum word count for a protected body to participate in whole-body
+/// matching. Single words (names, short terms) legitimately reappear in
+/// summaries.
+const CONTEXT_LEAK_MIN_BODY_WORDS: usize = 2;
 /// Consecutive normalized words shared between the output and a protected
 /// context body that count as a verbatim copy.
 const CONTEXT_LEAK_WINDOW_WORDS: usize = 15;
 
+/// Normalize text for the leak check: lowercase and drop non-alphanumeric
+/// characters inside words so Markdown emphasis or punctuation injected
+/// between/around words cannot evade the verbatim comparison.
 fn normalized_leak_words(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|word| word.to_lowercase())
+        .filter_map(|word| {
+            let normalized = word
+                .chars()
+                .filter(|ch| ch.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
         .collect()
 }
 
-/// Deterministic post-check against prompt-injection exfiltration: materialized
-/// context bodies (admin-managed domain knowledge, summary templates, AI
-/// memory, feedback text) are readable by the agent, and an injected
-/// instruction can ask the model to print them into the summary. Returns the
-/// kind of protected body that appears verbatim in `markdown`, if any.
+/// A protected context body captured at materialization time. The leak check
+/// compares the summary output only against bodies that were actually
+/// materialized into the agent's context for that attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedLeakCheckBody {
+    pub kind: String,
+    pub body: String,
+}
+
+const LEAK_KIND_DOMAIN_KNOWLEDGE: &str = "domain knowledge";
+const LEAK_KIND_AI_MEMORY: &str = "AI memory note";
+const LEAK_KIND_USER_FEEDBACK: &str = "user feedback";
+
+fn leak_kind_static(kind: &str) -> Option<&'static str> {
+    [
+        LEAK_KIND_DOMAIN_KNOWLEDGE,
+        LEAK_KIND_AI_MEMORY,
+        LEAK_KIND_USER_FEEDBACK,
+    ]
+    .into_iter()
+    .find(|known| *known == kind)
+}
+
+/// Bodies selected for materialization, as they appear to the agent. The
+/// summary template is intentionally excluded: its boilerplate is meant to
+/// shape valid output, so flagging a template run would reject compliant
+/// summaries. Feedback `original_text` is likewise excluded because it is a
+/// transcript quote that is never materialized — summaries are allowed to
+/// quote the transcript.
+fn leak_check_bodies_from_parts<'a>(
+    domain_knowledge: impl Iterator<Item = &'a DomainKnowledgeItem>,
+    ai_memory: impl Iterator<Item = &'a AiMemoryNote>,
+    user_feedback: impl Iterator<Item = &'a TranscriptFeedback>,
+) -> Vec<MaterializedLeakCheckBody> {
+    domain_knowledge
+        .map(|item| MaterializedLeakCheckBody {
+            kind: LEAK_KIND_DOMAIN_KNOWLEDGE.to_owned(),
+            body: item.body.clone(),
+        })
+        .chain(ai_memory.map(|note| MaterializedLeakCheckBody {
+            kind: LEAK_KIND_AI_MEMORY.to_owned(),
+            body: note.body.clone(),
+        }))
+        .chain(user_feedback.flat_map(|feedback| {
+            [feedback.note.as_ref(), feedback.corrected_text.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|text| MaterializedLeakCheckBody {
+                    kind: LEAK_KIND_USER_FEEDBACK.to_owned(),
+                    body: text.clone(),
+                })
+                .collect::<Vec<_>>()
+        }))
+        .collect()
+}
+
+/// Fallback mirror of the materialization-time selection for callers that
+/// have no snapshot (e.g. a manifest written by an older version). Applies
+/// the same active/archived/accepted gates but cannot reproduce the
+/// transcript-relevance match.
+pub fn summary_context_leak_check_bodies(
+    context: &SummaryContextInput,
+) -> Vec<MaterializedLeakCheckBody> {
+    leak_check_bodies_from_parts(
+        context
+            .domain_knowledge
+            .iter()
+            .filter(|item| item.active && item.archived_at.is_none()),
+        context
+            .ai_memory
+            .iter()
+            .filter(|note| note.active && note.archived_at.is_none()),
+        context
+            .user_feedback
+            .iter()
+            .filter(|feedback| feedback.status == TranscriptFeedbackStatus::Accepted),
+    )
+}
+
+/// Bodies the summary agent could read for this workspace: the materialized
+/// snapshot when present, otherwise the live `context` selection.
+pub fn summary_context_leak_bodies_for_workspace(
+    workspace: &crate::infrastructure::workspace::MeetingWorkspacePaths,
+    context: &SummaryContextInput,
+) -> Vec<MaterializedLeakCheckBody> {
+    match load_summary_context_leak_bodies(workspace) {
+        Ok(Some(bodies)) => bodies,
+        Ok(None) => summary_context_leak_check_bodies(context),
+        Err(err) => {
+            warn!(error = %err, "failed to load leak-check body snapshot; using loaded context");
+            summary_context_leak_check_bodies(context)
+        }
+    }
+}
+
+/// Load the protected-body snapshot written at materialization. Returns None
+/// when the workspace predates snapshotting; callers fall back to
+/// [`summary_context_leak_check_bodies`].
+pub fn load_summary_context_leak_bodies(
+    workspace: &crate::infrastructure::workspace::MeetingWorkspacePaths,
+) -> Result<Option<Vec<MaterializedLeakCheckBody>>, SummaryError> {
+    let path = workspace.context_leak_check_bodies_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = fs::read(&path).map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to read summary context leak-check bodies {}: {err}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&json).map(Some).map_err(|err| {
+        SummaryError::SummaryEngine(format!(
+            "failed to parse summary context leak-check bodies {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+/// Deterministic post-check against prompt-injection exfiltration: compare
+/// `markdown` against protected context bodies that were materialized for
+/// the agent. Returns the kind of protected body quoted verbatim, if any.
 ///
 /// A body counts as leaked when the output shares a run of
-/// [`CONTEXT_LEAK_WINDOW_WORDS`] normalized words with it (or the whole body,
-/// when shorter than the window but at least
-/// [`CONTEXT_LEAK_MIN_BODY_CHARS`]).
-pub fn summary_output_verbatim_context_leak(
+/// [`CONTEXT_LEAK_WINDOW_WORDS`] normalized words with it (or the whole body
+/// when it has at least [`CONTEXT_LEAK_MIN_BODY_WORDS`] words but fewer than
+/// the window).
+pub fn summary_output_verbatim_leak_in_bodies(
     markdown: &str,
-    context: &SummaryContextInput,
+    bodies: &[MaterializedLeakCheckBody],
 ) -> Option<&'static str> {
     let output = normalized_leak_words(markdown).join(" ");
-    let bodies: Vec<(&'static str, &str)> = context
-        .domain_knowledge
-        .iter()
-        .filter(|item| item.active && item.archived_at.is_none())
-        .map(|item| ("domain knowledge", item.body.as_str()))
-        .chain(
-            context
-                .summary_template
-                .iter()
-                .filter(|template| template.active && template.archived_at.is_none())
-                .map(|template| ("summary template", template.template.as_str())),
-        )
-        .chain(
-            context
-                .ai_memory
-                .iter()
-                .filter(|note| note.active && note.archived_at.is_none())
-                .map(|note| ("AI memory note", note.body.as_str())),
-        )
-        .chain(
-            context
-                .user_feedback
-                .iter()
-                .flat_map(|feedback| {
-                    [
-                        feedback.note.as_deref(),
-                        feedback.corrected_text.as_deref(),
-                        feedback.original_text.as_deref(),
-                    ]
-                })
-                .flatten()
-                .map(|text| ("user feedback", text)),
-        )
-        .collect();
-
-    for (kind, body) in bodies {
-        let words = normalized_leak_words(body);
+    for body in bodies {
+        let words = normalized_leak_words(&body.body);
         if words.len() >= CONTEXT_LEAK_WINDOW_WORDS {
             for window in words.windows(CONTEXT_LEAK_WINDOW_WORDS) {
                 if output.contains(&window.join(" ")) {
-                    return Some(kind);
+                    return leak_kind_static(&body.kind);
                 }
             }
-        } else {
+        } else if words.len() >= CONTEXT_LEAK_MIN_BODY_WORDS {
             let normalized_body = words.join(" ");
-            if normalized_body.chars().count() >= CONTEXT_LEAK_MIN_BODY_CHARS
-                && output.contains(&normalized_body)
-            {
-                return Some(kind);
+            if output.contains(&normalized_body) {
+                return leak_kind_static(&body.kind);
             }
         }
     }
     None
+}
+
+/// Deterministic post-check against prompt-injection exfiltration: materialized
+/// context bodies (admin-managed domain knowledge, AI memory notes, accepted
+/// feedback guidance) are readable by the agent, and an injected instruction
+/// can ask the model to print them into the summary. Returns the kind of
+/// protected body that appears verbatim in `markdown`, if any.
+///
+/// Production callers should prefer the materialized-body snapshot via
+/// [`summary_context_leak_bodies_for_workspace`] so retries compare the bodies
+/// the agent actually received; this helper re-derives the selection from a
+/// live `context` for tests and snapshot-less callers.
+pub fn summary_output_verbatim_context_leak(
+    markdown: &str,
+    context: &SummaryContextInput,
+) -> Option<&'static str> {
+    summary_output_verbatim_leak_in_bodies(markdown, &summary_context_leak_check_bodies(context))
 }
 
 pub fn materialize_or_load_summary_context(
