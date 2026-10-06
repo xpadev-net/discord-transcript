@@ -23,6 +23,33 @@ COMMAND_WRAPPERS = {
     "builtin", "chroot", "command", "doas", "env", "exec", "ionice", "nice",
     "nohup", "setsid", "stdbuf", "sudo", "time", "timeout", "watch", "xargs",
 }
+# Shell keywords that also start a fresh command word.
+SHELL_KEYWORDS = {
+    "!", "{", "}", "case", "coproc", "do", "done", "elif", "else", "esac",
+    "fi", "for", "if", "then", "until", "while",
+}
+# Wrapper options that take a separate value (e.g. `sudo -u root`), so the
+# value is consumed with its flag instead of being read as the command.
+WRAPPER_VALUE_FLAGS = {
+    "chroot": {"--groups", "--userspec"},
+    "doas": {"-C", "-u"},
+    "env": {"-C", "-S", "-u", "--chdir", "--split-string", "--unset"},
+    "ionice": {"-c", "-n", "-p", "-t"},
+    "nice": {"-n", "--adjustment"},
+    "stdbuf": {"-e", "-i", "-o"},
+    "sudo": {
+        "-A", "-b", "-C", "-D", "-E", "-g", "-h", "-p", "-R", "-r", "-T",
+        "-t", "-U", "-u", "--askpass", "--chdir", "--close-from", "--group",
+        "--host", "--other-user", "--prompt", "--role", "--type", "--user",
+    },
+    "time": {"-f", "-o", "--format", "--output"},
+    "timeout": {"-k", "-s", "--kill-after", "--signal"},
+    "watch": {"-d", "-e", "-g", "-n", "-p", "-t", "-x"},
+    "xargs": {
+        "-d", "-I", "-L", "-n", "-P", "-s", "-J", "--delimiter",
+        "--max-args", "--max-chars", "--max-lines", "--max-procs", "--replace",
+    },
+}
 # Programs whose `-c` (or combined short option containing c) argument is
 # executed as a command string.
 COMMAND_STRING_PROGRAMS = {
@@ -279,18 +306,32 @@ def command_start_indices(words: list[str]) -> list[int]:
     if index < len(words):
         starts.append(index)
     while index < len(words):
-        if command_word(words[index]) not in COMMAND_WRAPPERS:
+        head = command_word(words[index])
+        if head in SHELL_KEYWORDS:
+            index += 1
+            if index < len(words):
+                starts.append(index)
+            continue
+        if head not in COMMAND_WRAPPERS:
             index += 1
             continue
+        value_flags = WRAPPER_VALUE_FLAGS.get(head, set())
         index += 1
         # Skip wrapper options plus their values and value-like tokens
-        # (e.g. `timeout 5`, `nice -n 5`, `env FOO=1`) until the command.
-        while index < len(words) and (
-            (words[index].startswith("-") and words[index] != "-")
-            or ENV_ASSIGN_RE.match(words[index])
-            or WRAPPER_VALUE_TOKEN_RE.match(words[index])
-        ):
-            index += 1
+        # (e.g. `timeout 5`, `nice -n 5`, `env FOO=1`, `sudo -u root`)
+        # until the command.
+        while index < len(words):
+            token = words[index]
+            if token in value_flags:
+                index += 2
+            elif (
+                (token.startswith("-") and token != "-")
+                or ENV_ASSIGN_RE.match(token)
+                or WRAPPER_VALUE_TOKEN_RE.match(token)
+            ):
+                index += 1
+            else:
+                break
         if index < len(words):
             starts.append(index)
     return starts
@@ -325,9 +366,9 @@ def nested_command_invokes_docker_push(words: list[str], depth: int) -> bool:
     for index, word in enumerate(words):
         head = command_word(word)
         if head == "eval":
-            for argument in words[index + 1 :]:
-                if command_invokes_docker_push(argument, depth + 1):
-                    return True
+            # eval joins every argument into one command string.
+            if command_invokes_docker_push(" ".join(words[index + 1 :]), depth + 1):
+                return True
             continue
         if head not in COMMAND_STRING_PROGRAMS:
             continue
@@ -568,6 +609,16 @@ def self_test_command_invokes_docker_push() -> None:
         "/usr/bin/docker push example/image:latest",
         "docker --log-level debug push example/image:latest",
         "docker image push --all-tags example/image",
+        "sudo -u root docker push example/image:latest",
+        "sudo -E --preserve-env docker push example/image:latest",
+        "env -u HOME docker push example/image:latest",
+        "nice -n 5 docker push example/image:latest",
+        "timeout -k 2 60 docker push example/image:latest",
+        "xargs -I img docker push img",
+        "if true; then docker push example/image:latest; fi",
+        "while read -r tag; do docker push example/image:$tag; done",
+        "eval docker push example/image:latest",
+        "eval docker buildx build --load . && docker push example/image:latest",
     ]
     inert_cases = [
         "docker buildx build --target production --load .",
@@ -583,6 +634,9 @@ def self_test_command_invokes_docker_push() -> None:
         "docker run alpine sh -c 'echo docker push example/image:latest'",
         "grep -c docker /var/log/build.log",
         "timeout 5 echo docker push example/image:latest",
+        "sudo -u root echo docker push example/image:latest",
+        "eval echo docker push example/image:latest",
+        "if true; then echo docker push example/image:latest; fi",
     ]
     for command in invokes_cases:
         assert command_invokes_docker_push(command), (
