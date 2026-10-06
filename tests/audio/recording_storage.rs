@@ -31,7 +31,7 @@ impl ChunkStorage for FlakyChunkStorage {
     ) -> Result<SavedChunk, ChunkStorageError> {
         if self
             .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 if value > 0 { Some(value - 1) } else { None }
             })
             .is_ok()
