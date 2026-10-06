@@ -654,6 +654,47 @@ fn agent_workspace_cleanup_refuses_replaced_root() {
 
 #[cfg(unix)]
 #[test]
+fn agent_workspace_cleanup_refuses_recycled_inode_root() {
+    use std::os::unix::fs::MetadataExt;
+
+    let base = unique_temp_dir("agent_workspace_cleanup_recycled");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    let original_ino = std::fs::metadata(&agent_root)
+        .expect("stat agent root")
+        .ino();
+    std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
+    // The workspace holds the root's inode open, so the recreated directory
+    // cannot recycle it — a same-ino replacement is structurally prevented.
+    std::fs::create_dir(&agent_root).expect("recreate agent root");
+    assert_ne!(
+        std::fs::metadata(&agent_root)
+            .expect("stat recreated root")
+            .ino(),
+        original_ino
+    );
+    std::fs::write(agent_root.join("unrelated.txt"), "do not delete").expect("replacement file");
+
+    let err = agent_workspace
+        .cleanup()
+        .expect_err("cleanup should reject a recreated root");
+
+    assert!(err.to_string().contains("identity changed"));
+    assert!(agent_root.join("unrelated.txt").is_file());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
 fn agent_workspace_cleanup_removes_despite_oversized_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_oversized_marker");
     let meeting_root = base.join("meeting");

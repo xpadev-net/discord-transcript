@@ -53,12 +53,16 @@ pub struct MeetingWorkspacePaths {
     debug_root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct AgentWorkspace {
     root: PathBuf,
     expected_output_path: PathBuf,
     cursor_config_path: PathBuf,
     root_identity: AgentWorkspaceRootIdentity,
+    // Held open for the workspace's lifetime: an open directory fd pins the
+    // root inode so the filesystem cannot recycle it to a different directory
+    // object before cleanup, keeping the dev/ino identity check airtight.
+    root_handle: AgentWorkspaceRootHandle,
     cleanup_on_drop: bool,
 }
 
@@ -83,6 +87,14 @@ struct AgentWorkspaceRootIdentity {
     ino: u64,
     cleanup_marker: String,
 }
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct AgentWorkspaceRootHandle(fs::File);
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct AgentWorkspaceRootHandle;
 
 #[cfg(not(unix))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,12 +393,12 @@ impl AgentWorkspace {
     }
 
     pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
-        cleanup_agent_workspace_root(&self.root, &self.root_identity)
+        cleanup_agent_workspace_root(&self.root, &self.root_identity, &self.root_handle)
     }
 
     pub fn cleanup_once(mut self) -> Result<(), AgentWorkspaceError> {
         self.cleanup_on_drop = false;
-        cleanup_agent_workspace_root(&self.root, &self.root_identity)
+        cleanup_agent_workspace_root(&self.root, &self.root_identity, &self.root_handle)
     }
 }
 
@@ -457,12 +469,18 @@ impl AgentWorkspaceBuilder {
             canonicalize_agent_root(&self.agent_root, &meeting_root, &expected_agent_parent)?;
         initialize_cleanup_marker(&self.agent_root)?;
         let root_identity = root_identity(&self.agent_root)?;
+        // Pin the root inode for the workspace's lifetime: while this fd is
+        // open, a deleted-and-recreated directory cannot reuse the recorded
+        // dev/ino pair, so the cleanup identity check cannot be spoofed by
+        // inode recycling.
+        let root_handle = open_agent_root_handle(&self.agent_root)?;
+        let cleanup_handle = open_agent_root_handle(&self.agent_root)?;
 
         let cleanup_root = self.agent_root.clone();
         let cleanup_identity = root_identity.clone();
-        let build_result = self.populate(meeting_root, agent_root, root_identity);
+        let build_result = self.populate(meeting_root, agent_root, root_identity, root_handle);
         if build_result.is_err() {
-            let _ = cleanup_agent_workspace_root(&cleanup_root, &cleanup_identity);
+            let _ = cleanup_agent_workspace_root(&cleanup_root, &cleanup_identity, &cleanup_handle);
         }
         build_result
     }
@@ -472,6 +490,7 @@ impl AgentWorkspaceBuilder {
         meeting_root: PathBuf,
         agent_root: PathBuf,
         root_identity: AgentWorkspaceRootIdentity,
+        root_handle: AgentWorkspaceRootHandle,
     ) -> Result<AgentWorkspace, AgentWorkspaceError> {
         let input_dir = self.agent_root.join(AGENT_INPUT_DIR);
         let output_dir = self.agent_root.join(AGENT_OUTPUT_DIR);
@@ -524,6 +543,7 @@ impl AgentWorkspaceBuilder {
             expected_output_path: self.expected_output_path,
             cursor_config_path,
             root_identity,
+            root_handle,
             cleanup_on_drop: true,
         })
     }
@@ -645,6 +665,21 @@ fn validate_agent_dir(canonical_agent_root: &Path, path: &Path) -> Result<(), Ag
 }
 
 #[cfg(unix)]
+fn open_agent_root_handle(path: &Path) -> Result<AgentWorkspaceRootHandle, AgentWorkspaceError> {
+    fs::File::open(path)
+        .map(AgentWorkspaceRootHandle)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })
+}
+
+#[cfg(not(unix))]
+fn open_agent_root_handle(_path: &Path) -> Result<AgentWorkspaceRootHandle, AgentWorkspaceError> {
+    Ok(AgentWorkspaceRootHandle)
+}
+
+#[cfg(unix)]
 fn root_identity(path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorkspaceError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -674,6 +709,7 @@ fn root_identity(_path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorksp
 fn validate_root_identity(
     path: &Path,
     expected: &AgentWorkspaceRootIdentity,
+    root_handle: &AgentWorkspaceRootHandle,
 ) -> Result<(), AgentWorkspaceError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -699,6 +735,22 @@ fn validate_root_identity(
             reason: "agent workspace root identity changed before cleanup",
         });
     }
+    // The held-open fd must pin the recorded inode; together they prove the
+    // path resolves to the directory object that was materialized, since a
+    // pinned inode cannot be recycled to a replacement directory.
+    let handle_metadata = root_handle
+        .0
+        .metadata()
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+    if handle_metadata.dev() != expected.dev || handle_metadata.ino() != expected.ino {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root identity changed before cleanup",
+        });
+    }
     match read_cleanup_marker(path) {
         Ok(marker) if marker == expected.cleanup_marker => Ok(()),
         // The root is still the exact directory object that was materialized,
@@ -719,6 +771,7 @@ fn validate_root_identity(
 fn validate_root_identity(
     _path: &Path,
     _expected: &AgentWorkspaceRootIdentity,
+    _root_handle: &AgentWorkspaceRootHandle,
 ) -> Result<(), AgentWorkspaceError> {
     Ok(())
 }
@@ -726,6 +779,7 @@ fn validate_root_identity(
 fn cleanup_agent_workspace_root(
     root: &Path,
     expected: &AgentWorkspaceRootIdentity,
+    root_handle: &AgentWorkspaceRootHandle,
 ) -> Result<(), AgentWorkspaceError> {
     match fs::symlink_metadata(root) {
         Ok(_) => {}
@@ -738,7 +792,7 @@ fn cleanup_agent_workspace_root(
         }
     }
 
-    validate_root_identity(root, expected)?;
+    validate_root_identity(root, expected, root_handle)?;
     match fs::remove_dir_all(root) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
