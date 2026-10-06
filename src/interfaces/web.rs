@@ -5649,6 +5649,30 @@ fn guild_settings_response(
     stored: Option<StoredGuildSettings>,
     capabilities: GuildSettingsCapabilities,
 ) -> GuildSettingsResponse {
+    if !capabilities.can_manage_settings {
+        // Customization-only readers (domain knowledge / summary template
+        // managers) may open the settings page to reach their own sections,
+        // but they must not receive the guild's administrative settings or
+        // bot-token registration metadata.
+        return GuildSettingsResponse {
+            whisper_language: None,
+            whisper_language_explicit: false,
+            whisper_vad: false,
+            auto_stop_grace_seconds: 0,
+            retention_raw_audio_ttl_days: 0,
+            retention_transcript_ttl_days: 0,
+            summary_enabled: false,
+            discord_bot_token_registered: false,
+            discord_bot_token_updated_at: None,
+            discord_bot_token_last_validated_at: None,
+            discord_bot_user_id: None,
+            discord_bot_username: None,
+            is_admin: capabilities.is_admin,
+            can_manage_settings: capabilities.can_manage_settings,
+            can_manage_domain_knowledge: capabilities.can_manage_domain_knowledge,
+            can_manage_summary_templates: capabilities.can_manage_summary_templates,
+        };
+    }
     let stored = stored.unwrap_or(StoredGuildSettings {
         whisper_language: None,
         whisper_language_explicit: false,
@@ -13331,6 +13355,37 @@ mod guild_api_tests {
         assert_eq!(response.discord_bot_username.as_deref(), Some("GuildBot"));
         assert!(response.is_admin);
         assert!(response.can_manage_settings);
+        assert!(response.can_manage_domain_knowledge);
+        assert!(response.can_manage_summary_templates);
+    }
+
+    #[test]
+    fn guild_settings_response_redacts_values_for_customization_only_roles() {
+        let response = guild_settings_response(
+            &default_settings(),
+            Some(stored_settings_with_token(true)),
+            GuildSettingsCapabilities {
+                is_admin: false,
+                can_manage_settings: false,
+                can_manage_domain_knowledge: true,
+                can_manage_summary_templates: true,
+            },
+        );
+
+        assert_eq!(response.whisper_language, None);
+        assert!(!response.whisper_language_explicit);
+        assert!(!response.whisper_vad);
+        assert_eq!(response.auto_stop_grace_seconds, 0);
+        assert_eq!(response.retention_raw_audio_ttl_days, 0);
+        assert_eq!(response.retention_transcript_ttl_days, 0);
+        assert!(!response.summary_enabled);
+        assert!(!response.discord_bot_token_registered);
+        assert_eq!(response.discord_bot_token_updated_at, None);
+        assert_eq!(response.discord_bot_token_last_validated_at, None);
+        assert_eq!(response.discord_bot_user_id, None);
+        assert_eq!(response.discord_bot_username, None);
+        assert!(!response.is_admin);
+        assert!(!response.can_manage_settings);
         assert!(response.can_manage_domain_knowledge);
         assert!(response.can_manage_summary_templates);
     }
