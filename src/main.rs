@@ -1,8 +1,9 @@
 use discord_transcript::application::runtime::{BotRunExit, SummaryJobWakeups, run_bot};
 use discord_transcript::application::worker::{
-    ProcessJobResult, SummaryJobOptions, SummaryNotificationReceipt, SummaryStatusNotification,
-    SummaryUrlNotification, WorkerError, complete_summary_job_after_notification,
-    process_next_summary_job, record_summary_completion_usage_observe_only,
+    ProcessJobResult, SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobOptions,
+    SummaryNotificationReceipt, SummaryStatusNotification, SummaryUrlNotification, WorkerError,
+    complete_summary_job_after_notification, process_next_summary_job,
+    record_summary_completion_usage_observe_only, spawn_summary_job_heartbeat,
 };
 use discord_transcript::bootstrap::config::{AppConfig, AppRole};
 use discord_transcript::infrastructure::bot_token::{
@@ -25,7 +26,9 @@ use serenity::http::Http;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
@@ -344,10 +347,13 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         &config.database_url,
         &config.database_ssl_mode,
     )?);
-    let mut queue = SqlJobQueue::new(PgSqlExecutor::connect_with_ssl_mode(
-        &config.database_url,
-        &config.database_ssl_mode,
-    )?);
+    // The queue is shared with a per-job heartbeat task that keeps the claimed
+    // job's lease alive while the worker performs the (potentially long)
+    // Discord notification phase — the same guard the in-bot runtime uses.
+    let queue = Arc::new(Mutex::new(SqlJobQueue::new(
+        PgSqlExecutor::connect_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?,
+    )));
+    let worker_shutdown = CancellationToken::new();
     let token_db_url = database_url_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
     let (token_db_client, token_db_connection) =
         tokio_postgres::connect(&token_db_url, NoTls).await?;
@@ -398,42 +404,60 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         tokio::select! {
             () = shutdown_signal() => {
                 tracing::info!("shutdown signal received");
+                worker_shutdown.cancel();
                 break;
             }
             () = &mut idle_sleep => {
-                if let Err(err) = queue.ready_summary_meeting_ids() {
+                if let Err(err) = queue.lock().await.ready_summary_meeting_ids() {
                     tracing::warn!(
                         error = %err,
                         "standalone worker failed to recover stale running summary jobs"
                     );
                 }
-                match process_next_summary_job(
-                    &mut store,
-                    &mut queue,
-                    &whisper,
-                    &summary_client,
-                    &options,
-                ) {
+                let job_result = {
+                    let mut queue_guard = queue.lock().await;
+                    process_next_summary_job(
+                        &mut store,
+                        &mut *queue_guard,
+                        &whisper,
+                        &summary_client,
+                        &options,
+                    )
+                };
+                match job_result {
                     Ok(Some(result)) => {
                         let chunk_count = result.output.chunks.len();
-                        let completion_result =
-                            match notify_standalone_worker_summary(
-                                &config,
-                                &token_db_client,
-                                guild_bot_token_cipher.as_ref(),
-                                &mut store,
-                                &result,
-                            )
-                            .await
-                            {
-                                Ok(receipt) => complete_summary_job_after_notification(
+                        // Discord notification may take far longer than the job
+                        // lease (hundreds of messages under rate limits), so the
+                        // lease must be refreshed in the background or the job
+                        // expires mid-flight and is rerun by a later pass.
+                        let heartbeat_guard = spawn_summary_job_heartbeat(
+                            &result.job,
+                            Arc::clone(&queue),
+                            worker_shutdown.clone(),
+                            SUMMARY_JOB_HEARTBEAT_INTERVAL,
+                        );
+                        let notify_result = notify_standalone_worker_summary(
+                            &config,
+                            &token_db_client,
+                            guild_bot_token_cipher.as_ref(),
+                            &mut store,
+                            &result,
+                        )
+                        .await;
+                        heartbeat_guard.stop().await;
+                        let completion_result = match notify_result {
+                            Ok(receipt) => {
+                                let mut queue_guard = queue.lock().await;
+                                complete_summary_job_after_notification(
                                     &mut store,
-                                    &mut queue,
+                                    &mut *queue_guard,
                                     &result.job,
                                     receipt,
-                                ),
-                                Err(err) => Err(err),
-                            };
+                                )
+                            }
+                            Err(err) => Err(err),
+                        };
                         match completion_result {
                             Ok(true) => {
                                 record_summary_completion_usage_observe_only(

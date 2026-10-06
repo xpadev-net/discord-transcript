@@ -41,6 +41,10 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
 use std::io::Read;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +74,82 @@ pub struct ProcessMeetingOutput {
 }
 
 const MEETING_TITLE_MAX_CHARS: usize = 80;
+
+pub const SUMMARY_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Background task handle that keeps refreshing a claimed summary job's lease
+/// while long-running completion work (e.g. posting many Discord messages)
+/// runs without touching the queue.
+pub struct SummaryJobHeartbeatGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SummaryJobHeartbeatGuard {
+    pub async fn stop(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for SummaryJobHeartbeatGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Spawn a task that heartbeats `job` every `interval_duration` until
+/// `shutdown_token` fires or the returned guard is dropped/stopped.
+///
+/// Summary job leases are short (seconds), so any phase that can exceed the
+/// lease — Discord notification in particular — must run under this guard or
+/// the job will expire mid-flight and be re-claimed by another worker pass,
+/// rerunning the expensive summary pipeline indefinitely.
+pub fn spawn_summary_job_heartbeat<Q>(
+    job: &Job,
+    queue: Arc<Mutex<Q>>,
+    shutdown_token: CancellationToken,
+    interval_duration: Duration,
+) -> SummaryJobHeartbeatGuard
+where
+    Q: JobQueue + Send + 'static,
+{
+    let heartbeat_job = job.clone();
+    let interval_duration = if interval_duration.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval_duration
+    };
+    let heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval_duration);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let result = {
+                        let mut queue = queue.lock().await;
+                        queue.heartbeat(&heartbeat_job)
+                    };
+                    if let Err(err) = result {
+                        warn!(
+                            job_id = %heartbeat_job.id,
+                            error = %err,
+                            "failed to refresh summary job lease heartbeat"
+                        );
+                    }
+                }
+                _ = shutdown_token.cancelled() => break,
+            }
+        }
+    });
+
+    SummaryJobHeartbeatGuard {
+        handle: Some(heartbeat_task),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerError {

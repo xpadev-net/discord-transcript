@@ -15,9 +15,10 @@ use crate::application::retention_cleanup::{
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::{
-    SummaryNotificationReceipt, SummaryStatusNotification, SummaryUrlNotification,
-    complete_summary_job_after_notification, enqueue_summary_job,
-    mark_summary_meeting_failed_from_summary_state,
+    SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobHeartbeatGuard, SummaryNotificationReceipt,
+    SummaryStatusNotification, SummaryUrlNotification, complete_summary_job_after_notification,
+    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+    spawn_summary_job_heartbeat,
 };
 use crate::audio::meeting_audio::{
     ProcessedAudioChunk, build_speaker_audio_inputs,
@@ -2305,72 +2306,6 @@ enum SummaryJobRunError {
         message: String,
         retry_after: Duration,
     },
-}
-
-const SUMMARY_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
-struct SummaryJobHeartbeatGuard {
-    handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl SummaryJobHeartbeatGuard {
-    async fn stop(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
-    }
-}
-
-impl Drop for SummaryJobHeartbeatGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-fn spawn_summary_job_heartbeat<Q>(
-    job: &Job,
-    queue: Arc<Mutex<Q>>,
-    shutdown_token: CancellationToken,
-    interval_duration: Duration,
-) -> SummaryJobHeartbeatGuard
-where
-    Q: JobQueue + Send + 'static,
-{
-    let heartbeat_job = job.clone();
-    let interval_duration = if interval_duration.is_zero() {
-        Duration::from_millis(1)
-    } else {
-        interval_duration
-    };
-    let heartbeat_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(interval_duration);
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let result = {
-                        let mut queue = queue.lock().await;
-                        queue.heartbeat(&heartbeat_job)
-                    };
-                    if let Err(err) = result {
-                        warn!(
-                            job_id = %heartbeat_job.id,
-                            error = %err,
-                            "failed to refresh summary job lease heartbeat"
-                        );
-                    }
-                }
-                _ = shutdown_token.cancelled() => break,
-            }
-        }
-    });
-
-    SummaryJobHeartbeatGuard {
-        handle: Some(heartbeat_task),
-    }
 }
 
 struct RuntimeSummaryJobOutput {
