@@ -92,7 +92,6 @@ use tracing::{debug, error, info, warn};
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
-const FINAL_FLUSH_MAX_RETRIES: u32 = 10;
 const AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS: u32 = 10;
 const DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS: u32 = 10;
 const RECORDING_STOP_MAX_RETRIES: u32 = 10;
@@ -1427,7 +1426,6 @@ impl TeardownStopError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordingTeardownError {
-    FinalFlush(String),
     Stop(TeardownStopError),
 }
 
@@ -1450,7 +1448,6 @@ impl Display for TeardownStopError {
 impl Display for RecordingTeardownError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FinalFlush(err) => write!(f, "{err}"),
             Self::Stop(err) => write!(f, "{err}"),
         }
     }
@@ -4182,9 +4179,7 @@ impl EventHandler for ScaffoldHandler {
             let target_channel_for_task = target_voice_channel_id;
             self.spawn_background(async move {
                 // Keep these counters independent: cache misses decide grace
-                // rechecks, final-flush failures protect persisted audio, and
-                // stop failures protect the DB/job transition.
-                let mut final_flush_failures = 0u32;
+                // rechecks, stop failures protect the DB/job transition.
                 let mut grace_cache_misses = 0u32;
                 let mut lookup_failures = 0u32;
                 let mut stop_failures = 0u32;
@@ -4517,180 +4512,7 @@ impl EventHandler for ScaffoldHandler {
                             }
                             break result;
                         }
-                        Err(RecordingTeardownError::FinalFlush(err)) => {
-                            final_flush_failures += 1;
-                            if final_flush_failures >= FINAL_FLUSH_MAX_RETRIES {
-                                warn!(
-                                    guild_id = %guild_for_task,
-                                    attempts = final_flush_failures,
-                                    error = %err,
-                                    "auto-stop final flush retry limit reached; marking recording failed"
-                                );
-                                let terminal_error = format!(
-                                    "final audio flush failed after {final_flush_failures} auto-stop attempt(s): {err}"
-                                );
-                                match handler
-                                    .fail_recording_after_teardown_exhaustion(
-                                        &lifecycle_permit,
-                                        &ctx_for_task,
-                                        handler.guild_id,
-                                        &guild_for_task,
-                                        expected_meeting_id_ref,
-                                        &terminal_error,
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        if let Err(status_err) = handler
-                                            .update_status_message(
-                                                &ctx_for_task.http,
-                                                expected_meeting_id_ref,
-                                                StatusMessageUpdate::Failed {
-                                                    phase: "Recording persist",
-                                                    error: &terminal_error,
-                                                },
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                guild_id = %guild_for_task,
-                                                meeting_id = expected_meeting_id_ref,
-                                                error = %status_err,
-                                                "failed to notify final flush retry exhaustion"
-                                            );
-                                        }
-                                        return;
-                                    }
-                                    Err(mark_err) => {
-                                        warn!(
-                                            guild_id = %guild_for_task,
-                                            meeting_id = expected_meeting_id_ref,
-                                            error = %mark_err,
-                                            "failed to mark recording failed after auto-stop final flush exhaustion; rescheduling"
-                                        );
-                                        if let TerminalCleanupRetryDecision::Cleared {
-                                            removed_session,
-                                        } = handler
-                                            .handle_terminal_cleanup_retry_failure(
-                                                TerminalCleanupRetryFailureRequest {
-                                                    guild_key: &guild_for_task,
-                                                    expected_meeting_id: expected_meeting_id_ref,
-                                                    phase: "auto-stop final flush exhaustion",
-                                                    err: &mark_err,
-                                                },
-                                                &mut terminal_cleanup_failures,
-                                            )
-                                            .await
-                                        {
-                                            drop(lifecycle_permit);
-                                            handler
-                                                .finish_terminal_absence_cleanup(
-                                                    &ctx_for_task,
-                                                    handler.guild_id,
-                                                    &guild_for_task,
-                                                    expected_meeting_id_ref,
-                                                    "auto-stop final flush exhaustion",
-                                                    *removed_session,
-                                                )
-                                                .await;
-                                            return;
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                            let mut states = handler.auto_stop_states.lock().await;
-                            let Err(terminal_error) =
-                                rearm_auto_stop_state_for_retry_or_terminal_error(
-                                    &mut states,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
-                                    "final flush failure",
-                                    &err,
-                                )
-                            else {
-                                continue;
-                            };
-                            drop(states);
-                            warn!(
-                                guild_id = %guild_for_task,
-                                meeting_id = expected_meeting_id_ref,
-                                error = %err,
-                                "auto-stop timer state missing or changed after final flush failure; marking recording failed"
-                            );
-                            match handler
-                                .fail_recording_after_teardown_exhaustion(
-                                    &lifecycle_permit,
-                                    &ctx_for_task,
-                                    handler.guild_id,
-                                    &guild_for_task,
-                                    expected_meeting_id_ref,
-                                    &terminal_error,
-                                )
-                                .await
-                            {
-                                Ok(()) => {
-                                    if let Err(status_err) = handler
-                                        .update_status_message(
-                                            &ctx_for_task.http,
-                                            expected_meeting_id_ref,
-                                            StatusMessageUpdate::Failed {
-                                                phase: "Recording persist",
-                                                error: &terminal_error,
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            guild_id = %guild_for_task,
-                                            meeting_id = expected_meeting_id_ref,
-                                            error = %status_err,
-                                            "failed to notify auto-stop missing timer state"
-                                        );
-                                    }
-                                }
-                                Err(mark_err) => {
-                                    warn!(
-                                        guild_id = %guild_for_task,
-                                        meeting_id = expected_meeting_id_ref,
-                                        error = %mark_err,
-                                        "failed to mark recording failed after auto-stop timer state disappeared; rescheduling"
-                                    );
-                                    if let TerminalCleanupRetryDecision::Cleared {
-                                        removed_session,
-                                    } = handler
-                                        .handle_terminal_cleanup_retry_failure(
-                                            TerminalCleanupRetryFailureRequest {
-                                                guild_key: &guild_for_task,
-                                                expected_meeting_id: expected_meeting_id_ref,
-                                                phase:
-                                                    "auto-stop missing timer state after flush failure",
-                                                err: &mark_err,
-                                            },
-                                            &mut terminal_cleanup_failures,
-                                        )
-                                        .await
-                                    {
-                                        drop(lifecycle_permit);
-                                        handler
-                                            .finish_terminal_absence_cleanup(
-                                                &ctx_for_task,
-                                                handler.guild_id,
-                                                &guild_for_task,
-                                                expected_meeting_id_ref,
-                                                "auto-stop missing timer state after flush failure",
-                                                *removed_session,
-                                            )
-                                            .await;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                            }
-                            return;
-                        }
                         Err(RecordingTeardownError::Stop(err)) => {
-                            final_flush_failures = 0;
                             if err.is_target_absent() {
                                 warn!(
                                     guild_id = %guild_for_task,
@@ -5479,12 +5301,22 @@ impl ScaffoldHandler {
                 .get_mut(request.guild_key)
                 .filter(|session| session.meeting_id == request.expected_meeting_id)
             {
-                flush_session_for_teardown(session, request.guild_key, request.phase)
-                    .map_err(RecordingTeardownError::FinalFlush)?;
-                // The write voice_event_gate held for this block keeps
-                // SpeakingStateUpdate from changing the tracker while the
-                // successful final-flush mapping is persisted. Failed flushes
-                // keep the session in memory and retry with a fresh snapshot.
+                // A failed final flush must not wedge the control-plane stop
+                // path: the meeting still transitions out of Recording and
+                // voice is released. The session keeps its retained failed
+                // chunks, is removed below, and gets one tail-flush retry
+                // after the leave; if that still fails the meeting is marked
+                // failed with the audio loss recorded.
+                if let Err(err) =
+                    flush_session_for_teardown(session, request.guild_key, request.phase)
+                {
+                    warn!(
+                        guild_id = %request.guild_key,
+                        meeting_id = %request.expected_meeting_id,
+                        error = %err,
+                        "final audio flush incomplete; proceeding with stop and retrying tail flush after leave"
+                    );
+                }
                 session.persist_ssrc_mapping(&tracker);
             }
         }
@@ -8744,7 +8576,6 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         // Driver-disconnect has no timer state to consult after
                         // grace expiry, so the counters below bound only their
                         // own failure classes before terminal cleanup is tried.
-                        let mut final_flush_failures = 0u32;
                         let mut grace_cache_misses = 0u32;
                         let mut lookup_failures = 0u32;
                         let mut stop_failures = 0u32;
@@ -9306,92 +9137,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                     }
                                     break result;
                                 }
-                                Err(RecordingTeardownError::FinalFlush(err)) => {
-                                    final_flush_failures += 1;
-                                    if final_flush_failures >= FINAL_FLUSH_MAX_RETRIES {
-                                        warn!(
-                                            guild_id = %guild_key,
-                                            attempts = final_flush_failures,
-                                            error = %err,
-                                            "driver-disconnect final flush retry limit reached; marking recording failed"
-                                        );
-                                        let terminal_error = format!(
-                                            "final audio flush failed after {final_flush_failures} driver-disconnect attempt(s): {err}"
-                                        );
-                                        match runtime
-                                            .fail_recording_after_teardown_exhaustion(
-                                                &lifecycle_permit,
-                                                &ctx_for_task,
-                                                runtime.guild_id,
-                                                &guild_key,
-                                                expected_meeting_id_ref,
-                                                &terminal_error,
-                                            )
-                                            .await
-                                        {
-                                            Ok(()) => {
-                                                if let Err(status_err) = runtime
-                                                    .update_status_message(
-                                                        &http,
-                                                        expected_meeting_id_ref,
-                                                        StatusMessageUpdate::Failed {
-                                                            phase: "Recording persist",
-                                                            error: &terminal_error,
-                                                        },
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!(
-                                                        guild_id = %guild_key,
-                                                        meeting_id = expected_meeting_id_ref,
-                                                        error = %status_err,
-                                                        "failed to notify driver-disconnect final flush exhaustion"
-                                                    );
-                                                }
-                                                return;
-                                            }
-                                            Err(mark_err) => {
-                                                warn!(
-                                                    guild_id = %guild_key,
-                                                    meeting_id = expected_meeting_id_ref,
-                                                    error = %mark_err,
-                                                    "failed to mark recording failed after driver-disconnect final flush exhaustion; rescheduling"
-                                                );
-                                                if let TerminalCleanupRetryDecision::Cleared {
-                                                    removed_session,
-                                                } = runtime
-                                                    .handle_terminal_cleanup_retry_failure(
-                                                        TerminalCleanupRetryFailureRequest {
-                                                            guild_key: &guild_key,
-                                                            expected_meeting_id:
-                                                                expected_meeting_id_ref,
-                                                            phase: "driver-disconnect final flush exhaustion",
-                                                            err: &mark_err,
-                                                        },
-                                                        &mut terminal_cleanup_failures,
-                                                    )
-                                                    .await
-                                                {
-                                                    drop(lifecycle_permit);
-                                                    runtime
-                                                        .finish_terminal_absence_cleanup(
-                                                            &ctx_for_task,
-                                                            runtime.guild_id,
-                                                            &guild_key,
-                                                            expected_meeting_id_ref,
-                                                            "driver-disconnect final flush exhaustion",
-                                                            *removed_session,
-                                                        )
-                                                        .await;
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
                                 Err(RecordingTeardownError::Stop(err)) => {
-                                    final_flush_failures = 0;
                                     if err.is_target_absent() {
                                         warn!(
                                             guild_id = %guild_key,
@@ -12673,17 +12419,17 @@ mod status_message_tests {
     }
 
     #[test]
-    fn manual_stop_final_flush_failure_blocks_teardown_and_can_retry() {
+    fn manual_stop_final_flush_retains_failed_chunks_for_tail_retry() {
         assert_final_flush_failure_is_retryable("manual stop");
     }
 
     #[test]
-    fn auto_stop_final_flush_failure_blocks_teardown_and_can_retry() {
+    fn auto_stop_final_flush_retains_failed_chunks_for_tail_retry() {
         assert_final_flush_failure_is_retryable("auto-stop");
     }
 
     #[test]
-    fn driver_disconnect_final_flush_failure_blocks_teardown_and_can_retry() {
+    fn driver_disconnect_final_flush_retains_failed_chunks_for_tail_retry() {
         assert_final_flush_failure_is_retryable("driver disconnect");
     }
 
@@ -13093,11 +12839,11 @@ mod status_message_tests {
 
     #[test]
     fn final_flush_exhaustion_retains_session_until_terminal_cleanup_succeeds() {
+        const FLUSH_ATTEMPTS: usize = 3;
         let mut store = FaultInjectedMeetingStore::with_recording_meeting();
-        let mut local_state =
-            RecordingLocalState::with_matching_session(FINAL_FLUSH_MAX_RETRIES as usize);
+        let mut local_state = RecordingLocalState::with_matching_session(FLUSH_ATTEMPTS);
 
-        for _ in 0..FINAL_FLUSH_MAX_RETRIES {
+        for _ in 0..FLUSH_ATTEMPTS {
             let session = local_state
                 .sessions
                 .get_mut("g1")
@@ -13111,7 +12857,7 @@ mod status_message_tests {
         mark_recording_failed_after_teardown_exhaustion(
             &mut store,
             "m1",
-            "final audio flush failed after 10 auto-stop attempt(s): injected failure",
+            "final audio flush failed after 3 auto-stop attempt(s): injected failure",
         )
         .expect("terminal status write should succeed after flush retry exhaustion");
         let removed = local_state.clear_expected_meeting();
