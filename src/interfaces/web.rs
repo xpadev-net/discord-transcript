@@ -9515,6 +9515,8 @@ async fn api_list_ai_memory(
         .map(|source_type| source_type.as_str().to_owned())
         .unwrap_or_default();
     let include_archived = query.include_archived.unwrap_or(false).to_string();
+    // Admin list endpoints enumerate all records: no anchor filter or limit.
+    let unscoped = String::new();
     let rows = state
         .db
         .query(
@@ -9524,6 +9526,8 @@ async fn api_list_ai_memory(
                 &tenant.guild_id,
                 &include_archived,
                 &source_type,
+                &unscoped,
+                &unscoped,
             ],
         )
         .await
@@ -10012,11 +10016,19 @@ async fn api_list_feedback(
         .transpose()?
         .map(|feedback_type| feedback_type.as_str().to_owned())
         .unwrap_or_default();
+    let unscoped = String::new();
     let rows = state
         .db
         .query(
             LIST_TRANSCRIPT_FEEDBACK_SQL,
-            &[&tenant.tenant_id, &tenant.guild_id, &status, &feedback_type],
+            &[
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &status,
+                &feedback_type,
+                &unscoped,
+                &unscoped,
+            ],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -10113,6 +10125,7 @@ async fn api_list_person_aliases(
         .transpose()?
         .map(|status| status.as_str().to_owned())
         .unwrap_or_default();
+    let unscoped = String::new();
     let rows = state
         .db
         .query(
@@ -10122,6 +10135,8 @@ async fn api_list_person_aliases(
                 &tenant.guild_id,
                 &include_archived,
                 &review_status,
+                &unscoped,
+                &unscoped,
             ],
         )
         .await
