@@ -790,20 +790,22 @@ pub fn materialize_summary_context(
         summary_template: summary_template_metadata,
         effective_summary_template_id: context.effective_summary_template_id.clone(),
     };
-    write_json_file(&manifest_path, &manifest, "summary context manifest")?;
-
     // Snapshot the protected bodies exactly as materialized so the leak check
     // compares the context this attempt's agent could read, even if the store
-    // is edited before a later attempt reuses this manifest.
+    // is edited before a later attempt reuses this manifest. Written before
+    // the manifest: the manifest is the commit point for this materialization,
+    // so a reused manifest guarantees the snapshot exists.
     write_json_file(
         &request.workspace.context_leak_check_bodies_path(),
         &leak_check_bodies_from_parts(
             domain_knowledge.iter(),
             ai_memory.iter(),
             user_feedback.iter(),
+            context.summary_template.as_ref(),
         ),
         "summary context leak-check bodies",
     )?;
+    write_json_file(&manifest_path, &manifest, "summary context manifest")?;
 
     Ok(manifest)
 }
@@ -844,27 +846,37 @@ pub struct MaterializedLeakCheckBody {
 const LEAK_KIND_DOMAIN_KNOWLEDGE: &str = "domain knowledge";
 const LEAK_KIND_AI_MEMORY: &str = "AI memory note";
 const LEAK_KIND_USER_FEEDBACK: &str = "user feedback";
+const LEAK_KIND_SUMMARY_TEMPLATE: &str = "summary template";
 
 fn leak_kind_static(kind: &str) -> Option<&'static str> {
     [
         LEAK_KIND_DOMAIN_KNOWLEDGE,
         LEAK_KIND_AI_MEMORY,
         LEAK_KIND_USER_FEEDBACK,
+        LEAK_KIND_SUMMARY_TEMPLATE,
     ]
     .into_iter()
     .find(|known| *known == kind)
 }
 
-/// Bodies selected for materialization, as they appear to the agent. The
-/// summary template is intentionally excluded: its boilerplate is meant to
-/// shape valid output, so flagging a template run would reject compliant
-/// summaries. Feedback `original_text` is likewise excluded because it is a
-/// transcript quote that is never materialized — summaries are allowed to
-/// quote the transcript.
+/// Whether whole-body containment flags this body kind. Confidential store
+/// bodies must never appear verbatim, but template boilerplate and applied
+/// feedback are expected inside valid output, so only the long verbatim
+/// window applies to them — flagging a short run would reject compliant
+/// summaries on every retry.
+fn leak_body_short_match(kind: &str) -> bool {
+    matches!(kind, LEAK_KIND_DOMAIN_KNOWLEDGE | LEAK_KIND_AI_MEMORY)
+}
+
+/// Bodies selected for materialization, as they appear to the agent.
+/// Feedback `original_text` is excluded because it is a transcript quote
+/// that is never materialized — summaries are allowed to quote the
+/// transcript.
 fn leak_check_bodies_from_parts<'a>(
     domain_knowledge: impl Iterator<Item = &'a DomainKnowledgeItem>,
     ai_memory: impl Iterator<Item = &'a AiMemoryNote>,
     user_feedback: impl Iterator<Item = &'a TranscriptFeedback>,
+    summary_template: Option<&'a SummaryTemplate>,
 ) -> Vec<MaterializedLeakCheckBody> {
     domain_knowledge
         .map(|item| MaterializedLeakCheckBody {
@@ -885,6 +897,14 @@ fn leak_check_bodies_from_parts<'a>(
                 })
                 .collect::<Vec<_>>()
         }))
+        .chain(
+            summary_template
+                .filter(|template| template.active && template.archived_at.is_none())
+                .map(|template| MaterializedLeakCheckBody {
+                    kind: LEAK_KIND_SUMMARY_TEMPLATE.to_owned(),
+                    body: template.template.clone(),
+                }),
+        )
         .collect()
 }
 
@@ -908,6 +928,7 @@ pub fn summary_context_leak_check_bodies(
             .user_feedback
             .iter()
             .filter(|feedback| feedback.status == TranscriptFeedbackStatus::Accepted),
+        context.summary_template.as_ref(),
     )
 }
 
@@ -972,7 +993,7 @@ pub fn summary_output_verbatim_leak_in_bodies(
                     return leak_kind_static(&body.kind);
                 }
             }
-        } else if words.len() >= CONTEXT_LEAK_MIN_BODY_WORDS {
+        } else if words.len() >= CONTEXT_LEAK_MIN_BODY_WORDS && leak_body_short_match(&body.kind) {
             let normalized_body = words.join(" ");
             if output.contains(&normalized_body) {
                 return leak_kind_static(&body.kind);
@@ -1006,6 +1027,13 @@ pub fn materialize_or_load_summary_context(
 ) -> Result<SummaryContextManifest, SummaryError> {
     if let Some(manifest) = load_summary_context_manifest(request)?
         && manifest.context_selection_version == SUMMARY_CONTEXT_SELECTION_VERSION
+        // A v2+ manifest is only complete with its leak-check snapshot: an
+        // interrupted write could otherwise make retries compare context the
+        // agent never received.
+        && request
+            .workspace
+            .context_leak_check_bodies_path()
+            .exists()
     {
         return Ok(manifest);
     }

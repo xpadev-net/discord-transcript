@@ -2081,8 +2081,17 @@ fn summary_output_verbatim_context_leak_flags_long_copies() {
         Some("AI memory note")
     );
 
-    // Single-word bodies and template boilerplate are not protected: templates
-    // are materialized as instructions the summary may legitimately follow.
+    // Single-word bodies are not protected, and short template echoes stay
+    // allowed — but a verbatim run of the materialized template is a leak.
+    let leaked_template = format!("out: {template_body}");
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            &leaked_template,
+            &context
+        ),
+        Some("summary template")
+    );
+
     let short_template = SummaryContextInput {
         summary_template: Some(SummaryTemplate {
             template: "x".repeat(130),
@@ -2124,9 +2133,10 @@ fn summary_output_verbatim_context_leak_ignores_unmaterialized_feedback_original
         None
     );
 
-    // But a verbatim copy of the accepted guidance (which IS materialized) is
-    // still rejected.
-    let guidance = "use the phrase harbor migration delay in the final summary wording";
+    // But a long verbatim run of the accepted guidance (which IS materialized)
+    // is still rejected — only short applied corrections stay allowed.
+    let guidance =
+        "use the phrase harbor migration delay in the final summary wording exactly as written here";
     let context_with_note = SummaryContextInput {
         user_feedback: vec![TranscriptFeedback {
             original_text: Some(transcript_quote.to_owned()),
@@ -2143,6 +2153,93 @@ fn summary_output_verbatim_context_leak_ignores_unmaterialized_feedback_original
         ),
         Some("user feedback")
     );
+
+    // A short accepted correction is meant to appear in the output; only a
+    // long verbatim run flags it, so applying it must not fail the check.
+    let short_guidance = SummaryContextInput {
+        user_feedback: vec![TranscriptFeedback {
+            original_text: Some("old name".to_owned()),
+            corrected_text: Some("harbor migration".to_owned()),
+            note: None,
+            ..accepted_feedback("fb-3", "note", updated_at)
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_context_leak(
+            "the harbor migration is on track",
+            &short_guidance
+        ),
+        None
+    );
+}
+
+#[test]
+fn manifest_reuse_without_leak_snapshot_regenerates() {
+    let temp = unique_workspace("leak_snapshot_missing", "m2");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m2".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: None,
+        workspace: workspace.clone(),
+    };
+    request
+        .workspace
+        .ensure_base_dirs()
+        .expect("workspace dirs should be created");
+    let context = SummaryContextInput::default();
+    discord_transcript::application::summary::materialize_summary_context(
+        &request,
+        &context,
+        None,
+    )
+    .expect("context should materialize");
+    // Simulate an interrupted v2 write: manifest present, snapshot gone.
+    std::fs::remove_file(request.workspace.context_leak_check_bodies_path())
+        .expect("remove snapshot");
+
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+    let new_body =
+        "confidential harbor codename roadmap deadline launch approvals budget window q3 plan";
+    let transcript = format!("meeting notes: {new_body}");
+    let new_context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-2".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "Roadmap".to_owned(),
+            body: new_body.to_owned(),
+            active: true,
+            version: 2,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        ..Default::default()
+    };
+    discord_transcript::application::summary::materialize_or_load_summary_context(
+        &request,
+        &new_context,
+        Some(&transcript),
+    )
+    .expect("manifest should regenerate with fresh snapshot");
+    let bodies = discord_transcript::application::summary::summary_context_leak_bodies_for_workspace(
+        &workspace,
+        &new_context,
+    );
+    assert!(bodies.iter().any(|body| body.body == new_body));
 }
 
 #[test]
