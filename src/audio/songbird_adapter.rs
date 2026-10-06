@@ -100,9 +100,9 @@ pub fn adapt_voice_tick(
 }
 
 fn stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
-    let chunks = stereo.chunks_exact(2);
-    let remainder = chunks.remainder();
-    let mut mono: Vec<i16> = chunks
+    let (pairs, remainder) = stereo.as_chunks::<2>();
+    let mut mono: Vec<i16> = pairs
+        .iter()
         .map(|pair| ((pair[0] as i32 + pair[1] as i32) / 2) as i16)
         .collect();
     // If there is a trailing odd sample (incomplete stereo pair), keep it as-is.
