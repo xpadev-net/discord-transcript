@@ -574,7 +574,18 @@ async fn notify_standalone_worker_summary(
             result.output.meeting_id, err
         ))
     })?;
-    let http = Http::new(&token);
+    // Bot-originated messages must never ping: posted chunks embed the stored
+    // voice-channel name, which can contain @everyone/@here/user/role mention
+    // syntax that a channel manager could weaponize into bot-sent pings. Apply
+    // the same default_allowed_mentions restriction as the gateway client.
+    let http = serenity::http::HttpBuilder::new(&token)
+        .default_allowed_mentions(
+            serenity::all::CreateAllowedMentions::new()
+                .all_roles(false)
+                .all_users(false)
+                .everyone(false),
+        )
+        .build();
 
     let chunks = summary_chunks_with_voice_channel_metadata(&meeting, result.output.chunks.clone());
     post_summary_to_report_channel(&http, report_channel_id, &chunks)
