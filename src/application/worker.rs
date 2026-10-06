@@ -251,7 +251,18 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         effective_settings: Option<&EffectiveMeetingSettings>,
     ) -> Result<SummaryContextInput, StoreError> {
         let speakers = load_meeting_speakers(self, meeting_id)?;
-        let domain_knowledge = self.list_domain_knowledge(guild_id, false, None)?;
+        // Meeting summaries are visible to anyone who can view the recorded
+        // voice channel (verify_meeting_access), while domain knowledge,
+        // AI memory, accepted feedback, and person aliases are readable only
+        // by holders of admin-tier RBAC permissions. Materializing
+        // admin-curated records into a viewer-visible summary crosses that
+        // authorization boundary, and meeting participants can steer both
+        // relevance matching and the agent's output from inside the meeting.
+        // Context records are therefore only eligible when they are anchored
+        // to a meeting recorded in the same voice channel; records without a
+        // meeting anchor (guild-global admin data, including all domain
+        // knowledge) are never materialized.
+        let domain_knowledge = Vec::new();
         let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
         if let Err(err) =
             upsert_vc_participant_alias_candidates_for_guild(self, meeting_id, guild_id, &speakers)
@@ -265,20 +276,63 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         }
         let tenant = self.resolve_tenant_by_guild(guild_id)?;
         let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+            // The eligible-anchor set is resolved first so the candidate lists
+            // can pre-filter by anchor in SQL: the per-list LIMIT then applies
+            // to eligible records only, so guild-wide records can neither make
+            // the lookup unbounded nor crowd out eligible context.
+            let allowed_meetings = summary_context_allowed_meeting_ids(self, meeting_id, guild_id)?;
+            let anchor_csv = summary_context_anchor_csv(&allowed_meetings);
+            let ai_memory = self.list_ai_memory_notes(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                None,
+                Some(&anchor_csv),
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
+            )?;
+            let user_feedback = self.list_transcript_feedback(
+                &tenant.tenant_id,
+                guild_id,
+                Some(TranscriptFeedbackStatus::Accepted),
+                None,
+                Some(&anchor_csv),
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
+            )?;
+            let person_aliases = self.list_person_aliases(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                Some(PersonAliasReviewStatus::Accepted),
+                Some(&anchor_csv),
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
+            )?;
             (
-                self.list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)?,
-                self.list_transcript_feedback(
-                    &tenant.tenant_id,
-                    guild_id,
-                    Some(TranscriptFeedbackStatus::Accepted),
-                    None,
-                )?,
-                self.list_person_aliases(
-                    &tenant.tenant_id,
-                    guild_id,
-                    false,
-                    Some(PersonAliasReviewStatus::Accepted),
-                )?,
+                ai_memory
+                    .into_iter()
+                    .filter(|note| {
+                        note.source_meeting_id
+                            .as_deref()
+                            .is_some_and(|id| allowed_meetings.contains(id))
+                    })
+                    .collect(),
+                user_feedback
+                    .into_iter()
+                    .filter(|feedback| {
+                        feedback
+                            .meeting_id
+                            .as_deref()
+                            .is_some_and(|id| allowed_meetings.contains(id))
+                    })
+                    .collect(),
+                person_aliases
+                    .into_iter()
+                    .filter(|alias| {
+                        alias
+                            .source_meeting_id
+                            .as_deref()
+                            .is_some_and(|id| allowed_meetings.contains(id))
+                    })
+                    .collect(),
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
@@ -297,6 +351,193 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
                 .and_then(|settings| settings.domain_knowledge_version_id.clone()),
         })
     }
+}
+
+pub(crate) const SUMMARY_CONTEXT_MEETING_CHANNEL_SQL: &str =
+    "SELECT voice_channel_id FROM meetings WHERE id=$1 AND guild_id=$2";
+pub(crate) const SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL: &str = "SELECT id FROM meetings \
+             WHERE guild_id=$1 AND voice_channel_id=$2 AND id <> $3 ORDER BY id";
+
+/// Maximum rows loaded per candidate list (AI memory, feedback, aliases) for
+/// summary context scoping. Keeps each summary job's context lookup bounded
+/// regardless of how large the guild's record set grows.
+pub(crate) const SUMMARY_CONTEXT_LIST_LIMIT: u32 = 500;
+
+/// Maximum anchor meeting ids sent to the channel lookup in a single query.
+/// Bounds the comma-joined parameter size even if candidate lists grow.
+pub(crate) const SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT: usize = 1500;
+
+/// Returns the meeting ids whose records may be materialized into a summary's
+/// context: the meeting being summarized plus every meeting recorded in the
+/// same voice channel. Summary consumers are the viewers of that channel
+/// (verify_meeting_access), so context from meetings in other channels — or
+/// records with no meeting anchor — would cross the channel authorization
+/// boundary.
+pub(crate) fn summary_context_allowed_meeting_ids<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
+    meeting_id: &str,
+    guild_id: &str,
+) -> Result<HashSet<String>, StoreError> {
+    let mut allowed = HashSet::from([meeting_id.to_owned()]);
+    let current = store
+        .executor
+        .query_rows(
+            SUMMARY_CONTEXT_MEETING_CHANNEL_SQL,
+            &[meeting_id.to_owned(), guild_id.to_owned()],
+        )
+        .map_err(StoreError::Backend)?;
+    let Some(channel) = current
+        .first()
+        .and_then(|row| row.first().cloned().flatten())
+    else {
+        // The meeting's channel cannot be proven, so only the current meeting
+        // anchor is allowed.
+        return Ok(allowed);
+    };
+    // Ordering by id before the cap keeps the surviving subset deterministic;
+    // meetings beyond the cap are excluded from the allowed set (fail closed).
+    let same_channel_sql = format!(
+        "{SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL} LIMIT {SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT}"
+    );
+    let rows = store
+        .executor
+        .query_rows(
+            &same_channel_sql,
+            &[guild_id.to_owned(), channel, meeting_id.to_owned()],
+        )
+        .map_err(StoreError::Backend)?;
+    allowed.extend(
+        rows.into_iter()
+            .filter_map(|row| row.into_iter().next().flatten()),
+    );
+    Ok(allowed)
+}
+
+/// Serializes the allowed meeting set as a sorted CSV so the scoped list
+/// queries bind a deterministic `string_to_array` parameter.
+pub(crate) fn summary_context_anchor_csv(allowed: &HashSet<String>) -> String {
+    let mut ids = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.join(",")
+}
+
+/// Registers the fake rows for the shared summary-context fixture: tenant
+/// "t1"/guild "g1" whose candidates anchor to meeting "m1" (the summarized
+/// meeting), "m2" (same voice channel "vc1"), "m3" (other channel "vc2"), and
+/// unanchored rows. Used by the worker- and runtime-path loader tests so both
+/// loaders exercise identical records through their full SQL call paths.
+#[cfg(test)]
+pub(crate) fn register_summary_context_scope_fakes(
+    executor: &mut crate::infrastructure::sql_store::FakeSqlExecutor,
+) {
+    use crate::infrastructure::sql::{
+        LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+        RESOLVE_TENANT_BY_GUILD_SQL,
+    };
+    use crate::infrastructure::sql_store::{
+        ai_memory_note_row, person_alias_row, sql_key, sql_row_from_strings,
+        tenant_installation_row, transcript_feedback_row,
+    };
+
+    // The loaders resolve the channel first, then bind the allowed meeting
+    // set into the list queries so LIMIT applies after the anchor filter.
+    let same_channel_sql = format!(
+        "{SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL} LIMIT {SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT}"
+    );
+    let list_limit = SUMMARY_CONTEXT_LIST_LIMIT.to_string();
+    // Sorted CSV of the allowed set: m1 (current) + m2 (same channel); m3 is
+    // excluded by the same-channel query below.
+    let anchor_csv = "m1,m2";
+    executor.query_rows_result.insert(
+        sql_key(RESOLVE_TENANT_BY_GUILD_SQL, &["g1"]),
+        vec![tenant_installation_row("t1", "g1")],
+    );
+    executor.query_rows_result.insert(
+        sql_key(
+            LIST_AI_MEMORY_NOTES_SQL,
+            &["t1", "g1", "false", "", anchor_csv, &list_limit],
+        ),
+        vec![
+            ai_memory_note_row("n1", "t1", "g1", Some("m1")),
+            ai_memory_note_row("n2", "t1", "g1", Some("m2")),
+            ai_memory_note_row("n3", "t1", "g1", Some("m3")),
+            ai_memory_note_row("n4", "t1", "g1", None),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_key(
+            LIST_TRANSCRIPT_FEEDBACK_SQL,
+            &["t1", "g1", "accepted", "", anchor_csv, &list_limit],
+        ),
+        vec![
+            transcript_feedback_row("f1", "t1", "g1", Some("m1")),
+            transcript_feedback_row("f2", "t1", "g1", Some("m3")),
+            transcript_feedback_row("f3", "t1", "g1", None),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_key(
+            LIST_PERSON_ALIASES_SQL,
+            &["t1", "g1", "false", "accepted", anchor_csv, &list_limit],
+        ),
+        vec![
+            person_alias_row("a1", "t1", "g1", Some("m2")),
+            person_alias_row("a2", "t1", "g1", Some("m3")),
+            person_alias_row("a3", "t1", "g1", None),
+        ],
+    );
+    executor.query_rows_result.insert(
+        sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
+        vec![sql_row_from_strings(vec!["vc1".to_owned()])],
+    );
+    // m3's meeting lives in vc2, so the database only returns m2 for the
+    // same-channel lookup.
+    executor.query_rows_result.insert(
+        sql_key(&same_channel_sql, &["g1", "vc1", "m1"]),
+        vec![sql_row_from_strings(vec!["m2".to_owned()])],
+    );
+}
+
+/// Asserts that a loader kept only records anchored to the summarized meeting
+/// or to same-channel meetings, dropping cross-channel and unanchored rows.
+#[cfg(test)]
+pub(crate) fn assert_summary_context_scope(
+    context: &crate::application::summary::SummaryContextInput,
+) {
+    let ai_memory_ids = context
+        .ai_memory
+        .iter()
+        .map(|note| note.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        ai_memory_ids,
+        HashSet::from(["n1", "n2"]),
+        "AI memory must keep only the current meeting and same-channel anchors"
+    );
+    let feedback_ids = context
+        .user_feedback
+        .iter()
+        .map(|feedback| feedback.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        feedback_ids,
+        HashSet::from(["f1"]),
+        "feedback must keep only the current meeting anchor"
+    );
+    let alias_ids = context
+        .person_aliases
+        .iter()
+        .map(|alias| alias.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        alias_ids,
+        HashSet::from(["a1"]),
+        "aliases must keep only the same-channel anchor"
+    );
+    assert!(
+        context.domain_knowledge.is_empty(),
+        "domain knowledge is never materialized into summary context"
+    );
 }
 
 pub(crate) fn upsert_vc_participant_alias_candidates_for_guild<E: SqlExecutor>(
@@ -1645,5 +1886,90 @@ mod tests {
         assert!(workspace.pre_correction_transcript_path().is_file());
         assert!(!workspace.masked_transcript_path().exists());
         assert!(!workspace.transcript_manifest_path().exists());
+    }
+
+    #[test]
+    fn summary_context_allowed_meeting_ids_restricts_to_same_channel() {
+        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_key, sql_row_from_strings};
+
+        let mut executor = FakeSqlExecutor::default();
+        executor.query_rows_result.insert(
+            sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
+            vec![sql_row_from_strings(vec!["vc1".to_owned()])],
+        );
+        let same_channel_sql = format!(
+            "{SUMMARY_CONTEXT_SAME_CHANNEL_MEETING_IDS_SQL} LIMIT {SUMMARY_CONTEXT_ANCHOR_LOOKUP_LIMIT}"
+        );
+        // The meetings table only holds m2 (vc1) and m3 (vc2) besides m1, so
+        // the database returns just the same-channel id.
+        executor.query_rows_result.insert(
+            sql_key(&same_channel_sql, &["g1", "vc1", "m1"]),
+            vec![sql_row_from_strings(vec!["m2".to_owned()])],
+        );
+        let mut store = SqlMeetingStore::new(executor);
+
+        let allowed = summary_context_allowed_meeting_ids(&mut store, "m1", "g1")
+            .expect("scope should resolve");
+
+        assert_eq!(allowed, HashSet::from(["m1".to_owned(), "m2".to_owned()]));
+    }
+
+    #[test]
+    fn summary_context_allowed_meeting_ids_limits_to_current_meeting_without_siblings() {
+        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_key, sql_row_from_strings};
+
+        let mut executor = FakeSqlExecutor::default();
+        executor.query_rows_result.insert(
+            sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
+            vec![sql_row_from_strings(vec!["vc1".to_owned()])],
+        );
+        // No other meetings exist in the channel -> unregistered query.
+        let mut store = SqlMeetingStore::new(executor);
+
+        let allowed = summary_context_allowed_meeting_ids(&mut store, "m1", "g1")
+            .expect("scope should resolve");
+
+        assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
+    }
+
+    #[test]
+    fn summary_context_allowed_meeting_ids_deny_when_channel_unknown() {
+        use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+        // Meeting row missing -> channel cannot be proven, so only the current
+        // meeting anchor is allowed.
+        let executor = FakeSqlExecutor::default();
+        let mut store = SqlMeetingStore::new(executor);
+
+        let allowed = summary_context_allowed_meeting_ids(&mut store, "m1", "g1")
+            .expect("scope should resolve");
+
+        assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
+    }
+
+    #[test]
+    fn load_summary_context_scopes_records_to_same_channel() {
+        use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+        // Loader-level coverage: candidate rows flow through the real SQL call
+        // path (bounded list queries, tenant resolution, channel scoping)
+        // instead of being fed to the scope helper directly.
+        let mut executor = FakeSqlExecutor::default();
+        register_summary_context_scope_fakes(&mut executor);
+        let mut store = SqlMeetingStore::new(executor);
+
+        let context = store
+            .load_summary_context("m1", "g1", None)
+            .expect("summary context should load");
+
+        assert_summary_context_scope(&context);
+        assert!(
+            context.speakers.is_empty(),
+            "no meeting speaker rows are registered for m1"
+        );
+        assert!(
+            context.summary_template.is_none(),
+            "no active summary template is registered"
+        );
     }
 }

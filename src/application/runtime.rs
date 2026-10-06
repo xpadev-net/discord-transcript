@@ -3250,8 +3250,8 @@ async fn wait_for_bot_token_revision_change(revision: &mut watch::Receiver<u64>)
     }
 }
 
-fn load_runtime_summary_context(
-    store: &mut SqlMeetingStore<PgSqlExecutor>,
+fn load_runtime_summary_context<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
     meeting_id: &str,
     guild_id: &str,
     effective_settings: &EffectiveMeetingSettings,
@@ -3260,13 +3260,12 @@ fn load_runtime_summary_context(
     crate::application::summary::SummaryContextInput,
     crate::application::summary::SummaryError,
 > {
-    let domain_knowledge = store
-        .list_domain_knowledge(guild_id, false, None)
-        .map_err(|err| {
-            crate::application::summary::SummaryError::SummaryEngine(format!(
-                "failed to load domain knowledge for meeting {meeting_id}: {err}"
-            ))
-        })?;
+    // See load_summary_context in worker.rs: meeting summaries are visible to
+    // viewers of the recorded voice channel, while these context records are
+    // admin-tier data. Only records anchored to a meeting recorded in the
+    // same voice channel may be materialized; unanchored guild-global records
+    // (including all domain knowledge) are excluded.
+    let domain_knowledge = Vec::new();
     let tenant = store.resolve_tenant_by_guild(guild_id).map_err(|err| {
         crate::application::summary::SummaryError::SummaryEngine(format!(
             "failed to resolve active tenant for meeting {meeting_id}: {err}"
@@ -3283,38 +3282,87 @@ fn load_runtime_summary_context(
         );
     }
     let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+        // The eligible-anchor set is resolved first so the candidate lists
+        // can pre-filter by anchor in SQL; see load_summary_context in
+        // worker.rs.
+        let allowed_meetings = crate::application::worker::summary_context_allowed_meeting_ids(
+            store, meeting_id, guild_id,
+        )
+        .map_err(|err| {
+            crate::application::summary::SummaryError::SummaryEngine(format!(
+                "failed to resolve summary context scope for meeting {meeting_id}: {err}"
+            ))
+        })?;
+        let anchor_csv = crate::application::worker::summary_context_anchor_csv(&allowed_meetings);
+        let ai_memory = store
+            .list_ai_memory_notes(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                None,
+                Some(&anchor_csv),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load AI memory for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let user_feedback = store
+            .list_transcript_feedback(
+                &tenant.tenant_id,
+                guild_id,
+                Some(TranscriptFeedbackStatus::Accepted),
+                None,
+                Some(&anchor_csv),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load accepted user feedback for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let person_aliases = store
+            .list_person_aliases(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                Some(PersonAliasReviewStatus::Accepted),
+                Some(&anchor_csv),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load person aliases for meeting {meeting_id}: {err}"
+                ))
+            })?;
         (
-            store
-                .list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load AI memory for meeting {meeting_id}: {err}"
-                    ))
-                })?,
-            store
-                .list_transcript_feedback(
-                    &tenant.tenant_id,
-                    guild_id,
-                    Some(TranscriptFeedbackStatus::Accepted),
-                    None,
-                )
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load accepted user feedback for meeting {meeting_id}: {err}"
-                    ))
-                })?,
-            store
-                .list_person_aliases(
-                    &tenant.tenant_id,
-                    guild_id,
-                    false,
-                    Some(PersonAliasReviewStatus::Accepted),
-                )
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load person aliases for meeting {meeting_id}: {err}"
-                    ))
-                })?,
+            ai_memory
+                .into_iter()
+                .filter(|note| {
+                    note.source_meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
+            user_feedback
+                .into_iter()
+                .filter(|feedback| {
+                    feedback
+                        .meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
+            person_aliases
+                .into_iter()
+                .filter(|alias| {
+                    alias
+                        .source_meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
         )
     } else {
         (Vec::new(), Vec::new(), Vec::new())
@@ -8151,7 +8199,12 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(
                 crate::infrastructure::sql::INSERT_SUMMARY_SQL,
-                &[summary_id, claimed_job.meeting_id.clone(), markdown.clone()],
+                &[
+                    summary_id,
+                    claimed_job.meeting_id.clone(),
+                    markdown.clone(),
+                    crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION.to_string(),
+                ],
             ) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
@@ -14653,5 +14706,57 @@ mod status_message_tests {
             assert!(message.contains("https://example.test/meetings/meeting-1"));
             assert!(message.contains("meeting_id=meeting-1"));
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_context_tests {
+    use super::*;
+    use crate::application::worker::{
+        assert_summary_context_scope, register_summary_context_scope_fakes,
+    };
+    use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+    fn test_effective_settings() -> EffectiveMeetingSettings {
+        EffectiveMeetingSettings {
+            whisper_language: None,
+            whisper_vad: false,
+            whisper_beam_size: 1,
+            whisper_suppress_non_speech: false,
+            whisper_prompt: None,
+            whisper_temperature: 0.0,
+            whisper_resample_to_16k: true,
+            auto_stop_grace_seconds: 0,
+            retention_raw_audio_ttl_days: 0,
+            retention_transcript_ttl_days: 0,
+            retention_summary_ttl_days: None,
+            summary_enabled: true,
+            summary_template_id: None,
+            domain_knowledge_version_id: None,
+        }
+    }
+
+    #[test]
+    fn load_runtime_summary_context_scopes_records_to_same_channel() {
+        // Loader-level coverage: candidate rows flow through the real SQL call
+        // path (bounded list queries, tenant resolution, channel scoping)
+        // instead of being fed to the scope helper directly.
+        let mut executor = FakeSqlExecutor::default();
+        register_summary_context_scope_fakes(&mut executor);
+        let mut store = SqlMeetingStore::new(executor);
+        let settings = test_effective_settings();
+
+        let context = load_runtime_summary_context(&mut store, "m1", "g1", &settings, &[])
+            .expect("runtime summary context should load");
+
+        assert_summary_context_scope(&context);
+        assert!(
+            context.speakers.is_empty(),
+            "runtime path returns no speaker list"
+        );
+        assert!(
+            context.summary_template.is_none(),
+            "no active summary template is registered"
+        );
     }
 }

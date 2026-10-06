@@ -18,7 +18,7 @@ use discord_transcript::infrastructure::retry::RetryPolicy;
 use discord_transcript::infrastructure::sql::{
     CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS,
     ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
-    migration_transaction_sql,
+    migration_statements,
 };
 use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
@@ -169,9 +169,9 @@ async fn apply_pending_migrations_locked(
             continue;
         }
         tracing::info!(version = migration.version, "applying database migration");
-        db_client
-            .batch_execute(&migration_transaction_sql(*migration))
-            .await?;
+        for statement in migration_statements(*migration) {
+            db_client.batch_execute(&statement).await?;
+        }
     }
     Ok(())
 }

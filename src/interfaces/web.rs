@@ -9515,6 +9515,8 @@ async fn api_list_ai_memory(
         .map(|source_type| source_type.as_str().to_owned())
         .unwrap_or_default();
     let include_archived = query.include_archived.unwrap_or(false).to_string();
+    // Admin list endpoints enumerate all records: no anchor filter or limit.
+    let unscoped = String::new();
     let rows = state
         .db
         .query(
@@ -9524,6 +9526,8 @@ async fn api_list_ai_memory(
                 &tenant.guild_id,
                 &include_archived,
                 &source_type,
+                &unscoped,
+                &unscoped,
             ],
         )
         .await
@@ -10012,11 +10016,19 @@ async fn api_list_feedback(
         .transpose()?
         .map(|feedback_type| feedback_type.as_str().to_owned())
         .unwrap_or_default();
+    let unscoped = String::new();
     let rows = state
         .db
         .query(
             LIST_TRANSCRIPT_FEEDBACK_SQL,
-            &[&tenant.tenant_id, &tenant.guild_id, &status, &feedback_type],
+            &[
+                &tenant.tenant_id,
+                &tenant.guild_id,
+                &status,
+                &feedback_type,
+                &unscoped,
+                &unscoped,
+            ],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -10113,6 +10125,7 @@ async fn api_list_person_aliases(
         .transpose()?
         .map(|status| status.as_str().to_owned())
         .unwrap_or_default();
+    let unscoped = String::new();
     let rows = state
         .db
         .query(
@@ -10122,6 +10135,8 @@ async fn api_list_person_aliases(
                 &tenant.guild_id,
                 &include_archived,
                 &review_status,
+                &unscoped,
+                &unscoped,
             ],
         )
         .await
@@ -11379,6 +11394,17 @@ async fn api_transcript_state(
     }))
 }
 
+/// Summaries persisted under an older context-selection policy may embed
+/// records the channel audience cannot read, so only markdown generated at
+/// the current selection version is served.
+const CURRENT_CONTEXT_SUMMARY_MARKDOWN_SQL: &str = "SELECT markdown FROM summaries \
+         WHERE meeting_id=$1 AND context_selection_version=$2 \
+         ORDER BY version DESC LIMIT 1";
+
+fn current_context_selection_version() -> i32 {
+    crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION as i32
+}
+
 async fn api_summary(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -11389,8 +11415,8 @@ async fn api_summary(
     let row = state
         .db
         .query_opt(
-            "SELECT markdown FROM summaries WHERE meeting_id=$1 ORDER BY version DESC LIMIT 1",
-            &[&meeting_id],
+            CURRENT_CONTEXT_SUMMARY_MARKDOWN_SQL,
+            &[&meeting_id, &current_context_selection_version()],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -11803,11 +11829,11 @@ async fn api_debug_manifest(
     let meeting_title_path = workspace.meeting_title_debug_path();
     let meeting_title_legacy = legacy_debug_dir(&workspace).join(DEBUG_MEETING_TITLE_FILENAME);
 
-    let summary_query_params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&meeting_id];
-    let summary_query = state.db.query_opt(
-        "SELECT markdown FROM summaries WHERE meeting_id=$1 ORDER BY version DESC LIMIT 1",
-        &summary_query_params,
-    );
+    let summary_query_params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] =
+        [&meeting_id, &current_context_selection_version()];
+    let summary_query = state
+        .db
+        .query_opt(CURRENT_CONTEXT_SUMMARY_MARKDOWN_SQL, &summary_query_params);
 
     let (
         mixdown_primary_exists,
@@ -12329,8 +12355,8 @@ async fn resolve_debug_artifact(
             let summary_row = state
                 .db
                 .query_opt(
-                    "SELECT markdown FROM summaries WHERE meeting_id=$1 ORDER BY version DESC LIMIT 1",
-                    &[&meeting_id],
+                    CURRENT_CONTEXT_SUMMARY_MARKDOWN_SQL,
+                    &[&meeting_id, &current_context_selection_version()],
                 )
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
