@@ -13,7 +13,6 @@ use crate::application::summary::{
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::confidence::ConfidencePermille;
-use crate::domain::feedback::TranscriptFeedbackStatus;
 use crate::domain::person_alias::{
     NewPersonAlias, PersonAlias, PersonAliasReviewStatus, PersonAliasSourceType,
 };
@@ -180,11 +179,10 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
             (
                 self.list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)?,
-                self.list_transcript_feedback(
+                self.list_accepted_transcript_feedback_for_summary(
                     &tenant.tenant_id,
                     guild_id,
-                    Some(TranscriptFeedbackStatus::Accepted),
-                    None,
+                    meeting_id,
                 )?,
                 self.list_person_aliases(
                     &tenant.tenant_id,
