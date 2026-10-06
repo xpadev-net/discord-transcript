@@ -62,11 +62,16 @@ use crate::infrastructure::storage::{
 use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
+use crate::interfaces::web::{
+    GuildCache, PermissionCache, clear_permission_cache, invalidate_guild_cache,
+    invalidate_permission_cache_for_channel, invalidate_permission_cache_for_user,
+};
 use chrono::{DateTime, Utc};
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    EditMessage, GatewayIntents, GuildId, Interaction, Member, Ready, UserId, VoiceState,
+    EditMessage, GatewayIntents, Guild, GuildChannel, GuildId, GuildMemberUpdateEvent, Interaction,
+    Member, Message, PartialGuild, Ready, Role, RoleId, User, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -3294,6 +3299,8 @@ pub async fn run_bot(
     config: &AppConfig,
     mut bot_token_revision: watch::Receiver<u64>,
     summary_job_wakeups: SummaryJobWakeups,
+    meeting_permission_cache: Option<PermissionCache>,
+    meeting_guild_cache: Option<GuildCache>,
 ) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
@@ -3367,9 +3374,13 @@ pub async fn run_bot(
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
+        meeting_permission_cache,
+        meeting_guild_cache,
     };
 
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::GUILD_MODERATION;
     let songbird_config =
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
     let voice_manager = songbird::Songbird::serenity_from_config(songbird_config);
@@ -3609,6 +3620,13 @@ struct ScaffoldHandler {
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
     bot_admin_user_ids: HashSet<String>,
+    /// Shared with the in-process web server so gateway events that change
+    /// channel permissions can drop stale cached positive allows
+    /// immediately. `None` when run outside the web+bot process.
+    meeting_permission_cache: Option<PermissionCache>,
+    /// Same sharing for cached guild info (roles, channels, owner) that feeds
+    /// permission evaluation; invalidated when gateway events change guild data.
+    meeting_guild_cache: Option<GuildCache>,
 }
 
 fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
@@ -4178,6 +4196,113 @@ impl EventHandler for ScaffoldHandler {
                 error!(error = %err, "startup recovery failed");
             }
         });
+    }
+
+    // Drop cached positive permission decisions as soon as the gateway reports
+    // a change that can revoke channel visibility, instead of letting a stale
+    // allow serve until the cache TTL expires.
+
+    async fn channel_update(&self, _ctx: Context, _old: Option<GuildChannel>, new: GuildChannel) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_channel(cache, &new.id.to_string()).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn channel_delete(
+        &self,
+        _ctx: Context,
+        channel: GuildChannel,
+        _messages: Option<Vec<Message>>,
+    ) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_channel(cache, &channel.id.to_string()).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_role_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Role>,
+        _new: Role,
+    ) {
+        // A role permission edit can change visibility on any channel, and the
+        // cache key carries no guild/role dimension, so drop every entry.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_role_delete(
+        &self,
+        _ctx: Context,
+        _guild_id: GuildId,
+        _removed_role_id: RoleId,
+        _removed_role_data_if_available: Option<Role>,
+    ) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Guild>,
+        _new_data: PartialGuild,
+    ) {
+        // Guild ownership changes affect every permission evaluation.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_member_removal(
+        &self,
+        _ctx: Context,
+        _guild_id: GuildId,
+        user: User,
+        _member_data_if_available: Option<Member>,
+    ) {
+        // Only dispatched when the privileged GUILD_MEMBERS intent is enabled;
+        // kept as a no-cost hook so enabling it starts invalidating kicked or
+        // departed members' cached allows.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_user(cache, &user.id.to_string()).await;
+        }
+    }
+
+    async fn guild_member_update(
+        &self,
+        _ctx: Context,
+        _old_if_available: Option<Member>,
+        _new: Option<Member>,
+        event: GuildMemberUpdateEvent,
+    ) {
+        // Same GUILD_MEMBERS-intent caveat; covers per-member role assignments.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_user(cache, &event.user.id.to_string()).await;
+        }
+    }
+
+    async fn guild_ban_addition(&self, _ctx: Context, _guild_id: GuildId, banned_user: User) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_user(cache, &banned_user.id.to_string()).await;
+        }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {

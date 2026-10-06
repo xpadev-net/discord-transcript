@@ -270,6 +270,8 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             summary_enabled: config.summary_enabled,
         },
     );
+    let meeting_permission_cache = Arc::clone(&web_state.permission_cache);
+    let meeting_guild_cache = Arc::clone(&web_state.guild_cache);
     let router = web::create_router(web_state);
 
     let web_bind_host = config.web_bind_host.clone();
@@ -312,6 +314,8 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             &runtime_config,
             runtime_bot_token_revision_rx,
             summary_job_wakeups.clone(),
+            Some(Arc::clone(&meeting_permission_cache)),
+            Some(Arc::clone(&meeting_guild_cache)),
         )
         .await?
         {
