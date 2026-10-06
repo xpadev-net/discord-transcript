@@ -62,8 +62,8 @@ use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
 use crate::interfaces::web::{
-    PermissionCache, clear_permission_cache, invalidate_permission_cache_for_channel,
-    invalidate_permission_cache_for_user,
+    GuildCache, PermissionCache, clear_permission_cache, invalidate_guild_cache,
+    invalidate_permission_cache_for_channel, invalidate_permission_cache_for_user,
 };
 use chrono::{DateTime, Utc};
 use serenity::all::{
@@ -3202,6 +3202,7 @@ pub async fn run_bot(
     mut bot_token_revision: watch::Receiver<u64>,
     summary_job_wakeups: SummaryJobWakeups,
     meeting_permission_cache: Option<PermissionCache>,
+    meeting_guild_cache: Option<GuildCache>,
 ) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
@@ -3276,6 +3277,7 @@ pub async fn run_bot(
             .cloned()
             .collect::<HashSet<_>>(),
         meeting_permission_cache,
+        meeting_guild_cache,
     };
 
     let intents = GatewayIntents::GUILDS
@@ -3465,6 +3467,9 @@ struct ScaffoldHandler {
     /// channel permissions can drop stale cached positive allows
     /// immediately. `None` when run outside the web+bot process.
     meeting_permission_cache: Option<PermissionCache>,
+    /// Same sharing for cached guild info (roles, channels, owner) that feeds
+    /// permission evaluation; invalidated when gateway events change guild data.
+    meeting_guild_cache: Option<GuildCache>,
 }
 
 fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
@@ -4044,6 +4049,9 @@ impl EventHandler for ScaffoldHandler {
         if let Some(cache) = self.meeting_permission_cache.as_ref() {
             invalidate_permission_cache_for_channel(cache, &new.id.to_string()).await;
         }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
     }
 
     async fn channel_delete(
@@ -4054,6 +4062,9 @@ impl EventHandler for ScaffoldHandler {
     ) {
         if let Some(cache) = self.meeting_permission_cache.as_ref() {
             invalidate_permission_cache_for_channel(cache, &channel.id.to_string()).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
         }
     }
 
@@ -4068,6 +4079,9 @@ impl EventHandler for ScaffoldHandler {
         if let Some(cache) = self.meeting_permission_cache.as_ref() {
             clear_permission_cache(cache).await;
         }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
     }
 
     async fn guild_role_delete(
@@ -4080,6 +4094,9 @@ impl EventHandler for ScaffoldHandler {
         if let Some(cache) = self.meeting_permission_cache.as_ref() {
             clear_permission_cache(cache).await;
         }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
     }
 
     async fn guild_update(
@@ -4091,6 +4108,9 @@ impl EventHandler for ScaffoldHandler {
         // Guild ownership changes affect every permission evaluation.
         if let Some(cache) = self.meeting_permission_cache.as_ref() {
             clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
         }
     }
 

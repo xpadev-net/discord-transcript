@@ -19,6 +19,7 @@ use std::future::Future;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_postgres::Client as PgClient;
@@ -152,6 +153,8 @@ FROM job_counts, meeting_counts, live_chunk_counts
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
 const PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS: u64 = 5;
+/// Recompute budget when permission invalidations keep racing an access check.
+const PERMISSION_CHECK_MAX_STALE_RETRIES: usize = 2;
 const MEMBERSHIP_CACHE_TTL_SECS: u64 = 5;
 const MEMBERSHIP_REVERIFY_INFLIGHT_SECS: u64 = 5;
 const GUILD_CACHE_TTL_SECS: u64 = 15;
@@ -177,9 +180,22 @@ const DEBUG_DOWNLOAD_DEDUPE_WINDOW_SECS: i64 = 15 * 60;
 const MEETING_TITLE_DISPLAY_MAX_CHARS: usize = 80;
 const AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS: u128 = 100;
 
-pub type PermissionCache =
-    Arc<tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>>;
-type GuildCache = Arc<tokio::sync::RwLock<GuildCacheState>>;
+#[derive(Default)]
+pub struct PermissionCacheState {
+    entries: tokio::sync::RwLock<HashMap<(String, String), (CachedChannelPermission, Instant)>>,
+    /// Bumped under the write lock whenever an invalidation removes entries,
+    /// so an in-flight permission check cannot re-store a pre-invalidation result.
+    revision: AtomicU64,
+}
+
+impl PermissionCacheState {
+    fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+}
+
+pub type PermissionCache = Arc<PermissionCacheState>;
+pub type GuildCache = Arc<tokio::sync::RwLock<GuildCacheState>>;
 type BotTokenCache = Arc<tokio::sync::RwLock<BotTokenCacheState>>;
 type OperationalMetricsCache = Arc<Mutex<Option<OperationalMetricsCacheEntry>>>;
 type TranscriptSseLimiter = Arc<std::sync::Mutex<HashMap<(String, String), usize>>>;
@@ -205,7 +221,7 @@ struct UserGuildsCacheEntry {
 }
 
 #[derive(Default)]
-struct GuildCacheState {
+pub struct GuildCacheState {
     entry: Option<(DiscordGuildFull, Instant)>,
     failure: Option<(StatusCode, Instant)>,
     revision: u64,
@@ -375,7 +391,7 @@ pub struct WebState {
     /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
     /// Cache: guild info (shared across all requests)
-    guild_cache: GuildCache,
+    pub guild_cache: GuildCache,
     /// Cache: current user's OAuth-visible guild list, populated at login.
     user_guilds_cache: UserGuildsCache,
     /// Short-lived guild membership cache to bound Discord lookups during API bursts.
@@ -413,7 +429,7 @@ impl WebState {
             bot_token_cache: Arc::new(tokio::sync::RwLock::new(BotTokenCacheState::default())),
             bot_token_revision_tx: guild_bot_token.revision_tx,
             operational_metrics_cache: Arc::new(Mutex::new(None)),
-            permission_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            permission_cache: Arc::new(PermissionCacheState::default()),
             guild_cache: Arc::new(tokio::sync::RwLock::new(GuildCacheState::default())),
             user_guilds_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1486,17 +1502,38 @@ fn should_retry_settings_membership_check_with_global(result: &Result<bool, Stat
 }
 
 pub async fn invalidate_permission_cache_for_user(cache: &PermissionCache, user_id: &str) {
-    let mut cache = cache.write().await;
-    cache.retain(|(uid, _), _| uid != user_id);
+    let mut entries = cache.entries.write().await;
+    entries.retain(|(uid, _), _| uid != user_id);
+    cache.revision.fetch_add(1, Ordering::AcqRel);
 }
 
 pub async fn invalidate_permission_cache_for_channel(cache: &PermissionCache, channel_id: &str) {
-    let mut cache = cache.write().await;
-    cache.retain(|(_, cid), _| cid != channel_id);
+    let mut entries = cache.entries.write().await;
+    entries.retain(|(_, cid), _| cid != channel_id);
+    cache.revision.fetch_add(1, Ordering::AcqRel);
 }
 
 pub async fn clear_permission_cache(cache: &PermissionCache) {
-    cache.write().await.clear();
+    let mut entries = cache.entries.write().await;
+    entries.clear();
+    cache.revision.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Invalidate cached guild info (roles, channels, owner) so a permission
+/// change made on Discord's side cannot keep feeding stale access checks.
+/// Clears the pending refresh marker too: waiters must not receive a result
+/// that predates this invalidation.
+pub async fn invalidate_guild_cache(cache: &GuildCache) {
+    let refresh = {
+        let mut cache = cache.write().await;
+        cache.entry = None;
+        cache.failure = None;
+        cache.revision = cache.revision.wrapping_add(1);
+        cache.refresh.take()
+    };
+    if let Some(refresh) = refresh {
+        refresh.notify.notify_waiters();
+    }
 }
 
 // ========== Auth: handlers ==========
@@ -2068,30 +2105,16 @@ fn permission_cache_ttl(permission: CachedChannelPermission) -> u64 {
     }
 }
 
-async fn cache_channel_permission(
-    permission_cache: &PermissionCache,
-    cache_key: (String, String),
-    permission: CachedChannelPermission,
-) {
-    let mut cache = permission_cache.write().await;
-    let expires_at = Instant::now() + Duration::from_secs(permission_cache_ttl(permission));
-    cache.insert(cache_key, (permission, expires_at));
-
-    if cache.len() > 5000 {
-        let now = Instant::now();
-        cache.retain(|_, (_, exp)| *exp > now);
-    }
-}
-
-async fn verify_meeting_access_after_row<Fut>(
+async fn verify_meeting_access_after_row<F, Fut>(
     guild_id: String,
     channel_id: String,
     authenticated_guild_id: &str,
     user_id: &str,
     permission_cache: &PermissionCache,
-    permission_check: Fut,
+    permission_check: F,
 ) -> Result<MeetingAccess, StatusCode>
 where
+    F: Fn() -> Fut,
     Fut: Future<Output = Result<CachedChannelPermission, StatusCode>>,
 {
     let access = meeting_access_from_row(guild_id, channel_id.clone(), authenticated_guild_id)?;
@@ -2099,8 +2122,8 @@ where
     // Check permission cache
     let cache_key = (user_id.to_owned(), channel_id.clone());
     {
-        let cache = permission_cache.read().await;
-        if let Some(&(permission, expires_at)) = cache.get(&cache_key)
+        let entries = permission_cache.entries.read().await;
+        if let Some(&(permission, expires_at)) = entries.get(&cache_key)
             && Instant::now() < expires_at
         {
             return if permission.can_view {
@@ -2111,10 +2134,30 @@ where
         }
     }
 
-    // Cache miss — query Discord API
-    let permission = permission_check.await?;
-
-    cache_channel_permission(permission_cache, cache_key, permission).await;
+    // Cache miss — query Discord API. If a permission event invalidates the
+    // cache while the fetch is in flight, the computed result may predate the
+    // revocation; recompute so a stale allow is neither served nor stored.
+    let mut retries_left = PERMISSION_CHECK_MAX_STALE_RETRIES;
+    let permission = loop {
+        let observed_revision = permission_cache.revision();
+        let permission = permission_check().await?;
+        if cache_channel_permission_if_unchanged(
+            permission_cache,
+            observed_revision,
+            cache_key.clone(),
+            permission,
+        )
+        .await
+        {
+            break permission;
+        }
+        if retries_left == 0 {
+            // Invalidations keep racing this check; the last result was still
+            // computed after the previous invalidation, so serve it uncached.
+            break permission;
+        }
+        retries_left -= 1;
+    };
 
     if permission.can_view {
         Ok(access)
@@ -2123,15 +2166,39 @@ where
     }
 }
 
-async fn guild_meeting_channel_visible_after_row<Fut>(
+/// Insert a computed permission only when no invalidation landed while the
+/// check ran. Revision bumps happen under the entries write lock, so comparing
+/// inside that same critical section makes the guard race-free.
+async fn cache_channel_permission_if_unchanged(
+    permission_cache: &PermissionCache,
+    observed_revision: u64,
+    cache_key: (String, String),
+    permission: CachedChannelPermission,
+) -> bool {
+    let mut entries = permission_cache.entries.write().await;
+    if permission_cache.revision() != observed_revision {
+        return false;
+    }
+    let expires_at = Instant::now() + Duration::from_secs(permission_cache_ttl(permission));
+    entries.insert(cache_key, (permission, expires_at));
+
+    if entries.len() > 5000 {
+        let now = Instant::now();
+        entries.retain(|_, (_, exp)| *exp > now);
+    }
+    true
+}
+
+async fn guild_meeting_channel_visible_after_row<F, Fut>(
     guild_id: String,
     channel_id: String,
     authenticated_guild_id: &str,
     user_id: &str,
     permission_cache: &PermissionCache,
-    permission_check: Fut,
+    permission_check: F,
 ) -> Result<bool, StatusCode>
 where
+    F: Fn() -> Fut,
     Fut: Future<Output = Result<CachedChannelPermission, StatusCode>>,
 {
     match verify_meeting_access_after_row(
@@ -2196,7 +2263,7 @@ async fn verify_meeting_access(
         &auth.guild_id,
         user_id,
         &state.permission_cache,
-        resolve_channel_permission_flags(state, auth, &channel_id, user_id),
+        || resolve_channel_permission_flags(state, auth, &channel_id, user_id),
     )
     .await
 }
@@ -2629,10 +2696,13 @@ async fn check_guild_admin_permission_with_bot_auth(
     use_cache: bool,
 ) -> Result<GuildAdminCheck, StatusCode> {
     let cache_key = guild_admin_permission_cache_key(&auth.guild_id, user_id);
+    // Snapshot the cache revision before computing so a permission event that
+    // lands mid-check keeps this stale result out of the cache.
+    let observed_revision = state.permission_cache.revision();
 
     // Check cache first
     if use_cache {
-        let cache = state.permission_cache.read().await;
+        let cache = state.permission_cache.entries.read().await;
         if let Some(&(permission, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
         {
@@ -2652,7 +2722,8 @@ async fn check_guild_admin_permission_with_bot_auth(
     };
     if user_id == guild.owner_id {
         if use_cache {
-            cache_guild_admin_permission(state, &auth.guild_id, user_id, true).await;
+            cache_guild_admin_permission(state, &auth.guild_id, user_id, true, observed_revision)
+                .await;
         }
         return Ok(GuildAdminCheck::Admin);
     }
@@ -2680,7 +2751,14 @@ async fn check_guild_admin_permission_with_bot_auth(
         match decision {
             GuildAdminCheck::NotAdmin => {
                 if use_cache {
-                    cache_guild_admin_permission(state, &auth.guild_id, user_id, false).await;
+                    cache_guild_admin_permission(
+                        state,
+                        &auth.guild_id,
+                        user_id,
+                        false,
+                        observed_revision,
+                    )
+                    .await;
                 }
                 return Ok(GuildAdminCheck::NotAdmin);
             }
@@ -2724,7 +2802,8 @@ async fn check_guild_admin_permission_with_bot_auth(
     let is_admin = permissions & ADMINISTRATOR != 0;
 
     if use_cache {
-        cache_guild_admin_permission(state, &auth.guild_id, user_id, is_admin).await;
+        cache_guild_admin_permission(state, &auth.guild_id, user_id, is_admin, observed_revision)
+            .await;
     }
     Ok(if is_admin {
         GuildAdminCheck::Admin
@@ -2829,22 +2908,28 @@ async fn cache_guild_admin_permission(
     guild_id: &str,
     user_id: &str,
     is_admin: bool,
+    observed_revision: u64,
 ) {
-    let mut cache = state.permission_cache.write().await;
+    let mut entries = state.permission_cache.entries.write().await;
+    if state.permission_cache.revision() != observed_revision {
+        // A permission event landed mid-check; the computed answer may
+        // predate the revocation, so do not persist it.
+        return;
+    }
     let permission = CachedChannelPermission {
         can_view: is_admin,
         is_admin,
     };
     let expires_at = Instant::now() + Duration::from_secs(permission_cache_ttl(permission));
-    cache.insert(
+    entries.insert(
         guild_admin_permission_cache_key(guild_id, user_id),
         (permission, expires_at),
     );
 
     // Evict old entries if cache is too large (same pattern as check_channel_admin_permission)
-    if cache.len() > 5000 {
+    if entries.len() > 5000 {
         let now = Instant::now();
-        cache.retain(|_, (_, exp)| *exp > now);
+        entries.retain(|_, (_, exp)| *exp > now);
     }
 }
 
@@ -8515,7 +8600,7 @@ async fn resolve_visible_meeting_channel_ids_for_query(
             &auth.guild_id,
             user_id,
             &state.permission_cache,
-            resolve_channel_permission_flags(state, auth, voice_channel_id, user_id),
+            || resolve_channel_permission_flags(state, auth, voice_channel_id, user_id),
         )
         .await?;
         return if visible {
@@ -10980,18 +11065,9 @@ async fn invalidate_discord_caches(state: &WebState) {
     if let Some(refresh) = bot_token_refresh {
         refresh.notify.notify_waiters();
     }
-    let guild_refresh = {
-        let mut cache = state.guild_cache.write().await;
-        cache.entry = None;
-        cache.failure = None;
-        cache.revision = cache.revision.wrapping_add(1);
-        cache.refresh.take()
-    };
-    if let Some(refresh) = guild_refresh {
-        refresh.notify.notify_waiters();
-    }
+    invalidate_guild_cache(&state.guild_cache).await;
     state.membership_cache.write().await.clear();
-    state.permission_cache.write().await.clear();
+    clear_permission_cache(&state.permission_cache).await;
 }
 
 fn advance_bot_token_revision(sender: &watch::Sender<u64>) {
@@ -15666,7 +15742,8 @@ mod discord_channel_full_tests {
         AUDIT_RETENTION_CLEANUP_SAMPLE_MODULUS, CachedChannelPermission, DiscordChannelFull,
         DiscordOverwrite, DiscordOverwriteType, DiscordRoleFull,
         PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PERMISSION_CACHE_TTL_SECS, PermissionCache,
-        VIEW_CHANNEL, artifact_speaker_id_from_component, authorize_debug_artifact_download,
+        PermissionCacheState, VIEW_CHANNEL, artifact_speaker_id_from_component,
+        authorize_debug_artifact_download,
         build_content_disposition, clear_permission_cache, compute_channel_permissions,
         debug_artifact_requires_admin, debug_download_dedupe_bucket, debug_download_usage_event_id,
         existing_debug_path, guild_meeting_channel_visible_after_row,
@@ -15677,10 +15754,9 @@ mod discord_channel_full_tests {
     use crate::domain::authz::RbacPermission;
     use axum::http::StatusCode;
     use chrono::{TimeZone, Utc};
-    use std::collections::HashMap;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -15937,8 +16013,8 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn meeting_access_rejects_mismatched_guild_before_allowed_cache() {
-        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        cache.write().await.insert(
+        let cache: PermissionCache = Arc::new(PermissionCacheState::default());
+        cache.entries.write().await.insert(
             ("user".to_owned(), "voice".to_owned()),
             (
                 CachedChannelPermission {
@@ -15949,7 +16025,6 @@ mod discord_channel_full_tests {
             ),
         );
         let permission_check_called = Arc::new(AtomicBool::new(false));
-        let permission_check_called_in_future = Arc::clone(&permission_check_called);
 
         let result = verify_meeting_access_after_row(
             "other-guild".to_owned(),
@@ -15957,12 +16032,15 @@ mod discord_channel_full_tests {
             "auth-guild",
             "user",
             &cache,
-            async move {
-                permission_check_called_in_future.store(true, Ordering::SeqCst);
-                Ok(CachedChannelPermission {
-                    can_view: true,
-                    is_admin: false,
-                })
+            || {
+                let flag = Arc::clone(&permission_check_called);
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(CachedChannelPermission {
+                        can_view: true,
+                        is_admin: false,
+                    })
+                }
             },
         )
         .await;
@@ -15973,8 +16051,8 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn sensitive_access_denies_after_cached_allow_reverify_window() {
-        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        cache.write().await.insert(
+        let cache: PermissionCache = Arc::new(PermissionCacheState::default());
+        cache.entries.write().await.insert(
             ("user".to_owned(), "voice".to_owned()),
             (
                 CachedChannelPermission {
@@ -15986,7 +16064,6 @@ mod discord_channel_full_tests {
             ),
         );
         let permission_check_called = Arc::new(AtomicBool::new(false));
-        let permission_check_called_in_future = Arc::clone(&permission_check_called);
 
         let result = verify_meeting_access_after_row(
             "auth-guild".to_owned(),
@@ -15994,19 +16071,22 @@ mod discord_channel_full_tests {
             "auth-guild",
             "user",
             &cache,
-            async move {
-                permission_check_called_in_future.store(true, Ordering::SeqCst);
-                Ok(CachedChannelPermission {
-                    can_view: false,
-                    is_admin: false,
-                })
+            || {
+                let flag = Arc::clone(&permission_check_called);
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(CachedChannelPermission {
+                        can_view: false,
+                        is_admin: false,
+                    })
+                }
             },
         )
         .await;
 
         assert!(matches!(result, Err(StatusCode::FORBIDDEN)));
         assert!(permission_check_called.load(Ordering::SeqCst));
-        let cache = cache.read().await;
+        let cache = cache.entries.read().await;
         let (permission, expires_at) = cache
             .get(&("user".to_owned(), "voice".to_owned()))
             .expect("denial should replace stale allow");
@@ -16016,7 +16096,7 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn guild_meeting_channel_visibility_omits_forbidden_rows() {
-        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let cache: PermissionCache = Arc::new(PermissionCacheState::default());
 
         let result = guild_meeting_channel_visible_after_row(
             "auth-guild".to_owned(),
@@ -16024,7 +16104,7 @@ mod discord_channel_full_tests {
             "auth-guild",
             "user",
             &cache,
-            async {
+            || async {
                 Ok(CachedChannelPermission {
                     can_view: false,
                     is_admin: false,
@@ -16038,7 +16118,7 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn guild_meeting_channel_visibility_allows_viewable_rows() {
-        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let cache: PermissionCache = Arc::new(PermissionCacheState::default());
 
         let result = guild_meeting_channel_visible_after_row(
             "auth-guild".to_owned(),
@@ -16046,7 +16126,7 @@ mod discord_channel_full_tests {
             "auth-guild",
             "user",
             &cache,
-            async {
+            || async {
                 Ok(CachedChannelPermission {
                     can_view: true,
                     is_admin: false,
@@ -16060,13 +16140,13 @@ mod discord_channel_full_tests {
 
     #[tokio::test]
     async fn permission_cache_invalidation_selects_user_channel_or_everything() {
-        let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let cache: PermissionCache = Arc::new(PermissionCacheState::default());
         let allow = CachedChannelPermission {
             can_view: true,
             is_admin: false,
         };
         {
-            let mut guard = cache.write().await;
+            let mut guard = cache.entries.write().await;
             for key in [
                 ("user-1", "chan-1"),
                 ("user-2", "chan-1"),
@@ -16085,16 +16165,31 @@ mod discord_channel_full_tests {
 
         invalidate_permission_cache_for_channel(&cache, "chan-1").await;
         {
-            let guard = cache.read().await;
+            let guard = cache.entries.read().await;
             assert_eq!(guard.len(), 1);
             assert!(guard.contains_key(&("user-1".to_owned(), "chan-2".to_owned())));
         }
 
+        {
+            let mut guard = cache.entries.write().await;
+            guard.insert(
+                ("user-2".to_owned(), "chan-3".to_owned()),
+                (
+                    allow,
+                    Instant::now()
+                        + Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS),
+                ),
+            );
+        }
         invalidate_permission_cache_for_user(&cache, "user-1").await;
-        assert!(cache.read().await.is_empty());
+        {
+            let guard = cache.entries.read().await;
+            assert_eq!(guard.len(), 1);
+            assert!(guard.contains_key(&("user-2".to_owned(), "chan-3".to_owned())));
+        }
 
         {
-            let mut guard = cache.write().await;
+            let mut guard = cache.entries.write().await;
             for key in [("user-1", "chan-1"), ("user-2", "chan-2")] {
                 guard.insert(
                     (key.0.to_owned(), key.1.to_owned()),
@@ -16107,13 +16202,53 @@ mod discord_channel_full_tests {
             }
         }
         clear_permission_cache(&cache).await;
-        assert!(cache.read().await.is_empty());
+        assert!(cache.entries.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidation_during_check_recomputes_instead_of_caching_stale_allow() {
+        let cache: PermissionCache = Arc::new(PermissionCacheState::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache_for_check = Arc::clone(&cache);
+        let calls_for_check = Arc::clone(&calls);
+
+        let result = verify_meeting_access_after_row(
+            "guild".to_owned(),
+            "voice".to_owned(),
+            "guild",
+            "user",
+            &cache,
+            move || {
+                let cache = Arc::clone(&cache_for_check);
+                let calls = Arc::clone(&calls_for_check);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A permission event lands mid-check and wipes the cache.
+                        clear_permission_cache(&cache).await;
+                        Ok(CachedChannelPermission {
+                            can_view: true,
+                            is_admin: false,
+                        })
+                    } else {
+                        Ok(CachedChannelPermission {
+                            can_view: false,
+                            is_admin: false,
+                        })
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::FORBIDDEN)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.entries.read().await.len(), 1);
     }
 
     #[tokio::test]
     async fn invalid_channel_overwrites_do_not_cache_allow() {
         for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
-            let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let cache: PermissionCache = Arc::new(PermissionCacheState::default());
             let payload = json.to_owned();
 
             let result = verify_meeting_access_after_row(
@@ -16122,7 +16257,7 @@ mod discord_channel_full_tests {
                 "guild",
                 "user",
                 &cache,
-                async move {
+                || async move {
                     let channel: DiscordChannelFull =
                         serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
                     let permissions = compute_channel_permissions(
@@ -16151,7 +16286,7 @@ mod discord_channel_full_tests {
 
             assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
             assert!(
-                cache.read().await.is_empty(),
+                cache.entries.read().await.is_empty(),
                 "{json} should fail before permission cache is updated"
             );
         }
@@ -16160,11 +16295,11 @@ mod discord_channel_full_tests {
     #[tokio::test]
     async fn invalid_channel_overwrites_do_not_refresh_stale_allow() {
         for json in INVALID_CHANNEL_OVERWRITE_PAYLOADS {
-            let cache: PermissionCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let cache: PermissionCache = Arc::new(PermissionCacheState::default());
             let cache_key = ("user".to_owned(), "voice".to_owned());
             let expired_at = Instant::now()
                 - Duration::from_secs(PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS + 1);
-            cache.write().await.insert(
+            cache.entries.write().await.insert(
                 cache_key.clone(),
                 (
                     CachedChannelPermission {
@@ -16182,7 +16317,7 @@ mod discord_channel_full_tests {
                 "guild",
                 "user",
                 &cache,
-                async move {
+                || async move {
                     let _: DiscordChannelFull =
                         serde_json::from_str(payload).map_err(|_| StatusCode::BAD_GATEWAY)?;
                     Ok(CachedChannelPermission {
@@ -16194,7 +16329,7 @@ mod discord_channel_full_tests {
             .await;
 
             assert!(matches!(result, Err(StatusCode::BAD_GATEWAY)));
-            let cache = cache.read().await;
+            let cache = cache.entries.read().await;
             let (permission, expires_at) = cache
                 .get(&cache_key)
                 .expect("stale allow entry should not be refreshed");
