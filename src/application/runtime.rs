@@ -1250,6 +1250,7 @@ fn persist_terminal_cleanup_retry_exhaustion<S: MeetingStore>(
     mark_recording_failed_after_teardown_exhaustion(store, expected_meeting_id, terminal_error)
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait RecordingVoiceGateway {
     async fn leave_recording_voice(&self, guild_id: GuildId) -> Result<(), String>;
@@ -1262,6 +1263,7 @@ impl RecordingVoiceGateway for songbird::Songbird {
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait RecordingVoiceLeaveDependency {
     async fn leave_recording_voice_with_timeout(
@@ -3048,6 +3050,7 @@ struct DiscordStatusMessenger<'a> {
     http: &'a Http,
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait StatusMessenger {
     async fn send(&self, channel_id: u64, content: &str) -> Result<u64, String>;
@@ -9774,7 +9777,7 @@ mod status_message_tests {
         ) -> Result<SavedChunk, ChunkStorageError> {
             if self
                 .failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                     if value > 0 { Some(value - 1) } else { None }
                 })
                 .is_ok()
@@ -11235,7 +11238,7 @@ mod status_message_tests {
             self.leaves.fetch_add(1, Ordering::SeqCst);
             if self
                 .failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                     if value > 0 { Some(value - 1) } else { None }
                 })
                 .is_ok()
