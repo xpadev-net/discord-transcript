@@ -3322,13 +3322,12 @@ fn load_runtime_summary_context(
     crate::application::summary::SummaryContextInput,
     crate::application::summary::SummaryError,
 > {
-    let domain_knowledge = store
-        .list_domain_knowledge(guild_id, false, None)
-        .map_err(|err| {
-            crate::application::summary::SummaryError::SummaryEngine(format!(
-                "failed to load domain knowledge for meeting {meeting_id}: {err}"
-            ))
-        })?;
+    // See load_summary_context in worker.rs: meeting summaries are visible to
+    // viewers of the recorded voice channel, while these context records are
+    // admin-tier data. Only records anchored to a meeting recorded in the
+    // same voice channel may be materialized; unanchored guild-global records
+    // (including all domain knowledge) are excluded.
+    let domain_knowledge = Vec::new();
     let tenant = store.resolve_tenant_by_guild(guild_id).map_err(|err| {
         crate::application::summary::SummaryError::SummaryEngine(format!(
             "failed to resolve active tenant for meeting {meeting_id}: {err}"
@@ -3345,38 +3344,87 @@ fn load_runtime_summary_context(
         );
     }
     let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+        let ai_memory = store
+            .list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load AI memory for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let user_feedback = store
+            .list_transcript_feedback(
+                &tenant.tenant_id,
+                guild_id,
+                Some(TranscriptFeedbackStatus::Accepted),
+                None,
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load accepted user feedback for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let person_aliases = store
+            .list_person_aliases(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                Some(PersonAliasReviewStatus::Accepted),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load person aliases for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let allowed_meetings = crate::application::worker::summary_context_allowed_meeting_ids(
+            store,
+            meeting_id,
+            guild_id,
+            ai_memory
+                .iter()
+                .filter_map(|note| note.source_meeting_id.as_deref())
+                .chain(
+                    user_feedback
+                        .iter()
+                        .filter_map(|feedback| feedback.meeting_id.as_deref()),
+                )
+                .chain(
+                    person_aliases
+                        .iter()
+                        .filter_map(|alias| alias.source_meeting_id.as_deref()),
+                ),
+        )
+        .map_err(|err| {
+            crate::application::summary::SummaryError::SummaryEngine(format!(
+                "failed to resolve summary context scope for meeting {meeting_id}: {err}"
+            ))
+        })?;
         (
-            store
-                .list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load AI memory for meeting {meeting_id}: {err}"
-                    ))
-                })?,
-            store
-                .list_transcript_feedback(
-                    &tenant.tenant_id,
-                    guild_id,
-                    Some(TranscriptFeedbackStatus::Accepted),
-                    None,
-                )
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load accepted user feedback for meeting {meeting_id}: {err}"
-                    ))
-                })?,
-            store
-                .list_person_aliases(
-                    &tenant.tenant_id,
-                    guild_id,
-                    false,
-                    Some(PersonAliasReviewStatus::Accepted),
-                )
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load person aliases for meeting {meeting_id}: {err}"
-                    ))
-                })?,
+            ai_memory
+                .into_iter()
+                .filter(|note| {
+                    note.source_meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
+            user_feedback
+                .into_iter()
+                .filter(|feedback| {
+                    feedback
+                        .meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
+            person_aliases
+                .into_iter()
+                .filter(|alias| {
+                    alias
+                        .source_meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
         )
     } else {
         (Vec::new(), Vec::new(), Vec::new())

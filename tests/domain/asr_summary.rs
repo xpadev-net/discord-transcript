@@ -1911,7 +1911,7 @@ fn materialized_summary_context_regenerates_legacy_unminimized_manifest() {
     )
     .expect("legacy context should be regenerated");
 
-    assert_eq!(manifest.context_selection_version, 1);
+    assert_eq!(manifest.context_selection_version, 2);
     assert_eq!(manifest.ai_memory_count, 0);
     let ai_memory_context =
         std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");

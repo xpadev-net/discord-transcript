@@ -164,7 +164,18 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         effective_settings: Option<&EffectiveMeetingSettings>,
     ) -> Result<SummaryContextInput, StoreError> {
         let speakers = load_meeting_speakers(self, meeting_id)?;
-        let domain_knowledge = self.list_domain_knowledge(guild_id, false, None)?;
+        // Meeting summaries are visible to anyone who can view the recorded
+        // voice channel (verify_meeting_access), while domain knowledge,
+        // AI memory, accepted feedback, and person aliases are readable only
+        // by holders of admin-tier RBAC permissions. Materializing
+        // admin-curated records into a viewer-visible summary crosses that
+        // authorization boundary, and meeting participants can steer both
+        // relevance matching and the agent's output from inside the meeting.
+        // Context records are therefore only eligible when they are anchored
+        // to a meeting recorded in the same voice channel; records without a
+        // meeting anchor (guild-global admin data, including all domain
+        // knowledge) are never materialized.
+        let domain_knowledge = Vec::new();
         let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
         if let Err(err) =
             upsert_vc_participant_alias_candidates_for_guild(self, meeting_id, guild_id, &speakers)
@@ -178,20 +189,64 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         }
         let tenant = self.resolve_tenant_by_guild(guild_id)?;
         let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+            let ai_memory = self.list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)?;
+            let user_feedback = self.list_transcript_feedback(
+                &tenant.tenant_id,
+                guild_id,
+                Some(TranscriptFeedbackStatus::Accepted),
+                None,
+            )?;
+            let person_aliases = self.list_person_aliases(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                Some(PersonAliasReviewStatus::Accepted),
+            )?;
+            let allowed_meetings = summary_context_allowed_meeting_ids(
+                self,
+                meeting_id,
+                guild_id,
+                ai_memory
+                    .iter()
+                    .filter_map(|note| note.source_meeting_id.as_deref())
+                    .chain(
+                        user_feedback
+                            .iter()
+                            .filter_map(|feedback| feedback.meeting_id.as_deref()),
+                    )
+                    .chain(
+                        person_aliases
+                            .iter()
+                            .filter_map(|alias| alias.source_meeting_id.as_deref()),
+                    ),
+            )?;
             (
-                self.list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)?,
-                self.list_transcript_feedback(
-                    &tenant.tenant_id,
-                    guild_id,
-                    Some(TranscriptFeedbackStatus::Accepted),
-                    None,
-                )?,
-                self.list_person_aliases(
-                    &tenant.tenant_id,
-                    guild_id,
-                    false,
-                    Some(PersonAliasReviewStatus::Accepted),
-                )?,
+                ai_memory
+                    .into_iter()
+                    .filter(|note| {
+                        note.source_meeting_id
+                            .as_deref()
+                            .is_some_and(|id| allowed_meetings.contains(id))
+                    })
+                    .collect(),
+                user_feedback
+                    .into_iter()
+                    .filter(|feedback| {
+                        feedback
+                            .meeting_id
+                            .as_deref()
+                            .is_some_and(|id| allowed_meetings.contains(id))
+                    })
+                    .collect(),
+                person_aliases
+                    .into_iter()
+                    .filter(|alias| {
+                        alias
+                            .source_meeting_id
+                            .as_deref()
+                            .is_some_and(|id| allowed_meetings.contains(id))
+                    })
+                    .collect(),
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
@@ -210,6 +265,63 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
                 .and_then(|settings| settings.domain_knowledge_version_id.clone()),
         })
     }
+}
+
+const SUMMARY_CONTEXT_MEETING_CHANNEL_SQL: &str =
+    "SELECT voice_channel_id FROM meetings WHERE id=$1 AND guild_id=$2";
+const SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL: &str = "SELECT id, voice_channel_id FROM meetings \
+             WHERE guild_id=$1 AND id = ANY(string_to_array($2, ','))";
+
+/// Returns the meeting ids whose records may be materialized into a summary's
+/// context: the meeting being summarized plus every anchor meeting that was
+/// recorded in the same voice channel. Summary consumers are the viewers of
+/// that channel (verify_meeting_access), so context from meetings in other
+/// channels — or records with no meeting anchor — would cross the channel
+/// authorization boundary.
+pub(crate) fn summary_context_allowed_meeting_ids<'a, E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
+    meeting_id: &str,
+    guild_id: &str,
+    anchors: impl Iterator<Item = &'a str>,
+) -> Result<HashSet<String>, StoreError> {
+    let mut allowed = HashSet::from([meeting_id.to_owned()]);
+    let current = store
+        .executor
+        .query_rows(
+            SUMMARY_CONTEXT_MEETING_CHANNEL_SQL,
+            &[meeting_id.to_owned(), guild_id.to_owned()],
+        )
+        .map_err(StoreError::Backend)?;
+    let current_channel = current
+        .first()
+        .and_then(|row| row.first().cloned().flatten());
+    let Some(channel) = current_channel else {
+        return Ok(allowed);
+    };
+    let mut anchor_list = anchors
+        .filter(|id| *id != meeting_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    anchor_list.sort_unstable();
+    if anchor_list.is_empty() {
+        return Ok(allowed);
+    }
+    let rows = store
+        .executor
+        .query_rows(
+            SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL,
+            &[guild_id.to_owned(), anchor_list.join(",")],
+        )
+        .map_err(StoreError::Backend)?;
+    for row in rows {
+        if row.get(1).and_then(|cell| cell.as_deref()) == Some(channel.as_str())
+            && let Some(id) = row.first().and_then(|cell| cell.clone())
+        {
+            allowed.insert(id);
+        }
+    }
+    Ok(allowed)
 }
 
 pub(crate) fn upsert_vc_participant_alias_candidates_for_guild<E: SqlExecutor>(
@@ -1536,5 +1648,80 @@ mod tests {
         assert!(workspace.pre_correction_transcript_path().is_file());
         assert!(!workspace.masked_transcript_path().exists());
         assert!(!workspace.transcript_manifest_path().exists());
+    }
+
+    fn sql_key(sql: &str, params: &[&str]) -> String {
+        format!("{}|{}", sql, params.join("\u{1f}"))
+    }
+
+    #[test]
+    fn summary_context_allowed_meeting_ids_restricts_to_same_channel() {
+        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
+
+        let mut executor = FakeSqlExecutor::default();
+        executor.query_rows_result.insert(
+            sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
+            vec![sql_row_from_strings(vec!["vc1".to_owned()])],
+        );
+        executor.query_rows_result.insert(
+            sql_key(SUMMARY_CONTEXT_ANCHOR_CHANNELS_SQL, &["g1", "m2,m3,m4,m5"]),
+            vec![
+                sql_row_from_strings(vec!["m2".to_owned(), "vc1".to_owned()]),
+                sql_row_from_strings(vec!["m3".to_owned(), "vc2".to_owned()]),
+                sql_row_from_strings(vec!["m4".to_owned(), "vc1".to_owned()]),
+            ],
+        );
+        let mut store = SqlMeetingStore::new(executor);
+
+        let allowed = summary_context_allowed_meeting_ids(
+            &mut store,
+            "m1",
+            "g1",
+            ["m2", "m3", "m4", "m5"].into_iter(),
+        )
+        .expect("scope should resolve");
+
+        assert!(allowed.contains("m1"));
+        assert!(allowed.contains("m2"));
+        assert!(
+            !allowed.contains("m3"),
+            "different channel must be excluded"
+        );
+        assert!(allowed.contains("m4"));
+        assert!(!allowed.contains("m5"), "unknown anchor must be excluded");
+    }
+
+    #[test]
+    fn summary_context_allowed_meeting_ids_limits_to_current_meeting_without_channel() {
+        use crate::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
+
+        let mut executor = FakeSqlExecutor::default();
+        executor.query_rows_result.insert(
+            sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
+            vec![sql_row_from_strings(vec!["vc1".to_owned()])],
+        );
+        let mut store = SqlMeetingStore::new(executor);
+
+        let allowed =
+            summary_context_allowed_meeting_ids(&mut store, "m1", "g1", std::iter::empty())
+                .expect("scope should resolve");
+
+        assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
+    }
+
+    #[test]
+    fn summary_context_allowed_meeting_ids_deny_when_channel_unknown() {
+        use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+        // Meeting row missing -> channel cannot be proven, so only the current
+        // meeting anchor is allowed.
+        let executor = FakeSqlExecutor::default();
+        let mut store = SqlMeetingStore::new(executor);
+
+        let allowed =
+            summary_context_allowed_meeting_ids(&mut store, "m1", "g1", ["m2"].into_iter())
+                .expect("scope should resolve");
+
+        assert_eq!(allowed, HashSet::from(["m1".to_owned()]));
     }
 }

@@ -129,7 +129,7 @@ impl AgentOutputContract {
 
 pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
     AgentOutputContract::new("output/summary.md", "summary output", 1024 * 1024);
-const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 1;
+const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {
