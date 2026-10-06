@@ -433,26 +433,65 @@ fn is_sensitive_query_name(name: &str) -> bool {
         return true;
     }
 
-    normalized
-        .split('_')
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            matches!(
-                token,
-                "token"
-                    | "secret"
-                    | "password"
-                    | "passwd"
-                    | "pwd"
-                    | "credential"
-                    | "credentials"
-                    | "authorization"
-                    | "auth"
-                    | "signature"
-                    | "sig"
-                    | "key"
-            )
-        })
+    // Flag the name when a sensitive word appears between two word
+    // boundaries: run start/end, non-alphanumeric separators, lower→upper
+    // (camelCase) starts, and acronym→word boundaries (an uppercase run's
+    // last letter before a lowercase, e.g. `APISecret` → `API` + `Secret`).
+    // A match may span inner boundaries it does not need (`SEcret` splits as
+    // `S` + `Ecret`, yet its lowercase form is still `secret`), so
+    // `accessToken`, `clientSecret`, `clientAPISecret`, and `clientSEcret`
+    // all hit even though the normalized name has no separator.
+    const SENSITIVE_WORDS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "credential",
+        "credentials",
+        "authorization",
+        "auth",
+        "signature",
+        "sig",
+        "key",
+    ];
+    let chars = name.chars().collect::<Vec<_>>();
+    let len = chars.len();
+    let mut boundary = vec![false; len + 1];
+    boundary[0] = true;
+    boundary[len] = true;
+    for i in 1..len {
+        let ch = chars[i];
+        let prev = chars[i - 1];
+        if !ch.is_ascii_alphanumeric() || !prev.is_ascii_alphanumeric() {
+            boundary[i] = true;
+            continue;
+        }
+        if ch.is_ascii_uppercase()
+            && (!prev.is_ascii_uppercase()
+                || chars
+                    .get(i + 1)
+                    .is_some_and(|next| next.is_ascii_lowercase()))
+        {
+            boundary[i] = true;
+        }
+    }
+    let lower = chars
+        .iter()
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for start in 0..len {
+        if !boundary[start] {
+            continue;
+        }
+        for word in SENSITIVE_WORDS {
+            let end = start + word.len();
+            if end <= len && boundary[end] && lower[start..end].iter().copied().eq(word.chars()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn quote_log_arg(part: &str) -> String {
@@ -2119,6 +2158,18 @@ mod tests {
         assert!(message.contains("bearer_token=REDACTED"));
         assert!(message.contains("key=REDACTED"));
         assert!(message.contains("x=1"));
+    }
+
+    #[test]
+    fn whisper_endpoint_redaction_catches_camel_case_secret_params() {
+        let rendered = sanitize_whisper_endpoint_for_log(
+            "https://whisper.example.test/inference?accessToken=tok-1&clientSecret=sec-2&apiKey=key-3&sessionToken=s-4&awsSecretAccessKey=k-5&clientAPISecret=sec-6&clientSEcret=sec-7&debug=true&designMode=on",
+        );
+
+        assert_eq!(
+            rendered,
+            "https://whisper.example.test/inference?accessToken=REDACTED&clientSecret=REDACTED&apiKey=REDACTED&sessionToken=REDACTED&awsSecretAccessKey=REDACTED&clientAPISecret=REDACTED&clientSEcret=REDACTED&debug=true&designMode=on"
+        );
     }
 
     #[test]
