@@ -4147,15 +4147,29 @@ impl EventHandler for ScaffoldHandler {
             }
         };
         let target_voice_channel_id = active_voice_channel.voice_channel_id;
-        let Some(non_bot) =
-            count_non_bot_members_in_target_voice(&ctx, self.guild_id, target_voice_channel_id)
-        else {
-            warn!(
-                guild_id = %self.guild_id,
-                target_voice_channel_id,
-                "voice state cache unavailable; skipping auto-stop evaluation to avoid false trigger"
-            );
-            return;
+        // A missing voice-state cache is not proof the channel is empty, but
+        // skipping evaluation entirely is unsafe too: auto-stop is
+        // event-driven, so an empty-channel update lost to a cache miss
+        // would leave the recording active with no grace timer ever armed
+        // until another voice-state event happens to arrive. Arm the grace
+        // timer instead — the fire-time re-check only stops on an observed
+        // empty channel, reschedules while the cache stays unavailable, and
+        // bounds the outage into a marked failure rather than a stuck
+        // recording.
+        let non_bot = match count_non_bot_members_in_target_voice(
+            &ctx,
+            self.guild_id,
+            target_voice_channel_id,
+        ) {
+            Some(non_bot) => non_bot,
+            None => {
+                warn!(
+                    guild_id = %self.guild_id,
+                    target_voice_channel_id,
+                    "voice state cache unavailable; arming auto-stop grace timer so the fire-time check decides"
+                );
+                0
+            }
         };
         let active_meeting_id = active_voice_channel.meeting_id;
         let grace = self
