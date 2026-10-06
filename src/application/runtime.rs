@@ -2641,85 +2641,22 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SummaryCleanupFailureDisposition {
-    RetryScheduled,
-    OwnershipLost,
-    TerminalStatusUpdated,
-}
-
-fn summary_cleanup_failure_user_message(_err: impl Display) -> String {
-    "summary agent workspace cleanup failed after summary persistence; cleanup will be retried and retained agent workspaces are covered by retention cleanup".to_owned()
-}
-
-fn handle_summary_cleanup_failure<S, Q>(
-    store: &mut S,
-    queue: &mut Q,
-    claimed_job: &Job,
-    err_string: String,
-    summary_max_retries: u32,
-) -> SummaryCleanupFailureDisposition
-where
-    S: MeetingStore,
-    Q: JobQueue,
-{
-    if let Err(err) = queue.heartbeat(claimed_job) {
+/// Best-effort removal of a persisted summary's agent workspace. Cleanup
+/// failure after persistence must not change the job outcome (no retry, no
+/// meeting status change): the agent can tamper with the workspace to force
+/// a failure, and letting it escalate would turn cleanup into repeated LLM
+/// work. Workspace roots that fail validation (e.g. the inode was replaced)
+/// are left for startup retention cleanup instead of being deleted blindly.
+fn cleanup_agent_workspace_after_persist(
+    meeting_id: &str,
+    agent_workspace: crate::infrastructure::workspace::AgentWorkspace,
+) {
+    if let Err(err) = agent_workspace.cleanup_once() {
         warn!(
-            meeting_id = %claimed_job.meeting_id,
-            job_id = %claimed_job.id,
+            meeting_id = %meeting_id,
             error = %err,
-            "summary cleanup retry skipped because job ownership could not be proven"
+            "failed to clean summary agent workspace after summary persistence; leaving stale workspace for retention cleanup"
         );
-        return SummaryCleanupFailureDisposition::OwnershipLost;
-    }
-    match store.set_meeting_status(
-        &claimed_job.meeting_id,
-        MeetingStatus::Stopping,
-        Some(MeetingStatus::Summarizing),
-    ) {
-        Ok(()) => {}
-        Err(err @ StoreError::CasConflict { .. }) => {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                job_id = %claimed_job.id,
-                error = %err,
-                "summary cleanup retry cannot restore meeting state; failing job without touching meeting state"
-            );
-            let _ = queue.mark_failed(claimed_job, err_string);
-            return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
-        }
-        Err(err) => {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                job_id = %claimed_job.id,
-                error = %err,
-                "summary cleanup retry cannot restore meeting to retryable state"
-            );
-            let _ = queue.mark_failed(claimed_job, err_string.clone());
-            let _ = mark_summary_meeting_failed_from_summary_state(
-                store,
-                &claimed_job.meeting_id,
-                err_string,
-            );
-            return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
-        }
-    }
-    let exhausted = retry_claimed_summary_job(
-        queue,
-        claimed_job,
-        err_string.clone(),
-        summary_max_retries,
-        "summary_cleanup",
-    );
-    if exhausted {
-        let _ = mark_summary_meeting_failed_from_summary_state(
-            store,
-            &claimed_job.meeting_id,
-            err_string,
-        );
-        SummaryCleanupFailureDisposition::TerminalStatusUpdated
-    } else {
-        SummaryCleanupFailureDisposition::RetryScheduled
     }
 }
 
@@ -8224,56 +8161,12 @@ impl ScaffoldHandler {
                 );
             }
         }
-        if let Err(err) = agent_workspace.cleanup_once() {
-            let err_string = summary_cleanup_failure_user_message(&err);
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                error = %err,
-                "failed to clean summary agent workspace after summary persistence"
-            );
-            let disposition = {
-                let mut service = self.service.lock().await;
-                let mut queue = self.queue.lock().await;
-                handle_summary_cleanup_failure(
-                    &mut service.store,
-                    &mut *queue,
-                    &claimed_job,
-                    err_string.clone(),
-                    self.summary_max_retries,
-                )
-            };
-            return match disposition {
-                SummaryCleanupFailureDisposition::RetryScheduled => {
-                    Err(retry_scheduled_error(&claimed_job, err_string))
-                }
-                SummaryCleanupFailureDisposition::OwnershipLost => {
-                    Err(SummaryJobRunError::NotClaimable(err_string))
-                }
-                SummaryCleanupFailureDisposition::TerminalStatusUpdated => {
-                    if self
-                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
-                        .await
-                        && let Err(status_err) = self
-                            .update_status_message(
-                                http,
-                                &claimed_job.meeting_id,
-                                StatusMessageUpdate::Failed {
-                                    phase: "summary_cleanup",
-                                    error: &err_string,
-                                },
-                            )
-                            .await
-                    {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %status_err,
-                            "failed to update status message after summary cleanup failure"
-                        );
-                    }
-                    Err(SummaryJobRunError::TerminalStatusUpdated(err_string))
-                }
-            };
-        }
+        // The summary is already persisted at this point, so cleanup is
+        // best-effort housekeeping. A prompt-injected agent can tamper with
+        // the cleanup marker or other workspace contents to make cleanup
+        // fail; reverting the meeting and requeueing the job here would let
+        // the agent turn cleanup into a repeated-LLM-work DoS.
+        cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, agent_workspace);
 
         let ai_memory_extraction_supported = {
             let service = self.service.lock().await;
@@ -12197,101 +12090,77 @@ mod status_message_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn summary_cleanup_error_requeues_job_and_reverts_meeting_before_exhaustion() {
-        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
-        store.insert(summarizing_meeting());
-        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
-        let job = running_summary_job();
-        queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let raw_error =
-            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
-        let user_message = summary_cleanup_failure_user_message(raw_error);
+    fn post_persist_workspace_cleanup_removes_workspace_with_tampered_marker() {
+        let temp = runtime_temp_dir("post_persist_cleanup_tampered_marker");
+        let meeting_root = temp.path.join("meeting");
+        let agent_root = meeting_root.join("agent").join("run-1");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root");
+        let source = meeting_root.join("transcript.md");
+        std::fs::write(&source, "transcript").expect("source");
+        let agent_workspace = crate::infrastructure::workspace::AgentWorkspaceBuilder::new(
+            &meeting_root,
+            &agent_root,
+        )
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+        // A prompt-injected agent rewriting the cleanup marker must not be
+        // able to keep transcript copies on disk: the workspace inode is
+        // unchanged, so cleanup still removes it.
+        std::fs::write(
+            agent_root
+                .join(crate::infrastructure::workspace::AGENT_CURSOR_DIR)
+                .join(".cleanup-token"),
+            "tampered-marker",
+        )
+        .expect("tamper cleanup marker");
 
-        let disposition =
-            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 2);
+        cleanup_agent_workspace_after_persist("m1", agent_workspace);
 
-        assert_ne!(user_message, raw_error);
-        assert!(!user_message.contains("/tmp/private"));
-        assert!(!user_message.contains("summary.md"));
-        assert!(user_message.len() < 200);
+        assert!(!agent_root.exists());
         assert_eq!(
-            disposition,
-            SummaryCleanupFailureDisposition::RetryScheduled
-        );
-        let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
-        assert_eq!(updated.retry_count, 1);
-        assert_eq!(
-            updated.error_message.as_deref(),
-            Some(user_message.as_str())
-        );
-        let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
-        assert_eq!(meeting.error_message, None);
-    }
-
-    #[test]
-    fn summary_cleanup_error_marks_job_and_meeting_failed_after_exhaustion() {
-        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
-        store.insert(summarizing_meeting());
-        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
-        let job = running_summary_job();
-        queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let raw_error =
-            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
-        let user_message = summary_cleanup_failure_user_message(raw_error);
-
-        let disposition =
-            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 0);
-
-        assert_ne!(user_message, raw_error);
-        assert!(!user_message.contains("/tmp/private"));
-        assert!(!user_message.contains("summary.md"));
-        assert!(user_message.len() < 200);
-        assert_eq!(
-            disposition,
-            SummaryCleanupFailureDisposition::TerminalStatusUpdated
-        );
-        let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
-        assert_eq!(updated.retry_count, 1);
-        assert_eq!(
-            updated.error_message.as_deref(),
-            Some(user_message.as_str())
-        );
-        let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
-        assert_eq!(
-            meeting.error_message.as_deref(),
-            Some(user_message.as_str())
+            std::fs::read_to_string(&source).expect("source remains"),
+            "transcript"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn summary_cleanup_error_does_not_fail_meeting_after_state_advances() {
-        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
-        let mut meeting = summarizing_meeting();
-        meeting.status = crate::domain::MeetingStatus::Posted;
-        store.insert(meeting);
-        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
-        let job = running_summary_job();
-        queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let user_message = summary_cleanup_failure_user_message("cleanup failed");
+    fn post_persist_workspace_cleanup_failure_does_not_propagate() {
+        let temp = runtime_temp_dir("post_persist_cleanup_failure");
+        let meeting_root = temp.path.join("meeting");
+        let agent_root = meeting_root.join("agent").join("run-1");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root");
+        let source = meeting_root.join("transcript.md");
+        std::fs::write(&source, "transcript").expect("source");
+        let agent_workspace = crate::infrastructure::workspace::AgentWorkspaceBuilder::new(
+            &meeting_root,
+            &agent_root,
+        )
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+        // A root swapped for a symlink must be refused rather than
+        // traversed, and the failure must not propagate to the job.
+        std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
+        let symlink_target = temp.path.join("unrelated");
+        std::fs::create_dir_all(&symlink_target).expect("target dir");
+        std::fs::write(symlink_target.join("unrelated.txt"), "do not delete").expect("target file");
+        std::os::unix::fs::symlink(&symlink_target, &agent_root).expect("symlink swap");
 
-        let disposition =
-            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message, 0);
+        cleanup_agent_workspace_after_persist("m1", agent_workspace);
 
-        assert_eq!(
-            disposition,
-            SummaryCleanupFailureDisposition::TerminalStatusUpdated
+        assert!(
+            std::fs::symlink_metadata(&agent_root)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
         );
-        let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
-        assert_eq!(updated.retry_count, 0);
-        let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
-        assert_eq!(meeting.error_message, None);
+        assert!(symlink_target.join("unrelated.txt").is_file());
     }
 
     #[test]
