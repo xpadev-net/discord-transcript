@@ -393,12 +393,12 @@ impl AgentWorkspace {
     }
 
     pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
-        cleanup_agent_workspace_root(&self.root, &self.root_identity, &self.root_handle)
+        cleanup_agent_workspace_root(&self.root, &self.root_identity, Some(&self.root_handle))
     }
 
     pub fn cleanup_once(mut self) -> Result<(), AgentWorkspaceError> {
         self.cleanup_on_drop = false;
-        cleanup_agent_workspace_root(&self.root, &self.root_identity, &self.root_handle)
+        cleanup_agent_workspace_root(&self.root, &self.root_identity, Some(&self.root_handle))
     }
 }
 
@@ -473,14 +473,26 @@ impl AgentWorkspaceBuilder {
         // open, a deleted-and-recreated directory cannot reuse the recorded
         // dev/ino pair, so the cleanup identity check cannot be spoofed by
         // inode recycling.
-        let root_handle = open_agent_root_handle(&self.agent_root)?;
-        let cleanup_handle = open_agent_root_handle(&self.agent_root)?;
+        let root_handle = match open_agent_root_handle(&self.agent_root) {
+            Ok(root_handle) => root_handle,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&self.agent_root);
+                return Err(err);
+            }
+        };
 
         let cleanup_root = self.agent_root.clone();
         let cleanup_identity = root_identity.clone();
         let build_result = self.populate(meeting_root, agent_root, root_identity, root_handle);
         if build_result.is_err() {
-            let _ = cleanup_agent_workspace_root(&cleanup_root, &cleanup_identity, &cleanup_handle);
+            // The materialize-time fd moved into the workspace on success;
+            // on failure open a fresh pin so the identity check still runs.
+            let cleanup_handle = open_agent_root_handle(&cleanup_root).ok();
+            let _ = cleanup_agent_workspace_root(
+                &cleanup_root,
+                &cleanup_identity,
+                cleanup_handle.as_ref(),
+            );
         }
         build_result
     }
@@ -709,7 +721,7 @@ fn root_identity(_path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorksp
 fn validate_root_identity(
     path: &Path,
     expected: &AgentWorkspaceRootIdentity,
-    root_handle: &AgentWorkspaceRootHandle,
+    root_handle: Option<&AgentWorkspaceRootHandle>,
 ) -> Result<(), AgentWorkspaceError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -738,18 +750,20 @@ fn validate_root_identity(
     // The held-open fd must pin the recorded inode; together they prove the
     // path resolves to the directory object that was materialized, since a
     // pinned inode cannot be recycled to a replacement directory.
-    let handle_metadata = root_handle
-        .0
-        .metadata()
-        .map_err(|err| AgentWorkspaceError::Io {
-            path: path.to_path_buf(),
-            source: err,
-        })?;
-    if handle_metadata.dev() != expected.dev || handle_metadata.ino() != expected.ino {
-        return Err(AgentWorkspaceError::InvalidPath {
-            path: path.to_path_buf(),
-            reason: "agent workspace root identity changed before cleanup",
-        });
+    if let Some(root_handle) = root_handle {
+        let handle_metadata = root_handle
+            .0
+            .metadata()
+            .map_err(|err| AgentWorkspaceError::Io {
+                path: path.to_path_buf(),
+                source: err,
+            })?;
+        if handle_metadata.dev() != expected.dev || handle_metadata.ino() != expected.ino {
+            return Err(AgentWorkspaceError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "agent workspace root identity changed before cleanup",
+            });
+        }
     }
     match read_cleanup_marker(path) {
         Ok(marker) if marker == expected.cleanup_marker => Ok(()),
@@ -771,7 +785,7 @@ fn validate_root_identity(
 fn validate_root_identity(
     _path: &Path,
     _expected: &AgentWorkspaceRootIdentity,
-    _root_handle: &AgentWorkspaceRootHandle,
+    _root_handle: Option<&AgentWorkspaceRootHandle>,
 ) -> Result<(), AgentWorkspaceError> {
     Ok(())
 }
@@ -779,7 +793,7 @@ fn validate_root_identity(
 fn cleanup_agent_workspace_root(
     root: &Path,
     expected: &AgentWorkspaceRootIdentity,
-    root_handle: &AgentWorkspaceRootHandle,
+    root_handle: Option<&AgentWorkspaceRootHandle>,
 ) -> Result<(), AgentWorkspaceError> {
     match fs::symlink_metadata(root) {
         Ok(_) => {}
