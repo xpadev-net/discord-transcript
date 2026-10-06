@@ -69,7 +69,7 @@ use serenity::all::{
 };
 use serenity::async_trait;
 use serenity::http::Http;
-use serenity::prelude::{Client, Context, EventHandler};
+use serenity::prelude::{Context, EventHandler};
 use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::{
     Config as SongbirdConfig, CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
@@ -3272,7 +3272,18 @@ pub async fn run_bot(
     let songbird_config =
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
     let voice_manager = songbird::Songbird::serenity_from_config(songbird_config);
-    let mut client = Client::builder(&config.discord_token, intents)
+    // Bot-originated messages must never ping: voice channel names and other
+    // user-controlled text can contain @everyone/@here/user/role mention
+    // syntax that a channel manager could weaponize into bot-sent pings.
+    let http = serenity::http::HttpBuilder::new(&config.discord_token)
+        .default_allowed_mentions(
+            serenity::all::CreateAllowedMentions::new()
+                .all_roles(false)
+                .all_users(false)
+                .everyone(false),
+        )
+        .build();
+    let mut client = serenity::all::ClientBuilder::new_with_http(http, intents)
         .event_handler(handler.clone())
         .register_songbird_with(Arc::clone(&voice_manager))
         .await
@@ -9822,13 +9833,28 @@ fn resolve_user_voice_channel_id(ctx: &Context, guild_id: GuildId, user_id: User
         .map(|id| id.get())
 }
 
+const MAX_VOICE_CHANNEL_NAME_CHARS: usize = 100;
+
+/// Voice channel names are administrator-controlled text that reaches
+/// agent-consumed manifests and bot-posted messages. Strip control/format
+/// characters (zero-width and bidi overrides can smuggle invisible prompt
+/// instructions) and cap the length; mention ping risk is handled by the
+/// HTTP client's empty default allowed_mentions.
+fn sanitize_voice_channel_name(name: &str) -> Option<String> {
+    let sanitized = name
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(*ch as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF))
+        .take(MAX_VOICE_CHANNEL_NAME_CHARS)
+        .collect::<String>();
+    (!sanitized.trim().is_empty()).then_some(sanitized)
+}
+
 fn resolve_voice_channel_name(ctx: &Context, guild_id: GuildId, channel_id: u64) -> Option<String> {
     let guild = ctx.cache.guild(guild_id)?;
     guild
         .channels
         .get(&ChannelId::new(channel_id))
-        .map(|channel| channel.name.clone())
-        .filter(|name| !name.trim().is_empty())
+        .and_then(|channel| sanitize_voice_channel_name(&channel.name))
 }
 
 pub fn stop_reason_from_interaction(command: &CommandInteraction) -> Result<StopReason, String> {
@@ -14660,6 +14686,24 @@ mod status_message_tests {
             out.extend_from_slice(&s.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn voice_channel_name_sanitize_strips_hidden_format_chars() {
+        let sanitized = sanitize_voice_channel_name("stand\u{200B}up\u{202E}room\u{0007}");
+
+        assert_eq!(sanitized.as_deref(), Some("standuproom"));
+    }
+
+    #[test]
+    fn voice_channel_name_sanitize_caps_length_and_rejects_blank() {
+        let long = "a".repeat(MAX_VOICE_CHANNEL_NAME_CHARS + 10);
+        let sanitized = sanitize_voice_channel_name(&long);
+        assert_eq!(
+            sanitized.as_deref().map(str::chars).map(Iterator::count),
+            Some(MAX_VOICE_CHANNEL_NAME_CHARS)
+        );
+        assert_eq!(sanitize_voice_channel_name(" \u{200B} "), None);
     }
 
     #[test]
