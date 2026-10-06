@@ -440,14 +440,23 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
                             worker_shutdown.clone(),
                             SUMMARY_JOB_HEARTBEAT_INTERVAL,
                         );
-                        let job_result = process_claimed_summary_job(
-                            &mut store,
-                            &mut process_queue,
-                            job,
-                            &whisper,
-                            &summary_client,
-                            &options,
-                        );
+                        // Transcription and summary generation are
+                        // synchronous and long-running; on a runtime with a
+                        // single worker thread they would starve the lease
+                        // heartbeat task spawned above. block_in_place lets
+                        // the runtime run a replacement worker so the
+                        // heartbeat keeps polling while this job occupies
+                        // the current thread.
+                        let job_result = tokio::task::block_in_place(|| {
+                            process_claimed_summary_job(
+                                &mut store,
+                                &mut process_queue,
+                                job,
+                                &whisper,
+                                &summary_client,
+                                &options,
+                            )
+                        });
                         match job_result {
                             Ok(Some(result)) => {
                                 let chunk_count = result.output.chunks.len();
