@@ -431,8 +431,8 @@ pub(crate) fn register_summary_context_scope_fakes(
     executor: &mut crate::infrastructure::sql_store::FakeSqlExecutor,
 ) {
     use crate::infrastructure::sql::{
-        LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
-        RESOLVE_TENANT_BY_GUILD_SQL,
+        LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL,
+        LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
     };
     use crate::infrastructure::sql_store::{
         ai_memory_note_row, person_alias_row, sql_key, sql_row_from_strings,
@@ -466,7 +466,7 @@ pub(crate) fn register_summary_context_scope_fakes(
     );
     executor.query_rows_result.insert(
         sql_key(
-            LIST_TRANSCRIPT_FEEDBACK_SQL,
+            LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL,
             &["t1", "g1", "accepted", "", anchor_csv, &list_limit],
         ),
         vec![
@@ -1040,6 +1040,22 @@ where
             return Err(WorkerError::from(err));
         }
     };
+    if let Some(leaked_kind) = crate::application::summary::summary_output_verbatim_leak_in_bodies(
+        &markdown,
+        // Compare the bodies materialized for this attempt's workspace (the
+        // snapshot may predate edits made between retries).
+        &crate::application::summary::summary_context_leak_bodies_for_workspace(
+            &request.workspace,
+            &input.summary_context,
+        ),
+    ) {
+        let err = SummaryError::SummaryEngine(format!(
+            "summary output quoted materialized {leaked_kind} verbatim"
+        ));
+        error!(meeting_id = %input.meeting_id, error = %err, "summary output verbatim context leak rejected");
+        revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
+        return Err(WorkerError::from(err));
+    }
     ensure_owned()?;
     if let Err(err) = persist_generated_summary_markdown(&request.workspace, &markdown) {
         error!(meeting_id = %input.meeting_id, error = %err, "generated summary persistence failed");

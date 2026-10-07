@@ -30,6 +30,11 @@ pub const CONTEXT_AI_MEMORY_FILENAME: &str = "ai_memory.md";
 pub const CONTEXT_PERSON_ALIASES_FILENAME: &str = "person_aliases.md";
 pub const CONTEXT_USER_FEEDBACK_FILENAME: &str = "user_feedback.md";
 pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
+/// Snapshot of the protected context bodies materialized for the meeting;
+/// used by the post-summary verbatim-leak check so retries compare the same
+/// bodies the agent could read, even when the source context was edited
+/// between attempts.
+pub const CONTEXT_LEAK_CHECK_BODIES_FILENAME: &str = "leak_check_bodies.json";
 pub const AGENT_INPUT_DIR: &str = "input";
 pub const AGENT_OUTPUT_DIR: &str = "output";
 pub const AGENT_CURSOR_DIR: &str = ".cursor";
@@ -374,6 +379,10 @@ impl MeetingWorkspacePaths {
 
     pub fn context_summary_template_path(&self) -> PathBuf {
         self.context_dir().join(CONTEXT_SUMMARY_TEMPLATE_FILENAME)
+    }
+
+    pub fn context_leak_check_bodies_path(&self) -> PathBuf {
+        self.context_dir().join(CONTEXT_LEAK_CHECK_BODIES_FILENAME)
     }
 
     pub fn ensure_base_dirs(&self) -> std::io::Result<()> {

@@ -37,18 +37,19 @@ use crate::infrastructure::sql::{
     INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_PERSON_ALIAS_SQL,
     INSERT_RECORDING_MEETING_WITH_EFFECTIVE_SETTINGS_SQL,
     INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
-    INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL, LIST_AI_MEMORY_NOTES_SQL,
+    INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL,
+    LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL,
     LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_RECENT_USAGE_EVENTS_SQL,
-    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, LOCK_SCHEMA_MIGRATIONS_SQL,
-    MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
-    RECOVERY_READY_SUMMARY_JOBS_SQL, RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
-    RETRY_JOB_SQL, ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL,
-    SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
-    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
-    UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
-    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
-    migration_statements,
+    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL,
+    LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
+    MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration, RECOVERY_READY_SUMMARY_JOBS_SQL,
+    RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
+    ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
+    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
+    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
+    UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
+    UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL, migration_statements,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -139,8 +140,8 @@ pub fn ai_memory_note_row(
     ]
 }
 
-/// Test helper: accepted transcript-feedback row matching the
-/// `LIST_TRANSCRIPT_FEEDBACK_SQL` projection, with a controllable `meeting_id`
+/// Test helper: accepted transcript-feedback row matching the transcript
+/// feedback list queries' projection, with a controllable `meeting_id`
 /// anchor.
 pub fn transcript_feedback_row(
     id: &str,
@@ -898,7 +899,27 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         ];
         let rows = self
             .executor
-            .query_rows(LIST_TRANSCRIPT_FEEDBACK_SQL, &params)
+            .query_rows(LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL, &params)
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_transcript_feedback_row).collect()
+    }
+
+    pub fn list_accepted_transcript_feedback_for_summary(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        meeting_id: &str,
+    ) -> Result<Vec<TranscriptFeedback>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL,
+                &[
+                    tenant_id.to_owned(),
+                    guild_id.to_owned(),
+                    meeting_id.to_owned(),
+                ],
+            )
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_transcript_feedback_row).collect()
     }
