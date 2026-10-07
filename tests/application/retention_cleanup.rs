@@ -9,13 +9,17 @@ use discord_transcript::application::retention_cleanup::{
     estimate_meeting_filesystem_usage, estimate_target_filesystem_usage,
 };
 use discord_transcript::domain::retention::RetentionPolicy;
+use discord_transcript::infrastructure::s3::{ObjectStore, S3Error};
 use discord_transcript::infrastructure::sql::{
     ADMIN_RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL, ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, sql_row_from_strings};
+use discord_transcript::infrastructure::storage_s3::RecordingObjectStore;
 use discord_transcript::infrastructure::workspace::MeetingWorkspaceLayout;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 struct TempWorkspaceGuard {
     base: PathBuf,
@@ -45,6 +49,73 @@ fn query_key(sql: &str, params: &[&str]) -> String {
 
 fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value should be nonzero")
+}
+
+#[derive(Debug, Default)]
+struct RemoteFakeObjectStore {
+    lists: Mutex<Vec<String>>,
+    deletes: Mutex<Vec<Vec<String>>>,
+    list_result: Mutex<Vec<String>>,
+    fail_deletes: Mutex<bool>,
+}
+
+impl ObjectStore for RemoteFakeObjectStore {
+    fn put_object(&self, _key: &str, _body: &[u8], _content_type: &str) -> Result<(), S3Error> {
+        Ok(())
+    }
+
+    fn head_object(&self, _key: &str) -> Result<bool, S3Error> {
+        Ok(false)
+    }
+
+    fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
+        self.lists.lock().unwrap().push(prefix.to_owned());
+        Ok(self
+            .list_result
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    fn delete_keys(&self, keys: &[String]) -> Result<(), S3Error> {
+        self.deletes.lock().unwrap().push(keys.to_vec());
+        if *self.fail_deletes.lock().unwrap() {
+            return Err(S3Error::Status {
+                status: 503,
+                detail: "injected delete failure".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn presigned_get_url(&self, _key: &str, _ttl: Duration) -> String {
+        "https://example.test/object".to_owned()
+    }
+
+    fn endpoint_label(&self) -> String {
+        "fake".to_owned()
+    }
+}
+
+/// Builds a `RecordingObjectStore` rooted at the layout's base dir so meeting
+/// audio dirs resolve to the same key prefix as production wiring.
+fn remote_object_store(
+    layout: &MeetingWorkspaceLayout,
+) -> (Arc<RemoteFakeObjectStore>, RecordingObjectStore) {
+    let fake = Arc::new(RemoteFakeObjectStore::default());
+    let dyn_store: Arc<dyn ObjectStore> = fake.clone();
+    let base = layout
+        .workspace_root()
+        .parent()
+        .expect("workspace root has a base dir")
+        .to_path_buf();
+    (
+        fake,
+        RecordingObjectStore::new(dyn_store, String::new(), 900, base),
+    )
 }
 
 #[test]
@@ -148,7 +219,7 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
         .execute_result
         .insert(query_key(RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, &["7"]), 5);
 
-    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("cleanup should succeed");
 
     assert_eq!(report.raw_workspaces_scanned, 1);
@@ -213,8 +284,7 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect("cleanup should succeed");
 
     assert_eq!(report.summaries_deleted, 6);
@@ -281,7 +351,7 @@ fn retention_cleanup_revisits_raw_cleaned_meetings_for_legacy_debug_artifacts() 
         ])],
     );
 
-    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("debug cleanup should succeed");
 
     assert_eq!(report.raw_workspaces_scanned, 0);
@@ -309,7 +379,7 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
         ])],
     );
 
-    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("missing directories should be ignored");
 
     assert_eq!(report.raw_workspaces_scanned, 1);
@@ -379,7 +449,7 @@ fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
         3,
     );
 
-    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect_err("filesystem cleanup should fail after database cleanup runs");
 
     assert!(err.message.contains("failed to remove"));
@@ -438,8 +508,7 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect_err("filesystem cleanup should report the failed meeting");
 
     assert!(err.message.contains("failed to remove"));
@@ -490,8 +559,7 @@ fn retention_cleanup_can_rerun_after_transcript_and_summary_filesystem_failure()
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect_err("filesystem cleanup should fail before paths become removable");
 
     assert!(err.message.contains("failed to remove"));
@@ -548,8 +616,7 @@ fn retention_cleanup_can_rerun_after_transcript_and_summary_filesystem_failure()
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect("retry should remove the remaining workspace files");
 
     assert_eq!(retry_report.transcript_dirs_removed, 1);
@@ -583,7 +650,7 @@ fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
         3,
     );
 
-    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect_err("database cleanup should fail after filesystem cleanup runs");
 
     assert!(err.message.contains("database cleanup failed"));
@@ -613,7 +680,7 @@ fn retention_cleanup_uses_partial_plan_when_one_workspace_query_fails() {
         "transcript query unavailable".to_owned(),
     );
 
-    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect_err("plan query error should be reported after partial cleanup");
 
     assert!(err.message.contains("transcript query unavailable"));
@@ -669,7 +736,7 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
     assert_eq!(target_usage.summary_bytes, usage.summary_bytes);
     assert_eq!(target_usage.debug_bytes, 0);
 
-    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, targets)
+    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, targets, None)
         .expect("manual delete succeeds");
     assert_eq!(report.raw_workspaces_scanned, 1);
     assert_eq!(
@@ -697,10 +764,247 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
         summary: false,
         debug: true,
     };
-    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, debug_targets)
+    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, debug_targets, None)
         .expect("manual debug delete succeeds");
     assert_eq!(report.debug_dirs_removed, 2);
     assert_eq!(report.agent_workspace_dirs_removed, 0);
     assert!(!workspace.debug_dir().exists());
     assert!(!workspace.legacy_debug_dir().exists());
+}
+
+#[test]
+fn retention_cleanup_deletes_remote_objects_for_expired_raw_workspace() {
+    let (_guard, layout) = temp_layout("remote_raw");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec![
+        "workspaces/g1/vc1/m1/audio/chunk.wav".to_owned(),
+        "workspaces/g1/vc1/m1/audio/mixdown.wav".to_owned(),
+    ];
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let report = enforce_retention_policy(
+        &mut executor,
+        &layout,
+        RetentionPolicy::default(),
+        Some(&objects),
+    )
+    .expect("cleanup should succeed");
+
+    assert_eq!(report.raw_workspaces_scanned, 1);
+    assert_eq!(report.raw_audio_dirs_removed, 1);
+    assert_eq!(report.remote_objects_deleted, 2);
+    assert_eq!(
+        report.raw_workspace_cleaned_meeting_ids,
+        vec!["m1".to_owned()]
+    );
+    let lists = fake.lists.lock().unwrap();
+    assert_eq!(lists.len(), 2);
+    assert!(lists[0].ends_with("g1/vc1/m1/audio/"));
+    assert_eq!(lists[1], "m1/");
+    drop(lists);
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![vec![
+            "workspaces/g1/vc1/m1/audio/chunk.wav".to_owned(),
+            "workspaces/g1/vc1/m1/audio/mixdown.wav".to_owned(),
+        ]]
+    );
+}
+
+#[test]
+fn retention_cleanup_deletes_legacy_recording_objects() {
+    let (_guard, layout) = temp_layout("remote_legacy");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let legacy_dir = layout.legacy_meeting_dir("m1");
+    std::fs::create_dir_all(legacy_dir.join("speakers")).expect("create legacy speakers");
+    std::fs::write(legacy_dir.join("chunk.wav"), b"legacy wav").expect("write legacy wav");
+    std::fs::write(legacy_dir.join("mixdown.wav"), b"legacy mixdown").expect("write mixdown");
+    std::fs::write(legacy_dir.join("speakers/u1.wav"), b"speaker").expect("write speaker");
+    std::fs::write(legacy_dir.join("transcript.md"), b"transcript").expect("write transcript");
+
+    let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec![
+        "workspaces/g1/vc1/m1/audio/chunk.wav".to_owned(),
+        "m1/chunk.wav".to_owned(),
+        "m1/mixdown.wav".to_owned(),
+        "m1/speakers/u1.wav".to_owned(),
+        "m1/transcript.md".to_owned(),
+    ];
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let report = enforce_retention_policy(
+        &mut executor,
+        &layout,
+        RetentionPolicy::default(),
+        Some(&objects),
+    )
+    .expect("cleanup should succeed");
+
+    assert_eq!(
+        report.remote_objects_deleted,
+        4,
+        "audio prefix keys plus legacy wav/speakers objects"
+    );
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![
+            vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()],
+            vec![
+                "m1/chunk.wav".to_owned(),
+                "m1/mixdown.wav".to_owned(),
+                "m1/speakers/u1.wav".to_owned(),
+            ],
+        ],
+        "legacy recording keys are deleted but m1/transcript.md is kept"
+    );
+}
+
+#[test]
+fn retention_cleanup_deletes_remote_objects_on_manual_raw_delete() {
+    let (_guard, layout) = temp_layout("remote_manual");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()];
+
+    let meeting = ExpiredWorkspaceRow {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+    };
+    let targets = RetentionDeletionTargets {
+        raw_audio: true,
+        transcript: false,
+        summary: false,
+        debug: false,
+    };
+    let report = apply_manual_meeting_filesystem_delete(
+        &layout,
+        &meeting,
+        targets,
+        Some(&objects),
+    )
+    .expect("manual delete succeeds");
+
+    assert_eq!(report.remote_objects_deleted, 1);
+    assert_eq!(
+        report.raw_workspace_cleaned_meeting_ids,
+        vec!["m1".to_owned()]
+    );
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()]]
+    );
+}
+
+#[test]
+fn retention_cleanup_remote_delete_runs_even_after_local_failure() {
+    let (_guard, layout) = temp_layout("remote_after_local_failure");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    std::fs::create_dir_all(workspace.audio_dir()).expect("create audio dir");
+    // Block local speaker removal (which also skips the parent audio
+    // cleanup); the remote copy must still go.
+    std::fs::write(workspace.speakers_dir(), b"not a directory").expect("write speakers as file");
+
+    let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()];
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let err = enforce_retention_policy(
+        &mut executor,
+        &layout,
+        RetentionPolicy::default(),
+        Some(&objects),
+    )
+    .expect_err("local filesystem failure should still fail the meeting");
+
+    assert!(err.message.contains("failed to remove"));
+    assert_eq!(err.report.remote_objects_deleted, 1);
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()]],
+        "remote deletion must run even when local staging removal fails"
+    );
+    assert!(
+        err.report.raw_workspace_cleaned_meeting_ids.is_empty(),
+        "a meeting with local errors is not marked cleaned"
+    );
+}
+
+#[test]
+fn retention_cleanup_remote_delete_failure_blocks_clean_marker() {
+    let (_guard, layout) = temp_layout("remote_failure");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()];
+    *fake.fail_deletes.lock().unwrap() = true;
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let err = enforce_retention_policy(
+        &mut executor,
+        &layout,
+        RetentionPolicy::default(),
+        Some(&objects),
+    )
+    .expect_err("remote delete failure should fail the meeting");
+
+    assert!(err.message.contains("object store delete failed"));
+    assert_eq!(err.report.remote_objects_deleted, 0);
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()]],
+        "the injected failure exercised a delete of stored audio"
+    );
+    assert!(
+        err.report.raw_workspace_cleaned_meeting_ids.is_empty(),
+        "a remote failure must not mark the meeting cleaned"
+    );
 }

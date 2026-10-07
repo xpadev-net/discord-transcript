@@ -101,6 +101,7 @@ use crate::infrastructure::storage_fs::{
     decode_sanitized_path_component, legacy_sanitize_path_component, sanitize_path_component,
     sanitize_path_component_candidates,
 };
+use crate::infrastructure::storage_s3::RecordingObjectStore;
 use crate::infrastructure::workspace::{
     DEBUG_CORRECTION_PROMPT_FILENAME, DEBUG_DIR, DEBUG_MEETING_TITLE_FILENAME,
     DEBUG_MIXDOWN_WHISPER_FILENAME, DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME,
@@ -380,6 +381,9 @@ pub struct GuildBotTokenRuntimeConfig {
 pub struct WebState {
     pub db: Arc<PgClient>,
     pub chunk_storage_dir: String,
+    /// Present iff `CHUNK_STORAGE_BACKEND=s3`: playback endpoints redirect
+    /// to presigned GETs and retention deletes remote objects.
+    pub recording_objects: Option<RecordingObjectStore>,
     pub auth: Option<Arc<AuthConfig>>,
     pub http_client: reqwest::Client,
     pub guild_bot_token_cipher: Option<Arc<BotTokenCipher>>,
@@ -412,9 +416,11 @@ pub struct WebState {
 }
 
 impl WebState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<PgClient>,
         chunk_storage_dir: String,
+        recording_objects: Option<RecordingObjectStore>,
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
         guild_bot_token: GuildBotTokenRuntimeConfig,
@@ -425,6 +431,7 @@ impl WebState {
         Self {
             db,
             chunk_storage_dir,
+            recording_objects,
             auth,
             http_client,
             guild_bot_token_cipher: guild_bot_token.cipher,
@@ -3688,6 +3695,9 @@ struct AdminRetentionCleanupReportResponse {
     transcripts_marked_deleted: u64,
     summaries_deleted: u64,
     artifacts_deleted: u64,
+    /// Remote (object-store) objects removed under the meeting prefix when
+    /// the recording backend is S3; always 0 for the local backend.
+    remote_objects_deleted: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7524,10 +7534,12 @@ async fn api_admin_retention_cleanup_run(
     .await?;
     let layout =
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
-    let filesystem_result =
-        tokio::task::spawn_blocking(move || apply_retention_filesystem_cleanup(&layout, &plan))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let recording_objects = state.recording_objects.clone();
+    let filesystem_result = tokio::task::spawn_blocking(move || {
+        apply_retention_filesystem_cleanup(&layout, &plan, recording_objects.as_ref())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (mut report, mut error) = match filesystem_result {
         Ok(report) => (report, None),
         Err(err) => (*err.report, Some(err.message)),
@@ -7648,8 +7660,14 @@ async fn api_admin_retention_meeting_delete(
         voice_channel_id: preview.voice_channel_id.clone(),
     };
     let filesystem_targets = targets;
+    let recording_objects = state.recording_objects.clone();
     let filesystem_result = tokio::task::spawn_blocking(move || {
-        apply_manual_meeting_filesystem_delete(&layout, &meeting, filesystem_targets)
+        apply_manual_meeting_filesystem_delete(
+            &layout,
+            &meeting,
+            filesystem_targets,
+            recording_objects.as_ref(),
+        )
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -7889,6 +7907,7 @@ fn admin_retention_report_response(
         transcripts_marked_deleted: report.transcripts_marked_deleted,
         summaries_deleted: report.summaries_deleted,
         artifacts_deleted: report.artifacts_deleted,
+        remote_objects_deleted: report.remote_objects_deleted,
     }
 }
 
@@ -11683,6 +11702,48 @@ async fn api_audio(
     let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
     let primary = workspace.mixdown_path();
     let legacy = layout.legacy_meeting_dir(&meeting_id).join("mixdown.wav");
+    if let Some(objects) = &state.recording_objects {
+        // Object-store probes do blocking HTTP (up to the request timeout);
+        // run them on the blocking pool so a slow S3 cannot occupy a Tokio
+        // worker thread and stall unrelated requests.
+        // Legacy recordings are mirrored under the flat `<meeting>/` layout,
+        // so probe the primary workspace key first and then the legacy key.
+        let probe = {
+            let objects = objects.clone();
+            let primary = primary.clone();
+            let legacy = legacy.clone();
+            tokio::task::spawn_blocking(move || match objects.object_exists(&primary) {
+                Ok(true) => Ok(Some(primary)),
+                Ok(false) => objects
+                    .object_exists(&legacy)
+                    .map(|hit| hit.then_some(legacy)),
+                Err(err) => Err(err),
+            })
+            .await
+        };
+        match probe {
+            Ok(Ok(Some(remote_path))) => {
+                if let Some(url) = objects.presigned_get_for_path(&remote_path) {
+                    return Ok(Redirect::temporary(&url).into_response());
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    error = %err,
+                    "object store probe failed; falling back to local audio file"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    error = %join_err,
+                    "object store probe task failed; falling back to local audio file"
+                );
+            }
+        }
+    }
     let path = if tokio::fs::try_exists(&primary).await.unwrap_or(false) {
         primary
     } else {
@@ -11785,6 +11846,62 @@ async fn api_speakers(
     let primary_speakers_dir = workspace.speakers_dir();
     let legacy_speakers_dir = layout.legacy_meeting_dir(&meeting_id).join("speakers");
 
+    // Under the s3 backend, speaker audio lives in the object store. List
+    // each speakers prefix once (primary workspace and legacy flat layout)
+    // and match candidate filenames instead of a head request per speaker.
+    let remote_speaker_filenames: Option<Arc<HashSet<String>>> = if let Some(objects) =
+        state.recording_objects.as_ref().and_then(|objects| {
+            let prefixes = [
+                objects.object_prefix(&primary_speakers_dir),
+                objects.object_prefix(&legacy_speakers_dir),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            (!prefixes.is_empty()).then(|| (objects.clone(), prefixes))
+        }) {
+        let (objects, prefixes) = objects;
+        // Each prefix is listed independently: a successful workspace list is
+        // kept even when the legacy list fails, and vice versa.
+        match tokio::task::spawn_blocking(move || {
+            prefixes
+                .iter()
+                .map(|prefix| (prefix.clone(), objects.list_keys(prefix)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(results) => {
+                let mut filenames = HashSet::new();
+                for (prefix, result) in results {
+                    match result {
+                        Ok(keys) => filenames.extend(
+                            keys.iter()
+                                .filter_map(|key| key.rsplit('/').next().map(str::to_owned)),
+                        ),
+                        Err(err) => warn!(
+                            meeting_id = %meeting_id,
+                            prefix = %prefix,
+                            error = %err,
+                            "object store speaker list failed; falling back to local speaker files"
+                        ),
+                    }
+                }
+                Some(Arc::new(filenames))
+            }
+            Err(join_err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    error = %join_err,
+                    "object store list task failed; falling back to local speaker files"
+                );
+                Some(Arc::new(HashSet::new()))
+            }
+        }
+    } else {
+        None
+    };
+
     let speaker_tasks: Vec<_> = rows
         .iter()
         .map(|row| {
@@ -11803,8 +11920,16 @@ async fn api_speakers(
                 &legacy_speakers_dir,
                 &speaker_id,
             );
+            let remote_filenames = remote_speaker_filenames.clone();
             async move {
-                let has_audio = first_existing_path(audio_paths).await.is_some();
+                let has_remote = remote_filenames.as_ref().is_some_and(|names| {
+                    audio_paths.iter().any(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| names.contains(name))
+                    })
+                });
+                let has_audio = has_remote || first_existing_path(audio_paths).await.is_some();
                 SpeakerAudioResponse {
                     speaker_id,
                     username,
@@ -11859,13 +11984,60 @@ async fn api_speaker_audio(
         crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
     let workspace = layout.for_meeting(&guild_id, &voice_channel_id, &meeting_id);
     let legacy_speakers_dir = layout.legacy_meeting_dir(&meeting_id).join("speakers");
-    let path = first_existing_path(speaker_audio_path_candidates(
-        &workspace.speakers_dir(),
-        &legacy_speakers_dir,
-        &speaker_id,
-    ))
-    .await
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let candidates =
+        speaker_audio_path_candidates(&workspace.speakers_dir(), &legacy_speakers_dir, &speaker_id);
+    if let Some(objects) = &state.recording_objects {
+        // Blocking HTTP probes go through the blocking pool; a slow S3 must
+        // not hold a Tokio worker for the request timeout. The whole
+        // candidate scan runs in one task, returning the first remote hit or
+        // the first probe error.
+        let probe = {
+            let objects = objects.clone();
+            let candidates = candidates.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut remote = None;
+                for candidate in &candidates {
+                    match objects.object_exists(candidate) {
+                        Ok(true) => {
+                            remote = Some(candidate.clone());
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(remote)
+            })
+            .await
+        };
+        match probe {
+            Ok(Ok(Some(remote_path))) => {
+                if let Some(url) = objects.presigned_get_for_path(&remote_path) {
+                    return Ok(Redirect::temporary(&url).into_response());
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    speaker_id = %speaker_id,
+                    error = %err,
+                    "object store probe failed; falling back to local audio file"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    speaker_id = %speaker_id,
+                    error = %join_err,
+                    "object store probe task failed; falling back to local audio file"
+                );
+            }
+        }
+    }
+    let path = first_existing_path(candidates)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {

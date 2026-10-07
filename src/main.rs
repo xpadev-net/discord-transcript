@@ -22,6 +22,7 @@ use discord_transcript::infrastructure::sql::{
 };
 use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
+use discord_transcript::infrastructure::storage_s3::RecordingObjectStore;
 use discord_transcript::interfaces::web;
 use serenity::all::{ChannelId, EditMessage};
 use serenity::http::Http;
@@ -238,9 +239,33 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
     };
 
     let summary_job_wakeups = SummaryJobWakeups::new();
+    // One store per process: web deletion endpoints and the bot's upload
+    // queue must share it so `delete_prefix` cancels in-flight uploads too.
+    let recording_objects = config
+        .chunk_storage_s3
+        .as_ref()
+        .map(|settings| {
+            RecordingObjectStore::from_settings(settings, config.chunk_storage_dir.clone()).inspect(
+                |store| {
+                    tracing::info!(
+                        bucket = %settings.bucket,
+                        endpoint = %store.store().endpoint_label(),
+                        key_prefix = %settings.key_prefix,
+                        "chunk storage backend: s3"
+                    );
+                },
+            )
+        })
+        .transpose()?;
+    // Restarting during an S3 outage drops the in-memory upload queue; put
+    // back any staged files whose remote object never made it.
+    if let Some(objects) = &recording_objects {
+        objects.reconcile_staged_uploads();
+    }
     let web_state = web::WebState::new(
         Arc::clone(&db_client),
         config.chunk_storage_dir.clone(),
+        recording_objects.clone(),
         auth,
         reqwest::Client::builder()
             .use_rustls_tls()
@@ -316,6 +341,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             summary_job_wakeups.clone(),
             Some(Arc::clone(&meeting_permission_cache)),
             Some(Arc::clone(&meeting_guild_cache)),
+            recording_objects.clone(),
         )
         .await?
         {
@@ -405,11 +431,31 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         retry_policy,
         command_timeout: DEFAULT_COMMAND_TIMEOUT,
     };
+    let recording_objects = config
+        .chunk_storage_s3
+        .as_ref()
+        .map(|settings| {
+            RecordingObjectStore::from_settings(settings, config.chunk_storage_dir.clone()).inspect(
+                |store| {
+                    tracing::info!(
+                        bucket = %settings.bucket,
+                        endpoint = %store.store().endpoint_label(),
+                        key_prefix = %settings.key_prefix,
+                        "chunk storage backend: s3"
+                    );
+                },
+            )
+        })
+        .transpose()?;
+    if let Some(objects) = &recording_objects {
+        objects.reconcile_staged_uploads();
+    }
     let options = SummaryJobOptions {
         max_retries: config.summary_max_retries,
         audio_base_dir: config.chunk_storage_dir.clone(),
         language: config.whisper_language.clone(),
         resample_to_16k: config.whisper_resample_to_16k,
+        recording_objects,
     };
     let mut idle_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
 
