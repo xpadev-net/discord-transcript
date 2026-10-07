@@ -3074,8 +3074,20 @@ fn write_mixdown_wav(
         ));
     }
 
-    let result = write_mixdown_wav_stream(path, clusters, sample_rate, out_rate, resample);
+    // Write to a sibling temp file and rename atomically so queued uploads
+    // and playback probes can never read a truncated/placeholder WAV while
+    // the mixdown is being rewritten.
+    let tmp_path = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".part");
+        path.with_file_name(name)
+    };
+    let result = write_mixdown_wav_stream(&tmp_path, clusters, sample_rate, out_rate, resample)
+        .and_then(|()| {
+            fs::rename(&tmp_path, path).map_err(|err| format!("failed to finalize mixdown: {err}"))
+        });
     if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
         let _ = fs::remove_file(path);
     }
     result

@@ -4,7 +4,6 @@ use crate::infrastructure::storage_fs::{
 };
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -209,52 +208,31 @@ impl UploadQueue {
                     settle(&task);
                     continue;
                 }
-                // File-backed tasks read their payload at upload time so
-                // large artifacts never sit in queue memory. A vanished
-                // source (e.g. staging deleted by retention) is permanent.
-                let payload = match &task.source {
-                    UploadSource::Inline(bytes) => std::borrow::Cow::Borrowed(bytes.as_slice()),
-                    UploadSource::File(path) => match std::fs::read(path) {
-                        Ok(bytes) => std::borrow::Cow::Owned(bytes),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                            warn!(
-                                key = %task.key,
-                                path = %task.path.display(),
-                                "upload source file is gone; dropping task"
-                            );
-                            settle(&task);
-                            continue;
-                        }
-                        Err(err) => {
-                            let err = format!("failed to read {}: {err}", path.display());
-                            task.attempts += 1;
-                            if disconnected {
-                                warn!(
-                                    key = %task.key,
-                                    path = %task.path.display(),
-                                    error = %err,
-                                    "recording upload failed during shutdown drain; only the local staging copy remains"
-                                );
-                                settle(&task);
-                            } else {
-                                let backoff = retry_base * (1 << task.attempts.min(5));
-                                warn!(
-                                    key = %task.key,
-                                    attempts = task.attempts,
-                                    error = %err,
-                                    "recording upload failed; retrying"
-                                );
-                                task.not_before = Instant::now() + backoff;
-                                delayed.push(task);
-                            }
-                            continue;
-                        }
-                    },
-                };
+                // File-backed tasks stream from disk at upload time so large
+                // artifacts never sit in queue memory. A vanished source
+                // (e.g. staging deleted by retention) is permanent.
+                if let UploadSource::File(path) = &task.source
+                    && !path.exists()
+                {
+                    warn!(
+                        key = %task.key,
+                        path = %task.path.display(),
+                        "upload source file is gone; dropping task"
+                    );
+                    settle(&task);
+                    continue;
+                }
                 // Mark the key in-flight so `cancel_prefix` can wait out this
                 // PUT before the caller deletes under it.
                 inflight.lock().unwrap().insert(task.key.clone());
-                let result = objects.put_object(&task.key, &payload, &task.content_type);
+                let result = match &task.source {
+                    UploadSource::Inline(bytes) => {
+                        objects.put_object(&task.key, bytes, &task.content_type)
+                    }
+                    UploadSource::File(path) => {
+                        objects.put_file(&task.key, path, &task.content_type)
+                    }
+                };
                 inflight.lock().unwrap().remove(&task.key);
                 match result {
                     Ok(()) => settle(&task),

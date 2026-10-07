@@ -8,6 +8,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
@@ -27,6 +28,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DELETE_KEYS_PER_REQUEST: usize = 1000;
 /// How much of an error response body to surface in diagnostics.
 const MAX_ERROR_BODY_CHARS: usize = 300;
+/// Files larger than this upload via multipart instead of one buffered PUT.
+const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
+/// Bytes buffered per multipart part (S3 requires >=5 MiB for all but the
+/// final part); bounds upload memory to this amount at a time.
+const MULTIPART_PART_SIZE: usize = 32 * 1024 * 1024;
 
 /// Resolved S3 settings (post env parsing). `secret_access_key` is kept out of
 /// logs and `PartialEq` is only derived for tests.
@@ -84,6 +90,15 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
 pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     /// Stores `body` under `key`, overwriting any existing object.
     fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> Result<(), S3Error>;
+
+    /// Stores the file at `path` under `key`. Backends should stream it so
+    /// arbitrarily large artifacts never sit fully in memory; the default
+    /// falls back to an in-memory `put_object`.
+    fn put_file(&self, key: &str, path: &Path, content_type: &str) -> Result<(), S3Error> {
+        let body = std::fs::read(path)
+            .map_err(|err| S3Error::Http(format!("read {}: {err}", path.display())))?;
+        self.put_object(key, &body, content_type)
+    }
 
     /// Returns whether `key` exists.
     fn head_object(&self, key: &str) -> Result<bool, S3Error>;
@@ -315,8 +330,34 @@ impl S3Client {
         content_type: Option<&str>,
         extra_headers: &[(&str, String)],
     ) -> Result<reqwest::Response, S3Error> {
-        let now = Utc::now();
         let payload_hash = sha256_hex(&body);
+        self.send_signed_body(
+            method,
+            path,
+            query,
+            reqwest::Body::from(body),
+            payload_hash,
+            content_type,
+            extra_headers,
+        )
+        .await
+    }
+
+    /// SigV4-signs a request whose body arrives as `reqwest::Body`.
+    /// `payload_hash` is the `x-amz-content-sha256` value the signature
+    /// covers (already hashed by the caller).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_signed_body(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: reqwest::Body,
+        payload_hash: String,
+        content_type: Option<&str>,
+        extra_headers: &[(&str, String)],
+    ) -> Result<reqwest::Response, S3Error> {
+        let now = Utc::now();
         let (amz_date, date_stamp) = amz_dates(now);
         let authority = self.endpoint.authority(&self.settings);
         let mut headers = vec![
@@ -372,6 +413,150 @@ impl S3Client {
             .send()
             .await
             .map_err(|err| S3Error::Http(err.to_string()))
+    }
+
+    /// Uploads `path` under `key` with bounded memory: files above
+    /// `MULTIPART_THRESHOLD` go through multipart upload, where each part is
+    /// a normal hashed PUT of at most `MULTIPART_PART_SIZE` buffered bytes
+    /// rather than the whole file at once.
+    async fn put_file_async(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<(), S3Error> {
+        let meta = std::fs::metadata(path)
+            .map_err(|err| S3Error::Http(format!("stat {}: {err}", path.display())))?;
+        if meta.len() <= MULTIPART_THRESHOLD {
+            let body = std::fs::read(path)
+                .map_err(|err| S3Error::Http(format!("read {}: {err}", path.display())))?;
+            return self.put_object_async(key, body, content_type).await;
+        }
+        let canonical = self.endpoint.canonical_path(&self.settings, key);
+        let upload_id = self.multipart_initiate(&canonical).await?;
+        match self
+            .multipart_upload_parts(&canonical, &upload_id, path)
+            .await
+        {
+            Ok(parts) => {
+                self.multipart_complete(&canonical, &upload_id, &parts)
+                    .await
+            }
+            Err(err) => {
+                // Best-effort cleanup so failed uploads do not leak storage.
+                let _ = self.multipart_abort(&canonical, &upload_id).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn multipart_initiate(&self, canonical_path: &str) -> Result<String, S3Error> {
+        let response = self
+            .signed_request(
+                reqwest::Method::POST,
+                canonical_path,
+                &[("uploads".to_owned(), String::new())],
+                Vec::new(),
+                None,
+                &[],
+            )
+            .await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| S3Error::Http(err.to_string()))?;
+        extract_xml_tag(&body, "UploadId")
+            .map(str::to_owned)
+            .ok_or_else(|| S3Error::Http("multipart initiate response missing UploadId".to_owned()))
+    }
+
+    async fn multipart_upload_parts(
+        &self,
+        canonical_path: &str,
+        upload_id: &str,
+        path: &Path,
+    ) -> Result<Vec<(u32, String)>, S3Error> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)
+            .map_err(|err| S3Error::Http(format!("open {}: {err}", path.display())))?;
+        let mut buffer = vec![0u8; MULTIPART_PART_SIZE];
+        let mut parts = Vec::new();
+        let mut part_number = 0u32;
+        loop {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match file.read(&mut buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(err) => {
+                        return Err(S3Error::Http(format!("read {}: {err}", path.display())));
+                    }
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            part_number += 1;
+            let response = self
+                .signed_request(
+                    reqwest::Method::PUT,
+                    canonical_path,
+                    &[
+                        ("partNumber".to_owned(), part_number.to_string()),
+                        ("uploadId".to_owned(), upload_id.to_owned()),
+                    ],
+                    buffer[..filled].to_vec(),
+                    None,
+                    &[],
+                )
+                .await?;
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+                .ok_or_else(|| S3Error::Http("multipart part response missing ETag".to_owned()))?;
+            parts.push((part_number, etag));
+        }
+        Ok(parts)
+    }
+
+    async fn multipart_complete(
+        &self,
+        canonical_path: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<(), S3Error> {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (number, etag) in parts {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        self.signed_request(
+            reqwest::Method::POST,
+            canonical_path,
+            &[("uploadId".to_owned(), upload_id.to_owned())],
+            xml.into_bytes(),
+            Some("application/xml"),
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn multipart_abort(&self, canonical_path: &str, upload_id: &str) -> Result<(), S3Error> {
+        self.signed_request(
+            reqwest::Method::DELETE,
+            canonical_path,
+            &[("uploadId".to_owned(), upload_id.to_owned())],
+            Vec::new(),
+            None,
+            &[],
+        )
+        .await?;
+        Ok(())
     }
 
     /// Signs and sends a request with `body`, expecting a 2xx status.
@@ -602,6 +787,13 @@ impl ObjectStore for S3Client {
         self.block_on(async move { self.put_object_async(key, body, &content_type).await })
     }
 
+    fn put_file(&self, key: &str, path: &Path, content_type: &str) -> Result<(), S3Error> {
+        let key = key.to_owned();
+        let path = path.to_path_buf();
+        let content_type = content_type.to_owned();
+        self.block_on(async move { self.put_file_async(&key, &path, &content_type).await })
+    }
+
     fn head_object(&self, key: &str) -> Result<bool, S3Error> {
         self.block_on(async move { self.head_object_async(key).await })
     }
@@ -830,6 +1022,16 @@ fn xml_unescape(value: &str) -> String {
         .replace("&apos;", "'")
         // &amp; must come last so a literal "&lt;" stays "<" text, not a tag.
         .replace("&amp;", "&")
+}
+
+/// Extracts the text of `<tag>...</tag>` from a small XML response body
+/// (multipart initiate/complete responses only).
+fn extract_xml_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].trim())
 }
 
 fn truncate_body(body: &str) -> String {
