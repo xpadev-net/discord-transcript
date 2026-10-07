@@ -589,7 +589,7 @@ impl NativeAgentSummaryClient {
                     match self.auth_file.as_deref() {
                         Some(path) => {
                             let guard = chatgpt_auth_file_guard(path, Some(auth_deadline))?;
-                            harden_auth_file_permissions(path);
+                            harden_auth_file_permissions(path)?;
                             guard
                         }
                         None => None,
@@ -1020,29 +1020,34 @@ fn chatgpt_auth_file_guard(
 /// rig persists OAuth credentials with `std::fs::write`, which keeps a
 /// pre-existing file's mode but applies the process umask on creation.
 /// Tighten an existing record to owner-only before authenticate reads and
-/// refreshes it; a missing file is left to `authenticate`'s own error.
+/// refreshes it; a missing file is left to `authenticate`'s own error. Any
+/// failure aborts authentication — continuing would let rig write fresh
+/// tokens into a file other users can still read (e.g. a group-writable
+/// host file owned by another UID).
 #[cfg(unix)]
-fn harden_auth_file_permissions(path: &Path) {
+fn harden_auth_file_permissions(path: &Path) -> Result<(), SummaryError> {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(_) => {
-            if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            {
-                tracing::warn!(
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+                summary_engine_error(format!(
                     "failed to restrict permissions on ChatGPT auth file {}: {err}",
                     path.display()
-                );
-            }
+                ))
+            })
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            tracing::warn!("failed to stat ChatGPT auth file {}: {err}", path.display())
-        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(summary_engine_error(format!(
+            "failed to stat ChatGPT auth file {}: {err}",
+            path.display()
+        ))),
     }
 }
 
 #[cfg(not(unix))]
-fn harden_auth_file_permissions(_path: &Path) {}
+fn harden_auth_file_permissions(_path: &Path) -> Result<(), SummaryError> {
+    Ok(())
+}
 
 /// "Sign in with ChatGPT" device login behind the `auth login-chatgpt`
 /// subcommand: runs the OAuth device flow interactively and persists the
