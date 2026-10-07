@@ -7,11 +7,12 @@ use discord_transcript::application::worker::{
 };
 use discord_transcript::bootstrap::config::{AppConfig, AppRole};
 use discord_transcript::domain::JobType;
+use discord_transcript::infrastructure::agent::{SummaryClientConfig, build_summary_client};
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use discord_transcript::infrastructure::integrations::{
-    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
+    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT,
 };
 use discord_transcript::infrastructure::queue::JobQueue;
 use discord_transcript::infrastructure::retry::RetryPolicy;
@@ -423,14 +424,16 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         temperature: config.whisper_temperature,
         command_timeout: DEFAULT_COMMAND_TIMEOUT,
     };
-    let summary_client = HarnessCliSummaryClient {
+    let summary_client = build_summary_client(SummaryClientConfig {
         harness: config.summary_harness,
         command_path: config.summary_command.clone(),
         model: config.summary_model.clone(),
+        provider: config.summary_provider,
+        api_key: config.summary_api_key.clone(),
         allow_unsafe_agent_harness: config.summary_allow_unsafe_agent_harness,
         retry_policy,
         command_timeout: DEFAULT_COMMAND_TIMEOUT,
-    };
+    })?;
     let recording_objects = config
         .chunk_storage_s3
         .as_ref()
