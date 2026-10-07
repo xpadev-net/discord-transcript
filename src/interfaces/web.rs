@@ -504,48 +504,75 @@ async fn persist_audit_event(
 }
 
 /// Coordinates audit-retention prune tasks so at most one prune query is in
-/// flight. A trigger arriving while a prune is running collapses into
-/// `pending` instead of being dropped, and the in-flight task runs one more
-/// prune for it before releasing the slot.
+/// flight. A trigger arriving while a prune is running collapses into the
+/// single PENDING state instead of being dropped, and the in-flight task runs
+/// one more prune for it before releasing the slot. Keeping the flag and the
+/// pending marker in one atomic closes the handoff race: a trigger that lands
+/// between the runner's last pending check and its slot release either moves
+/// the state to PENDING (runner re-runs) or observes a released slot and
+/// starts a fresh prune — it can never be recorded where no one reads it.
+const AUDIT_CLEANUP_IDLE: u8 = 0;
+const AUDIT_CLEANUP_RUNNING: u8 = 1;
+const AUDIT_CLEANUP_PENDING: u8 = 2;
+
 #[derive(Default)]
 struct AuditCleanupGate {
-    in_flight: std::sync::atomic::AtomicBool,
-    pending: std::sync::atomic::AtomicBool,
+    state: std::sync::atomic::AtomicU8,
 }
 
 impl AuditCleanupGate {
     /// Try to acquire the prune slot for a sampled trigger. Returns true when
     /// the caller owns the slot and must spawn the prune task; otherwise the
-    /// trigger is recorded in `pending` and the call returns false.
+    /// trigger is recorded in the shared state and the call returns false.
     fn try_begin(&self) -> bool {
-        if self
-            .in_flight
-            .compare_exchange(
-                false,
-                true,
+        loop {
+            match self.state.compare_exchange(
+                AUDIT_CLEANUP_IDLE,
+                AUDIT_CLEANUP_RUNNING,
+                std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            return true;
+            ) {
+                Ok(_) => return true,
+                // A runner is already committed to one more prune for the
+                // pending trigger; this trigger collapses into the same one.
+                Err(AUDIT_CLEANUP_PENDING) => return false,
+                Err(AUDIT_CLEANUP_RUNNING) => {
+                    match self.state.compare_exchange(
+                        AUDIT_CLEANUP_RUNNING,
+                        AUDIT_CLEANUP_PENDING,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    ) {
+                        Ok(_) => return false,
+                        // The state moved (to IDLE or PENDING) between the two
+                        // reads; retry the whole decision.
+                        Err(_) => continue,
+                    }
+                }
+                Err(_) => unreachable!("audit cleanup gate has only three states"),
+            }
         }
-        self.pending
-            .store(true, std::sync::atomic::Ordering::Release);
-        false
     }
 
-    /// Consume a trigger that collapsed into `pending` while a prune was in
-    /// flight.
-    fn take_pending(&self) -> bool {
-        self.pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-    }
-
-    /// Release the prune slot after the spawned task finishes.
-    fn finish(&self) {
-        self.in_flight
-            .store(false, std::sync::atomic::Ordering::Release);
+    /// Try to release the slot after a prune. Returns true when the runner is
+    /// done; false when a trigger collapsed into PENDING at the release
+    /// boundary and the runner must prune once more.
+    fn release_after_prune(&self) -> bool {
+        match self.state.compare_exchange(
+            AUDIT_CLEANUP_RUNNING,
+            AUDIT_CLEANUP_IDLE,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            // Only PENDING can make this fail: a trigger arrived before the
+            // release and claimed the rerun. Take the slot back and loop.
+            Err(_) => {
+                self.state
+                    .store(AUDIT_CLEANUP_RUNNING, std::sync::atomic::Ordering::Release);
+                false
+            }
+        }
     }
 }
 
@@ -574,8 +601,9 @@ fn spawn_audit_retention_cleanup(state: &WebState) {
 }
 
 /// Body of the spawned audit-retention prune task: prunes once, then repeats
-/// for each trigger that collapsed into `pending` while it ran, and finally
-/// releases the slot so a later trigger can start a fresh prune.
+/// for each trigger that collapsed into PENDING while it ran or at the release
+/// boundary, and finally releases the slot so a later trigger can start a
+/// fresh prune.
 async fn run_audit_retention_cleanup<F, Fut>(gate: Arc<AuditCleanupGate>, prune: F)
 where
     F: Fn() -> Fut + Send + 'static,
@@ -585,11 +613,10 @@ where
         if let Err(err) = prune().await {
             warn!(error = %err, "failed to prune stale audit events");
         }
-        if !gate.take_pending() {
+        if gate.release_after_prune() {
             break;
         }
     }
-    gate.finish();
 }
 
 fn should_sample_audit_retention_cleanup(sample: u128) -> bool {
@@ -16343,12 +16370,14 @@ mod discord_channel_full_tests {
 
         assert!(gate.try_begin());
         // A trigger while a prune is in flight does not acquire the slot but
-        // collapses into `pending` for one rerun instead of being dropped.
+        // collapses into PENDING for one rerun instead of being dropped.
         assert!(!gate.try_begin());
-        assert!(gate.take_pending());
-        assert!(!gate.take_pending());
-        gate.finish();
+        // A trigger sitting at the release boundary claims a rerun instead of
+        // being stranded behind the slot release.
+        assert!(!gate.release_after_prune());
+        assert!(gate.release_after_prune());
         assert!(gate.try_begin());
+        assert!(gate.release_after_prune());
     }
 
     #[tokio::test]
@@ -16389,7 +16418,7 @@ mod discord_channel_full_tests {
         assert_eq!(prune_calls.load(Ordering::SeqCst), 2);
         // The slot is released so a later trigger can start a fresh prune.
         assert!(gate.try_begin());
-        gate.finish();
+        assert!(gate.release_after_prune());
     }
 
     #[tokio::test]
@@ -16420,7 +16449,7 @@ mod discord_channel_full_tests {
         assert_eq!(prune_calls.load(Ordering::SeqCst), 2);
         // The slot is released even after a failed prune.
         assert!(gate.try_begin());
-        gate.finish();
+        assert!(gate.release_after_prune());
     }
 
     #[tokio::test]
