@@ -420,9 +420,31 @@ def docker_push_command_lines(job: str, start_line: int) -> list[str]:
 def ci_docker_build_commands(ci: str, start_line: int = 1) -> list[tuple[int, list[str]]]:
     commands: list[tuple[int, list[str]]] = []
     lines = ci.splitlines()
+    run_block_indent = None
 
     for offset, line in enumerate(lines):
-        first_command = workflow_shell_command(line)
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        first_command = ""
+        if run_block_indent is not None:
+            if not stripped:
+                continue
+            if indent > run_block_indent:
+                first_command = stripped
+            else:
+                run_block_indent = None
+        if run_block_indent is None:
+            first_command = workflow_shell_command(line)
+            for prefix in RUN_PREFIXES:
+                if not stripped.startswith(prefix):
+                    continue
+                header = stripped.removeprefix(prefix).strip().strip("\"'")
+                if not header or RUN_BLOCK_RE.match(header):
+                    run_block_indent = indent
+                    first_command = ""
+                break
+
         if not first_command.startswith(DOCKER_BUILD_COMMAND):
             continue
 
@@ -593,6 +615,35 @@ def self_test_docker_push_command_lines() -> None:
     )
 
 
+def self_test_ci_docker_build_commands() -> None:
+    workflow = """
+      - name: single-line pushing build
+        run: docker buildx build --push -t example/image:latest .
+      - name: inline pushing build
+        run: docker buildx build --output type=registry .
+      - run: docker buildx build --cache-to type=registry,ref=example/cache .
+      - name: block-scoped pushing build
+        run: |
+          docker buildx build \\
+            --push -t example/image:block .
+      - name: safe builds stay inert
+        run: |
+          docker buildx build --target builder .
+          docker buildx build --target production --load .
+      - name: not a build
+        run: docker buildx bake
+    """
+    commands = ci_docker_build_commands(workflow, 1)
+    pushing = [words for _, words in commands if command_pushes_image(words)]
+    assert len(commands) == 6, (
+        f"expected every buildx build to be found, including blocks: {commands}"
+    )
+    assert len(pushing) == 4, (
+        f"expected only the push/registry-output builds to be flagged: {pushing}"
+    )
+    assert not any("bake" in words for words in pushing)
+
+
 def assert_ci_runs_postgres_sql_contract_smoke() -> None:
     ci = read_repo_file(CI_WORKFLOW)
     _, rust_job = workflow_job_block(ci, "rust")
@@ -614,6 +665,7 @@ def assert_ci_runs_postgres_sql_contract_smoke() -> None:
 def main() -> None:
     self_test_command_invokes_docker_push()
     self_test_docker_push_command_lines()
+    self_test_ci_docker_build_commands()
     assert_workflow_actions_are_sha_pinned()
     assert_pr_ci_never_pushes_docker_images()
     assert_ci_runs_postgres_sql_contract_smoke()
