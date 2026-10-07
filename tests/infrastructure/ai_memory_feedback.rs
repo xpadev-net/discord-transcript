@@ -14,7 +14,8 @@ use discord_transcript::infrastructure::sql::{
     ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_PERSON_ALIAS_SQL, INCREMENTAL_MIGRATIONS_SQL,
     INSERT_AI_MEMORY_NOTE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL,
     INSERT_TRANSCRIPT_FEEDBACK_SQL,
-    LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, MIGRATIONS,
+    LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL, LIST_AI_MEMORY_NOTES_SQL,
+    LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL, MIGRATIONS,
     RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
 };
@@ -715,6 +716,7 @@ fn api_sql_resolves_exactly_one_active_tenant_guild_before_new_resource_access()
     for sql in [
         LIST_AI_MEMORY_NOTES_SQL,
         LIST_TRANSCRIPT_FEEDBACK_SQL,
+        LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL,
         LIST_PERSON_ALIASES_SQL,
     ] {
         assert!(sql.contains("WHERE tenant_id = $1"));
@@ -752,6 +754,32 @@ fn api_sql_mutations_scope_by_tenant_and_guild_and_preserve_review_state_machine
     assert!(INSERT_PERSON_ALIAS_SQL.contains("CASE WHEN $13 = 'unreviewed' THEN NULL ELSE NOW() END"));
     assert!(UPDATE_PERSON_ALIAS_SQL.contains("WHEN $9 = 'unreviewed' THEN NULL"));
     assert!(ARCHIVE_PERSON_ALIAS_SQL.contains("SET active = FALSE"));
+}
+
+#[test]
+fn list_transcript_feedback_sql_is_bounded() {
+    // The admin review queue drains open items oldest-first: an unbounded
+    // scan over accumulated feedback rows is a retrieval-cost DoS lever, a
+    // newest-first cap would let a flood of new submissions hide older
+    // unreviewed items, and a plain oldest-first cap would let reviewed
+    // history hide newer open items from unfiltered requests. Open items
+    // therefore sort ahead of the cap, FIFO within each status class.
+    assert!(LIST_TRANSCRIPT_FEEDBACK_SQL
+        .contains("ORDER BY (status = 'open') DESC, created_at ASC, id ASC"));
+    assert!(LIST_TRANSCRIPT_FEEDBACK_SQL.contains("LIMIT 1000"));
+}
+
+#[test]
+fn accepted_transcript_feedback_for_summary_sql_prioritizes_meeting_scoped_rows() {
+    // Summary context materializes accepted feedback scoped to the summarized
+    // meeting (always relevant) plus guild-wide rows as relevance candidates.
+    // Meeting-scoped rows must sort ahead of the cap so the LIMIT can never
+    // evict them; only the guild-wide candidate pool is bounded.
+    let sql = LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL;
+    assert!(sql.contains("AND status = 'accepted'"));
+    assert!(sql.contains("AND (meeting_id = $3 OR meeting_id IS NULL)"));
+    assert!(sql.contains("ORDER BY (meeting_id = $3) DESC, created_at DESC, id DESC"));
+    assert!(sql.contains("LIMIT 1000"));
 }
 
 #[test]
@@ -848,6 +876,12 @@ fn sql_store_helpers_cover_ai_memory_feedback_status_and_person_aliases() {
             "accepted",
             Some("2026-06-04T01:05:03.000Z"),
         )],
+    );
+    executor.query_rows_result.insert(
+        format!(
+            "{LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL}|tenant-1\u{1f}guild-1\u{1f}meeting-1"
+        ),
+        vec![feedback_row("fb-1", "accepted")],
     );
     let mut store = SqlMeetingStore::new(executor);
 
@@ -981,4 +1015,14 @@ fn sql_store_helpers_cover_ai_memory_feedback_status_and_person_aliases() {
         .expect("alias row should exist");
     assert!(!archived_alias.active);
     assert!(archived_alias.archived_at.is_some());
+
+    let summary_feedback = store
+        .list_accepted_transcript_feedback_for_summary("tenant-1", "guild-1", "meeting-1")
+        .expect("summary feedback list should parse");
+    assert_eq!(summary_feedback.len(), 1);
+    assert_eq!(summary_feedback[0].id, "fb-1");
+    assert_eq!(
+        summary_feedback[0].status,
+        TranscriptFeedbackStatus::Accepted
+    );
 }

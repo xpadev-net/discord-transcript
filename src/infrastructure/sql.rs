@@ -2573,6 +2573,9 @@ RETURNING id,
           archived_actor_user_id
 "#;
 
+// The admin review queue is drained FIFO: ordering oldest-first keeps the
+// longest-waiting items visible, so the cap can only hide newer submissions,
+// which surface automatically as reviewers process the queue.
 pub const LIST_TRANSCRIPT_FEEDBACK_SQL: &str = r#"
 SELECT id,
        tenant_discord_guild_id,
@@ -2599,7 +2602,43 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND (NULLIF($3, '') IS NULL OR status = $3)
   AND (NULLIF($4, '') IS NULL OR feedback_type = $4)
-ORDER BY created_at DESC, id DESC
+ORDER BY (status = 'open') DESC, created_at ASC, id ASC
+LIMIT 1000
+"#;
+
+// Accepted feedback materialized into summary context. Rows scoped to the
+// summarized meeting always match the relevance check in
+// `ContextRelevanceEvidence::matches_feedback`, so they order first and the
+// LIMIT cannot evict them; guild-wide (meeting_id IS NULL) rows are only
+// relevance candidates and fill the remaining slots newest-first.
+pub const LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL: &str = r#"
+SELECT id,
+       tenant_discord_guild_id,
+       tenant_id,
+       guild_id,
+       meeting_id,
+       transcript_segment_id,
+       feedback_type,
+       term_type,
+       original_text,
+       corrected_text,
+       speaker_id,
+       corrected_speaker_id,
+       note,
+       target_domain_knowledge_id,
+       target_ai_memory_note_id,
+       actor_user_id,
+       status,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+       reviewed_actor_user_id
+FROM transcript_feedback
+WHERE tenant_id = $1
+  AND guild_id = $2
+  AND status = 'accepted'
+  AND (meeting_id = $3 OR meeting_id IS NULL)
+ORDER BY (meeting_id = $3) DESC, created_at DESC, id DESC
+LIMIT 1000
 "#;
 
 pub const INSERT_TRANSCRIPT_FEEDBACK_SQL: &str = r#"

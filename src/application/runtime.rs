@@ -30,7 +30,6 @@ use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness};
 use crate::domain::authz::{
     MemberRoleSource, RbacPermission, RbacSubject, UserRole, resolve_rbac_permission,
 };
-use crate::domain::feedback::TranscriptFeedbackStatus;
 use crate::domain::person_alias::PersonAliasReviewStatus;
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
@@ -3459,11 +3458,10 @@ fn load_runtime_summary_context(
                     ))
                 })?,
             store
-                .list_transcript_feedback(
+                .list_accepted_transcript_feedback_for_summary(
                     &tenant.tenant_id,
                     guild_id,
-                    Some(TranscriptFeedbackStatus::Accepted),
-                    None,
+                    meeting_id,
                 )
                 .map_err(|err| {
                     crate::application::summary::SummaryError::SummaryEngine(format!(
