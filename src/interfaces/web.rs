@@ -384,6 +384,11 @@ pub struct WebState {
     membership_reverify_inflight: MembershipReverifyInflight,
     audio_range_limiter: Arc<Mutex<AudioRangeRateLimiter>>,
     transcript_sse_limiter: TranscriptSseLimiter,
+    /// Ensures at most one audit-retention prune query is in flight; without
+    /// it every sampled audit write can enqueue an unbounded backlog of
+    /// detached DB tasks. Triggers arriving while a prune runs collapse into
+    /// a pending rerun instead of being dropped.
+    audit_cleanup_gate: Arc<AuditCleanupGate>,
     pub static_files_dir: String,
     /// Default guild settings used when a guild has no custom settings
     pub guild_settings_defaults: Arc<GuildSettingsDefaults>,
@@ -420,6 +425,7 @@ impl WebState {
             membership_reverify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             audio_range_limiter: Arc::new(Mutex::new(AudioRangeRateLimiter::default())),
             transcript_sse_limiter: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            audit_cleanup_gate: Arc::new(AuditCleanupGate::default()),
             static_files_dir,
             guild_settings_defaults: Arc::new(guild_settings_defaults),
             summary_job_wakeups,
@@ -497,16 +503,120 @@ async fn persist_audit_event(
     Ok(())
 }
 
+/// Coordinates audit-retention prune tasks so at most one prune query is in
+/// flight. A trigger arriving while a prune is running collapses into the
+/// single PENDING state instead of being dropped, and the in-flight task runs
+/// one more prune for it before releasing the slot. Keeping the flag and the
+/// pending marker in one atomic closes the handoff race: a trigger that lands
+/// between the runner's last pending check and its slot release either moves
+/// the state to PENDING (runner re-runs) or observes a released slot and
+/// starts a fresh prune — it can never be recorded where no one reads it.
+const AUDIT_CLEANUP_IDLE: u8 = 0;
+const AUDIT_CLEANUP_RUNNING: u8 = 1;
+const AUDIT_CLEANUP_PENDING: u8 = 2;
+
+#[derive(Default)]
+struct AuditCleanupGate {
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl AuditCleanupGate {
+    /// Try to acquire the prune slot for a sampled trigger. Returns true when
+    /// the caller owns the slot and must spawn the prune task; otherwise the
+    /// trigger is recorded in the shared state and the call returns false.
+    fn try_begin(&self) -> bool {
+        loop {
+            match self.state.compare_exchange(
+                AUDIT_CLEANUP_IDLE,
+                AUDIT_CLEANUP_RUNNING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                // A runner is already committed to one more prune for the
+                // pending trigger; this trigger collapses into the same one.
+                Err(AUDIT_CLEANUP_PENDING) => return false,
+                Err(AUDIT_CLEANUP_RUNNING) => {
+                    match self.state.compare_exchange(
+                        AUDIT_CLEANUP_RUNNING,
+                        AUDIT_CLEANUP_PENDING,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    ) {
+                        Ok(_) => return false,
+                        // The state moved (to IDLE or PENDING) between the two
+                        // reads; retry the whole decision.
+                        Err(_) => continue,
+                    }
+                }
+                Err(_) => unreachable!("audit cleanup gate has only three states"),
+            }
+        }
+    }
+
+    /// Try to release the slot after a prune. Returns true when the runner is
+    /// done; false when a trigger collapsed into PENDING at the release
+    /// boundary and the runner must prune once more.
+    fn release_after_prune(&self) -> bool {
+        match self.state.compare_exchange(
+            AUDIT_CLEANUP_RUNNING,
+            AUDIT_CLEANUP_IDLE,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            // Only PENDING can make this fail: a trigger arrived before the
+            // release and claimed the rerun. Take the slot back and loop.
+            Err(_) => {
+                self.state
+                    .store(AUDIT_CLEANUP_RUNNING, std::sync::atomic::Ordering::Release);
+                false
+            }
+        }
+    }
+}
+
 fn spawn_audit_retention_cleanup(state: &WebState) {
     if !should_sample_audit_retention_cleanup(Uuid::new_v4().as_u128()) {
         return;
     }
-    let state = state.clone();
-    tokio::spawn(async move {
-        if let Err(err) = state.db.execute(PRUNE_STALE_AUDIT_EVENTS_SQL, &[]).await {
+    // Cap the backlog at one in-flight prune: an authorized member can
+    // trigger audit writes (and therefore sampled cleanups) as fast as they
+    // can send requests, so without this gate the detached tasks accumulate
+    // unboundedly against the DB.
+    if !state.audit_cleanup_gate.try_begin() {
+        return;
+    }
+    let gate = state.audit_cleanup_gate.clone();
+    let db = state.db.clone();
+    tokio::spawn(run_audit_retention_cleanup(gate, move || {
+        let db = db.clone();
+        async move {
+            db.execute(PRUNE_STALE_AUDIT_EVENTS_SQL, &[])
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
+    }));
+}
+
+/// Body of the spawned audit-retention prune task: prunes once, then repeats
+/// for each trigger that collapsed into PENDING while it ran or at the release
+/// boundary, and finally releases the slot so a later trigger can start a
+/// fresh prune.
+async fn run_audit_retention_cleanup<F, Fut>(gate: Arc<AuditCleanupGate>, prune: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    loop {
+        if let Err(err) = prune().await {
             warn!(error = %err, "failed to prune stale audit events");
         }
-    });
+        if gate.release_after_prune() {
+            break;
+        }
+    }
 }
 
 fn should_sample_audit_retention_cleanup(sample: u128) -> bool {
@@ -16307,6 +16417,94 @@ mod discord_channel_full_tests {
         assert!(!should_sample_audit_retention_cleanup(
             reachable_multiple + 1
         ));
+    }
+
+    #[test]
+    fn audit_retention_cleanup_slot_allows_only_one_in_flight() {
+        let gate = super::AuditCleanupGate::default();
+
+        assert!(gate.try_begin());
+        // A trigger while a prune is in flight does not acquire the slot but
+        // collapses into PENDING for one rerun instead of being dropped.
+        assert!(!gate.try_begin());
+        // A trigger sitting at the release boundary claims a rerun instead of
+        // being stranded behind the slot release.
+        assert!(!gate.release_after_prune());
+        assert!(gate.release_after_prune());
+        assert!(gate.try_begin());
+        assert!(gate.release_after_prune());
+    }
+
+    #[tokio::test]
+    async fn audit_retention_cleanup_collapses_triggers_into_one_extra_prune() {
+        let gate = Arc::new(super::AuditCleanupGate::default());
+        let prune_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_prune_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first_prune = Arc::new(tokio::sync::Notify::new());
+
+        assert!(gate.try_begin());
+        let runner = tokio::spawn(super::run_audit_retention_cleanup(gate.clone(), {
+            let prune_calls = prune_calls.clone();
+            let first_prune_entered = first_prune_entered.clone();
+            let release_first_prune = release_first_prune.clone();
+            move || {
+                let prune_calls = prune_calls.clone();
+                let first_prune_entered = first_prune_entered.clone();
+                let release_first_prune = release_first_prune.clone();
+                async move {
+                    if prune_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        first_prune_entered.notify_one();
+                        release_first_prune.notified().await;
+                    }
+                    Ok(())
+                }
+            }
+        }));
+
+        // Wait until the spawned task is inside the first prune, then fire
+        // several triggers: all of them collapse into a single extra prune.
+        first_prune_entered.notified().await;
+        assert!(!gate.try_begin());
+        assert!(!gate.try_begin());
+        assert!(!gate.try_begin());
+        release_first_prune.notify_one();
+
+        runner.await.expect("cleanup task panicked");
+        assert_eq!(prune_calls.load(Ordering::SeqCst), 2);
+        // The slot is released so a later trigger can start a fresh prune.
+        assert!(gate.try_begin());
+        assert!(gate.release_after_prune());
+    }
+
+    #[tokio::test]
+    async fn audit_retention_cleanup_runs_pending_prune_after_failure() {
+        let gate = Arc::new(super::AuditCleanupGate::default());
+        let prune_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(gate.try_begin());
+        super::run_audit_retention_cleanup(gate.clone(), {
+            let gate = gate.clone();
+            let prune_calls = prune_calls.clone();
+            move || {
+                let gate = gate.clone();
+                let prune_calls = prune_calls.clone();
+                async move {
+                    if prune_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A trigger arriving mid-prune collapses into pending
+                        // and must be retried even when this prune failed.
+                        assert!(!gate.try_begin());
+                        return Err("prune failed".to_owned());
+                    }
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(prune_calls.load(Ordering::SeqCst), 2);
+        // The slot is released even after a failed prune.
+        assert!(gate.try_begin());
+        assert!(gate.release_after_prune());
     }
 
     #[tokio::test]
