@@ -3,7 +3,7 @@ use crate::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -22,15 +22,28 @@ use tracing::warn;
 /// get backpressure (`save_chunk` then reports `Remote` so the session's
 /// pending-chunk retry kicks in).
 const UPLOAD_QUEUE_BOUND: usize = 64;
-/// Total bytes the queue (channel + delayed retries) may hold; WAV payloads
-/// ride in the tasks, so task-count alone cannot bound memory. Producers
-/// exceeding the cap get `Remote` backpressure exactly like a full channel.
+/// Total inline bytes the queue (channel + delayed retries) may hold.
+/// Recording chunks carry their payload in the task so `save_chunk` keeps
+/// its Remote-on-saturation semantics; file-backed tasks only hold a path
+/// and are read by the worker at PUT time, so arbitrarily large playback
+/// files never count against — or get rejected by — this cap.
 const UPLOAD_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+/// How long `cancel_prefix` waits for an in-flight PUT under the prefix
+/// before giving up (the S3 request timeout bounds a single PUT at 60s).
+const CANCEL_INFLIGHT_WAIT: Duration = Duration::from_secs(65);
+
+/// Task payload: chunk/audio bytes already in memory, or a file the worker
+/// reads lazily (so large artifacts never sit in queue memory).
+#[derive(Debug)]
+enum UploadSource {
+    Inline(Vec<u8>),
+    File(PathBuf),
+}
 
 #[derive(Debug)]
 struct UploadTask {
     key: String,
-    bytes: Vec<u8>,
+    source: UploadSource,
     content_type: String,
     path: PathBuf,
     /// Monotonic enqueue order — a task is skipped when a newer write for the
@@ -38,6 +51,17 @@ struct UploadTask {
     generation: u64,
     attempts: u32,
     not_before: Instant,
+}
+
+impl UploadTask {
+    /// Bytes counted against `UPLOAD_MAX_PENDING_BYTES` — only inline
+    /// payloads occupy queue memory.
+    fn counted_bytes(&self) -> usize {
+        match &self.source {
+            UploadSource::Inline(bytes) => bytes.len(),
+            UploadSource::File(_) => 0,
+        }
+    }
 }
 
 /// Single worker thread draining queued PUTs so object writes never run on
@@ -59,11 +83,18 @@ struct UploadQueue {
     worker: Option<std::thread::JoinHandle<()>>,
     /// Tasks in flight or waiting; test-only drain signal.
     pending: Arc<AtomicUsize>,
-    /// Bytes held by queued + delayed tasks; bounds total memory.
+    /// Inline bytes held by queued + delayed tasks; bounds total memory.
     pending_bytes: Arc<AtomicUsize>,
     /// Latest generation enqueued per key — supersedes older queued writes.
     latest_generations: Arc<Mutex<HashMap<String, u64>>>,
     next_generation: AtomicU64,
+    /// Object prefixes permanently cancelled by `delete_prefix`: matching
+    /// queued tasks are skipped and new enqueues rejected, so a retried
+    /// upload can never recreate a deleted recording.
+    cancelled_prefixes: Arc<Mutex<Vec<String>>>,
+    /// Keys currently mid-PUT — `cancel_prefix` waits for these to finish
+    /// before the caller deletes, keeping delete-after-upload ordering.
+    inflight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl UploadQueue {
@@ -72,9 +103,13 @@ impl UploadQueue {
         let pending = Arc::new(AtomicUsize::new(0));
         let pending_bytes = Arc::new(AtomicUsize::new(0));
         let latest = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::<String>::new()));
+        let inflight = Arc::new(Mutex::new(HashSet::<String>::new()));
         let worker_pending = Arc::clone(&pending);
         let worker_bytes = Arc::clone(&pending_bytes);
         let worker_latest = Arc::clone(&latest);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_inflight = Arc::clone(&inflight);
         let worker = std::thread::Builder::new()
             .name("s3-upload".to_owned())
             .spawn(move || {
@@ -84,6 +119,8 @@ impl UploadQueue {
                     worker_pending,
                     worker_bytes,
                     worker_latest,
+                    worker_cancelled,
+                    worker_inflight,
                     retry_base,
                 )
             })
@@ -95,26 +132,38 @@ impl UploadQueue {
             pending_bytes,
             latest_generations: latest,
             next_generation: AtomicU64::new(0),
+            cancelled_prefixes: cancelled,
+            inflight,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn worker(
         receiver: Receiver<UploadTask>,
         objects: Arc<dyn ObjectStore>,
         pending: Arc<AtomicUsize>,
         pending_bytes: Arc<AtomicUsize>,
         latest: Arc<Mutex<HashMap<String, u64>>>,
+        cancelled: Arc<Mutex<Vec<String>>>,
+        inflight: Arc<Mutex<HashSet<String>>>,
         retry_base: Duration,
     ) {
         // A task counts down pending/pending_bytes exactly once, whichever way
-        // it leaves: delivered, superseded, or abandoned during drain.
+        // it leaves: delivered, superseded, cancelled, or abandoned in drain.
         let settle = |task: &UploadTask| {
             pending.fetch_sub(1, Ordering::SeqCst);
-            pending_bytes.fetch_sub(task.bytes.len(), Ordering::SeqCst);
+            pending_bytes.fetch_sub(task.counted_bytes(), Ordering::SeqCst);
             let mut latest = latest.lock().unwrap();
             if latest.get(&task.key) == Some(&task.generation) {
                 latest.remove(&task.key);
             }
+        };
+        let is_cancelled = |key: &str| {
+            cancelled
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|prefix| key.starts_with(prefix.as_str()))
         };
         let mut delayed: Vec<UploadTask> = Vec::new();
         let mut disconnected = false;
@@ -156,11 +205,58 @@ impl UploadQueue {
                     .unwrap()
                     .get(&task.key)
                     .is_some_and(|latest_gen| *latest_gen > task.generation);
-                if superseded {
+                if superseded || is_cancelled(&task.key) {
                     settle(&task);
                     continue;
                 }
-                match objects.put_object(&task.key, &task.bytes, &task.content_type) {
+                // File-backed tasks read their payload at upload time so
+                // large artifacts never sit in queue memory. A vanished
+                // source (e.g. staging deleted by retention) is permanent.
+                let payload = match &task.source {
+                    UploadSource::Inline(bytes) => std::borrow::Cow::Borrowed(bytes.as_slice()),
+                    UploadSource::File(path) => match std::fs::read(path) {
+                        Ok(bytes) => std::borrow::Cow::Owned(bytes),
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            warn!(
+                                key = %task.key,
+                                path = %task.path.display(),
+                                "upload source file is gone; dropping task"
+                            );
+                            settle(&task);
+                            continue;
+                        }
+                        Err(err) => {
+                            let err = format!("failed to read {}: {err}", path.display());
+                            task.attempts += 1;
+                            if disconnected {
+                                warn!(
+                                    key = %task.key,
+                                    path = %task.path.display(),
+                                    error = %err,
+                                    "recording upload failed during shutdown drain; only the local staging copy remains"
+                                );
+                                settle(&task);
+                            } else {
+                                let backoff = retry_base * (1 << task.attempts.min(5));
+                                warn!(
+                                    key = %task.key,
+                                    attempts = task.attempts,
+                                    error = %err,
+                                    "recording upload failed; retrying"
+                                );
+                                task.not_before = Instant::now() + backoff;
+                                delayed.push(task);
+                            }
+                            continue;
+                        }
+                    },
+                };
+                // Mark the key in-flight so `cancel_prefix` can wait out this
+                // PUT before the caller deletes under it.
+                inflight.lock().unwrap().insert(task.key.clone());
+                let result = objects.put_object(&task.key, &payload, &task.content_type);
+                inflight.lock().unwrap().remove(&task.key);
+                match result {
                     Ok(()) => settle(&task),
                     Err(err) => {
                         task.attempts += 1;
@@ -190,6 +286,35 @@ impl UploadQueue {
         }
     }
 
+    /// Tombstones `prefix`: queued tasks under it are skipped at process
+    /// time, future enqueues are rejected, and this call waits for any
+    /// currently-executing PUT under the prefix to finish so a subsequent
+    /// object delete cannot be undone by an upload already in flight.
+    /// Waits at most `CANCEL_INFLIGHT_WAIT`.
+    fn cancel_prefix(&self, prefix: &str) {
+        self.cancelled_prefixes
+            .lock()
+            .unwrap()
+            .push(prefix.to_owned());
+        let deadline = Instant::now() + CANCEL_INFLIGHT_WAIT;
+        while Instant::now() < deadline {
+            let active = self
+                .inflight
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|key| key.starts_with(prefix));
+            if !active {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        warn!(
+            prefix = %prefix,
+            "timed out waiting for in-flight uploads to drain before delete"
+        );
+    }
+
     /// Undoes the accounting and the generation marker for a task that never
     /// reached the channel, so it cannot supersede an earlier queued write
     /// for the same key.
@@ -203,7 +328,16 @@ impl UploadQueue {
 
     /// Enqueues a PUT without blocking the caller.
     fn enqueue(&self, mut task: UploadTask) -> Result<(), String> {
-        let size = task.bytes.len();
+        if self
+            .cancelled_prefixes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prefix| task.key.starts_with(prefix.as_str()))
+        {
+            return Err("recording upload cancelled for deleted prefix".to_owned());
+        }
+        let size = task.counted_bytes();
         let used = self.pending_bytes.fetch_add(size, Ordering::SeqCst) + size;
         if used > UPLOAD_MAX_PENDING_BYTES {
             self.pending_bytes.fetch_sub(size, Ordering::SeqCst);
@@ -354,7 +488,7 @@ impl RecordingObjectStore {
         };
         self.uploads.enqueue(UploadTask {
             key,
-            bytes: bytes.to_vec(),
+            source: UploadSource::Inline(bytes.to_vec()),
             content_type: content_type.to_owned(),
             path: path.to_path_buf(),
             generation: 0, // assigned by `enqueue`
@@ -363,22 +497,34 @@ impl RecordingObjectStore {
         })
     }
 
-    /// Reads `path` and uploads it under its mirrored key. Missing files are
-    /// reported as `Ok(false)` so callers can treat them as already deleted.
+    /// Queues `path` for upload under its mirrored key; the worker reads the
+    /// file at PUT time so arbitrarily large playback files never occupy
+    /// queue memory or trip the inline byte cap. Missing files are reported
+    /// as `Ok(false)` so callers can treat them as already deleted.
     pub fn upload_file(&self, path: &Path, content_type: &str) -> Result<bool, String> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => {
-                return Err(format!("failed to read {}: {err}", path.display()));
-            }
+        let Some(key) = self.object_key(path) else {
+            return Ok(false);
         };
-        self.put_bytes(path, &bytes, content_type)?;
+        if !path.is_file() {
+            return Ok(false);
+        }
+        self.uploads.enqueue(UploadTask {
+            key,
+            source: UploadSource::File(path.to_path_buf()),
+            content_type: content_type.to_owned(),
+            path: path.to_path_buf(),
+            generation: 0, // assigned by `enqueue`
+            attempts: 0,
+            not_before: Instant::now(),
+        })?;
         Ok(true)
     }
 
     /// Deletes every object under `prefix` (a meeting's whole object tree).
+    /// Pending and in-flight uploads under the prefix are cancelled first so
+    /// a retried PUT cannot recreate deleted recordings.
     pub fn delete_prefix(&self, prefix: &str) -> Result<(), S3Error> {
+        self.uploads.cancel_prefix(prefix);
         let keys = self.objects.list_keys(prefix)?;
         self.objects.delete_keys(&keys)
     }
@@ -692,6 +838,80 @@ mod tests {
         assert_eq!(puts.len(), 1);
         assert_eq!(puts[0].1, b"wav-data");
         assert!(saved.path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `delete_prefix` must stop queued retries from recreating the deleted
+    /// recording, and reject uploads enqueued afterwards for that prefix.
+    #[test]
+    fn delete_prefix_cancels_queued_uploads_and_rejects_new_ones() {
+        let base = temp_dir("cancel");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.fail_puts.lock().unwrap() = true;
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(1),
+        );
+        let storage = MeetingChunkStorage::new(layout_meeting(&base), "m1", Some(objects.clone()));
+
+        storage
+            .save_chunk("m1", "u1", 1, 0, b"wav-data")
+            .expect("save should enqueue");
+        // Let the task attempt once so it is parked in the delayed queue.
+        for _ in 0..200 {
+            if *fake.attempts.lock().unwrap() >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        objects
+            .delete_prefix("workspaces/")
+            .expect("prefix delete should succeed");
+        objects.wait_uploads_idle();
+
+        assert!(
+            fake.puts.lock().unwrap().is_empty(),
+            "a cancelled task must never be uploaded"
+        );
+        let later = base.join("workspaces/g/vc/m/later.json");
+        std::fs::create_dir_all(later.parent().unwrap()).unwrap();
+        assert!(
+            objects
+                .put_bytes(&later, b"{}", "application/json")
+                .is_err(),
+            "enqueues under a deleted prefix are rejected"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `upload_file` defers the read to the worker, so large artifacts queue
+    /// without occupying memory and are uploaded with their current bytes.
+    #[test]
+    fn upload_file_reads_payload_at_upload_time() {
+        let base = temp_dir("upload_file");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let wav = base.join("workspaces/g/vc/m/audio/mixdown.wav");
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        std::fs::write(&wav, vec![7u8; 4096]).unwrap();
+
+        assert!(objects.upload_file(&wav, "audio/wav").unwrap());
+        objects.wait_uploads_idle();
+
+        let puts = fake.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, "workspaces/g/vc/m/audio/mixdown.wav");
+        assert_eq!(puts[0].1, vec![7u8; 4096]);
+        assert!(
+            !objects
+                .upload_file(&base.join("workspaces/g/vc/m/audio/none.wav"), "audio/wav")
+                .unwrap()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
