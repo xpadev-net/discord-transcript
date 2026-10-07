@@ -13,12 +13,11 @@
 //! static `CHATGPT_ACCESS_TOKEN`, or the OAuth credential file written by
 //! `auth login-chatgpt` at `CHATGPT_AUTH_FILE`, refreshed on use).
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rig_agent::{Agent, AgentBuilder};
@@ -581,13 +580,14 @@ impl NativeAgentSummaryClient {
                 // refresh if expired) over HTTP, so it is async; summarize()
                 // runs synchronously, so drive it through the shared helper.
                 // Serialize credential reads/refreshes on the shared auth
-                // file across concurrent summary jobs in this process — rig's
-                // internal mutex only covers clones of one authenticator, and
-                // each job builds its own.
-                let auth_lock = self.auth_file.as_deref().map(chatgpt_auth_file_lock);
-                let _guard = auth_lock
-                    .as_ref()
-                    .map(|lock| lock.lock().unwrap_or_else(|err| err.into_inner()));
+                // file across jobs — rig's internal mutex only covers clones
+                // of one authenticator, and each job builds its own.
+                let _guard = self
+                    .auth_file
+                    .as_deref()
+                    .map(chatgpt_auth_file_guard)
+                    .transpose()?
+                    .flatten();
                 if let Some(path) = self.auth_file.as_deref() {
                     harden_auth_file_permissions(path);
                 }
@@ -919,19 +919,64 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
     }
 }
 
-/// Per-file lock registry for [`NativeAgentSummaryClient`]'s ChatGPT OAuth
-/// path. Each summary job builds a fresh authenticator, so rig's own
-/// refresh mutex (shared only between clones of one authenticator) cannot
-/// serialize concurrent refreshes of the same credential file.
-fn chatgpt_auth_file_lock(path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .entry(path.to_path_buf())
-        .or_default()
-        .clone()
+/// Open `path` owner-only: create it (with parent directories) at mode
+/// 0600 when absent — reporting `created` — or tighten an existing file to
+/// 0600. Errors are propagated so credential setup never falls back to a
+/// group/world-readable file.
+#[cfg(unix)]
+fn open_private_record(path: &Path) -> Result<(fs::File, bool), std::io::Error> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok((file, false))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Exclusive OS-level lock on `<auth_file>.lock`, held while the credential
+/// record is read, refreshed, and rewritten. `flock` attaches to the open
+/// file description, so distinct opens serialize both threads in this
+/// worker and separate processes sharing the same `CHATGPT_AUTH_FILE`
+/// (rig's own refresh mutex only spans clones of one authenticator, and a
+/// torn `fs::write` in another process could otherwise be read here).
+/// The returned `File` is the guard: dropping it releases the lock.
+#[cfg(unix)]
+fn chatgpt_auth_file_guard(path: &Path) -> Result<Option<fs::File>, SummaryError> {
+    use std::os::unix::io::AsRawFd;
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let (file, _) = open_private_record(&lock_path).map_err(|err| {
+        summary_engine_error(format!(
+            "failed to prepare ChatGPT auth lock {}: {err}",
+            lock_path.display()
+        ))
+    })?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(summary_engine_error(format!(
+            "failed to lock ChatGPT auth file {}: {}",
+            lock_path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(unix))]
+fn chatgpt_auth_file_guard(_path: &Path) -> Result<Option<fs::File>, SummaryError> {
+    Ok(None)
 }
 
 /// rig persists OAuth credentials with `std::fs::write`, which keeps a
@@ -965,22 +1010,24 @@ fn harden_auth_file_permissions(_path: &Path) {}
 /// subcommand: runs the OAuth device flow interactively and persists the
 /// credential record to `auth_file`, where `SUMMARY_PROVIDER=chatgpt` picks
 /// it up (and refreshes it) on every summary run.
-pub async fn chatgpt_device_login(
-    auth_file: PathBuf,
-) -> Result<(), Box<rig_core::providers::chatgpt::auth::AuthError>> {
-    // rig writes the record with `std::fs::write` under the process umask —
-    // pre-create it owner-only so tokens never sit in a group/world-readable
-    // file, and tighten an existing file the same way.
+pub async fn chatgpt_device_login(auth_file: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize against concurrent logins/summary refreshes before touching
+    // the record (see chatgpt_auth_file_guard).
+    let _guard = chatgpt_auth_file_guard(&auth_file)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
+    // rig persists the record with `std::fs::write` under the process umask
+    // and deserializes any existing file — pre-create it owner-only and
+    // seed a fresh file with `{}` (rig's AuthRecord is all-optional), so a
+    // first-time login reaches the device prompt instead of dying on an
+    // empty-file JSON error. Errors propagate: never let tokens land in a
+    // group/world-readable file.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&auth_file);
-        harden_auth_file_permissions(&auth_file);
+        let (mut file, created) = open_private_record(&auth_file)?;
+        if created {
+            file.write_all(b"{}")?;
+            file.sync_all()?;
+        }
     }
     let authenticator = Authenticator::new(
         AuthSource::OAuth,
@@ -997,7 +1044,7 @@ pub async fn chatgpt_device_login(
         .client()
         .authenticate(&authenticator)
         .await
-        .map_err(Box::new)?;
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
     println!("ChatGPT credentials saved to {}", auth_file.display());
     Ok(())
 }
