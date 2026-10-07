@@ -723,37 +723,31 @@ fn resolve_summary_settings(
 }
 
 /// Resolve `SUMMARY_PROVIDER` / the provider credential for the native
-/// harness. Strict only when the role actually runs summaries: the native
-/// harness requires a provider and (per provider) an API key. Every other
-/// harness ignores both settings entirely — an unrelated or even invalid
-/// `SUMMARY_PROVIDER` value must not stop a CLI-harness deployment from
-/// booting.
+/// harness. Strict only when the role actually runs summaries: then the
+/// native harness requires a provider and (per provider) an API key. Any
+/// other state — CLI harnesses, roles that never run summaries, or
+/// `SUMMARY_ENABLED=false` — ignores both settings entirely so a stray or
+/// invalid value cannot stop the process from booting.
 fn resolve_summary_provider(
     summary_runtime_enabled: bool,
     harness: SummaryHarness,
     provider: Option<String>,
     api_key: Option<String>,
 ) -> Result<(Option<SummaryProvider>, Option<String>), ConfigError> {
-    match harness {
-        SummaryHarness::Native => {
-            let provider = provider
-                .map(|value| SummaryProvider::parse(&value))
-                .transpose()?;
-            if !summary_runtime_enabled {
-                return Ok((provider, api_key));
-            }
-            let provider = provider.ok_or(ConfigError::MissingEnv {
-                key: "SUMMARY_PROVIDER",
-            })?;
-            let api_key = api_key.filter(|value| !value.trim().is_empty()).ok_or(
-                ConfigError::MissingEnv {
-                    key: provider.api_key_env(),
-                },
-            )?;
-            Ok((Some(provider), Some(api_key)))
-        }
-        _ => Ok((None, None)),
+    if harness != SummaryHarness::Native || !summary_runtime_enabled {
+        return Ok((None, None));
     }
+    let provider = provider.ok_or(ConfigError::MissingEnv {
+        key: "SUMMARY_PROVIDER",
+    })?;
+    let provider = SummaryProvider::parse(&provider)?;
+    let api_key =
+        api_key
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingEnv {
+                key: provider.api_key_env(),
+            })?;
+    Ok((Some(provider), Some(api_key)))
 }
 
 fn disabled_summary_settings(

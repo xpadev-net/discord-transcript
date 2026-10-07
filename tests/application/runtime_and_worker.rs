@@ -2022,6 +2022,33 @@ fn app_config_native_rejects_invalid_provider() {
 }
 
 #[test]
+fn app_config_native_summary_disabled_ignores_provider() {
+    // Provider settings never run when summaries are disabled, so even an
+    // invalid value must not stop startup.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_web_bot_role_ignores_summary_provider() {
+    // A role that never runs summaries must boot past provider settings.
+    let mut values = base_env();
+    values.insert("APP_ROLE".to_owned(), "web-bot".to_owned());
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
 fn app_config_cursor_agent_requires_summary_command_even_if_claude_set() {
     let mut values = base_env();
     values.insert("SUMMARY_HARNESS".to_owned(), "cursor_agent".to_owned());
