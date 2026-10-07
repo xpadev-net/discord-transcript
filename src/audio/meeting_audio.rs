@@ -404,17 +404,39 @@ fn load_ssrc_mapping(meeting_dir: &Path) -> HashMap<String, String> {
     lookup
 }
 
+/// Directory under the audio dir that holds complete per-speaker playback
+/// wavs (served by the speaker playback API).
+const SPEAKER_PLAYBACK_DIR: &str = "speakers";
+/// Directory that holds partial per-speaker wavs used only as transcription
+/// inputs once live transcription already covered some chunks — kept out of
+/// `speakers/` so partial audio never clobbers the playback copy.
+const SPEAKER_TRANSCRIPTION_DIR: &str = "transcription_speakers";
+
 pub fn build_speaker_audio_inputs(
     meeting_dir: &Path,
     resample_to_16k: bool,
 ) -> Result<Vec<SpeakerAudioInput>, String> {
-    build_speaker_audio_inputs_excluding_processed_chunks(meeting_dir, resample_to_16k, &[])
+    build_speaker_audio_inputs_with_dir(meeting_dir, resample_to_16k, &[], SPEAKER_PLAYBACK_DIR)
 }
 
 pub fn build_speaker_audio_inputs_excluding_processed_chunks(
     meeting_dir: &Path,
     resample_to_16k: bool,
     processed_chunks: &[ProcessedAudioChunk],
+) -> Result<Vec<SpeakerAudioInput>, String> {
+    build_speaker_audio_inputs_with_dir(
+        meeting_dir,
+        resample_to_16k,
+        processed_chunks,
+        SPEAKER_TRANSCRIPTION_DIR,
+    )
+}
+
+fn build_speaker_audio_inputs_with_dir(
+    meeting_dir: &Path,
+    resample_to_16k: bool,
+    processed_chunks: &[ProcessedAudioChunk],
+    speaker_dir_name: &str,
 ) -> Result<Vec<SpeakerAudioInput>, String> {
     let mut chunks = load_chunks(meeting_dir)?;
 
@@ -483,7 +505,7 @@ pub fn build_speaker_audio_inputs_excluding_processed_chunks(
         ));
     }
 
-    let speaker_dir = meeting_dir.join("speakers");
+    let speaker_dir = meeting_dir.join(speaker_dir_name);
     fs::create_dir_all(&speaker_dir).map_err(|err| {
         format!(
             "failed to create speaker dir {}: {err}",

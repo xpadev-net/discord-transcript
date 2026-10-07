@@ -59,7 +59,8 @@ use crate::infrastructure::storage::{
     EffectiveMeetingSettings, MeetingSettingsDefaults, MeetingStore, StatusMessageMetadata,
     StoreError, StoredMeeting,
 };
-use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
+use crate::infrastructure::storage_fs::ChunkStorage;
+use crate::infrastructure::storage_s3::MeetingChunkStorage;
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
 use crate::interfaces::web::{
@@ -3073,8 +3074,20 @@ fn write_mixdown_wav(
         ));
     }
 
-    let result = write_mixdown_wav_stream(path, clusters, sample_rate, out_rate, resample);
+    // Write to a sibling temp file and rename atomically so queued uploads
+    // and playback probes can never read a truncated/placeholder WAV while
+    // the mixdown is being rewritten.
+    let tmp_path = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".part");
+        path.with_file_name(name)
+    };
+    let result = write_mixdown_wav_stream(&tmp_path, clusters, sample_rate, out_rate, resample)
+        .and_then(|()| {
+            fs::rename(&tmp_path, path).map_err(|err| format!("failed to finalize mixdown: {err}"))
+        });
     if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
         let _ = fs::remove_file(path);
     }
     result
@@ -3416,6 +3429,28 @@ pub async fn run_bot(
         .map_err(RuntimeError::DatabaseMigration)?;
     let base_executor = migration_store.executor;
 
+    let recording_objects = config
+        .chunk_storage_s3
+        .as_ref()
+        .map(|settings| {
+            crate::infrastructure::storage_s3::RecordingObjectStore::from_settings(
+                settings,
+                config.chunk_storage_dir.clone(),
+            )
+            .map_err(|err| {
+                RuntimeError::ClientInit(format!("failed to initialize s3 object store: {err}"))
+            })
+            .inspect(|store| {
+                tracing::info!(
+                    bucket = %settings.bucket,
+                    endpoint = %store.store().endpoint_label(),
+                    key_prefix = %settings.key_prefix,
+                    "chunk storage backend: s3"
+                );
+            })
+        })
+        .transpose()?;
+
     let handler = ScaffoldHandler {
         guild_id,
         service: Arc::new(Mutex::new(BotCommandService::new(SqlMeetingStore::new(
@@ -3443,6 +3478,7 @@ pub async fn run_bot(
         shutdown_token: CancellationToken::new(),
         task_tracker: TaskTracker::new(),
         chunk_storage_dir: config.chunk_storage_dir.clone(),
+        recording_objects,
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
         summary_harness: config.summary_harness,
@@ -3683,7 +3719,7 @@ struct ScaffoldHandler {
     service: Arc<Mutex<BotCommandService<SqlMeetingStore<PgSqlExecutor>>>>,
     queue: Arc<Mutex<SqlJobQueue<PgSqlExecutor>>>,
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
-    sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
+    sessions: Arc<Mutex<HashMap<String, RecordingSession<MeetingChunkStorage>>>>,
     recording_startups: Arc<Mutex<HashMap<String, String>>>,
     recording_start_cleanup_retries: Arc<StdMutex<HashSet<String>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
@@ -3700,6 +3736,9 @@ struct ScaffoldHandler {
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
     chunk_storage_dir: String,
+    /// Present iff `CHUNK_STORAGE_BACKEND=s3`: shared handle that mirrors
+    /// local workspace paths into object keys for uploads/presigning/deletes.
+    recording_objects: Option<crate::infrastructure::storage_s3::RecordingObjectStore>,
     auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
     summary_harness: SummaryHarness,
@@ -4680,7 +4719,7 @@ impl EventHandler for ScaffoldHandler {
                             &guild_for_task,
                             expected_meeting_id_ref,
                             FailedRecordingStartLocalCleanup::FullRuntimeState,
-                            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                            |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                                 session.persist_ssrc_mapping(tracker);
                             },
                         )
@@ -4852,7 +4891,7 @@ impl EventHandler for ScaffoldHandler {
                                 &guild_for_task,
                                 expected_meeting_id_ref,
                                 FailedRecordingStartLocalCleanup::FullRuntimeState,
-                                |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                                |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                                     session.persist_ssrc_mapping(tracker);
                                 },
                             )
@@ -5619,7 +5658,7 @@ impl ScaffoldHandler {
         recording_lifecycle_write_permit_for_gate(&self.command_gate).await
     }
 
-    fn lifecycle_local_state(&self) -> RecordingLifecycleLocalState<'_, LocalChunkStorage> {
+    fn lifecycle_local_state(&self) -> RecordingLifecycleLocalState<'_, MeetingChunkStorage> {
         RecordingLifecycleLocalState {
             sessions: &self.sessions,
             auto_stop_states: &self.auto_stop_states,
@@ -5683,7 +5722,7 @@ impl ScaffoldHandler {
     ) -> Result<
         (
             RecordingStopTeardownResult,
-            Option<RecordingSession<LocalChunkStorage>>,
+            Option<RecordingSession<MeetingChunkStorage>>,
         ),
         RecordingTeardownError,
     > {
@@ -5778,7 +5817,7 @@ impl ScaffoldHandler {
         meeting_id: &str,
         phase: &str,
         summary_job_deferred: bool,
-        mut removed_session: Option<RecordingSession<LocalChunkStorage>>,
+        mut removed_session: Option<RecordingSession<MeetingChunkStorage>>,
         _reset_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), String> {
         // Stop has already won the DB transition, so leave voice even if
@@ -6024,7 +6063,7 @@ impl ScaffoldHandler {
         &self,
         guild_key: &str,
         expected_meeting_id: &str,
-    ) -> Option<RecordingSession<LocalChunkStorage>> {
+    ) -> Option<RecordingSession<MeetingChunkStorage>> {
         let local = self.lifecycle_local_state();
         remove_local_recording_state_after_terminal_absence_with_dependencies(
             &local,
@@ -6041,7 +6080,7 @@ impl ScaffoldHandler {
         guild_key: &str,
         expected_meeting_id: &str,
         phase: &str,
-        removed_session: Option<RecordingSession<LocalChunkStorage>>,
+        removed_session: Option<RecordingSession<MeetingChunkStorage>>,
     ) {
         let local = self.lifecycle_local_state();
         let voice_leave = ContextRecordingVoiceLeave { ctx };
@@ -6055,7 +6094,7 @@ impl ScaffoldHandler {
                 phase,
             },
             removed_session,
-            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+            |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                 session.persist_ssrc_mapping(tracker);
             },
         )
@@ -6066,7 +6105,7 @@ impl ScaffoldHandler {
         &self,
         request: TerminalCleanupRetryFailureRequest<'_>,
         terminal_cleanup_failures: &mut u32,
-    ) -> TerminalCleanupRetryDecision<LocalChunkStorage> {
+    ) -> TerminalCleanupRetryDecision<MeetingChunkStorage> {
         let local = self.lifecycle_local_state();
         handle_terminal_cleanup_retry_failure_with_dependencies(
             &self.service,
@@ -6139,7 +6178,7 @@ impl ScaffoldHandler {
                 phase: "teardown exhaustion",
             },
             error_message,
-            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+            |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                 session.persist_ssrc_mapping(tracker);
             },
         )
@@ -6238,7 +6277,7 @@ impl ScaffoldHandler {
             meeting_id,
             error_message,
             cleanup_scope,
-            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+            |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                 session.persist_ssrc_mapping(tracker);
             },
         )
@@ -6342,7 +6381,7 @@ impl ScaffoldHandler {
                 &meeting_id,
                 &error_message,
                 cleanup_scope,
-                |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                     session.persist_ssrc_mapping(tracker);
                 },
             )
@@ -6392,7 +6431,7 @@ impl ScaffoldHandler {
             meeting_id,
             error_message,
             cleanup_scope,
-            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+            |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                 session.persist_ssrc_mapping(tracker);
             },
         )
@@ -6844,7 +6883,11 @@ impl ScaffoldHandler {
                 guild_key.clone(),
                 RecordingSession::new(
                     meeting_id.clone(),
-                    LocalChunkStorage::new(workspace.clone(), meeting_id.clone()),
+                    MeetingChunkStorage::new(
+                        workspace.clone(),
+                        meeting_id.clone(),
+                        self.recording_objects.clone(),
+                    ),
                     ReceiverConfig::default(),
                     48_000,
                 ),
@@ -8004,6 +8047,72 @@ impl ScaffoldHandler {
             }
         };
 
+        // Transcription inputs may exclude chunks live transcription already
+        // handled (written under `transcription_speakers/`), but playback —
+        // local speakers/ serving and the object store alike — needs the
+        // complete per-speaker set. Build it separately so partial audio
+        // never lands under `speakers/`.
+        let playback_speaker_dir: Option<PathBuf> = match &summary_input_source {
+            SummaryInputSource::Audio {
+                completed_live_chunks,
+                ..
+            } if completed_live_chunks.is_empty() => None,
+            SummaryInputSource::Audio { meeting_dir, .. } => Some(meeting_dir.clone()),
+            SummaryInputSource::FinalTranscript => {
+                // Recovered meetings may still have their chunk staging dir;
+                // build playback files from whatever remains.
+                Some(workspace.audio_dir())
+            }
+        };
+        let playback_speaker_paths: Vec<PathBuf> = match playback_speaker_dir {
+            None => speaker_audio
+                .iter()
+                .map(|input| PathBuf::from(&input.audio_path))
+                .collect(),
+            Some(meeting_dir) => match build_speaker_audio_inputs(
+                &meeting_dir,
+                effective_settings.whisper_resample_to_16k,
+            ) {
+                Ok(outputs) => outputs
+                    .iter()
+                    .map(|input| PathBuf::from(&input.audio_path))
+                    .collect(),
+                Err(err) => {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %err,
+                        "failed to build complete speaker playback files"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+
+        // Under the s3 backend, mirror the playback artifacts (mixdown +
+        // per-speaker wavs) to the object store. Uploads are queued in the
+        // background; a missing local file or enqueue failure only warns —
+        // the local copy is still authoritative for this run.
+        if let Some(objects) = &self.recording_objects {
+            let artifact_paths = std::iter::once(std::path::Path::new(&audio_path))
+                .chain(playback_speaker_paths.iter().map(|path| path.as_path()));
+            for path in artifact_paths {
+                match objects.upload_file(path, "audio/wav") {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        path = %path.display(),
+                        "recording artifact missing locally; skipping object upload"
+                    ),
+                    Err(err) => warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to queue recording artifact upload"
+                    ),
+                }
+            }
+        }
+
         let request = crate::application::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
@@ -9001,7 +9110,7 @@ impl ScaffoldHandler {
 #[derive(Clone)]
 struct VoiceReceiveHandler {
     tracker: Arc<Mutex<SsrcTracker>>,
-    sessions: Arc<Mutex<HashMap<String, RecordingSession<LocalChunkStorage>>>>,
+    sessions: Arc<Mutex<HashMap<String, RecordingSession<MeetingChunkStorage>>>>,
     guild_id: String,
     runtime: ScaffoldHandler,
     http: Arc<Http>,
@@ -9400,7 +9509,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                             &guild_key,
                                             expected_meeting_id_ref,
                                             FailedRecordingStartLocalCleanup::FullRuntimeState,
-                                            |session: &RecordingSession<LocalChunkStorage>, tracker| {
+                                            |session: &RecordingSession<MeetingChunkStorage>, tracker| {
                                                 session.persist_ssrc_mapping(tracker);
                                             },
                                         )
@@ -9870,8 +9979,8 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
     }
 }
 
-pub fn ingest_voice_frames_into_session(
-    session: &mut RecordingSession<LocalChunkStorage>,
+pub fn ingest_voice_frames_into_session<S: ChunkStorage>(
+    session: &mut RecordingSession<S>,
     adapted: &AdaptedVoiceFrames,
 ) -> Result<Vec<PersistedChunk>, String> {
     for (user_id, frame) in &adapted.per_user {

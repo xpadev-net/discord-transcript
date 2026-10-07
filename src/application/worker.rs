@@ -30,6 +30,7 @@ use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoreError, UsageEventStore,
 };
+use crate::infrastructure::storage_s3::RecordingObjectStore;
 use crate::infrastructure::workspace::{
     AGENT_SUMMARY_OUTPUT_FILENAME, MeetingWorkspaceLayout, MeetingWorkspacePaths,
 };
@@ -1345,12 +1346,16 @@ impl SummaryNotificationReceipt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SummaryJobOptions {
     pub max_retries: u32,
     pub audio_base_dir: String,
     pub language: Option<String>,
     pub resample_to_16k: bool,
+    /// Present iff `CHUNK_STORAGE_BACKEND=s3`: playback artifacts produced
+    /// here (mixdown, per-speaker wavs) are uploaded so the web layer can
+    /// serve them via presigned URLs.
+    pub recording_objects: Option<RecordingObjectStore>,
 }
 
 pub fn process_next_summary_job<S, Q, W, C>(
@@ -1490,6 +1495,36 @@ where
 
         let mixdown_path = merge_user_chunks_to_mixdown(&meeting_dir, resample_to_16k)
             .map_err(WorkerError::Summary)?;
+        let speaker_audio = build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
+            .map_err(WorkerError::Summary)?;
+        if let Some(objects) = &options.recording_objects {
+            // Playback artifacts must exist in the object store for the web
+            // presigned-URL path. Uploads warn rather than fail the job: the
+            // local staging copies still serve playback until retention.
+            // Paths outside the storage dir (the legacy fallback) cannot be
+            // keyed and are reported by upload_file's error.
+            let artifact_paths = std::iter::once(std::path::Path::new(&mixdown_path)).chain(
+                speaker_audio
+                    .iter()
+                    .map(|input| std::path::Path::new(&input.audio_path)),
+            );
+            for path in artifact_paths {
+                match objects.upload_file(path, "audio/wav") {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        meeting_id = %job.meeting_id,
+                        path = %path.display(),
+                        "playback artifact missing locally; skipped object upload"
+                    ),
+                    Err(err) => warn!(
+                        meeting_id = %job.meeting_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to upload playback artifact to object store"
+                    ),
+                }
+            }
+        }
         let input = ProcessMeetingInput {
             meeting_id: job.meeting_id.clone(),
             job_id: Some(job.id.clone()),
@@ -1501,8 +1536,7 @@ where
             stopped_at: meeting.stopped_at,
             duration_seconds: meeting.duration_seconds,
             audio_path: mixdown_path,
-            speaker_audio: build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
-                .map_err(WorkerError::Summary)?,
+            speaker_audio,
             language: effective_settings
                 .as_ref()
                 .and_then(|settings| settings.whisper_language.clone())

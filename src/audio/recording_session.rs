@@ -1,9 +1,7 @@
 use crate::audio::receiver::{BufferedFrame, ReceiverConfig};
 use crate::audio::recorder::{RecorderEngine, RecorderError, RecorderOutputChunk};
 use crate::audio::songbird_adapter::SsrcTracker;
-use crate::infrastructure::storage_fs::{
-    ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
-};
+use crate::infrastructure::storage_fs::{ChunkStorage, ChunkStorageError, SavedChunk};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -312,7 +310,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
     }
 }
 
-impl RecordingSession<LocalChunkStorage> {
+impl RecordingSession<crate::infrastructure::storage_s3::MeetingChunkStorage> {
     /// Persist the SSRC-to-user mapping as a JSON file in the audio directory.
     /// Only mappings for users recorded in this session are included.
     pub fn persist_ssrc_mapping(&self, tracker: &SsrcTracker) {
@@ -330,7 +328,7 @@ impl RecordingSession<LocalChunkStorage> {
         if filtered.all_mappings().is_empty() {
             return;
         }
-        let path = self.storage.workspace.ssrc_mapping_path();
+        let path = self.storage.workspace().ssrc_mapping_path();
         match serde_json::to_vec_pretty(&filtered) {
             Ok(json) => {
                 if let Err(err) = std::fs::write(&path, &json) {
@@ -339,6 +337,16 @@ impl RecordingSession<LocalChunkStorage> {
                         path = %path.display(),
                         error = %err,
                         "failed to persist SSRC mapping"
+                    );
+                } else if let Err(err) =
+                    self.storage
+                        .put_object_bytes(&path, &json, "application/json")
+                {
+                    tracing::warn!(
+                        meeting_id = %self.meeting_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to upload SSRC mapping to object store"
                     );
                 }
             }
