@@ -113,6 +113,23 @@ impl GenerationState {
         self.outstanding.remove(key);
         self.latest.remove(key);
     }
+
+    /// Rolls back a generation that was enqueued but never queued (rejected
+    /// enqueue): restores `latest` to the newest still-outstanding write so
+    /// the rejected write cannot supersede accepted ones.
+    fn untrack(&mut self, key: &str, generation: u64) {
+        if let Some(set) = self.outstanding.get_mut(key) {
+            set.remove(&generation);
+            if !set.is_empty() {
+                if let Some(newest) = set.iter().next_back() {
+                    self.latest.insert(key.to_owned(), *newest);
+                }
+                return;
+            }
+        }
+        self.outstanding.remove(key);
+        self.latest.remove(key);
+    }
 }
 
 /// Delete/cancel bookkeeping shared by producers, the worker, and
@@ -449,7 +466,7 @@ impl UploadQueue {
         self.generations
             .lock()
             .unwrap()
-            .settle(&task.key, task.generation);
+            .untrack(&task.key, task.generation);
     }
 
     /// Enqueues a PUT without blocking the caller.
@@ -830,6 +847,16 @@ fn is_upload_candidate(rel: &Path) -> bool {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
+    // Hidden entries are build scaffolding (e.g. `.speaker-build-tmp/`), and
+    // `.tmp`/`.part` names are staged writes that were never promoted — a
+    // crash leftovers must not become permanent objects.
+    if components.iter().any(|c| c.starts_with('.'))
+        || components
+            .last()
+            .is_some_and(|name| name.ends_with(".tmp") || name.ends_with(".part"))
+    {
+        return false;
+    }
     if components.first().map(String::as_str)
         == Some(crate::infrastructure::workspace::WORKSPACES_ROOT_DIR)
     {
@@ -1541,6 +1568,12 @@ mod tests {
         std::fs::write(audio.join("transcription_speakers/u.wav"), b"part").unwrap();
         std::fs::create_dir_all(base.join("workspaces/g/vc/m/transcript")).unwrap();
         std::fs::write(base.join("workspaces/g/vc/m/transcript/t.md"), b"doc").unwrap();
+        // Crash leftovers (staging tmp, unfinished mixdown, speaker build
+        // scaffolding) are never uploaded either.
+        std::fs::write(audio.join("u_1_0.wav.tmp"), b"staged").unwrap();
+        std::fs::write(audio.join("mixdown.wav.part"), b"partial").unwrap();
+        std::fs::create_dir_all(audio.join("speakers/.speaker-build-tmp")).unwrap();
+        std::fs::write(audio.join("speakers/.speaker-build-tmp/u.wav"), b"tmp").unwrap();
         // Remote already has the mixdown and the mapping.
         *fake.list_result.lock().unwrap() = vec![
             "workspaces/g/vc/m/audio/mixdown.wav".to_owned(),
@@ -1573,6 +1606,19 @@ mod tests {
             "only missing, non-tombstoned candidates are re-enqueued"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A rejected enqueue rolls its generation back so it cannot supersede
+    /// an accepted older write for the same key.
+    #[test]
+    fn rejected_enqueue_does_not_supersede_accepted_write() {
+        let mut state = GenerationState::default();
+        state.track("k", 1);
+        state.track("k", 2);
+        state.untrack("k", 2);
+        assert!(!state.is_superseded("k", 1));
+        state.settle("k", 1);
+        assert!(!state.is_superseded("k", 3));
     }
 
     #[test]
