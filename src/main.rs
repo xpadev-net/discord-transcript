@@ -239,6 +239,8 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
     };
 
     let summary_job_wakeups = SummaryJobWakeups::new();
+    // One store per process: web deletion endpoints and the bot's upload
+    // queue must share it so `delete_prefix` cancels in-flight uploads too.
     let recording_objects = config
         .chunk_storage_s3
         .as_ref()
@@ -255,10 +257,15 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             )
         })
         .transpose()?;
+    // Restarting during an S3 outage drops the in-memory upload queue; put
+    // back any staged files whose remote object never made it.
+    if let Some(objects) = &recording_objects {
+        objects.reconcile_staged_uploads();
+    }
     let web_state = web::WebState::new(
         Arc::clone(&db_client),
         config.chunk_storage_dir.clone(),
-        recording_objects,
+        recording_objects.clone(),
         auth,
         reqwest::Client::builder()
             .use_rustls_tls()
@@ -334,6 +341,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             summary_job_wakeups.clone(),
             Some(Arc::clone(&meeting_permission_cache)),
             Some(Arc::clone(&meeting_guild_cache)),
+            recording_objects.clone(),
         )
         .await?
         {
@@ -439,6 +447,9 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
             )
         })
         .transpose()?;
+    if let Some(objects) = &recording_objects {
+        objects.reconcile_staged_uploads();
+    }
     let options = SummaryJobOptions {
         max_retries: config.summary_max_retries,
         audio_base_dir: config.chunk_storage_dir.clone(),

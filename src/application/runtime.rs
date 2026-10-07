@@ -3413,6 +3413,9 @@ pub async fn run_bot(
     summary_job_wakeups: SummaryJobWakeups,
     meeting_permission_cache: Option<PermissionCache>,
     meeting_guild_cache: Option<GuildCache>,
+    // Shared with the web layer so its deletes cancel our pending uploads;
+    // `Some` iff `CHUNK_STORAGE_BACKEND=s3`.
+    recording_objects: Option<crate::infrastructure::storage_s3::RecordingObjectStore>,
 ) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
@@ -3429,27 +3432,8 @@ pub async fn run_bot(
         .map_err(RuntimeError::DatabaseMigration)?;
     let base_executor = migration_store.executor;
 
-    let recording_objects = config
-        .chunk_storage_s3
-        .as_ref()
-        .map(|settings| {
-            crate::infrastructure::storage_s3::RecordingObjectStore::from_settings(
-                settings,
-                config.chunk_storage_dir.clone(),
-            )
-            .map_err(|err| {
-                RuntimeError::ClientInit(format!("failed to initialize s3 object store: {err}"))
-            })
-            .inspect(|store| {
-                tracing::info!(
-                    bucket = %settings.bucket,
-                    endpoint = %store.store().endpoint_label(),
-                    key_prefix = %settings.key_prefix,
-                    "chunk storage backend: s3"
-                );
-            })
-        })
-        .transpose()?;
+    // `recording_objects` is shared with the web layer by the caller so a
+    // delete issued through either path cancels this queue's pending uploads.
 
     let handler = ScaffoldHandler {
         guild_id,
