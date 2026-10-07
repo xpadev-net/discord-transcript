@@ -11685,18 +11685,28 @@ async fn api_audio(
         // Object-store probes do blocking HTTP (up to the request timeout);
         // run them on the blocking pool so a slow S3 cannot occupy a Tokio
         // worker thread and stall unrelated requests.
+        // Legacy recordings are mirrored under the flat `<meeting>/` layout,
+        // so probe the primary workspace key first and then the legacy key.
         let probe = {
             let objects = objects.clone();
-            let path = primary.clone();
-            tokio::task::spawn_blocking(move || objects.object_exists(&path)).await
+            let primary = primary.clone();
+            let legacy = legacy.clone();
+            tokio::task::spawn_blocking(move || match objects.object_exists(&primary) {
+                Ok(true) => Ok(Some(primary)),
+                Ok(false) => objects
+                    .object_exists(&legacy)
+                    .map(|hit| hit.then_some(legacy)),
+                Err(err) => Err(err),
+            })
+            .await
         };
         match probe {
-            Ok(Ok(true)) => {
-                if let Some(url) = objects.presigned_get_for_path(&primary) {
+            Ok(Ok(Some(remote_path))) => {
+                if let Some(url) = objects.presigned_get_for_path(&remote_path) {
                     return Ok(Redirect::temporary(&url).into_response());
                 }
             }
-            Ok(Ok(false)) => {}
+            Ok(Ok(None)) => {}
             Ok(Err(err)) => {
                 warn!(
                     meeting_id = %meeting_id,
@@ -11816,18 +11826,32 @@ async fn api_speakers(
     let legacy_speakers_dir = layout.legacy_meeting_dir(&meeting_id).join("speakers");
 
     // Under the s3 backend, speaker audio lives in the object store. List
-    // the speakers prefix once and match candidate filenames instead of a
-    // head request per speaker.
+    // each speakers prefix once (primary workspace and legacy flat layout)
+    // and match candidate filenames instead of a head request per speaker.
     let remote_speaker_filenames: Option<Arc<HashSet<String>>> = if let Some(objects) =
         state.recording_objects.as_ref().and_then(|objects| {
-            objects
-                .object_prefix(&primary_speakers_dir)
-                .map(|prefix| (objects.clone(), prefix))
+            let prefixes = [
+                objects.object_prefix(&primary_speakers_dir),
+                objects.object_prefix(&legacy_speakers_dir),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            (!prefixes.is_empty()).then(|| (objects.clone(), prefixes))
         }) {
-        let (objects, prefix) = objects;
-        match tokio::task::spawn_blocking(move || objects.list_keys(&prefix)).await {
-            Ok(Ok(keys)) => Some(Arc::new(
-                keys.iter()
+        let (objects, prefixes) = objects;
+        match tokio::task::spawn_blocking(move || {
+            prefixes
+                .iter()
+                .map(|prefix| objects.list_keys(prefix))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        {
+            Ok(Ok(key_lists)) => Some(Arc::new(
+                key_lists
+                    .iter()
+                    .flatten()
                     .filter_map(|key| key.rsplit('/').next().map(str::to_owned))
                     .collect::<HashSet<String>>(),
             )),
