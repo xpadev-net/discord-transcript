@@ -4,6 +4,7 @@ pub mod bot_token;
 pub mod integrations;
 pub mod queue;
 pub mod retry;
+pub mod s3;
 pub mod sql;
 pub mod sql_store;
 pub mod storage;

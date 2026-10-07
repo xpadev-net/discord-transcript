@@ -713,6 +713,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "libc",
+ "md-5",
  "regex",
  "reqwest",
  "serde",
