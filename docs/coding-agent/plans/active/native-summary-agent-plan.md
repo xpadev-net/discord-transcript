@@ -104,7 +104,7 @@ Caveat: rig is 0.x (API churn). Mitigation: keep a thin adapter module so swappi
 2. Workspace tools (`list_input_files`, `read_input_file`, `write_output_file`) with deny-by-default path enforcement + spawn_blocking lifecycle handling (#221, merged).
 3. Native client driven by rig: OpenCode Go dual-dialect (`/responses` + `/chat/completions`) with model→dialect resolution, output contract validation, unsafe opt-in gate, retries (#222).
 4. Flip `SUMMARY_HARNESS` default to `native`, make `SUMMARY_MODEL` optional-but-preserved for native, and gate CLI values behind explicit opt-in (this PR); docs/README env table.
-5. ChatGPT provider: rig `providers::chatgpt` wiring + auth dir mount + `auth login-chatgpt` subcommand (device flow); README + compose unsafe-mount docs.
+5. ChatGPT provider: rig `providers::chatgpt` wiring — `SUMMARY_PROVIDER=chatgpt` with `CHATGPT_AUTH_FILE` OAuth record (or static `CHATGPT_ACCESS_TOKEN`), plus `auth login-chatgpt` subcommand (device flow); README/.env.example docs (this PR).
 6. (Deferred, needs sign-off) Remove CLI harnesses + per-CLI workspace configs once native is validated in production.
 
 ## Risks / Open Questions

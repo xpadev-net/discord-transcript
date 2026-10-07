@@ -1982,6 +1982,59 @@ fn app_config_defaults_to_native_harness() {
 }
 
 #[test]
+fn app_config_native_chatgpt_loads_with_auth_file() {
+    // ChatGPT OAuth keeps credentials in the file written by
+    // `auth login-chatgpt` — no API key needed for config to load.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "gpt-5.3-codex".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "chatgpt".to_owned());
+    values.insert(
+        "CHATGPT_AUTH_FILE".to_owned(),
+        "/run/secrets/chatgpt-auth.json".to_owned(),
+    );
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::ChatGpt));
+    assert_eq!(config.summary_api_key, None);
+    assert_eq!(
+        config.summary_auth_file.as_deref(),
+        Some("/run/secrets/chatgpt-auth.json")
+    );
+}
+
+#[test]
+fn app_config_native_chatgpt_loads_with_access_token() {
+    // A static access token (e.g. ChatGPT Enterprise) works without an
+    // auth file; both may also be present — the token wins at runtime.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "gpt-5.3-codex".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "chatgpt".to_owned());
+    values.insert("CHATGPT_ACCESS_TOKEN".to_owned(), "oauth-token".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::ChatGpt));
+    assert_eq!(config.summary_api_key.as_deref(), Some("oauth-token"));
+    assert_eq!(config.summary_auth_file, None);
+}
+
+#[test]
+fn app_config_native_chatgpt_loads_without_credentials() {
+    // Optional-but-preserved: provider alone still boots; the client
+    // reports disabled per job until a token or auth file appears.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "gpt-5.3-codex".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "chatgpt".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::ChatGpt));
+    assert_eq!(config.summary_api_key, None);
+    assert_eq!(config.summary_auth_file, None);
+}
+
+#[test]
 fn app_config_native_model_is_optional() {
     // Provider and key survive config load without SUMMARY_MODEL; the
     // disabled client reports the gap per job instead of failing startup.
