@@ -730,14 +730,14 @@ impl ClaudeSummaryClient for NativeAgentSummaryClient {
             ));
         }
         let workdir = require_native_agent_workdir(workdir)?;
-        let model = self.completion_model()?;
-        self.summarize_with_model(&model, prompt, workdir, output)
+        self.summarize_attempts(prompt, workdir, output, || self.completion_model())
     }
 }
 
 impl NativeAgentSummaryClient {
     /// `summarize` with the completion model supplied — tests inject a
     /// scripted mock instead of a live provider.
+    #[cfg(test)]
     fn summarize_with_model(
         &self,
         model: &DynModel<Completion>,
@@ -745,13 +745,29 @@ impl NativeAgentSummaryClient {
         workdir: &Path,
         output: AgentOutputContract,
     ) -> Result<String, SummaryError> {
-        // Retried attempts start from a clean conversation rather than
-        // compounding a broken transcript, and each attempt must produce
-        // its own output file — a leftover from a failed attempt is deleted
-        // before the next run so it cannot be mistaken for fresh output.
+        self.summarize_attempts(prompt, workdir, output, || Ok(model.clone()))
+    }
+
+    /// Retried attempts start from a clean conversation rather than
+    /// compounding a broken transcript, and each attempt must produce
+    /// its own output file — a leftover from a failed attempt is deleted
+    /// before the next run so it cannot be mistaken for fresh output.
+    /// The model is rebuilt per attempt (not hoisted) because rig's
+    /// `authenticate` copies the resolved token into the client: a model
+    /// built once would keep retrying with an OAuth access token that
+    /// expired mid-attempt, while re-resolving lets the persisted record
+    /// (refreshed on read) recover the job.
+    fn summarize_attempts(
+        &self,
+        prompt: &str,
+        workdir: &Path,
+        output: AgentOutputContract,
+        model_for_attempt: impl Fn() -> Result<DynModel<Completion>, SummaryError>,
+    ) -> Result<String, SummaryError> {
         retry_with_backoff(self.retry_policy, |_| {
             remove_stale_agent_output(workdir, output)?;
-            self.run_agent_attempt(model.clone(), prompt, workdir, output)
+            let model = model_for_attempt()?;
+            self.run_agent_attempt(model, prompt, workdir, output)
         })
     }
 }
