@@ -239,9 +239,26 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
     };
 
     let summary_job_wakeups = SummaryJobWakeups::new();
+    let recording_objects = config
+        .chunk_storage_s3
+        .as_ref()
+        .map(|settings| {
+            RecordingObjectStore::from_settings(settings, config.chunk_storage_dir.clone()).inspect(
+                |store| {
+                    tracing::info!(
+                        bucket = %settings.bucket,
+                        endpoint = %store.store().endpoint_label(),
+                        key_prefix = %settings.key_prefix,
+                        "chunk storage backend: s3"
+                    );
+                },
+            )
+        })
+        .transpose()?;
     let web_state = web::WebState::new(
         Arc::clone(&db_client),
         config.chunk_storage_dir.clone(),
+        recording_objects,
         auth,
         reqwest::Client::builder()
             .use_rustls_tls()

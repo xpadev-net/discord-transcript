@@ -5215,10 +5215,11 @@ impl ScaffoldHandler {
             );
         };
         let chunk_storage_dir = self.chunk_storage_dir.clone();
+        let recording_objects = self.recording_objects.clone();
         let filesystem_result = tokio::task::spawn_blocking(move || {
             let layout =
                 crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&chunk_storage_dir);
-            apply_retention_filesystem_cleanup(&layout, &plan)
+            apply_retention_filesystem_cleanup(&layout, &plan, recording_objects.as_ref())
         })
         .await
         .map_err(|err| format!("retention filesystem cleanup task failed: {err}"))?;
@@ -5266,6 +5267,7 @@ impl ScaffoldHandler {
                 transcripts_marked_deleted = report.transcripts_marked_deleted,
                 summaries_deleted = report.summaries_deleted,
                 artifacts_deleted = report.artifacts_deleted,
+                remote_objects_deleted = report.remote_objects_deleted,
                 error = %err,
                 "startup retention cleanup failed after partial work"
             );
@@ -5285,6 +5287,7 @@ impl ScaffoldHandler {
                 transcripts_marked_deleted = report.transcripts_marked_deleted,
                 summaries_deleted = report.summaries_deleted,
                 artifacts_deleted = report.artifacts_deleted,
+                remote_objects_deleted = report.remote_objects_deleted,
                 "startup retention cleanup completed"
             );
             Ok(())
