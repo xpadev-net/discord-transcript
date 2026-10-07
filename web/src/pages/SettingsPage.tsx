@@ -120,6 +120,7 @@ interface DomainKnowledgeDraft {
   title: string;
   body: string;
   active: boolean;
+  allow_summary_context: boolean;
 }
 
 interface SummaryTemplateDraft {
@@ -255,6 +256,7 @@ function emptyDomainKnowledgeDraft(): DomainKnowledgeDraft {
     title: "",
     body: "",
     active: true,
+    allow_summary_context: false,
   };
 }
 
@@ -455,6 +457,7 @@ function domainKnowledgeDraftFromItem(
     title: item.title,
     body: item.body,
     active: item.active,
+    allow_summary_context: item.allow_summary_context,
   };
 }
 
@@ -560,6 +563,7 @@ function domainKnowledgeRequestFromDraft(
     title: draft.title.trim(),
     body: draft.body.trim(),
     active: draft.active,
+    allow_summary_context: draft.allow_summary_context,
   };
 }
 
@@ -3202,6 +3206,25 @@ export function SettingsPage({
                   />
                   <span>
                     {"\u4fdd\u5b58\u6642\u306b\u6709\u52b9\u306b\u3059\u308b"}
+                  </span>
+                </label>
+
+                <label className="settings-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={domainKnowledgeDraft.allow_summary_context}
+                    disabled={
+                      customizationControlsDisabled ||
+                      selectedDomainKnowledgeItem?.archived_at != null
+                    }
+                    onChange={(event) =>
+                      updateDomainKnowledgeDraft({
+                        allow_summary_context: event.target.checked,
+                      })
+                    }
+                  />
+                  <span>
+                    {"\u8981\u7d04\u30b3\u30f3\u30c6\u30ad\u30b9\u30c8\u3078\u306e\u5229\u7528\u3092\u8a31\u53ef\u3059\u308b"}
                   </span>
                 </label>
 
