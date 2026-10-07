@@ -295,9 +295,6 @@ impl AppConfig {
                 optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
             )?;
         }
-        let summary_provider = optional_env("SUMMARY_PROVIDER")
-            .map(|value| SummaryProvider::parse(&value))
-            .transpose()?;
         let summary_api_key = optional_env("OPENCODE_API_KEY");
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
@@ -320,7 +317,7 @@ impl AppConfig {
         let (summary_provider, summary_api_key) = resolve_summary_provider(
             summary_enabled && app_role.requires_summary_harness_config(),
             summary_harness,
-            summary_provider,
+            optional_env("SUMMARY_PROVIDER"),
             summary_api_key,
         )?;
 
@@ -442,9 +439,6 @@ impl AppConfig {
                 optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
             )?;
         }
-        let summary_provider = optional_from_map(values, "SUMMARY_PROVIDER")
-            .map(|value| SummaryProvider::parse(&value))
-            .transpose()?;
         let summary_api_key = optional_from_map(values, "OPENCODE_API_KEY");
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
@@ -467,7 +461,7 @@ impl AppConfig {
         let (summary_provider, summary_api_key) = resolve_summary_provider(
             summary_enabled && app_role.requires_summary_harness_config(),
             summary_harness,
-            summary_provider,
+            optional_from_map(values, "SUMMARY_PROVIDER"),
             summary_api_key,
         )?;
 
@@ -730,18 +724,24 @@ fn resolve_summary_settings(
 
 /// Resolve `SUMMARY_PROVIDER` / the provider credential for the native
 /// harness. Strict only when the role actually runs summaries: the native
-/// harness requires a provider and (per provider) an API key; every other
-/// harness ignores both. On the disabled path values pass through unparsed
-/// requirements so a worker that never executes a summary does not fail to
-/// boot.
+/// harness requires a provider and (per provider) an API key. Every other
+/// harness ignores both settings entirely — an unrelated or even invalid
+/// `SUMMARY_PROVIDER` value must not stop a CLI-harness deployment from
+/// booting.
 fn resolve_summary_provider(
     summary_runtime_enabled: bool,
     harness: SummaryHarness,
-    provider: Option<SummaryProvider>,
+    provider: Option<String>,
     api_key: Option<String>,
 ) -> Result<(Option<SummaryProvider>, Option<String>), ConfigError> {
     match harness {
-        SummaryHarness::Native if summary_runtime_enabled => {
+        SummaryHarness::Native => {
+            let provider = provider
+                .map(|value| SummaryProvider::parse(&value))
+                .transpose()?;
+            if !summary_runtime_enabled {
+                return Ok((provider, api_key));
+            }
             let provider = provider.ok_or(ConfigError::MissingEnv {
                 key: "SUMMARY_PROVIDER",
             })?;
@@ -752,7 +752,6 @@ fn resolve_summary_provider(
             )?;
             Ok((Some(provider), Some(api_key)))
         }
-        SummaryHarness::Native => Ok((provider, api_key)),
         _ => Ok((None, None)),
     }
 }

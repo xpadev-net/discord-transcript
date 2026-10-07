@@ -16,7 +16,7 @@ use discord_transcript::application::worker::{
 };
 use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{
-    AppConfig, AppRole, ChunkStorageBackend, ConfigError, SummaryHarness,
+    AppConfig, AppRole, ChunkStorageBackend, ConfigError, SummaryHarness, SummaryProvider,
 };
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
@@ -1945,6 +1945,78 @@ fn app_config_rejects_invalid_summary_harness() {
         ConfigError::InvalidEnv {
             key: "SUMMARY_HARNESS",
             value: "unknown".to_owned()
+        }
+    );
+}
+
+#[test]
+fn app_config_native_requires_summary_provider() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(err, ConfigError::MissingEnv { key: "SUMMARY_PROVIDER" });
+}
+
+#[test]
+fn app_config_native_requires_provider_api_key() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "OPENCODE_API_KEY"
+        }
+    );
+}
+
+#[test]
+fn app_config_native_loads_with_provider_and_key() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key.as_deref(), Some("ocg-key"));
+}
+
+#[test]
+fn app_config_cli_harness_ignores_summary_provider() {
+    // A provider value that would not parse must not stop a CLI-harness
+    // deployment from booting.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_native_rejects_invalid_provider() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "SUMMARY_PROVIDER",
+            value: "bogus".to_owned()
         }
     );
 }
