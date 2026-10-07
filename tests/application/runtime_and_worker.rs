@@ -1950,29 +1950,30 @@ fn app_config_rejects_invalid_summary_harness() {
 }
 
 #[test]
-fn app_config_native_requires_summary_provider() {
+fn app_config_native_loads_without_provider_settings() {
+    // Missing provider credentials must not block startup: the summary
+    // client reports a disabled error per job instead.
     let mut values = base_env();
     values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
     values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
 
-    let err = AppConfig::from_map(&values).expect_err("config should fail");
-    assert_eq!(err, ConfigError::MissingEnv { key: "SUMMARY_PROVIDER" });
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
 }
 
 #[test]
-fn app_config_native_requires_provider_api_key() {
+fn app_config_native_loads_provider_without_api_key() {
+    // A valid provider with a missing key still boots (and disables the
+    // client at runtime) rather than failing config load.
     let mut values = base_env();
     values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
     values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
     values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
 
-    let err = AppConfig::from_map(&values).expect_err("config should fail");
-    assert_eq!(
-        err,
-        ConfigError::MissingEnv {
-            key: "OPENCODE_API_KEY"
-        }
-    );
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key, None);
 }
 
 #[test]
@@ -2004,35 +2005,33 @@ fn app_config_cli_harness_ignores_summary_provider() {
 }
 
 #[test]
-fn app_config_native_rejects_invalid_provider() {
+fn app_config_native_ignores_invalid_provider() {
+    // An invalid provider value is warned about and ignored rather than
+    // fatal: a misconfigured worker still boots and reports the disabled
+    // summary client per job.
     let mut values = base_env();
     values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
     values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
     values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
     values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
 
-    let err = AppConfig::from_map(&values).expect_err("config should fail");
-    assert_eq!(
-        err,
-        ConfigError::InvalidEnv {
-            key: "SUMMARY_PROVIDER",
-            value: "bogus".to_owned()
-        }
-    );
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
 }
 
 #[test]
-fn app_config_native_summary_disabled_ignores_provider() {
-    // Provider settings never run when summaries are disabled, so even an
-    // invalid value must not stop startup.
+fn app_config_native_summary_disabled_keeps_valid_provider() {
+    // SUMMARY_ENABLED only defaults new meetings; stored meetings can still
+    // enable summaries, so valid credentials are preserved for the worker.
     let mut values = base_env();
     values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
     values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
-    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
-    assert_eq!(config.summary_provider, None);
-    assert_eq!(config.summary_api_key, None);
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key.as_deref(), Some("ocg-key"));
 }
 
 #[test]

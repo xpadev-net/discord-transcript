@@ -315,7 +315,7 @@ impl AppConfig {
                 )
             };
         let (summary_provider, summary_api_key) = resolve_summary_provider(
-            summary_enabled && app_role.requires_summary_harness_config(),
+            app_role.requires_summary_harness_config(),
             summary_harness,
             optional_env("SUMMARY_PROVIDER"),
             summary_api_key,
@@ -459,7 +459,7 @@ impl AppConfig {
                 )
             };
         let (summary_provider, summary_api_key) = resolve_summary_provider(
-            summary_enabled && app_role.requires_summary_harness_config(),
+            app_role.requires_summary_harness_config(),
             summary_harness,
             optional_from_map(values, "SUMMARY_PROVIDER"),
             summary_api_key,
@@ -723,31 +723,34 @@ fn resolve_summary_settings(
 }
 
 /// Resolve `SUMMARY_PROVIDER` / the provider credential for the native
-/// harness. Strict only when the role actually runs summaries: then the
-/// native harness requires a provider and (per provider) an API key. Any
-/// other state — CLI harnesses, roles that never run summaries, or
-/// `SUMMARY_ENABLED=false` — ignores both settings entirely so a stray or
-/// invalid value cannot stop the process from booting.
+/// harness. Gated on whether the role can run summary jobs at all — not
+/// `SUMMARY_ENABLED`, which only sets the default for new meetings while
+/// stored meetings and guild settings can still enable summaries. Settings
+/// are kept optional here: a worker without them boots and reports the
+/// disabled summary client per job instead of failing startup, and an
+/// invalid provider value is warned about and ignored for the same reason.
+/// CLI harnesses ignore both settings entirely.
 fn resolve_summary_provider(
-    summary_runtime_enabled: bool,
+    summary_runtime_capable: bool,
     harness: SummaryHarness,
     provider: Option<String>,
     api_key: Option<String>,
 ) -> Result<(Option<SummaryProvider>, Option<String>), ConfigError> {
-    if harness != SummaryHarness::Native || !summary_runtime_enabled {
+    if harness != SummaryHarness::Native || !summary_runtime_capable {
         return Ok((None, None));
     }
-    let provider = provider.ok_or(ConfigError::MissingEnv {
-        key: "SUMMARY_PROVIDER",
-    })?;
-    let provider = SummaryProvider::parse(&provider)?;
-    let api_key =
-        api_key
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ConfigError::MissingEnv {
-                key: provider.api_key_env(),
-            })?;
-    Ok((Some(provider), Some(api_key)))
+    let provider = provider.and_then(|value| match SummaryProvider::parse(&value) {
+        Ok(provider) => Some(provider),
+        Err(_) => {
+            tracing::warn!(
+                key = "SUMMARY_PROVIDER",
+                value,
+                "ignoring invalid native summary provider"
+            );
+            None
+        }
+    });
+    Ok((provider, api_key.filter(|value| !value.trim().is_empty())))
 }
 
 fn disabled_summary_settings(
