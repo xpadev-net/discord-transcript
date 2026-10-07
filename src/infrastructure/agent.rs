@@ -908,7 +908,7 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
 /// it up (and refreshes it) on every summary run.
 pub async fn chatgpt_device_login(
     auth_file: PathBuf,
-) -> Result<(), rig_core::providers::chatgpt::auth::AuthError> {
+) -> Result<(), Box<rig_core::providers::chatgpt::auth::AuthError>> {
     let authenticator = Authenticator::new(
         AuthSource::OAuth,
         Some(auth_file.clone()),
@@ -923,7 +923,8 @@ pub async fn chatgpt_device_login(
     OpenAIConfig::with_key(&chatgpt::DIALECT, Secret::from(""))
         .client()
         .authenticate(&authenticator)
-        .await?;
+        .await
+        .map_err(Box::new)?;
     println!("ChatGPT credentials saved to {}", auth_file.display());
     Ok(())
 }
