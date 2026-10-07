@@ -148,7 +148,7 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
         .execute_result
         .insert(query_key(RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, &["7"]), 5);
 
-    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("cleanup should succeed");
 
     assert_eq!(report.raw_workspaces_scanned, 1);
@@ -213,8 +213,7 @@ fn retention_cleanup_applies_summary_ttl_when_configured() {
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect("cleanup should succeed");
 
     assert_eq!(report.summaries_deleted, 6);
@@ -281,7 +280,7 @@ fn retention_cleanup_revisits_raw_cleaned_meetings_for_legacy_debug_artifacts() 
         ])],
     );
 
-    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("debug cleanup should succeed");
 
     assert_eq!(report.raw_workspaces_scanned, 0);
@@ -309,7 +308,7 @@ fn retention_cleanup_is_idempotent_for_missing_workspace_files() {
         ])],
     );
 
-    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("missing directories should be ignored");
 
     assert_eq!(report.raw_workspaces_scanned, 1);
@@ -379,7 +378,7 @@ fn retention_cleanup_runs_database_phase_when_filesystem_cleanup_fails() {
         3,
     );
 
-    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect_err("filesystem cleanup should fail after database cleanup runs");
 
     assert!(err.message.contains("failed to remove"));
@@ -438,8 +437,7 @@ fn retention_cleanup_continues_filesystem_phase_after_meeting_error() {
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect_err("filesystem cleanup should report the failed meeting");
 
     assert!(err.message.contains("failed to remove"));
@@ -490,8 +488,7 @@ fn retention_cleanup_can_rerun_after_transcript_and_summary_filesystem_failure()
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect_err("filesystem cleanup should fail before paths become removable");
 
     assert!(err.message.contains("failed to remove"));
@@ -548,8 +545,7 @@ fn retention_cleanup_can_rerun_after_transcript_and_summary_filesystem_failure()
             raw_audio_ttl_days: nonzero(7),
             transcript_ttl_days: nonzero(30),
             summary_ttl_days: Some(nonzero(90)),
-        },
-    )
+        }, None)
     .expect("retry should remove the remaining workspace files");
 
     assert_eq!(retry_report.transcript_dirs_removed, 1);
@@ -583,7 +579,7 @@ fn retention_cleanup_preserves_partial_report_when_database_cleanup_fails() {
         3,
     );
 
-    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect_err("database cleanup should fail after filesystem cleanup runs");
 
     assert!(err.message.contains("database cleanup failed"));
@@ -613,7 +609,7 @@ fn retention_cleanup_uses_partial_plan_when_one_workspace_query_fails() {
         "transcript query unavailable".to_owned(),
     );
 
-    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default())
+    let err = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect_err("plan query error should be reported after partial cleanup");
 
     assert!(err.message.contains("transcript query unavailable"));
@@ -669,7 +665,7 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
     assert_eq!(target_usage.summary_bytes, usage.summary_bytes);
     assert_eq!(target_usage.debug_bytes, 0);
 
-    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, targets)
+    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, targets, None)
         .expect("manual delete succeeds");
     assert_eq!(report.raw_workspaces_scanned, 1);
     assert_eq!(
@@ -697,7 +693,7 @@ fn manual_meeting_delete_estimates_and_removes_selected_targets_only() {
         summary: false,
         debug: true,
     };
-    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, debug_targets)
+    let report = apply_manual_meeting_filesystem_delete(&layout, &meeting, debug_targets, None)
         .expect("manual debug delete succeeds");
     assert_eq!(report.debug_dirs_removed, 2);
     assert_eq!(report.agent_workspace_dirs_removed, 0);

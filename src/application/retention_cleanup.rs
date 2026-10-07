@@ -1,6 +1,7 @@
 use crate::domain::retention::RetentionPolicy;
 use crate::infrastructure::sql_store::SqlExecutor;
-use crate::infrastructure::workspace::MeetingWorkspaceLayout;
+use crate::infrastructure::storage_s3::RecordingObjectStore;
+use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -204,6 +205,9 @@ pub struct RetentionCleanupReport {
     pub transcripts_marked_deleted: u64,
     pub summaries_deleted: u64,
     pub artifacts_deleted: u64,
+    /// Object-store keys deleted under the meeting's audio prefix
+    /// (`CHUNK_STORAGE_BACKEND=s3` only).
+    pub remote_objects_deleted: usize,
 }
 
 impl RetentionCleanupReport {
@@ -224,6 +228,7 @@ impl RetentionCleanupReport {
         self.transcripts_marked_deleted += other.transcripts_marked_deleted;
         self.summaries_deleted += other.summaries_deleted;
         self.artifacts_deleted += other.artifacts_deleted;
+        self.remote_objects_deleted += other.remote_objects_deleted;
     }
 }
 
@@ -288,11 +293,12 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
     executor: &mut E,
     workspace_layout: &MeetingWorkspaceLayout,
     policy: RetentionPolicy,
+    objects: Option<&RecordingObjectStore>,
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let plan = collect_retention_cleanup_plan(executor, policy);
     let plan_errors = plan.errors.clone();
     let mut report = RetentionCleanupReport::default();
-    let filesystem_result = apply_retention_filesystem_cleanup(workspace_layout, &plan);
+    let filesystem_result = apply_retention_filesystem_cleanup(workspace_layout, &plan, objects);
     let filesystem_error = match filesystem_result {
         Ok(filesystem_report) => {
             report.merge(filesystem_report);
@@ -393,6 +399,7 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
 pub fn apply_retention_filesystem_cleanup(
     workspace_layout: &MeetingWorkspaceLayout,
     plan: &RetentionCleanupPlan,
+    objects: Option<&RecordingObjectStore>,
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let mut report = RetentionCleanupReport::default();
     let mut errors = Vec::new();
@@ -428,6 +435,15 @@ pub fn apply_retention_filesystem_cleanup(
             remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
             || report.legacy_meetings_cleaned += 1,
         );
+        if let Some(objects) = objects {
+            // The object store is the canonical copy under the s3 backend —
+            // delete it even if a local staging removal failed.
+            record_count_cleanup_result(
+                &mut errors,
+                delete_meeting_recording_objects(objects, &workspace),
+                |deleted| report.remote_objects_deleted += deleted,
+            );
+        }
         record_cleanup_result(
             &mut errors,
             remove_dir_if_present(&workspace.context_dir()),
@@ -574,6 +590,7 @@ pub fn apply_manual_meeting_filesystem_delete(
     workspace_layout: &MeetingWorkspaceLayout,
     meeting: &ExpiredWorkspaceRow,
     targets: RetentionDeletionTargets,
+    objects: Option<&RecordingObjectStore>,
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
     let workspace = workspace_layout.for_meeting(
         &meeting.guild_id,
@@ -610,6 +627,13 @@ pub fn apply_manual_meeting_filesystem_delete(
             remove_legacy_raw_audio(&workspace_layout.legacy_meeting_dir(&meeting.meeting_id)),
             || report.legacy_meetings_cleaned += 1,
         );
+        if let Some(objects) = objects {
+            record_count_cleanup_result(
+                &mut errors,
+                delete_meeting_recording_objects(objects, &workspace),
+                |deleted| report.remote_objects_deleted += deleted,
+            );
+        }
         record_cleanup_result(
             &mut errors,
             remove_dir_if_present(&workspace.context_dir()),
@@ -818,6 +842,36 @@ fn record_cleanup_result(
     match result {
         Ok(true) => on_removed(),
         Ok(false) => {}
+        Err(err) => errors.push(err),
+    }
+}
+
+/// Deletes every object under the meeting's `audio/` prefix (chunks,
+/// mixdown, speakers, ssrc mapping) and returns how many keys were removed.
+fn delete_meeting_recording_objects(
+    objects: &RecordingObjectStore,
+    workspace: &MeetingWorkspacePaths,
+) -> Result<usize, String> {
+    let prefix = objects
+        .object_prefix(&workspace.audio_dir())
+        .ok_or_else(|| {
+            format!(
+                "audio dir {} is outside the object storage root",
+                workspace.audio_dir().display()
+            )
+        })?;
+    objects
+        .delete_prefix(&prefix)
+        .map_err(|err| format!("object store delete failed: {err}"))
+}
+
+fn record_count_cleanup_result(
+    errors: &mut Vec<String>,
+    result: Result<usize, String>,
+    mut on_removed: impl FnMut(usize),
+) {
+    match result {
+        Ok(deleted) => on_removed(deleted),
         Err(err) => errors.push(err),
     }
 }

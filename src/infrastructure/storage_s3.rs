@@ -498,13 +498,41 @@ impl RecordingObjectStore {
         Ok(true)
     }
 
+    /// Lists all object keys under `prefix` (paginates as needed).
+    pub fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
+        self.objects.list_keys(prefix)
+    }
+
+    /// Object key prefix mirroring a directory under `storage_dir`.
+    pub fn object_prefix(&self, dir: &Path) -> Option<String> {
+        self.object_key(dir).map(|key| format!("{key}/"))
+    }
+
+    /// Whether an object exists at the key mirrored from `path`. `Ok(false)`
+    /// for paths outside the storage root, which have no mirror.
+    pub fn object_exists(&self, path: &Path) -> Result<bool, S3Error> {
+        let Some(key) = self.object_key(path) else {
+            return Ok(false);
+        };
+        self.objects.head_object(&key)
+    }
+
+    /// Presigned GET URL for the object mirrored from `path`. `None` when the
+    /// path is outside the storage root.
+    pub fn presigned_get_for_path(&self, path: &Path) -> Option<String> {
+        self.object_key(path).map(|key| self.presigned_get(&key))
+    }
+
     /// Deletes every object under `prefix` (a meeting's whole object tree).
     /// Pending and in-flight uploads under the prefix are cancelled first so
     /// a retried PUT cannot recreate deleted recordings.
-    pub fn delete_prefix(&self, prefix: &str) -> Result<(), S3Error> {
+    /// Returns how many keys were deleted.
+    pub fn delete_prefix(&self, prefix: &str) -> Result<usize, S3Error> {
         self.uploads.cancel_prefix(prefix);
         let keys = self.objects.list_keys(prefix)?;
-        self.objects.delete_keys(&keys)
+        let deleted = keys.len();
+        self.objects.delete_keys(&keys)?;
+        Ok(deleted)
     }
 
     /// Presigned GET URL for `key` using the configured TTL.
@@ -1015,7 +1043,7 @@ mod tests {
         let (fake, dyn_store) = fake_store();
         *fake.list_result.lock().unwrap() = vec!["a".to_owned(), "b".to_owned()];
         let store = RecordingObjectStore::new(dyn_store, String::new(), 900, "/data");
-        store.delete_prefix("workspaces/g/vc/m/").unwrap();
+        assert_eq!(store.delete_prefix("workspaces/g/vc/m/").unwrap(), 2);
         assert_eq!(fake.lists.lock().unwrap()[0], "workspaces/g/vc/m/");
         assert_eq!(
             fake.deletes.lock().unwrap()[0],
