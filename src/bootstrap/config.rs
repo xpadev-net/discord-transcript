@@ -4,6 +4,10 @@ use std::fmt::{Display, Formatter};
 use std::num::NonZeroU32;
 
 use crate::domain::retention::RetentionPolicy;
+use crate::infrastructure::s3::{
+    DEFAULT_PRESIGN_TTL_SECONDS, DEFAULT_REGION, MAX_PRESIGN_TTL_SECONDS, S3Settings,
+    validate_endpoint,
+};
 
 /// Process role used to decide which config surface must be present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +49,45 @@ impl AppRole {
 }
 
 impl Display for AppRole {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Storage backend that owns the canonical copy of recorded audio,
+/// selected by `CHUNK_STORAGE_BACKEND`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkStorageBackend {
+    /// Local filesystem under `CHUNK_STORAGE_DIR` (default).
+    Local,
+    /// S3-compatible object storage. Local files still exist as recording-time
+    /// staging under `CHUNK_STORAGE_DIR` but S3 is the durable store; playback
+    /// is served via presigned GET URLs.
+    S3,
+}
+
+impl ChunkStorageBackend {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let key = "CHUNK_STORAGE_BACKEND";
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "s3" => Ok(Self::S3),
+            _ => Err(ConfigError::InvalidEnv {
+                key,
+                value: raw.to_owned(),
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::S3 => "s3",
+        }
+    }
+}
+
+impl Display for ChunkStorageBackend {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -101,6 +144,9 @@ pub struct AppConfig {
     pub database_url: String,
     pub database_ssl_mode: String,
     pub chunk_storage_dir: String,
+    pub chunk_storage_backend: ChunkStorageBackend,
+    /// Present iff `chunk_storage_backend == S3`.
+    pub chunk_storage_s3: Option<S3Settings>,
     pub auto_stop_grace_seconds: u64,
     pub summary_max_retries: u32,
     pub integration_retry_max_attempts: u32,
@@ -166,6 +212,15 @@ impl AppConfig {
         let whisper_endpoint = required_env("WHISPER_ENDPOINT")?;
         let database_url = required_env("DATABASE_URL")?;
         let chunk_storage_dir = required_env("CHUNK_STORAGE_DIR")?;
+        let chunk_storage_backend = optional_env("CHUNK_STORAGE_BACKEND")
+            .map(|value| ChunkStorageBackend::parse(&value))
+            .transpose()?
+            .unwrap_or(ChunkStorageBackend::Local);
+        let chunk_storage_s3 = if chunk_storage_backend == ChunkStorageBackend::S3 {
+            Some(parse_s3_settings(optional_env)?)
+        } else {
+            None
+        };
 
         let summary_enabled = optional_env_parse_bool("SUMMARY_ENABLED", true)?;
         let summary_harness = optional_env("SUMMARY_HARNESS")
@@ -219,6 +274,8 @@ impl AppConfig {
             database_url,
             database_ssl_mode: parse_database_ssl_mode(optional_env("DATABASE_SSL_MODE"))?,
             chunk_storage_dir,
+            chunk_storage_backend,
+            chunk_storage_s3,
             auto_stop_grace_seconds: optional_env_parse_u64_nonzero("AUTO_STOP_GRACE_SECONDS")?
                 .unwrap_or(60),
             summary_max_retries: optional_env_parse_u32("SUMMARY_MAX_RETRIES")?.unwrap_or(3),
@@ -295,6 +352,15 @@ impl AppConfig {
         let whisper_endpoint = required_from_map(values, "WHISPER_ENDPOINT")?;
         let database_url = required_from_map(values, "DATABASE_URL")?;
         let chunk_storage_dir = required_from_map(values, "CHUNK_STORAGE_DIR")?;
+        let chunk_storage_backend = optional_from_map(values, "CHUNK_STORAGE_BACKEND")
+            .map(|value| ChunkStorageBackend::parse(&value))
+            .transpose()?
+            .unwrap_or(ChunkStorageBackend::Local);
+        let chunk_storage_s3 = if chunk_storage_backend == ChunkStorageBackend::S3 {
+            Some(parse_s3_settings(|key| optional_from_map(values, key))?)
+        } else {
+            None
+        };
 
         let summary_enabled = optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?;
         let summary_harness = optional_from_map(values, "SUMMARY_HARNESS")
@@ -346,6 +412,8 @@ impl AppConfig {
                 "DATABASE_SSL_MODE",
             ))?,
             chunk_storage_dir,
+            chunk_storage_backend,
+            chunk_storage_s3,
             auto_stop_grace_seconds: optional_from_map_parse_u64_nonzero(
                 values,
                 "AUTO_STOP_GRACE_SECONDS",
@@ -430,6 +498,65 @@ impl AppConfig {
             },
         })
     }
+}
+
+/// Parses the `CHUNK_STORAGE_S3_*` env group when the backend is `s3`.
+/// `lookup` resolves a key to its raw (already non-empty-filtered) value so
+/// `from_env` and `from_map` share this one implementation.
+fn parse_s3_settings(
+    lookup: impl Fn(&'static str) -> Option<String>,
+) -> Result<S3Settings, ConfigError> {
+    let required = |key: &'static str| lookup(key).ok_or(ConfigError::MissingEnv { key });
+    let optional_u64 = |key: &'static str| -> Result<Option<u64>, ConfigError> {
+        lookup(key)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidEnv { key, value })
+            })
+            .transpose()
+    };
+    let optional_bool = |key: &'static str| -> Result<Option<bool>, ConfigError> {
+        lookup(key)
+            .map(|value| parse_bool(&value).ok_or(ConfigError::InvalidEnv { key, value }))
+            .transpose()
+    };
+
+    let endpoint = lookup("CHUNK_STORAGE_S3_ENDPOINT")
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = &endpoint {
+        validate_endpoint(value).map_err(|_| ConfigError::InvalidEnv {
+            key: "CHUNK_STORAGE_S3_ENDPOINT",
+            value: value.clone(),
+        })?;
+    }
+    let key_prefix = lookup("CHUNK_STORAGE_S3_KEY_PREFIX")
+        .map(|value| value.trim().trim_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{value}/"))
+        .unwrap_or_default();
+    let path_style_default = endpoint.is_some();
+
+    Ok(S3Settings {
+        bucket: required("CHUNK_STORAGE_S3_BUCKET")?.trim().to_owned(),
+        endpoint,
+        region: lookup("CHUNK_STORAGE_S3_REGION")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| DEFAULT_REGION.to_owned()),
+        access_key_id: required("CHUNK_STORAGE_S3_ACCESS_KEY_ID")?
+            .trim()
+            .to_owned(),
+        secret_access_key: required("CHUNK_STORAGE_S3_SECRET_ACCESS_KEY")?
+            .trim()
+            .to_owned(),
+        key_prefix,
+        path_style: optional_bool("CHUNK_STORAGE_S3_FORCE_PATH_STYLE")?
+            .unwrap_or(path_style_default),
+        presign_ttl_seconds: optional_u64("CHUNK_STORAGE_S3_PRESIGN_TTL_SECONDS")?
+            .unwrap_or(DEFAULT_PRESIGN_TTL_SECONDS)
+            .clamp(1, MAX_PRESIGN_TTL_SECONDS),
+    })
 }
 
 fn parse_csv_list(value: Option<String>) -> Vec<String> {

@@ -15,7 +15,9 @@ use discord_transcript::application::worker::{
     LOAD_MEETING_SPEAKERS_SQL, ProcessMeetingInput, SummaryContextStore, process_meeting_summary,
 };
 use discord_transcript::audio::build_wav_bytes_raw;
-use discord_transcript::bootstrap::config::{AppConfig, AppRole, ConfigError, SummaryHarness};
+use discord_transcript::bootstrap::config::{
+    AppConfig, AppRole, ChunkStorageBackend, ConfigError, SummaryHarness,
+};
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
 use discord_transcript::domain::ai_memory::AiMemoryTag;
@@ -1164,6 +1166,112 @@ fn app_config_loads_from_map() {
     assert!(config.whisper_resample_to_16k);
     assert_eq!(config.operational_metrics_bearer_token, None);
     assert_eq!(config.guild_bot_token_encryption_key, None);
+    assert_eq!(config.chunk_storage_backend, ChunkStorageBackend::Local);
+    assert_eq!(config.chunk_storage_s3, None);
+}
+
+fn s3_env() -> HashMap<String, String> {
+    let mut values = base_env();
+    values.insert("CHUNK_STORAGE_BACKEND".to_owned(), "s3".to_owned());
+    values.insert(
+        "CHUNK_STORAGE_S3_BUCKET".to_owned(),
+        "recordings".to_owned(),
+    );
+    values.insert(
+        "CHUNK_STORAGE_S3_ACCESS_KEY_ID".to_owned(),
+        "AKIDEXAMPLE".to_owned(),
+    );
+    values.insert(
+        "CHUNK_STORAGE_S3_SECRET_ACCESS_KEY".to_owned(),
+        "secret".to_owned(),
+    );
+    values
+}
+
+#[test]
+fn app_config_s3_backend_parses_settings() {
+    let mut values = s3_env();
+    values.insert(
+        "CHUNK_STORAGE_S3_ENDPOINT".to_owned(),
+        "https://minio.example.com/".to_owned(),
+    );
+    values.insert(
+        "CHUNK_STORAGE_S3_KEY_PREFIX".to_owned(),
+        "discord".to_owned(),
+    );
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+
+    assert_eq!(config.chunk_storage_backend, ChunkStorageBackend::S3);
+    let s3 = config.chunk_storage_s3.expect("s3 settings should be present");
+    assert_eq!(s3.bucket, "recordings");
+    assert_eq!(s3.endpoint.as_deref(), Some("https://minio.example.com"));
+    assert_eq!(s3.region, "us-east-1");
+    assert_eq!(s3.key_prefix, "discord/");
+    // Custom endpoints default to path-style addressing.
+    assert!(s3.path_style);
+    assert_eq!(s3.presign_ttl_seconds, 900);
+}
+
+#[test]
+fn app_config_s3_defaults_to_aws_virtual_hosted_style() {
+    let values = s3_env();
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    let s3 = config.chunk_storage_s3.expect("s3 settings should be present");
+
+    assert_eq!(s3.endpoint, None);
+    assert!(!s3.path_style);
+}
+
+#[test]
+fn app_config_s3_requires_credentials() {
+    let mut values = s3_env();
+    values.remove("CHUNK_STORAGE_S3_ACCESS_KEY_ID");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "CHUNK_STORAGE_S3_ACCESS_KEY_ID"
+        }
+    );
+}
+
+#[test]
+fn app_config_s3_rejects_invalid_endpoint() {
+    let mut values = s3_env();
+    values.insert(
+        "CHUNK_STORAGE_S3_ENDPOINT".to_owned(),
+        "ftp://host?q=1".to_owned(),
+    );
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "CHUNK_STORAGE_S3_ENDPOINT",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn app_config_s3_rejects_unknown_backend() {
+    let mut values = base_env();
+    values.insert("CHUNK_STORAGE_BACKEND".to_owned(), "gs".to_owned());
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidEnv {
+            key: "CHUNK_STORAGE_BACKEND",
+            ..
+        }
+    ));
 }
 
 #[test]

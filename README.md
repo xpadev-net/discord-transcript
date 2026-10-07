@@ -62,6 +62,15 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `INTEGRATION_RETRY_INITIAL_DELAY_MS` | `200` | リトライ初回遅延 (ms) |
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
+| `CHUNK_STORAGE_BACKEND` | `local` | 録音データの保管先。`local` はローカルファイル、`s3` は S3 / S3 互換ストレージ（ローカルファイルは録音中の一次配置のみ、S3 が正本）。`s3` 時は `CHUNK_STORAGE_S3_*` が必須で、再生は presigned GET URL で配信します。 |
+| `CHUNK_STORAGE_S3_BUCKET` | - | backend が `s3` のとき必須。保存先バケット |
+| `CHUNK_STORAGE_S3_ACCESS_KEY_ID` | - | backend が `s3` のとき必須 |
+| `CHUNK_STORAGE_S3_SECRET_ACCESS_KEY` | - | backend が `s3` のとき必須 |
+| `CHUNK_STORAGE_S3_ENDPOINT` | 未設定 | S3 互換サービス用エンドポイント（MinIO, R2 等。`https://host[:port][/path]`）。未設定時は AWS `s3.<region>.amazonaws.com` |
+| `CHUNK_STORAGE_S3_REGION` | `us-east-1` | 署名用リージョン。R2 は `auto` |
+| `CHUNK_STORAGE_S3_KEY_PREFIX` | 未設定 | 全オブジェクトキーに付けるプレフィックス（末尾 `/` は自動付与） |
+| `CHUNK_STORAGE_S3_FORCE_PATH_STYLE` | endpoint 指定時 `true`、AWS 時 `false` | path-style (`endpoint/bucket/key`) を強制。多くの S3 互換サービスで必要 |
+| `CHUNK_STORAGE_S3_PRESIGN_TTL_SECONDS` | `900` | 再生用 presigned GET URL の有効秒数（最大 604800） |
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
 | `CLAUDE_MODEL` | `haiku` | Claude harness 時の `--model`（`SUMMARY_MODEL` 未指定時のフォールバック） |
 | `SUMMARY_HARNESS` | `claude` | `claude` / `cursor_agent` / `opencode` |
@@ -274,6 +283,7 @@ src/
     sql_store.rs       # PostgreSQL 実装
     storage.rs
     storage_fs.rs
+    s3.rs              # SigV4 署名付き S3/S3互換クライアント
     queue.rs
     integrations.rs
     asr.rs
