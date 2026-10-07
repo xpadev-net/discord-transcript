@@ -1,3 +1,4 @@
+use discord_transcript::application::ai_memory_extraction::materialize_ai_memory_agent_workspace;
 use discord_transcript::application::summary::materialize_summary_agent_workspace;
 use discord_transcript::application::summary::{SummaryRequest, TranscriptManifest};
 use discord_transcript::domain::privacy::MaskingStats;
@@ -374,6 +375,26 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
         ]
     );
 
+    let cursor_config = assert_agent_workspace_lockdown_configs(
+        &agent_root,
+        agent_workspace.cursor_config_path(),
+    );
+    assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
+    assert!(cursor_config.contains("Read(input/context/manifest.json)"));
+    assert!(cursor_config.contains("Write(output/summary.md)"));
+    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Asserts the deny-by-default lockdown config every agent workspace must
+/// materialize: Claude settings deny-list + hook/MCP shutdown, empty MCP
+/// servers, and the opencode permission tree. Returns the cursor cli.json
+/// contents so callers can additionally check harness-specific allow rules.
+fn assert_agent_workspace_lockdown_configs(
+    agent_root: &std::path::Path,
+    cursor_config_path: &std::path::Path,
+) -> String {
     let claude_settings: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(agent_root.join(".claude/settings.json"))
             .expect("claude settings"),
@@ -454,18 +475,68 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
         );
     }
 
-    let cursor_config = std::fs::read_to_string(agent_workspace.cursor_config_path())
-        .expect("cursor config");
-    assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
-    assert!(cursor_config.contains("Read(input/context/manifest.json)"));
-    assert!(cursor_config.contains("Write(output/summary.md)"));
+    let cursor_config =
+        std::fs::read_to_string(cursor_config_path).expect("cursor config");
     assert!(cursor_config.contains("Read(.env)"));
     assert!(cursor_config.contains("Read(.cursor/.cleanup-token)"));
     assert!(cursor_config.contains("Read(debug/**)"));
     assert!(cursor_config.contains("Read(../**)"));
     assert!(cursor_config.contains("Write(input/**)"));
     assert!(cursor_config.contains("Shell(*)"));
-    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
+    cursor_config
+}
+
+#[cfg(unix)]
+#[test]
+fn ai_memory_agent_workspace_materializes_same_lockdown_configs() {
+    let base = unique_temp_dir("ai_memory_agent_workspace");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g", "vc", "m");
+    workspace.ensure_base_dirs().expect("workspace dirs");
+    std::fs::write(workspace.masked_transcript_path(), "masked transcript")
+        .expect("write transcript");
+    std::fs::write(workspace.transcript_manifest_path(), "{}").expect("write manifest");
+    std::fs::create_dir_all(workspace.summary_dir()).expect("summary dir");
+
+    let request = SummaryRequest {
+        meeting_id: "m".to_owned(),
+        guild_id: "g".to_owned(),
+        voice_channel_id: "vc".to_owned(),
+        voice_channel_name: None,
+        title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: String::new(),
+        speaker_audio: Vec::new(),
+        language: Some("en".to_owned()),
+        workspace: workspace.clone(),
+    };
+    let agent_root = workspace.root().join("agent").join("ai-memory-1");
+
+    let agent_workspace =
+        materialize_ai_memory_agent_workspace(&request, "# summary", &agent_root)
+            .expect("materialize ai memory workspace");
+
+    for lockdown_file in [
+        ".claude/settings.json",
+        ".claude/mcp_servers.json",
+        ".cursor/cli.json",
+        ".cursor/.cleanup-token",
+        "opencode.json",
+    ] {
+        assert!(
+            agent_root.join(lockdown_file).is_file(),
+            "ai memory workspace must materialize {lockdown_file}"
+        );
+    }
+    assert!(agent_root.join("input/transcript/transcript_masked.md").is_file());
+    assert!(agent_workspace.output_dir().is_dir());
+    assert!(agent_workspace.cursor_config_path().is_file());
+    assert_agent_workspace_lockdown_configs(
+        &agent_root,
+        agent_workspace.cursor_config_path(),
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }
