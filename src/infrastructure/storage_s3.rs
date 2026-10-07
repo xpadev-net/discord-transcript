@@ -3,9 +3,14 @@ use crate::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{error, warn};
 
 /// Shared S3 object-store handle plus the layout rules that mirror local
 /// `CHUNK_STORAGE_DIR` paths into object keys: a file at
@@ -13,6 +18,147 @@ use std::sync::Arc;
 /// separators. One instance is shared by the recording writer, the summary
 /// worker's artifact uploads, the web playback endpoints, and retention
 /// deletion so every consumer derives identical keys.
+/// How many upload tasks may wait in the background queue before producers
+/// get backpressure (`save_chunk` then reports `Remote` so the session's
+/// pending-chunk retry kicks in).
+const UPLOAD_QUEUE_BOUND: usize = 64;
+/// PUT attempts before a task is dropped (failures only mean the local
+/// staging file remains the sole copy; the loss is logged).
+const UPLOAD_MAX_ATTEMPTS: u32 = 6;
+
+#[derive(Debug)]
+struct UploadTask {
+    key: String,
+    bytes: Vec<u8>,
+    content_type: String,
+    path: PathBuf,
+    attempts: u32,
+    not_before: Instant,
+}
+
+/// Single worker thread draining queued PUTs so object writes never run on
+/// the shared voice-ingest path. Failed uploads retry with exponential
+/// backoff on a delayed in-worker queue (no head-of-line blocking); after
+/// `UPLOAD_MAX_ATTEMPTS` the task is dropped — the local staging file stays.
+#[derive(Debug)]
+struct UploadQueue {
+    sender: SyncSender<UploadTask>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl UploadQueue {
+    fn start(objects: Arc<dyn ObjectStore>, retry_base: Duration) -> Self {
+        let (sender, receiver) = sync_channel::<UploadTask>(UPLOAD_QUEUE_BOUND);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
+        std::thread::Builder::new()
+            .name("s3-upload".to_owned())
+            .spawn(move || Self::worker(receiver, objects, worker_pending, retry_base))
+            .expect("s3 upload worker must spawn");
+        Self { sender, pending }
+    }
+
+    fn worker(
+        receiver: Receiver<UploadTask>,
+        objects: Arc<dyn ObjectStore>,
+        pending: Arc<AtomicUsize>,
+        retry_base: Duration,
+    ) {
+        let mut delayed: Vec<UploadTask> = Vec::new();
+        let mut disconnected = false;
+        loop {
+            let now = Instant::now();
+            let next_due = delayed
+                .iter()
+                .map(|task| task.not_before)
+                .min()
+                .unwrap_or(now + Duration::from_secs(3600));
+            let wait = next_due.saturating_duration_since(now);
+            if disconnected {
+                if delayed.is_empty() {
+                    return;
+                }
+                std::thread::sleep(wait.min(Duration::from_millis(50)));
+            } else {
+                match receiver.recv_timeout(wait.max(Duration::from_millis(1))) {
+                    Ok(task) => delayed.push(task),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                    }
+                }
+            }
+            let now = Instant::now();
+            let mut i = 0;
+            while i < delayed.len() {
+                if delayed[i].not_before > now {
+                    i += 1;
+                    continue;
+                }
+                let mut task = delayed.remove(i);
+                match objects.put_object(&task.key, &task.bytes, &task.content_type) {
+                    Ok(()) => {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    Err(err) => {
+                        task.attempts += 1;
+                        if task.attempts >= UPLOAD_MAX_ATTEMPTS {
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            error!(
+                                key = %task.key,
+                                path = %task.path.display(),
+                                attempts = task.attempts,
+                                error = %err,
+                                "recording upload failed permanently; only the local staging copy remains"
+                            );
+                        } else {
+                            let backoff = retry_base * (1 << (task.attempts - 1).min(5));
+                            warn!(
+                                key = %task.key,
+                                attempts = task.attempts,
+                                error = %err,
+                                "recording upload failed; retrying"
+                            );
+                            task.not_before = Instant::now() + backoff;
+                            delayed.push(task);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enqueues a PUT without blocking the caller.
+    fn enqueue(&self, task: UploadTask) -> Result<(), String> {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        match self.sender.try_send(task) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                Err(match err {
+                    std::sync::mpsc::TrySendError::Full(_) => {
+                        "recording upload queue is full".to_owned()
+                    }
+                    std::sync::mpsc::TrySendError::Disconnected(_) => {
+                        "recording upload worker is gone".to_owned()
+                    }
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_idle(&self) {
+        for _ in 0..500 {
+            if self.pending.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("s3 upload queue did not drain in time");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordingObjectStore {
     objects: Arc<dyn ObjectStore>,
@@ -22,6 +168,7 @@ pub struct RecordingObjectStore {
     presign_ttl_seconds: u64,
     /// `CHUNK_STORAGE_DIR`: local workspace root mirrored into object keys.
     storage_dir: PathBuf,
+    uploads: Arc<UploadQueue>,
 }
 
 impl RecordingObjectStore {
@@ -46,7 +193,24 @@ impl RecordingObjectStore {
         presign_ttl_seconds: u64,
         storage_dir: impl Into<PathBuf>,
     ) -> Self {
+        Self::with_retry_base(
+            objects,
+            key_prefix,
+            presign_ttl_seconds,
+            storage_dir,
+            Duration::from_secs(1),
+        )
+    }
+
+    fn with_retry_base(
+        objects: Arc<dyn ObjectStore>,
+        key_prefix: String,
+        presign_ttl_seconds: u64,
+        storage_dir: impl Into<PathBuf>,
+        retry_base: Duration,
+    ) -> Self {
         Self {
+            uploads: Arc::new(UploadQueue::start(objects.clone(), retry_base)),
             objects,
             key_prefix,
             presign_ttl_seconds,
@@ -56,6 +220,12 @@ impl RecordingObjectStore {
 
     pub fn store(&self) -> &Arc<dyn ObjectStore> {
         &self.objects
+    }
+
+    /// Blocks until every queued upload finished (success or final failure).
+    #[cfg(test)]
+    pub fn wait_uploads_idle(&self) {
+        self.uploads.wait_idle();
     }
 
     /// Object key mirroring `path` relative to `storage_dir`. `None` when the
@@ -73,7 +243,9 @@ impl RecordingObjectStore {
         Some(format!("{}{}", self.key_prefix, rel))
     }
 
-    /// Uploads `bytes` under the key derived from `path`.
+    /// Enqueues `bytes` for upload under the key derived from `path` and
+    /// returns immediately. Only queue-level failures surface; the worker
+    /// retries object-store failures itself.
     pub fn put_bytes(&self, path: &Path, bytes: &[u8], content_type: &str) -> Result<(), String> {
         let Some(key) = self.object_key(path) else {
             return Err(format!(
@@ -81,9 +253,14 @@ impl RecordingObjectStore {
                 path.display()
             ));
         };
-        self.objects
-            .put_object(&key, bytes, content_type)
-            .map_err(|err| err.to_string())
+        self.uploads.enqueue(UploadTask {
+            key,
+            bytes: bytes.to_vec(),
+            content_type: content_type.to_owned(),
+            path: path.to_path_buf(),
+            attempts: 0,
+            not_before: Instant::now(),
+        })
     }
 
     /// Reads `path` and uploads it under its mirrored key. Missing files are
@@ -117,13 +294,47 @@ impl RecordingObjectStore {
 
 /// `ChunkStorage` for `CHUNK_STORAGE_BACKEND=s3`: every chunk is still
 /// written to the local workspace as the recording-time staging copy (live
-/// transcription and assembly read local paths) and is PUT to the object
-/// store, which is the canonical durable copy. A failed upload fails the
-/// whole save so the session's pending-chunk retry keeps re-attempting it.
+/// transcription and assembly read local paths) and is queued for upload to
+/// the object store, which is the canonical durable copy. Upload runs on the
+/// shared background queue so the voice-ingest path never blocks on object
+/// I/O; only a saturated queue surfaces `Remote` (the session's
+/// pending-chunk retry then keeps re-attempting the save).
 #[derive(Debug)]
 pub struct S3ChunkStorage {
     local: LocalChunkStorage,
     objects: RecordingObjectStore,
+    /// Staged files whose upload never reached the queue (`start_ms` →
+    /// (path, byte length)). A retried save may stage under a different
+    /// filename (sequence re-assigned, or the user re-keyed), so superseded
+    /// duplicates are removed before they would double-count in assembly.
+    failed_staged: Mutex<HashMap<u64, Vec<(PathBuf, usize)>>>,
+}
+
+impl S3ChunkStorage {
+    /// Removes earlier staged files for `start_ms` whose bytes equal the
+    /// chunk being saved — they are the same audio restaged by a retry.
+    fn drop_superseded_staging(&self, start_ms: u64, bytes: &[u8]) {
+        let mut pending = self.failed_staged.lock().unwrap();
+        let Some(candidates) = pending.get_mut(&start_ms) else {
+            return;
+        };
+        candidates.retain(|(path, len)| {
+            if *len != bytes.len() {
+                return true;
+            }
+            let same = std::fs::read(path).is_ok_and(|content| content == bytes);
+            if same && std::fs::remove_file(path).is_err() {
+                warn!(
+                    path = %path.display(),
+                    "failed to remove superseded staging file; duplicate may persist"
+                );
+            }
+            !same
+        });
+        if candidates.is_empty() {
+            pending.remove(&start_ms);
+        }
+    }
 }
 
 impl ChunkStorage for S3ChunkStorage {
@@ -135,12 +346,19 @@ impl ChunkStorage for S3ChunkStorage {
         start_ms: u64,
         bytes: &[u8],
     ) -> Result<SavedChunk, ChunkStorageError> {
+        self.drop_superseded_staging(start_ms, bytes);
         let saved = self
             .local
             .save_chunk(meeting_id, user_id, sequence, start_ms, bytes)?;
-        self.objects
-            .put_bytes(&saved.path, bytes, "audio/wav")
-            .map_err(ChunkStorageError::Remote)?;
+        if let Err(err) = self.objects.put_bytes(&saved.path, bytes, "audio/wav") {
+            self.failed_staged
+                .lock()
+                .unwrap()
+                .entry(start_ms)
+                .or_default()
+                .push((saved.path.clone(), bytes.len()));
+            return Err(ChunkStorageError::Remote(err));
+        }
         Ok(saved)
     }
 }
@@ -162,7 +380,11 @@ impl MeetingChunkStorage {
     ) -> Self {
         let local = LocalChunkStorage::new(workspace, meeting_id);
         match objects {
-            Some(objects) => Self::S3(S3ChunkStorage { local, objects }),
+            Some(objects) => Self::S3(S3ChunkStorage {
+                local,
+                objects,
+                failed_staged: Mutex::new(HashMap::new()),
+            }),
             None => Self::Local(local),
         }
     }
@@ -220,6 +442,8 @@ mod tests {
     struct FakeObjectStore {
         puts: Mutex<Vec<(String, Vec<u8>, String)>>,
         fail_puts: Mutex<bool>,
+        /// Kills the upload worker (panic) to exercise queue-disconnect paths.
+        panic_puts: Mutex<bool>,
         lists: Mutex<Vec<String>>,
         deletes: Mutex<Vec<Vec<String>>>,
         list_result: Mutex<Vec<String>>,
@@ -227,6 +451,9 @@ mod tests {
 
     impl ObjectStore for FakeObjectStore {
         fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> Result<(), S3Error> {
+            if *self.panic_puts.lock().unwrap() {
+                panic!("injected put panic");
+            }
             if *self.fail_puts.lock().unwrap() {
                 return Err(S3Error::Status {
                     status: 500,
@@ -308,11 +535,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let (fake, dyn_store) = fake_store();
         let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
-        let storage = MeetingChunkStorage::new(layout_meeting(&base), "m1", Some(objects));
+        let storage = MeetingChunkStorage::new(layout_meeting(&base), "m1", Some(objects.clone()));
 
         let saved = storage
             .save_chunk("m1", "u1", 1, 0, b"wav-data")
             .expect("save should succeed");
+        objects.wait_uploads_idle();
 
         assert!(saved.path.exists());
         let rel = saved.path.strip_prefix(&base).unwrap().to_path_buf();
@@ -330,25 +558,83 @@ mod tests {
     }
 
     #[test]
-    fn s3_chunk_storage_reports_remote_error_but_keeps_staging_file() {
+    fn s3_chunk_storage_retries_failed_upload_and_keeps_staging_file() {
         let base = temp_dir("put_fail");
         let _ = std::fs::remove_dir_all(&base);
         let (fake, dyn_store) = fake_store();
         *fake.fail_puts.lock().unwrap() = true;
-        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
-        let storage = MeetingChunkStorage::new(layout_meeting(&base), "m1", Some(objects));
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(1),
+        );
+        let storage = MeetingChunkStorage::new(layout_meeting(&base), "m1", Some(objects.clone()));
+
+        let saved = storage
+            .save_chunk("m1", "u1", 1, 0, b"wav-data")
+            .expect("enqueue should succeed even when the store fails");
+        objects.wait_uploads_idle();
+
+        assert!(fake.puts.lock().unwrap().is_empty());
+        // The staging copy is kept so post-incident recovery still has it.
+        assert!(saved.path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dead upload worker surfaces `Remote`, and a retry of the same audio
+    /// under a different filename removes the superseded staging file so
+    /// assembly never sees it twice.
+    #[test]
+    fn s3_chunk_storage_remote_error_dedupes_restaged_chunk() {
+        let base = temp_dir("put_dead");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(1),
+        );
+        let storage = MeetingChunkStorage::new(layout_meeting(&base), "m1", Some(objects.clone()));
+
+        // Kill the worker, then keep probing until the disconnect is visible.
+        *fake.panic_puts.lock().unwrap() = true;
+        let probe = base.join("workspaces/g/vc/m/probe.json");
+        std::fs::create_dir_all(probe.parent().unwrap()).unwrap();
+        let mut gone = false;
+        for _ in 0..200 {
+            if objects
+                .put_bytes(&probe, b"{}", "application/json")
+                .is_err()
+            {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(gone, "upload worker never reported disconnection");
 
         let err = storage
             .save_chunk("m1", "u1", 1, 0, b"wav-data")
-            .expect_err("put failure must surface as Remote");
+            .expect_err("save must surface Remote once the worker is gone");
         match err {
             ChunkStorageError::Remote(detail) => {
-                assert!(detail.contains("injected put failure"));
+                assert!(detail.contains("worker is gone"));
             }
             other => panic!("expected Remote error, got {other:?}"),
         }
-        // The staging copy was still written so a retry can re-upload it.
-        let staged = layout_meeting(&base).audio_dir().join("u1_1_0.wav");
+        let first_path = layout_meeting(&base).audio_dir().join("u1_1_0.wav");
+        assert!(first_path.exists());
+
+        let err = storage
+            .save_chunk("m1", "u2", 7, 0, b"wav-data")
+            .expect_err("retry still fails while the worker is dead");
+        assert!(matches!(err, ChunkStorageError::Remote(_)));
+        assert!(!first_path.exists(), "superseded staging file was removed");
+        let staged = layout_meeting(&base).audio_dir().join("u2_7_0.wav");
         assert!(staged.exists());
         let _ = std::fs::remove_dir_all(&base);
     }

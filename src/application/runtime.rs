@@ -8035,6 +8035,34 @@ impl ScaffoldHandler {
             }
         };
 
+        // Under the s3 backend, mirror the playback artifacts (mixdown +
+        // per-speaker wavs) to the object store. Uploads are queued in the
+        // background; a missing local file or enqueue failure only warns —
+        // the local copy is still authoritative for this run.
+        if let Some(objects) = &self.recording_objects {
+            let artifact_paths = std::iter::once(std::path::Path::new(&audio_path)).chain(
+                speaker_audio
+                    .iter()
+                    .map(|input| std::path::Path::new(&input.audio_path)),
+            );
+            for path in artifact_paths {
+                match objects.upload_file(path, "audio/wav") {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        path = %path.display(),
+                        "recording artifact missing locally; skipping object upload"
+                    ),
+                    Err(err) => warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to queue recording artifact upload"
+                    ),
+                }
+            }
+        }
+
         let request = crate::application::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
