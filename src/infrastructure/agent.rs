@@ -35,14 +35,21 @@ fn summary_engine_error(message: impl Into<String>) -> SummaryError {
     SummaryError::SummaryEngine(message.into())
 }
 
+/// Path/limits snapshot the tool bodies run against. Bodies capture this
+/// — never the `AgentToolFs` itself — so the last `AgentToolFs` reference
+/// cannot be dropped inside a tracked task (see `Drop` below).
+struct ToolFsInner {
+    root: PathBuf,
+    max_read_bytes: u64,
+    max_write_bytes: u64,
+}
+
 /// Filesystem surface the workspace tools expose to the model: reads and
 /// listings under `input/`, writes under `output/`. All paths go through
 /// `validate_agent_relative_path` and are re-checked against the
 /// canonicalized workspace root so symlinked components cannot escape.
 pub struct AgentToolFs {
-    root: PathBuf,
-    max_read_bytes: u64,
-    max_write_bytes: u64,
+    inner: Arc<ToolFsInner>,
     /// Every tool body spawned so far. `spawn_blocking` tasks keep running
     /// after their tool future is dropped (e.g. when the agent run times
     /// out), so the driver drains this set via `settle` before validating
@@ -67,9 +74,11 @@ impl AgentToolFs {
             }
         }
         Ok(Self {
-            root,
-            max_read_bytes: MAX_TOOL_READ_BYTES,
-            max_write_bytes: MAX_TOOL_WRITE_BYTES,
+            inner: Arc::new(ToolFsInner {
+                root,
+                max_read_bytes: MAX_TOOL_READ_BYTES,
+                max_write_bytes: MAX_TOOL_WRITE_BYTES,
+            }),
             pending: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         })
     }
@@ -99,13 +108,47 @@ impl AgentToolFs {
         while pending.join_next().await.is_some() {}
     }
 
-    /// Resolve a model-supplied relative path to an absolute path under
-    /// `root`, refusing anything that does not start with `required_first`.
-    pub fn resolve(
+    pub fn list_inputs(&self) -> Result<Value, ToolExecutionError> {
+        self.inner.list_inputs()
+    }
+
+    pub fn read_input(
         &self,
         relative: &str,
-        required_first: &str,
-    ) -> Result<PathBuf, ToolExecutionError> {
+        offset: u64,
+        limit: u64,
+    ) -> Result<String, ToolExecutionError> {
+        self.inner.read_input(relative, offset, limit)
+    }
+
+    pub fn write_output(&self, relative: &str, contents: &str) -> Result<u64, ToolExecutionError> {
+        self.inner.write_output(relative, contents)
+    }
+}
+
+impl Drop for AgentToolFs {
+    /// Join every started tool task before the fs goes away. A
+    /// `spawn_blocking` task cannot be cancelled once running — dropping
+    /// the fs (end of an attempt, workspace teardown) without this wait
+    /// would let a timed-out write land on the workspace afterwards. Safe
+    /// from self-join because tool bodies only hold `ToolFsInner`, never
+    /// this object.
+    fn drop(&mut self) {
+        let pending = self.pending.get_mut();
+        loop {
+            while pending.try_join_next().is_some() {}
+            if pending.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+impl ToolFsInner {
+    /// Resolve a model-supplied relative path to an absolute path under
+    /// `root`, refusing anything that does not start with `required_first`.
+    fn resolve(&self, relative: &str, required_first: &str) -> Result<PathBuf, ToolExecutionError> {
         let relative = validate_agent_relative_path(Path::new(relative), required_first)
             .map_err(|err| ToolExecutionError::refused(format!("invalid workspace path: {err}")))?;
         let candidate = self.root.join(&relative);
@@ -132,7 +175,7 @@ impl AgentToolFs {
         Ok(candidate)
     }
 
-    pub fn list_inputs(&self) -> Result<Value, ToolExecutionError> {
+    fn list_inputs(&self) -> Result<Value, ToolExecutionError> {
         let input_dir = self.root.join(AGENT_INPUT_DIR);
         let mut files = Vec::new();
         let mut stack = vec![input_dir.clone()];
@@ -166,7 +209,7 @@ impl AgentToolFs {
         Ok(json!({ "files": files }))
     }
 
-    pub fn read_input(
+    fn read_input(
         &self,
         relative: &str,
         offset: u64,
@@ -239,7 +282,7 @@ impl AgentToolFs {
         })
     }
 
-    pub fn write_output(&self, relative: &str, contents: &str) -> Result<u64, ToolExecutionError> {
+    fn write_output(&self, relative: &str, contents: &str) -> Result<u64, ToolExecutionError> {
         if contents.len() as u64 > self.max_write_bytes {
             return Err(ToolExecutionError::refused(format!(
                 "write exceeds {} bytes limit",
@@ -274,23 +317,6 @@ impl AgentToolFs {
             ToolExecutionError::other(format!("failed to write {relative}: {err}"))
         })?;
         Ok(contents.len() as u64)
-    }
-}
-
-impl Drop for AgentToolFs {
-    /// Join every started tool task before the fs goes away. A
-    /// `spawn_blocking` task cannot be cancelled once running — dropping
-    /// the fs (end of an attempt, workspace teardown) without this wait
-    /// would let a timed-out write land on the workspace afterwards.
-    fn drop(&mut self) {
-        let pending = self.pending.get_mut();
-        loop {
-            while pending.try_join_next().is_some() {}
-            if pending.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
     }
 }
 
@@ -350,7 +376,7 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&list_fs);
                 Box::pin(async move {
                     // File IO is synchronous; keep it off the async worker.
-                    let inner = Arc::clone(&fs);
+                    let inner = Arc::clone(&fs.inner);
                     fs.spawn_tool(move || inner.list_inputs())
                         .await
                         .map(ToolOutput::json)
@@ -376,7 +402,7 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&read_fs);
                 Box::pin(async move {
                     let args: ReadInputArgs = parse_args(args)?;
-                    let inner = Arc::clone(&fs);
+                    let inner = Arc::clone(&fs.inner);
                     fs.spawn_tool(move || {
                         inner.read_input(
                             &args.path,
@@ -408,7 +434,7 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&write_fs);
                 Box::pin(async move {
                     let args: WriteOutputArgs = parse_args(args)?;
-                    let inner = Arc::clone(&fs);
+                    let inner = Arc::clone(&fs.inner);
                     fs.spawn_tool(move || inner.write_output(&args.path, &args.contents))
                         .await
                         .map(|written| ToolOutput::text(format!("wrote {written} bytes")))
@@ -575,5 +601,40 @@ mod tests {
             fs.settle().await;
             assert!(done.load(Ordering::Relaxed));
         });
+    }
+
+    #[test]
+    fn tool_fs_drop_joins_started_tool_tasks() {
+        let root = fresh_workdir();
+        let fs = Arc::new(AgentToolFs::new(&root).unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let done = {
+            use std::sync::atomic::AtomicBool;
+            let done = Arc::new(AtomicBool::new(false));
+            rt.block_on(async {
+                let flag = Arc::clone(&done);
+                let task_fs = Arc::clone(&fs);
+                let tool = tokio::spawn(async move {
+                    let _ = task_fs
+                        .spawn_tool(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            flag.store(true, Ordering::Relaxed);
+                            Ok(())
+                        })
+                        .await;
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tool.abort();
+                let _ = tool.await; // ensure the aborted future released its Arc<AgentToolFs>
+            });
+            done
+        };
+        // Dropping the fs while a tool task still runs must wait for it —
+        // and not hang (the task holds only a ToolFsInner snapshot).
+        drop(fs);
+        assert!(done.load(Ordering::Relaxed));
     }
 }
