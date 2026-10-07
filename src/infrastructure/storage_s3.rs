@@ -72,63 +72,63 @@ impl UploadTask {
     }
 }
 
-/// Generation tracking for one key: `latest` supersedes older queued
-/// writes, while `outstanding` holds every generation that is queued,
-/// delayed, or in-flight. `latest` may only be garbage-collected once
-/// `outstanding` is empty — removing it earlier would let an older retried
-/// task overwrite a newer snapshot (e.g. `ssrc_mapping.json`).
+/// Generation tracking for one key. `outstanding` holds every generation
+/// that is queued, delayed, or in-flight; `delivered` records the newest
+/// generation confirmed uploaded. Both are garbage-collected once
+/// `outstanding` empties — while anything older remains, `delivered` keeps
+/// a delayed retry from overwriting a newer snapshot (e.g. `ssrc_mapping.json`).
 #[derive(Debug, Default)]
 struct GenerationState {
-    latest: HashMap<String, u64>,
     outstanding: HashMap<String, BTreeSet<u64>>,
+    delivered: HashMap<String, u64>,
 }
 
 impl GenerationState {
-    /// Records a fresh enqueue and returns whether any older write for the
-    /// key is still outstanding.
+    /// Records a fresh enqueue for the key.
     fn track(&mut self, key: &str, generation: u64) {
-        self.latest.insert(key.to_owned(), generation);
         self.outstanding
             .entry(key.to_owned())
             .or_default()
             .insert(generation);
     }
 
-    /// A task is superseded when a newer generation was enqueued for its key.
+    /// A task is superseded when a newer write for its key is queued or was
+    /// already delivered — a rejected enqueue never counts because it is
+    /// rolled back via `untrack` before this is consulted.
     fn is_superseded(&self, key: &str, generation: u64) -> bool {
-        self.latest
-            .get(key)
-            .is_some_and(|latest| *latest > generation)
+        let newest = [
+            self.outstanding
+                .get(key)
+                .and_then(|set| set.iter().next_back())
+                .copied(),
+            self.delivered.get(key).copied(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        newest.is_some_and(|newest| newest > generation)
     }
 
-    /// Releases one generation; drops the whole marker once no queued or
-    /// in-flight write for the key remains.
-    fn settle(&mut self, key: &str, generation: u64) {
-        if let Some(set) = self.outstanding.get_mut(key) {
-            set.remove(&generation);
-            if !set.is_empty() {
-                return;
-            }
-        }
-        self.outstanding.remove(key);
-        self.latest.remove(key);
-    }
-
-    /// Rolls back a generation that was enqueued but never queued (rejected
-    /// enqueue): restores `latest` to the newest still-outstanding write so
-    /// the rejected write cannot supersede accepted ones.
+    /// Drops one generation; forgets the key entirely (including the
+    /// delivered marker) once no queued or in-flight write for it remains.
     fn untrack(&mut self, key: &str, generation: u64) {
         if let Some(set) = self.outstanding.get_mut(key) {
             set.remove(&generation);
-            if !set.is_empty() {
-                if let Some(newest) = set.iter().next_back() {
-                    self.latest.insert(key.to_owned(), *newest);
-                }
-                return;
+            if set.is_empty() {
+                self.outstanding.remove(key);
+                self.delivered.remove(key);
             }
         }
-        self.outstanding.remove(key);
-        self.latest.remove(key);
+    }
+
+    /// Releases a task; when `delivered`, the generation also counts as a
+    /// completed write so older outstanding retries stay superseded.
+    fn settle(&mut self, key: &str, generation: u64, delivered: bool) {
+        if delivered {
+            let slot = self.delivered.entry(key.to_owned()).or_default();
+            *slot = (*slot).max(generation);
+        }
+        self.untrack(key, generation);
     }
 }
 
@@ -192,7 +192,7 @@ struct UploadQueue {
     pending: Arc<AtomicUsize>,
     /// Inline bytes held by queued + delayed tasks; bounds total memory.
     pending_bytes: Arc<AtomicUsize>,
-    /// Per-key write ordering state (latest generation + outstanding set).
+    /// Per-key write ordering state (outstanding set + delivered marker).
     generations: Arc<Mutex<GenerationState>>,
     next_generation: AtomicU64,
     /// Cancellation state shared with the worker (see `CancelState`).
@@ -289,13 +289,15 @@ impl UploadQueue {
     ) {
         // A task counts down pending/pending_bytes exactly once, whichever way
         // it leaves: delivered, superseded, cancelled, or abandoned in drain.
-        let settle = |task: &UploadTask| {
+        // `delivered` marks the write as landed so older queued generations
+        // for the key stay superseded.
+        let settle = |task: &UploadTask, delivered: bool| {
             pending.fetch_sub(1, Ordering::SeqCst);
             pending_bytes.fetch_sub(task.counted_bytes(), Ordering::SeqCst);
             generations
                 .lock()
                 .unwrap()
-                .settle(&task.key, task.generation);
+                .settle(&task.key, task.generation, delivered);
         };
         let mut delayed: Vec<UploadTask> = Vec::new();
         let mut disconnected = false;
@@ -344,7 +346,7 @@ impl UploadQueue {
                     .unwrap()
                     .is_superseded(&task.key, task.generation)
                 {
-                    settle(&task);
+                    settle(&task, false);
                     continue;
                 }
                 // File-backed tasks stream from disk at upload time so large
@@ -358,7 +360,7 @@ impl UploadQueue {
                         path = %task.path.display(),
                         "upload source file is gone; dropping task"
                     );
-                    settle(&task);
+                    settle(&task, false);
                     continue;
                 }
                 // Check cancellation and mark the key in-flight atomically —
@@ -374,7 +376,7 @@ impl UploadQueue {
                             "failed to clean up object under deleted prefix"
                         );
                     }
-                    settle(&task);
+                    settle(&task, false);
                     continue;
                 }
                 let result = match &task.source {
@@ -387,7 +389,7 @@ impl UploadQueue {
                 };
                 cancel.lock().unwrap().inflight.remove(&task.key);
                 match result {
-                    Ok(()) => settle(&task),
+                    Ok(()) => settle(&task, true),
                     Err(err) => {
                         task.attempts += 1;
                         if disconnected {
@@ -398,7 +400,7 @@ impl UploadQueue {
                                 error = %err,
                                 "recording upload failed during shutdown drain; only the local staging copy remains"
                             );
-                            settle(&task);
+                            settle(&task, false);
                         } else {
                             let backoff = retry_base * (1 << task.attempts.min(5));
                             warn!(
@@ -1608,17 +1610,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A rejected enqueue rolls its generation back so it cannot supersede
-    /// an accepted older write for the same key.
+    /// A rejected enqueue is fully rolled back: it can neither supersede
+    /// an accepted older write nor weaken supersession by a delivered newer
+    /// write for the same key.
     #[test]
-    fn rejected_enqueue_does_not_supersede_accepted_write() {
+    fn rejected_enqueue_never_supersedes_and_delivered_wins() {
         let mut state = GenerationState::default();
+        // Rejected gen2 must not supersede accepted gen1.
         state.track("k", 1);
         state.track("k", 2);
         state.untrack("k", 2);
         assert!(!state.is_superseded("k", 1));
-        state.settle("k", 1);
-        assert!(!state.is_superseded("k", 3));
+        // A delivered gen2 keeps superseding the delayed gen1...
+        state.track("k", 2);
+        state.settle("k", 2, true);
+        assert!(state.is_superseded("k", 1));
+        // ...even when a still-newer enqueue is rejected afterwards.
+        state.track("k", 3);
+        state.untrack("k", 3);
+        assert!(state.is_superseded("k", 1));
+        // Once gen1 is gone the key is forgotten entirely.
+        state.settle("k", 1, false);
+        assert!(!state.is_superseded("k", 4));
     }
 
     #[test]
