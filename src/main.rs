@@ -22,6 +22,7 @@ use discord_transcript::infrastructure::sql::{
 };
 use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
+use discord_transcript::infrastructure::storage_s3::RecordingObjectStore;
 use discord_transcript::interfaces::web;
 use serenity::all::{ChannelId, EditMessage};
 use serenity::http::Http;
@@ -405,11 +406,28 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         retry_policy,
         command_timeout: DEFAULT_COMMAND_TIMEOUT,
     };
+    let recording_objects = config
+        .chunk_storage_s3
+        .as_ref()
+        .map(|settings| {
+            RecordingObjectStore::from_settings(settings, config.chunk_storage_dir.clone()).inspect(
+                |store| {
+                    tracing::info!(
+                        bucket = %settings.bucket,
+                        endpoint = %store.store().endpoint_label(),
+                        key_prefix = %settings.key_prefix,
+                        "chunk storage backend: s3"
+                    );
+                },
+            )
+        })
+        .transpose()?;
     let options = SummaryJobOptions {
         max_retries: config.summary_max_retries,
         audio_base_dir: config.chunk_storage_dir.clone(),
         language: config.whisper_language.clone(),
         resample_to_16k: config.whisper_resample_to_16k,
+        recording_objects,
     };
     let mut idle_sleep = Box::pin(tokio::time::sleep(Duration::ZERO));
 

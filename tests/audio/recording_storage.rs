@@ -4,6 +4,7 @@ use discord_transcript::audio::songbird_adapter::SsrcTracker;
 use discord_transcript::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
+use discord_transcript::infrastructure::storage_s3::MeetingChunkStorage;
 use discord_transcript::infrastructure::workspace::{
     MeetingWorkspaceLayout, SSRC_MAPPING_FILENAME,
 };
@@ -416,7 +417,7 @@ fn recording_session_persists_ssrc_mapping_for_rekeyed_pending_failed_chunks() {
     let base = unique_temp_dir("recording_session_pending_failed_mapping");
     let layout = MeetingWorkspaceLayout::new(&base);
     let meeting_dir = layout.for_meeting("g1", "vc1", "meeting-mapping");
-    let storage = LocalChunkStorage::new(meeting_dir.clone(), "meeting-mapping");
+    let storage = MeetingChunkStorage::new(meeting_dir.clone(), "meeting-mapping", None);
 
     std::fs::create_dir_all(meeting_dir.root())
         .expect("meeting root should be creatable");
@@ -471,7 +472,8 @@ fn recording_session_overwrites_ssrc_mapping_on_retry_snapshot() {
     let base = unique_temp_dir("recording_session_mapping_overwrite");
     let layout = MeetingWorkspaceLayout::new(&base);
     let meeting_dir = layout.for_meeting("g1", "vc1", "meeting-mapping-overwrite");
-    let storage = LocalChunkStorage::new(meeting_dir.clone(), "meeting-mapping-overwrite");
+    let storage =
+        MeetingChunkStorage::new(meeting_dir.clone(), "meeting-mapping-overwrite", None);
 
     let mut session = RecordingSession::new(
         "meeting-mapping-overwrite".to_owned(),

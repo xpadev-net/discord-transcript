@@ -13,12 +13,17 @@ pub struct SavedChunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkStorageError {
     Io(String),
+    /// The remote (object-store) copy failed after the local staging write
+    /// succeeded. Callers retry, which rewrites the same local path and
+    /// re-uploads the same key.
+    Remote(String),
 }
 
 impl Display for ChunkStorageError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "filesystem error: {err}"),
+            Self::Remote(err) => write!(f, "object store error: {err}"),
         }
     }
 }

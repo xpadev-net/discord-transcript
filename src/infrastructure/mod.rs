@@ -9,4 +9,5 @@ pub mod sql;
 pub mod sql_store;
 pub mod storage;
 pub mod storage_fs;
+pub mod storage_s3;
 pub mod workspace;

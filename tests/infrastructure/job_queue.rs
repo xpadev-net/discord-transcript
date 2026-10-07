@@ -426,6 +426,7 @@ fn worker_job_processing_waits_for_notification_before_completion() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("ja".to_owned()),
             resample_to_16k: false,
+            recording_objects: None,
         },
     )
     .expect("worker should succeed")
@@ -571,6 +572,7 @@ fn worker_job_processing_uses_snapshot_language_for_asr() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("option-en".to_owned()),
             resample_to_16k: true,
+            recording_objects: None,
         },
     )
     .expect("worker should succeed")
@@ -615,6 +617,7 @@ fn worker_job_processing_does_not_run_disabled_summary_snapshot() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("option-en".to_owned()),
             resample_to_16k: true,
+            recording_objects: None,
         },
     )
     .expect("disabled summary job should be consumed without work");
@@ -670,6 +673,7 @@ fn worker_job_processing_marks_disabled_summary_done_when_meeting_already_posted
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("option-en".to_owned()),
             resample_to_16k: true,
+            recording_objects: None,
         },
     )
     .expect("disabled summary job should be consumed without work");
@@ -713,6 +717,7 @@ fn worker_job_processing_marks_posted_meeting_job_done_without_rerunning_summary
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("option-en".to_owned()),
             resample_to_16k: true,
+            recording_objects: None,
         },
     )
     .expect("posted meeting job should be consumed without work");
@@ -764,6 +769,7 @@ fn worker_job_processing_rejects_disabled_summary_for_non_terminal_pipeline_stat
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("option-en".to_owned()),
             resample_to_16k: true,
+            recording_objects: None,
         },
     )
     .expect_err("disabled summary should not be suppressed from transcribing");
@@ -824,6 +830,7 @@ fn worker_job_processing_requeues_when_generated_summary_persistence_fails() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: None,
             resample_to_16k: false,
+            recording_objects: None,
         },
     )
     .expect_err("summary persistence failure should retry");
@@ -868,6 +875,7 @@ fn worker_job_processing_marks_failed_after_retries_exhausted() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: None,
             resample_to_16k: false,
+            recording_objects: None,
         },
     );
     assert!(result.is_err(), "should fail with invalid JSON");
@@ -909,6 +917,7 @@ fn worker_job_processing_rejects_empty_chunks() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: None,
             resample_to_16k: false,
+            recording_objects: None,
         },
     );
     let err = result.expect_err("should fail when only empty chunks exist");
@@ -954,6 +963,7 @@ fn worker_job_processing_ignores_temporary_wav_chunks() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: None,
             resample_to_16k: false,
+            recording_objects: None,
         },
     )
     .expect_err("temporary chunks must not be processed as complete audio");
@@ -1001,6 +1011,7 @@ fn worker_job_processing_rejects_pcm_only_chunks() {
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: None,
             resample_to_16k: false,
+            recording_objects: None,
         },
     );
     let err = result.expect_err("should fail when only pcm chunks are non-empty");
@@ -1047,6 +1058,7 @@ fn worker_job_processing_falls_back_to_legacy_when_workspace_chunks_are_empty() 
             audio_base_dir: base.path().to_string_lossy().to_string(),
             language: Some("ja".to_owned()),
             resample_to_16k: false,
+            recording_objects: None,
         },
     )
     .expect("worker should succeed")
