@@ -11840,31 +11840,39 @@ async fn api_speakers(
             (!prefixes.is_empty()).then(|| (objects.clone(), prefixes))
         }) {
         let (objects, prefixes) = objects;
+        // Each prefix is listed independently: a successful workspace list is
+        // kept even when the legacy list fails, and vice versa.
         match tokio::task::spawn_blocking(move || {
             prefixes
                 .iter()
-                .map(|prefix| objects.list_keys(prefix))
-                .collect::<Result<Vec<_>, _>>()
+                .map(|prefix| (prefix.clone(), objects.list_keys(prefix)))
+                .collect::<Vec<_>>()
         })
         .await
         {
-            Ok(Ok(key_lists)) => Some(Arc::new(
-                key_lists
-                    .iter()
-                    .flatten()
-                    .filter_map(|key| key.rsplit('/').next().map(str::to_owned))
-                    .collect::<HashSet<String>>(),
-            )),
-            result => {
-                let detail = match result {
-                    Ok(Err(err)) => err.to_string(),
-                    Err(join_err) => join_err.to_string(),
-                    Ok(Ok(_)) => unreachable!(),
-                };
+            Ok(results) => {
+                let mut filenames = HashSet::new();
+                for (prefix, result) in results {
+                    match result {
+                        Ok(keys) => filenames.extend(
+                            keys.iter()
+                                .filter_map(|key| key.rsplit('/').next().map(str::to_owned)),
+                        ),
+                        Err(err) => warn!(
+                            meeting_id = %meeting_id,
+                            prefix = %prefix,
+                            error = %err,
+                            "object store speaker list failed; falling back to local speaker files"
+                        ),
+                    }
+                }
+                Some(Arc::new(filenames))
+            }
+            Err(join_err) => {
                 warn!(
                     meeting_id = %meeting_id,
-                    error = %detail,
-                    "object store list failed; falling back to local speaker files"
+                    error = %join_err,
+                    "object store list task failed; falling back to local speaker files"
                 );
                 Some(Arc::new(HashSet::new()))
             }
