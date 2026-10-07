@@ -1241,7 +1241,7 @@ fn create_new_file_under_agent_root(
     create_file_at(current_dir.as_raw_fd(), file_name, &full_path)
 }
 
-fn validate_agent_relative_path(
+pub(crate) fn validate_agent_relative_path(
     path: &Path,
     required_first_component: &str,
 ) -> Result<PathBuf, AgentWorkspaceError> {
