@@ -6,11 +6,11 @@ use crate::infrastructure::workspace::MeetingWorkspacePaths;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{error, warn};
+use tracing::warn;
 
 /// Shared S3 object-store handle plus the layout rules that mirror local
 /// `CHUNK_STORAGE_DIR` paths into object keys: a file at
@@ -22,9 +22,10 @@ use tracing::{error, warn};
 /// get backpressure (`save_chunk` then reports `Remote` so the session's
 /// pending-chunk retry kicks in).
 const UPLOAD_QUEUE_BOUND: usize = 64;
-/// PUT attempts before a task is dropped (failures only mean the local
-/// staging file remains the sole copy; the loss is logged).
-const UPLOAD_MAX_ATTEMPTS: u32 = 6;
+/// Total bytes the queue (channel + delayed retries) may hold; WAV payloads
+/// ride in the tasks, so task-count alone cannot bound memory. Producers
+/// exceeding the cap get `Remote` backpressure exactly like a full channel.
+const UPLOAD_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 struct UploadTask {
@@ -32,38 +33,89 @@ struct UploadTask {
     bytes: Vec<u8>,
     content_type: String,
     path: PathBuf,
+    /// Monotonic enqueue order — a task is skipped when a newer write for the
+    /// same key exists (e.g. a fresher `ssrc_mapping.json` snapshot).
+    generation: u64,
     attempts: u32,
     not_before: Instant,
 }
 
 /// Single worker thread draining queued PUTs so object writes never run on
 /// the shared voice-ingest path. Failed uploads retry with exponential
-/// backoff on a delayed in-worker queue (no head-of-line blocking); after
-/// `UPLOAD_MAX_ATTEMPTS` the task is dropped — the local staging file stays.
+/// backoff on a delayed in-worker queue — without an attempt cap, so an S3
+/// outage resumes by itself once the service recovers instead of stranding
+/// chunks that only exist as local staging files. Memory is bounded by
+/// `UPLOAD_MAX_PENDING_BYTES` + `UPLOAD_QUEUE_BOUND`; saturation surfaces as
+/// `Remote` so session-level pending retries and `audio_loss` metrics still
+/// cover a prolonged outage.
+///
+/// Drop disconnects the channel and joins the worker: during drain each
+/// queued task is attempted exactly once (no retries), so shutdown waits for
+/// in-flight uploads but stays bounded.
 #[derive(Debug)]
 struct UploadQueue {
-    sender: SyncSender<UploadTask>,
+    /// `Option` so `Drop` can close the channel before joining the worker.
+    sender: Option<SyncSender<UploadTask>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Tasks in flight or waiting; test-only drain signal.
     pending: Arc<AtomicUsize>,
+    /// Bytes held by queued + delayed tasks; bounds total memory.
+    pending_bytes: Arc<AtomicUsize>,
+    /// Latest generation enqueued per key — supersedes older queued writes.
+    latest_generations: Arc<Mutex<HashMap<String, u64>>>,
+    next_generation: AtomicU64,
 }
 
 impl UploadQueue {
     fn start(objects: Arc<dyn ObjectStore>, retry_base: Duration) -> Self {
         let (sender, receiver) = sync_channel::<UploadTask>(UPLOAD_QUEUE_BOUND);
         let pending = Arc::new(AtomicUsize::new(0));
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
+        let latest = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
         let worker_pending = Arc::clone(&pending);
-        std::thread::Builder::new()
+        let worker_bytes = Arc::clone(&pending_bytes);
+        let worker_latest = Arc::clone(&latest);
+        let worker = std::thread::Builder::new()
             .name("s3-upload".to_owned())
-            .spawn(move || Self::worker(receiver, objects, worker_pending, retry_base))
+            .spawn(move || {
+                Self::worker(
+                    receiver,
+                    objects,
+                    worker_pending,
+                    worker_bytes,
+                    worker_latest,
+                    retry_base,
+                )
+            })
             .expect("s3 upload worker must spawn");
-        Self { sender, pending }
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            pending,
+            pending_bytes,
+            latest_generations: latest,
+            next_generation: AtomicU64::new(0),
+        }
     }
 
     fn worker(
         receiver: Receiver<UploadTask>,
         objects: Arc<dyn ObjectStore>,
         pending: Arc<AtomicUsize>,
+        pending_bytes: Arc<AtomicUsize>,
+        latest: Arc<Mutex<HashMap<String, u64>>>,
         retry_base: Duration,
     ) {
+        // A task counts down pending/pending_bytes exactly once, whichever way
+        // it leaves: delivered, superseded, or abandoned during drain.
+        let settle = |task: &UploadTask| {
+            pending.fetch_sub(1, Ordering::SeqCst);
+            pending_bytes.fetch_sub(task.bytes.len(), Ordering::SeqCst);
+            let mut latest = latest.lock().unwrap();
+            if latest.get(&task.key) == Some(&task.generation) {
+                latest.remove(&task.key);
+            }
+        };
         let mut delayed: Vec<UploadTask> = Vec::new();
         let mut disconnected = false;
         loop {
@@ -78,7 +130,10 @@ impl UploadQueue {
                 if delayed.is_empty() {
                     return;
                 }
-                std::thread::sleep(wait.min(Duration::from_millis(50)));
+                // Drain attempts everything once without waiting for backoff.
+                for task in &mut delayed {
+                    task.not_before = now;
+                }
             } else {
                 match receiver.recv_timeout(wait.max(Duration::from_millis(1))) {
                     Ok(task) => delayed.push(task),
@@ -96,23 +151,30 @@ impl UploadQueue {
                     continue;
                 }
                 let mut task = delayed.remove(i);
+                let superseded = latest
+                    .lock()
+                    .unwrap()
+                    .get(&task.key)
+                    .is_some_and(|latest_gen| *latest_gen > task.generation);
+                if superseded {
+                    settle(&task);
+                    continue;
+                }
                 match objects.put_object(&task.key, &task.bytes, &task.content_type) {
-                    Ok(()) => {
-                        pending.fetch_sub(1, Ordering::SeqCst);
-                    }
+                    Ok(()) => settle(&task),
                     Err(err) => {
                         task.attempts += 1;
-                        if task.attempts >= UPLOAD_MAX_ATTEMPTS {
-                            pending.fetch_sub(1, Ordering::SeqCst);
-                            error!(
+                        if disconnected {
+                            // Shutdown drain: one attempt per task, then drop.
+                            warn!(
                                 key = %task.key,
                                 path = %task.path.display(),
-                                attempts = task.attempts,
                                 error = %err,
-                                "recording upload failed permanently; only the local staging copy remains"
+                                "recording upload failed during shutdown drain; only the local staging copy remains"
                             );
+                            settle(&task);
                         } else {
-                            let backoff = retry_base * (1 << (task.attempts - 1).min(5));
+                            let backoff = retry_base * (1 << task.attempts.min(5));
                             warn!(
                                 key = %task.key,
                                 attempts = task.attempts,
@@ -128,21 +190,46 @@ impl UploadQueue {
         }
     }
 
+    /// Undoes the accounting and the generation marker for a task that never
+    /// reached the channel, so it cannot supersede an earlier queued write
+    /// for the same key.
+    fn revert_enqueue(&self, task: &UploadTask, size: usize) {
+        self.pending_bytes.fetch_sub(size, Ordering::SeqCst);
+        let mut latest = self.latest_generations.lock().unwrap();
+        if latest.get(&task.key) == Some(&task.generation) {
+            latest.remove(&task.key);
+        }
+    }
+
     /// Enqueues a PUT without blocking the caller.
-    fn enqueue(&self, task: UploadTask) -> Result<(), String> {
+    fn enqueue(&self, mut task: UploadTask) -> Result<(), String> {
+        let size = task.bytes.len();
+        let used = self.pending_bytes.fetch_add(size, Ordering::SeqCst) + size;
+        if used > UPLOAD_MAX_PENDING_BYTES {
+            self.pending_bytes.fetch_sub(size, Ordering::SeqCst);
+            return Err("recording upload queue byte limit exceeded".to_owned());
+        }
+        task.generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        self.latest_generations
+            .lock()
+            .unwrap()
+            .insert(task.key.clone(), task.generation);
+        let Some(sender) = &self.sender else {
+            self.revert_enqueue(&task, size);
+            return Err("recording upload worker is gone".to_owned());
+        };
         self.pending.fetch_add(1, Ordering::SeqCst);
-        match self.sender.try_send(task) {
+        match sender.try_send(task) {
             Ok(()) => Ok(()),
-            Err(err) => {
+            Err(std::sync::mpsc::TrySendError::Full(task)) => {
                 self.pending.fetch_sub(1, Ordering::SeqCst);
-                Err(match err {
-                    std::sync::mpsc::TrySendError::Full(_) => {
-                        "recording upload queue is full".to_owned()
-                    }
-                    std::sync::mpsc::TrySendError::Disconnected(_) => {
-                        "recording upload worker is gone".to_owned()
-                    }
-                })
+                self.revert_enqueue(&task, size);
+                Err("recording upload queue is full".to_owned())
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(task)) => {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                self.revert_enqueue(&task, size);
+                Err("recording upload worker is gone".to_owned())
             }
         }
     }
@@ -156,6 +243,18 @@ impl UploadQueue {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("s3 upload queue did not drain in time");
+    }
+}
+
+impl Drop for UploadQueue {
+    fn drop(&mut self) {
+        // Close the channel so the worker drains what's left, then wait for
+        // it. Each remaining task is attempted once, so this is bounded by
+        // task count × request timeout.
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -258,6 +357,7 @@ impl RecordingObjectStore {
             bytes: bytes.to_vec(),
             content_type: content_type.to_owned(),
             path: path.to_path_buf(),
+            generation: 0, // assigned by `enqueue`
             attempts: 0,
             not_before: Instant::now(),
         })
@@ -441,6 +541,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeObjectStore {
         puts: Mutex<Vec<(String, Vec<u8>, String)>>,
+        /// Every put_object call, success or failure.
+        attempts: Mutex<usize>,
         fail_puts: Mutex<bool>,
         /// Kills the upload worker (panic) to exercise queue-disconnect paths.
         panic_puts: Mutex<bool>,
@@ -451,6 +553,7 @@ mod tests {
 
     impl ObjectStore for FakeObjectStore {
         fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> Result<(), S3Error> {
+            *self.attempts.lock().unwrap() += 1;
             if *self.panic_puts.lock().unwrap() {
                 panic!("injected put panic");
             }
@@ -575,11 +678,61 @@ mod tests {
         let saved = storage
             .save_chunk("m1", "u1", 1, 0, b"wav-data")
             .expect("enqueue should succeed even when the store fails");
+        // Uploads retry indefinitely; let a few attempts fail, then recover.
+        for _ in 0..200 {
+            if *fake.attempts.lock().unwrap() >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *fake.fail_puts.lock().unwrap() = false;
         objects.wait_uploads_idle();
 
-        assert!(fake.puts.lock().unwrap().is_empty());
-        // The staging copy is kept so post-incident recovery still has it.
+        let puts = fake.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].1, b"wav-data");
         assert!(saved.path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A second write to the same key (e.g. a fresher `ssrc_mapping.json`)
+    /// must win over an older queued task whose first attempts failed.
+    #[test]
+    fn newer_write_supersedes_queued_retry_for_same_key() {
+        let base = temp_dir("supersede");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.fail_puts.lock().unwrap() = true;
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(1),
+        );
+        let path = base.join("workspaces/g/vc/m/ssrc_mapping.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        objects
+            .put_bytes(&path, b"{\"v\":1}", "application/json")
+            .unwrap();
+        objects
+            .put_bytes(&path, b"{\"v\":2}", "application/json")
+            .unwrap();
+        // Let both tasks attempt at least once so the older one is parked in
+        // the delayed queue before it can be superseded.
+        for _ in 0..200 {
+            if *fake.attempts.lock().unwrap() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *fake.fail_puts.lock().unwrap() = false;
+        objects.wait_uploads_idle();
+
+        let puts = fake.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].1, b"{\"v\":2}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
