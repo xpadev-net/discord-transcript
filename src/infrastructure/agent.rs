@@ -43,6 +43,11 @@ pub struct AgentToolFs {
     root: PathBuf,
     max_read_bytes: u64,
     max_write_bytes: u64,
+    /// Every tool body spawned so far. `spawn_blocking` tasks keep running
+    /// after their tool future is dropped (e.g. when the agent run times
+    /// out), so the driver drains this set via `settle` before validating
+    /// output, retrying, or letting the workspace be cleaned up.
+    pending: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl AgentToolFs {
@@ -65,7 +70,33 @@ impl AgentToolFs {
             root,
             max_read_bytes: MAX_TOOL_READ_BYTES,
             max_write_bytes: MAX_TOOL_WRITE_BYTES,
+            pending: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         })
+    }
+
+    /// Run a synchronous tool body on the blocking pool so file IO does
+    /// not stall the async worker driving the agent loop.
+    async fn spawn_tool<F, T>(&self, body: F) -> Result<T, ToolExecutionError>
+    where
+        F: FnOnce() -> Result<T, ToolExecutionError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().await.spawn_blocking(move || {
+            let _ = tx.send(body());
+        });
+        rx.await.map_err(|_| {
+            ToolExecutionError::other("workspace tool task dropped before finishing")
+        })?
+    }
+
+    /// Wait for every tool task started so far to finish. Must run after
+    /// the agent loop ends — on timeout the run's future is dropped while
+    /// a started write may still be in flight, and retrying or removing
+    /// the workspace without draining first would race that write.
+    pub async fn settle(&self) {
+        let mut pending = self.pending.lock().await;
+        while pending.join_next().await.is_some() {}
     }
 
     /// Resolve a model-supplied relative path to an absolute path under
@@ -170,6 +201,11 @@ impl AgentToolFs {
         // `limit` bytes past `end` so mid-codepoint cuts can be snapped
         // forward instead of returning an empty page before EOF.
         let file_len = metadata.len();
+        if offset >= file_len {
+            // Past EOF (including empty files): an empty page, not an
+            // error, so the model can page until the file runs out.
+            return Ok(String::new());
+        }
         let mut file = fs::File::open(&canonical).map_err(|err| {
             ToolExecutionError::other(format!("failed to open {relative}: {err}"))
         })?;
@@ -186,7 +222,7 @@ impl AgentToolFs {
             ToolExecutionError::other(format!("failed to read {relative}: {err}"))
         })?;
         // A byte is a UTF-8 continuation iff its top bits are 10xxxxxx.
-        let mut start = (offset.min(file_len) - win_start) as usize;
+        let mut start = (offset - win_start) as usize;
         while start > 0 && (buf[start] & 0xC0) == 0x80 {
             start -= 1;
         }
@@ -280,18 +316,6 @@ fn path_arg_schema(extra: serde_json::Map<String, Value>) -> Value {
     })
 }
 
-/// Run a synchronous tool body on the blocking pool so file IO does not
-/// stall the async worker driving the agent loop.
-async fn spawn_tool<F, T>(body: F) -> Result<T, ToolExecutionError>
-where
-    F: FnOnce() -> Result<T, ToolExecutionError> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(body)
-        .await
-        .map_err(|err| ToolExecutionError::other(format!("workspace tool task failed: {err}")))?
-}
-
 /// The three tools the model can call during a summary run. Everything the
 /// agent is allowed to touch is expressed here — there is no shell, no
 /// network tool, no arbitrary fs access.
@@ -309,7 +333,8 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&list_fs);
                 Box::pin(async move {
                     // File IO is synchronous; keep it off the async worker.
-                    spawn_tool(move || fs.list_inputs())
+                    let inner = Arc::clone(&fs);
+                    fs.spawn_tool(move || inner.list_inputs())
                         .await
                         .map(ToolOutput::json)
                 })
@@ -334,8 +359,9 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&read_fs);
                 Box::pin(async move {
                     let args: ReadInputArgs = parse_args(args)?;
-                    spawn_tool(move || {
-                        fs.read_input(
+                    let inner = Arc::clone(&fs);
+                    fs.spawn_tool(move || {
+                        inner.read_input(
                             &args.path,
                             args.offset.unwrap_or(0),
                             args.limit.unwrap_or(u64::MAX),
@@ -365,7 +391,8 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&write_fs);
                 Box::pin(async move {
                     let args: WriteOutputArgs = parse_args(args)?;
-                    spawn_tool(move || fs.write_output(&args.path, &args.contents))
+                    let inner = Arc::clone(&fs);
+                    fs.spawn_tool(move || inner.write_output(&args.path, &args.contents))
                         .await
                         .map(|written| ToolOutput::text(format!("wrote {written} bytes")))
                 })
@@ -447,6 +474,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_fs_read_at_eof_returns_empty_page() {
+        let root = fresh_workdir();
+        fs::write(root.join("input/t.md"), "abc").unwrap();
+        let fs = AgentToolFs::new(&root).unwrap();
+        // Paging to exactly the end — or past it — returns an empty page
+        // so the model can read until the file runs out.
+        assert_eq!(fs.read_input("input/t.md", 3, 10).unwrap(), "");
+        assert_eq!(fs.read_input("input/t.md", 100, 10).unwrap(), "");
+        fs::write(root.join("input/empty.md"), "").unwrap();
+        assert_eq!(fs.read_input("input/empty.md", 0, 10).unwrap(), "");
+    }
+
+    #[test]
     fn tool_fs_read_rejects_non_utf8_input() {
         let root = fresh_workdir();
         fs::write(root.join("input/b.bin"), [0xff, 0xfe, 0xfd]).unwrap();
@@ -487,5 +527,36 @@ mod tests {
         let oversized = "x".repeat((MAX_TOOL_WRITE_BYTES + 1) as usize);
         assert!(fs.write_output("output/big.md", &oversized).is_err());
         assert!(fs.write_output("output/small.md", "ok").is_ok());
+    }
+
+    #[test]
+    fn tool_fs_settle_waits_for_started_tool_tasks() {
+        let root = fresh_workdir();
+        let fs = Arc::new(AgentToolFs::new(&root).unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::AtomicBool;
+            let done = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&done);
+            let task_fs = Arc::clone(&fs);
+            let tool = tokio::spawn(async move {
+                let _ = task_fs
+                    .spawn_tool(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        flag.store(true, Ordering::Relaxed);
+                        Ok(())
+                    })
+                    .await;
+            });
+            // Let the tool task start, then drop its future the way an
+            // agent timeout does. The blocking body keeps running.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tool.abort();
+            fs.settle().await;
+            assert!(done.load(Ordering::Relaxed));
+        });
     }
 }
