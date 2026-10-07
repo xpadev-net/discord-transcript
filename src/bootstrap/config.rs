@@ -93,7 +93,10 @@ impl Display for ChunkStorageBackend {
     }
 }
 
-/// Which CLI drives meeting summary and transcript correction (`summarize` integration).
+/// Which harness drives meeting summary and transcript correction
+/// (`summarize` integration). `native` (the in-process rig agent) is the
+/// default; the CLI harnesses remain only as explicit opt-in and are due
+/// for removal once native proves out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryHarness {
     Claude,
@@ -276,11 +279,13 @@ impl AppConfig {
         };
 
         let summary_enabled = optional_env_parse_bool("SUMMARY_ENABLED", true)?;
+        // Default harness is the in-process native agent; CLI harnesses
+        // require explicit opt-in via SUMMARY_HARNESS.
         let summary_harness = optional_env("SUMMARY_HARNESS")
             .filter(|s| !s.trim().is_empty())
             .map(|s| SummaryHarness::parse(&s))
             .transpose()?
-            .unwrap_or(SummaryHarness::Claude);
+            .unwrap_or(SummaryHarness::Native);
         let summary_allow_unsafe_agent_harness =
             optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
         // The unsafe-agent opt-in acknowledgement is validated whenever the
@@ -425,11 +430,13 @@ impl AppConfig {
         };
 
         let summary_enabled = optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?;
+        // Default harness is the in-process native agent; CLI harnesses
+        // require explicit opt-in via SUMMARY_HARNESS.
         let summary_harness = optional_from_map(values, "SUMMARY_HARNESS")
             .filter(|s| !s.trim().is_empty())
             .map(|s| SummaryHarness::parse(&s))
             .transpose()?
-            .unwrap_or(SummaryHarness::Claude);
+            .unwrap_or(SummaryHarness::Native);
         let summary_allow_unsafe_agent_harness =
             optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
         if app_role.requires_summary_harness_config() {
@@ -711,9 +718,11 @@ fn resolve_summary_settings(
         };
     }
 
-    if matches!(harness, SummaryHarness::OpenCode | SummaryHarness::Native)
-        && model.trim().is_empty()
-    {
+    // Only the opencode CLI still requires a model up front. The native
+    // agent treats model like provider credentials: optional-but-preserved,
+    // so an unconfigured worker boots and reports the disabled client per
+    // job instead of failing startup.
+    if harness == SummaryHarness::OpenCode && model.trim().is_empty() {
         return Err(ConfigError::MissingEnv {
             key: "SUMMARY_MODEL",
         });

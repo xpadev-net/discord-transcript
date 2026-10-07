@@ -100,11 +100,12 @@ Caveat: rig is 0.x (API churn). Mitigation: keep a thin adapter module so swappi
 
 ## PR Breakdown (small PRs, independently reviewable)
 
-1. `rig` dep + `infrastructure/agent` module: tool set, path enforcement, agent loop, fake `CompletionModel` unit tests (no network). Behind `SUMMARY_HARNESS=native` with a stub provider error.
-2. ChatGPT provider: rig `Authenticator` wiring + auth dir mount + `auth login-chatgpt` subcommand (device flow); README + compose unsafe-mount docs.
-3. OpenCode Go provider: `OPENCODE_API_KEY` + dual-dialect client (`/responses` + `/chat/completions`) with model→dialect resolution.
-4. Wire native client into worker/runtime/ai-memory consumers; flip `SUMMARY_HARNESS` default to `native` and gate CLI values behind explicit opt-in; run a real summary end-to-end; docs/README env table.
-5. (Deferred, needs sign-off) Remove CLI harnesses + per-CLI workspace configs once native is validated in production.
+1. `rig` dep + `SUMMARY_HARNESS=native`/`SUMMARY_PROVIDER=opencode_go`/`OPENCODE_API_KEY` config plumbing (#220, merged).
+2. Workspace tools (`list_input_files`, `read_input_file`, `write_output_file`) with deny-by-default path enforcement + spawn_blocking lifecycle handling (#221, merged).
+3. Native client driven by rig: OpenCode Go dual-dialect (`/responses` + `/chat/completions`) with model→dialect resolution, output contract validation, unsafe opt-in gate, retries (#222).
+4. Flip `SUMMARY_HARNESS` default to `native`, make `SUMMARY_MODEL` optional-but-preserved for native, and gate CLI values behind explicit opt-in (this PR); docs/README env table.
+5. ChatGPT provider: rig `providers::chatgpt` wiring + auth dir mount + `auth login-chatgpt` subcommand (device flow); README + compose unsafe-mount docs.
+6. (Deferred, needs sign-off) Remove CLI harnesses + per-CLI workspace configs once native is validated in production.
 
 ## Risks / Open Questions
 

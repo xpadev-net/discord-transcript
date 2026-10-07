@@ -73,11 +73,13 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `CHUNK_STORAGE_S3_PRESIGN_TTL_SECONDS` | `900` | 再生用 presigned GET URL の有効秒数（最大 604800） |
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
 | `CLAUDE_MODEL` | `haiku` | Claude harness 時の `--model`（`SUMMARY_MODEL` 未指定時のフォールバック） |
-| `SUMMARY_HARNESS` | `claude` | `claude` / `cursor_agent` / `opencode` |
-| `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | CLI harness へ untrusted transcript を渡す unsafe opt-in。production では既定で拒否します。 |
+| `SUMMARY_HARNESS` | `native` | `native`（既定、インプロセスエージェント）/ `claude` / `cursor_agent` / `opencode`。CLI harness は明示的な opt-in（将来削除予定） |
+| `SUMMARY_PROVIDER` | 未設定 | `SUMMARY_HARNESS=native` のモデルプロバイダ。`opencode_go` のみ対応（`OPENCODE_API_KEY` を使用） |
+| `OPENCODE_API_KEY` | 未設定 | OpenCode Go の API キー（console.opencode.ai）。`grok*`/`gpt*` 系モデルは `/responses`、その他は `/chat/completions` で呼び出し |
+| `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | untrusted transcript へエージェントを走らせる unsafe opt-in（native を含む全 harness で必須）。production では既定で拒否します。 |
 | `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE` | 未設定 | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` のとき必須。`local` / `local-dev` / `dev` / `development` / `test` / `testing` のみ許可し、production-like な値では起動を拒否します。 |
-| `SUMMARY_COMMAND` | 未設定 | 設定時は **どの harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
-| `SUMMARY_MODEL` | 未設定 | `CLAUDE_MODEL` より優先。**`opencode` では必須**（`provider/model` 形式。例: `anthropic/claude-3-5-haiku-20241022`） |
+| `SUMMARY_COMMAND` | 未設定 | CLI harness 専用。設定時は **どの CLI harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
+| `SUMMARY_MODEL` | 未設定 | native では対象モデル id（例: `grok-code-fast-1`）。CLI harness では `CLAUDE_MODEL` より優先し、**`opencode` では必須**（`provider/model` 形式） |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 | `OPERATIONAL_METRICS_BEARER_TOKEN` | 未設定 | `/metricsz` の Bearer 認証トークン。未設定時は `/metricsz` を無効化します。 |
 

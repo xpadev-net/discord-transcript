@@ -1141,9 +1141,11 @@ fn app_config_loads_from_map() {
     assert_eq!(config.discord_token, "token");
     assert_eq!(config.discord_guild_id, "guild");
     assert_eq!(config.whisper_endpoint, "http://whisper");
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
-    assert_eq!(config.summary_command, "claude");
-    assert_eq!(config.summary_model, "haiku");
+    // Native is the default harness; without provider settings the
+    // summary client reports disabled rather than failing config.
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "");
     assert!(config.summary_allow_unsafe_agent_harness);
     assert_eq!(config.database_url, "postgres://localhost/db");
     assert_eq!(config.database_ssl_mode, "disable");
@@ -1283,9 +1285,9 @@ fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_setti
     let config = AppConfig::from_map(&values).expect("config should load");
 
     assert!(!config.summary_enabled);
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
     assert_eq!(config.summary_command, "");
-    assert_eq!(config.summary_model, "haiku");
+    assert_eq!(config.summary_model, "");
     assert!(config.summary_allow_unsafe_agent_harness);
 }
 
@@ -1342,9 +1344,9 @@ fn app_config_web_bot_role_does_not_require_summary_harness_settings() {
     assert_eq!(config.discord_token, "token");
     assert_eq!(config.discord_guild_id, "guild");
     assert!(config.summary_enabled);
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
     assert_eq!(config.summary_command, "");
-    assert_eq!(config.summary_model, "haiku");
+    assert_eq!(config.summary_model, "");
     assert!(!config.summary_allow_unsafe_agent_harness);
 }
 
@@ -1376,9 +1378,9 @@ fn app_config_worker_role_does_not_require_discord_gateway_credentials() {
     assert_eq!(config.app_role, AppRole::Worker);
     assert_eq!(config.discord_token, "");
     assert_eq!(config.discord_guild_id, "");
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
-    assert_eq!(config.summary_command, "claude");
-    assert_eq!(config.summary_model, "haiku");
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "");
     assert!(config.summary_allow_unsafe_agent_harness);
 }
 
@@ -1596,9 +1598,9 @@ fn app_config_from_env_child_loads_web_bot_role_without_summary_harness_settings
     assert_eq!(config.discord_token, "token");
     assert_eq!(config.discord_guild_id, "guild");
     assert!(config.summary_enabled);
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
     assert_eq!(config.summary_command, "");
-    assert_eq!(config.summary_model, "haiku");
+    assert_eq!(config.summary_model, "");
     assert!(!config.summary_allow_unsafe_agent_harness);
 }
 
@@ -1615,9 +1617,9 @@ fn app_config_from_env_child_loads_worker_role_without_discord_gateway_credentia
     assert_eq!(config.app_role, AppRole::Worker);
     assert_eq!(config.discord_token, "");
     assert_eq!(config.discord_guild_id, "");
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
-    assert_eq!(config.summary_command, "claude");
-    assert_eq!(config.summary_model, "haiku");
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "");
     assert!(config.summary_allow_unsafe_agent_harness);
 }
 
@@ -1630,9 +1632,9 @@ fn app_config_from_env_child_loads_summary_disabled_without_summary_harness_sett
     let config = AppConfig::from_env().expect("config should load");
 
     assert!(!config.summary_enabled);
-    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
     assert_eq!(config.summary_command, "");
-    assert_eq!(config.summary_model, "haiku");
+    assert_eq!(config.summary_model, "");
     assert!(config.summary_allow_unsafe_agent_harness);
 }
 
@@ -1676,7 +1678,7 @@ fn app_config_from_env_child_rejects_missing_unsafe_profile_even_when_summary_di
 }
 
 #[test]
-fn app_config_rejects_default_claude_cli_without_unsafe_opt_in() {
+fn app_config_rejects_default_harness_without_unsafe_opt_in() {
     let values = required_env_values();
 
     let err = AppConfig::from_map(&values).expect_err("config should fail closed");
@@ -1770,7 +1772,7 @@ fn app_config_accepts_all_dev_test_unsafe_agent_profiles() {
 
         assert_eq!(
             config.summary_harness,
-            SummaryHarness::Claude,
+            SummaryHarness::Native,
             "profile {profile} should be accepted"
         );
         assert!(config.summary_allow_unsafe_agent_harness);
@@ -1851,6 +1853,7 @@ fn app_config_accepts_valid_whisper_language() {
 #[test]
 fn app_config_accepts_claude_model_override() {
     let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.insert("CLAUDE_MODEL".to_owned(), "sonnet".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
@@ -1860,6 +1863,7 @@ fn app_config_accepts_claude_model_override() {
 #[test]
 fn app_config_summary_command_overrides_claude_path() {
     let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.insert("SUMMARY_COMMAND".to_owned(), "/opt/bin/claude".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
@@ -1960,6 +1964,72 @@ fn app_config_native_loads_without_provider_settings() {
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.summary_provider, None);
     assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_defaults_to_native_harness() {
+    // Native is the default: SUMMARY_HARNESS unset must resolve to the
+    // in-process agent, and its model/provider settings are all
+    // optional-but-preserved so an unconfigured worker still boots.
+    let values = base_env();
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert_eq!(config.summary_command, "");
+    assert_eq!(config.summary_model, "");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_native_model_is_optional() {
+    // Provider and key survive config load without SUMMARY_MODEL; the
+    // disabled client reports the gap per job instead of failing startup.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_model, "");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key.as_deref(), Some("ocg-key"));
+}
+
+#[test]
+fn app_config_claude_harness_is_explicit_opt_in() {
+    // The legacy CLI harnesses now require SUMMARY_HARNESS; once opted in
+    // they keep their existing requirements (command + model default).
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_harness, SummaryHarness::Claude);
+    assert_eq!(config.summary_command, "claude");
+    assert_eq!(config.summary_model, "haiku");
+}
+
+#[test]
+fn app_config_claude_opt_in_without_command_fails() {
+    let mut values = required_env_values();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
+    values.insert(
+        "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
+        "true".to_owned(),
+    );
+    values.insert(
+        "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE".to_owned(),
+        "local-dev".to_owned(),
+    );
+    values.remove("CLAUDE_COMMAND");
+
+    let err = AppConfig::from_map(&values).expect_err("config should fail");
+    assert_eq!(
+        err,
+        ConfigError::MissingEnv {
+            key: "CLAUDE_COMMAND"
+        }
+    );
 }
 
 #[test]
