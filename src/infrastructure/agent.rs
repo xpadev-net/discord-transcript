@@ -13,11 +13,12 @@
 //! static `CHATGPT_ACCESS_TOKEN`, or the OAuth credential file written by
 //! `auth login-chatgpt` at `CHATGPT_AUTH_FILE`, refreshed on use).
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rig_agent::{Agent, AgentBuilder};
@@ -579,15 +580,31 @@ impl NativeAgentSummaryClient {
                 // `authenticate` resolves the OAuth record (file read plus
                 // refresh if expired) over HTTP, so it is async; summarize()
                 // runs synchronously, so drive it through the shared helper.
+                // Serialize credential reads/refreshes on the shared auth
+                // file across concurrent summary jobs in this process — rig's
+                // internal mutex only covers clones of one authenticator, and
+                // each job builds its own.
+                let auth_lock = self.auth_file.as_deref().map(chatgpt_auth_file_lock);
+                let _guard = auth_lock
+                    .as_ref()
+                    .map(|lock| lock.lock().unwrap_or_else(|err| err.into_inner()));
+                if let Some(path) = self.auth_file.as_deref() {
+                    harden_auth_file_permissions(path);
+                }
+                let auth_timeout = self.command_timeout;
                 let client = run_future_blocking(async move {
-                    OpenAIConfig::with_key(&chatgpt::DIALECT, Secret::from(""))
-                        .client()
-                        .authenticate(&authenticator)
-                        .await
+                    timeout(
+                        auth_timeout,
+                        OpenAIConfig::with_key(&chatgpt::DIALECT, Secret::from(""))
+                            .client()
+                            .authenticate(&authenticator),
+                    )
+                    .await
                 })
                 .map_err(|err| {
                     summary_engine_error(format!("ChatGPT authentication failed: {err}"))
                 })?
+                .map_err(|_| summary_engine_error("ChatGPT authentication timed out"))?
                 .map_err(|err| {
                     summary_engine_error(format!("ChatGPT authentication failed: {err}"))
                 })?;
@@ -902,6 +919,48 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
     }
 }
 
+/// Per-file lock registry for [`NativeAgentSummaryClient`]'s ChatGPT OAuth
+/// path. Each summary job builds a fresh authenticator, so rig's own
+/// refresh mutex (shared only between clones of one authenticator) cannot
+/// serialize concurrent refreshes of the same credential file.
+fn chatgpt_auth_file_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+/// rig persists OAuth credentials with `std::fs::write`, which keeps a
+/// pre-existing file's mode but applies the process umask on creation.
+/// Tighten an existing record to owner-only before authenticate reads and
+/// refreshes it; a missing file is left to `authenticate`'s own error.
+#[cfg(unix)]
+fn harden_auth_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(_) => {
+            if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(
+                    "failed to restrict permissions on ChatGPT auth file {}: {err}",
+                    path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!("failed to stat ChatGPT auth file {}: {err}", path.display())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_auth_file_permissions(_path: &Path) {}
+
 /// "Sign in with ChatGPT" device login behind the `auth login-chatgpt`
 /// subcommand: runs the OAuth device flow interactively and persists the
 /// credential record to `auth_file`, where `SUMMARY_PROVIDER=chatgpt` picks
@@ -909,6 +968,20 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
 pub async fn chatgpt_device_login(
     auth_file: PathBuf,
 ) -> Result<(), Box<rig_core::providers::chatgpt::auth::AuthError>> {
+    // rig writes the record with `std::fs::write` under the process umask —
+    // pre-create it owner-only so tokens never sit in a group/world-readable
+    // file, and tighten an existing file the same way.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&auth_file);
+        harden_auth_file_permissions(&auth_file);
+    }
     let authenticator = Authenticator::new(
         AuthSource::OAuth,
         Some(auth_file.clone()),
