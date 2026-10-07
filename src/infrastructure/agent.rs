@@ -780,23 +780,40 @@ impl Debug for SummaryClientConfig {
 /// Build the summary client for the configured harness.
 pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient, SummaryError> {
     match config.harness {
-        SummaryHarness::Native => match (config.provider, config.api_key) {
-            (Some(provider), Some(api_key)) if !api_key.trim().is_empty() => {
-                Ok(SummaryClient::Native(NativeAgentSummaryClient {
-                    provider,
-                    model: config.model,
-                    api_key: Secret::from(api_key),
-                    allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
-                    retry_policy: config.retry_policy,
-                    command_timeout: config.command_timeout,
-                    max_agent_turns: DEFAULT_MAX_AGENT_TURNS,
-                }))
+        SummaryHarness::Native => {
+            let partially_configured = config.provider.is_some()
+                || config.api_key.is_some()
+                || !config.model.trim().is_empty();
+            match (config.provider, config.api_key) {
+                (Some(provider), Some(api_key))
+                    if !api_key.trim().is_empty() && !config.model.trim().is_empty() =>
+                {
+                    Ok(SummaryClient::Native(NativeAgentSummaryClient {
+                        provider,
+                        model: config.model,
+                        api_key: Secret::from(api_key),
+                        allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
+                        retry_policy: config.retry_policy,
+                        command_timeout: config.command_timeout,
+                        max_agent_turns: DEFAULT_MAX_AGENT_TURNS,
+                    }))
+                }
+                // Provider, key, and model are all optional-but-preserved in
+                // config so an unconfigured or partially configured deployment
+                // boots cleanly — the disabled client errors only if a summary
+                // job actually runs.
+                _ => {
+                    if partially_configured {
+                        tracing::warn!(
+                            provider = ?config.provider,
+                            model = %config.model,
+                            "native summary partially configured; summaries will report disabled"
+                        );
+                    }
+                    Ok(SummaryClient::Disabled)
+                }
             }
-            // Config validation requires provider+key for native whenever a
-            // role runs summaries, so reaching here means the runtime is
-            // disabled — start cleanly and error only if a summary runs.
-            _ => Ok(SummaryClient::Disabled),
-        },
+        }
         _ => Ok(SummaryClient::Cli(HarnessCliSummaryClient {
             harness: config.harness,
             command_path: config.command_path,
@@ -1144,6 +1161,22 @@ mod tests {
         .unwrap();
         assert!(matches!(disabled, SummaryClient::Disabled));
         assert!(disabled.summarize("prompt", None).is_err());
+
+        // Provider+key without a model is also partial config — the
+        // disabled client surfaces the gap per job instead of a
+        // startup-time failure.
+        let no_model = build_summary_client(SummaryClientConfig {
+            harness: SummaryHarness::Native,
+            command_path: String::new(),
+            model: String::new(),
+            provider: Some(SummaryProvider::OpenCodeGo),
+            api_key: Some("key".to_owned()),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(matches!(no_model, SummaryClient::Disabled));
 
         let cli = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Claude,
