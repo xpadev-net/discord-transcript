@@ -7,7 +7,9 @@ use discord_transcript::application::worker::{
 };
 use discord_transcript::bootstrap::config::{AppConfig, AppRole};
 use discord_transcript::domain::JobType;
-use discord_transcript::infrastructure::agent::{SummaryClientConfig, build_summary_client};
+use discord_transcript::infrastructure::agent::{
+    SummaryClientConfig, build_summary_client, chatgpt_device_login,
+};
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
@@ -28,6 +30,7 @@ use discord_transcript::interfaces::web;
 use serenity::all::{ChannelId, EditMessage};
 use serenity::http::Http;
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -46,12 +49,33 @@ async fn main() {
 
     let result = match env::args().nth(1).as_deref() {
         Some("migrate") => run_migrations_from_env().await,
+        Some("auth") => run_auth_subcommand().await,
         _ => run().await,
     };
 
     if let Err(err) = result {
         tracing::error!(error = %err, "fatal");
         std::process::exit(1);
+    }
+}
+
+/// `auth login-chatgpt [auth_file]` — device-flow sign-in that writes the
+/// ChatGPT OAuth credential record `SUMMARY_PROVIDER=chatgpt` consumes.
+/// The target defaults to `CHATGPT_AUTH_FILE`.
+async fn run_auth_subcommand() -> Result<(), Box<dyn std::error::Error>> {
+    match env::args().nth(2).as_deref() {
+        Some("login-chatgpt") => {
+            let auth_file = env::args()
+                .nth(3)
+                .or_else(|| env::var("CHATGPT_AUTH_FILE").ok())
+                .ok_or(
+                    "auth login-chatgpt requires a target file: pass it as an argument \
+                     or set CHATGPT_AUTH_FILE",
+                )?;
+            chatgpt_device_login(PathBuf::from(auth_file)).await?;
+            Ok(())
+        }
+        _ => Err("usage: auth login-chatgpt [auth_file]".into()),
     }
 }
 
@@ -430,6 +454,7 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         model: config.summary_model.clone(),
         provider: config.summary_provider,
         api_key: config.summary_api_key.clone(),
+        auth_file: config.summary_auth_file.clone().map(PathBuf::from),
         allow_unsafe_agent_harness: config.summary_allow_unsafe_agent_harness,
         retry_policy,
         command_timeout: DEFAULT_COMMAND_TIMEOUT,

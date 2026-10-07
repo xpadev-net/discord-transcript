@@ -74,8 +74,11 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
 | `CLAUDE_MODEL` | `haiku` | Claude harness 時の `--model`（`SUMMARY_MODEL` 未指定時のフォールバック） |
 | `SUMMARY_HARNESS` | `native` | `native`（既定、インプロセスエージェント）/ `claude` / `cursor_agent` / `opencode`。CLI harness は明示的な opt-in（将来削除予定） |
-| `SUMMARY_PROVIDER` | 未設定 | `SUMMARY_HARNESS=native` のモデルプロバイダ。`opencode_go` のみ対応（`OPENCODE_API_KEY` を使用） |
+| `SUMMARY_PROVIDER` | 未設定 | `SUMMARY_HARNESS=native` のモデルプロバイダ（`opencode_go` / `chatgpt`） |
 | `OPENCODE_API_KEY` | 未設定 | OpenCode Go の API キー（console.opencode.ai）。`grok*`/`gpt*` 系モデルは `/responses`、その他は `/chat/completions` で呼び出し |
+| `CHATGPT_AUTH_FILE` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の OAuth クレデンシャルファイル。`auth login-chatgpt` サブコマンドで発行し、利用時に自動 refresh される |
+| `CHATGPT_ACCESS_TOKEN` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の静的アクセストークン（Enterprise 等）。設定時は auth file より優先 |
+| `CHATGPT_ACCOUNT_ID` | 未設定 | `CHATGPT_ACCESS_TOKEN` 使用時の ChatGPT アカウント ID（省略可） |
 | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | untrusted transcript へエージェントを走らせる unsafe opt-in（native を含む全 harness で必須）。production では既定で拒否します。 |
 | `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE` | 未設定 | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` のとき必須。`local` / `local-dev` / `dev` / `development` / `test` / `testing` のみ許可し、production-like な値では起動を拒否します。 |
 | `SUMMARY_COMMAND` | 未設定 | CLI harness 専用。設定時は **どの CLI harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |

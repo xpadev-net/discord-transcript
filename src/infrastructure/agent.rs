@@ -8,13 +8,14 @@
 //! write-only), which keeps the deny-by-default posture of the CLI
 //! harnesses without depending on their binaries or config files.
 //!
-//! Providers are OpenAI-compatible endpoints reachable by API key today:
-//! `opencode_go` (OpenCode Go subscription quota). ChatGPT subscription auth
-//! (`chatgpt`) lands separately.
+//! Providers: `opencode_go` (OpenCode Go subscription, API key) and
+//! `chatgpt` (ChatGPT subscription via "Sign in with ChatGPT" OAuth — a
+//! static `CHATGPT_ACCESS_TOKEN`, or the OAuth credential file written by
+//! `auth login-chatgpt` at `CHATGPT_AUTH_FILE`, refreshed on use).
 
 use std::fmt::Debug;
 use std::fs;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,10 @@ use std::time::Duration;
 use rig_agent::{Agent, AgentBuilder};
 use rig_core::DynModel;
 use rig_core::operation::Completion;
+use rig_core::providers::chatgpt::{
+    self,
+    auth::{AuthSource, Authenticator, DeviceCodeHandler},
+};
 use rig_core::providers::openai::{self, OpenAIConfig};
 use rig_core::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use rig_core::wire::Secret;
@@ -510,7 +515,12 @@ pub struct NativeAgentSummaryClient {
     pub provider: SummaryProvider,
     pub model: String,
     /// Provider credential. `Secret` redacts itself in Debug output.
+    /// For `chatgpt` this is the optional static access token; OAuth file
+    /// auth is `auth_file` instead.
     pub api_key: Secret,
+    /// OAuth credential file for `chatgpt` (`CHATGPT_AUTH_FILE`): read,
+    /// refreshed, and persisted by rig's authenticator on each run.
+    pub auth_file: Option<PathBuf>,
     pub allow_unsafe_agent_harness: bool,
     pub retry_policy: RetryPolicy,
     pub command_timeout: Duration,
@@ -519,21 +529,93 @@ pub struct NativeAgentSummaryClient {
 }
 
 impl NativeAgentSummaryClient {
+    /// ChatGPT subscription credential: a static `CHATGPT_ACCESS_TOKEN` when
+    /// one is configured, otherwise the OAuth record in `auth_file`
+    /// (refreshing through auth.openai.com as needed). Device flow is never
+    /// triggered from a summary job — `auth login-chatgpt` writes the file.
+    fn chatgpt_authenticator(&self) -> Authenticator {
+        let source = if self.api_key.is_empty() {
+            AuthSource::OAuth
+        } else {
+            AuthSource::AccessToken {
+                access_token: self.api_key.expose().to_owned(),
+                account_id: std::env::var("CHATGPT_ACCOUNT_ID")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+            }
+        };
+        Authenticator::new(
+            source,
+            self.auth_file.clone(),
+            DeviceCodeHandler::default(),
+            false,
+        )
+    }
+
     fn completion_model(&self) -> Result<DynModel<Completion>, SummaryError> {
-        if self.api_key.is_empty() {
-            return Err(summary_engine_error(format!(
-                "summary harness `native` provider `{}` requires an API key",
-                self.provider
-            )));
-        }
         match self.provider {
             SummaryProvider::OpenCodeGo => {
+                if self.api_key.is_empty() {
+                    return Err(summary_engine_error(format!(
+                        "summary harness `native` provider `{}` requires an API key",
+                        self.provider
+                    )));
+                }
                 let config = OpenAIConfig::with_key(&OPENCODE_GO_DIALECT, self.api_key.expose());
                 let client = config.client();
                 match opencode_go_route(&self.model) {
                     CompletionRoute::Responses => Ok(client.responses(self.model.clone()).erase()),
                     CompletionRoute::ChatCompletions => Ok(client.chat(self.model.clone()).erase()),
                 }
+            }
+            SummaryProvider::ChatGpt => {
+                if self.api_key.is_empty() && self.auth_file.is_none() {
+                    return Err(summary_engine_error(
+                        "summary harness `native` provider `chatgpt` requires \
+                         CHATGPT_ACCESS_TOKEN or CHATGPT_AUTH_FILE (run `auth login-chatgpt`)",
+                    ));
+                }
+                let authenticator = self.chatgpt_authenticator();
+                // `authenticate` resolves the OAuth record (file read plus
+                // refresh if expired) over HTTP, so it is async; summarize()
+                // runs synchronously, so drive it through the shared helper.
+                // The file lock + permission hardening only apply in OAuth
+                // mode: a configured CHATGPT_ACCESS_TOKEN never touches the
+                // credential file (a read-only auth dir must not break
+                // static-token summaries). Lock acquisition counts against
+                // the same deadline as the HTTP authentication itself.
+                let auth_deadline = std::time::Instant::now() + self.command_timeout;
+                let _guard: Option<fs::File> = if self.api_key.is_empty() {
+                    match self.auth_file.as_deref() {
+                        Some(path) => {
+                            let guard = chatgpt_auth_file_guard(path, Some(auth_deadline))?;
+                            harden_auth_file_permissions(path)?;
+                            guard
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let auth_timeout =
+                    auth_deadline.saturating_duration_since(std::time::Instant::now());
+                let client = run_future_blocking(async move {
+                    timeout(
+                        auth_timeout,
+                        OpenAIConfig::with_key(&chatgpt::DIALECT, Secret::from(""))
+                            .client()
+                            .authenticate(&authenticator),
+                    )
+                    .await
+                })
+                .map_err(|err| {
+                    summary_engine_error(format!("ChatGPT authentication failed: {err}"))
+                })?
+                .map_err(|_| summary_engine_error("ChatGPT authentication timed out"))?
+                .map_err(|err| {
+                    summary_engine_error(format!("ChatGPT authentication failed: {err}"))
+                })?;
+                Ok(client.responses(self.model.clone()).erase())
             }
         }
     }
@@ -648,14 +730,14 @@ impl ClaudeSummaryClient for NativeAgentSummaryClient {
             ));
         }
         let workdir = require_native_agent_workdir(workdir)?;
-        let model = self.completion_model()?;
-        self.summarize_with_model(&model, prompt, workdir, output)
+        self.summarize_attempts(prompt, workdir, output, || self.completion_model())
     }
 }
 
 impl NativeAgentSummaryClient {
     /// `summarize` with the completion model supplied — tests inject a
     /// scripted mock instead of a live provider.
+    #[cfg(test)]
     fn summarize_with_model(
         &self,
         model: &DynModel<Completion>,
@@ -663,13 +745,29 @@ impl NativeAgentSummaryClient {
         workdir: &Path,
         output: AgentOutputContract,
     ) -> Result<String, SummaryError> {
-        // Retried attempts start from a clean conversation rather than
-        // compounding a broken transcript, and each attempt must produce
-        // its own output file — a leftover from a failed attempt is deleted
-        // before the next run so it cannot be mistaken for fresh output.
+        self.summarize_attempts(prompt, workdir, output, || Ok(model.clone()))
+    }
+
+    /// Retried attempts start from a clean conversation rather than
+    /// compounding a broken transcript, and each attempt must produce
+    /// its own output file — a leftover from a failed attempt is deleted
+    /// before the next run so it cannot be mistaken for fresh output.
+    /// The model is rebuilt per attempt (not hoisted) because rig's
+    /// `authenticate` copies the resolved token into the client: a model
+    /// built once would keep retrying with an OAuth access token that
+    /// expired mid-attempt, while re-resolving lets the persisted record
+    /// (refreshed on read) recover the job.
+    fn summarize_attempts(
+        &self,
+        prompt: &str,
+        workdir: &Path,
+        output: AgentOutputContract,
+        model_for_attempt: impl Fn() -> Result<DynModel<Completion>, SummaryError>,
+    ) -> Result<String, SummaryError> {
         retry_with_backoff(self.retry_policy, |_| {
             remove_stale_agent_output(workdir, output)?;
-            self.run_agent_attempt(model.clone(), prompt, workdir, output)
+            let model = model_for_attempt()?;
+            self.run_agent_attempt(model, prompt, workdir, output)
         })
     }
 }
@@ -754,6 +852,8 @@ pub struct SummaryClientConfig {
     pub provider: Option<SummaryProvider>,
     /// Provider credential. Kept out of Debug output.
     pub api_key: Option<String>,
+    /// OAuth credential file for `chatgpt` (`CHATGPT_AUTH_FILE`).
+    pub auth_file: Option<PathBuf>,
     pub allow_unsafe_agent_harness: bool,
     pub retry_policy: RetryPolicy,
     pub command_timeout: Duration,
@@ -767,6 +867,7 @@ impl Debug for SummaryClientConfig {
             .field("model", &self.model)
             .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("auth_file", &self.auth_file)
             .field(
                 "allow_unsafe_agent_harness",
                 &self.allow_unsafe_agent_harness,
@@ -781,37 +882,53 @@ impl Debug for SummaryClientConfig {
 pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient, SummaryError> {
     match config.harness {
         SummaryHarness::Native => {
-            let partially_configured = config.provider.is_some()
-                || config.api_key.is_some()
-                || !config.model.trim().is_empty();
-            match (config.provider, config.api_key) {
-                (Some(provider), Some(api_key))
-                    if !api_key.trim().is_empty() && !config.model.trim().is_empty() =>
+            // Every credential piece is optional-but-preserved in config;
+            // a missing piece yields Disabled (per-job error) instead of a
+            // startup failure.
+            let configured = match config.provider {
+                Some(SummaryProvider::OpenCodeGo) => {
+                    config
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|k| !k.trim().is_empty())
+                        && !config.model.trim().is_empty()
+                }
+                Some(SummaryProvider::ChatGpt) => {
+                    // ChatGPT OAuth uses either a static access token or the
+                    // credential file written by `auth login-chatgpt`.
+                    (config
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|k| !k.trim().is_empty())
+                        || config.auth_file.is_some())
+                        && !config.model.trim().is_empty()
+                }
+                None => false,
+            };
+            if configured {
+                Ok(SummaryClient::Native(NativeAgentSummaryClient {
+                    provider: config.provider.expect("configured implies provider"),
+                    model: config.model,
+                    api_key: Secret::from(config.api_key.unwrap_or_default()),
+                    auth_file: config.auth_file,
+                    allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
+                    retry_policy: config.retry_policy,
+                    command_timeout: config.command_timeout,
+                    max_agent_turns: DEFAULT_MAX_AGENT_TURNS,
+                }))
+            } else {
+                if config.provider.is_some()
+                    || config.api_key.is_some()
+                    || config.auth_file.is_some()
+                    || !config.model.trim().is_empty()
                 {
-                    Ok(SummaryClient::Native(NativeAgentSummaryClient {
-                        provider,
-                        model: config.model,
-                        api_key: Secret::from(api_key),
-                        allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
-                        retry_policy: config.retry_policy,
-                        command_timeout: config.command_timeout,
-                        max_agent_turns: DEFAULT_MAX_AGENT_TURNS,
-                    }))
+                    tracing::warn!(
+                        provider = ?config.provider,
+                        model = %config.model,
+                        "native summary partially configured; summaries will report disabled"
+                    );
                 }
-                // Provider, key, and model are all optional-but-preserved in
-                // config so an unconfigured or partially configured deployment
-                // boots cleanly — the disabled client errors only if a summary
-                // job actually runs.
-                _ => {
-                    if partially_configured {
-                        tracing::warn!(
-                            provider = ?config.provider,
-                            model = %config.model,
-                            "native summary partially configured; summaries will report disabled"
-                        );
-                    }
-                    Ok(SummaryClient::Disabled)
-                }
+                Ok(SummaryClient::Disabled)
             }
         }
         _ => Ok(SummaryClient::Cli(HarnessCliSummaryClient {
@@ -823,6 +940,174 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
             command_timeout: config.command_timeout,
         })),
     }
+}
+
+/// Open `path` owner-only: create it (with parent directories) at mode
+/// 0600 when absent — reporting `created` — or tighten an existing file to
+/// 0600. Errors are propagated so credential setup never falls back to a
+/// group/world-readable file.
+#[cfg(unix)]
+fn open_private_record(path: &Path) -> Result<(fs::File, bool), std::io::Error> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok((file, false))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Exclusive OS-level lock on `<auth_file>.lock`, held while the credential
+/// record is read, refreshed, and rewritten. `flock` attaches to the open
+/// file description, so distinct opens serialize both threads in this
+/// worker and separate processes sharing the same `CHATGPT_AUTH_FILE`
+/// (rig's own refresh mutex only spans clones of one authenticator, and a
+/// torn `fs::write` in another process could otherwise be read here).
+/// The returned `File` is the guard: dropping it releases the lock.
+/// With `deadline`, acquisition is retried non-blockingly until it elapses
+/// so a held lock (e.g. an interactive `auth login-chatgpt`) cannot pin a
+/// summary job forever; `None` waits indefinitely.
+#[cfg(unix)]
+fn chatgpt_auth_file_guard(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<fs::File>, SummaryError> {
+    use std::os::unix::io::AsRawFd;
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let (file, _) = open_private_record(&lock_path).map_err(|err| {
+        summary_engine_error(format!(
+            "failed to prepare ChatGPT auth lock {}: {err}",
+            lock_path.display()
+        ))
+    })?;
+    let fd = file.as_raw_fd();
+    loop {
+        let operation = if deadline.is_some() {
+            libc::LOCK_EX | libc::LOCK_NB
+        } else {
+            libc::LOCK_EX
+        };
+        if unsafe { libc::flock(fd, operation) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = std::io::Error::last_os_error();
+        match deadline {
+            Some(deadline) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(summary_engine_error(format!(
+                        "timed out waiting for the ChatGPT auth file lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50).min(deadline - now));
+            }
+            _ => {
+                return Err(summary_engine_error(format!(
+                    "failed to lock ChatGPT auth file {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn chatgpt_auth_file_guard(
+    _path: &Path,
+    _deadline: Option<std::time::Instant>,
+) -> Result<Option<fs::File>, SummaryError> {
+    Ok(None)
+}
+
+/// rig persists OAuth credentials with `std::fs::write`, which keeps a
+/// pre-existing file's mode but applies the process umask on creation.
+/// Tighten an existing record to owner-only before authenticate reads and
+/// refreshes it; a missing file is left to `authenticate`'s own error. Any
+/// failure aborts authentication — continuing would let rig write fresh
+/// tokens into a file other users can still read (e.g. a group-writable
+/// host file owned by another UID).
+#[cfg(unix)]
+fn harden_auth_file_permissions(path: &Path) -> Result<(), SummaryError> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(_) => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+                summary_engine_error(format!(
+                    "failed to restrict permissions on ChatGPT auth file {}: {err}",
+                    path.display()
+                ))
+            })
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(summary_engine_error(format!(
+            "failed to stat ChatGPT auth file {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_auth_file_permissions(_path: &Path) -> Result<(), SummaryError> {
+    Ok(())
+}
+
+/// "Sign in with ChatGPT" device login behind the `auth login-chatgpt`
+/// subcommand: runs the OAuth device flow interactively and persists the
+/// credential record to `auth_file`, where `SUMMARY_PROVIDER=chatgpt` picks
+/// it up (and refreshes it) on every summary run.
+pub async fn chatgpt_device_login(auth_file: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize against concurrent logins/summary refreshes before touching
+    // the record (see chatgpt_auth_file_guard). Interactive login waits for
+    // a held lock rather than failing — the other side is a bounded summary
+    // job.
+    let _guard = chatgpt_auth_file_guard(&auth_file, None)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
+    // rig persists the record with `std::fs::write` under the process umask
+    // and deserializes any existing file — pre-create it owner-only and
+    // seed a fresh file with `{}` (rig's AuthRecord is all-optional), so a
+    // first-time login reaches the device prompt instead of dying on an
+    // empty-file JSON error. Errors propagate: never let tokens land in a
+    // group/world-readable file.
+    #[cfg(unix)]
+    {
+        let (mut file, created) = open_private_record(&auth_file)?;
+        if created {
+            file.write_all(b"{}")?;
+            file.sync_all()?;
+        }
+    }
+    let authenticator = Authenticator::new(
+        AuthSource::OAuth,
+        Some(auth_file.clone()),
+        DeviceCodeHandler::new(|prompt| {
+            println!(
+                "Visit {} and enter code {}",
+                prompt.verification_uri, prompt.user_code
+            );
+        }),
+        true,
+    );
+    OpenAIConfig::with_key(&chatgpt::DIALECT, Secret::from(""))
+        .client()
+        .authenticate(&authenticator)
+        .await
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
+    println!("ChatGPT credentials saved to {}", auth_file.display());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -959,6 +1244,7 @@ mod tests {
             provider: SummaryProvider::OpenCodeGo,
             model: "test-model".to_owned(),
             api_key: Secret::from("test-key"),
+            auth_file: None,
             allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy {
                 max_attempts: 1,
@@ -1139,6 +1425,7 @@ mod tests {
             model: "model".to_owned(),
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("key".to_owned()),
+            auth_file: None,
             allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
@@ -1154,6 +1441,7 @@ mod tests {
             model: "model".to_owned(),
             provider: None,
             api_key: Some("key".to_owned()),
+            auth_file: None,
             allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
@@ -1171,6 +1459,7 @@ mod tests {
             model: String::new(),
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("key".to_owned()),
+            auth_file: None,
             allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
@@ -1178,12 +1467,44 @@ mod tests {
         .unwrap();
         assert!(matches!(no_model, SummaryClient::Disabled));
 
+        // ChatGPT OAuth counts an auth file as credentials even without a
+        // static access token.
+        let chatgpt_oauth = build_summary_client(SummaryClientConfig {
+            harness: SummaryHarness::Native,
+            command_path: String::new(),
+            model: "gpt-5.3-codex".to_owned(),
+            provider: Some(SummaryProvider::ChatGpt),
+            api_key: None,
+            auth_file: Some(PathBuf::from("/run/secrets/chatgpt-auth.json")),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(matches!(chatgpt_oauth, SummaryClient::Native(_)));
+
+        // ChatGPT with neither token nor file is partial config.
+        let chatgpt_bare = build_summary_client(SummaryClientConfig {
+            harness: SummaryHarness::Native,
+            command_path: String::new(),
+            model: "gpt-5.3-codex".to_owned(),
+            provider: Some(SummaryProvider::ChatGpt),
+            api_key: None,
+            auth_file: None,
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(matches!(chatgpt_bare, SummaryClient::Disabled));
+
         let cli = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Claude,
             command_path: "/bin/claude".to_owned(),
             model: "haiku".to_owned(),
             provider: None,
             api_key: None,
+            auth_file: None,
             allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
@@ -1200,6 +1521,7 @@ mod tests {
             model: "model".to_owned(),
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("super-secret-key".to_owned()),
+            auth_file: None,
             allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),

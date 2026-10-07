@@ -142,6 +142,11 @@ pub enum SummaryProvider {
     /// OpenCode Go subscription: API key from `OPENCODE_API_KEY`, models on
     /// `opencode.ai/zen/go/v1` (Responses or Chat Completions by model).
     OpenCodeGo,
+    /// ChatGPT subscription ("Sign in with ChatGPT" OAuth): either a static
+    /// `CHATGPT_ACCESS_TOKEN` or an OAuth credential file at
+    /// `CHATGPT_AUTH_FILE` (written by `auth login-chatgpt`, refreshed on
+    /// use). Models run on `chatgpt.com/backend-api/codex` (Responses).
+    ChatGpt,
 }
 
 impl SummaryProvider {
@@ -149,6 +154,7 @@ impl SummaryProvider {
         let key = "SUMMARY_PROVIDER";
         match raw.trim().to_ascii_lowercase().as_str() {
             "opencode_go" | "opencode-go" => Ok(Self::OpenCodeGo),
+            "chatgpt" => Ok(Self::ChatGpt),
             _ => Err(ConfigError::InvalidEnv {
                 key,
                 value: raw.to_owned(),
@@ -159,13 +165,25 @@ impl SummaryProvider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenCodeGo => "opencode_go",
+            Self::ChatGpt => "chatgpt",
         }
     }
 
     /// Env var the provider's credential is read from, when it needs one.
+    /// For `chatgpt` this is an optional static access token; OAuth file
+    /// auth comes from `CHATGPT_AUTH_FILE` instead.
     pub const fn api_key_env(self) -> &'static str {
         match self {
             Self::OpenCodeGo => "OPENCODE_API_KEY",
+            Self::ChatGpt => "CHATGPT_ACCESS_TOKEN",
+        }
+    }
+
+    /// Env var naming the OAuth credential file, when the provider has one.
+    pub const fn auth_file_env(self) -> Option<&'static str> {
+        match self {
+            Self::OpenCodeGo => None,
+            Self::ChatGpt => Some("CHATGPT_AUTH_FILE"),
         }
     }
 }
@@ -195,6 +213,9 @@ pub struct AppConfig {
     pub summary_provider: Option<SummaryProvider>,
     /// Credential for `summary_provider` (`<provider>.api_key_env()`).
     pub summary_api_key: Option<String>,
+    /// OAuth credential file for `summary_provider`
+    /// (`<provider>.auth_file_env()` — currently `CHATGPT_AUTH_FILE`).
+    pub summary_auth_file: Option<String>,
     pub summary_allow_unsafe_agent_harness: bool,
     pub summary_enabled: bool,
     pub database_url: String,
@@ -300,7 +321,6 @@ impl AppConfig {
                 optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
             )?;
         }
-        let summary_api_key = optional_env("OPENCODE_API_KEY");
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
                 resolve_summary_settings(
@@ -319,11 +339,10 @@ impl AppConfig {
                     optional_env("CLAUDE_MODEL"),
                 )
             };
-        let (summary_provider, summary_api_key) = resolve_summary_provider(
+        let (summary_provider, summary_api_key, summary_auth_file) = resolve_summary_provider(
             app_role.requires_summary_harness_config(),
             summary_harness,
-            optional_env("SUMMARY_PROVIDER"),
-            summary_api_key,
+            optional_env,
         )?;
 
         Ok(Self {
@@ -336,6 +355,7 @@ impl AppConfig {
             summary_model,
             summary_provider,
             summary_api_key,
+            summary_auth_file,
             summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
@@ -446,7 +466,6 @@ impl AppConfig {
                 optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
             )?;
         }
-        let summary_api_key = optional_from_map(values, "OPENCODE_API_KEY");
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
                 resolve_summary_settings(
@@ -465,11 +484,10 @@ impl AppConfig {
                     optional_from_map(values, "CLAUDE_MODEL"),
                 )
             };
-        let (summary_provider, summary_api_key) = resolve_summary_provider(
+        let (summary_provider, summary_api_key, summary_auth_file) = resolve_summary_provider(
             app_role.requires_summary_harness_config(),
             summary_harness,
-            optional_from_map(values, "SUMMARY_PROVIDER"),
-            summary_api_key,
+            |key| optional_from_map(values, key),
         )?;
 
         Ok(Self {
@@ -482,6 +500,7 @@ impl AppConfig {
             summary_model,
             summary_provider,
             summary_api_key,
+            summary_auth_file,
             summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
@@ -731,35 +750,46 @@ fn resolve_summary_settings(
     Ok((command, model))
 }
 
-/// Resolve `SUMMARY_PROVIDER` / the provider credential for the native
-/// harness. Gated on whether the role can run summary jobs at all — not
+/// Resolve `SUMMARY_PROVIDER` and that provider's credentials for the
+/// native harness: the API key from `<provider>.api_key_env()` and, for
+/// OAuth-backed providers, the credential file from `auth_file_env()`.
+/// Gated on whether the role can run summary jobs at all — not
 /// `SUMMARY_ENABLED`, which only sets the default for new meetings while
 /// stored meetings and guild settings can still enable summaries. Settings
 /// are kept optional here: a worker without them boots and reports the
 /// disabled summary client per job instead of failing startup, and an
 /// invalid provider value is warned about and ignored for the same reason.
-/// CLI harnesses ignore both settings entirely.
+/// CLI harnesses ignore all of these settings.
+/// Credentials [`resolve_summary_provider`] collects for the native
+/// harness's provider: `(provider, api_key, auth_file)`.
+pub type SummaryProviderSettings = (Option<SummaryProvider>, Option<String>, Option<String>);
+
 fn resolve_summary_provider(
     summary_runtime_capable: bool,
     harness: SummaryHarness,
-    provider: Option<String>,
-    api_key: Option<String>,
-) -> Result<(Option<SummaryProvider>, Option<String>), ConfigError> {
+    read_env: impl Fn(&'static str) -> Option<String>,
+) -> Result<SummaryProviderSettings, ConfigError> {
     if harness != SummaryHarness::Native || !summary_runtime_capable {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
-    let provider = provider.and_then(|value| match SummaryProvider::parse(&value) {
-        Ok(provider) => Some(provider),
-        Err(_) => {
-            tracing::warn!(
-                key = "SUMMARY_PROVIDER",
-                value,
-                "ignoring invalid native summary provider"
-            );
-            None
-        }
-    });
-    Ok((provider, api_key.filter(|value| !value.trim().is_empty())))
+    let provider =
+        read_env("SUMMARY_PROVIDER").and_then(|value| match SummaryProvider::parse(&value) {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                tracing::warn!(
+                    key = "SUMMARY_PROVIDER",
+                    value,
+                    "ignoring invalid native summary provider"
+                );
+                None
+            }
+        });
+    let non_empty = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    let api_key = provider.and_then(|provider| non_empty(read_env(provider.api_key_env())));
+    let auth_file = provider
+        .and_then(|provider| provider.auth_file_env())
+        .and_then(|env| non_empty(read_env(env)));
+    Ok((provider, api_key, auth_file))
 }
 
 fn disabled_summary_settings(
