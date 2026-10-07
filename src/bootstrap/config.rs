@@ -99,6 +99,8 @@ pub enum SummaryHarness {
     Claude,
     CursorAgent,
     OpenCode,
+    /// In-process rig-based agent (`src/infrastructure/agent.rs`); no CLI.
+    Native,
 }
 
 impl SummaryHarness {
@@ -108,6 +110,7 @@ impl SummaryHarness {
             "claude" => Ok(Self::Claude),
             "cursor_agent" => Ok(Self::CursorAgent),
             "opencode" => Ok(Self::OpenCode),
+            "native" => Ok(Self::Native),
             _ => Err(ConfigError::InvalidEnv {
                 key,
                 value: raw.to_owned(),
@@ -120,7 +123,53 @@ impl SummaryHarness {
             Self::Claude => "claude",
             Self::CursorAgent => "cursor_agent",
             Self::OpenCode => "opencode",
+            Self::Native => "native",
         }
+    }
+
+    /// Whether this harness shells out to a coding CLI (vs the in-process agent).
+    pub const fn is_cli(self) -> bool {
+        !matches!(self, Self::Native)
+    }
+}
+
+/// Model provider for `SUMMARY_HARNESS=native` (`SUMMARY_PROVIDER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryProvider {
+    /// OpenCode Go subscription: API key from `OPENCODE_API_KEY`, models on
+    /// `opencode.ai/zen/go/v1` (Responses or Chat Completions by model).
+    OpenCodeGo,
+}
+
+impl SummaryProvider {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let key = "SUMMARY_PROVIDER";
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "opencode_go" | "opencode-go" => Ok(Self::OpenCodeGo),
+            _ => Err(ConfigError::InvalidEnv {
+                key,
+                value: raw.to_owned(),
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenCodeGo => "opencode_go",
+        }
+    }
+
+    /// Env var the provider's credential is read from, when it needs one.
+    pub const fn api_key_env(self) -> &'static str {
+        match self {
+            Self::OpenCodeGo => "OPENCODE_API_KEY",
+        }
+    }
+}
+
+impl Display for SummaryProvider {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -139,6 +188,10 @@ pub struct AppConfig {
     pub summary_harness: SummaryHarness,
     pub summary_command: String,
     pub summary_model: String,
+    /// Provider behind `SUMMARY_HARNESS=native` (`SUMMARY_PROVIDER`).
+    pub summary_provider: Option<SummaryProvider>,
+    /// Credential for `summary_provider` (`<provider>.api_key_env()`).
+    pub summary_api_key: Option<String>,
     pub summary_allow_unsafe_agent_harness: bool,
     pub summary_enabled: bool,
     pub database_url: String,
@@ -242,6 +295,10 @@ impl AppConfig {
                 optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
             )?;
         }
+        let summary_provider = optional_env("SUMMARY_PROVIDER")
+            .map(|value| SummaryProvider::parse(&value))
+            .transpose()?;
+        let summary_api_key = optional_env("OPENCODE_API_KEY");
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
                 resolve_summary_settings(
@@ -260,6 +317,12 @@ impl AppConfig {
                     optional_env("CLAUDE_MODEL"),
                 )
             };
+        let (summary_provider, summary_api_key) = resolve_summary_provider(
+            summary_enabled && app_role.requires_summary_harness_config(),
+            summary_harness,
+            summary_provider,
+            summary_api_key,
+        )?;
 
         Ok(Self {
             app_role,
@@ -269,6 +332,8 @@ impl AppConfig {
             summary_harness,
             summary_command,
             summary_model,
+            summary_provider,
+            summary_api_key,
             summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
@@ -377,6 +442,10 @@ impl AppConfig {
                 optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
             )?;
         }
+        let summary_provider = optional_from_map(values, "SUMMARY_PROVIDER")
+            .map(|value| SummaryProvider::parse(&value))
+            .transpose()?;
+        let summary_api_key = optional_from_map(values, "OPENCODE_API_KEY");
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
                 resolve_summary_settings(
@@ -395,6 +464,12 @@ impl AppConfig {
                     optional_from_map(values, "CLAUDE_MODEL"),
                 )
             };
+        let (summary_provider, summary_api_key) = resolve_summary_provider(
+            summary_enabled && app_role.requires_summary_harness_config(),
+            summary_harness,
+            summary_provider,
+            summary_api_key,
+        )?;
 
         Ok(Self {
             app_role,
@@ -404,6 +479,8 @@ impl AppConfig {
             summary_harness,
             summary_command,
             summary_model,
+            summary_provider,
+            summary_api_key,
             summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
@@ -617,13 +694,16 @@ fn resolve_summary_settings(
         c
     } else if harness == SummaryHarness::Claude {
         get_claude_command()?
+    } else if harness == SummaryHarness::Native {
+        // The native agent runs in-process; there is no command to resolve.
+        String::new()
     } else {
         return Err(ConfigError::MissingEnv {
             key: "SUMMARY_COMMAND",
         });
     };
 
-    let mut model = if harness == SummaryHarness::OpenCode {
+    let mut model = if matches!(harness, SummaryHarness::OpenCode | SummaryHarness::Native) {
         summary_model.unwrap_or_default()
     } else {
         summary_model.or(claude_model).unwrap_or_default()
@@ -631,17 +711,50 @@ fn resolve_summary_settings(
     if model.trim().is_empty() {
         model = match harness {
             SummaryHarness::Claude => "haiku".to_owned(),
-            SummaryHarness::CursorAgent | SummaryHarness::OpenCode => String::new(),
+            SummaryHarness::CursorAgent | SummaryHarness::OpenCode | SummaryHarness::Native => {
+                String::new()
+            }
         };
     }
 
-    if harness == SummaryHarness::OpenCode && model.trim().is_empty() {
+    if matches!(harness, SummaryHarness::OpenCode | SummaryHarness::Native)
+        && model.trim().is_empty()
+    {
         return Err(ConfigError::MissingEnv {
             key: "SUMMARY_MODEL",
         });
     }
 
     Ok((command, model))
+}
+
+/// Resolve `SUMMARY_PROVIDER` / the provider credential for the native
+/// harness. Strict only when the role actually runs summaries: the native
+/// harness requires a provider and (per provider) an API key; every other
+/// harness ignores both. On the disabled path values pass through unparsed
+/// requirements so a worker that never executes a summary does not fail to
+/// boot.
+fn resolve_summary_provider(
+    summary_runtime_enabled: bool,
+    harness: SummaryHarness,
+    provider: Option<SummaryProvider>,
+    api_key: Option<String>,
+) -> Result<(Option<SummaryProvider>, Option<String>), ConfigError> {
+    match harness {
+        SummaryHarness::Native if summary_runtime_enabled => {
+            let provider = provider.ok_or(ConfigError::MissingEnv {
+                key: "SUMMARY_PROVIDER",
+            })?;
+            let api_key = api_key.filter(|value| !value.trim().is_empty()).ok_or(
+                ConfigError::MissingEnv {
+                    key: provider.api_key_env(),
+                },
+            )?;
+            Ok((Some(provider), Some(api_key)))
+        }
+        SummaryHarness::Native => Ok((provider, api_key)),
+        _ => Ok((None, None)),
+    }
 }
 
 fn disabled_summary_settings(
@@ -661,7 +774,7 @@ fn disabled_summary_settings(
         })
         .unwrap_or_default();
 
-    let mut model = if harness == SummaryHarness::OpenCode {
+    let mut model = if matches!(harness, SummaryHarness::OpenCode | SummaryHarness::Native) {
         summary_model.unwrap_or_default()
     } else {
         summary_model.or(claude_model).unwrap_or_default()
