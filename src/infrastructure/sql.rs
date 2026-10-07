@@ -144,6 +144,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0031_meetings_guild_channel_index",
         sql: include_str!("../../migrations/0031_meetings_guild_channel_index.sql"),
     },
+    Migration {
+        version: "0032_domain_knowledge_summary_approval",
+        sql: include_str!("../../migrations/0032_domain_knowledge_summary_approval.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -264,6 +268,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0030_summaries_context_selection_version.sql"),
     "\n",
     include_str!("../../migrations/0031_meetings_guild_channel_index.sql"),
+    "\n",
+    include_str!("../../migrations/0032_domain_knowledge_summary_approval.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -2175,13 +2181,53 @@ SELECT id,
        to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
        archived_actor_user_id,
        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       allow_summary_context
 FROM domain_knowledge_items
 WHERE guild_id = $1
   AND tenant_id = (SELECT tenant_id FROM active_tenant)
   AND ($2::TEXT::BOOLEAN OR archived_at IS NULL)
   AND (NULLIF($3, '') IS NULL OR content_type = $3)
 ORDER BY active DESC, updated_at DESC, id DESC
+"#;
+
+// Domain knowledge materialized into summary context: only records an admin
+// explicitly approved for viewer-visible summaries (`allow_summary_context`)
+// that are currently live. `$2` is an optional row cap (the loader passes the
+// summary-context list limit) so a large knowledge base stays bounded.
+pub const LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL: &str = r#"
+WITH active_tenant AS (
+    SELECT tg.tenant_id
+    FROM tenant_discord_guilds tg
+    JOIN tenants t ON t.id = tg.tenant_id
+    WHERE tg.guild_id = $1
+      AND tg.status = 'active'
+      AND t.status = 'active'
+    ORDER BY tg.effective_at DESC
+    LIMIT 1
+)
+SELECT id,
+       tenant_id,
+       guild_id,
+       content_type,
+       title,
+       body,
+       active,
+       version,
+       updated_actor_user_id,
+       to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
+       archived_actor_user_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       allow_summary_context
+FROM domain_knowledge_items
+WHERE guild_id = $1
+  AND tenant_id = (SELECT tenant_id FROM active_tenant)
+  AND active
+  AND archived_at IS NULL
+  AND allow_summary_context
+ORDER BY updated_at DESC, id DESC
+LIMIT NULLIF($2, '')::TEXT::INTEGER
 "#;
 
 pub const GET_DOMAIN_KNOWLEDGE_SQL: &str = r#"
@@ -2207,7 +2253,8 @@ SELECT id,
        to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
        archived_actor_user_id,
        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+       allow_summary_context
 FROM domain_knowledge_items
 WHERE guild_id = $1
   AND id = $2
@@ -2227,11 +2274,11 @@ WITH active_tenant AS (
 )
 INSERT INTO domain_knowledge_items (
     id, tenant_id, guild_id, content_type, title, body, active,
-    version, updated_actor_user_id, created_at, updated_at
+    allow_summary_context, version, updated_actor_user_id, created_at, updated_at
 )
 SELECT
     $1, tenant_id, $2, $3, $4, $5,
-    $6::TEXT::BOOLEAN, 1, NULLIF($7, ''), NOW(), NOW()
+    $6::TEXT::BOOLEAN, $8::TEXT::BOOLEAN, 1, NULLIF($7, ''), NOW(), NOW()
 FROM active_tenant
 RETURNING id,
           tenant_id,
@@ -2245,7 +2292,8 @@ RETURNING id,
           to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
           archived_actor_user_id,
           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+          allow_summary_context
 "#;
 
 pub const UPDATE_DOMAIN_KNOWLEDGE_SQL: &str = r#"
@@ -2264,11 +2312,13 @@ WITH active_tenant AS (
         title = $4,
         body = $5,
         active = COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active),
+        allow_summary_context = COALESCE(NULLIF($8, '')::TEXT::BOOLEAN, allow_summary_context),
         version = CASE
             WHEN content_type IS DISTINCT FROM $3
               OR title IS DISTINCT FROM $4
               OR body IS DISTINCT FROM $5
               OR active IS DISTINCT FROM COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)
+              OR allow_summary_context IS DISTINCT FROM COALESCE(NULLIF($8, '')::TEXT::BOOLEAN, allow_summary_context)
             THEN version + 1
             ELSE version
         END,
@@ -2277,6 +2327,7 @@ WITH active_tenant AS (
               OR title IS DISTINCT FROM $4
               OR body IS DISTINCT FROM $5
               OR active IS DISTINCT FROM COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)
+              OR allow_summary_context IS DISTINCT FROM COALESCE(NULLIF($8, '')::TEXT::BOOLEAN, allow_summary_context)
             THEN NULLIF($7, '')
             ELSE updated_actor_user_id
         END,
@@ -2285,6 +2336,7 @@ WITH active_tenant AS (
               OR title IS DISTINCT FROM $4
               OR body IS DISTINCT FROM $5
               OR active IS DISTINCT FROM COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)
+              OR allow_summary_context IS DISTINCT FROM COALESCE(NULLIF($8, '')::TEXT::BOOLEAN, allow_summary_context)
             THEN NOW()
             ELSE updated_at
         END
@@ -2304,7 +2356,8 @@ WITH active_tenant AS (
               to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
               archived_actor_user_id,
               to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+              allow_summary_context
 )
 SELECT * FROM updated
 "#;
@@ -2351,7 +2404,8 @@ WITH active_tenant AS (
               to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
               archived_actor_user_id,
               to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+              allow_summary_context
 )
 SELECT * FROM updated
 "#;
@@ -2401,7 +2455,8 @@ WITH active_tenant AS (
               to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at,
               archived_actor_user_id,
               to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+              allow_summary_context
 )
 SELECT * FROM updated
 "#;

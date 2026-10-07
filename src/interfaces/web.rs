@@ -3737,6 +3737,7 @@ struct DomainKnowledgeUpsertRequest {
     title: String,
     body: String,
     active: Option<bool>,
+    allow_summary_context: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3830,6 +3831,7 @@ struct DomainKnowledgeItemResponse {
     title: String,
     body: String,
     active: bool,
+    allow_summary_context: bool,
     version: i32,
     updated_actor_user_id: Option<String>,
     archived_at: Option<String>,
@@ -4839,6 +4841,7 @@ struct NormalizedDomainKnowledgeRequest {
     title: String,
     body: String,
     active: Option<bool>,
+    allow_summary_context: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4959,6 +4962,7 @@ fn normalize_domain_knowledge_request(
         title: title.to_owned(),
         body: body.to_owned(),
         active: request.active,
+        allow_summary_context: request.allow_summary_context,
     })
 }
 
@@ -5365,6 +5369,7 @@ fn domain_knowledge_response_from_row(row: &tokio_postgres::Row) -> DomainKnowle
         title: row.get("title"),
         body: row.get("body"),
         active: row.get("active"),
+        allow_summary_context: row.get("allow_summary_context"),
         version: row.get("version"),
         updated_actor_user_id: row.get("updated_actor_user_id"),
         archived_at: row.get("archived_at"),
@@ -9521,6 +9526,10 @@ async fn api_create_domain_knowledge(
     let id = Uuid::new_v4().to_string();
     let content_type = normalized.content_type.as_str().to_owned();
     let active = normalized.active.unwrap_or(true).to_string();
+    let allow_summary_context = normalized
+        .allow_summary_context
+        .unwrap_or(false)
+        .to_string();
     let row = state
         .db
         .query_opt(
@@ -9533,6 +9542,7 @@ async fn api_create_domain_knowledge(
                 &normalized.body,
                 &active,
                 &user_id,
+                &allow_summary_context,
             ],
         )
         .await
@@ -9551,6 +9561,7 @@ async fn api_create_domain_knowledge(
             json!({
                 "content_type": response.content_type.clone(),
                 "active": response.active,
+                "allow_summary_context": response.allow_summary_context,
                 "version": response.version,
             }),
         ),
@@ -9580,6 +9591,10 @@ async fn api_update_domain_knowledge(
         .active
         .map(|active| active.to_string())
         .unwrap_or_default();
+    let allow_summary_context = normalized
+        .allow_summary_context
+        .map(|allow| allow.to_string())
+        .unwrap_or_default();
     let row = state
         .db
         .query_opt(
@@ -9592,6 +9607,7 @@ async fn api_update_domain_knowledge(
                 &normalized.body,
                 &active,
                 &user_id,
+                &allow_summary_context,
             ],
         )
         .await
@@ -9614,6 +9630,7 @@ async fn api_update_domain_knowledge(
             json!({
                 "content_type": response.content_type.clone(),
                 "active": response.active,
+                "allow_summary_context": response.allow_summary_context,
                 "version": response.version,
             }),
         ),
@@ -10084,6 +10101,9 @@ async fn api_promote_ai_memory_to_domain_knowledge(
     let id = Uuid::new_v4().to_string();
     let content_type_text = content_type.as_str().to_owned();
     let active = false.to_string();
+    // Promoted notes start denied for summary context: an admin must approve
+    // the new domain-knowledge record before it may reach channel viewers.
+    let allow_summary_context = false.to_string();
     let row = state
         .db
         .query_opt(
@@ -10096,6 +10116,7 @@ async fn api_promote_ai_memory_to_domain_knowledge(
                 &memory.body,
                 &active,
                 &user_id,
+                &allow_summary_context,
             ],
         )
         .await
@@ -13713,6 +13734,7 @@ mod guild_api_tests {
             title: "Title".to_owned(),
             body: "   ".to_owned(),
             active: Some(true),
+            allow_summary_context: None,
         };
 
         assert_eq!(
@@ -13736,6 +13758,7 @@ mod guild_api_tests {
                     title: "   ".to_owned(),
                     body: "Body".to_owned(),
                     active: Some(true),
+                    allow_summary_context: None,
                 },
             ),
             Err(StatusCode::BAD_REQUEST)
@@ -14054,6 +14077,7 @@ mod guild_api_tests {
             title: "  Launch plan  ".to_owned(),
             body: "  Internal wording guidance.  ".to_owned(),
             active: None,
+            allow_summary_context: Some(true),
         })
         .expect("valid domain knowledge request should normalize");
 
@@ -14061,6 +14085,7 @@ mod guild_api_tests {
         assert_eq!(normalized.title, "Launch plan");
         assert_eq!(normalized.body, "Internal wording guidance.");
         assert_eq!(normalized.active, None);
+        assert_eq!(normalized.allow_summary_context, Some(true));
     }
 
     #[test]
@@ -14071,6 +14096,7 @@ mod guild_api_tests {
                 title: "Title".to_owned(),
                 body: "Body".to_owned(),
                 active: Some(true),
+                allow_summary_context: None,
             }),
             Err(StatusCode::BAD_REQUEST)
         );
@@ -14080,6 +14106,7 @@ mod guild_api_tests {
                 title: "Title".to_owned(),
                 body: "   ".to_owned(),
                 active: Some(true),
+                allow_summary_context: None,
             }),
             Err(StatusCode::BAD_REQUEST)
         );

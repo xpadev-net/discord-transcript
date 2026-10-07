@@ -376,6 +376,7 @@ export interface DomainKnowledgeItem {
   title: string;
   body: string;
   active: boolean;
+  allow_summary_context: boolean;
   version: number;
   updated_actor_user_id: string | null;
   archived_at: string | null;
@@ -389,6 +390,7 @@ export interface DomainKnowledgeUpsertRequest {
   title: string;
   body: string;
   active?: boolean;
+  allow_summary_context?: boolean;
 }
 
 export interface SummaryTemplate {

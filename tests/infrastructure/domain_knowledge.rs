@@ -3,7 +3,8 @@ use discord_transcript::domain::domain_knowledge::{
 };
 use discord_transcript::infrastructure::sql::{
     ACTIVATE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, INCREMENTAL_MIGRATIONS_SQL,
-    INSERT_DOMAIN_KNOWLEDGE_SQL, LIST_DOMAIN_KNOWLEDGE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
+    INSERT_DOMAIN_KNOWLEDGE_SQL, LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL,
+    LIST_DOMAIN_KNOWLEDGE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL,
 };
 use discord_transcript::infrastructure::sql_store::{FakeSqlExecutor, SqlMeetingStore, SqlRow};
 
@@ -15,6 +16,20 @@ fn domain_row(
     active: bool,
     version: u32,
     archived_at: Option<&str>,
+) -> SqlRow {
+    domain_row_with_approval(id, tenant_id, guild_id, content_type, active, version, archived_at, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn domain_row_with_approval(
+    id: &str,
+    tenant_id: Option<&str>,
+    guild_id: &str,
+    content_type: &str,
+    active: bool,
+    version: u32,
+    archived_at: Option<&str>,
+    allow_summary_context: bool,
 ) -> SqlRow {
     vec![
         Some(id.to_owned()),
@@ -30,6 +45,7 @@ fn domain_row(
         archived_at.map(|_| "actor-2".to_owned()),
         Some("2026-06-03T01:02:03.000Z".to_owned()),
         Some("2026-06-03T01:02:04.000Z".to_owned()),
+        Some(allow_summary_context.to_string()),
     ]
 }
 
@@ -72,8 +88,58 @@ fn domain_knowledge_sql_scopes_to_active_tenant_and_authenticated_guild() {
 }
 
 #[test]
+fn summary_context_query_only_returns_admin_approved_active_items() {
+    assert!(LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL.contains("AND allow_summary_context"));
+    assert!(LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL.contains("AND active"));
+    assert!(LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL.contains("archived_at IS NULL"));
+    assert!(LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL.contains("tg.status = 'active'"));
+    assert!(LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL.contains("t.status = 'active'"));
+    assert!(LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL.contains("LIMIT NULLIF($2, '')::TEXT::INTEGER"));
+    assert!(schema_has_allow_summary_context_column());
+    assert!(INSERT_DOMAIN_KNOWLEDGE_SQL.contains("allow_summary_context"));
+    assert!(UPDATE_DOMAIN_KNOWLEDGE_SQL.contains("COALESCE(NULLIF($8, '')::TEXT::BOOLEAN, allow_summary_context)"));
+}
+
+fn schema_has_allow_summary_context_column() -> bool {
+    INCREMENTAL_MIGRATIONS_SQL.contains("ADD COLUMN IF NOT EXISTS allow_summary_context BOOLEAN NOT NULL DEFAULT FALSE")
+}
+
+#[test]
+fn sql_store_lists_only_approved_domain_knowledge_for_summary_context() {
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        format!(
+            "{LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL}|g1\u{1f}50"
+        ),
+        vec![domain_row(
+            "dk-1",
+            Some("tenant-g1"),
+            "g1",
+            "glossary",
+            true,
+            5,
+            None,
+        )],
+    );
+    let mut store = SqlMeetingStore::new(executor);
+
+    let items = store
+        .list_domain_knowledge_for_summary_context("g1", Some(50))
+        .expect("approved rows should parse");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, "dk-1");
+    assert!(items[0].allow_summary_context);
+    assert_eq!(
+        store.executor.executed[0].1,
+        vec!["g1".to_owned(), "50".to_owned()]
+    );
+}
+
+#[test]
 fn domain_knowledge_mutations_increment_version_and_preserve_archive_contract() {
     assert!(UPDATE_DOMAIN_KNOWLEDGE_SQL.contains("COALESCE(NULLIF($6, '')::TEXT::BOOLEAN, active)"));
+    assert!(UPDATE_DOMAIN_KNOWLEDGE_SQL.contains("allow_summary_context IS DISTINCT FROM"));
     assert!(UPDATE_DOMAIN_KNOWLEDGE_SQL.contains("THEN version + 1"));
     assert!(UPDATE_DOMAIN_KNOWLEDGE_SQL.contains("AND guild_id = $2"));
     assert!(UPDATE_DOMAIN_KNOWLEDGE_SQL.contains("AND archived_at IS NULL"));
@@ -125,13 +191,13 @@ fn sql_store_creates_updates_activates_and_archives_domain_knowledge() {
     let mut executor = FakeSqlExecutor::default();
     executor.query_rows_result.insert(
         format!(
-            "{INSERT_DOMAIN_KNOWLEDGE_SQL}|dk-1\u{1f}g1\u{1f}wording_rule\u{1f}Names\u{1f}Use project names.\u{1f}true\u{1f}actor-1"
+            "{INSERT_DOMAIN_KNOWLEDGE_SQL}|dk-1\u{1f}g1\u{1f}wording_rule\u{1f}Names\u{1f}Use project names.\u{1f}true\u{1f}actor-1\u{1f}false"
         ),
         vec![domain_row("dk-1", Some("tenant-g1"), "g1", "wording_rule", true, 1, None)],
     );
     executor.query_rows_result.insert(
         format!(
-            "{UPDATE_DOMAIN_KNOWLEDGE_SQL}|dk-1\u{1f}g1\u{1f}project_context\u{1f}Context\u{1f}A project context.\u{1f}false\u{1f}actor-2"
+            "{UPDATE_DOMAIN_KNOWLEDGE_SQL}|dk-1\u{1f}g1\u{1f}project_context\u{1f}Context\u{1f}A project context.\u{1f}false\u{1f}actor-2\u{1f}true"
         ),
         vec![domain_row("dk-1", Some("tenant-g1"), "g1", "project_context", false, 2, None)],
     );
@@ -161,6 +227,7 @@ fn sql_store_creates_updates_activates_and_archives_domain_knowledge() {
             title: "Names".to_owned(),
             body: "Use project names.".to_owned(),
             active: true,
+            allow_summary_context: false,
             updated_actor_user_id: Some("actor-1".to_owned()),
         })
         .expect("create should parse returned row");
@@ -174,6 +241,7 @@ fn sql_store_creates_updates_activates_and_archives_domain_knowledge() {
             title: "Context".to_owned(),
             body: "A project context.".to_owned(),
             active: false,
+            allow_summary_context: Some(true),
             updated_actor_user_id: Some("actor-2".to_owned()),
         })
         .expect("update should parse")

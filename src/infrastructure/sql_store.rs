@@ -39,17 +39,18 @@ use crate::infrastructure::sql::{
     INSERT_SCHEDULED_MEETING_WITH_EFFECTIVE_SETTINGS_SQL, INSERT_SUMMARY_TEMPLATE_SQL,
     INSERT_TRANSCRIPT_FEEDBACK_SQL, INSERT_USAGE_EVENT_SQL,
     LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL, LIST_AI_MEMORY_NOTES_SQL,
-    LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL,
-    LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_RECENT_USAGE_EVENTS_SQL,
-    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL,
-    LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
-    MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration, RECOVERY_READY_SUMMARY_JOBS_SQL,
-    RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
-    ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
-    SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
-    UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
-    UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
-    UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL, migration_statements,
+    LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL, LIST_DOMAIN_KNOWLEDGE_SQL,
+    LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL, LIST_PERSON_ALIASES_SQL,
+    LIST_RECENT_AUDIT_EVENTS_SQL, LIST_RECENT_USAGE_EVENTS_SQL, LIST_SUMMARY_TEMPLATES_SQL,
+    LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL,
+    MARK_JOB_FAILED_SQL, MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration,
+    RECOVERY_READY_SUMMARY_JOBS_SQL, RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
+    RETRY_JOB_SQL, ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL,
+    SET_AI_MEMORY_PINNED_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
+    UPDATE_SUMMARY_TEMPLATE_SQL, UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL,
+    UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL, UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL,
+    migration_statements,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -204,6 +205,27 @@ pub fn person_alias_row(
         None,
         Some("2026-06-04T01:02:03.000Z".to_owned()),
         Some("2026-06-04T01:03:03.000Z".to_owned()),
+    ]
+}
+
+/// Test helper: domain-knowledge row matching the domain knowledge list
+/// queries' projection, with `allow_summary_context` enabled.
+pub fn domain_knowledge_row(id: &str, tenant_id: &str, guild_id: &str) -> SqlRow {
+    vec![
+        Some(id.to_owned()),
+        Some(tenant_id.to_owned()),
+        Some(guild_id.to_owned()),
+        Some("project_context".to_owned()),
+        Some(format!("title-{id}")),
+        Some(format!("body-{id}")),
+        Some("true".to_owned()),
+        Some("1".to_owned()),
+        Some("actor-1".to_owned()),
+        None,
+        None,
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        Some("2026-06-04T01:03:03.000Z".to_owned()),
+        Some("true".to_owned()),
     ]
 }
 
@@ -614,6 +636,28 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
                     content_type
                         .map(|content_type| content_type.as_str().to_owned())
                         .unwrap_or_default(),
+                ],
+            )
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_domain_knowledge_row).collect()
+    }
+
+    /// Active, unarchived domain knowledge items an admin approved for
+    /// materialization into summary context (`allow_summary_context`).
+    /// `limit` bounds the lookup the same way as the other summary-context
+    /// loaders.
+    pub fn list_domain_knowledge_for_summary_context(
+        &mut self,
+        guild_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<DomainKnowledgeItem>, StoreError> {
+        let rows = self
+            .executor
+            .query_rows(
+                LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL,
+                &[
+                    guild_id.to_owned(),
+                    limit.map(|limit| limit.to_string()).unwrap_or_default(),
                 ],
             )
             .map_err(StoreError::Backend)?;
@@ -1756,6 +1800,7 @@ fn new_domain_knowledge_params(item: &NewDomainKnowledgeItem) -> Vec<String> {
         item.body.clone(),
         item.active.to_string(),
         item.updated_actor_user_id.clone().unwrap_or_default(),
+        item.allow_summary_context.to_string(),
     ]
 }
 
@@ -1768,11 +1813,14 @@ fn update_domain_knowledge_params(item: &UpdateDomainKnowledgeItem) -> Vec<Strin
         item.body.clone(),
         item.active.to_string(),
         item.updated_actor_user_id.clone().unwrap_or_default(),
+        item.allow_summary_context
+            .map(|allow| allow.to_string())
+            .unwrap_or_default(),
     ]
 }
 
 fn parse_domain_knowledge_row(row: &SqlRow) -> Result<DomainKnowledgeItem, StoreError> {
-    if row.len() < 13 {
+    if row.len() < 14 {
         return Err(StoreError::Backend(format!(
             "invalid domain knowledge row length: {}",
             row.len()
@@ -1796,6 +1844,7 @@ fn parse_domain_knowledge_row(row: &SqlRow) -> Result<DomainKnowledgeItem, Store
         title: require_store_column(row, 4, "title")?,
         body: require_store_column(row, 5, "body")?,
         active: required_bool_column(row, 6, "active")?,
+        allow_summary_context: required_bool_column(row, 13, "allow_summary_context")?,
         version: required_u32_column(row, 7, "version")?,
         updated_actor_user_id: row.get(8).and_then(|v| v.clone()),
         archived_at: parse_optional_domain_knowledge_timestamp(

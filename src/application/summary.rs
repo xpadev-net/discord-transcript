@@ -576,7 +576,10 @@ pub fn materialize_summary_context(
         .domain_knowledge
         .iter()
         .filter(|item| {
-            item.active && item.archived_at.is_none() && evidence.matches_domain_knowledge(item)
+            item.active
+                && item.archived_at.is_none()
+                && item.allow_summary_context
+                && evidence.matches_domain_knowledge(item)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -931,7 +934,7 @@ pub fn summary_context_leak_check_bodies(
         context
             .domain_knowledge
             .iter()
-            .filter(|item| item.active && item.archived_at.is_none()),
+            .filter(|item| item.active && item.archived_at.is_none() && item.allow_summary_context),
         context
             .ai_memory
             .iter()

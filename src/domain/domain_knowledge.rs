@@ -41,6 +41,10 @@ pub struct DomainKnowledgeItem {
     pub title: String,
     pub body: String,
     pub active: bool,
+    /// Admin approval to materialize this record into summary context files
+    /// that channel viewers may see. Deny-by-default: unapproved records stay
+    /// admin-tier data and are never injected into summaries.
+    pub allow_summary_context: bool,
     pub version: u32,
     pub updated_actor_user_id: Option<String>,
     pub archived_at: Option<DateTime<Utc>>,
@@ -57,6 +61,7 @@ pub struct NewDomainKnowledgeItem {
     pub title: String,
     pub body: String,
     pub active: bool,
+    pub allow_summary_context: bool,
     pub updated_actor_user_id: Option<String>,
 }
 
@@ -68,5 +73,7 @@ pub struct UpdateDomainKnowledgeItem {
     pub title: String,
     pub body: String,
     pub active: bool,
+    /// `None` keeps the stored value on update; `Some(_)` replaces it.
+    pub allow_summary_context: Option<bool>,
     pub updated_actor_user_id: Option<String>,
 }

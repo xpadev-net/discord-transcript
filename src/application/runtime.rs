@@ -3548,8 +3548,9 @@ fn load_runtime_summary_context<E: SqlExecutor>(
     // viewers of the recorded voice channel, while these context records are
     // admin-tier data. Only records anchored to a meeting recorded in the
     // same voice channel may be materialized; unanchored guild-global records
-    // (including all domain knowledge) are excluded.
-    let domain_knowledge = Vec::new();
+    // are excluded. Domain knowledge has no meeting anchor and is only
+    // materialized when an admin approved it for viewer-visible summaries
+    // (`allow_summary_context`).
     let tenant = store.resolve_tenant_by_guild(guild_id).map_err(|err| {
         crate::application::summary::SummaryError::SummaryEngine(format!(
             "failed to resolve active tenant for meeting {meeting_id}: {err}"
@@ -3565,10 +3566,22 @@ fn load_runtime_summary_context<E: SqlExecutor>(
             "failed to upsert VC participant alias candidates"
         );
     }
-    let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+    let (domain_knowledge, ai_memory, user_feedback, person_aliases) = if let Some(tenant) =
+        tenant.as_ref()
+    {
         // The eligible-anchor set is resolved first so the candidate lists
         // can pre-filter by anchor in SQL; see load_summary_context in
         // worker.rs.
+        let domain_knowledge = store
+            .list_domain_knowledge_for_summary_context(
+                guild_id,
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load domain knowledge for meeting {meeting_id}: {err}"
+                ))
+            })?;
         let allowed_meetings = crate::application::worker::summary_context_allowed_meeting_ids(
             store, meeting_id, guild_id,
         )
@@ -3621,6 +3634,7 @@ fn load_runtime_summary_context<E: SqlExecutor>(
                 ))
             })?;
         (
+            domain_knowledge,
             ai_memory
                 .into_iter()
                 .filter(|note| {
@@ -3649,7 +3663,7 @@ fn load_runtime_summary_context<E: SqlExecutor>(
                 .collect(),
         )
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
 
     let summary_template = crate::application::worker::load_effective_summary_template(

@@ -85,6 +85,7 @@ function domainKnowledgeItem(overrides: Record<string, unknown> = {}) {
     title: "Project Alpha",
     body: "Alpha terms",
     active: true,
+    allow_summary_context: false,
     version: 1,
     updated_actor_user_id: "admin-1",
     archived_at: null,
@@ -2049,6 +2050,7 @@ describe("App access controls", () => {
         title: "Beta Term",
         body: "Beta body",
         active: true,
+        allow_summary_context: false,
       }),
     );
     expect(await screen.findByText("有効: Beta Term v2")).toBeTruthy();

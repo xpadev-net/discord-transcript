@@ -260,9 +260,10 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
         // relevance matching and the agent's output from inside the meeting.
         // Context records are therefore only eligible when they are anchored
         // to a meeting recorded in the same voice channel; records without a
-        // meeting anchor (guild-global admin data, including all domain
-        // knowledge) are never materialized.
-        let domain_knowledge = Vec::new();
+        // meeting anchor (guild-global admin data) are never materialized.
+        // Domain knowledge has no meeting anchor; it is only materialized
+        // when an admin explicitly approved the record for viewer-visible
+        // summaries (`allow_summary_context`).
         let summary_template = load_effective_summary_template(self, guild_id, effective_settings)?;
         if let Err(err) =
             upsert_vc_participant_alias_candidates_for_guild(self, meeting_id, guild_id, &speakers)
@@ -275,11 +276,17 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
             );
         }
         let tenant = self.resolve_tenant_by_guild(guild_id)?;
-        let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+        let (domain_knowledge, ai_memory, user_feedback, person_aliases) = if let Some(tenant) =
+            tenant.as_ref()
+        {
             // The eligible-anchor set is resolved first so the candidate lists
             // can pre-filter by anchor in SQL: the per-list LIMIT then applies
             // to eligible records only, so guild-wide records can neither make
             // the lookup unbounded nor crowd out eligible context.
+            let domain_knowledge = self.list_domain_knowledge_for_summary_context(
+                guild_id,
+                Some(SUMMARY_CONTEXT_LIST_LIMIT),
+            )?;
             let allowed_meetings = summary_context_allowed_meeting_ids(self, meeting_id, guild_id)?;
             let anchor_csv = summary_context_anchor_csv(&allowed_meetings);
             let ai_memory = self.list_ai_memory_notes(
@@ -307,6 +314,7 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
                 Some(SUMMARY_CONTEXT_LIST_LIMIT),
             )?;
             (
+                domain_knowledge,
                 ai_memory
                     .into_iter()
                     .filter(|note| {
@@ -335,7 +343,7 @@ impl<E: SqlExecutor> SummaryContextStore for SqlMeetingStore<E> {
                     .collect(),
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
         Ok(SummaryContextInput {
@@ -431,11 +439,12 @@ pub(crate) fn register_summary_context_scope_fakes(
     executor: &mut crate::infrastructure::sql_store::FakeSqlExecutor,
 ) {
     use crate::infrastructure::sql::{
-        LIST_AI_MEMORY_NOTES_SQL, LIST_PERSON_ALIASES_SQL,
-        LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL, RESOLVE_TENANT_BY_GUILD_SQL,
+        LIST_AI_MEMORY_NOTES_SQL, LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL,
+        LIST_PERSON_ALIASES_SQL, LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL,
+        RESOLVE_TENANT_BY_GUILD_SQL,
     };
     use crate::infrastructure::sql_store::{
-        ai_memory_note_row, person_alias_row, sql_key, sql_row_from_strings,
+        ai_memory_note_row, domain_knowledge_row, person_alias_row, sql_key, sql_row_from_strings,
         tenant_installation_row, transcript_feedback_row,
     };
 
@@ -486,6 +495,15 @@ pub(crate) fn register_summary_context_scope_fakes(
             person_alias_row("a3", "t1", "g1", None),
         ],
     );
+    // Domain knowledge has no meeting anchor: the query is gated on the
+    // admin's `allow_summary_context` approval instead.
+    executor.query_rows_result.insert(
+        sql_key(
+            LIST_DOMAIN_KNOWLEDGE_FOR_SUMMARY_CONTEXT_SQL,
+            &["g1", &list_limit],
+        ),
+        vec![domain_knowledge_row("d1", "t1", "g1")],
+    );
     executor.query_rows_result.insert(
         sql_key(SUMMARY_CONTEXT_MEETING_CHANNEL_SQL, &["m1", "g1"]),
         vec![sql_row_from_strings(vec!["vc1".to_owned()])],
@@ -534,9 +552,15 @@ pub(crate) fn assert_summary_context_scope(
         HashSet::from(["a1"]),
         "aliases must keep only the same-channel anchor"
     );
-    assert!(
-        context.domain_knowledge.is_empty(),
-        "domain knowledge is never materialized into summary context"
+    let domain_knowledge_ids = context
+        .domain_knowledge
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        domain_knowledge_ids,
+        HashSet::from(["d1"]),
+        "domain knowledge must keep only admin-approved records"
     );
 }
 
