@@ -11678,18 +11678,33 @@ async fn api_audio(
     let primary = workspace.mixdown_path();
     let legacy = layout.legacy_meeting_dir(&meeting_id).join("mixdown.wav");
     if let Some(objects) = &state.recording_objects {
-        match objects.object_exists(&primary) {
-            Ok(true) => {
+        // Object-store probes do blocking HTTP (up to the request timeout);
+        // run them on the blocking pool so a slow S3 cannot occupy a Tokio
+        // worker thread and stall unrelated requests.
+        let probe = {
+            let objects = objects.clone();
+            let path = primary.clone();
+            tokio::task::spawn_blocking(move || objects.object_exists(&path)).await
+        };
+        match probe {
+            Ok(Ok(true)) => {
                 if let Some(url) = objects.presigned_get_for_path(&primary) {
                     return Ok(Redirect::temporary(&url).into_response());
                 }
             }
-            Ok(false) => {}
-            Err(err) => {
+            Ok(Ok(false)) => {}
+            Ok(Err(err)) => {
                 warn!(
                     meeting_id = %meeting_id,
                     error = %err,
                     "object store probe failed; falling back to local audio file"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    error = %join_err,
+                    "object store probe task failed; falling back to local audio file"
                 );
             }
         }
@@ -11799,26 +11814,36 @@ async fn api_speakers(
     // Under the s3 backend, speaker audio lives in the object store. List
     // the speakers prefix once and match candidate filenames instead of a
     // head request per speaker.
-    let remote_speaker_filenames: Option<Arc<HashSet<String>>> =
+    let remote_speaker_filenames: Option<Arc<HashSet<String>>> = if let Some(objects) =
         state.recording_objects.as_ref().and_then(|objects| {
-            objects.object_prefix(&primary_speakers_dir).map(|prefix| {
-                match objects.list_keys(&prefix) {
-                    Ok(keys) => Arc::new(
-                        keys.iter()
-                            .filter_map(|key| key.rsplit('/').next().map(str::to_owned))
-                            .collect::<HashSet<String>>(),
-                    ),
-                    Err(err) => {
-                        warn!(
-                            meeting_id = %meeting_id,
-                            error = %err,
-                            "object store list failed; falling back to local speaker files"
-                        );
-                        Arc::new(HashSet::new())
-                    }
-                }
-            })
-        });
+            objects
+                .object_prefix(&primary_speakers_dir)
+                .map(|prefix| (objects.clone(), prefix))
+        }) {
+        let (objects, prefix) = objects;
+        match tokio::task::spawn_blocking(move || objects.list_keys(&prefix)).await {
+            Ok(Ok(keys)) => Some(Arc::new(
+                keys.iter()
+                    .filter_map(|key| key.rsplit('/').next().map(str::to_owned))
+                    .collect::<HashSet<String>>(),
+            )),
+            result => {
+                let detail = match result {
+                    Ok(Err(err)) => err.to_string(),
+                    Err(join_err) => join_err.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                warn!(
+                    meeting_id = %meeting_id,
+                    error = %detail,
+                    "object store list failed; falling back to local speaker files"
+                );
+                Some(Arc::new(HashSet::new()))
+            }
+        }
+    } else {
+        None
+    };
 
     let speaker_tasks: Vec<_> = rows
         .iter()
@@ -11905,23 +11930,51 @@ async fn api_speaker_audio(
     let candidates =
         speaker_audio_path_candidates(&workspace.speakers_dir(), &legacy_speakers_dir, &speaker_id);
     if let Some(objects) = &state.recording_objects {
-        for candidate in &candidates {
-            match objects.object_exists(candidate) {
-                Ok(true) => {
-                    if let Some(url) = objects.presigned_get_for_path(candidate) {
-                        return Ok(Redirect::temporary(&url).into_response());
+        // Blocking HTTP probes go through the blocking pool; a slow S3 must
+        // not hold a Tokio worker for the request timeout. The whole
+        // candidate scan runs in one task, returning the first remote hit or
+        // the first probe error.
+        let probe = {
+            let objects = objects.clone();
+            let candidates = candidates.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut remote = None;
+                for candidate in &candidates {
+                    match objects.object_exists(candidate) {
+                        Ok(true) => {
+                            remote = Some(candidate.clone());
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(err) => return Err(err),
                     }
                 }
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(
-                        meeting_id = %meeting_id,
-                        speaker_id = %speaker_id,
-                        error = %err,
-                        "object store probe failed; falling back to local audio file"
-                    );
-                    break;
+                Ok(remote)
+            })
+            .await
+        };
+        match probe {
+            Ok(Ok(Some(remote_path))) => {
+                if let Some(url) = objects.presigned_get_for_path(&remote_path) {
+                    return Ok(Redirect::temporary(&url).into_response());
                 }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    speaker_id = %speaker_id,
+                    error = %err,
+                    "object store probe failed; falling back to local audio file"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    speaker_id = %speaker_id,
+                    error = %join_err,
+                    "object store probe task failed; falling back to local audio file"
+                );
             }
         }
     }
