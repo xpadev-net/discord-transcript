@@ -579,19 +579,26 @@ impl NativeAgentSummaryClient {
                 // `authenticate` resolves the OAuth record (file read plus
                 // refresh if expired) over HTTP, so it is async; summarize()
                 // runs synchronously, so drive it through the shared helper.
-                // Serialize credential reads/refreshes on the shared auth
-                // file across jobs — rig's internal mutex only covers clones
-                // of one authenticator, and each job builds its own.
-                let _guard = self
-                    .auth_file
-                    .as_deref()
-                    .map(chatgpt_auth_file_guard)
-                    .transpose()?
-                    .flatten();
-                if let Some(path) = self.auth_file.as_deref() {
-                    harden_auth_file_permissions(path);
-                }
-                let auth_timeout = self.command_timeout;
+                // The file lock + permission hardening only apply in OAuth
+                // mode: a configured CHATGPT_ACCESS_TOKEN never touches the
+                // credential file (a read-only auth dir must not break
+                // static-token summaries). Lock acquisition counts against
+                // the same deadline as the HTTP authentication itself.
+                let auth_deadline = std::time::Instant::now() + self.command_timeout;
+                let _guard: Option<fs::File> = if self.api_key.is_empty() {
+                    match self.auth_file.as_deref() {
+                        Some(path) => {
+                            let guard = chatgpt_auth_file_guard(path, Some(auth_deadline))?;
+                            harden_auth_file_permissions(path);
+                            guard
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let auth_timeout =
+                    auth_deadline.saturating_duration_since(std::time::Instant::now());
                 let client = run_future_blocking(async move {
                     timeout(
                         auth_timeout,
@@ -952,8 +959,14 @@ fn open_private_record(path: &Path) -> Result<(fs::File, bool), std::io::Error> 
 /// (rig's own refresh mutex only spans clones of one authenticator, and a
 /// torn `fs::write` in another process could otherwise be read here).
 /// The returned `File` is the guard: dropping it releases the lock.
+/// With `deadline`, acquisition is retried non-blockingly until it elapses
+/// so a held lock (e.g. an interactive `auth login-chatgpt`) cannot pin a
+/// summary job forever; `None` waits indefinitely.
 #[cfg(unix)]
-fn chatgpt_auth_file_guard(path: &Path) -> Result<Option<fs::File>, SummaryError> {
+fn chatgpt_auth_file_guard(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<fs::File>, SummaryError> {
     use std::os::unix::io::AsRawFd;
     let mut lock_name = path.as_os_str().to_os_string();
     lock_name.push(".lock");
@@ -964,18 +977,43 @@ fn chatgpt_auth_file_guard(path: &Path) -> Result<Option<fs::File>, SummaryError
             lock_path.display()
         ))
     })?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(summary_engine_error(format!(
-            "failed to lock ChatGPT auth file {}: {}",
-            lock_path.display(),
-            std::io::Error::last_os_error()
-        )));
+    let fd = file.as_raw_fd();
+    loop {
+        let operation = if deadline.is_some() {
+            libc::LOCK_EX | libc::LOCK_NB
+        } else {
+            libc::LOCK_EX
+        };
+        if unsafe { libc::flock(fd, operation) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = std::io::Error::last_os_error();
+        match deadline {
+            Some(deadline) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(summary_engine_error(format!(
+                        "timed out waiting for the ChatGPT auth file lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50).min(deadline - now));
+            }
+            _ => {
+                return Err(summary_engine_error(format!(
+                    "failed to lock ChatGPT auth file {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
     }
-    Ok(Some(file))
 }
 
 #[cfg(not(unix))]
-fn chatgpt_auth_file_guard(_path: &Path) -> Result<Option<fs::File>, SummaryError> {
+fn chatgpt_auth_file_guard(
+    _path: &Path,
+    _deadline: Option<std::time::Instant>,
+) -> Result<Option<fs::File>, SummaryError> {
     Ok(None)
 }
 
@@ -1012,8 +1050,10 @@ fn harden_auth_file_permissions(_path: &Path) {}
 /// it up (and refreshes it) on every summary run.
 pub async fn chatgpt_device_login(auth_file: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // Serialize against concurrent logins/summary refreshes before touching
-    // the record (see chatgpt_auth_file_guard).
-    let _guard = chatgpt_auth_file_guard(&auth_file)
+    // the record (see chatgpt_auth_file_guard). Interactive login waits for
+    // a held lock rather than failing — the other side is a bounded summary
+    // job.
+    let _guard = chatgpt_auth_file_guard(&auth_file, None)
         .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
     // rig persists the record with `std::fs::write` under the process umask
     // and deserializes any existing file — pre-create it owner-only and
