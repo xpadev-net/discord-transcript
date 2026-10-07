@@ -277,6 +277,23 @@ impl AgentToolFs {
     }
 }
 
+impl Drop for AgentToolFs {
+    /// Join every started tool task before the fs goes away. A
+    /// `spawn_blocking` task cannot be cancelled once running — dropping
+    /// the fs (end of an attempt, workspace teardown) without this wait
+    /// would let a timed-out write land on the workspace afterwards.
+    fn drop(&mut self) {
+        let pending = self.pending.get_mut();
+        loop {
+            while pending.try_join_next().is_some() {}
+            if pending.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ReadInputArgs {
     path: String,
