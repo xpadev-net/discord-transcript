@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod artifact;
 pub mod asr;
 pub mod bot_token;
