@@ -13,12 +13,14 @@ libc = "0.2"
 md-5 = "0.10"
 regex = "1.12.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rig-agent = "0.43"
+rig-core = { version = "0.43", features = ["reqwest"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serenity = { version = "0.12.5", default-features = false, features = ["default_native_tls", "client", "gateway", "model"] }
 sha2 = "0.10"
 songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "native", "serenity", "tungstenite", "receive"] }
-tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "fs", "net", "signal"] }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "fs", "net", "signal", "time"] }
 tokio-postgres = "0.7.15"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 tracing = "0.1.41"
@@ -27,6 +29,9 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 futures-util = "0.3"
 tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+rig-core = { version = "0.43", features = ["test-utils"] }
 
 [patch.crates-io]
 hpke-rs-libcrux = { path = "vendor/hpke-rs-libcrux-0.6.1" }

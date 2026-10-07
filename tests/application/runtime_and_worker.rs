@@ -16,7 +16,7 @@ use discord_transcript::application::worker::{
 };
 use discord_transcript::audio::build_wav_bytes_raw;
 use discord_transcript::bootstrap::config::{
-    AppConfig, AppRole, ChunkStorageBackend, ConfigError, SummaryHarness,
+    AppConfig, AppRole, ChunkStorageBackend, ConfigError, SummaryHarness, SummaryProvider,
 };
 use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::domain::authz::UserRole;
@@ -1947,6 +1947,104 @@ fn app_config_rejects_invalid_summary_harness() {
             value: "unknown".to_owned()
         }
     );
+}
+
+#[test]
+fn app_config_native_loads_without_provider_settings() {
+    // Missing provider credentials must not block startup: the summary
+    // client reports a disabled error per job instead.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_native_loads_provider_without_api_key() {
+    // A valid provider with a missing key still boots (and disables the
+    // client at runtime) rather than failing config load.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_native_loads_with_provider_and_key() {
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key.as_deref(), Some("ocg-key"));
+}
+
+#[test]
+fn app_config_cli_harness_ignores_summary_provider() {
+    // A provider value that would not parse must not stop a CLI-harness
+    // deployment from booting.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
+}
+
+#[test]
+fn app_config_native_ignores_invalid_provider() {
+    // An invalid provider value is warned about and ignored rather than
+    // fatal: a misconfigured worker still boots and reports the disabled
+    // summary client per job.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_MODEL".to_owned(), "grok-code-fast-1".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+}
+
+#[test]
+fn app_config_native_summary_disabled_keeps_valid_provider() {
+    // SUMMARY_ENABLED only defaults new meetings; stored meetings can still
+    // enable summaries, so valid credentials are preserved for the worker.
+    let mut values = base_env();
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "opencode_go".to_owned());
+    values.insert("OPENCODE_API_KEY".to_owned(), "ocg-key".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, Some(SummaryProvider::OpenCodeGo));
+    assert_eq!(config.summary_api_key.as_deref(), Some("ocg-key"));
+}
+
+#[test]
+fn app_config_web_bot_role_ignores_summary_provider() {
+    // A role that never runs summaries must boot past provider settings.
+    let mut values = base_env();
+    values.insert("APP_ROLE".to_owned(), "web-bot".to_owned());
+    values.insert("SUMMARY_HARNESS".to_owned(), "native".to_owned());
+    values.insert("SUMMARY_PROVIDER".to_owned(), "bogus".to_owned());
+
+    let config = AppConfig::from_map(&values).expect("config should load");
+    assert_eq!(config.summary_provider, None);
+    assert_eq!(config.summary_api_key, None);
 }
 
 #[test]

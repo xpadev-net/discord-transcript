@@ -607,6 +607,10 @@ fn run_agent_harness_with_output_contract(
         SummaryHarness::Claude => summarize_claude_stdin(client, prompt, workdir, output),
         SummaryHarness::OpenCode => summarize_opencode_argv(client, prompt, workdir, output),
         SummaryHarness::CursorAgent => summarize_cursor_argv(client, prompt, workdir, output),
+        SummaryHarness::Native => Err(SummaryError::SummaryEngine(
+            "summary harness `native` is handled by the in-process agent, not the CLI harness"
+                .to_owned(),
+        )),
     })
 }
 
@@ -799,7 +803,7 @@ fn agent_output_path(
     Ok(workdir.join(relative_path))
 }
 
-fn remove_stale_agent_output(
+pub(crate) fn remove_stale_agent_output(
     workdir: &Path,
     output_contract: AgentOutputContract,
 ) -> Result<(), SummaryError> {
@@ -814,7 +818,7 @@ fn remove_stale_agent_output(
     }
 }
 
-fn read_validated_agent_output(
+pub(crate) fn read_validated_agent_output(
     harness: SummaryHarness,
     workdir: &Path,
     output_contract: AgentOutputContract,
@@ -1685,6 +1689,9 @@ mod tests {
                         std::fs::read_to_string(&stdin_path).expect("stdin should be empty"),
                         ""
                     );
+                }
+                SummaryHarness::Native => {
+                    unreachable!("native is not a CLI harness")
                 }
             }
 
