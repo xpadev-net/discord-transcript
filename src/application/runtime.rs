@@ -8047,16 +8047,54 @@ impl ScaffoldHandler {
             }
         };
 
+        // Transcription inputs may exclude chunks live transcription already
+        // handled (written under `transcription_speakers/`), but playback —
+        // local speakers/ serving and the object store alike — needs the
+        // complete per-speaker set. Build it separately so partial audio
+        // never lands under `speakers/`.
+        let playback_speaker_dir: Option<PathBuf> = match &summary_input_source {
+            SummaryInputSource::Audio {
+                completed_live_chunks,
+                ..
+            } if completed_live_chunks.is_empty() => None,
+            SummaryInputSource::Audio { meeting_dir, .. } => Some(meeting_dir.clone()),
+            SummaryInputSource::FinalTranscript => {
+                // Recovered meetings may still have their chunk staging dir;
+                // build playback files from whatever remains.
+                Some(workspace.audio_dir())
+            }
+        };
+        let playback_speaker_paths: Vec<PathBuf> = match playback_speaker_dir {
+            None => speaker_audio
+                .iter()
+                .map(|input| PathBuf::from(&input.audio_path))
+                .collect(),
+            Some(meeting_dir) => match build_speaker_audio_inputs(
+                &meeting_dir,
+                effective_settings.whisper_resample_to_16k,
+            ) {
+                Ok(outputs) => outputs
+                    .iter()
+                    .map(|input| PathBuf::from(&input.audio_path))
+                    .collect(),
+                Err(err) => {
+                    warn!(
+                        meeting_id = %claimed_job.meeting_id,
+                        error = %err,
+                        "failed to build complete speaker playback files"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+
         // Under the s3 backend, mirror the playback artifacts (mixdown +
         // per-speaker wavs) to the object store. Uploads are queued in the
         // background; a missing local file or enqueue failure only warns —
         // the local copy is still authoritative for this run.
         if let Some(objects) = &self.recording_objects {
-            let artifact_paths = std::iter::once(std::path::Path::new(&audio_path)).chain(
-                speaker_audio
-                    .iter()
-                    .map(|input| std::path::Path::new(&input.audio_path)),
-            );
+            let artifact_paths = std::iter::once(std::path::Path::new(&audio_path))
+                .chain(playback_speaker_paths.iter().map(|path| path.as_path()));
             for path in artifact_paths {
                 match objects.upload_file(path, "audio/wav") {
                     Ok(true) => {}

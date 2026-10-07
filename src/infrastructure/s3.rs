@@ -433,8 +433,8 @@ impl S3Client {
             return self.put_object_async(key, body, content_type).await;
         }
         let canonical = self.endpoint.canonical_path(&self.settings, key);
-        let upload_id = self.multipart_initiate(&canonical).await?;
-        match self
+        let upload_id = self.multipart_initiate(&canonical, content_type).await?;
+        let result = match self
             .multipart_upload_parts(&canonical, &upload_id, path)
             .await
         {
@@ -442,22 +442,31 @@ impl S3Client {
                 self.multipart_complete(&canonical, &upload_id, &parts)
                     .await
             }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => Ok(()),
             Err(err) => {
-                // Best-effort cleanup so failed uploads do not leak storage.
+                // Best-effort cleanup so failed uploads (including a failed
+                // completion) do not leak paid part storage.
                 let _ = self.multipart_abort(&canonical, &upload_id).await;
                 Err(err)
             }
         }
     }
 
-    async fn multipart_initiate(&self, canonical_path: &str) -> Result<String, S3Error> {
+    async fn multipart_initiate(
+        &self,
+        canonical_path: &str,
+        content_type: &str,
+    ) -> Result<String, S3Error> {
         let response = self
             .signed_request(
                 reqwest::Method::POST,
                 canonical_path,
                 &[("uploads".to_owned(), String::new())],
                 Vec::new(),
-                None,
+                Some(content_type),
                 &[],
             )
             .await?;
@@ -534,15 +543,28 @@ impl S3Client {
             ));
         }
         xml.push_str("</CompleteMultipartUpload>");
-        self.signed_request(
-            reqwest::Method::POST,
-            canonical_path,
-            &[("uploadId".to_owned(), upload_id.to_owned())],
-            xml.into_bytes(),
-            Some("application/xml"),
-            &[],
-        )
-        .await?;
+        let response = self
+            .signed_request(
+                reqwest::Method::POST,
+                canonical_path,
+                &[("uploadId".to_owned(), upload_id.to_owned())],
+                xml.into_bytes(),
+                Some("application/xml"),
+                &[],
+            )
+            .await?;
+        // S3 may return HTTP 200 and still fail completion in the response
+        // body — treat any embedded <Error> payload as an upload failure.
+        let body = response
+            .text()
+            .await
+            .map_err(|err| S3Error::Http(err.to_string()))?;
+        if extract_xml_tag(&body, "Error").is_some() {
+            return Err(S3Error::Http(format!(
+                "multipart complete returned an error body: {}",
+                truncate_body(&body)
+            )));
+        }
         Ok(())
     }
 
