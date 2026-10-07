@@ -3224,7 +3224,9 @@ export function SettingsPage({
                     }
                   />
                   <span>
-                    {"\u8981\u7d04\u30b3\u30f3\u30c6\u30ad\u30b9\u30c8\u3078\u306e\u5229\u7528\u3092\u8a31\u53ef\u3059\u308b"}
+                    {
+                      "\u8981\u7d04\u30b3\u30f3\u30c6\u30ad\u30b9\u30c8\u3078\u306e\u5229\u7528\u3092\u8a31\u53ef\u3059\u308b"
+                    }
                   </span>
                 </label>
 
