@@ -5267,6 +5267,7 @@ impl ScaffoldHandler {
                 transcripts_marked_deleted = report.transcripts_marked_deleted,
                 summaries_deleted = report.summaries_deleted,
                 artifacts_deleted = report.artifacts_deleted,
+                remote_objects_deleted = report.remote_objects_deleted,
                 error = %err,
                 "startup retention cleanup failed after partial work"
             );
@@ -5286,6 +5287,7 @@ impl ScaffoldHandler {
                 transcripts_marked_deleted = report.transcripts_marked_deleted,
                 summaries_deleted = report.summaries_deleted,
                 artifacts_deleted = report.artifacts_deleted,
+                remote_objects_deleted = report.remote_objects_deleted,
                 "startup retention cleanup completed"
             );
             Ok(())

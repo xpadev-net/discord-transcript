@@ -3695,6 +3695,9 @@ struct AdminRetentionCleanupReportResponse {
     transcripts_marked_deleted: u64,
     summaries_deleted: u64,
     artifacts_deleted: u64,
+    /// Remote (object-store) objects removed under the meeting prefix when
+    /// the recording backend is S3; always 0 for the local backend.
+    remote_objects_deleted: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7899,6 +7902,7 @@ fn admin_retention_report_response(
         transcripts_marked_deleted: report.transcripts_marked_deleted,
         summaries_deleted: report.summaries_deleted,
         artifacts_deleted: report.artifacts_deleted,
+        remote_objects_deleted: report.remote_objects_deleted,
     }
 }
 
