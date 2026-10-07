@@ -1355,6 +1355,80 @@ fn materialized_summary_context_excludes_unrelated_private_context() {
 }
 
 #[test]
+fn materialized_summary_context_excludes_unapproved_domain_knowledge() {
+    let temp = unique_workspace("context_unapproved_domain", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("Planning".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("en".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let approved_body = "APPROVED_DOMAIN_BODY Roadmap planning";
+    let denied_body = "DENIED_DOMAIN_BODY Roadmap planning";
+    let domain_item = |id: &str, body: &str, allow: bool| DomainKnowledgeItem {
+        id: id.to_owned(),
+        tenant_id: Some("tenant-g1".to_owned()),
+        guild_id: "g1".to_owned(),
+        content_type: DomainKnowledgeContentType::ProjectContext,
+        title: "Roadmap".to_owned(),
+        body: body.to_owned(),
+        active: true,
+        allow_summary_context: allow,
+        version: 1,
+        updated_actor_user_id: None,
+        archived_at: None,
+        archived_actor_user_id: None,
+        created_at: updated_at,
+        updated_at,
+    };
+    let context = SummaryContextInput {
+        speakers: vec![SpeakerProfile {
+            speaker_id: "u1".to_owned(),
+            username: Some("alice".to_owned()),
+            nickname: Some("Alice".to_owned()),
+            display_name: None,
+        }],
+        domain_knowledge: vec![
+            domain_item("dk-approved", approved_body, true),
+            domain_item("dk-denied", denied_body, false),
+        ],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("Alice Example discussed Roadmap planning."),
+    )
+    .expect("context should materialize");
+
+    // Both records are equally relevant; only the approved one may reach the
+    // workspace context files or the verbatim leak-check snapshot.
+    assert_eq!(manifest.domain_knowledge_count, 1);
+    let rendered = std::fs::read_to_string(request.workspace.context_domain_knowledge_path())
+        .expect("domain knowledge");
+    assert!(rendered.contains(approved_body));
+    assert!(!rendered.contains(denied_body));
+    let snapshot = std::fs::read_to_string(request.workspace.context_leak_check_bodies_path())
+        .expect("leak-check bodies snapshot");
+    assert!(snapshot.contains(approved_body));
+    assert!(!snapshot.contains(denied_body));
+}
+
+#[test]
 fn materialized_summary_context_rejects_single_common_token_overlap() {
     let temp = unique_workspace("context_common_token_overlap", "m1");
     let workspace = temp.workspace().clone();
