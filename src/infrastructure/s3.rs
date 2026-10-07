@@ -10,6 +10,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::time::Duration;
 
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -29,7 +30,7 @@ const MAX_ERROR_BODY_CHARS: usize = 300;
 
 /// Resolved S3 settings (post env parsing). `secret_access_key` is kept out of
 /// logs and `PartialEq` is only derived for tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S3Settings {
     pub bucket: String,
     /// Normalized endpoint root `scheme://host[:port][/path]`; `None` selects
@@ -45,6 +46,21 @@ pub struct S3Settings {
     /// set (what most S3-compatible services expect).
     pub path_style: bool,
     pub presign_ttl_seconds: u64,
+}
+
+impl std::fmt::Debug for S3Settings {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Settings")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[redacted]")
+            .field("key_prefix", &self.key_prefix)
+            .field("path_style", &self.path_style)
+            .field("presign_ttl_seconds", &self.presign_ttl_seconds)
+            .finish()
+    }
 }
 
 /// Validates an `CHUNK_STORAGE_S3_ENDPOINT` value (scheme + host, optional
@@ -109,6 +125,36 @@ impl Display for S3Error {
 
 impl std::error::Error for S3Error {}
 
+/// Decodes `%XX` escapes in a URL path segment. `+` is left alone (it is a
+/// literal in paths, not a form-encoded space).
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 struct EndpointParts {
     scheme: String,
@@ -139,7 +185,10 @@ impl EndpointParts {
             .trim_matches('/')
             .split('/')
             .filter(|segment| !segment.is_empty())
-            .map(uri_encode_segment)
+            // `url.path()` is already percent-encoded; decode first so
+            // uri_encode_segment produces the canonical form instead of
+            // double-encoding `%` (e.g. `%20` -> `%2520`).
+            .map(|segment| uri_encode_segment(&percent_decode(segment)))
             .collect::<Vec<_>>()
             .join("/");
         Ok(Self {
@@ -184,7 +233,9 @@ pub struct S3Client {
     http: reqwest::Client,
     settings: S3Settings,
     endpoint: EndpointParts,
-    fallback_rt: tokio::runtime::Runtime,
+    /// Lazily built because `S3Client` is constructed inside async contexts
+    /// where an eager runtime's blocking drop would panic (see `Drop`).
+    fallback_rt: std::sync::OnceLock<tokio::runtime::Runtime>,
 }
 
 impl S3Client {
@@ -196,15 +247,22 @@ impl S3Client {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|err| S3Error::Http(err.to_string()))?;
-        let fallback_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| S3Error::Http(err.to_string()))?;
         Ok(Self {
             http,
             settings,
             endpoint,
-            fallback_rt,
+            fallback_rt: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Runtime for non-Tokio callers; created on first use so dropping an
+    /// unused client never tears down a runtime at all.
+    fn fallback_runtime(&self) -> &tokio::runtime::Runtime {
+        self.fallback_rt.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("s3 fallback runtime must build")
         })
     }
 
@@ -216,7 +274,7 @@ impl S3Client {
     /// Tokio runtime thread the future is driven on a private runtime inside a
     /// scoped OS thread (this avoids `block_in_place` restrictions on
     /// current-thread runtimes and blocking pools); from a plain thread it
-    /// runs in place.
+    /// runs in place on the lazily built fallback runtime.
     fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: Future + Send,
@@ -224,13 +282,25 @@ impl S3Client {
     {
         if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::scope(|scope| {
-                match scope.spawn(|| self.fallback_rt.block_on(fut)).join() {
+                match scope
+                    .spawn(|| {
+                        // A fresh runtime per call on the scoped thread: it is
+                        // created and dropped on a plain OS thread, so it is
+                        // safe from the async-context drop restriction.
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("scoped s3 runtime must build");
+                        rt.block_on(fut)
+                    })
+                    .join()
+                {
                     Ok(output) => output,
                     Err(payload) => std::panic::resume_unwind(payload),
                 }
             })
         } else {
-            self.fallback_rt.block_on(fut)
+            self.fallback_runtime().block_on(fut)
         }
     }
 
@@ -243,6 +313,7 @@ impl S3Client {
         query: &[(String, String)],
         body: Vec<u8>,
         content_type: Option<&str>,
+        extra_headers: &[(&str, String)],
     ) -> Result<reqwest::Response, S3Error> {
         let now = Utc::now();
         let payload_hash = sha256_hex(&body);
@@ -255,6 +326,9 @@ impl S3Client {
         ];
         if let Some(content_type) = content_type {
             headers.push(("content-type".to_owned(), content_type.to_owned()));
+        }
+        for (name, value) in extra_headers {
+            headers.push((name.to_ascii_lowercase(), value.clone()));
         }
         let (signed_headers, canonical_headers) = canonicalize_headers(&headers);
         let canonical_query = canonicalize_query(query);
@@ -290,6 +364,9 @@ impl S3Client {
         if let Some(content_type) = content_type {
             request = request.header("content-type", content_type);
         }
+        for (name, value) in extra_headers {
+            request = request.header(*name, value);
+        }
         request
             .body(body)
             .send()
@@ -305,9 +382,10 @@ impl S3Client {
         query: &[(String, String)],
         body: Vec<u8>,
         content_type: Option<&str>,
+        extra_headers: &[(&str, String)],
     ) -> Result<reqwest::Response, S3Error> {
         let response = self
-            .send_signed(method, path, query, body, content_type)
+            .send_signed(method, path, query, body, content_type, extra_headers)
             .await?;
         let status = response.status();
         if !status.is_success() {
@@ -349,15 +427,22 @@ impl S3Client {
         content_type: &str,
     ) -> Result<(), S3Error> {
         let path = self.endpoint.canonical_path(&self.settings, key);
-        self.signed_request(reqwest::Method::PUT, &path, &[], body, Some(content_type))
-            .await?;
+        self.signed_request(
+            reqwest::Method::PUT,
+            &path,
+            &[],
+            body,
+            Some(content_type),
+            &[],
+        )
+        .await?;
         Ok(())
     }
 
     async fn head_object_async(&self, key: &str) -> Result<bool, S3Error> {
         let path = self.endpoint.canonical_path(&self.settings, key);
         let response = self
-            .send_signed(reqwest::Method::HEAD, &path, &[], Vec::new(), None)
+            .send_signed(reqwest::Method::HEAD, &path, &[], Vec::new(), None, &[])
             .await?;
         match response.status().as_u16() {
             404 => Ok(false),
@@ -392,7 +477,7 @@ impl S3Client {
                 query.push(("continuation-token".to_owned(), token.clone()));
             }
             let response = self
-                .signed_request(reqwest::Method::GET, &path, &query, Vec::new(), None)
+                .signed_request(reqwest::Method::GET, &path, &query, Vec::new(), None, &[])
                 .await?;
             let body = response
                 .text()
@@ -463,13 +548,19 @@ impl S3Client {
                 body.push_str("</Key></Object>");
             }
             body.push_str("</Delete>");
+            let body = body.into_bytes();
+            // AWS S3 requires Content-MD5 on DeleteObjects (x-amz-content-
+            // sha256 does not substitute for it); sign the header too.
+            let content_md5 =
+                base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body));
             let response = self
                 .signed_request(
                     reqwest::Method::POST,
                     &path,
                     &query,
-                    body.into_bytes(),
+                    body,
                     Some("application/xml"),
+                    &[("content-md5", content_md5)],
                 )
                 .await?;
             let body = response
@@ -489,6 +580,18 @@ impl S3Client {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for S3Client {
+    fn drop(&mut self) {
+        // Dropping a Tokio Runtime blocks and panics when the client is
+        // dropped inside an async context (e.g. a task holding it exits).
+        // The nonblocking shutdown leaves orphaned background tasks to the
+        // process teardown instead of panicking.
+        if let Some(rt) = self.fallback_rt.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
@@ -766,10 +869,7 @@ mod tests {
                 host: "s3.amazonaws.com".to_owned(),
                 path_prefix: String::new(),
             },
-            fallback_rt: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap(),
+            fallback_rt: std::sync::OnceLock::new(),
         }
     }
 
@@ -874,5 +974,60 @@ mod tests {
         assert!(validate_endpoint("ftp://host").is_err());
         assert!(validate_endpoint("https://host/path?q=1").is_err());
         assert!(validate_endpoint("not a url").is_err());
+    }
+
+    #[test]
+    fn settings_debug_redacts_secret_access_key() {
+        let settings = test_client(None, true).settings.clone();
+        let rendered = format!("{settings:?}");
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn endpoint_path_prefix_decodes_then_reencodes_segments() {
+        let endpoint = EndpointParts::resolve(&S3Settings {
+            bucket: "b".to_owned(),
+            endpoint: Some("http://localhost:9000/my%20store".to_owned()),
+            region: DEFAULT_REGION.to_owned(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            key_prefix: String::new(),
+            path_style: true,
+            presign_ttl_seconds: DEFAULT_PRESIGN_TTL_SECONDS,
+        })
+        .expect("endpoint should resolve");
+        assert_eq!(endpoint.path_prefix, "my%20store");
+    }
+
+    #[test]
+    fn endpoint_path_prefix_keeps_unencoded_characters() {
+        let endpoint = EndpointParts::resolve(&S3Settings {
+            bucket: "b".to_owned(),
+            endpoint: Some("http://localhost:9000/桶".to_owned()),
+            region: DEFAULT_REGION.to_owned(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            key_prefix: String::new(),
+            path_style: true,
+            presign_ttl_seconds: DEFAULT_PRESIGN_TTL_SECONDS,
+        })
+        .expect("endpoint should resolve");
+        assert_eq!(endpoint.path_prefix, "%E6%A1%B6");
+    }
+
+    /// Constructing and dropping the client inside a Tokio runtime must not
+    /// panic: the fallback runtime is lazily built and shut down without
+    /// blocking (regression test for the async-context drop restriction).
+    #[test]
+    fn client_drops_cleanly_inside_async_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _client = S3Client::new(test_client(None, true).settings.clone()).unwrap();
+            // Client dropped here, inside the runtime's thread.
+        });
     }
 }
