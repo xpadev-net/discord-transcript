@@ -129,10 +129,13 @@ impl AgentOutputContract {
 
 pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
     AgentOutputContract::new("output/summary.md", "summary output", 1024 * 1024);
-// v2: materialization also snapshots the protected context bodies used by
-// the verbatim-leak check, so retries compare the bodies the agent actually
-// received instead of whatever the store holds at check time.
-const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
+/// Version of the context-selection policy that produced a summary's
+/// materialized context and its persisted markdown. Summaries persisted under
+/// an older policy are not served to channel viewers (see web.rs).
+/// v2: materialization also snapshots the protected context bodies used by
+/// the verbatim-leak check, so retries compare the bodies the agent actually
+/// received instead of whatever the store holds at check time.
+pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {

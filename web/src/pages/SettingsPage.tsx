@@ -1182,8 +1182,9 @@ export function SettingsPage({
     canManageDomainKnowledge || canManageSummaryTemplates;
   const isSavingAny = activeOperation !== null;
   const controlsDisabled = !canEdit || loading || isSavingAny || form == null;
+  const canManageBotToken = settings?.is_admin ?? false;
   const tokenControlsDisabled =
-    !canEdit || loading || isSavingAny || settings == null;
+    !canManageBotToken || loading || isSavingAny || settings == null;
   const selectedDomainKnowledgeItem = domainKnowledgeDraft.id
     ? (domainKnowledgeItems.find(
         (item) => item.id === domainKnowledgeDraft.id,

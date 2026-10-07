@@ -8,6 +8,7 @@ use discord_transcript::infrastructure::sql::{
     FIND_ACTIVE_RECORDING_BLOCKER_BY_GUILD_SQL, INCREMENTAL_MIGRATIONS_SQL, INITIAL_SCHEMA_SQL,
     LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS, RETRY_JOB_SQL, SELECT_SCHEMA_MIGRATION_SQL,
     ROLLBACK_SCHEMA_MIGRATIONS_SQL, SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
+    migration_statements,
 };
 use discord_transcript::infrastructure::sql_store::{
     FakeSqlExecutor, SqlJobQueue, SqlMeetingStore, UNIQUE_VIOLATION_PREFIX, sql_row_from_strings,
@@ -317,8 +318,29 @@ fn schema_constrains_transcript_confidence_to_unit_range() {
     assert!(incremental_schema.contains("NOT VALID"));
     assert_eq!(
         MIGRATIONS.last().expect("latest migration").version,
-        "0029_transcript_confidence_check"
+        "0031_meetings_guild_channel_index"
     );
+}
+
+#[test]
+fn concurrent_index_migration_splits_at_statement_boundaries() {
+    let migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0031_meetings_guild_channel_index")
+        .expect("0031 migration is registered");
+
+    let statements = migration_statements(*migration);
+
+    // DO block stays whole despite its inner semicolons; the concurrent
+    // CREATE and the version row each land in their own statement.
+    assert_eq!(statements.len(), 3);
+    assert!(statements[0].contains("DO $$"));
+    assert!(statements[0].contains("END $$;"));
+    assert!(statements[0].contains("DROP INDEX idx_meetings_guild_channel;"));
+    assert!(statements[0].contains("indisvalid"));
+    assert!(statements[1].contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
+    assert!(statements[2].contains("INSERT INTO schema_migrations"));
+    assert!(statements[2].contains("0031_meetings_guild_channel_index"));
 }
 
 #[test]
@@ -557,18 +579,19 @@ fn pending_migrations_apply_and_record_unseen_versions() {
         store.executor.executed.last().expect("unlock").0,
         UNLOCK_SCHEMA_MIGRATIONS_SQL
     );
+    // Every migration ends by recording its version row — transactional
+    // migrations do so inside the batch, non-transactional ones (e.g.
+    // CREATE INDEX CONCURRENTLY) as their own final statement.
     let applied_sql: Vec<&str> = store
         .executor
         .executed
         .iter()
         .map(|(sql, _)| sql.as_str())
-        .filter(|sql| sql.starts_with("BEGIN;"))
+        .filter(|sql| sql.contains("INSERT INTO schema_migrations (version)"))
         .collect();
     assert_eq!(applied_sql.len(), MIGRATIONS.len());
     assert!(applied_sql[0].contains("CREATE TABLE IF NOT EXISTS meetings"));
-    assert!(applied_sql[0].contains(
-        "INSERT INTO schema_migrations (version) VALUES ('0001_mvp_schema')"
-    ));
+    assert!(applied_sql[0].contains("VALUES ('0001_mvp_schema')"));
 }
 
 #[test]

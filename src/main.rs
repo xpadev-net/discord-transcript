@@ -1,21 +1,24 @@
 use discord_transcript::application::runtime::{BotRunExit, SummaryJobWakeups, run_bot};
 use discord_transcript::application::worker::{
-    ProcessJobResult, SummaryJobOptions, SummaryNotificationReceipt, SummaryStatusNotification,
-    SummaryUrlNotification, WorkerError, complete_summary_job_after_notification,
-    process_next_summary_job, record_summary_completion_usage_observe_only,
+    ProcessJobResult, SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobOptions,
+    SummaryNotificationReceipt, SummaryStatusNotification, SummaryUrlNotification, WorkerError,
+    complete_summary_job_after_notification, process_claimed_summary_job,
+    record_summary_completion_usage_observe_only, spawn_summary_job_heartbeat,
 };
 use discord_transcript::bootstrap::config::{AppConfig, AppRole};
+use discord_transcript::domain::JobType;
 use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use discord_transcript::infrastructure::integrations::{
     CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
 };
+use discord_transcript::infrastructure::queue::JobQueue;
 use discord_transcript::infrastructure::retry::RetryPolicy;
 use discord_transcript::infrastructure::sql::{
     CREATE_SCHEMA_MIGRATIONS_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MIGRATIONS,
     ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL,
-    migration_transaction_sql,
+    migration_statements,
 };
 use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, SqlMeetingStore};
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
@@ -25,7 +28,9 @@ use serenity::http::Http;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
@@ -164,9 +169,9 @@ async fn apply_pending_migrations_locked(
             continue;
         }
         tracing::info!(version = migration.version, "applying database migration");
-        db_client
-            .batch_execute(&migration_transaction_sql(*migration))
-            .await?;
+        for statement in migration_statements(*migration) {
+            db_client.batch_execute(&statement).await?;
+        }
     }
     Ok(())
 }
@@ -265,6 +270,8 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             summary_enabled: config.summary_enabled,
         },
     );
+    let meeting_permission_cache = Arc::clone(&web_state.permission_cache);
+    let meeting_guild_cache = Arc::clone(&web_state.guild_cache);
     let router = web::create_router(web_state);
 
     let web_bind_host = config.web_bind_host.clone();
@@ -307,6 +314,8 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             &runtime_config,
             runtime_bot_token_revision_rx,
             summary_job_wakeups.clone(),
+            Some(Arc::clone(&meeting_permission_cache)),
+            Some(Arc::clone(&meeting_guild_cache)),
         )
         .await?
         {
@@ -344,10 +353,20 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         &config.database_url,
         &config.database_ssl_mode,
     )?);
-    let mut queue = SqlJobQueue::new(PgSqlExecutor::connect_with_ssl_mode(
+    // `queue` is shared with the per-job heartbeat task that keeps the claimed
+    // job's lease alive while the worker runs the (potentially long) processing
+    // and notification phases — the same guard the in-bot runtime uses.
+    // `process_queue` is a dedicated connection for the synchronous processing
+    // phase: it is borrowed for the whole duration, so heartbeats must go
+    // through the shared `queue` instead or they would starve behind it.
+    let queue = Arc::new(Mutex::new(SqlJobQueue::new(
+        PgSqlExecutor::connect_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?,
+    )));
+    let mut process_queue = SqlJobQueue::new(PgSqlExecutor::connect_with_ssl_mode(
         &config.database_url,
         &config.database_ssl_mode,
     )?);
+    let worker_shutdown = CancellationToken::new();
     let token_db_url = database_url_with_ssl_mode(&config.database_url, &config.database_ssl_mode)?;
     let (token_db_client, token_db_connection) =
         tokio_postgres::connect(&token_db_url, NoTls).await?;
@@ -398,74 +417,117 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         tokio::select! {
             () = shutdown_signal() => {
                 tracing::info!("shutdown signal received");
+                worker_shutdown.cancel();
                 break;
             }
             () = &mut idle_sleep => {
-                if let Err(err) = queue.ready_summary_meeting_ids() {
+                if let Err(err) = queue.lock().await.ready_summary_meeting_ids() {
                     tracing::warn!(
                         error = %err,
                         "standalone worker failed to recover stale running summary jobs"
                     );
                 }
-                match process_next_summary_job(
-                    &mut store,
-                    &mut queue,
-                    &whisper,
-                    &summary_client,
-                    &options,
-                ) {
-                    Ok(Some(result)) => {
-                        let chunk_count = result.output.chunks.len();
-                        let completion_result =
-                            match notify_standalone_worker_summary(
-                                &config,
-                                &token_db_client,
-                                guild_bot_token_cipher.as_ref(),
+                let claimed = {
+                    let mut queue_guard = queue.lock().await;
+                    queue_guard.claim_next(JobType::Summarize)
+                };
+                match claimed {
+                    Ok(Some(job)) => {
+                        // Arm the lease heartbeat as soon as the job is
+                        // claimed: transcription and summary generation can
+                        // run longer than the 90-second lease, so without the
+                        // background refresh a still-running generation would
+                        // expire and be reclaimed by another worker.
+                        let heartbeat_guard = spawn_summary_job_heartbeat(
+                            &job,
+                            Arc::clone(&queue),
+                            worker_shutdown.clone(),
+                            SUMMARY_JOB_HEARTBEAT_INTERVAL,
+                        );
+                        // Transcription and summary generation are
+                        // synchronous and long-running; on a runtime with a
+                        // single worker thread they would starve the lease
+                        // heartbeat task spawned above. block_in_place lets
+                        // the runtime run a replacement worker so the
+                        // heartbeat keeps polling while this job occupies
+                        // the current thread.
+                        let job_result = tokio::task::block_in_place(|| {
+                            process_claimed_summary_job(
                                 &mut store,
-                                &result,
+                                &mut process_queue,
+                                job,
+                                &whisper,
+                                &summary_client,
+                                &options,
                             )
-                            .await
-                            {
-                                Ok(receipt) => complete_summary_job_after_notification(
+                        });
+                        match job_result {
+                            Ok(Some(result)) => {
+                                let chunk_count = result.output.chunks.len();
+                                let notify_result = notify_standalone_worker_summary(
+                                    &config,
+                                    &token_db_client,
+                                    guild_bot_token_cipher.as_ref(),
                                     &mut store,
-                                    &mut queue,
-                                    &result.job,
-                                    receipt,
-                                ),
-                                Err(err) => Err(err),
-                            };
-                        match completion_result {
-                            Ok(true) => {
-                                record_summary_completion_usage_observe_only(
-                                    &mut store,
-                                    &result.output.meeting_id,
-                                    &result.job_id,
-                                    chunk_count,
-                                );
+                                    &result,
+                                )
+                                .await;
+                                heartbeat_guard.stop().await;
+                                let completion_result = match notify_result {
+                                    Ok(receipt) => {
+                                        let mut queue_guard = queue.lock().await;
+                                        complete_summary_job_after_notification(
+                                            &mut store,
+                                            &mut *queue_guard,
+                                            &result.job,
+                                            receipt,
+                                        )
+                                    }
+                                    Err(err) => Err(err),
+                                };
+                                match completion_result {
+                                    Ok(true) => {
+                                        record_summary_completion_usage_observe_only(
+                                            &mut store,
+                                            &result.output.meeting_id,
+                                            &result.job_id,
+                                            chunk_count,
+                                        );
+                                    }
+                                    Ok(false) => {
+                                        tracing::warn!(
+                                            job_id = %result.job_id,
+                                            meeting_id = %result.output.meeting_id,
+                                            "standalone worker completed summary notification but job completion will retry after lease recovery"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            job_id = %result.job_id,
+                                            meeting_id = %result.output.meeting_id,
+                                            error = %err,
+                                            "standalone worker could not complete generated summary job"
+                                        );
+                                    }
+                                }
+                                idle_sleep.as_mut().reset(tokio::time::Instant::now());
                             }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    job_id = %result.job_id,
-                                    meeting_id = %result.output.meeting_id,
-                                    "standalone worker completed summary notification but job completion will retry after lease recovery"
-                                );
+                            Ok(None) => {
+                                heartbeat_guard.stop().await;
+                                idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                             }
                             Err(err) => {
-                                tracing::warn!(
-                                    job_id = %result.job_id,
-                                    meeting_id = %result.output.meeting_id,
-                                    error = %err,
-                                    "standalone worker could not complete generated summary job"
-                                );
+                                heartbeat_guard.stop().await;
+                                tracing::warn!(error = %err, "standalone worker summary job attempt failed");
+                                idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                             }
                         }
-                        idle_sleep.as_mut().reset(tokio::time::Instant::now());
                     }
                     Ok(None) => {
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, "standalone worker summary job attempt failed");
+                        tracing::warn!(error = %err, "standalone worker summary job claim failed");
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                     }
                 }
@@ -516,7 +578,18 @@ async fn notify_standalone_worker_summary(
             result.output.meeting_id, err
         ))
     })?;
-    let http = Http::new(&token);
+    // Bot-originated messages must never ping: posted chunks embed the stored
+    // voice-channel name, which can contain @everyone/@here/user/role mention
+    // syntax that a channel manager could weaponize into bot-sent pings. Apply
+    // the same default_allowed_mentions restriction as the gateway client.
+    let http = serenity::http::HttpBuilder::new(&token)
+        .default_allowed_mentions(
+            serenity::all::CreateAllowedMentions::new()
+                .all_roles(false)
+                .all_users(false)
+                .everyone(false),
+        )
+        .build();
 
     let chunks = summary_chunks_with_voice_channel_metadata(&meeting, result.output.chunks.clone());
     post_summary_to_report_channel(&http, report_channel_id, &chunks)

@@ -136,6 +136,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0029_transcript_confidence_check",
         sql: include_str!("../../migrations/0029_transcript_confidence_check.sql"),
     },
+    Migration {
+        version: "0030_summaries_context_selection_version",
+        sql: include_str!("../../migrations/0030_summaries_context_selection_version.sql"),
+    },
+    Migration {
+        version: "0031_meetings_guild_channel_index",
+        sql: include_str!("../../migrations/0031_meetings_guild_channel_index.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -148,6 +156,50 @@ pub fn migration_transaction_sql(migration: Migration) -> String {
         migration.sql.trim_end(),
         sql_literal(migration.version),
     )
+}
+
+/// Statements to execute for a migration, in order. Most migrations run as
+/// one transactional batch. A migration containing `CONCURRENTLY` (e.g.
+/// `CREATE INDEX CONCURRENTLY`) cannot run inside a transaction — not even
+/// the implicit one wrapping multi-statement simple queries — so each of
+/// its `;`-terminated statements executes separately and the version row
+/// is recorded last.
+pub fn migration_statements(migration: Migration) -> Vec<String> {
+    if !migration.sql.contains("CONCURRENTLY") {
+        return vec![migration_transaction_sql(migration)];
+    }
+    // Split at `;` that end a line, except inside `$$`-quoted bodies
+    // (e.g. DO blocks), whose inner semicolons belong to the same
+    // statement.
+    let mut statements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_dollar_quote = false;
+    for line in migration.sql.split_inclusive('\n') {
+        // An odd number of `$$` markers on the line toggles the quote.
+        if line.matches("$$").count() % 2 == 1 {
+            in_dollar_quote = !in_dollar_quote;
+        }
+        let trimmed = line.trim();
+        if !in_dollar_quote && trimmed.ends_with(';') && !trimmed.starts_with("--") {
+            let part = format!("{current}{line}");
+            let part = part.trim();
+            if !part.is_empty() {
+                statements.push(part.to_owned());
+            }
+            current.clear();
+        } else {
+            current.push_str(line);
+        }
+    }
+    let tail = current.trim();
+    if !tail.is_empty() {
+        statements.push(tail.to_owned());
+    }
+    statements.push(format!(
+        "INSERT INTO schema_migrations (version) VALUES ({}) ON CONFLICT (version) DO NOTHING;",
+        sql_literal(migration.version),
+    ));
+    statements
 }
 
 /// Incremental migrations applied after the initial schema.
@@ -208,6 +260,10 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0028_active_meeting_unique_index.sql"),
     "\n",
     include_str!("../../migrations/0029_transcript_confidence_check.sql"),
+    "\n",
+    include_str!("../../migrations/0030_summaries_context_selection_version.sql"),
+    "\n",
+    include_str!("../../migrations/0031_meetings_guild_channel_index.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1624,9 +1680,11 @@ RETURNING j.id,
 "#;
 
 pub const INSERT_SUMMARY_SQL: &str = r#"
-INSERT INTO summaries (id, meeting_id, version, markdown)
-VALUES ($1, $2, 1, $3)
-ON CONFLICT (meeting_id, version) DO UPDATE SET markdown = EXCLUDED.markdown
+INSERT INTO summaries (id, meeting_id, version, markdown, context_selection_version)
+VALUES ($1, $2, 1, $3, $4::TEXT::INTEGER)
+ON CONFLICT (meeting_id, version) DO UPDATE SET
+    markdown = EXCLUDED.markdown,
+    context_selection_version = EXCLUDED.context_selection_version
 "#;
 
 pub const UPSERT_MEETING_SPEAKER_SQL: &str = r#"
@@ -2411,7 +2469,10 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND ($3::TEXT::BOOLEAN OR archived_at IS NULL)
   AND (NULLIF($4, '') IS NULL OR source_type = $4)
+  AND (NULLIF($5, '') IS NULL
+       OR source_meeting_id = ANY(string_to_array($5, ',')))
 ORDER BY pinned DESC, updated_at DESC, id DESC
+LIMIT NULLIF($6, '')::TEXT::INTEGER
 "#;
 
 pub const GET_AI_MEMORY_NOTE_SQL: &str = r#"
@@ -2641,6 +2702,42 @@ ORDER BY (meeting_id = $3) DESC, created_at DESC, id DESC
 LIMIT 1000
 "#;
 
+// Feedback rows for summary context materialization. `$5` is a
+// comma-separated allowlist of anchor meeting ids applied to `meeting_id`
+// before `LIMIT` ($6), so the cap can only evict rows that are out of scope
+// for the summary anyway.
+pub const LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL: &str = r#"
+SELECT id,
+       tenant_discord_guild_id,
+       tenant_id,
+       guild_id,
+       meeting_id,
+       transcript_segment_id,
+       feedback_type,
+       term_type,
+       original_text,
+       corrected_text,
+       speaker_id,
+       corrected_speaker_id,
+       note,
+       target_domain_knowledge_id,
+       target_ai_memory_note_id,
+       actor_user_id,
+       status,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS reviewed_at,
+       reviewed_actor_user_id
+FROM transcript_feedback
+WHERE tenant_id = $1
+  AND guild_id = $2
+  AND (NULLIF($3, '') IS NULL OR status = $3)
+  AND (NULLIF($4, '') IS NULL OR feedback_type = $4)
+  AND (NULLIF($5, '') IS NULL
+       OR meeting_id = ANY(string_to_array($5, ',')))
+ORDER BY created_at DESC, id DESC
+LIMIT NULLIF($6, '')::TEXT::INTEGER
+"#;
+
 pub const INSERT_TRANSCRIPT_FEEDBACK_SQL: &str = r#"
 INSERT INTO transcript_feedback (
     id, tenant_discord_guild_id, tenant_id, guild_id, meeting_id,
@@ -2777,7 +2874,10 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND ($3::TEXT::BOOLEAN OR archived_at IS NULL)
   AND (NULLIF($4, '') IS NULL OR review_status = $4)
+  AND (NULLIF($5, '') IS NULL
+       OR source_meeting_id = ANY(string_to_array($5, ',')))
 ORDER BY active DESC, updated_at DESC, id DESC
+LIMIT NULLIF($6, '')::TEXT::INTEGER
 "#;
 
 pub const INSERT_PERSON_ALIAS_SQL: &str = r#"

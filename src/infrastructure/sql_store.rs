@@ -41,14 +41,15 @@ use crate::infrastructure::sql::{
     LIST_ACCEPTED_TRANSCRIPT_FEEDBACK_FOR_SUMMARY_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_RBAC_PERMISSIONS_FOR_ROLE_CSV_SQL,
     LIST_PERSON_ALIASES_SQL, LIST_RECENT_AUDIT_EVENTS_SQL, LIST_RECENT_USAGE_EVENTS_SQL,
-    LIST_SUMMARY_TEMPLATES_SQL, LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
+    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL,
+    LOCK_SCHEMA_MIGRATIONS_SQL, MARK_JOB_DONE_SQL, MARK_JOB_FAILED_SQL,
     MARK_STOPPING_IF_RECORDING_SQL, MIGRATIONS, Migration, RECOVERY_READY_SUMMARY_JOBS_SQL,
     RESOLVE_PLAN_FOR_GUILD_SQL, RESOLVE_TENANT_BY_GUILD_SQL, RETRY_JOB_SQL,
     ROLLBACK_SCHEMA_MIGRATIONS_SQL, SELECT_SCHEMA_MIGRATION_SQL, SET_AI_MEMORY_PINNED_SQL,
     SET_MEETING_STATUS_CAS_SQL, UNLOCK_SCHEMA_MIGRATIONS_SQL, UPDATE_AI_MEMORY_NOTE_SQL,
     UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL, UPDATE_SUMMARY_TEMPLATE_SQL,
     UPDATE_TRANSCRIPT_FEEDBACK_STATUS_SQL, UPSERT_EFFECTIVE_MEETING_SETTINGS_SQL,
-    UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL, migration_transaction_sql,
+    UPSERT_VC_PARTICIPANT_PERSON_ALIAS_CANDIDATE_SQL, migration_statements,
 };
 use crate::infrastructure::storage::{
     CreateMeetingRequest, EffectiveMeetingSettings, GuildSettingsForSnapshot, MeetingStore,
@@ -87,6 +88,123 @@ pub trait SqlExecutor {
 /// Test helper: map plain strings to `Some` columns (SQL non-NULL values).
 pub fn sql_row_from_strings(values: Vec<String>) -> SqlRow {
     values.into_iter().map(Some).collect()
+}
+
+/// Test helper: build the `sql|params` key [`FakeSqlExecutor`] uses to look up
+/// registered `query_rows`/`execute` results.
+pub fn sql_key(sql: &str, params: &[&str]) -> String {
+    format!("{}|{}", sql, params.join("\u{1f}"))
+}
+
+/// Test helper: tenant-installation row matching the
+/// `RESOLVE_TENANT_BY_GUILD_SQL` projection.
+pub fn tenant_installation_row(tenant_id: &str, guild_id: &str) -> SqlRow {
+    vec![
+        Some(tenant_id.to_owned()),
+        Some("active".to_owned()),
+        None,
+        Some(guild_id.to_owned()),
+        Some("manual".to_owned()),
+    ]
+}
+
+/// Test helper: AI memory row matching the `LIST_AI_MEMORY_NOTES_SQL`
+/// projection, with a controllable `source_meeting_id` anchor.
+pub fn ai_memory_note_row(
+    id: &str,
+    tenant_id: &str,
+    guild_id: &str,
+    source_meeting_id: Option<&str>,
+) -> SqlRow {
+    vec![
+        Some(id.to_owned()),
+        Some("tdg-1".to_owned()),
+        Some(tenant_id.to_owned()),
+        Some(guild_id.to_owned()),
+        Some(format!("title-{id}")),
+        Some(format!("body-{id}")),
+        Some("".to_owned()),
+        Some("manual".to_owned()),
+        source_meeting_id.map(str::to_owned),
+        None,
+        None,
+        Some("true".to_owned()),
+        Some("false".to_owned()),
+        Some("actor-1".to_owned()),
+        Some("actor-1".to_owned()),
+        None,
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        Some("2026-06-04T01:03:03.000Z".to_owned()),
+        None,
+        None,
+    ]
+}
+
+/// Test helper: accepted transcript-feedback row matching the transcript
+/// feedback list queries' projection, with a controllable `meeting_id`
+/// anchor.
+pub fn transcript_feedback_row(
+    id: &str,
+    tenant_id: &str,
+    guild_id: &str,
+    meeting_id: Option<&str>,
+) -> SqlRow {
+    vec![
+        Some(id.to_owned()),
+        Some("tdg-1".to_owned()),
+        Some(tenant_id.to_owned()),
+        Some(guild_id.to_owned()),
+        meeting_id.map(str::to_owned),
+        None,
+        Some("term".to_owned()),
+        None,
+        Some("x p a".to_owned()),
+        Some("xpa".to_owned()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("actor-1".to_owned()),
+        Some("accepted".to_owned()),
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        Some("2026-06-04T01:04:03.000Z".to_owned()),
+        Some("reviewer-1".to_owned()),
+    ]
+}
+
+/// Test helper: accepted person-alias row matching the
+/// `LIST_PERSON_ALIASES_SQL` projection, with a controllable
+/// `source_meeting_id` anchor.
+pub fn person_alias_row(
+    id: &str,
+    tenant_id: &str,
+    guild_id: &str,
+    source_meeting_id: Option<&str>,
+) -> SqlRow {
+    vec![
+        Some(id.to_owned()),
+        Some("tdg-1".to_owned()),
+        Some(tenant_id.to_owned()),
+        Some(guild_id.to_owned()),
+        Some("xpadev".to_owned()),
+        Some("xpa".to_owned()),
+        None,
+        Some("manual".to_owned()),
+        source_meeting_id.map(str::to_owned),
+        None,
+        Some("0.900".to_owned()),
+        Some("true".to_owned()),
+        Some("accepted".to_owned()),
+        Some("actor-1".to_owned()),
+        Some("actor-1".to_owned()),
+        Some("2026-06-04T01:04:03.000Z".to_owned()),
+        Some("reviewer-1".to_owned()),
+        None,
+        None,
+        Some("2026-06-04T01:02:03.000Z".to_owned()),
+        Some("2026-06-04T01:03:03.000Z".to_owned()),
+    ]
 }
 
 #[derive(Debug, Default)]
@@ -251,8 +369,10 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         {
             return Ok(());
         }
-        self.executor
-            .run_migration(&migration_transaction_sql(migration))
+        for statement in migration_statements(migration) {
+            self.executor.run_migration(&statement)?;
+        }
+        Ok(())
     }
 
     fn map_active_meeting_insert_error(
@@ -601,26 +721,31 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         parse_domain_knowledge_row(&row).map(Some)
     }
 
+    /// `anchor_meeting_ids` is an optional comma-separated allowlist bound to
+    /// `source_meeting_id = ANY(string_to_array($5, ','))` so the anchor
+    /// filter runs before `LIMIT` in the database.
     pub fn list_ai_memory_notes(
         &mut self,
         tenant_id: &str,
         guild_id: &str,
         include_archived: bool,
         source_type: Option<AiMemorySourceType>,
+        anchor_meeting_ids: Option<&str>,
+        limit: Option<u32>,
     ) -> Result<Vec<AiMemoryNote>, StoreError> {
+        let params = vec![
+            tenant_id.to_owned(),
+            guild_id.to_owned(),
+            include_archived.to_string(),
+            source_type
+                .map(|source_type| source_type.as_str().to_owned())
+                .unwrap_or_default(),
+            anchor_meeting_ids.unwrap_or_default().to_owned(),
+            limit.map(|limit| limit.to_string()).unwrap_or_default(),
+        ];
         let rows = self
             .executor
-            .query_rows(
-                LIST_AI_MEMORY_NOTES_SQL,
-                &[
-                    tenant_id.to_owned(),
-                    guild_id.to_owned(),
-                    include_archived.to_string(),
-                    source_type
-                        .map(|source_type| source_type.as_str().to_owned())
-                        .unwrap_or_default(),
-                ],
-            )
+            .query_rows(LIST_AI_MEMORY_NOTES_SQL, &params)
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_ai_memory_note_row).collect()
     }
@@ -748,6 +873,37 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         parse_transcript_feedback_row(&row)
     }
 
+    /// `anchor_meeting_ids` is an optional comma-separated allowlist bound to
+    /// `meeting_id = ANY(string_to_array($5, ','))` so the anchor filter runs
+    /// before `LIMIT` in the database.
+    pub fn list_transcript_feedback(
+        &mut self,
+        tenant_id: &str,
+        guild_id: &str,
+        status: Option<TranscriptFeedbackStatus>,
+        feedback_type: Option<TranscriptFeedbackType>,
+        anchor_meeting_ids: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<TranscriptFeedback>, StoreError> {
+        let params = vec![
+            tenant_id.to_owned(),
+            guild_id.to_owned(),
+            status
+                .map(|status| status.as_str().to_owned())
+                .unwrap_or_default(),
+            feedback_type
+                .map(|feedback_type| feedback_type.as_str().to_owned())
+                .unwrap_or_default(),
+            anchor_meeting_ids.unwrap_or_default().to_owned(),
+            limit.map(|limit| limit.to_string()).unwrap_or_default(),
+        ];
+        let rows = self
+            .executor
+            .query_rows(LIST_TRANSCRIPT_FEEDBACK_FOR_CONTEXT_SQL, &params)
+            .map_err(StoreError::Backend)?;
+        rows.iter().map(parse_transcript_feedback_row).collect()
+    }
+
     pub fn list_accepted_transcript_feedback_for_summary(
         &mut self,
         tenant_id: &str,
@@ -785,26 +941,31 @@ impl<E: SqlExecutor> SqlMeetingStore<E> {
         parse_transcript_feedback_row(&row).map(Some)
     }
 
+    /// `anchor_meeting_ids` is an optional comma-separated allowlist bound to
+    /// `source_meeting_id = ANY(string_to_array($5, ','))` so the anchor
+    /// filter runs before `LIMIT` in the database.
     pub fn list_person_aliases(
         &mut self,
         tenant_id: &str,
         guild_id: &str,
         include_archived: bool,
         review_status: Option<PersonAliasReviewStatus>,
+        anchor_meeting_ids: Option<&str>,
+        limit: Option<u32>,
     ) -> Result<Vec<PersonAlias>, StoreError> {
+        let params = vec![
+            tenant_id.to_owned(),
+            guild_id.to_owned(),
+            include_archived.to_string(),
+            review_status
+                .map(|status| status.as_str().to_owned())
+                .unwrap_or_default(),
+            anchor_meeting_ids.unwrap_or_default().to_owned(),
+            limit.map(|limit| limit.to_string()).unwrap_or_default(),
+        ];
         let rows = self
             .executor
-            .query_rows(
-                LIST_PERSON_ALIASES_SQL,
-                &[
-                    tenant_id.to_owned(),
-                    guild_id.to_owned(),
-                    include_archived.to_string(),
-                    review_status
-                        .map(|status| status.as_str().to_owned())
-                        .unwrap_or_default(),
-                ],
-            )
+            .query_rows(LIST_PERSON_ALIASES_SQL, &params)
             .map_err(StoreError::Backend)?;
         rows.iter().map(parse_person_alias_row).collect()
     }

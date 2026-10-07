@@ -15,9 +15,10 @@ use crate::application::retention_cleanup::{
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::{
-    SummaryNotificationReceipt, SummaryStatusNotification, SummaryUrlNotification,
-    complete_summary_job_after_notification, enqueue_summary_job,
-    mark_summary_meeting_failed_from_summary_state,
+    SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobHeartbeatGuard, SummaryNotificationReceipt,
+    SummaryStatusNotification, SummaryUrlNotification, complete_summary_job_after_notification,
+    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+    spawn_summary_job_heartbeat,
 };
 use crate::audio::meeting_audio::{
     ProcessedAudioChunk, build_speaker_audio_inputs,
@@ -30,6 +31,7 @@ use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness};
 use crate::domain::authz::{
     MemberRoleSource, RbacPermission, RbacSubject, UserRole, resolve_rbac_permission,
 };
+use crate::domain::feedback::TranscriptFeedbackStatus;
 use crate::domain::person_alias::PersonAliasReviewStatus;
 use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::speaker::SpeakerProfile;
@@ -60,15 +62,20 @@ use crate::infrastructure::storage::{
 use crate::infrastructure::storage_fs::{ChunkStorage, LocalChunkStorage};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
+use crate::interfaces::web::{
+    GuildCache, PermissionCache, clear_permission_cache, invalidate_guild_cache,
+    invalidate_permission_cache_for_channel, invalidate_permission_cache_for_user,
+};
 use chrono::{DateTime, Utc};
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    EditMessage, GatewayIntents, GuildId, Interaction, Member, Ready, UserId, VoiceState,
+    EditMessage, GatewayIntents, Guild, GuildChannel, GuildId, GuildMemberUpdateEvent, Interaction,
+    Member, Message, PartialGuild, Ready, Role, RoleId, User, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
-use serenity::prelude::{Client, Context, EventHandler};
+use serenity::prelude::{Context, EventHandler};
 use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::{
     Config as SongbirdConfig, CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler,
@@ -707,18 +714,15 @@ fn auto_stop_event_member_count(cached_count: Option<usize>) -> usize {
     cached_count.unwrap_or(0)
 }
 
-fn decide_driver_disconnect_grace_expiry(
-    reconnected: Option<bool>,
-    non_bot_member_count: Option<usize>,
-) -> GraceExpiryDecision {
-    match (reconnected, non_bot_member_count) {
-        (Some(false), Some(0)) => GraceExpiryDecision::Stop,
-        (Some(true), _) => GraceExpiryDecision::Cancel,
-        // Bot is still disconnected after grace, but members are present. Do
-        // not auto-stop an occupied recording; a later empty-channel grace or
-        // manual stop can end it.
-        (Some(false), Some(_)) => GraceExpiryDecision::Cancel,
-        _ => GraceExpiryDecision::Reschedule,
+fn decide_driver_disconnect_grace_expiry(reconnected: Option<bool>) -> GraceExpiryDecision {
+    match reconnected {
+        Some(true) => GraceExpiryDecision::Cancel,
+        // The bot is still disconnected after grace, so the recording cannot
+        // capture anything regardless of who remains in the channel. Leaving
+        // the meeting in Recording state would block every later recording
+        // until a manual stop or process restart.
+        Some(false) => GraceExpiryDecision::Stop,
+        None => GraceExpiryDecision::Reschedule,
     }
 }
 
@@ -2410,72 +2414,6 @@ enum SummaryJobRunError {
     },
 }
 
-const SUMMARY_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
-struct SummaryJobHeartbeatGuard {
-    handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl SummaryJobHeartbeatGuard {
-    async fn stop(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
-    }
-}
-
-impl Drop for SummaryJobHeartbeatGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-fn spawn_summary_job_heartbeat<Q>(
-    job: &Job,
-    queue: Arc<Mutex<Q>>,
-    shutdown_token: CancellationToken,
-    interval_duration: Duration,
-) -> SummaryJobHeartbeatGuard
-where
-    Q: JobQueue + Send + 'static,
-{
-    let heartbeat_job = job.clone();
-    let interval_duration = if interval_duration.is_zero() {
-        Duration::from_millis(1)
-    } else {
-        interval_duration
-    };
-    let heartbeat_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(interval_duration);
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let result = {
-                        let mut queue = queue.lock().await;
-                        queue.heartbeat(&heartbeat_job)
-                    };
-                    if let Err(err) = result {
-                        warn!(
-                            job_id = %heartbeat_job.id,
-                            error = %err,
-                            "failed to refresh summary job lease heartbeat"
-                        );
-                    }
-                }
-                _ = shutdown_token.cancelled() => break,
-            }
-        }
-    });
-
-    SummaryJobHeartbeatGuard {
-        handle: Some(heartbeat_task),
-    }
-}
-
 struct RuntimeSummaryJobOutput {
     job: Job,
     output: crate::application::worker::ProcessMeetingOutput,
@@ -2807,85 +2745,22 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SummaryCleanupFailureDisposition {
-    RetryScheduled,
-    OwnershipLost,
-    TerminalStatusUpdated,
-}
-
-fn summary_cleanup_failure_user_message(_err: impl Display) -> String {
-    "summary agent workspace cleanup failed after summary persistence; cleanup will be retried and retained agent workspaces are covered by retention cleanup".to_owned()
-}
-
-fn handle_summary_cleanup_failure<S, Q>(
-    store: &mut S,
-    queue: &mut Q,
-    claimed_job: &Job,
-    err_string: String,
-    summary_max_retries: u32,
-) -> SummaryCleanupFailureDisposition
-where
-    S: MeetingStore,
-    Q: JobQueue,
-{
-    if let Err(err) = queue.heartbeat(claimed_job) {
+/// Best-effort removal of a persisted summary's agent workspace. Cleanup
+/// failure after persistence must not change the job outcome (no retry, no
+/// meeting status change): the agent can tamper with the workspace to force
+/// a failure, and letting it escalate would turn cleanup into repeated LLM
+/// work. Workspace roots that fail validation (e.g. the inode was replaced)
+/// are left for startup retention cleanup instead of being deleted blindly.
+fn cleanup_agent_workspace_after_persist(
+    meeting_id: &str,
+    agent_workspace: crate::infrastructure::workspace::AgentWorkspace,
+) {
+    if let Err(err) = agent_workspace.cleanup_once() {
         warn!(
-            meeting_id = %claimed_job.meeting_id,
-            job_id = %claimed_job.id,
+            meeting_id = %meeting_id,
             error = %err,
-            "summary cleanup retry skipped because job ownership could not be proven"
+            "failed to clean summary agent workspace after summary persistence; leaving stale workspace for retention cleanup"
         );
-        return SummaryCleanupFailureDisposition::OwnershipLost;
-    }
-    match store.set_meeting_status(
-        &claimed_job.meeting_id,
-        MeetingStatus::Stopping,
-        Some(MeetingStatus::Summarizing),
-    ) {
-        Ok(()) => {}
-        Err(err @ StoreError::CasConflict { .. }) => {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                job_id = %claimed_job.id,
-                error = %err,
-                "summary cleanup retry cannot restore meeting state; failing job without touching meeting state"
-            );
-            let _ = queue.mark_failed(claimed_job, err_string);
-            return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
-        }
-        Err(err) => {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                job_id = %claimed_job.id,
-                error = %err,
-                "summary cleanup retry cannot restore meeting to retryable state"
-            );
-            let _ = queue.mark_failed(claimed_job, err_string.clone());
-            let _ = mark_summary_meeting_failed_from_summary_state(
-                store,
-                &claimed_job.meeting_id,
-                err_string,
-            );
-            return SummaryCleanupFailureDisposition::TerminalStatusUpdated;
-        }
-    }
-    let exhausted = retry_claimed_summary_job(
-        queue,
-        claimed_job,
-        err_string.clone(),
-        summary_max_retries,
-        "summary_cleanup",
-    );
-    if exhausted {
-        let _ = mark_summary_meeting_failed_from_summary_state(
-            store,
-            &claimed_job.meeting_id,
-            err_string,
-        );
-        SummaryCleanupFailureDisposition::TerminalStatusUpdated
-    } else {
-        SummaryCleanupFailureDisposition::RetryScheduled
     }
 }
 
@@ -2982,14 +2857,32 @@ fn duration_until_utc(next_run_at: DateTime<Utc>) -> Duration {
 /// Place every chunk on a shared wall-clock timeline so speakers with
 /// different join times (and thus independent per-user sequence numbers)
 /// stay aligned in the mixdown. `meeting_start_ms` anchors t=0 of the output.
-fn mix_chunks_by_wallclock(
+/// An overlap-connected group of chunk placements on the shared meeting
+/// timeline. Mixing cluster-by-cluster keeps peak memory proportional to the
+/// audio that actually overlaps, not the meeting's wall-clock span — a few
+/// chunks spread across hours no longer forces a dense multi-GB `vec![0i32; span]`
+/// allocation (plus the equally dense f64 resample buffer) during
+/// `merge_user_chunks_to_mixdown`.
+struct MixdownCluster<'a> {
+    /// Start offset in input-rate samples, relative to the meeting start.
+    start_samples: usize,
+    /// End offset (exclusive) in input-rate samples.
+    end_samples: usize,
+    /// (offset_samples, chunk) placements belonging to this cluster.
+    chunks: Vec<(usize, &'a crate::audio::meeting_audio::LoadedChunk)>,
+}
+
+fn mixdown_clusters(
     chunks: &[crate::audio::meeting_audio::LoadedChunk],
     sample_rate: u32,
-) -> Vec<u8> {
+) -> Vec<MixdownCluster<'_>> {
     use crate::audio::meeting_audio::MAX_MEETING_AUDIO_SPAN_MS;
 
     let meeting_start_ms = compute_meeting_start_ms(chunks);
-    let mut placements = Vec::new();
+    let cap_samples = ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128)
+        / 1_000u128) as usize;
+
+    let mut placements: Vec<(usize, usize, &crate::audio::meeting_audio::LoadedChunk)> = Vec::new();
     for chunk in chunks {
         let offset_ms = chunk.start_ms.saturating_sub(meeting_start_ms);
         if offset_ms > MAX_MEETING_AUDIO_SPAN_MS {
@@ -3003,35 +2896,61 @@ fn mix_chunks_by_wallclock(
         }
         let offset_samples =
             ((offset_ms as u128).saturating_mul(sample_rate as u128) / 1_000u128) as usize;
-        placements.push((offset_samples, chunk));
-    }
-    let total_samples = placements
-        .iter()
-        .map(|(offset, chunk)| *offset + chunk.pcm.len() / 2)
-        .max()
-        .unwrap_or(0);
-    let capped_total_samples = total_samples.min(
-        ((MAX_MEETING_AUDIO_SPAN_MS as u128).saturating_mul(sample_rate as u128) / 1_000u128)
-            as usize,
-    );
-
-    let mut mixed = vec![0i32; capped_total_samples];
-    for (offset_samples, chunk) in placements {
         let chunk_samples = chunk.pcm.len() / 2;
-        let usable_samples = chunk_samples.min(capped_total_samples.saturating_sub(offset_samples));
+        let usable_samples = chunk_samples.min(cap_samples.saturating_sub(offset_samples));
         if usable_samples < chunk_samples {
             warn!(
                 start_ms = chunk.start_ms,
                 offset_samples,
                 chunk_samples,
                 usable_samples,
-                capped_total_samples,
+                capped_total_samples = cap_samples,
                 "truncating chunk PCM tail beyond meeting wall-clock cap"
             );
         }
+        if usable_samples == 0 {
+            continue;
+        }
+        placements.push((offset_samples, offset_samples + usable_samples, chunk));
+    }
+    placements.sort_by_key(|(start, ..)| *start);
+
+    let mut clusters: Vec<MixdownCluster> = Vec::new();
+    for (start, end, chunk) in placements {
+        match clusters.last_mut() {
+            Some(cluster)
+                if start.saturating_sub(cluster.end_samples)
+                    < 2 * crate::audio::wav::RESAMPLE_FIR_TAPS =>
+            {
+                // Gaps shorter than the resampler's FIR reach would make a
+                // per-cluster resample treat real neighbor audio as silence;
+                // merging keeps the filter context identical to a single
+                // continuous resample and costs only the tiny gap span.
+                cluster.end_samples = cluster.end_samples.max(end);
+                cluster.chunks.push((start, chunk));
+            }
+            _ => clusters.push(MixdownCluster {
+                start_samples: start,
+                end_samples: end,
+                chunks: vec![(start, chunk)],
+            }),
+        }
+    }
+    clusters
+}
+
+/// Mix one cluster's chunks into i16 PCM covering
+/// `[cluster.start_samples, cluster.end_samples)`. The i32 accumulation
+/// buffer is only as large as the cluster's overlap span.
+fn mix_cluster_pcm(cluster: &MixdownCluster) -> Vec<u8> {
+    let span = cluster.end_samples - cluster.start_samples;
+    let mut mixed = vec![0i32; span];
+    for (offset_samples, chunk) in &cluster.chunks {
+        let base = offset_samples - cluster.start_samples;
+        let usable_samples = (cluster.end_samples - offset_samples).min(chunk.pcm.len() / 2);
         for i in 0..usable_samples {
             let sample = i16::from_le_bytes([chunk.pcm[i * 2], chunk.pcm[i * 2 + 1]]) as i32;
-            mixed[offset_samples + i] = mixed[offset_samples + i].saturating_add(sample);
+            mixed[base + i] = mixed[base + i].saturating_add(sample);
         }
     }
 
@@ -3043,12 +2962,210 @@ fn mix_chunks_by_wallclock(
     out
 }
 
+#[cfg(test)]
+fn mix_chunks_by_wallclock(
+    chunks: &[crate::audio::meeting_audio::LoadedChunk],
+    sample_rate: u32,
+) -> Vec<u8> {
+    // Dense test-only reassembly of the cluster mix: verifies that clusters
+    // tile the same timeline the previous single-buffer implementation used.
+    let clusters = mixdown_clusters(chunks, sample_rate);
+    let total_samples = clusters
+        .iter()
+        .map(|cluster| cluster.end_samples)
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![0u8; total_samples * 2];
+    for cluster in &clusters {
+        let pcm = mix_cluster_pcm(cluster);
+        let start = cluster.start_samples * 2;
+        out[start..start + pcm.len()].copy_from_slice(&pcm);
+    }
+    out
+}
+
+fn mixdown_wav_header(sample_rate: u32, data_size: u32) -> [u8; 44] {
+    let mut header = [0u8; 44];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(36u32 + data_size).to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM format
+    header[22..24].copy_from_slice(&1u16.to_le_bytes()); // mono
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&sample_rate.saturating_mul(2).to_le_bytes());
+    header[32..34].copy_from_slice(&2u16.to_le_bytes()); // block align
+    header[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits per sample
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_size.to_le_bytes());
+    header
+}
+
+const MIXDOWN_SILENCE_BLOCK: [u8; 8192] = [0u8; 8192];
+
+/// Number of output PCM samples the clusters would produce; used to reject
+/// wall-clock-huge meetings before gigabytes of silence hit the disk.
+fn planned_mixdown_out_samples(
+    clusters: &[MixdownCluster],
+    sample_rate: u32,
+    out_rate: u32,
+) -> u64 {
+    clusters
+        .iter()
+        .map(|cluster| {
+            let out_start = (cluster.start_samples as u128).saturating_mul(out_rate as u128)
+                / sample_rate as u128;
+            let in_span = (cluster.end_samples - cluster.start_samples) as u128;
+            let out_span = in_span.saturating_mul(out_rate as u128) / sample_rate as u128;
+            out_start.saturating_add(out_span) as u64
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Fallback resampler for clips too short for the FIR path: decimates
+/// input samples so a tiny clip is still stored at the output rate instead
+/// of being mislabeled.
+fn decimate_pcm_16le(pcm: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
+    let samples = pcm.len() / 2;
+    let out_samples = (samples as u64).saturating_mul(to_rate as u64) / from_rate.max(1) as u64;
+    let mut out = Vec::with_capacity(out_samples as usize * 2);
+    for i in 0..out_samples {
+        let src = ((i * from_rate as u64) / to_rate as u64) as usize;
+        if src < samples {
+            out.extend_from_slice(&pcm[src * 2..src * 2 + 2]);
+        }
+    }
+    out
+}
+
+/// Stream the mixdown WAV to disk cluster-by-cluster so neither the mixing
+/// buffer nor the output buffer scales with meeting wall-clock length.
+/// Silence between clusters is written as zero-filled gaps from a small
+/// reusable block.
+fn write_mixdown_wav(
+    path: &std::path::Path,
+    clusters: &[MixdownCluster],
+    sample_rate: u32,
+    resample_to_16k: bool,
+) -> Result<(), String> {
+    let (out_rate, resample) = if resample_to_16k && sample_rate == 48_000 {
+        (16_000u32, true)
+    } else {
+        if resample_to_16k {
+            warn!(
+                sample_rate,
+                "mixdown resampling skipped: unsupported sample rate (expected 48000)"
+            );
+        }
+        (sample_rate, false)
+    };
+
+    // Reject wall-clock-huge meetings up front: a nearly-day-long gap would
+    // otherwise fill the disk with silence before the size check could run.
+    let planned_samples = planned_mixdown_out_samples(clusters, sample_rate, out_rate);
+    let planned_bytes = planned_samples.saturating_mul(2);
+    if planned_bytes > (u32::MAX - 36) as u64 {
+        return Err(format!(
+            "mixdown exceeds WAV size limit ({planned_bytes} bytes > {} bytes)",
+            u32::MAX - 36
+        ));
+    }
+
+    let result = write_mixdown_wav_stream(path, clusters, sample_rate, out_rate, resample);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn write_mixdown_wav_stream(
+    path: &std::path::Path,
+    clusters: &[MixdownCluster],
+    sample_rate: u32,
+    out_rate: u32,
+    resample: bool,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = std::io::BufWriter::new(
+        fs::File::create(path).map_err(|err| format!("failed to create mixdown: {err}"))?,
+    );
+    // Placeholder sizes; patched once the total data size is known.
+    file.write_all(&mixdown_wav_header(out_rate, 0))
+        .map_err(|err| format!("failed to write mixdown header: {err}"))?;
+
+    let mut out_samples_written = 0usize;
+    for cluster in clusters {
+        // Convert the cluster start from input-rate to output-rate samples.
+        let out_start = ((cluster.start_samples as u128).saturating_mul(out_rate as u128)
+            / sample_rate as u128) as usize;
+        let mut gap_bytes = out_start.saturating_sub(out_samples_written) * 2;
+        while gap_bytes > 0 {
+            let n = gap_bytes.min(MIXDOWN_SILENCE_BLOCK.len());
+            file.write_all(&MIXDOWN_SILENCE_BLOCK[..n])
+                .map_err(|err| format!("failed to write mixdown silence: {err}"))?;
+            gap_bytes -= n;
+        }
+        if out_start < out_samples_written {
+            // Sub-sample rounding overlap; keep stream position authoritative.
+            warn!(
+                out_start,
+                out_samples_written, "skipping overlapped mixdown cluster region"
+            );
+        }
+        let mixed = mix_cluster_pcm(cluster);
+        let out_pcm = if resample {
+            let (resampled, actual_rate) =
+                crate::audio::wav::resample_pcm_16le(&mixed, sample_rate, out_rate);
+            if actual_rate != out_rate {
+                // The FIR needs a minimum-length clip; decimate shorter ones
+                // so the WAV's 16 kHz label stays truthful.
+                decimate_pcm_16le(&resampled, actual_rate, out_rate)
+            } else {
+                resampled
+            }
+        } else {
+            mixed
+        };
+        let offset_bytes = out_start * 2;
+        let written_bytes = out_samples_written * 2;
+        if offset_bytes < written_bytes {
+            file.seek(SeekFrom::Start(44 + offset_bytes as u64))
+                .map_err(|err| format!("failed to seek mixdown output: {err}"))?;
+        }
+        file.write_all(&out_pcm)
+            .map_err(|err| format!("failed to write mixdown audio: {err}"))?;
+        out_samples_written = out_samples_written.max(out_start + out_pcm.len() / 2);
+    }
+    file.flush()
+        .map_err(|err| format!("failed to flush mixdown: {err}"))?;
+
+    let data_size = u64::try_from(out_samples_written * 2)
+        .map_err(|_| "mixdown PCM size overflow".to_owned())?;
+    if data_size > (u32::MAX - 36) as u64 {
+        return Err(format!(
+            "mixdown exceeds WAV size limit ({data_size} bytes > {} bytes)",
+            u32::MAX - 36
+        ));
+    }
+    let data_size = data_size as u32;
+    let mut file = file
+        .into_inner()
+        .map_err(|err| format!("failed to finalize mixdown stream: {err}"))?;
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&(36u32 + data_size).to_le_bytes()))
+        .and_then(|_| file.seek(SeekFrom::Start(40)))
+        .and_then(|_| file.write_all(&data_size.to_le_bytes()))
+        .map_err(|err| format!("failed to patch mixdown header: {err}"))?;
+    Ok(())
+}
+
 pub fn merge_user_chunks_to_mixdown(
     audio_dir: &std::path::Path,
     resample_to_16k: bool,
 ) -> Result<String, String> {
-    use crate::audio::build_wav_bytes_raw;
-
     let mixdown_path = audio_dir.join("mixdown.wav");
 
     let chunks = load_chunks(audio_dir)?;
@@ -3057,24 +3174,8 @@ pub fn merge_user_chunks_to_mixdown(
         return Err("mixed sample rates are not supported for mixdown".to_owned());
     }
 
-    let all_pcm = mix_chunks_by_wallclock(&chunks, sample_rate);
-
-    let (final_pcm, final_rate) = if resample_to_16k {
-        let (pcm, rate) = crate::audio::wav::resample_pcm_16le(&all_pcm, sample_rate, 16_000);
-        if rate != 16_000 {
-            warn!(
-                sample_rate,
-                "mixdown resampling skipped: unsupported sample rate (expected 48000)"
-            );
-        }
-        (pcm, rate)
-    } else {
-        (all_pcm, sample_rate)
-    };
-    let wav_bytes = build_wav_bytes_raw(&final_pcm, final_rate, 1, 16)
-        .map_err(|err| format!("failed to build mixdown WAV: {err}"))?;
-    fs::write(&mixdown_path, &wav_bytes)
-        .map_err(|err| format!("failed to write mixdown: {err}"))?;
+    let clusters = mixdown_clusters(&chunks, sample_rate);
+    write_mixdown_wav(&mixdown_path, &clusters, sample_rate, resample_to_16k)?;
 
     Ok(mixdown_path.to_string_lossy().to_string())
 }
@@ -3297,6 +3398,8 @@ pub async fn run_bot(
     config: &AppConfig,
     mut bot_token_revision: watch::Receiver<u64>,
     summary_job_wakeups: SummaryJobWakeups,
+    meeting_permission_cache: Option<PermissionCache>,
+    meeting_guild_cache: Option<GuildCache>,
 ) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
@@ -3370,13 +3473,28 @@ pub async fn run_bot(
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
+        meeting_permission_cache,
+        meeting_guild_cache,
     };
 
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::GUILD_MODERATION;
     let songbird_config =
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
     let voice_manager = songbird::Songbird::serenity_from_config(songbird_config);
-    let mut client = Client::builder(&config.discord_token, intents)
+    // Bot-originated messages must never ping: voice channel names and other
+    // user-controlled text can contain @everyone/@here/user/role mention
+    // syntax that a channel manager could weaponize into bot-sent pings.
+    let http = serenity::http::HttpBuilder::new(&config.discord_token)
+        .default_allowed_mentions(
+            serenity::all::CreateAllowedMentions::new()
+                .all_roles(false)
+                .all_users(false)
+                .everyone(false),
+        )
+        .build();
+    let mut client = serenity::all::ClientBuilder::new_with_http(http, intents)
         .event_handler(handler.clone())
         .register_songbird_with(Arc::clone(&voice_manager))
         .await
@@ -3416,8 +3534,8 @@ async fn wait_for_bot_token_revision_change(revision: &mut watch::Receiver<u64>)
     }
 }
 
-fn load_runtime_summary_context(
-    store: &mut SqlMeetingStore<PgSqlExecutor>,
+fn load_runtime_summary_context<E: SqlExecutor>(
+    store: &mut SqlMeetingStore<E>,
     meeting_id: &str,
     guild_id: &str,
     effective_settings: &EffectiveMeetingSettings,
@@ -3426,13 +3544,12 @@ fn load_runtime_summary_context(
     crate::application::summary::SummaryContextInput,
     crate::application::summary::SummaryError,
 > {
-    let domain_knowledge = store
-        .list_domain_knowledge(guild_id, false, None)
-        .map_err(|err| {
-            crate::application::summary::SummaryError::SummaryEngine(format!(
-                "failed to load domain knowledge for meeting {meeting_id}: {err}"
-            ))
-        })?;
+    // See load_summary_context in worker.rs: meeting summaries are visible to
+    // viewers of the recorded voice channel, while these context records are
+    // admin-tier data. Only records anchored to a meeting recorded in the
+    // same voice channel may be materialized; unanchored guild-global records
+    // (including all domain knowledge) are excluded.
+    let domain_knowledge = Vec::new();
     let tenant = store.resolve_tenant_by_guild(guild_id).map_err(|err| {
         crate::application::summary::SummaryError::SummaryEngine(format!(
             "failed to resolve active tenant for meeting {meeting_id}: {err}"
@@ -3449,37 +3566,87 @@ fn load_runtime_summary_context(
         );
     }
     let (ai_memory, user_feedback, person_aliases) = if let Some(tenant) = tenant.as_ref() {
+        // The eligible-anchor set is resolved first so the candidate lists
+        // can pre-filter by anchor in SQL; see load_summary_context in
+        // worker.rs.
+        let allowed_meetings = crate::application::worker::summary_context_allowed_meeting_ids(
+            store, meeting_id, guild_id,
+        )
+        .map_err(|err| {
+            crate::application::summary::SummaryError::SummaryEngine(format!(
+                "failed to resolve summary context scope for meeting {meeting_id}: {err}"
+            ))
+        })?;
+        let anchor_csv = crate::application::worker::summary_context_anchor_csv(&allowed_meetings);
+        let ai_memory = store
+            .list_ai_memory_notes(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                None,
+                Some(&anchor_csv),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load AI memory for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let user_feedback = store
+            .list_transcript_feedback(
+                &tenant.tenant_id,
+                guild_id,
+                Some(TranscriptFeedbackStatus::Accepted),
+                None,
+                Some(&anchor_csv),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load accepted user feedback for meeting {meeting_id}: {err}"
+                ))
+            })?;
+        let person_aliases = store
+            .list_person_aliases(
+                &tenant.tenant_id,
+                guild_id,
+                false,
+                Some(PersonAliasReviewStatus::Accepted),
+                Some(&anchor_csv),
+                Some(crate::application::worker::SUMMARY_CONTEXT_LIST_LIMIT),
+            )
+            .map_err(|err| {
+                crate::application::summary::SummaryError::SummaryEngine(format!(
+                    "failed to load person aliases for meeting {meeting_id}: {err}"
+                ))
+            })?;
         (
-            store
-                .list_ai_memory_notes(&tenant.tenant_id, guild_id, false, None)
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load AI memory for meeting {meeting_id}: {err}"
-                    ))
-                })?,
-            store
-                .list_accepted_transcript_feedback_for_summary(
-                    &tenant.tenant_id,
-                    guild_id,
-                    meeting_id,
-                )
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load accepted user feedback for meeting {meeting_id}: {err}"
-                    ))
-                })?,
-            store
-                .list_person_aliases(
-                    &tenant.tenant_id,
-                    guild_id,
-                    false,
-                    Some(PersonAliasReviewStatus::Accepted),
-                )
-                .map_err(|err| {
-                    crate::application::summary::SummaryError::SummaryEngine(format!(
-                        "failed to load person aliases for meeting {meeting_id}: {err}"
-                    ))
-                })?,
+            ai_memory
+                .into_iter()
+                .filter(|note| {
+                    note.source_meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
+            user_feedback
+                .into_iter()
+                .filter(|feedback| {
+                    feedback
+                        .meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
+            person_aliases
+                .into_iter()
+                .filter(|alias| {
+                    alias
+                        .source_meeting_id
+                        .as_deref()
+                        .is_some_and(|id| allowed_meetings.contains(id))
+                })
+                .collect(),
         )
     } else {
         (Vec::new(), Vec::new(), Vec::new())
@@ -3552,6 +3719,13 @@ struct ScaffoldHandler {
     integration_retry_policy: RetryPolicy,
     public_base_url: Option<String>,
     bot_admin_user_ids: HashSet<String>,
+    /// Shared with the in-process web server so gateway events that change
+    /// channel permissions can drop stale cached positive allows
+    /// immediately. `None` when run outside the web+bot process.
+    meeting_permission_cache: Option<PermissionCache>,
+    /// Same sharing for cached guild info (roles, channels, owner) that feeds
+    /// permission evaluation; invalidated when gateway events change guild data.
+    meeting_guild_cache: Option<GuildCache>,
 }
 
 fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
@@ -4121,6 +4295,113 @@ impl EventHandler for ScaffoldHandler {
                 error!(error = %err, "startup recovery failed");
             }
         });
+    }
+
+    // Drop cached positive permission decisions as soon as the gateway reports
+    // a change that can revoke channel visibility, instead of letting a stale
+    // allow serve until the cache TTL expires.
+
+    async fn channel_update(&self, _ctx: Context, _old: Option<GuildChannel>, new: GuildChannel) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_channel(cache, &new.id.to_string()).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn channel_delete(
+        &self,
+        _ctx: Context,
+        channel: GuildChannel,
+        _messages: Option<Vec<Message>>,
+    ) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_channel(cache, &channel.id.to_string()).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_role_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Role>,
+        _new: Role,
+    ) {
+        // A role permission edit can change visibility on any channel, and the
+        // cache key carries no guild/role dimension, so drop every entry.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_role_delete(
+        &self,
+        _ctx: Context,
+        _guild_id: GuildId,
+        _removed_role_id: RoleId,
+        _removed_role_data_if_available: Option<Role>,
+    ) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Guild>,
+        _new_data: PartialGuild,
+    ) {
+        // Guild ownership changes affect every permission evaluation.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            clear_permission_cache(cache).await;
+        }
+        if let Some(cache) = self.meeting_guild_cache.as_ref() {
+            invalidate_guild_cache(cache).await;
+        }
+    }
+
+    async fn guild_member_removal(
+        &self,
+        _ctx: Context,
+        _guild_id: GuildId,
+        user: User,
+        _member_data_if_available: Option<Member>,
+    ) {
+        // Only dispatched when the privileged GUILD_MEMBERS intent is enabled;
+        // kept as a no-cost hook so enabling it starts invalidating kicked or
+        // departed members' cached allows.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_user(cache, &user.id.to_string()).await;
+        }
+    }
+
+    async fn guild_member_update(
+        &self,
+        _ctx: Context,
+        _old_if_available: Option<Member>,
+        _new: Option<Member>,
+        event: GuildMemberUpdateEvent,
+    ) {
+        // Same GUILD_MEMBERS-intent caveat; covers per-member role assignments.
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_user(cache, &event.user.id.to_string()).await;
+        }
+    }
+
+    async fn guild_ban_addition(&self, _ctx: Context, _guild_id: GuildId, banned_user: User) {
+        if let Some(cache) = self.meeting_permission_cache.as_ref() {
+            invalidate_permission_cache_for_user(cache, &banned_user.id.to_string()).await;
+        }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -8368,7 +8649,12 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             if let Err(err) = service.store.executor.execute(
                 crate::infrastructure::sql::INSERT_SUMMARY_SQL,
-                &[summary_id, claimed_job.meeting_id.clone(), markdown.clone()],
+                &[
+                    summary_id,
+                    claimed_job.meeting_id.clone(),
+                    markdown.clone(),
+                    crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION.to_string(),
+                ],
             ) {
                 warn!(
                     meeting_id = %claimed_job.meeting_id,
@@ -8377,56 +8663,12 @@ impl ScaffoldHandler {
                 );
             }
         }
-        if let Err(err) = agent_workspace.cleanup_once() {
-            let err_string = summary_cleanup_failure_user_message(&err);
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                error = %err,
-                "failed to clean summary agent workspace after summary persistence"
-            );
-            let disposition = {
-                let mut service = self.service.lock().await;
-                let mut queue = self.queue.lock().await;
-                handle_summary_cleanup_failure(
-                    &mut service.store,
-                    &mut *queue,
-                    &claimed_job,
-                    err_string.clone(),
-                    self.summary_max_retries,
-                )
-            };
-            return match disposition {
-                SummaryCleanupFailureDisposition::RetryScheduled => {
-                    Err(retry_scheduled_error(&claimed_job, err_string))
-                }
-                SummaryCleanupFailureDisposition::OwnershipLost => {
-                    Err(SummaryJobRunError::NotClaimable(err_string))
-                }
-                SummaryCleanupFailureDisposition::TerminalStatusUpdated => {
-                    if self
-                        .meeting_status_is(&claimed_job.meeting_id, MeetingStatus::Failed)
-                        .await
-                        && let Err(status_err) = self
-                            .update_status_message(
-                                http,
-                                &claimed_job.meeting_id,
-                                StatusMessageUpdate::Failed {
-                                    phase: "summary_cleanup",
-                                    error: &err_string,
-                                },
-                            )
-                            .await
-                    {
-                        warn!(
-                            meeting_id = %claimed_job.meeting_id,
-                            error = %status_err,
-                            "failed to update status message after summary cleanup failure"
-                        );
-                    }
-                    Err(SummaryJobRunError::TerminalStatusUpdated(err_string))
-                }
-            };
-        }
+        // The summary is already persisted at this point, so cleanup is
+        // best-effort housekeeping. A prompt-injected agent can tamper with
+        // the cleanup marker or other workspace contents to make cleanup
+        // fail; reverting the meeting and requeueing the job here would let
+        // the agent turn cleanup into a repeated-LLM-work DoS.
+        cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, agent_workspace);
 
         let ai_memory_extraction_supported = {
             let service = self.service.lock().await;
@@ -9315,12 +9557,7 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 runtime.guild_id,
                                 target_voice_channel_id,
                             );
-                            let non_bot = count_non_bot_members_in_target_voice(
-                                &ctx_for_task,
-                                runtime.guild_id,
-                                target_voice_channel_id,
-                            );
-                            match decide_driver_disconnect_grace_expiry(reconnected, non_bot) {
+                            match decide_driver_disconnect_grace_expiry(reconnected) {
                                 GraceExpiryDecision::Reschedule => {
                                     let terminal_error = driver_disconnect_cache_miss_terminal_error(
                                         &mut grace_cache_misses,
@@ -9892,13 +10129,28 @@ fn resolve_user_voice_channel_id(ctx: &Context, guild_id: GuildId, user_id: User
         .map(|id| id.get())
 }
 
+const MAX_VOICE_CHANNEL_NAME_CHARS: usize = 100;
+
+/// Voice channel names are administrator-controlled text that reaches
+/// agent-consumed manifests and bot-posted messages. Strip control/format
+/// characters (zero-width and bidi overrides can smuggle invisible prompt
+/// instructions) and cap the length; mention ping risk is handled by the
+/// HTTP client's empty default allowed_mentions.
+fn sanitize_voice_channel_name(name: &str) -> Option<String> {
+    let sanitized = name
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(*ch as u32, 0x00AD | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF))
+        .take(MAX_VOICE_CHANNEL_NAME_CHARS)
+        .collect::<String>();
+    (!sanitized.trim().is_empty()).then_some(sanitized)
+}
+
 fn resolve_voice_channel_name(ctx: &Context, guild_id: GuildId, channel_id: u64) -> Option<String> {
     let guild = ctx.cache.guild(guild_id)?;
     guild
         .channels
         .get(&ChannelId::new(channel_id))
-        .map(|channel| channel.name.clone())
-        .filter(|name| !name.trim().is_empty())
+        .and_then(|channel| sanitize_voice_channel_name(&channel.name))
 }
 
 pub fn stop_reason_from_interaction(command: &CommandInteraction) -> Result<StopReason, String> {
@@ -12250,101 +12502,77 @@ mod status_message_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn summary_cleanup_error_requeues_job_and_reverts_meeting_before_exhaustion() {
-        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
-        store.insert(summarizing_meeting());
-        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
-        let job = running_summary_job();
-        queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let raw_error =
-            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
-        let user_message = summary_cleanup_failure_user_message(raw_error);
+    fn post_persist_workspace_cleanup_removes_workspace_with_tampered_marker() {
+        let temp = runtime_temp_dir("post_persist_cleanup_tampered_marker");
+        let meeting_root = temp.path.join("meeting");
+        let agent_root = meeting_root.join("agent").join("run-1");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root");
+        let source = meeting_root.join("transcript.md");
+        std::fs::write(&source, "transcript").expect("source");
+        let agent_workspace = crate::infrastructure::workspace::AgentWorkspaceBuilder::new(
+            &meeting_root,
+            &agent_root,
+        )
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+        // A prompt-injected agent rewriting the cleanup marker must not be
+        // able to keep transcript copies on disk: the workspace inode is
+        // unchanged, so cleanup still removes it.
+        std::fs::write(
+            agent_root
+                .join(crate::infrastructure::workspace::AGENT_CURSOR_DIR)
+                .join(".cleanup-token"),
+            "tampered-marker",
+        )
+        .expect("tamper cleanup marker");
 
-        let disposition =
-            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 2);
+        cleanup_agent_workspace_after_persist("m1", agent_workspace);
 
-        assert_ne!(user_message, raw_error);
-        assert!(!user_message.contains("/tmp/private"));
-        assert!(!user_message.contains("summary.md"));
-        assert!(user_message.len() < 200);
+        assert!(!agent_root.exists());
         assert_eq!(
-            disposition,
-            SummaryCleanupFailureDisposition::RetryScheduled
-        );
-        let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Queued);
-        assert_eq!(updated.retry_count, 1);
-        assert_eq!(
-            updated.error_message.as_deref(),
-            Some(user_message.as_str())
-        );
-        let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Stopping);
-        assert_eq!(meeting.error_message, None);
-    }
-
-    #[test]
-    fn summary_cleanup_error_marks_job_and_meeting_failed_after_exhaustion() {
-        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
-        store.insert(summarizing_meeting());
-        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
-        let job = running_summary_job();
-        queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let raw_error =
-            "agent workspace filesystem error at /tmp/private/output/summary.md: permission denied";
-        let user_message = summary_cleanup_failure_user_message(raw_error);
-
-        let disposition =
-            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message.clone(), 0);
-
-        assert_ne!(user_message, raw_error);
-        assert!(!user_message.contains("/tmp/private"));
-        assert!(!user_message.contains("summary.md"));
-        assert!(user_message.len() < 200);
-        assert_eq!(
-            disposition,
-            SummaryCleanupFailureDisposition::TerminalStatusUpdated
-        );
-        let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
-        assert_eq!(updated.retry_count, 1);
-        assert_eq!(
-            updated.error_message.as_deref(),
-            Some(user_message.as_str())
-        );
-        let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Failed);
-        assert_eq!(
-            meeting.error_message.as_deref(),
-            Some(user_message.as_str())
+            std::fs::read_to_string(&source).expect("source remains"),
+            "transcript"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn summary_cleanup_error_does_not_fail_meeting_after_state_advances() {
-        let mut store = crate::infrastructure::storage::InMemoryMeetingStore::new();
-        let mut meeting = summarizing_meeting();
-        meeting.status = crate::domain::MeetingStatus::Posted;
-        store.insert(meeting);
-        let mut queue = crate::infrastructure::queue::InMemoryJobQueue::new();
-        let job = running_summary_job();
-        queue.enqueue(job.clone()).expect("enqueue should succeed");
-        let user_message = summary_cleanup_failure_user_message("cleanup failed");
+    fn post_persist_workspace_cleanup_failure_does_not_propagate() {
+        let temp = runtime_temp_dir("post_persist_cleanup_failure");
+        let meeting_root = temp.path.join("meeting");
+        let agent_root = meeting_root.join("agent").join("run-1");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root");
+        let source = meeting_root.join("transcript.md");
+        std::fs::write(&source, "transcript").expect("source");
+        let agent_workspace = crate::infrastructure::workspace::AgentWorkspaceBuilder::new(
+            &meeting_root,
+            &agent_root,
+        )
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+        // A root swapped for a symlink must be refused rather than
+        // traversed, and the failure must not propagate to the job.
+        std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
+        let symlink_target = temp.path.join("unrelated");
+        std::fs::create_dir_all(&symlink_target).expect("target dir");
+        std::fs::write(symlink_target.join("unrelated.txt"), "do not delete").expect("target file");
+        std::os::unix::fs::symlink(&symlink_target, &agent_root).expect("symlink swap");
 
-        let disposition =
-            handle_summary_cleanup_failure(&mut store, &mut queue, &job, user_message, 0);
+        cleanup_agent_workspace_after_persist("m1", agent_workspace);
 
-        assert_eq!(
-            disposition,
-            SummaryCleanupFailureDisposition::TerminalStatusUpdated
+        assert!(
+            std::fs::symlink_metadata(&agent_root)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
         );
-        let updated = queue.get(&job.id).expect("job should remain");
-        assert_eq!(updated.status, crate::domain::JobStatus::Failed);
-        assert_eq!(updated.retry_count, 0);
-        let meeting = store.get("m1").expect("meeting should remain");
-        assert_eq!(meeting.status, crate::domain::MeetingStatus::Posted);
-        assert_eq!(meeting.error_message, None);
+        assert!(symlink_target.join("unrelated.txt").is_file());
     }
 
     #[test]
@@ -12870,29 +13098,19 @@ mod status_message_tests {
     }
 
     #[test]
-    fn driver_disconnect_cache_miss_reschedules_instead_of_stopping() {
+    fn driver_disconnect_grace_expiry_stops_when_still_disconnected() {
         assert_eq!(
-            decide_driver_disconnect_grace_expiry(None, Some(0)),
+            decide_driver_disconnect_grace_expiry(None),
             GraceExpiryDecision::Reschedule
         );
         assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(false), None),
-            GraceExpiryDecision::Reschedule
-        );
-        assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(true), Some(0)),
+            decide_driver_disconnect_grace_expiry(Some(true)),
             GraceExpiryDecision::Cancel
         );
+        // Whether or not non-bot occupants remain, a still-disconnected bot
+        // cannot record; stop the meeting instead of leaving it active.
         assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(true), None),
-            GraceExpiryDecision::Cancel
-        );
-        assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(false), Some(1)),
-            GraceExpiryDecision::Cancel
-        );
-        assert_eq!(
-            decide_driver_disconnect_grace_expiry(Some(false), Some(0)),
+            decide_driver_disconnect_grace_expiry(Some(false)),
             GraceExpiryDecision::Stop
         );
     }
@@ -14885,6 +15103,26 @@ mod status_message_tests {
     }
 
     #[test]
+    fn voice_channel_name_sanitize_strips_hidden_format_chars() {
+        let sanitized = sanitize_voice_channel_name(
+            "stand\u{200B}up\u{202E}room\u{0007}\u{2066}iso\u{2069}\u{00AD}late",
+        );
+
+        assert_eq!(sanitized.as_deref(), Some("standuproomisolate"));
+    }
+
+    #[test]
+    fn voice_channel_name_sanitize_caps_length_and_rejects_blank() {
+        let long = "a".repeat(MAX_VOICE_CHANNEL_NAME_CHARS + 10);
+        let sanitized = sanitize_voice_channel_name(&long);
+        assert_eq!(
+            sanitized.as_deref().map(str::chars).map(Iterator::count),
+            Some(MAX_VOICE_CHANNEL_NAME_CHARS)
+        );
+        assert_eq!(sanitize_voice_channel_name(" \u{200B} "), None);
+    }
+
+    #[test]
     fn summary_completion_message_includes_url() {
         let message = format_status_message_content(
             "meeting-1",
@@ -14937,5 +15175,57 @@ mod status_message_tests {
             assert!(message.contains("https://example.test/meetings/meeting-1"));
             assert!(message.contains("meeting_id=meeting-1"));
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_context_tests {
+    use super::*;
+    use crate::application::worker::{
+        assert_summary_context_scope, register_summary_context_scope_fakes,
+    };
+    use crate::infrastructure::sql_store::FakeSqlExecutor;
+
+    fn test_effective_settings() -> EffectiveMeetingSettings {
+        EffectiveMeetingSettings {
+            whisper_language: None,
+            whisper_vad: false,
+            whisper_beam_size: 1,
+            whisper_suppress_non_speech: false,
+            whisper_prompt: None,
+            whisper_temperature: 0.0,
+            whisper_resample_to_16k: true,
+            auto_stop_grace_seconds: 0,
+            retention_raw_audio_ttl_days: 0,
+            retention_transcript_ttl_days: 0,
+            retention_summary_ttl_days: None,
+            summary_enabled: true,
+            summary_template_id: None,
+            domain_knowledge_version_id: None,
+        }
+    }
+
+    #[test]
+    fn load_runtime_summary_context_scopes_records_to_same_channel() {
+        // Loader-level coverage: candidate rows flow through the real SQL call
+        // path (bounded list queries, tenant resolution, channel scoping)
+        // instead of being fed to the scope helper directly.
+        let mut executor = FakeSqlExecutor::default();
+        register_summary_context_scope_fakes(&mut executor);
+        let mut store = SqlMeetingStore::new(executor);
+        let settings = test_effective_settings();
+
+        let context = load_runtime_summary_context(&mut store, "m1", "g1", &settings, &[])
+            .expect("runtime summary context should load");
+
+        assert_summary_context_scope(&context);
+        assert!(
+            context.speakers.is_empty(),
+            "runtime path returns no speaker list"
+        );
+        assert!(
+            context.summary_template.is_none(),
+            "no active summary template is registered"
+        );
     }
 }

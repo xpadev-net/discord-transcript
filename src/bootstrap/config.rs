@@ -175,13 +175,20 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
+        // The unsafe-agent opt-in acknowledgement is validated whenever the
+        // role can execute summary jobs, regardless of SUMMARY_ENABLED: that
+        // flag is only the default for new meeting settings, so stored or
+        // per-guild summary_enabled=true values can still enqueue jobs that
+        // run the harness against untrusted transcripts.
+        if app_role.requires_summary_harness_config() {
+            validate_unsafe_agent_harness_opt_in(
+                summary_harness,
+                summary_allow_unsafe_agent_harness,
+                optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+            )?;
+        }
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
-                validate_unsafe_agent_harness_opt_in(
-                    summary_harness,
-                    summary_allow_unsafe_agent_harness,
-                    optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-                )?;
                 resolve_summary_settings(
                     summary_harness,
                     optional_env("SUMMARY_COMMAND"),
@@ -297,13 +304,15 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Claude);
         let summary_allow_unsafe_agent_harness =
             optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
+        if app_role.requires_summary_harness_config() {
+            validate_unsafe_agent_harness_opt_in(
+                summary_harness,
+                summary_allow_unsafe_agent_harness,
+                optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
+            )?;
+        }
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
-                validate_unsafe_agent_harness_opt_in(
-                    summary_harness,
-                    summary_allow_unsafe_agent_harness,
-                    optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-                )?;
                 resolve_summary_settings(
                     summary_harness,
                     optional_from_map(values, "SUMMARY_COMMAND"),

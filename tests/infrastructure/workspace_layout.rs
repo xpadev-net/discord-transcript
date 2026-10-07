@@ -1,3 +1,4 @@
+use discord_transcript::application::ai_memory_extraction::materialize_ai_memory_agent_workspace;
 use discord_transcript::application::summary::materialize_summary_agent_workspace;
 use discord_transcript::application::summary::{SummaryRequest, TranscriptManifest};
 use discord_transcript::domain::privacy::MaskingStats;
@@ -361,6 +362,8 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
     assert_eq!(
         top_level_entries,
         vec![
+            ".claude/mcp_servers.json",
+            ".claude/settings.json",
             ".cursor/.cleanup-token",
             ".cursor/cli.json",
             "input/context/manifest.json",
@@ -368,21 +371,172 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
             "input/context/summary_template.txt",
             "input/transcript/manifest.json",
             "input/transcript/transcript_masked.md",
+            "opencode.json",
         ]
     );
 
-    let cursor_config = std::fs::read_to_string(agent_workspace.cursor_config_path())
-        .expect("cursor config");
+    let cursor_config = assert_agent_workspace_lockdown_configs(
+        &agent_root,
+        agent_workspace.cursor_config_path(),
+    );
     assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
     assert!(cursor_config.contains("Read(input/context/manifest.json)"));
     assert!(cursor_config.contains("Write(output/summary.md)"));
+    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Asserts the deny-by-default lockdown config every agent workspace must
+/// materialize: Claude settings deny-list + hook/MCP shutdown, empty MCP
+/// servers, and the opencode permission tree. Returns the cursor cli.json
+/// contents so callers can additionally check harness-specific allow rules.
+fn assert_agent_workspace_lockdown_configs(
+    agent_root: &std::path::Path,
+    cursor_config_path: &std::path::Path,
+) -> String {
+    let claude_settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent_root.join(".claude/settings.json"))
+            .expect("claude settings"),
+    )
+    .expect("claude settings parses");
+    let claude_permissions = claude_settings["permissions"].as_object().unwrap();
+    assert_eq!(
+        claude_permissions["allow"],
+        serde_json::json!(["Read(./input/**)", "Write(./output/**)"])
+    );
+    let claude_deny = claude_permissions["deny"].as_array().unwrap();
+    for rule in [
+        "Bash",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Read(../**)",
+        "Read(.env*)",
+        "Read(**/.env*)",
+        "Read(./.cursor/**)",
+        "Read(./.claude/**)",
+        "Read(./opencode.json)",
+        "Write(../**)",
+        "Write(./input/**)",
+        "Write(./.cursor/**)",
+        "Write(./.claude/**)",
+        "Write(./opencode.json)",
+    ] {
+        assert!(
+            claude_deny.iter().any(|entry| entry.as_str() == Some(rule)),
+            "claude deny list must include {rule}: {claude_deny:?}"
+        );
+    }
+    assert_eq!(claude_settings["disableAllHooks"], serde_json::json!(true));
+    assert_eq!(
+        claude_settings["enableAllProjectMcpServers"],
+        serde_json::json!(false)
+    );
+    let claude_mcp: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent_root.join(".claude/mcp_servers.json"))
+            .expect("mcp config"),
+    )
+    .expect("mcp config parses");
+    assert!(claude_mcp["mcpServers"].as_object().unwrap().is_empty());
+    let opencode_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent_root.join("opencode.json")).expect("opencode config"),
+    )
+    .expect("opencode config parses");
+    let permissions = opencode_config["permission"].as_object().unwrap();
+    assert_eq!(permissions["*"], serde_json::json!("deny"));
+    let read_rules = permissions["read"].as_object().unwrap();
+    assert_eq!(read_rules["*"], serde_json::json!("deny"));
+    assert_eq!(read_rules["input/**"], serde_json::json!("allow"));
+    assert_eq!(read_rules["output/**"], serde_json::json!("allow"));
+    let edit_rules = permissions["edit"].as_object().unwrap();
+    assert_eq!(edit_rules["*"], serde_json::json!("deny"));
+    assert_eq!(edit_rules["output/**"], serde_json::json!("allow"));
+    for key in [
+        "bash",
+        "webfetch",
+        "task",
+        "external_directory",
+        "doom_loop",
+    ] {
+        assert_eq!(
+            permissions[key],
+            serde_json::json!("deny"),
+            "{key} must be denied"
+        );
+    }
+    for key in ["read", "glob", "grep"] {
+        assert!(
+            permissions.contains_key(key),
+            "{key} must be present in permission config"
+        );
+    }
+
+    let cursor_config =
+        std::fs::read_to_string(cursor_config_path).expect("cursor config");
     assert!(cursor_config.contains("Read(.env)"));
     assert!(cursor_config.contains("Read(.cursor/.cleanup-token)"));
     assert!(cursor_config.contains("Read(debug/**)"));
     assert!(cursor_config.contains("Read(../**)"));
     assert!(cursor_config.contains("Write(input/**)"));
     assert!(cursor_config.contains("Shell(*)"));
-    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
+    cursor_config
+}
+
+#[cfg(unix)]
+#[test]
+fn ai_memory_agent_workspace_materializes_same_lockdown_configs() {
+    let base = unique_temp_dir("ai_memory_agent_workspace");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g", "vc", "m");
+    workspace.ensure_base_dirs().expect("workspace dirs");
+    std::fs::write(workspace.masked_transcript_path(), "masked transcript")
+        .expect("write transcript");
+    std::fs::write(workspace.transcript_manifest_path(), "{}").expect("write manifest");
+    std::fs::create_dir_all(workspace.summary_dir()).expect("summary dir");
+
+    let request = SummaryRequest {
+        meeting_id: "m".to_owned(),
+        guild_id: "g".to_owned(),
+        voice_channel_id: "vc".to_owned(),
+        voice_channel_name: None,
+        title: None,
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: String::new(),
+        speaker_audio: Vec::new(),
+        language: Some("en".to_owned()),
+        workspace: workspace.clone(),
+    };
+    let agent_root = workspace.root().join("agent").join("ai-memory-1");
+
+    let agent_workspace =
+        materialize_ai_memory_agent_workspace(&request, "# summary", &agent_root)
+            .expect("materialize ai memory workspace");
+
+    for lockdown_file in [
+        ".claude/settings.json",
+        ".claude/mcp_servers.json",
+        ".cursor/cli.json",
+        ".cursor/.cleanup-token",
+        "opencode.json",
+    ] {
+        assert!(
+            agent_root.join(lockdown_file).is_file(),
+            "ai memory workspace must materialize {lockdown_file}"
+        );
+    }
+    assert!(agent_root.join("input/transcript/transcript_masked.md").is_file());
+    assert!(agent_workspace.output_dir().is_dir());
+    assert!(agent_workspace.cursor_config_path().is_file());
+    assert_agent_workspace_lockdown_configs(
+        &agent_root,
+        agent_workspace.cursor_config_path(),
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -635,9 +789,13 @@ fn agent_workspace_cleanup_refuses_replaced_root() {
         .expect("register source")
         .build()
         .expect("materialize");
+    // Allocate the replacement dir while the original still exists so the two
+    // cannot share an inode, then swap it in atomically with rename.
+    let replacement = meeting_root.join("agent").join("run-1-replacement");
+    std::fs::create_dir_all(&replacement).expect("replacement agent root");
+    std::fs::write(replacement.join("unrelated.txt"), "do not delete").expect("replacement file");
     std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
-    std::fs::create_dir_all(&agent_root).expect("replace agent root");
-    std::fs::write(agent_root.join("unrelated.txt"), "do not delete").expect("replacement file");
+    std::fs::rename(&replacement, &agent_root).expect("swap in replacement root");
 
     let err = agent_workspace
         .cleanup()
@@ -650,7 +808,48 @@ fn agent_workspace_cleanup_refuses_replaced_root() {
 
 #[cfg(unix)]
 #[test]
-fn agent_workspace_cleanup_refuses_oversized_cleanup_marker() {
+fn agent_workspace_cleanup_refuses_recycled_inode_root() {
+    use std::os::unix::fs::MetadataExt;
+
+    let base = unique_temp_dir("agent_workspace_cleanup_recycled");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    let original_ino = std::fs::metadata(&agent_root)
+        .expect("stat agent root")
+        .ino();
+    std::fs::remove_dir_all(&agent_root).expect("remove original agent root");
+    // The workspace holds the root's inode open, so the recreated directory
+    // cannot recycle it — a same-ino replacement is structurally prevented.
+    std::fs::create_dir(&agent_root).expect("recreate agent root");
+    assert_ne!(
+        std::fs::metadata(&agent_root)
+            .expect("stat recreated root")
+            .ino(),
+        original_ino
+    );
+    std::fs::write(agent_root.join("unrelated.txt"), "do not delete").expect("replacement file");
+
+    let err = agent_workspace
+        .cleanup()
+        .expect_err("cleanup should reject a recreated root");
+
+    assert!(err.to_string().contains("identity changed"));
+    assert!(agent_root.join("unrelated.txt").is_file());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_removes_despite_oversized_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_oversized_marker");
     let meeting_root = base.join("meeting");
     let agent_root = meeting_root.join("agent").join("run-1");
@@ -669,18 +868,20 @@ fn agent_workspace_cleanup_refuses_oversized_cleanup_marker() {
     )
     .expect("overwrite cleanup marker");
 
-    let err = agent_workspace
+    // The marker is tampered but the workspace inode is unchanged, so an
+    // agent must not be able to strand transcripts by corrupting the marker.
+    agent_workspace
         .cleanup()
-        .expect_err("cleanup should reject oversized marker");
+        .expect("cleanup should remove workspace despite oversized marker");
 
-    assert!(err.to_string().contains("identity changed"));
-    assert!(agent_root.exists());
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
 }
 
 #[cfg(unix)]
 #[test]
-fn agent_workspace_cleanup_refuses_malformed_cleanup_marker() {
+fn agent_workspace_cleanup_removes_despite_malformed_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_malformed_marker");
     let meeting_root = base.join("meeting");
     let agent_root = meeting_root.join("agent").join("run-1");
@@ -699,18 +900,18 @@ fn agent_workspace_cleanup_refuses_malformed_cleanup_marker() {
     )
     .expect("overwrite cleanup marker");
 
-    let err = agent_workspace
+    agent_workspace
         .cleanup()
-        .expect_err("cleanup should reject malformed marker");
+        .expect("cleanup should remove workspace despite malformed marker");
 
-    assert!(err.to_string().contains("identity changed"));
-    assert!(agent_root.exists());
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
 }
 
 #[cfg(unix)]
 #[test]
-fn agent_workspace_cleanup_refuses_missing_cleanup_marker() {
+fn agent_workspace_cleanup_removes_despite_missing_cleanup_marker() {
     let base = unique_temp_dir("agent_workspace_cleanup_missing_marker");
     let meeting_root = base.join("meeting");
     let agent_root = meeting_root.join("agent").join("run-1");
@@ -726,12 +927,83 @@ fn agent_workspace_cleanup_refuses_missing_cleanup_marker() {
     std::fs::remove_file(agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"))
         .expect("remove cleanup marker");
 
-    let err = agent_workspace
+    agent_workspace
         .cleanup()
-        .expect_err("cleanup should reject missing marker");
+        .expect("cleanup should remove workspace despite missing marker");
 
-    assert!(err.to_string().contains("identity changed"));
-    assert!(agent_root.exists());
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_removes_despite_moved_input_dir() {
+    let base = unique_temp_dir("agent_workspace_cleanup_moved_input");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::write(
+        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        "tampered",
+    )
+    .expect("overwrite cleanup marker");
+    std::fs::rename(
+        agent_root.join(AGENT_INPUT_DIR),
+        agent_root.join("moved-input"),
+    )
+    .expect("move input dir");
+
+    // The marker is corrupt and part of the skeleton was moved, but the root
+    // still holds build-time structure, so cleanup must still remove it.
+    agent_workspace
+        .cleanup()
+        .expect("cleanup should remove workspace with corrupt marker and partial skeleton");
+
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_workspace_cleanup_removes_despite_stripped_skeleton() {
+    let base = unique_temp_dir("agent_workspace_cleanup_stripped_skeleton");
+    let meeting_root = base.join("meeting");
+    let agent_root = meeting_root.join("agent").join("run-1");
+    std::fs::create_dir_all(&meeting_root).expect("meeting root");
+    let source = meeting_root.join("transcript.md");
+    std::fs::write(&source, "transcript").expect("source");
+
+    let agent_workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+        .add_input_file(&source, "input/transcript/transcript_masked.md")
+        .expect("register source")
+        .build()
+        .expect("materialize");
+    std::fs::write(
+        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        "tampered",
+    )
+    .expect("overwrite cleanup marker");
+    std::fs::remove_dir_all(agent_root.join(AGENT_INPUT_DIR)).expect("remove input dir");
+    std::fs::remove_dir_all(agent_root.join(AGENT_OUTPUT_DIR)).expect("remove output dir");
+
+    // Even with the whole subdirectory tree removed, the root is still the
+    // materialized directory object, so cleanup must still delete it.
+    agent_workspace
+        .cleanup()
+        .expect("cleanup should remove workspace stripped of its subdirectory tree");
+
+    assert!(!agent_root.exists());
+    assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
 }
 

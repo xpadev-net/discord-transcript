@@ -7,6 +7,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use tracing::warn;
 
 pub const WORKSPACES_ROOT_DIR: &str = "workspaces";
 pub const DEBUG_ARTIFACTS_ROOT_DIR: &str = "debug-artifacts";
@@ -36,8 +38,12 @@ pub const CONTEXT_LEAK_CHECK_BODIES_FILENAME: &str = "leak_check_bodies.json";
 pub const AGENT_INPUT_DIR: &str = "input";
 pub const AGENT_OUTPUT_DIR: &str = "output";
 pub const AGENT_CURSOR_DIR: &str = ".cursor";
+pub const AGENT_CLAUDE_DIR: &str = ".claude";
 pub const AGENT_WORKSPACE_PARENT_DIR: &str = "agent";
 pub const AGENT_CURSOR_CONFIG_FILENAME: &str = "cli.json";
+pub const AGENT_CLAUDE_SETTINGS_FILENAME: &str = "settings.json";
+pub const AGENT_CLAUDE_MCP_CONFIG_FILENAME: &str = "mcp_servers.json";
+pub const AGENT_OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
 pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
 
 #[cfg(unix)]
@@ -56,12 +62,16 @@ pub struct MeetingWorkspacePaths {
     debug_root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct AgentWorkspace {
     root: PathBuf,
     expected_output_path: PathBuf,
     cursor_config_path: PathBuf,
     root_identity: AgentWorkspaceRootIdentity,
+    // Held open for the workspace's lifetime: an open directory fd pins the
+    // root inode so the filesystem cannot recycle it to a different directory
+    // object before cleanup, keeping the dev/ino identity check airtight.
+    root_handle: AgentWorkspaceRootHandle,
     cleanup_on_drop: bool,
 }
 
@@ -86,6 +96,14 @@ struct AgentWorkspaceRootIdentity {
     ino: u64,
     cleanup_marker: String,
 }
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct AgentWorkspaceRootHandle(fs::File);
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct AgentWorkspaceRootHandle;
 
 #[cfg(not(unix))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +179,23 @@ struct CursorCliConfig {
 #[derive(Debug, Serialize)]
 struct CursorPermissions {
     allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeSettingsConfig {
+    permissions: ClaudePermissions,
+    #[serde(rename = "disableAllHooks")]
+    disable_all_hooks: bool,
+    #[serde(rename = "enableAllProjectMcpServers")]
+    enable_all_project_mcp_servers: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudePermissions {
+    allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ask: Vec<String>,
     deny: Vec<String>,
 }
 
@@ -388,12 +423,12 @@ impl AgentWorkspace {
     }
 
     pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
-        cleanup_agent_workspace_root(&self.root, &self.root_identity)
+        cleanup_agent_workspace_root(&self.root, &self.root_identity, Some(&self.root_handle))
     }
 
     pub fn cleanup_once(mut self) -> Result<(), AgentWorkspaceError> {
         self.cleanup_on_drop = false;
-        cleanup_agent_workspace_root(&self.root, &self.root_identity)
+        cleanup_agent_workspace_root(&self.root, &self.root_identity, Some(&self.root_handle))
     }
 }
 
@@ -464,12 +499,30 @@ impl AgentWorkspaceBuilder {
             canonicalize_agent_root(&self.agent_root, &meeting_root, &expected_agent_parent)?;
         initialize_cleanup_marker(&self.agent_root)?;
         let root_identity = root_identity(&self.agent_root)?;
+        // Pin the root inode for the workspace's lifetime: while this fd is
+        // open, a deleted-and-recreated directory cannot reuse the recorded
+        // dev/ino pair, so the cleanup identity check cannot be spoofed by
+        // inode recycling.
+        let root_handle = match open_agent_root_handle(&self.agent_root) {
+            Ok(root_handle) => root_handle,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&self.agent_root);
+                return Err(err);
+            }
+        };
 
         let cleanup_root = self.agent_root.clone();
         let cleanup_identity = root_identity.clone();
-        let build_result = self.populate(meeting_root, agent_root, root_identity);
+        let build_result = self.populate(meeting_root, agent_root, root_identity, root_handle);
         if build_result.is_err() {
-            let _ = cleanup_agent_workspace_root(&cleanup_root, &cleanup_identity);
+            // The materialize-time fd moved into the workspace on success;
+            // on failure open a fresh pin so the identity check still runs.
+            let cleanup_handle = open_agent_root_handle(&cleanup_root).ok();
+            let _ = cleanup_agent_workspace_root(
+                &cleanup_root,
+                &cleanup_identity,
+                cleanup_handle.as_ref(),
+            );
         }
         build_result
     }
@@ -479,6 +532,7 @@ impl AgentWorkspaceBuilder {
         meeting_root: PathBuf,
         agent_root: PathBuf,
         root_identity: AgentWorkspaceRootIdentity,
+        root_handle: AgentWorkspaceRootHandle,
     ) -> Result<AgentWorkspace, AgentWorkspaceError> {
         let input_dir = self.agent_root.join(AGENT_INPUT_DIR);
         let output_dir = self.agent_root.join(AGENT_OUTPUT_DIR);
@@ -525,12 +579,22 @@ impl AgentWorkspaceBuilder {
             allowed_reads,
             permission_path(expected_output_relative),
         )?;
+        write_claude_settings_config(
+            &self.agent_root,
+            Path::new(AGENT_CLAUDE_DIR).join(AGENT_CLAUDE_SETTINGS_FILENAME),
+        )?;
+        write_claude_mcp_config(
+            &self.agent_root,
+            Path::new(AGENT_CLAUDE_DIR).join(AGENT_CLAUDE_MCP_CONFIG_FILENAME),
+        )?;
+        write_opencode_config(&self.agent_root, Path::new(AGENT_OPENCODE_CONFIG_FILENAME))?;
 
         Ok(AgentWorkspace {
             root: self.agent_root,
             expected_output_path: self.expected_output_path,
             cursor_config_path,
             root_identity,
+            root_handle,
             cleanup_on_drop: true,
         })
     }
@@ -652,6 +716,21 @@ fn validate_agent_dir(canonical_agent_root: &Path, path: &Path) -> Result<(), Ag
 }
 
 #[cfg(unix)]
+fn open_agent_root_handle(path: &Path) -> Result<AgentWorkspaceRootHandle, AgentWorkspaceError> {
+    fs::File::open(path)
+        .map(AgentWorkspaceRootHandle)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })
+}
+
+#[cfg(not(unix))]
+fn open_agent_root_handle(_path: &Path) -> Result<AgentWorkspaceRootHandle, AgentWorkspaceError> {
+    Ok(AgentWorkspaceRootHandle)
+}
+
+#[cfg(unix)]
 fn root_identity(path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorkspaceError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -681,22 +760,63 @@ fn root_identity(_path: &Path) -> Result<AgentWorkspaceRootIdentity, AgentWorksp
 fn validate_root_identity(
     path: &Path,
     expected: &AgentWorkspaceRootIdentity,
+    root_handle: Option<&AgentWorkspaceRootHandle>,
 ) -> Result<(), AgentWorkspaceError> {
-    match root_identity(path) {
-        Ok(actual) if &actual == expected => Ok(()),
-        Ok(_) | Err(AgentWorkspaceError::InvalidPath { .. }) => {
-            Err(AgentWorkspaceError::InvalidPath {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root identity changed before cleanup",
+        },
+        _ => AgentWorkspaceError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        },
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root must be a real directory",
+        });
+    }
+    if metadata.dev() != expected.dev || metadata.ino() != expected.ino {
+        return Err(AgentWorkspaceError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "agent workspace root identity changed before cleanup",
+        });
+    }
+    // The held-open fd must pin the recorded inode; together they prove the
+    // path resolves to the directory object that was materialized, since a
+    // pinned inode cannot be recycled to a replacement directory.
+    if let Some(root_handle) = root_handle {
+        let handle_metadata = root_handle
+            .0
+            .metadata()
+            .map_err(|err| AgentWorkspaceError::Io {
+                path: path.to_path_buf(),
+                source: err,
+            })?;
+        if handle_metadata.dev() != expected.dev || handle_metadata.ino() != expected.ino {
+            return Err(AgentWorkspaceError::InvalidPath {
                 path: path.to_path_buf(),
                 reason: "agent workspace root identity changed before cleanup",
-            })
+            });
         }
-        Err(AgentWorkspaceError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            Err(AgentWorkspaceError::InvalidPath {
-                path: path.to_path_buf(),
-                reason: "agent workspace root identity changed before cleanup",
-            })
+    }
+    match read_cleanup_marker(path) {
+        Ok(marker) if marker == expected.cleanup_marker => Ok(()),
+        // The root is still the exact directory object that was materialized,
+        // so a marker that fails validation only proves the agent tampered
+        // with it in place; subdirectory state is irrelevant and refusing to
+        // delete would let the agent strand transcript copies on disk.
+        _ => {
+            warn!(
+                path = %path.display(),
+                "agent workspace cleanup marker validation failed on unchanged root; removing workspace anyway"
+            );
+            Ok(())
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -704,6 +824,7 @@ fn validate_root_identity(
 fn validate_root_identity(
     _path: &Path,
     _expected: &AgentWorkspaceRootIdentity,
+    _root_handle: Option<&AgentWorkspaceRootHandle>,
 ) -> Result<(), AgentWorkspaceError> {
     Ok(())
 }
@@ -711,6 +832,7 @@ fn validate_root_identity(
 fn cleanup_agent_workspace_root(
     root: &Path,
     expected: &AgentWorkspaceRootIdentity,
+    root_handle: Option<&AgentWorkspaceRootHandle>,
 ) -> Result<(), AgentWorkspaceError> {
     match fs::symlink_metadata(root) {
         Ok(_) => {}
@@ -723,7 +845,7 @@ fn cleanup_agent_workspace_root(
         }
     }
 
-    validate_root_identity(root, expected)?;
+    validate_root_identity(root, expected, root_handle)?;
     match fs::remove_dir_all(root) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1075,9 +1197,7 @@ fn create_new_file_under_agent_root(
         Ok(unsafe { fs::File::from_raw_fd(fd) })
     }
 
-    let relative_path = validate_agent_relative_path(relative_path, AGENT_INPUT_DIR)
-        .or_else(|_| validate_agent_relative_path(relative_path, AGENT_OUTPUT_DIR))
-        .or_else(|_| validate_agent_relative_path(relative_path, AGENT_CURSOR_DIR))?;
+    let relative_path = validate_agent_writable_path(relative_path)?;
     let full_path = agent_root.join(&relative_path);
     let components = relative_path.components().collect::<Vec<_>>();
     let (file_component, parent_components) =
@@ -1160,6 +1280,16 @@ fn validate_agent_relative_path(
     Ok(path.to_path_buf())
 }
 
+fn validate_agent_writable_path(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
+    if path == Path::new(AGENT_OPENCODE_CONFIG_FILENAME) {
+        return Ok(path.to_path_buf());
+    }
+    validate_agent_relative_path(path, AGENT_INPUT_DIR)
+        .or_else(|_| validate_agent_relative_path(path, AGENT_OUTPUT_DIR))
+        .or_else(|_| validate_agent_relative_path(path, AGENT_CURSOR_DIR))
+        .or_else(|_| validate_agent_relative_path(path, AGENT_CLAUDE_DIR))
+}
+
 fn permission_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -1187,11 +1317,104 @@ fn write_cursor_config(
                 cleanup_marker_deny_rule(),
                 "Read(debug/**)".to_owned(),
                 "Read(../**)".to_owned(),
+                "Read(.claude/**)".to_owned(),
+                "Read(opencode.json)".to_owned(),
                 "Write(input/**)".to_owned(),
+                "Write(.cursor/**)".to_owned(),
+                "Write(.claude/**)".to_owned(),
+                "Write(opencode.json)".to_owned(),
                 "Shell(*)".to_owned(),
             ],
         },
     };
+    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+/// Write Claude Code project settings that keep the harness to a minimal,
+/// file-only toolset. Deny rules cannot be overridden by user-level allow
+/// rules, so dangerous tools stay blocked even when the operator's global
+/// Claude settings would otherwise permit them.
+fn write_claude_settings_config(
+    agent_root: &Path,
+    relative_path: impl AsRef<Path>,
+) -> Result<(), AgentWorkspaceError> {
+    let config = ClaudeSettingsConfig {
+        permissions: ClaudePermissions {
+            allow: vec![
+                format!("Read(./{AGENT_INPUT_DIR}/**)"),
+                format!("Write(./{AGENT_OUTPUT_DIR}/**)"),
+            ],
+            ask: vec!["Glob".to_owned(), "Grep".to_owned()],
+            deny: vec![
+                "Read(../**)".to_owned(),
+                "Read(.env*)".to_owned(),
+                "Read(**/.env*)".to_owned(),
+                format!("Read(./{AGENT_CURSOR_DIR}/**)"),
+                format!("Read(./{AGENT_CLAUDE_DIR}/**)"),
+                format!("Read(./{AGENT_OPENCODE_CONFIG_FILENAME})"),
+                "Write(../**)".to_owned(),
+                format!("Write(./{AGENT_INPUT_DIR}/**)"),
+                format!("Write(./{AGENT_CURSOR_DIR}/**)"),
+                format!("Write(./{AGENT_CLAUDE_DIR}/**)"),
+                format!("Write(./{AGENT_OPENCODE_CONFIG_FILENAME})"),
+                "Edit".to_owned(),
+                "MultiEdit".to_owned(),
+                "NotebookEdit".to_owned(),
+                "Bash".to_owned(),
+                "WebFetch".to_owned(),
+                "WebSearch".to_owned(),
+                "Task".to_owned(),
+            ],
+        },
+        disable_all_hooks: true,
+        enable_all_project_mcp_servers: false,
+    };
+    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+/// Write an empty Claude MCP config referenced by `--mcp-config` +
+/// `--strict-mcp-config` so no MCP servers from any other scope can load.
+fn write_claude_mcp_config(
+    agent_root: &Path,
+    relative_path: impl AsRef<Path>,
+) -> Result<(), AgentWorkspaceError> {
+    let json = serde_json::to_vec_pretty(&serde_json::json!({ "mcpServers": {} }))
+        .map_err(AgentWorkspaceError::Serialize)?;
+    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
+}
+
+/// Write an OpenCode project config that denies every tool/action by default
+/// and re-allows only the file operations the summarization contract needs
+/// inside the generated workspace. `opencode run` is non-interactive, so
+/// anything not explicitly allowed cannot be approved at runtime.
+fn write_opencode_config(
+    agent_root: &Path,
+    relative_path: impl AsRef<Path>,
+) -> Result<(), AgentWorkspaceError> {
+    let config = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "permission": {
+            "*": "deny",
+            "read": {
+                "*": "deny",
+                format!("{AGENT_INPUT_DIR}/**"): "allow",
+                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
+            },
+            "glob": "allow",
+            "grep": "allow",
+            "edit": {
+                "*": "deny",
+                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
+            },
+            "bash": "deny",
+            "webfetch": "deny",
+            "task": "deny",
+            "external_directory": "deny",
+            "doom_loop": "deny",
+        },
+    });
     let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
     write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
 }
