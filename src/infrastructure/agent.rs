@@ -12,7 +12,7 @@
 //! the loop lands in a follow-up.
 
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -163,22 +163,44 @@ impl AgentToolFs {
                 "input path escapes the agent workspace",
             ));
         }
-        let bytes = fs::read(&canonical).map_err(|err| {
+        // Bounded read: only the requested window (plus a few bytes of
+        // char-boundary padding on each side) is loaded, so paging a huge
+        // transcript never materializes the whole file. `win_start` backs
+        // `offset` up by up to a full codepoint, and the buffer extends
+        // `limit` bytes past `end` so mid-codepoint cuts can be snapped
+        // forward instead of returning an empty page before EOF.
+        let file_len = metadata.len();
+        let mut file = fs::File::open(&canonical).map_err(|err| {
+            ToolExecutionError::other(format!("failed to open {relative}: {err}"))
+        })?;
+        let win_start = offset.saturating_sub(3).min(file_len);
+        let win_end = offset
+            .saturating_add(limit.min(self.max_read_bytes))
+            .saturating_add(4)
+            .min(file_len);
+        let mut buf = vec![0u8; (win_end - win_start) as usize];
+        file.seek(SeekFrom::Start(win_start)).map_err(|err| {
+            ToolExecutionError::other(format!("failed to seek {relative}: {err}"))
+        })?;
+        file.read_exact(&mut buf).map_err(|err| {
             ToolExecutionError::other(format!("failed to read {relative}: {err}"))
         })?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            ToolExecutionError::invalid_args(format!("input file is not valid UTF-8: {relative}"))
-        })?;
-        let limit = limit.min(self.max_read_bytes) as usize;
-        let mut start = offset.min(text.len() as u64) as usize;
-        while start > 0 && !text.is_char_boundary(start) {
+        // A byte is a UTF-8 continuation iff its top bits are 10xxxxxx.
+        let mut start = (offset.min(file_len) - win_start) as usize;
+        while start > 0 && (buf[start] & 0xC0) == 0x80 {
             start -= 1;
         }
-        let mut end = (start + limit).min(text.len());
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
+        let snapped = win_start as usize + start;
+        let mut end = snapped
+            .saturating_add(limit.min(self.max_read_bytes) as usize)
+            .min(file_len as usize)
+            .saturating_sub(win_start as usize);
+        while end < buf.len() && (buf[end] & 0xC0) == 0x80 {
+            end += 1;
         }
-        Ok(text[start..end].to_owned())
+        String::from_utf8(buf[start..end].to_vec()).map_err(|_| {
+            ToolExecutionError::invalid_args(format!("input file is not valid UTF-8: {relative}"))
+        })
     }
 
     pub fn write_output(&self, relative: &str, contents: &str) -> Result<u64, ToolExecutionError> {
@@ -258,6 +280,18 @@ fn path_arg_schema(extra: serde_json::Map<String, Value>) -> Value {
     })
 }
 
+/// Run a synchronous tool body on the blocking pool so file IO does not
+/// stall the async worker driving the agent loop.
+async fn spawn_tool<F, T>(body: F) -> Result<T, ToolExecutionError>
+where
+    F: FnOnce() -> Result<T, ToolExecutionError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(body)
+        .await
+        .map_err(|err| ToolExecutionError::other(format!("workspace tool task failed: {err}")))?
+}
+
 /// The three tools the model can call during a summary run. Everything the
 /// agent is allowed to touch is expressed here — there is no shell, no
 /// network tool, no arbitrary fs access.
@@ -273,7 +307,12 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
             move |args: Value| {
                 let _ = args;
                 let fs = Arc::clone(&list_fs);
-                Box::pin(async move { fs.list_inputs().map(ToolOutput::json) })
+                Box::pin(async move {
+                    // File IO is synchronous; keep it off the async worker.
+                    spawn_tool(move || fs.list_inputs())
+                        .await
+                        .map(ToolOutput::json)
+                })
             },
         ),
         DynamicTool::new(
@@ -295,11 +334,14 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&read_fs);
                 Box::pin(async move {
                     let args: ReadInputArgs = parse_args(args)?;
-                    fs.read_input(
-                        &args.path,
-                        args.offset.unwrap_or(0),
-                        args.limit.unwrap_or(u64::MAX),
-                    )
+                    spawn_tool(move || {
+                        fs.read_input(
+                            &args.path,
+                            args.offset.unwrap_or(0),
+                            args.limit.unwrap_or(u64::MAX),
+                        )
+                    })
+                    .await
                     .map(ToolOutput::text)
                 })
             },
@@ -323,7 +365,8 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
                 let fs = Arc::clone(&write_fs);
                 Box::pin(async move {
                     let args: WriteOutputArgs = parse_args(args)?;
-                    fs.write_output(&args.path, &args.contents)
+                    spawn_tool(move || fs.write_output(&args.path, &args.contents))
+                        .await
                         .map(|written| ToolOutput::text(format!("wrote {written} bytes")))
                 })
             },
@@ -391,6 +434,24 @@ mod tests {
         // "あ" is 3 bytes; offset 1 snaps back to 0.
         let page = fs.read_input("input/t.md", 1, 3).unwrap();
         assert_eq!(page, "あ");
+    }
+
+    #[test]
+    fn tool_fs_read_snaps_limit_forward_to_char_boundary() {
+        let root = fresh_workdir();
+        fs::write(root.join("input/t.md"), "あいうえお").unwrap();
+        let fs = AgentToolFs::new(&root).unwrap();
+        // limit=1 cuts inside "あ"; the page extends to the char boundary
+        // instead of returning an empty page before EOF.
+        assert_eq!(fs.read_input("input/t.md", 0, 1).unwrap(), "あ");
+    }
+
+    #[test]
+    fn tool_fs_read_rejects_non_utf8_input() {
+        let root = fresh_workdir();
+        fs::write(root.join("input/b.bin"), [0xff, 0xfe, 0xfd]).unwrap();
+        let fs = AgentToolFs::new(&root).unwrap();
+        assert!(fs.read_input("input/b.bin", 0, u64::MAX).is_err());
     }
 
     #[test]
