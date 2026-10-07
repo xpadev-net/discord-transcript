@@ -758,12 +758,14 @@ fn api_sql_mutations_scope_by_tenant_and_guild_and_preserve_review_state_machine
 
 #[test]
 fn list_transcript_feedback_sql_is_bounded() {
-    // The admin review queue drains oldest-first: an unbounded scan over
-    // accumulated feedback rows is a retrieval-cost DoS lever, and a
+    // The admin review queue drains open items oldest-first: an unbounded
+    // scan over accumulated feedback rows is a retrieval-cost DoS lever, a
     // newest-first cap would let a flood of new submissions hide older
-    // unreviewed items with no way to reach them. Keep a deterministic FIFO
-    // bound so the cap can only defer newer items until the queue drains.
-    assert!(LIST_TRANSCRIPT_FEEDBACK_SQL.contains("ORDER BY created_at ASC, id ASC"));
+    // unreviewed items, and a plain oldest-first cap would let reviewed
+    // history hide newer open items from unfiltered requests. Open items
+    // therefore sort ahead of the cap, FIFO within each status class.
+    assert!(LIST_TRANSCRIPT_FEEDBACK_SQL
+        .contains("ORDER BY (status = 'open') DESC, created_at ASC, id ASC"));
     assert!(LIST_TRANSCRIPT_FEEDBACK_SQL.contains("LIMIT 1000"));
 }
 

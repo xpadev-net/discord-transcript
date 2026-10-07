@@ -2602,7 +2602,7 @@ WHERE tenant_id = $1
   AND guild_id = $2
   AND (NULLIF($3, '') IS NULL OR status = $3)
   AND (NULLIF($4, '') IS NULL OR feedback_type = $4)
-ORDER BY created_at ASC, id ASC
+ORDER BY (status = 'open') DESC, created_at ASC, id ASC
 LIMIT 1000
 "#;
 
