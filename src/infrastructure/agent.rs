@@ -8,18 +8,37 @@
 //! write-only), which keeps the deny-by-default posture of the CLI
 //! harnesses without depending on their binaries or config files.
 //!
-//! This module carries only the tool surface; the rig client that drives
-//! the loop lands in a follow-up.
+//! Providers are OpenAI-compatible endpoints reachable by API key today:
+//! `opencode_go` (OpenCode Go subscription quota). ChatGPT subscription auth
+//! (`chatgpt`) lands separately.
 
+use std::fmt::Debug;
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use rig_agent::{Agent, AgentBuilder};
+use rig_core::DynModel;
+use rig_core::operation::Completion;
+use rig_core::providers::openai::{self, OpenAIConfig};
 use rig_core::tool::{DynamicTool, ToolExecutionError, ToolOutput};
+use rig_core::wire::Secret;
 use serde_json::{Value, json};
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
+use tokio::time::timeout;
+use tracing::debug;
 
-use crate::application::summary::SummaryError;
+use crate::application::summary::{
+    AgentOutputContract, ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT, SummaryError,
+};
+use crate::bootstrap::config::{SummaryHarness, SummaryProvider};
+use crate::infrastructure::integrations::{
+    HarnessCliSummaryClient, read_validated_agent_output, remove_stale_agent_output,
+};
+use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff};
 use crate::infrastructure::workspace::{
     AGENT_INPUT_DIR, AGENT_OUTPUT_DIR, validate_agent_relative_path,
 };
@@ -359,6 +378,27 @@ fn path_arg_schema(extra: serde_json::Map<String, Value>) -> Value {
     })
 }
 
+/// OpenCode Go's OpenAI-compatible endpoint (Grok/GPT ids on `/responses`,
+/// the open-model ids on `/chat/completions`).
+const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+
+/// Dialect descriptor for OpenCode Go; the registry name only affects error
+/// and telemetry strings. `api_key_env` is unused because the key is passed
+/// explicitly from config.
+static OPENCODE_GO_DIALECT: openai::wire::Dialect =
+    openai::wire::Dialect::gateway("opencode-go", OPENCODE_GO_BASE_URL, "OPENCODE_API_KEY");
+
+/// Hard cap on the tool-call loop so a confused model cannot spin forever.
+const DEFAULT_MAX_AGENT_TURNS: usize = 32;
+
+/// System prompt for every native summary-agent run. The per-task prompt
+/// (carrying the transcript/context) arrives as the user message.
+const AGENT_PREAMBLE: &str = "You are a document-processing agent inside a sandboxed workspace.\n\
+Use `list_input_files` to enumerate the files provided under `input/` and `read_input_file` to read them.\n\
+Write with `write_output_file`, under `output/`, exactly the path the prompt requires. \
+Your chat reply is discarded; the only artifact that matters is the file you write.\n\
+Never fabricate file contents you have not read.";
+
 /// The three tools the model can call during a summary run. Everything the
 /// agent is allowed to touch is expressed here — there is no shell, no
 /// network tool, no arbitrary fs access.
@@ -444,9 +484,334 @@ pub fn workspace_tools(fs: Arc<AgentToolFs>) -> Vec<DynamicTool> {
     ]
 }
 
+/// Which wire protocol a model id uses on a provider's endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionRoute {
+    /// `POST /responses` (OpenAI Responses API dialect).
+    Responses,
+    /// `POST /chat/completions`.
+    ChatCompletions,
+}
+
+/// OpenCode Go serves Grok/GPT ids on `/responses` and the open models
+/// (GLM, Kimi, DeepSeek, LongCat, …) on `/chat/completions`.
+fn opencode_go_route(model: &str) -> CompletionRoute {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.starts_with("grok") || normalized.starts_with("gpt") {
+        CompletionRoute::Responses
+    } else {
+        CompletionRoute::ChatCompletions
+    }
+}
+
+/// In-process agent client for `SUMMARY_HARNESS=native`.
+#[derive(Debug)]
+pub struct NativeAgentSummaryClient {
+    pub provider: SummaryProvider,
+    pub model: String,
+    /// Provider credential. `Secret` redacts itself in Debug output.
+    pub api_key: Secret,
+    pub allow_unsafe_agent_harness: bool,
+    pub retry_policy: RetryPolicy,
+    pub command_timeout: Duration,
+    /// Max model turns per attempt; defaults to `DEFAULT_MAX_AGENT_TURNS`.
+    pub max_agent_turns: usize,
+}
+
+impl NativeAgentSummaryClient {
+    fn completion_model(&self) -> Result<DynModel<Completion>, SummaryError> {
+        if self.api_key.is_empty() {
+            return Err(summary_engine_error(format!(
+                "summary harness `native` provider `{}` requires an API key",
+                self.provider
+            )));
+        }
+        match self.provider {
+            SummaryProvider::OpenCodeGo => {
+                let config = OpenAIConfig::with_key(&OPENCODE_GO_DIALECT, self.api_key.expose());
+                let client = config.client();
+                match opencode_go_route(&self.model) {
+                    CompletionRoute::Responses => Ok(client.responses(self.model.clone()).erase()),
+                    CompletionRoute::ChatCompletions => Ok(client.chat(self.model.clone()).erase()),
+                }
+            }
+        }
+    }
+
+    /// One full agent run over the workspace: builds the rig agent, runs the
+    /// tool-call loop to completion (or turn/timeout limit), then validates
+    /// the produced output file against `contract`.
+    fn run_agent_attempt(
+        &self,
+        model: DynModel<Completion>,
+        prompt: &str,
+        workdir: &Path,
+        output: AgentOutputContract,
+    ) -> Result<String, SummaryError> {
+        let fs = Arc::new(AgentToolFs::new(workdir)?);
+        let agent = AgentBuilder::new(model)
+            .preamble(AGENT_PREAMBLE)
+            .default_max_turns(self.max_agent_turns)
+            .dynamic_tools(workspace_tools(Arc::clone(&fs)))
+            .build();
+        let outcome = self.drive_agent(agent, prompt);
+        // A dropped tool future (timeout, cancelled run) does not stop its
+        // blocking file task — wait for every started task before touching
+        // output/, so a lingering write cannot race validation or the next
+        // attempt's cleanup.
+        run_future_blocking(fs.settle())?;
+        outcome?;
+        read_validated_agent_output(SummaryHarness::Native, workdir, output, b"", b"")
+    }
+
+    fn drive_agent(&self, agent: Agent, prompt: &str) -> Result<(), SummaryError> {
+        let run_timeout = self.command_timeout;
+        let prompt = prompt.to_owned();
+        let future = async move { agent.prompt(prompt).await };
+        let outcome = run_future_blocking(async { timeout(run_timeout, future).await })?;
+        match outcome {
+            Ok(Ok(response)) => {
+                debug!(
+                    output_len = response.output.len(),
+                    usage = ?response.usage,
+                    "native summary agent completed"
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => Err(summary_engine_error(format!(
+                "native summary agent failed: {err}"
+            ))),
+            Err(_) => Err(summary_engine_error(format!(
+                "native summary agent timed out after {}s",
+                run_timeout.as_secs()
+            ))),
+        }
+    }
+}
+
+/// Run `future` on the ambient tokio runtime from a sync context, or on a
+/// throwaway current-thread runtime when there is none (unit tests).
+fn run_future_blocking<F, T>(future: F) -> Result<T, SummaryError>
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    match Handle::try_current() {
+        Ok(handle) => Ok(block_in_place(|| handle.block_on(future))),
+        Err(_) => Ok(tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| summary_engine_error(format!("failed to start agent runtime: {err}")))?
+            .block_on(future)),
+    }
+}
+
+/// Only workspaces materialized by `AgentWorkspaceBuilder` may be handed to
+/// the agent: `input/` and `output/` must exist. (CLI-harness config markers
+/// are irrelevant here — the tool surface is compiled in.)
+fn require_native_agent_workdir(workdir: Option<&Path>) -> Result<&Path, SummaryError> {
+    let workdir = workdir
+        .ok_or_else(|| summary_engine_error("summary harness native: workdir not provided"))?;
+    if !workdir.join(AGENT_INPUT_DIR).is_dir() || !workdir.join(AGENT_OUTPUT_DIR).is_dir() {
+        return Err(summary_engine_error(
+            "summary harness native: workdir missing expected agent workspace directories (input/, output/)",
+        ));
+    }
+    Ok(workdir)
+}
+
+impl ClaudeSummaryClient for NativeAgentSummaryClient {
+    fn supports_transcript_correction(&self) -> bool {
+        // The GEC correction prompt does not instruct the agent to write
+        // `output/` (it predates the file contract), so native correction is
+        // disabled alongside the CLI harnesses for now.
+        false
+    }
+
+    fn supports_untrusted_agent_workspace(&self) -> bool {
+        self.allow_unsafe_agent_harness
+    }
+
+    fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
+        self.summarize_with_output_contract(prompt, workdir, SUMMARY_OUTPUT_CONTRACT)
+    }
+
+    fn summarize_with_output_contract(
+        &self,
+        prompt: &str,
+        workdir: Option<&Path>,
+        output: AgentOutputContract,
+    ) -> Result<String, SummaryError> {
+        if !self.supports_untrusted_agent_workspace() {
+            return Err(summary_engine_error(
+                "refusing to run native summary agent over untrusted transcript/context data without SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true",
+            ));
+        }
+        let workdir = require_native_agent_workdir(workdir)?;
+        let model = self.completion_model()?;
+        self.summarize_with_model(&model, prompt, workdir, output)
+    }
+}
+
+impl NativeAgentSummaryClient {
+    /// `summarize` with the completion model supplied — tests inject a
+    /// scripted mock instead of a live provider.
+    fn summarize_with_model(
+        &self,
+        model: &DynModel<Completion>,
+        prompt: &str,
+        workdir: &Path,
+        output: AgentOutputContract,
+    ) -> Result<String, SummaryError> {
+        // Retried attempts start from a clean conversation rather than
+        // compounding a broken transcript, and each attempt must produce
+        // its own output file — a leftover from a failed attempt is deleted
+        // before the next run so it cannot be mistaken for fresh output.
+        retry_with_backoff(self.retry_policy, |_| {
+            remove_stale_agent_output(workdir, output)?;
+            self.run_agent_attempt(model.clone(), prompt, workdir, output)
+        })
+    }
+}
+
+/// Runtime-selected summary client: the CLI harnesses, the native agent, or
+/// a placeholder for a native harness selected while summaries are disabled
+/// (provider credentials are not collected in that state).
+#[derive(Debug)]
+pub enum SummaryClient {
+    Cli(HarnessCliSummaryClient),
+    Native(NativeAgentSummaryClient),
+    /// Configured `SUMMARY_HARNESS=native` without provider credentials —
+    /// only possible when the summary runtime is disabled, so every summary
+    /// method reports a configuration error rather than running.
+    Disabled,
+}
+
+const DISABLED_SUMMARY_ERROR: &str = "summary harness `native` is selected but provider credentials are missing (expected only when summaries are disabled)";
+
+impl SummaryClient {
+    /// Full-transcript LLM correction needs a boundary other than argv; the
+    /// CLI harnesses are argv-limited. The native agent could lift that,
+    /// but the correction prompt still says "output only the transcript"
+    /// rather than naming the output file — keep it disabled until the
+    /// prompt is rewritten for the file contract.
+    pub fn can_run_llm_transcript_correction(&self) -> bool {
+        match self {
+            Self::Cli(client) => client.can_run_llm_transcript_correction(),
+            Self::Native(_) | Self::Disabled => false,
+        }
+    }
+}
+
+impl ClaudeSummaryClient for SummaryClient {
+    fn supports_transcript_correction(&self) -> bool {
+        match self {
+            Self::Cli(client) => client.supports_transcript_correction(),
+            Self::Native(client) => client.supports_transcript_correction(),
+            Self::Disabled => false,
+        }
+    }
+
+    fn supports_untrusted_agent_workspace(&self) -> bool {
+        match self {
+            Self::Cli(client) => client.supports_untrusted_agent_workspace(),
+            Self::Native(client) => client.supports_untrusted_agent_workspace(),
+            Self::Disabled => false,
+        }
+    }
+
+    fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
+        match self {
+            Self::Cli(client) => client.summarize(prompt, workdir),
+            Self::Native(client) => client.summarize(prompt, workdir),
+            Self::Disabled => Err(summary_engine_error(DISABLED_SUMMARY_ERROR)),
+        }
+    }
+
+    fn summarize_with_output_contract(
+        &self,
+        prompt: &str,
+        workdir: Option<&Path>,
+        output: AgentOutputContract,
+    ) -> Result<String, SummaryError> {
+        match self {
+            Self::Cli(client) => client.summarize_with_output_contract(prompt, workdir, output),
+            Self::Native(client) => client.summarize_with_output_contract(prompt, workdir, output),
+            Self::Disabled => Err(summary_engine_error(DISABLED_SUMMARY_ERROR)),
+        }
+    }
+}
+
+/// Everything `build_summary_client` needs, lifted out of the argument
+/// list: the harness picks which variant is constructed; `provider` and
+/// `api_key` are required for `SummaryHarness::Native` when summaries run
+/// (the config layer enforces that — a missing pair here means summaries
+/// are disabled).
+pub struct SummaryClientConfig {
+    pub harness: SummaryHarness,
+    pub command_path: String,
+    pub model: String,
+    pub provider: Option<SummaryProvider>,
+    /// Provider credential. Kept out of Debug output.
+    pub api_key: Option<String>,
+    pub allow_unsafe_agent_harness: bool,
+    pub retry_policy: RetryPolicy,
+    pub command_timeout: Duration,
+}
+
+impl Debug for SummaryClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SummaryClientConfig")
+            .field("harness", &self.harness)
+            .field("command_path", &self.command_path)
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field(
+                "allow_unsafe_agent_harness",
+                &self.allow_unsafe_agent_harness,
+            )
+            .field("retry_policy", &self.retry_policy)
+            .field("command_timeout", &self.command_timeout)
+            .finish()
+    }
+}
+
+/// Build the summary client for the configured harness.
+pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient, SummaryError> {
+    match config.harness {
+        SummaryHarness::Native => match (config.provider, config.api_key) {
+            (Some(provider), Some(api_key)) if !api_key.trim().is_empty() => {
+                Ok(SummaryClient::Native(NativeAgentSummaryClient {
+                    provider,
+                    model: config.model,
+                    api_key: Secret::from(api_key),
+                    allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
+                    retry_policy: config.retry_policy,
+                    command_timeout: config.command_timeout,
+                    max_agent_turns: DEFAULT_MAX_AGENT_TURNS,
+                }))
+            }
+            // Config validation requires provider+key for native whenever a
+            // role runs summaries, so reaching here means the runtime is
+            // disabled — start cleanly and error only if a summary runs.
+            _ => Ok(SummaryClient::Disabled),
+        },
+        _ => Ok(SummaryClient::Cli(HarnessCliSummaryClient {
+            harness: config.harness,
+            command_path: config.command_path,
+            model: config.model,
+            allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
+            retry_policy: config.retry_policy,
+            command_timeout: config.command_timeout,
+        })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::test_utils::{MockCompletionModel, MockTurn};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
@@ -570,6 +935,245 @@ mod tests {
         let oversized = "x".repeat((MAX_TOOL_WRITE_BYTES + 1) as usize);
         assert!(fs.write_output("output/big.md", &oversized).is_err());
         assert!(fs.write_output("output/small.md", "ok").is_ok());
+    }
+
+    fn test_client() -> NativeAgentSummaryClient {
+        NativeAgentSummaryClient {
+            provider: SummaryProvider::OpenCodeGo,
+            model: "test-model".to_owned(),
+            api_key: Secret::from("test-key"),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                backoff_multiplier: 1,
+                max_delay: Duration::from_millis(1),
+            },
+            command_timeout: Duration::from_secs(60),
+            max_agent_turns: 8,
+        }
+    }
+
+    #[test]
+    fn agent_writes_contract_output_via_tools() {
+        let root = fresh_workdir();
+        fs::write(root.join("input/transcript.md"), "meeting transcript").unwrap();
+
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("c1", "list_input_files", json!({})),
+            MockTurn::tool_call(
+                "c2",
+                "read_input_file",
+                json!({ "path": "input/transcript.md" }),
+            ),
+            MockTurn::tool_call(
+                "c3",
+                "write_output_file",
+                json!({ "path": "output/summary.md", "contents": "# Summary\nhello" }),
+            ),
+            MockTurn::text("done"),
+        ])
+        .erase();
+
+        let client = test_client();
+        let out = client
+            .run_agent_attempt(
+                model,
+                "summarize the inputs",
+                &root,
+                SUMMARY_OUTPUT_CONTRACT,
+            )
+            .unwrap();
+        assert_eq!(out, "# Summary\nhello");
+        assert_eq!(
+            fs::read_to_string(root.join("output/summary.md")).unwrap(),
+            "# Summary\nhello"
+        );
+    }
+
+    #[test]
+    fn agent_cannot_write_outside_output() {
+        let root = fresh_workdir();
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call(
+                "c1",
+                "write_output_file",
+                json!({ "path": "input/evil.md", "contents": "nope" }),
+            ),
+            MockTurn::tool_call(
+                "c2",
+                "write_output_file",
+                json!({ "path": "../escape.md", "contents": "nope" }),
+            ),
+            MockTurn::tool_call(
+                "c3",
+                "write_output_file",
+                json!({ "path": "output/summary.md", "contents": "ok" }),
+            ),
+            MockTurn::text("done"),
+        ])
+        .erase();
+
+        let client = test_client();
+        let out = client
+            .run_agent_attempt(model, "prompt", &root, SUMMARY_OUTPUT_CONTRACT)
+            .unwrap();
+        assert_eq!(out, "ok");
+        assert!(!root.join("input/evil.md").exists());
+        assert!(!root.parent().unwrap().join("escape.md").exists());
+    }
+
+    #[test]
+    fn summarize_requires_unsafe_opt_in() {
+        let root = fresh_workdir();
+        let mut client = test_client();
+        client.allow_unsafe_agent_harness = false;
+        let err = client
+            .summarize_with_output_contract("prompt", Some(&root), SUMMARY_OUTPUT_CONTRACT)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS")
+        );
+    }
+
+    #[test]
+    fn summarize_rejects_workdir_without_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "discord_transcript_agent_test_nodirs_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let client = test_client();
+        let err = client
+            .summarize_with_output_contract("prompt", Some(&dir), SUMMARY_OUTPUT_CONTRACT)
+            .unwrap_err();
+        assert!(err.to_string().contains("input/"));
+    }
+
+    #[test]
+    fn missing_contract_output_is_an_error() {
+        let root = fresh_workdir();
+        let model = MockCompletionModel::from_turns([MockTurn::text("no tools")]).erase();
+        let client = test_client();
+        let err = client
+            .run_agent_attempt(model, "prompt", &root, SUMMARY_OUTPUT_CONTRACT)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("summary.md") || err.to_string().contains("output"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_deletes_stale_output_between_attempts() {
+        let root = fresh_workdir();
+        // First attempt writes output then fails; second succeeds without
+        // writing — if the stale file survived, the result would wrongly
+        // come back Ok("stale").
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call(
+                "c1",
+                "write_output_file",
+                json!({ "path": "output/summary.md", "contents": "stale" }),
+            ),
+            MockTurn::error("attempt 1 boom"),
+            MockTurn::text("done without writing"),
+        ])
+        .erase();
+        let mut client = test_client();
+        client.retry_policy.max_attempts = 2;
+        let err = client
+            .summarize_with_model(&model, "prompt", &root, SUMMARY_OUTPUT_CONTRACT)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("summary.md") || err.to_string().contains("output"),
+            "unexpected error: {err}"
+        );
+        assert!(!root.join("output/summary.md").exists());
+    }
+
+    #[test]
+    fn opencode_go_route_selects_wire_by_model_id() {
+        assert_eq!(
+            opencode_go_route("grok-code-fast-1"),
+            CompletionRoute::Responses
+        );
+        assert_eq!(opencode_go_route("gpt-5-codex"), CompletionRoute::Responses);
+        assert_eq!(
+            opencode_go_route("GLM-4.6"),
+            CompletionRoute::ChatCompletions
+        );
+        assert_eq!(
+            opencode_go_route("kimi-k2"),
+            CompletionRoute::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn build_summary_client_dispatches_on_harness() {
+        let native = build_summary_client(SummaryClientConfig {
+            harness: SummaryHarness::Native,
+            command_path: String::new(),
+            model: "model".to_owned(),
+            provider: Some(SummaryProvider::OpenCodeGo),
+            api_key: Some("key".to_owned()),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(matches!(native, SummaryClient::Native(_)));
+
+        // Native without provider/key (summaries disabled) yields the
+        // disabled client instead of a startup failure.
+        let disabled = build_summary_client(SummaryClientConfig {
+            harness: SummaryHarness::Native,
+            command_path: String::new(),
+            model: "model".to_owned(),
+            provider: None,
+            api_key: Some("key".to_owned()),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(matches!(disabled, SummaryClient::Disabled));
+        assert!(disabled.summarize("prompt", None).is_err());
+
+        let cli = build_summary_client(SummaryClientConfig {
+            harness: SummaryHarness::Claude,
+            command_path: "/bin/claude".to_owned(),
+            model: "haiku".to_owned(),
+            provider: None,
+            api_key: None,
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(matches!(cli, SummaryClient::Cli(_)));
+    }
+
+    #[test]
+    fn summary_client_config_debug_redacts_api_key() {
+        let config = SummaryClientConfig {
+            harness: SummaryHarness::Native,
+            command_path: String::new(),
+            model: "model".to_owned(),
+            provider: Some(SummaryProvider::OpenCodeGo),
+            api_key: Some("super-secret-key".to_owned()),
+            allow_unsafe_agent_harness: true,
+            retry_policy: RetryPolicy::default(),
+            command_timeout: Duration::from_secs(1),
+        };
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("super-secret-key"));
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::audio::meeting_audio::{
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{FlushResult, PersistedChunk, RecordingSession};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
-use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness};
+use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness, SummaryProvider};
 use crate::domain::authz::{
     MemberRoleSource, RbacPermission, RbacSubject, UserRole, resolve_rbac_permission,
 };
@@ -44,10 +44,9 @@ use crate::domain::usage::{
     UsageSnapshot, recording_minutes_from_seconds,
 };
 use crate::domain::{JobType, MeetingStatus, StopReason};
+use crate::infrastructure::agent::{SummaryClientConfig, build_summary_client};
 use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
-use crate::infrastructure::integrations::{
-    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, HarnessCliSummaryClient,
-};
+use crate::infrastructure::integrations::{CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT};
 use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
@@ -3468,6 +3467,8 @@ pub async fn run_bot(
         summary_harness: config.summary_harness,
         summary_command: config.summary_command.clone(),
         summary_model: config.summary_model.clone(),
+        summary_provider: config.summary_provider,
+        summary_api_key: config.summary_api_key.clone(),
         summary_allow_unsafe_agent_harness: config.summary_allow_unsafe_agent_harness,
         whisper_language: config.whisper_language.clone(),
         whisper_beam_size: config.whisper_beam_size,
@@ -3742,6 +3743,8 @@ struct ScaffoldHandler {
     summary_harness: SummaryHarness,
     summary_command: String,
     summary_model: String,
+    summary_provider: Option<SummaryProvider>,
+    summary_api_key: Option<String>,
     summary_allow_unsafe_agent_harness: bool,
     whisper_language: Option<String>,
     whisper_beam_size: u32,
@@ -7741,14 +7744,17 @@ impl ScaffoldHandler {
             temperature: effective_settings.whisper_temperature,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
-        let summary_client = HarnessCliSummaryClient {
+        let summary_client = build_summary_client(SummaryClientConfig {
             harness: self.summary_harness,
             command_path: self.summary_command.clone(),
             model: self.summary_model.clone(),
+            provider: self.summary_provider,
+            api_key: self.summary_api_key.clone(),
             allow_unsafe_agent_harness: self.summary_allow_unsafe_agent_harness,
             retry_policy: self.integration_retry_policy,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
-        };
+        })
+        .map_err(|err| SummaryJobRunError::Terminal(err.to_string()))?;
         let job_id = format!("summary-{meeting_id}");
         let meeting = self.load_meeting(meeting_id).await?;
         let workspace = self.workspace_for_meeting(&meeting);
