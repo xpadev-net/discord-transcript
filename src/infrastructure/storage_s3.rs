@@ -535,6 +535,30 @@ impl RecordingObjectStore {
         Ok(deleted)
     }
 
+    /// Deletes only recording objects under a legacy flat meeting prefix:
+    /// top-level `*.wav` files and the `speakers/` subtree. Other objects
+    /// under the prefix (transcripts, context, ...) are left in place.
+    /// Pending and in-flight uploads under the prefix are cancelled first.
+    /// Returns how many keys were deleted.
+    pub fn delete_legacy_recording_prefix(&self, prefix: &str) -> Result<usize, S3Error> {
+        self.uploads.cancel_prefix(prefix);
+        let keys = self
+            .objects
+            .list_keys(prefix)?
+            .into_iter()
+            .filter_map(|key| {
+                let rel = key.strip_prefix(prefix)?;
+                ((rel.ends_with(".wav") && !rel.contains('/')) || rel.starts_with("speakers/"))
+                    .then_some(key)
+            })
+            .collect::<Vec<_>>();
+        let deleted = keys.len();
+        if !keys.is_empty() {
+            self.objects.delete_keys(&keys)?;
+        }
+        Ok(deleted)
+    }
+
     /// Presigned GET URL for `key` using the configured TTL.
     pub fn presigned_get(&self, key: &str) -> String {
         self.objects.presigned_get_url(

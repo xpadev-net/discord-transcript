@@ -70,17 +70,24 @@ impl ObjectStore for RemoteFakeObjectStore {
 
     fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
         self.lists.lock().unwrap().push(prefix.to_owned());
-        Ok(self.list_result.lock().unwrap().clone())
+        Ok(self
+            .list_result
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect())
     }
 
     fn delete_keys(&self, keys: &[String]) -> Result<(), S3Error> {
+        self.deletes.lock().unwrap().push(keys.to_vec());
         if *self.fail_deletes.lock().unwrap() {
             return Err(S3Error::Status {
                 status: 503,
                 detail: "injected delete failure".to_owned(),
             });
         }
-        self.deletes.lock().unwrap().push(keys.to_vec());
         Ok(())
     }
 
@@ -804,14 +811,76 @@ fn retention_cleanup_deletes_remote_objects_for_expired_raw_workspace() {
         vec!["m1".to_owned()]
     );
     let lists = fake.lists.lock().unwrap();
-    assert_eq!(lists.len(), 1);
+    assert_eq!(lists.len(), 2);
     assert!(lists[0].ends_with("g1/vc1/m1/audio/"));
+    assert_eq!(lists[1], "m1/");
+    drop(lists);
     assert_eq!(
         *fake.deletes.lock().unwrap(),
         vec![vec![
             "workspaces/g1/vc1/m1/audio/chunk.wav".to_owned(),
             "workspaces/g1/vc1/m1/audio/mixdown.wav".to_owned(),
         ]]
+    );
+}
+
+#[test]
+fn retention_cleanup_deletes_legacy_recording_objects() {
+    let (_guard, layout) = temp_layout("remote_legacy");
+    let workspace = layout.for_meeting("g1", "vc1", "m1");
+    workspace.ensure_base_dirs().expect("create workspace");
+    std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
+
+    let legacy_dir = layout.legacy_meeting_dir("m1");
+    std::fs::create_dir_all(legacy_dir.join("speakers")).expect("create legacy speakers");
+    std::fs::write(legacy_dir.join("chunk.wav"), b"legacy wav").expect("write legacy wav");
+    std::fs::write(legacy_dir.join("mixdown.wav"), b"legacy mixdown").expect("write mixdown");
+    std::fs::write(legacy_dir.join("speakers/u1.wav"), b"speaker").expect("write speaker");
+    std::fs::write(legacy_dir.join("transcript.md"), b"transcript").expect("write transcript");
+
+    let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec![
+        "workspaces/g1/vc1/m1/audio/chunk.wav".to_owned(),
+        "m1/chunk.wav".to_owned(),
+        "m1/mixdown.wav".to_owned(),
+        "m1/speakers/u1.wav".to_owned(),
+        "m1/transcript.md".to_owned(),
+    ];
+
+    let mut executor = FakeSqlExecutor::default();
+    executor.query_rows_result.insert(
+        query_key(RETENTION_EXPIRED_RAW_WORKSPACES_SQL, &["7"]),
+        vec![sql_row_from_strings(vec![
+            "m1".to_owned(),
+            "g1".to_owned(),
+            "vc1".to_owned(),
+        ])],
+    );
+
+    let report = enforce_retention_policy(
+        &mut executor,
+        &layout,
+        RetentionPolicy::default(),
+        Some(&objects),
+    )
+    .expect("cleanup should succeed");
+
+    assert_eq!(
+        report.remote_objects_deleted,
+        4,
+        "audio prefix keys plus legacy wav/speakers objects"
+    );
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![
+            vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()],
+            vec![
+                "m1/chunk.wav".to_owned(),
+                "m1/mixdown.wav".to_owned(),
+                "m1/speakers/u1.wav".to_owned(),
+            ],
+        ],
+        "legacy recording keys are deleted but m1/transcript.md is kept"
     );
 }
 
@@ -906,6 +975,7 @@ fn retention_cleanup_remote_delete_failure_blocks_clean_marker() {
     std::fs::write(workspace.audio_dir().join("chunk.wav"), b"wav").expect("write audio");
 
     let (fake, objects) = remote_object_store(&layout);
+    *fake.list_result.lock().unwrap() = vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()];
     *fake.fail_deletes.lock().unwrap() = true;
 
     let mut executor = FakeSqlExecutor::default();
@@ -928,6 +998,11 @@ fn retention_cleanup_remote_delete_failure_blocks_clean_marker() {
 
     assert!(err.message.contains("object store delete failed"));
     assert_eq!(err.report.remote_objects_deleted, 0);
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        vec![vec!["workspaces/g1/vc1/m1/audio/chunk.wav".to_owned()]],
+        "the injected failure exercised a delete of stored audio"
+    );
     assert!(
         err.report.raw_workspace_cleaned_meeting_ids.is_empty(),
         "a remote failure must not mark the meeting cleaned"

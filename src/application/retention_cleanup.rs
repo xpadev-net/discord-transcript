@@ -443,6 +443,14 @@ pub fn apply_retention_filesystem_cleanup(
                 delete_meeting_recording_objects(objects, &workspace),
                 |deleted| report.remote_objects_deleted += deleted,
             );
+            record_count_cleanup_result(
+                &mut errors,
+                delete_legacy_recording_objects(
+                    objects,
+                    &workspace_layout.legacy_meeting_dir(&meeting.meeting_id),
+                ),
+                |deleted| report.remote_objects_deleted += deleted,
+            );
         }
         record_cleanup_result(
             &mut errors,
@@ -631,6 +639,14 @@ pub fn apply_manual_meeting_filesystem_delete(
             record_count_cleanup_result(
                 &mut errors,
                 delete_meeting_recording_objects(objects, &workspace),
+                |deleted| report.remote_objects_deleted += deleted,
+            );
+            record_count_cleanup_result(
+                &mut errors,
+                delete_legacy_recording_objects(
+                    objects,
+                    &workspace_layout.legacy_meeting_dir(&meeting.meeting_id),
+                ),
                 |deleted| report.remote_objects_deleted += deleted,
             );
         }
@@ -862,6 +878,25 @@ fn delete_meeting_recording_objects(
         })?;
     objects
         .delete_prefix(&prefix)
+        .map_err(|err| format!("object store delete failed: {err}"))
+}
+
+/// Deletes the legacy flat-layout recording objects (`<meeting>/*.wav` and
+/// `<meeting>/speakers/**`) that playback-artifact uploads and pre-workspace
+/// recordings create, while leaving other objects under the meeting prefix
+/// (transcripts, context, ...) untouched.
+fn delete_legacy_recording_objects(
+    objects: &RecordingObjectStore,
+    legacy_dir: &Path,
+) -> Result<usize, String> {
+    let prefix = objects.object_prefix(legacy_dir).ok_or_else(|| {
+        format!(
+            "legacy dir {} is outside the object storage root",
+            legacy_dir.display()
+        )
+    })?;
+    objects
+        .delete_legacy_recording_prefix(&prefix)
         .map_err(|err| format!("object store delete failed: {err}"))
 }
 
