@@ -459,7 +459,7 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         provider: config.summary_provider,
         api_key: config.summary_api_key.clone(),
         auth_file: config.summary_auth_file.clone().map(PathBuf::from),
-        allow_unsafe_agent_harness: config.summary_allow_unsafe_agent_harness,
+        allow_unsafe_agent_harness: false,
         retry_policy,
         command_timeout: DEFAULT_COMMAND_TIMEOUT,
     })?;

@@ -96,10 +96,8 @@ impl Display for ChunkStorageBackend {
     }
 }
 
-/// Which harness drives meeting summary and transcript correction
-/// (`summarize` integration). `native` (the in-process rig agent) is the
-/// default; the CLI harnesses remain only as explicit opt-in and are due
-/// for removal once native proves out.
+/// Summary engine selected for app startup. The CLI variants are retained for
+/// the legacy infrastructure adapters, but configuration only accepts native.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryHarness {
     Claude,
@@ -113,10 +111,14 @@ impl SummaryHarness {
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
         let key = "SUMMARY_HARNESS";
         match raw.trim().to_ascii_lowercase().as_str() {
-            "claude" => Ok(Self::Claude),
-            "cursor_agent" => Ok(Self::CursorAgent),
-            "opencode" => Ok(Self::OpenCode),
             "native" => Ok(Self::Native),
+            "claude" | "cursor_agent" | "opencode" => Err(ConfigError::InvalidEnv {
+                key,
+                value: format!(
+                    "{} CLI summary harness is retired; unset SUMMARY_HARNESS or set SUMMARY_HARNESS=native and configure SUMMARY_PROVIDER",
+                    raw.trim()
+                ),
+            }),
             _ => Err(ConfigError::InvalidEnv {
                 key,
                 value: raw.to_owned(),
@@ -219,9 +221,6 @@ pub struct AppConfig {
     /// OAuth credential file for `summary_provider`
     /// (`<provider>.auth_file_env()` — currently `CHATGPT_AUTH_FILE`).
     pub summary_auth_file: Option<String>,
-    /// Explicit opt-in for CLI harness access to untrusted agent workspaces.
-    /// Native's compiled workspace tools do not use this setting.
-    pub summary_allow_unsafe_agent_harness: bool,
     pub summary_enabled: bool,
     pub database_url: String,
     pub database_ssl_mode: String,
@@ -281,6 +280,11 @@ impl AppConfig {
             .map(|s| AppRole::parse(&s))
             .transpose()?
             .unwrap_or(AppRole::All);
+        let summary_harness = optional_env("SUMMARY_HARNESS")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| SummaryHarness::parse(&s))
+            .transpose()?
+            .unwrap_or(SummaryHarness::Native);
         let discord_token = if app_role.requires_discord_gateway_config() {
             required_env("DISCORD_TOKEN")?
         } else {
@@ -305,26 +309,6 @@ impl AppConfig {
         };
 
         let summary_enabled = optional_env_parse_bool("SUMMARY_ENABLED", true)?;
-        // Default harness is the in-process native agent; CLI harnesses
-        // require explicit opt-in via SUMMARY_HARNESS.
-        let summary_harness = optional_env("SUMMARY_HARNESS")
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| SummaryHarness::parse(&s))
-            .transpose()?
-            .unwrap_or(SummaryHarness::Native);
-        let summary_allow_unsafe_agent_harness =
-            optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        // CLI harnesses can reach beyond the per-job workspace, so their
-        // unsafe-agent acknowledgement is validated whenever the role can
-        // execute summary jobs, regardless of SUMMARY_ENABLED. Native uses
-        // only compiled tools scoped to the workspace and skips this gate.
-        if app_role.requires_summary_harness_config() {
-            validate_unsafe_agent_harness_opt_in(
-                summary_harness,
-                summary_allow_unsafe_agent_harness,
-                optional_env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-            )?;
-        }
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
                 resolve_summary_settings(
@@ -360,7 +344,6 @@ impl AppConfig {
             summary_provider,
             summary_api_key,
             summary_auth_file,
-            summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
             database_ssl_mode: parse_database_ssl_mode(optional_env("DATABASE_SSL_MODE"))?,
@@ -430,6 +413,11 @@ impl AppConfig {
             .map(|s| AppRole::parse(&s))
             .transpose()?
             .unwrap_or(AppRole::All);
+        let summary_harness = optional_from_map(values, "SUMMARY_HARNESS")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| SummaryHarness::parse(&s))
+            .transpose()?
+            .unwrap_or(SummaryHarness::Native);
         let discord_token = if app_role.requires_discord_gateway_config() {
             required_from_map(values, "DISCORD_TOKEN")?
         } else {
@@ -454,22 +442,6 @@ impl AppConfig {
         };
 
         let summary_enabled = optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?;
-        // Default harness is the in-process native agent; CLI harnesses
-        // require explicit opt-in via SUMMARY_HARNESS.
-        let summary_harness = optional_from_map(values, "SUMMARY_HARNESS")
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| SummaryHarness::parse(&s))
-            .transpose()?
-            .unwrap_or(SummaryHarness::Native);
-        let summary_allow_unsafe_agent_harness =
-            optional_from_map_parse_bool(values, "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        if app_role.requires_summary_harness_config() {
-            validate_unsafe_agent_harness_opt_in(
-                summary_harness,
-                summary_allow_unsafe_agent_harness,
-                optional_from_map(values, "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE"),
-            )?;
-        }
         let (summary_command, summary_model) =
             if summary_enabled && app_role.requires_summary_harness_config() {
                 resolve_summary_settings(
@@ -505,7 +477,6 @@ impl AppConfig {
             summary_provider,
             summary_api_key,
             summary_auth_file,
-            summary_allow_unsafe_agent_harness,
             summary_enabled,
             database_url,
             database_ssl_mode: parse_database_ssl_mode(optional_from_map(
@@ -679,37 +650,6 @@ fn parse_database_ssl_mode(value: Option<String>) -> Result<String, ConfigError>
             key: "DATABASE_SSL_MODE",
             value,
         })
-    }
-}
-
-fn validate_unsafe_agent_harness_opt_in(
-    harness: SummaryHarness,
-    allow_unsafe_agent_harness: bool,
-    unsafe_agent_harness_profile: Option<String>,
-) -> Result<(), ConfigError> {
-    // Native exposes only its compiled, workspace-scoped file tools. The
-    // unsafe opt-in protects CLI harnesses, which can access the host
-    // workspace and environment.
-    if harness == SummaryHarness::Native {
-        return Ok(());
-    }
-    if !allow_unsafe_agent_harness {
-        return Err(ConfigError::MissingEnv {
-            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS",
-        });
-    }
-    let Some(profile) = unsafe_agent_harness_profile else {
-        return Err(ConfigError::MissingEnv {
-            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE",
-        });
-    };
-    let normalized = profile.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "local" | "local-dev" | "dev" | "development" | "test" | "testing" => Ok(()),
-        _ => Err(ConfigError::InvalidEnv {
-            key: "SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE",
-            value: profile.trim().to_owned(),
-        }),
     }
 }
 

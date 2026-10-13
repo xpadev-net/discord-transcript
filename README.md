@@ -1,6 +1,6 @@
 # discord-transcript
 
-Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし、既定のインプロセス native agent または明示的に許可された CLI harness で要約を生成して結果をテキストチャンネルに投稿する Bot です。
+Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし、インプロセス native agent で要約を生成して結果をテキストチャンネルに投稿する Bot です。
 
 ## 前提条件
 
@@ -9,7 +9,6 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| 要約用 CLI | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示したローカル検証用途のみ（既定 harness は native、production Docker image には同梱しません） |
 
 ## 環境構築
 
@@ -47,7 +46,6 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `DISCORD_TOKEN` | Discord Bot トークン (serenity が `Bot ` プレフィックスを自動付与するため、トークン文字列のみ設定) | `xxxx...` |
 | `DISCORD_GUILD_ID` | 対象サーバーの ID | `123456789012345678` |
 | `WHISPER_ENDPOINT` | whisper.cpp サーバーの URL | `http://localhost:8080` |
-| `CLAUDE_COMMAND` | **harness が `claude`（既定）**のとき必須。Claude CLI の実行パス（`SUMMARY_COMMAND` 未指定時のみ使用） | `/usr/local/bin/claude` |
 | `DATABASE_URL` | PostgreSQL 接続文字列 | `postgresql://user:pass@localhost/discord_transcript` |
 | `CHUNK_STORAGE_DIR` | 会議ワークスペースのルート (`workspaces/<guild>/<voice>/<meeting>/...`) | `/var/data/chunks` |
 
@@ -72,38 +70,23 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `CHUNK_STORAGE_S3_FORCE_PATH_STYLE` | endpoint 指定時 `true`、AWS 時 `false` | path-style (`endpoint/bucket/key`) を強制。多くの S3 互換サービスで必要 |
 | `CHUNK_STORAGE_S3_PRESIGN_TTL_SECONDS` | `900` | 再生用 presigned GET URL の有効秒数（最大 604800） |
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
-| `CLAUDE_MODEL` | `haiku` | Claude harness 時の `--model`（`SUMMARY_MODEL` 未指定時のフォールバック） |
-| `SUMMARY_HARNESS` | `native` | `native`（既定、インプロセスエージェント）/ `claude` / `cursor_agent` / `opencode`。CLI harness は明示的な opt-in（将来削除予定） |
+| `SUMMARY_HARNESS` | `native` | `native`（インプロセス agent）のみ対応。旧 `claude` / `cursor_agent` / `opencode` は廃止済みで、設定すると `SUMMARY_HARNESS=native` と `SUMMARY_PROVIDER` への移行案内を出して終了します。 |
 | `SUMMARY_PROVIDER` | 未設定 | `SUMMARY_HARNESS=native` のモデルプロバイダ（`opencode_go` / `chatgpt`） |
-| `OPENCODE_API_KEY` | 未設定 | OpenCode Go の API キー（console.opencode.ai）。`grok*`/`gpt*` 系モデルは `/responses`、その他は `/chat/completions` で呼び出し |
+| `OPENCODE_API_KEY` | 未設定 | native の OpenCode Go provider 用 API キー（console.opencode.ai）。`grok*`/`gpt*` 系モデルは `/responses`、その他は `/chat/completions` で呼び出し |
 | `CHATGPT_AUTH_FILE` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の OAuth クレデンシャルファイル。`auth login-chatgpt` サブコマンドで発行し、利用時に自動 refresh される |
 | `CHATGPT_ACCESS_TOKEN` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の静的アクセストークン（Enterprise 等）。設定時は auth file より優先 |
 | `CHATGPT_ACCOUNT_ID` | 未設定 | `CHATGPT_ACCESS_TOKEN` 使用時の ChatGPT アカウント ID（省略可） |
-| `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | CLI harness が untrusted transcript を処理するための opt-in。native は `input/` 読み取り・`output/` 書き込みに限定した組み込み tools を使うため不要です。 |
-| `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE` | 未設定 | CLI harness で `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` のとき必須。`local` / `local-dev` / `dev` / `development` / `test` / `testing` のみ許可し、production-like な値では起動を拒否します。 |
-| `SUMMARY_COMMAND` | 未設定 | CLI harness 専用。設定時は **どの CLI harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
-| `SUMMARY_MODEL` | 未設定 | native では対象モデル id（例: `grok-code-fast-1`）。CLI harness では `CLAUDE_MODEL` より優先し、**`opencode` では必須**（`provider/model` 形式） |
+| `SUMMARY_MODEL` | 未設定 | native の対象モデル id（例: `grok-code-fast-1`）。provider と model が揃っていない場合、summary client は無効として要約 job で設定エラーを返します。 |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
 | `OPERATIONAL_METRICS_BEARER_TOKEN` | 未設定 | `/metricsz` の Bearer 認証トークン。未設定時は `/metricsz` を無効化します。 |
 
 要約ジョブは録音・Discord gateway と同一プロセスで処理してください。旧 standalone worker によるプロセス分割はサポートしていません。
 
-> **Note:** native は組み込み tools だけを使い、会議 workspace の `input/` を読み取り、`output/` に書き込みます。パス検証・サイズ上限・出力検証を適用し、任意 shell や環境アクセスは提供しません。CLI harness はワークスペースや環境へアクセスできるため、既定では起動を拒否します。ローカル検証で使う場合は `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示してください。production-like な profile では unsafe opt-in があっても起動しません。文字起こし補正（LLM によるトランスクリプト整形）は全文プロンプトを扱うため、unsafe opt-in 後も built-in CLI harness では実行しません。
-
-Docker Compose の通常サービスは、要約用 CLI やホストの LLM 認証ディレクトリを含めません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する unsafe override file を明示的に追加してください。Claude Code のローカル検証では `unsafe-claude` Docker target を使い、固定バージョン・integrity・`claude --version` 検証付きで CLI を追加します。これらの override file は認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
-
-```bash
-# Claude Code local unsafe harness image
-docker compose -f docker-compose.dev.yml -f docker-compose.unsafe-claude.yml up app
-
-# OpenCode / Cursor require a trusted derived image or mounted binary with SUMMARY_COMMAND set.
-docker compose -f docker-compose.yml -f docker-compose.unsafe-opencode.yml up app
-docker compose -f docker-compose.yml -f docker-compose.unsafe-cursor.yml up app
-```
+> **Note:** native は組み込み tools だけを使い、会議 workspace の `input/` を読み取り、`output/` に書き込みます。パス検証・サイズ上限・出力検証を適用し、任意 shell や環境アクセスは提供しません。旧 CLI harness の実行・認証ディレクトリの mount はサポートしていません。ChatGPT の native provider は `auth login-chatgpt` で OAuth credential を発行するか、`CHATGPT_ACCESS_TOKEN` を設定してください。
 
 Compose の `app` は Discord voice (songbird) の UDP 通信のため host network を使います。Web UI は既定で `127.0.0.1` に bind します。外部公開する場合は、リバースプロキシなどの公開経路を決めた上で `WEB_BIND_HOST` を明示的に変更してください。`migrate` は compose network 上の `db:5432` に接続するため host network を使いません。
 
-公開 GHCR イメージはネットワークインストーラや registry の最新状態に依存しないため、Claude Code / Cursor Agent CLI / OpenCode を同梱しません。Docker で CLI harness を使う場合は、ローカル検証専用の `unsafe-claude` target を使うか、検証済みの CLI を含む派生イメージを作るか、信頼できる方法でバイナリを配置し、`SUMMARY_COMMAND` に明示的なパスを設定してください。
+公開 GHCR イメージには Claude Code / Cursor Agent CLI / OpenCode を同梱しません。native provider を使う場合は、必要な API key または ChatGPT OAuth credential を設定してください。
 
 ### ワークスペース構造
 
@@ -115,7 +98,7 @@ Compose の `app` は Discord voice (songbird) の UDP 通信のため host netw
 - `context/`: 話者 roster、domain knowledge、AI memory、feedback、alias、template manifest など要約用コンテキスト
 - `summary/`: 検証済み要約や downstream artifact の保存先
 
-要約・AI memory 抽出用の CLI harness は、実会議ワークスペース全体ではなく、実行ごとに生成される agent workspace を作業ディレクトリとして起動します。agent workspace には許可された入力ファイルだけを exact path で `input/**` にコピーし、成功結果は `output/**` の検証済みファイルだけから読み取ります。stdout は成功時の要約本文や AI memory JSON としては受け付けず、失敗時のサイズ制限・サニタイズ済み診断にだけ使います。
+native summary と AI memory agent は、実会議ワークスペース全体ではなく実行ごとに生成される agent workspace のみを使用します。agent workspace には許可された入力ファイルだけを exact path で `input/**` にコピーし、成功結果は `output/**` の検証済みファイルだけから読み取ります。
 
 agent workspace の契約:
 
@@ -124,8 +107,6 @@ agent workspace の契約:
 - AI memory 抽出入力: 要約入力と同じ context/transcript 一式に加えて、検証済み要約を `input/summary/summary.md` として渡します。
 - AI memory 抽出出力: `output/ai_memory_candidates.json`
 - 除外: `audio/**`, `debug/**`, 実会議ワークスペースの `summary/**`（AI memory 用に検証済み `summary/summary.md` を個別コピーするときだけ例外）, `.env`, 認証・credential ディレクトリ、リポジトリのソースやテスト、未知のファイル、symlink は agent workspace にコピーしません。
-
-`cursor_agent` harness では agent workspace 内に `.cursor/cli.json` を生成し、materialize された各入力ファイルへの `Read(...)` と実行種別ごとの単一出力ファイルへの `Write(...)` だけを許可する意図を記録します。あわせて `.env`、`debug/**`、`../**`、`input/**` への書き込み、`Shell(*)` を deny します。この設定は Cursor の権限モデル向けの defense-in-depth であり、唯一の境界ではありません。主な境界は、コピー対象を exact path で限定した agent workspace、credential 系環境変数の削除、コマンド実行の制限、`output/**` の検証です。
 
 要約成功時は、`output/summary.md` を regular file / UTF-8 / 非空 / サイズ上限内として検証し、永続化した後に agent workspace を削除します。AI memory 抽出成功時は、`output/ai_memory_candidates.json` を strict JSON schema と候補ルールで検証した後に workspace を削除します。失敗時も stdout を代替結果として使わず、サニタイズ済み診断だけを返して workspace 削除を試みます。要約永続化後の cleanup が失敗した場合はジョブを retry し、残留した `agent/` ディレクトリは retention cleanup の削除対象になります。現時点では failed-run workspace を明示保持する運用設定はありません。
 
@@ -234,7 +215,7 @@ cargo build --release --locked
 - 全ての必須環境変数が設定されていること
 - PostgreSQL に接続可能で、マイグレーションが適用済みであること
 - whisper.cpp サーバーが起動していること
-- 要約用 CLI（既定なら Claude）がインストール・認証済みであること（production Docker image には同梱しません）
+- 要約を利用する場合は native provider/model を設定し、provider の credential を用意すること（OpenCode Go API key または ChatGPT OAuth/access token）
 - `CHUNK_STORAGE_DIR` で指定したディレクトリが存在し、書き込み可能であること
 
 ### systemd によるサービス化 (例)
