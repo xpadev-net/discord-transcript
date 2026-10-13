@@ -68,7 +68,7 @@ use crate::infrastructure::storage::{
     EffectiveMeetingSettings, MeetingSettingsDefaults, MeetingStore, StatusMessageMetadata,
     StoreError, StoredMeeting,
 };
-use crate::infrastructure::storage_fs::ChunkStorage;
+use crate::infrastructure::storage_fs::{ChunkStorage, SavedChunk};
 use crate::infrastructure::storage_s3::MeetingChunkStorage;
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
@@ -2106,6 +2106,14 @@ fn live_chunk_id(chunk: &PersistedChunk) -> String {
     )
 }
 
+const RECOVER_INTERRUPTED_LIVE_TRANSCRIPTION_JOBS_SQL: &str = "UPDATE live_transcription_chunks SET status='queued', error_message=NULL, updated_at=NOW() WHERE status='running' AND audio_path IS NOT NULL";
+
+fn recover_interrupted_live_transcription_jobs<E: SqlExecutor>(
+    executor: &mut E,
+) -> Result<u64, String> {
+    executor.execute(RECOVER_INTERRUPTED_LIVE_TRANSCRIPTION_JOBS_SQL, &[])
+}
+
 fn live_transcript_row_id(chunk_id: &str, segment_index: usize) -> String {
     format!("{chunk_id}-seg-{segment_index}")
 }
@@ -2149,7 +2157,7 @@ fn build_live_insert_transcripts_sql(count: usize, param_offset: usize) -> Strin
     sql
 }
 
-fn mark_live_transcription_chunk_running<E: SqlExecutor>(
+fn persist_live_transcription_chunk_queued<E: SqlExecutor>(
     executor: &mut E,
     chunk: &PersistedChunk,
     timeline_base_ms: u64,
@@ -2157,10 +2165,13 @@ fn mark_live_transcription_chunk_running<E: SqlExecutor>(
     executor
         .execute(
             "INSERT INTO live_transcription_chunks \
-             (id, meeting_id, speaker_id, sequence, start_ms, timeline_base_ms, status, error_message, attempt_count, updated_at) \
-             VALUES ($1, $2, $3, $4::TEXT::BIGINT, $5::TEXT::BIGINT, $6::TEXT::BIGINT, 'running', NULL, 1, NOW()) \
+             (id, meeting_id, speaker_id, sequence, start_ms, timeline_base_ms, status, audio_path, error_message, attempt_count, updated_at) \
+             VALUES ($1, $2, $3, $4::TEXT::BIGINT, $5::TEXT::BIGINT, $6::TEXT::BIGINT, 'queued', $7, NULL, 0, NOW()) \
              ON CONFLICT (id) DO UPDATE SET \
-             status='running', error_message=NULL, timeline_base_ms=EXCLUDED.timeline_base_ms, attempt_count=live_transcription_chunks.attempt_count + 1, updated_at=NOW()",
+             status=CASE WHEN live_transcription_chunks.status IN ('done', 'running') \
+                         THEN live_transcription_chunks.status ELSE 'queued' END, \
+             audio_path=EXCLUDED.audio_path, timeline_base_ms=EXCLUDED.timeline_base_ms, \
+             error_message=NULL, updated_at=NOW()",
             &[
                 live_chunk_id(chunk),
                 chunk.meeting_id.clone(),
@@ -2168,9 +2179,82 @@ fn mark_live_transcription_chunk_running<E: SqlExecutor>(
                 chunk.sequence.to_string(),
                 chunk.start_ms.to_string(),
                 timeline_base_ms.to_string(),
+                chunk.saved.path.to_string_lossy().into_owned(),
             ],
         )
         .map(|_| ())
+}
+
+fn load_next_live_transcription_job<E: SqlExecutor>(
+    executor: &mut E,
+    chunk_storage_dir: &str,
+) -> Result<Option<LiveTranscriptionJob>, String> {
+    let rows = executor.query_rows(
+        "SELECT c.id, c.meeting_id, c.speaker_id, c.sequence, c.start_ms, \
+         COALESCE(c.timeline_base_ms, c.start_ms), c.audio_path, m.title \
+         FROM live_transcription_chunks c JOIN meetings m ON m.id=c.meeting_id \
+         WHERE c.status='queued' AND c.audio_path IS NOT NULL \
+         ORDER BY c.start_ms, c.meeting_id, c.speaker_id, c.sequence LIMIT 1",
+        &[],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let value = |index: usize, name: &str| -> Result<String, String> {
+        row.get(index)
+            .and_then(|value| value.clone())
+            .ok_or_else(|| format!("queued live transcription row missing {name}"))
+    };
+    let chunk_id = value(0, "id")?;
+    let meeting_id = value(1, "meeting_id")?;
+    let user_id = value(2, "speaker_id")?;
+    let sequence = value(3, "sequence")?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid queued live transcription sequence: {err}"))?;
+    let start_ms = value(4, "start_ms")?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid queued live transcription start: {err}"))?;
+    let timeline_base_ms = value(5, "timeline_base_ms")?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid queued live transcription timeline base: {err}"))?;
+    let audio_path = std::path::PathBuf::from(value(6, "audio_path")?);
+    let root = std::path::Path::new(chunk_storage_dir)
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve live transcription audio root: {err}"))?;
+    let audio_path = audio_path
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve queued live audio path: {err}"))?;
+    if !audio_path.starts_with(&root) {
+        return Err("queued live audio path is outside the configured storage root".to_owned());
+    }
+    let size_bytes = std::fs::metadata(&audio_path)
+        .map_err(|err| format!("failed to stat queued live audio: {err}"))?
+        .len()
+        .try_into()
+        .map_err(|_| "queued live audio file exceeds addressable size".to_owned())?;
+    let updated = executor.execute(
+        "UPDATE live_transcription_chunks SET status='running', error_message=NULL, \
+         attempt_count=attempt_count + 1, updated_at=NOW() WHERE id=$1 AND status='queued'",
+        &[chunk_id],
+    )?;
+    if updated == 0 {
+        return Ok(None);
+    }
+    let meeting_title = row.get(7).and_then(Clone::clone);
+    Ok(Some(LiveTranscriptionJob {
+        chunk: PersistedChunk {
+            meeting_id,
+            user_id,
+            sequence,
+            start_ms,
+            saved: SavedChunk {
+                path: audio_path,
+                size_bytes,
+            },
+        },
+        base_start_ms: timeline_base_ms,
+        meeting_title,
+    }))
 }
 
 fn persist_live_transcription_success<E: SqlExecutor>(
@@ -3492,7 +3576,9 @@ pub async fn run_bot(
     migration_store
         .apply_pending_migrations()
         .map_err(RuntimeError::DatabaseMigration)?;
-    let base_executor = migration_store.executor;
+    let mut base_executor = migration_store.executor;
+    recover_interrupted_live_transcription_jobs(&mut base_executor)
+        .map_err(RuntimeError::DatabaseMigration)?;
 
     // `recording_objects` is shared with the web layer by the caller so a
     // delete issued through either path cancels this queue's pending uploads.
@@ -3804,7 +3890,7 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<MeetingChunkStorage>>>>,
     recording_writer: BoundedRecordingWriter<MeetingChunkStorage>,
-    live_transcription_dispatcher: LiveTranscriptionDispatcher<LiveTranscriptionJob>,
+    live_transcription_dispatcher: LiveTranscriptionDispatcher<()>,
     recording_startups: Arc<Mutex<HashMap<String, String>>>,
     recording_start_cleanup_retries: Arc<StdMutex<HashSet<String>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
@@ -4039,28 +4125,43 @@ impl ScaffoldHandler {
         titles.get(meeting_id).cloned().flatten()
     }
 
-    fn start_live_transcription_dispatcher(
-        &self,
-        mut receiver: mpsc::Receiver<LiveTranscriptionJob>,
-    ) {
+    async fn claim_next_live_transcription_job(&self) -> Option<LiveTranscriptionJob> {
+        let result = {
+            let mut service = self.service.lock().await;
+            load_next_live_transcription_job(&mut service.store.executor, &self.chunk_storage_dir)
+        };
+        match result {
+            Ok(job) => job,
+            Err(error) => {
+                warn!(error = %error, "failed to claim durable live transcription outbox item");
+                None
+            }
+        }
+    }
+
+    fn start_live_transcription_dispatcher(&self, mut receiver: mpsc::Receiver<()>) {
         let runtime = self.clone();
         self.task_tracker.spawn(async move {
+            let mut retry_tick = tokio::time::interval(Duration::from_millis(500));
             loop {
                 tokio::select! {
                     biased;
                     _ = runtime.shutdown_token.cancelled() => {
                         runtime.live_transcription_dispatcher.stop_accepting();
                         receiver.close();
-                        while let Some(job) = receiver.recv().await {
-                            runtime.fail_live_transcription_job(
-                                job,
-                                "runtime shutdown before live transcription started",
-                            ).await;
-                        }
                         break;
                     }
-                    job = receiver.recv() => match job {
-                        Some(job) => runtime.process_live_transcription_job(job).await,
+                    _ = retry_tick.tick() => {
+                        if let Some(job) = runtime.claim_next_live_transcription_job().await {
+                            runtime.process_live_transcription_job(job).await;
+                        }
+                    }
+                    wake = receiver.recv() => match wake {
+                        Some(()) => {
+                            if let Some(job) = runtime.claim_next_live_transcription_job().await {
+                                runtime.process_live_transcription_job(job).await;
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -4080,17 +4181,27 @@ impl ScaffoldHandler {
                 base_start_ms,
                 meeting_title: meeting_title.clone(),
             };
-            // The receipt permit remains held while this send applies
-            // backpressure, so blocked producers are bounded by the writer's
-            // task/byte budget. A closed dispatcher takes the durable failure
-            // path below; the audio artifact remains available for final ASR.
-            if let Err(job) = self.live_transcription_dispatcher.enqueue(job).await {
-                self.fail_live_transcription_job(
-                    job,
-                    "runtime stopped before live transcription admission",
+            let result = {
+                let mut service = self.service.lock().await;
+                persist_live_transcription_chunk_queued(
+                    &mut service.store.executor,
+                    &job.chunk,
+                    job.base_start_ms,
                 )
-                .await;
+            };
+            if let Err(error) = result {
+                error!(
+                    meeting_id = %job.chunk.meeting_id,
+                    speaker_id = %job.chunk.user_id,
+                    sequence = job.chunk.sequence,
+                    error = %error,
+                    "failed to persist live transcription outbox item"
+                );
+                continue;
             }
+            // Saturation only coalesces wakeups; the database outbox remains
+            // the source of truth and the worker also polls it after restart.
+            let _ = self.live_transcription_dispatcher.try_enqueue(());
         }
     }
 
@@ -4225,24 +4336,6 @@ impl ScaffoldHandler {
             return;
         }
 
-        if let Err(err) = {
-            let mut service = self.service.lock().await;
-            mark_live_transcription_chunk_running(
-                &mut service.store.executor,
-                &chunk,
-                base_start_ms,
-            )
-        } {
-            warn!(
-                meeting_id = %chunk.meeting_id,
-                user_id = %chunk.user_id,
-                sequence = chunk.sequence,
-                error = %err,
-                "failed to mark live transcription chunk running"
-            );
-            return;
-        }
-
         let effective_settings = self
             .effective_settings_for_meeting(&chunk.meeting_id)
             .await
@@ -4291,6 +4384,11 @@ impl ScaffoldHandler {
                 normalize_segments(&segments, NormalizationConfig::default())
             }
             Err(err) => {
+                if self.shutting_down.load(Ordering::Acquire) {
+                    // Keep the durable row running so startup recovery can
+                    // reclaim the unchanged WAV instead of losing this job.
+                    return;
+                }
                 let error_message = err.to_string();
                 let mark_result = {
                     let mut service = self.service.lock().await;
@@ -4365,6 +4463,12 @@ impl ScaffoldHandler {
                 })
                 && !final_rows_exist;
             if !live_write_allowed {
+                if self.shutting_down.load(Ordering::Acquire) {
+                    // Startup recovery resets this claimed outbox row to
+                    // queued; do not turn graceful shutdown into a terminal
+                    // failure for a still-recoverable audio artifact.
+                    return;
+                }
                 let error_message =
                     "live transcription finished after final transcription started".to_owned();
                 let mark_result = mark_live_transcription_chunk_failed(
@@ -12776,6 +12880,46 @@ mod status_message_tests {
                         ]
             }),
             "source chunk should be marked failed"
+        );
+    }
+
+    #[test]
+    fn live_transcription_outbox_persists_audio_reference_before_admission() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
+        let chunk = persisted_chunk_for_live_test();
+
+        persist_live_transcription_chunk_queued(&mut executor, &chunk, 900_000)
+            .expect("outbox item should persist");
+
+        let (sql, params) = executor
+            .executed
+            .iter()
+            .find(|(sql, _)| sql.contains("INSERT INTO live_transcription_chunks"))
+            .expect("queued outbox row should be inserted");
+        assert!(sql.contains("'queued'"));
+        assert!(sql.contains("audio_path"));
+        assert_eq!(params[0], live_chunk_id(&chunk));
+        assert_eq!(params[5], "900000");
+        assert_eq!(params[6], chunk.saved.path.to_string_lossy());
+    }
+
+    #[test]
+    fn interrupted_live_transcription_rows_are_requeued_at_startup() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::strict();
+        executor.register_execute_wildcard(
+            RECOVER_INTERRUPTED_LIVE_TRANSCRIPTION_JOBS_SQL,
+            0,
+            &[],
+            2,
+        );
+
+        let recovered = recover_interrupted_live_transcription_jobs(&mut executor)
+            .expect("startup should recover in-flight outbox rows");
+
+        assert_eq!(recovered, 2);
+        assert_eq!(
+            executor.executed[0].0,
+            RECOVER_INTERRUPTED_LIVE_TRANSCRIPTION_JOBS_SQL
         );
     }
 

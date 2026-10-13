@@ -2,14 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
-// Match the bounded recording-writer receipt count: no more than this many
-// persisted chunks can be awaiting live-dispatch admission at once.
+// Match the bounded recording-writer receipt count. This channel contains
+// bounded wakeups only; persisted chunk metadata lives in the DB outbox.
 pub const DEFAULT_LIVE_TRANSCRIPTION_QUEUE_LIMIT: usize =
     crate::application::recording_writer::DEFAULT_RECORDING_WRITER_TASK_LIMIT;
 
-/// Bounded admission for persisted live-transcription metadata. A single
-/// receiver worker performs ASR, so this queue never creates per-chunk waiter
-/// tasks or copies recording PCM into memory.
+/// Bounded wakeups for the durable live-transcription outbox. A single
+/// receiver worker performs ASR, so this channel never creates per-chunk
+/// waiter tasks or copies recording PCM into memory.
 pub struct LiveTranscriptionDispatcher<T> {
     sender: mpsc::Sender<T>,
     accepting: Arc<AtomicBool>,
@@ -46,15 +46,6 @@ impl<T> LiveTranscriptionDispatcher<T> {
             .map_err(|error| error.into_inner())
     }
 
-    /// Apply backpressure to the bounded recording-writer receipt pool instead
-    /// of spawning an unbounded queue of tasks when ASR is slower than storage.
-    pub async fn enqueue(&self, item: T) -> Result<(), T> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(item);
-        }
-        self.sender.send(item).await.map_err(|error| error.0)
-    }
-
     pub fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Release);
     }
@@ -68,18 +59,25 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     #[tokio::test]
-    async fn slow_worker_keeps_in_flight_plus_queue_within_bound() {
+    async fn slow_failing_whisper_keeps_in_flight_plus_queue_within_bound() {
         let (dispatcher, mut receiver) = LiveTranscriptionDispatcher::channel(2);
         let started = Arc::new(Notify::new());
         let release = Arc::new(Semaphore::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
         let worker_started = Arc::clone(&started);
         let worker_release = Arc::clone(&release);
         let worker_completed = Arc::clone(&completed);
+        let worker_failed = Arc::clone(&failed);
         let worker = tokio::spawn(async move {
             while let Some(_item) = receiver.recv().await {
                 worker_started.notify_one();
                 worker_release.acquire().await.unwrap().forget();
+                // The fixture models a slow Whisper process that eventually
+                // fails; failure handling must not create another waiter task.
+                let inference: Result<(), &str> = Err("fixture inference failure");
+                assert!(inference.is_err());
+                worker_failed.fetch_add(1, Ordering::AcqRel);
                 worker_completed.fetch_add(1, Ordering::AcqRel);
             }
         });
@@ -103,25 +101,6 @@ mod tests {
         drop(dispatcher);
         worker.await.expect("dispatcher worker should finish");
         assert_eq!(completed.load(Ordering::Acquire), 3);
-    }
-
-    #[tokio::test]
-    async fn async_enqueue_applies_backpressure_then_admits_without_loss() {
-        let (dispatcher, mut receiver) = LiveTranscriptionDispatcher::channel(1);
-        dispatcher.try_enqueue(1).expect("initial item should fit");
-        let blocked_dispatcher = dispatcher.clone();
-        let blocked = tokio::spawn(async move { blocked_dispatcher.enqueue(2).await });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(
-            !blocked.is_finished(),
-            "full queue should apply backpressure"
-        );
-
-        assert_eq!(receiver.recv().await, Some(1));
-        blocked
-            .await
-            .expect("enqueue task should finish")
-            .expect("open dispatcher should admit the waiting item");
-        assert_eq!(receiver.recv().await, Some(2));
+        assert_eq!(failed.load(Ordering::Acquire), 3);
     }
 }

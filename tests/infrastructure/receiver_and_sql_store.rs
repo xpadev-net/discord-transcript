@@ -318,7 +318,7 @@ fn schema_constrains_transcript_confidence_to_unit_range() {
     assert!(incremental_schema.contains("NOT VALID"));
     assert_eq!(
         MIGRATIONS.last().expect("latest migration").version,
-        "0032_domain_knowledge_summary_approval"
+        "0033_live_transcription_outbox"
     );
 }
 
