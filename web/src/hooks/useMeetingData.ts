@@ -89,6 +89,8 @@ function transcriptFetchErrorMessage(retryAttempt: number): string {
     : "\u6587\u5b57\u8d77\u3053\u3057\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
 }
 
+const MEETING_COMPLETION_POLL_INTERVAL_MS = 5_000;
+
 function streamEventCode(data: string): string {
   let parsed: unknown;
   try {
@@ -117,6 +119,10 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [transcriptStreamState, setTranscriptStreamState] =
     useState<TranscriptStreamState>("idle");
+  const [
+    meetingCompletionTrackingEnabled,
+    setMeetingCompletionTrackingEnabled,
+  ] = useState(false);
   const [transcriptStreamError, setTranscriptStreamError] = useState<
     string | null
   >(null);
@@ -126,6 +132,9 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
 
   const applyTranscriptStatus = useCallback((response: TranscriptResponse) => {
     setTranscriptState(transcriptStateFromResponse(response));
+    if (response.is_final) {
+      setMeetingCompletionTrackingEnabled(true);
+    }
     if (response.status === "unknown") {
       return;
     }
@@ -139,6 +148,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
   useEffect(() => {
     if (!meetingId) {
       setLoading(false);
+      setMeetingCompletionTrackingEnabled(false);
       return;
     }
 
@@ -146,6 +156,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     setLoading(true);
     setError(null);
     setMeeting(null);
+    setMeetingCompletionTrackingEnabled(false);
     setTranscriptStreamState("idle");
     setTranscriptStreamError(null);
     setTranscriptRetryCount(0);
@@ -153,7 +164,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
 
     Promise.all([
       fetchMeeting(meetingId, controller.signal)
-        .then(setMeeting)
+        .then((response) => {
+          if (!controller.signal.aborted) {
+            setMeeting(response);
+          }
+        })
         .catch(() => {
           if (!controller.signal.aborted) {
             setError(
@@ -204,6 +219,58 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     applyTranscriptStatus,
   ]);
 
+  const shouldTrackMeetingCompletion =
+    isLiveMeetingStatus(meeting?.status) && meetingCompletionTrackingEnabled;
+
+  useEffect(() => {
+    if (!meetingId || !shouldTrackMeetingCompletion) {
+      return;
+    }
+
+    const controller = new AbortController();
+    let timer: number | undefined;
+    const pollMeetingStatus = async () => {
+      try {
+        const latestMeeting = await fetchMeeting(meetingId, controller.signal);
+        if (controller.signal.aborted) {
+          return;
+        }
+        setMeeting(latestMeeting);
+      } catch (err: unknown) {
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (isForbiddenError(err) || isNotFoundError(err)) {
+          setMeetingCompletionTrackingEnabled(false);
+          setError(
+            isForbiddenError(err)
+              ? "この会議を表示する権限がありません"
+              : "会議が見つかりません",
+          );
+          return;
+        }
+      }
+
+      if (!controller.signal.aborted) {
+        timer = window.setTimeout(
+          pollMeetingStatus,
+          MEETING_COMPLETION_POLL_INTERVAL_MS,
+        );
+      }
+    };
+
+    timer = window.setTimeout(
+      pollMeetingStatus,
+      MEETING_COMPLETION_POLL_INTERVAL_MS,
+    );
+    return () => {
+      controller.abort();
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [meetingId, shouldTrackMeetingCompletion]);
+
   useEffect(() => {
     if (!meetingId || !shouldStreamTranscript) {
       setTranscriptStreamState("idle");
@@ -218,6 +285,9 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     let accessCheckInFlight = false;
 
     const closeStream = () => {
+      if (closed) {
+        return;
+      }
       closed = true;
       source?.close();
       if (reconnectTimer !== undefined) {
@@ -382,11 +452,13 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         const code = streamEventCode(message.data);
         closeStream();
         if (code === "idle_timeout") {
+          setMeetingCompletionTrackingEnabled(true);
           setTranscriptStreamState("closed");
           setTranscriptStreamError(null);
           return;
         }
         if (code === "error_limit") {
+          setMeetingCompletionTrackingEnabled(true);
           setTranscriptStreamState("error");
           setTranscriptStreamError(
             "\u6587\u5b57\u8d77\u3053\u3057\u306e\u30e9\u30a4\u30d6\u66f4\u65b0\u3067\u30a8\u30e9\u30fc\u304c\u7d9a\u3044\u305f\u305f\u3081\u505c\u6b62\u3057\u307e\u3057\u305f",
@@ -428,6 +500,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       setSummaryError(null);
       return;
     }
+    if (!meeting) {
+      setSummary(null);
+      setSummaryError(null);
+      return;
+    }
     if (shouldStreamTranscript) {
       setSummary(null);
       setSummaryError(null);
@@ -438,7 +515,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     setSummary(null);
     setSummaryError(null);
     fetchSummary(meetingId, controller.signal)
-      .then(setSummary)
+      .then((response) => {
+        if (!controller.signal.aborted) {
+          setSummary(response);
+        }
+      })
       .catch(() => {
         if (!controller.signal.aborted) {
           setSummaryError(
@@ -449,7 +530,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         }
       });
     return () => controller.abort();
-  }, [meetingId, shouldStreamTranscript, summaryRetryCount]);
+  }, [meetingId, meeting, shouldStreamTranscript, summaryRetryCount]);
 
   return {
     meeting,
