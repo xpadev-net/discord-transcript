@@ -644,7 +644,7 @@ def self_test_ci_docker_build_commands() -> None:
     assert not any("bake" in words for words in pushing)
 
 
-def assert_ci_runs_postgres_sql_contract_smoke() -> None:
+def assert_ci_runs_postgres_contract_tests() -> None:
     ci = read_repo_file(CI_WORKFLOW)
     _, rust_job = workflow_job_block(ci, "rust")
 
@@ -656,10 +656,25 @@ def assert_ci_runs_postgres_sql_contract_smoke() -> None:
     ), "Postgres service must have a readiness health check"
     assert (
         "DISCORD_TRANSCRIPT_TEST_DATABASE_URL:" in rust_job
-    ), "Postgres smoke must set DISCORD_TRANSCRIPT_TEST_DATABASE_URL"
+    ), "Rust CI must set DISCORD_TRANSCRIPT_TEST_DATABASE_URL for all tests"
     assert (
-        "cargo test --locked --test postgres_sql_contract_smoke" in rust_job
-    ), "Rust CI must run the Postgres SQL contract smoke test with --locked"
+        "cargo test --locked --workspace --all-targets --all-features -- --nocapture"
+        in rust_job
+    ), "Rust CI must expose all test output while running the workspace suite"
+
+    postgres_tests = (
+        "tests/infrastructure/postgres_sql_contract_smoke.rs",
+        "tests/infrastructure/postgres_active_meeting_unique.rs",
+        "tests/infrastructure/postgres_migration_lock.rs",
+    )
+    for path in postgres_tests:
+        source = read_repo_file(path)
+        assert (
+            'std::env::var_os("CI").is_some()' in source
+        ), f"{path} must fail in CI when its real Postgres URL is missing"
+        assert "skipping real Postgres" in source, (
+            f"{path} must clearly report the local no-database skip"
+        )
 
 
 def main() -> None:
@@ -668,7 +683,7 @@ def main() -> None:
     self_test_ci_docker_build_commands()
     assert_workflow_actions_are_sha_pinned()
     assert_pr_ci_never_pushes_docker_images()
-    assert_ci_runs_postgres_sql_contract_smoke()
+    assert_ci_runs_postgres_contract_tests()
     print("Workflow action and PR Docker policy checks passed.")
 
 
