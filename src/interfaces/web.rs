@@ -73,16 +73,17 @@ use crate::infrastructure::sql::{
     ADMIN_RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
     ADMIN_RETENTION_MARK_MEETING_TRANSCRIPTS_DELETED_SQL,
     ADMIN_RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL, ADMIN_RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
-    ADMIN_RETENTION_MEETING_DETAIL_SQL, ADMIN_RETENTION_OVERVIEW_SQL, ADMIN_RETRY_JOB_SQL,
-    ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, ARCHIVE_ADMIN_PLAN_SQL, ARCHIVE_AI_MEMORY_NOTE_SQL,
-    ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL, ARCHIVE_SUMMARY_TEMPLATE_SQL,
-    CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL, COUNT_VISIBLE_GUILD_MEETINGS_SQL,
-    DELETE_ADMIN_PLAN_QUOTA_SQL, GET_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, GET_ADMIN_PLAN_BY_CODE_SQL,
-    GET_ADMIN_PLAN_QUOTA_SQL, GET_ADMIN_PLAN_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL,
-    GET_GUILD_SETTINGS_SQL, GET_SUMMARY_TEMPLATE_SQL, INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL,
-    INSERT_ADMIN_PLAN_QUOTA_SQL, INSERT_ADMIN_PLAN_SQL, INSERT_AI_MEMORY_NOTE_SQL,
-    INSERT_AUDIT_EVENT_SQL, INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL,
-    INSERT_PERSON_ALIAS_SQL, INSERT_SUMMARY_TEMPLATE_SQL, INSERT_USAGE_EVENT_SQL,
+    ADMIN_RETENTION_MEETING_DETAIL_SQL, ADMIN_RETENTION_OVERVIEW_SQL, ADMIN_RETRY_JOB_INPUT_SQL,
+    ADMIN_RETRY_JOB_SQL, ARCHIVE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, ARCHIVE_ADMIN_PLAN_SQL,
+    ARCHIVE_AI_MEMORY_NOTE_SQL, ARCHIVE_DOMAIN_KNOWLEDGE_SQL, ARCHIVE_PERSON_ALIAS_SQL,
+    ARCHIVE_SUMMARY_TEMPLATE_SQL, CLEAR_GUILD_BOT_TOKEN_SQL, COUNT_GUILD_MEETINGS_SQL,
+    COUNT_VISIBLE_GUILD_MEETINGS_SQL, DELETE_ADMIN_PLAN_QUOTA_SQL,
+    GET_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, GET_ADMIN_PLAN_BY_CODE_SQL, GET_ADMIN_PLAN_QUOTA_SQL,
+    GET_ADMIN_PLAN_SQL, GET_AI_MEMORY_NOTE_SQL, GET_DOMAIN_KNOWLEDGE_SQL, GET_GUILD_SETTINGS_SQL,
+    GET_SUMMARY_TEMPLATE_SQL, INSERT_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, INSERT_ADMIN_PLAN_QUOTA_SQL,
+    INSERT_ADMIN_PLAN_SQL, INSERT_AI_MEMORY_NOTE_SQL, INSERT_AUDIT_EVENT_SQL,
+    INSERT_DOMAIN_KNOWLEDGE_SQL, INSERT_MEETING_TRANSCRIPT_FEEDBACK_SQL, INSERT_PERSON_ALIAS_SQL,
+    INSERT_SUMMARY_TEMPLATE_SQL, INSERT_USAGE_EVENT_SQL,
     LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL,
     LIST_ADMIN_PLAN_QUOTAS_SQL, LIST_ADMIN_PLANS_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_JOBS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
@@ -105,7 +106,8 @@ use crate::infrastructure::storage_s3::RecordingObjectStore;
 use crate::infrastructure::workspace::{
     DEBUG_CORRECTION_PROMPT_FILENAME, DEBUG_DIR, DEBUG_MEETING_TITLE_FILENAME,
     DEBUG_MIXDOWN_WHISPER_FILENAME, DEBUG_PRE_CORRECTION_TRANSCRIPT_FILENAME,
-    DEBUG_SUMMARY_PROMPT_FILENAME, DEBUG_WHISPER_DIR, MeetingWorkspacePaths,
+    DEBUG_SUMMARY_PROMPT_FILENAME, DEBUG_WHISPER_DIR, MeetingWorkspaceLayout,
+    MeetingWorkspacePaths,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -8528,18 +8530,75 @@ async fn api_retry_job(
     Path(job_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<JobResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::MeetingReprocess)
         .await?;
     validate_resource_id(&job_id)?;
     let request = parse_job_retry_request_body(&body)?;
     let normalized = normalize_job_retry_request(&request)?;
+
+    let retry_input = state
+        .db
+        .query_opt(ADMIN_RETRY_JOB_INPUT_SQL, &[&job_id, &auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(retry_input) = retry_input else {
+        return Err(StatusCode::CONFLICT);
+    };
+    let meeting_id: String = retry_input
+        .try_get("meeting_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let voice_channel_id: String = retry_input
+        .try_get("voice_channel_id")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let raw_audio_not_cleaned: bool = retry_input
+        .try_get("raw_audio_not_cleaned")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let has_recoverable_audio = if !raw_audio_not_cleaned {
+        false
+    } else {
+        let layout = MeetingWorkspaceLayout::new(&state.chunk_storage_dir);
+        let primary_audio_dir = layout
+            .for_meeting(&auth.guild_id, &voice_channel_id, &meeting_id)
+            .audio_dir();
+        let legacy_audio_dir = layout.legacy_meeting_dir(&meeting_id);
+        let check_meeting_id = meeting_id.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::application::runtime::has_recoverable_audio_with_legacy_fallback(
+                primary_audio_dir,
+                legacy_audio_dir,
+            )
+        })
+        .await
+        .map_err(|err| {
+            warn!(meeting_id = %check_meeting_id, error = %err, "retained audio inspection task failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|err| {
+            warn!(meeting_id = %meeting_id, error = %err, "failed to inspect retained audio before retry");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+    if !has_recoverable_audio {
+        return Ok(api_error_response(
+            StatusCode::CONFLICT,
+            "retry_input_unavailable",
+            "This meeting cannot be retried because its retained audio is unavailable.",
+        ));
+    }
+    let has_recoverable_audio_param = has_recoverable_audio.to_string();
+
     let row = state
         .db
         .query_opt(
             ADMIN_RETRY_JOB_SQL,
-            &[&job_id, &auth.guild_id, &normalized.next_run_at],
+            &[
+                &job_id,
+                &auth.guild_id,
+                &normalized.next_run_at,
+                &has_recoverable_audio_param,
+            ],
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -8570,7 +8629,7 @@ async fn api_retry_job(
         ),
     )
     .await;
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 async fn api_cancel_job(

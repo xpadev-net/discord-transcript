@@ -1616,39 +1616,89 @@ ORDER BY j.updated_at DESC, j.created_at DESC, j.id DESC
 LIMIT $4::integer
 "#;
 
-pub const ADMIN_RETRY_JOB_SQL: &str = r#"
-UPDATE jobs j
-SET status = 'queued',
-    retry_count = 0,
-    error_message = NULL,
-    next_run_at = COALESCE(NULLIF($3, '')::timestamptz, NOW()),
-    leased_until = NULL,
-    claim_token = NULL,
-    finished_at = NULL,
-    dead_lettered_at = NULL,
-    canceled_at = NULL,
-    cancel_reason = NULL,
-    updated_at = NOW()
-FROM meetings m
-WHERE m.id = j.meeting_id
-  AND m.guild_id = $2
+pub const ADMIN_RETRY_JOB_INPUT_SQL: &str = r#"
+SELECT m.id AS meeting_id,
+       m.voice_channel_id,
+       m.retention_raw_cleaned_at IS NULL AS raw_audio_not_cleaned
+FROM jobs j
+JOIN meetings m ON m.id = j.meeting_id
+WHERE m.guild_id = $2
   AND j.id = $1
+  AND j.job_type = 'summarize'
   AND j.status IN ('failed', 'canceled')
-RETURNING j.id,
-          j.meeting_id,
-          $2::text AS guild_id,
-          j.job_type,
-          j.status,
-          j.retry_count,
-          j.error_message,
-          to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
-          to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
-          to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
-          to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
-          to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
-          j.cancel_reason,
-          to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-          to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+  AND m.status = 'failed'
+"#;
+
+pub const ADMIN_RETRY_JOB_SQL: &str = r#"
+WITH candidate AS MATERIALIZED (
+    SELECT j.id AS job_id, j.meeting_id
+    FROM jobs j
+    JOIN meetings m ON m.id = j.meeting_id
+    WHERE m.guild_id = $2
+      AND j.id = $1
+      AND j.job_type = 'summarize'
+      AND j.status IN ('failed', 'canceled')
+      AND m.status = 'failed'
+      AND $4::TEXT::BOOLEAN
+      AND m.retention_raw_cleaned_at IS NULL
+    FOR UPDATE OF j, m
+), restored_meeting AS (
+    UPDATE meetings m
+    SET status = 'stopping',
+        error_message = NULL,
+        updated_at = NOW()
+    FROM candidate c
+    WHERE m.id = c.meeting_id
+      AND m.status = 'failed'
+    RETURNING m.id
+), retried_job AS (
+    UPDATE jobs j
+    SET status = 'queued',
+        retry_count = 0,
+        error_message = NULL,
+        next_run_at = COALESCE(NULLIF($3, '')::timestamptz, NOW()),
+        leased_until = NULL,
+        claim_token = NULL,
+        finished_at = NULL,
+        dead_lettered_at = NULL,
+        canceled_at = NULL,
+        cancel_reason = NULL,
+        updated_at = NOW()
+    FROM candidate c
+    JOIN restored_meeting m ON m.id = c.meeting_id
+    WHERE j.id = c.job_id
+      AND j.status IN ('failed', 'canceled')
+    RETURNING j.id,
+              j.meeting_id,
+              j.job_type,
+              j.status,
+              j.retry_count,
+              j.error_message,
+              j.next_run_at,
+              j.leased_until,
+              j.finished_at,
+              j.dead_lettered_at,
+              j.canceled_at,
+              j.cancel_reason,
+              j.created_at,
+              j.updated_at
+)
+SELECT j.id,
+       j.meeting_id,
+       $2::text AS guild_id,
+       j.job_type,
+       j.status,
+       j.retry_count,
+       j.error_message,
+       to_char(j.next_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_run_at,
+       to_char(j.leased_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS leased_until,
+       to_char(j.finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS finished_at,
+       to_char(j.dead_lettered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS dead_lettered_at,
+       to_char(j.canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
+       j.cancel_reason,
+       to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+       to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+FROM retried_job j
 "#;
 
 pub const ADMIN_CANCEL_JOB_SQL: &str = r#"

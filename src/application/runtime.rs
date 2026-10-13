@@ -608,6 +608,14 @@ fn recoverable_audio_dir_with_legacy_fallback(
     }))
 }
 
+pub(crate) fn has_recoverable_audio_with_legacy_fallback(
+    primary_dir: PathBuf,
+    legacy_dir: PathBuf,
+) -> Result<bool, String> {
+    recoverable_audio_dir_with_legacy_fallback(primary_dir, legacy_dir)
+        .map(|audio_dir| audio_dir.is_some())
+}
+
 fn recovery_can_resume_from_final_transcript(status: MeetingStatus) -> bool {
     matches!(
         status,
