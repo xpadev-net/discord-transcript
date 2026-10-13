@@ -1,4 +1,3 @@
-use crate::application::summary::SpeakerAudioInput;
 use crate::audio::build_wav_bytes_raw;
 use crate::audio::songbird_adapter::SsrcTracker;
 use crate::audio::wav::{
@@ -6,6 +5,7 @@ use crate::audio::wav::{
     checked_pcm_growth, is_supported_wav_sample_rate, pcm_byte_len_for_duration_ms,
     pcm_duration_ms, resample_pcm_16le,
 };
+use crate::domain::speaker::SpeakerAudioInput;
 use crate::infrastructure::storage_fs::{
     decode_sanitized_path_component, sanitize_path_component, sanitize_path_component_candidates,
 };

@@ -1,5 +1,15 @@
 use std::collections::HashMap;
 
+/// Per-speaker audio file and its offset on the meeting timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerAudioInput {
+    pub speaker_id: String,
+    pub audio_path: String,
+    /// Offset from meeting start in milliseconds to align segments from this
+    /// speaker's audio back onto the meeting timeline.
+    pub offset_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeakerProfile {
     pub speaker_id: String,

@@ -3,6 +3,7 @@ use crate::domain::domain_knowledge::DomainKnowledgeItem;
 use crate::domain::feedback::{TranscriptFeedback, TranscriptFeedbackStatus};
 use crate::domain::person_alias::{PersonAlias, PersonAliasReviewStatus};
 use crate::domain::privacy::{MaskingStats, mask_pii};
+pub use crate::domain::speaker::SpeakerAudioInput;
 use crate::domain::speaker::SpeakerProfile;
 use crate::domain::summary_template::{
     SummaryTemplate, SummaryTemplateValidationError, SummaryTemplateVariables,
@@ -65,15 +66,6 @@ pub struct SummaryContextInput {
     pub summary_template: Option<SummaryTemplate>,
     pub effective_summary_template_id: Option<String>,
     pub effective_domain_knowledge_version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpeakerAudioInput {
-    pub speaker_id: String,
-    pub audio_path: String,
-    /// Offset from meeting start in milliseconds to align segments from this
-    /// speaker's audio back onto the meeting timeline.
-    pub offset_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
