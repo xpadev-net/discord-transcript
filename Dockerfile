@@ -7,7 +7,7 @@ RUN pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm run build
 
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends cmake libopus-dev libssl-dev pkg-config && rm -rf /var/lib/apt/lists/*
 

@@ -876,7 +876,9 @@ describe("App access controls", () => {
     renderApp("/admin/usage", fetchMock);
 
     await screen.findByRole("heading", { name: "Usage" });
-    expect(calledUrls).toContain("/api/guild/jobs?limit=100");
+    await waitFor(() =>
+      expect(calledUrls).toContain("/api/guild/jobs?limit=100"),
+    );
     expect(calledUrls).not.toContain("/api/guild/settings");
     screen.getByRole("link", { name: "Usage" });
     screen.getByRole("link", { name: "Jobs" });
@@ -1984,14 +1986,17 @@ describe("App access controls", () => {
     const selector = (await screen.findByRole("combobox", {
       name: "\u30ae\u30eb\u30c9",
     })) as HTMLSelectElement;
+    await waitFor(() => expect(memoryCalls).toBe(1));
     fireEvent.change(selector, { target: { value: "guild-2" } });
 
     expect(await screen.findByText("Guild Two のギルド設定")).toBeTruthy();
-    staleMemory.resolve(
-      jsonResponse([aiMemoryNote({ title: "Stale memory" })]),
-    );
+    await act(async () => {
+      staleMemory.resolve(
+        jsonResponse([aiMemoryNote({ title: "Stale memory" })]),
+      );
+      await staleMemory.promise;
+    });
 
-    await waitFor(() => expect(memoryCalls).toBe(1));
     expect(screen.queryByDisplayValue("Stale memory")).toBeNull();
   });
 
