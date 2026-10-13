@@ -10408,9 +10408,19 @@ mod status_message_tests {
 
     #[test]
     fn generated_summary_persistence_failure_is_fatal_to_completion_path() {
-        let mut executor = FakeSqlExecutor::default();
+        let mut executor = FakeSqlExecutor::strict();
+        let params = [
+            "m1-s-1",
+            "m1",
+            "## Summary\nresult",
+            &crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION.to_string(),
+        ];
         executor.execute_error.insert(
-            format!("{}|*", crate::infrastructure::sql::INSERT_SUMMARY_SQL),
+            format!(
+                "{}|{}",
+                crate::infrastructure::sql::INSERT_SUMMARY_SQL,
+                params.join("\u{1f}")
+            ),
             "database unavailable".to_owned(),
         );
 
@@ -11118,9 +11128,11 @@ mod status_message_tests {
 
     #[test]
     fn summary_status_transition_backend_retry_limit_fits_sql_integer() {
-        let mut executor = FakeSqlExecutor::default();
-        executor.query_rows_result.insert(
-            format!("{}|*", crate::infrastructure::sql::RETRY_JOB_SQL),
+        let mut executor = FakeSqlExecutor::strict();
+        executor.register_query_rows_wildcard(
+            crate::infrastructure::sql::RETRY_JOB_SQL,
+            4,
+            &[0, 1, 2, 3],
             vec![vec![Some("queued".to_owned())]],
         );
         let mut queue = SqlJobQueue::new(executor);
@@ -11196,6 +11208,43 @@ mod status_message_tests {
             assert_eq!(meeting.status, status);
             assert_eq!(meeting.error_message, None);
         }
+    }
+
+    #[test]
+    fn summary_status_transition_sql_cas_conflict_is_registered_and_detected() {
+        let mut executor = FakeSqlExecutor::strict();
+        executor.register_execute_wildcard(
+            crate::infrastructure::sql::MARK_JOB_FAILED_SQL,
+            3,
+            &[0, 1, 2],
+            0,
+        );
+        let mut queue = SqlJobQueue::new(executor);
+        let job = running_summary_job();
+
+        let err = handle_summary_status_transition_failure(
+            &mut queue,
+            &job,
+            StoreError::CasConflict {
+                meeting_id: job.meeting_id.clone(),
+            },
+            "Transcribing->Summarizing",
+        );
+
+        assert!(matches!(
+            err,
+            SummaryJobRunError::Terminal(message)
+                if message.contains("meeting status does not match expected value")
+        ));
+        assert_eq!(queue.executor.executed.len(), 1);
+        assert_eq!(
+            queue.executor.executed[0].0,
+            crate::infrastructure::sql::MARK_JOB_FAILED_SQL
+        );
+        assert_eq!(queue.executor.executed[0].1.len(), 3);
+        assert_eq!(queue.executor.executed[0].1[0], job.id);
+        assert!(!queue.executor.executed[0].1[1].is_empty());
+        assert_eq!(queue.executor.executed[0].1[2], "token-m1");
     }
 
     #[test]

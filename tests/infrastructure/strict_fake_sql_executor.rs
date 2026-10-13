@@ -111,6 +111,49 @@ fn strict_fake_query_rows_uses_registered_exact_and_wildcard_results() {
 }
 
 #[test]
+fn strict_fake_wildcard_registration_checks_bind_count_and_required_values() {
+    let mut executor = FakeSqlExecutor::strict();
+    executor.register_query_rows_wildcard(
+        "UPDATE jobs SET status=$1 WHERE id=$2 AND claim_token=$3 RETURNING status",
+        3,
+        &[0, 1, 2],
+        vec![sql_row_from_strings(vec!["queued".to_owned()])],
+    );
+
+    let wrong_count = executor
+        .query_rows(
+            "UPDATE jobs SET status=$1 WHERE id=$2 AND claim_token=$3 RETURNING status",
+            &["queued".to_owned(), "job-1".to_owned()],
+        )
+        .expect_err("wildcard registration must reject the wrong bind count");
+    assert!(wrong_count.contains("bind count mismatch"));
+
+    let missing_claim_token = executor
+        .query_rows(
+            "UPDATE jobs SET status=$1 WHERE id=$2 AND claim_token=$3 RETURNING status",
+            &[
+                "queued".to_owned(),
+                "job-1".to_owned(),
+                " ".to_owned(),
+            ],
+        )
+        .expect_err("wildcard registration must reject an empty claim token");
+    assert!(missing_claim_token.contains("required bind 2 is empty or missing"));
+
+    let matched = executor
+        .query_rows(
+            "UPDATE jobs SET status=$1 WHERE id=$2 AND claim_token=$3 RETURNING status",
+            &[
+                "queued".to_owned(),
+                "job-1".to_owned(),
+                "generated-claim-token".to_owned(),
+            ],
+        )
+        .expect("correct wildcard binds should be accepted");
+    assert_eq!(matched, vec![sql_row_from_strings(vec!["queued".to_owned()])]);
+}
+
+#[test]
 fn strict_fake_run_migration_uses_registered_success() {
     let mut executor = FakeSqlExecutor::strict();
     executor

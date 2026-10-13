@@ -237,9 +237,17 @@ pub struct FakeSqlExecutor {
     pub query_rows_error: HashMap<String, String>,
     pub execute_result: HashMap<String, u64>,
     pub execute_error: HashMap<String, String>,
+    pub execute_wildcard_bind_expectations: HashMap<String, FakeSqlBindExpectation>,
+    pub query_rows_wildcard_bind_expectations: HashMap<String, FakeSqlBindExpectation>,
     pub run_migration_success: HashSet<String>,
     pub run_migration_error: HashMap<String, String>,
     pub strict_unregistered_sql: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeSqlBindExpectation {
+    pub bind_count: usize,
+    pub required_non_empty: Vec<usize>,
 }
 
 impl FakeSqlExecutor {
@@ -258,6 +266,71 @@ impl FakeSqlExecutor {
         format!("{sql}|*")
     }
 
+    pub fn register_execute_wildcard(
+        &mut self,
+        sql: &str,
+        bind_count: usize,
+        required_non_empty: &[usize],
+        result: u64,
+    ) {
+        let key = Self::wildcard_sql_key(sql);
+        self.execute_result.insert(key.clone(), result);
+        self.execute_wildcard_bind_expectations.insert(
+            key,
+            FakeSqlBindExpectation {
+                bind_count,
+                required_non_empty: required_non_empty.to_vec(),
+            },
+        );
+    }
+
+    pub fn register_query_rows_wildcard(
+        &mut self,
+        sql: &str,
+        bind_count: usize,
+        required_non_empty: &[usize],
+        rows: Vec<SqlRow>,
+    ) {
+        let key = Self::wildcard_sql_key(sql);
+        self.query_rows_result.insert(key.clone(), rows);
+        self.query_rows_wildcard_bind_expectations.insert(
+            key,
+            FakeSqlBindExpectation {
+                bind_count,
+                required_non_empty: required_non_empty.to_vec(),
+            },
+        );
+    }
+
+    fn validate_wildcard_binds(
+        kind: &str,
+        sql: &str,
+        params: &[String],
+        expectation: Option<&FakeSqlBindExpectation>,
+    ) -> Result<(), String> {
+        let Some(expectation) = expectation else {
+            return Ok(());
+        };
+        if params.len() != expectation.bind_count {
+            return Err(format!(
+                "wildcard fake {kind} bind count mismatch: expected {}, got {} for sql={sql:?}",
+                expectation.bind_count,
+                params.len()
+            ));
+        }
+        for index in &expectation.required_non_empty {
+            if params
+                .get(*index)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(format!(
+                    "wildcard fake {kind} required bind {index} is empty or missing for sql={sql:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn unregistered_sql_error(kind: &str, sql: &str, params: &[String]) -> String {
         format!("unregistered fake {kind}: sql={sql:?}, params={params:?}")
     }
@@ -268,20 +341,30 @@ impl SqlExecutor for FakeSqlExecutor {
         self.executed.push((sql.to_owned(), params.to_vec()));
         let key = Self::sql_key(sql, params);
         let wildcard_key = Self::wildcard_sql_key(sql);
-        if let Some(err) = self
-            .execute_error
-            .get(&key)
-            .or_else(|| self.execute_error.get(&wildcard_key))
-        {
+        if let Some(err) = self.execute_error.get(&key) {
+            return Err(err.clone());
+        }
+        if let Some(err) = self.execute_error.get(&wildcard_key) {
+            Self::validate_wildcard_binds(
+                "execute",
+                sql,
+                params,
+                self.execute_wildcard_bind_expectations.get(&wildcard_key),
+            )?;
             return Err(err.clone());
         }
         // Wildcard keys support SQL whose params include generated values such as
         // claim tokens. They intentionally bypass exact parameter arity checks.
-        if let Some(result) = self
-            .execute_result
-            .get(&key)
-            .or_else(|| self.execute_result.get(&wildcard_key))
-        {
+        if let Some(result) = self.execute_result.get(&key) {
+            return Ok(*result);
+        }
+        if let Some(result) = self.execute_result.get(&wildcard_key) {
+            Self::validate_wildcard_binds(
+                "execute",
+                sql,
+                params,
+                self.execute_wildcard_bind_expectations.get(&wildcard_key),
+            )?;
             return Ok(*result);
         }
         if self.strict_unregistered_sql {
@@ -298,20 +381,32 @@ impl SqlExecutor for FakeSqlExecutor {
         self.executed.push((sql.to_owned(), params.to_vec()));
         let key = Self::sql_key(sql, params);
         let wildcard_key = Self::wildcard_sql_key(sql);
-        if let Some(err) = self
-            .query_rows_error
-            .get(&key)
-            .or_else(|| self.query_rows_error.get(&wildcard_key))
-        {
+        if let Some(err) = self.query_rows_error.get(&key) {
+            return Err(err.clone());
+        }
+        if let Some(err) = self.query_rows_error.get(&wildcard_key) {
+            Self::validate_wildcard_binds(
+                "query_rows",
+                sql,
+                params,
+                self.query_rows_wildcard_bind_expectations
+                    .get(&wildcard_key),
+            )?;
             return Err(err.clone());
         }
         // Wildcard keys support SQL whose params include generated values such as
         // claim tokens. They intentionally bypass exact parameter arity checks.
-        if let Some(result) = self
-            .query_rows_result
-            .get(&key)
-            .or_else(|| self.query_rows_result.get(&wildcard_key))
-        {
+        if let Some(result) = self.query_rows_result.get(&key) {
+            return Ok(result.clone());
+        }
+        if let Some(result) = self.query_rows_result.get(&wildcard_key) {
+            Self::validate_wildcard_binds(
+                "query_rows",
+                sql,
+                params,
+                self.query_rows_wildcard_bind_expectations
+                    .get(&wildcard_key),
+            )?;
             return Ok(result.clone());
         }
         if self.strict_unregistered_sql {
