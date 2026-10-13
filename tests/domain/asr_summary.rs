@@ -2066,7 +2066,7 @@ fn materialized_summary_context_regenerates_legacy_unminimized_manifest() {
     )
     .expect("legacy context should be regenerated");
 
-    assert_eq!(manifest.context_selection_version, 3);
+    assert_eq!(manifest.context_selection_version, 4);
     assert_eq!(manifest.ai_memory_count, 0);
     let ai_memory_context =
         std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");
@@ -2260,6 +2260,101 @@ fn summary_output_verbatim_context_leak_flags_long_copies() {
         discord_transcript::application::summary::summary_output_verbatim_context_leak(
             &leaked_short,
             &short_template
+        ),
+        None
+    );
+}
+
+#[test]
+fn summary_output_verbatim_context_leak_detects_japanese_materialized_bodies() {
+    let temp = unique_workspace("japanese_context_leak", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("顧客移行計画".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("ja".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+    let protected_body = "顧客移行計画に関する重要な社内情報を公開しないでください".repeat(4);
+    let context = SummaryContextInput {
+        domain_knowledge: vec![DomainKnowledgeItem {
+            id: "dk-japanese-protected".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: "顧客移行計画".to_owned(),
+            body: protected_body.clone(),
+            active: true,
+            allow_summary_context: true,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }],
+        summary_template: Some(SummaryTemplate {
+            id: "st-short-japanese".to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            name: "短い指示".to_owned(),
+            template: "出力は日本語で簡潔に".to_owned(),
+            active: true,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }),
+        user_feedback: vec![TranscriptFeedback {
+            original_text: Some("旧名称".to_owned()),
+            corrected_text: Some("正式名称を使う".to_owned()),
+            note: None,
+            ..accepted_feedback("fb-short-japanese", "short correction", updated_at)
+        }],
+        ..SummaryContextInput::default()
+    };
+    materialize_summary_context(
+        &request,
+        &context,
+        Some("顧客移行計画の進捗を確認しました。"),
+    )
+    .expect("context should materialize");
+    let bodies = discord_transcript::application::summary::summary_context_leak_bodies_for_workspace(
+        &request.workspace,
+        &SummaryContextInput::default(),
+    );
+
+    let markdown_copy = format!("**{}**", protected_body.replace('い', "、い"));
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_leak_in_bodies(
+            &markdown_copy,
+            &bodies
+        ),
+        Some("domain knowledge")
+    );
+    let partial_copy = protected_body.chars().take(48).collect::<String>();
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_leak_in_bodies(
+            &partial_copy,
+            &bodies
+        ),
+        Some("domain knowledge")
+    );
+    assert_eq!(
+        discord_transcript::application::summary::summary_output_verbatim_leak_in_bodies(
+            "出力は日本語で簡潔に。正式名称を使う。",
+            &bodies
         ),
         None
     );

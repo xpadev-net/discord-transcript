@@ -136,7 +136,8 @@ pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
 /// the verbatim-leak check, so retries compare the bodies the agent actually
 /// received instead of whatever the store holds at check time.
 /// v3: context relevance includes CJK phrases and character n-grams.
-pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 3;
+/// v4: the post-summary leak check recognizes long CJK verbatim copies.
+pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {
@@ -824,6 +825,10 @@ const CONTEXT_LEAK_MIN_BODY_WORDS: usize = 2;
 /// Consecutive normalized words shared between the output and a protected
 /// context body that count as a verbatim copy.
 const CONTEXT_LEAK_WINDOW_WORDS: usize = 15;
+/// Minimum CJK characters for whole-body or long-window verbatim checks.
+const CONTEXT_LEAK_MIN_CJK_BODY_CHARS: usize = 20;
+const CONTEXT_LEAK_CJK_WINDOW_CHARS: usize = 48;
+const CONTEXT_LEAK_CJK_WINDOW_MIN_CJK_CHARS: usize = 24;
 
 /// Normalize text for the leak check: lowercase and drop non-alphanumeric
 /// characters inside words so Markdown emphasis or punctuation injected
@@ -838,6 +843,15 @@ fn normalized_leak_words(text: &str) -> Vec<String> {
                 .to_lowercase();
             (!normalized.is_empty()).then_some(normalized)
         })
+        .collect()
+}
+
+/// Compact alphanumeric normalization keeps CJK text comparable when
+/// whitespace, Markdown markers, or punctuation differ around copied text.
+fn normalized_leak_compact(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -995,12 +1009,18 @@ pub fn load_summary_context_leak_bodies(
 /// A body counts as leaked when the output shares a run of
 /// [`CONTEXT_LEAK_WINDOW_WORDS`] normalized words with it (or the whole body
 /// when it has at least [`CONTEXT_LEAK_MIN_BODY_WORDS`] words but fewer than
-/// the window).
+/// the window). CJK text also checks full copies with at least
+/// [`CONTEXT_LEAK_MIN_CJK_BODY_CHARS`] CJK characters for protected body kinds,
+/// plus [`CONTEXT_LEAK_CJK_WINDOW_CHARS`]-character runs containing at least
+/// [`CONTEXT_LEAK_CJK_WINDOW_MIN_CJK_CHARS`] CJK characters. This exact-text
+/// check does not detect paraphrases or guarantee complete information-flow
+/// prevention.
 pub fn summary_output_verbatim_leak_in_bodies(
     markdown: &str,
     bodies: &[MaterializedLeakCheckBody],
 ) -> Option<&'static str> {
     let output = normalized_leak_words(markdown).join(" ");
+    let compact_output = normalized_leak_compact(markdown);
     for body in bodies {
         let words = normalized_leak_words(&body.body);
         if words.len() >= CONTEXT_LEAK_WINDOW_WORDS {
@@ -1013,6 +1033,34 @@ pub fn summary_output_verbatim_leak_in_bodies(
             let normalized_body = words.join(" ");
             if output.contains(&normalized_body) {
                 return leak_kind_static(&body.kind);
+            }
+        }
+
+        let compact_body = normalized_leak_compact(&body.body);
+        let cjk_char_count = compact_body
+            .chars()
+            .filter(|ch| is_cjk_context_char(*ch))
+            .count();
+        if cjk_char_count >= CONTEXT_LEAK_MIN_CJK_BODY_CHARS {
+            if leak_body_short_match(&body.kind)
+                && !compact_body.is_empty()
+                && compact_output.contains(&compact_body)
+            {
+                return leak_kind_static(&body.kind);
+            }
+
+            for window in compact_body
+                .chars()
+                .collect::<Vec<_>>()
+                .windows(CONTEXT_LEAK_CJK_WINDOW_CHARS)
+            {
+                let cjk_in_window = window.iter().filter(|ch| is_cjk_context_char(**ch)).count();
+                let normalized_window = window.iter().collect::<String>();
+                if cjk_in_window >= CONTEXT_LEAK_CJK_WINDOW_MIN_CJK_CHARS
+                    && compact_output.contains(&normalized_window)
+                {
+                    return leak_kind_static(&body.kind);
+                }
             }
         }
     }
