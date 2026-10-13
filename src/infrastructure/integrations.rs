@@ -1346,6 +1346,7 @@ mod tests {
         read_temp_output_file, run_agent_harness_with_output_contract, run_command_with_timeout,
         run_command_with_timeout_and_output_limit, sanitize_whisper_endpoint_for_log,
     };
+    use crate::application::asr::{AsrError, AsrRequest, AudioSource, S3AudioObjectReference};
     use crate::application::summary::{ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT};
     use crate::bootstrap::config::SummaryHarness;
     use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
@@ -1353,6 +1354,38 @@ mod tests {
     use std::io::Write;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn command_whisper_adapter_rejects_s3_sources_without_treating_keys_as_urls() {
+        let client = CommandWhisperClient {
+            endpoint: "http://localhost".to_owned(),
+            curl_bin: "must-not-run".to_owned(),
+            retry_policy: RetryPolicy::default(),
+            beam_size: 1,
+            suppress_non_speech: false,
+            prompt: None,
+            vad: false,
+            temperature: 0.0,
+            command_timeout: Duration::from_secs(1),
+        };
+        let request = AsrRequest {
+            source: AudioSource::S3Object(
+                S3AudioObjectReference::new(
+                    "meetings/meeting-1/audio/alice.wav",
+                    Some("alice".to_owned()),
+                    Some(1_250),
+                )
+                .unwrap(),
+            ),
+            language: None,
+            prompt: None,
+        };
+
+        assert!(matches!(
+            crate::application::asr::AsrPort::infer(&client, &request),
+            Err(AsrError::InvalidAudioSource(_))
+        ));
+    }
 
     #[test]
     fn command_runner_times_out_and_kills_hanging_command() {

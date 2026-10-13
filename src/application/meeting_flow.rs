@@ -1,4 +1,5 @@
 use crate::application::ai_memory_extraction::AiMemoryExtractionStore;
+use crate::application::asr::AsrPort;
 use crate::application::recovery_runner::{RecoveryEffect, RecoveryRunnerError, run_recovery};
 use crate::application::summary::ClaudeSummaryClient;
 use crate::application::worker::{
@@ -9,7 +10,6 @@ use crate::domain::recovery::RecoveryCandidate;
 use crate::domain::retention::{
     ArtifactRecord, CleanupCandidate, RetentionPolicy, select_cleanup_candidates,
 };
-use crate::infrastructure::asr::WhisperClient;
 use crate::infrastructure::storage::{MeetingStore, StoreError};
 use crate::infrastructure::storage_fs::ChunkStorage;
 use std::fmt::{Display, Formatter};
@@ -113,7 +113,7 @@ pub fn run_meeting_flow<S, C, W, FS>(
 where
     S: MeetingStore + AiMemoryExtractionStore,
     C: ClaudeSummaryClient,
-    W: WhisperClient,
+    W: AsrPort,
     FS: ChunkStorage,
 {
     let recovery_effect = run_recovery(store, input.recovery_candidate)?;

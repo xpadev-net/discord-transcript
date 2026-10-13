@@ -1,6 +1,7 @@
 use crate::application::ai_memory_extraction::{
     AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
+use crate::application::asr::AsrPort;
 use crate::application::runtime::{has_nonempty_audio_chunk, merge_user_chunks_to_mixdown};
 use crate::application::summary::{
     ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
@@ -24,7 +25,6 @@ use crate::domain::usage::{
     UsageSnapshot,
 };
 use crate::domain::{JobStatus, JobType, MeetingStatus};
-use crate::infrastructure::asr::WhisperClient;
 use crate::infrastructure::queue::{Job, JobQueue, QueueError};
 use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{
@@ -872,7 +872,7 @@ pub fn process_meeting_summary<S, W, C>(
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
     S: MeetingStore + AiMemoryExtractionStore,
-    W: WhisperClient,
+    W: AsrPort,
     C: ClaudeSummaryClient,
 {
     process_meeting_summary_with_ownership_check(store, whisper, claude, input, || Ok(()))
@@ -887,7 +887,7 @@ fn process_meeting_summary_with_ownership_check<S, W, C, F>(
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
     S: MeetingStore + AiMemoryExtractionStore,
-    W: WhisperClient,
+    W: AsrPort,
     C: ClaudeSummaryClient,
     F: FnMut() -> Result<(), WorkerError>,
 {
@@ -1392,7 +1392,7 @@ pub fn process_next_summary_job<S, Q, W, C>(
 where
     S: MeetingStore + SummaryContextStore + AiMemoryExtractionStore,
     Q: JobQueue,
-    W: WhisperClient,
+    W: AsrPort,
     C: ClaudeSummaryClient,
 {
     let Some(job) = queue.claim_next(JobType::Summarize)? else {
@@ -1417,7 +1417,7 @@ pub fn process_claimed_summary_job<S, Q, W, C>(
 where
     S: MeetingStore + SummaryContextStore + AiMemoryExtractionStore,
     Q: JobQueue,
-    W: WhisperClient,
+    W: AsrPort,
     C: ClaudeSummaryClient,
 {
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");

@@ -1,6 +1,7 @@
 use crate::application::ai_memory_extraction::{
     AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
+use crate::application::asr::{AsrPort, AsrRequest};
 use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
 use crate::application::command::{
@@ -46,7 +47,6 @@ use crate::domain::usage::{
 };
 use crate::domain::{JobType, MeetingStatus, StopReason};
 use crate::infrastructure::agent::{SummaryClientConfig, build_summary_client};
-use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest};
 use crate::infrastructure::integrations::{CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT};
 use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
@@ -4064,14 +4064,14 @@ impl ScaffoldHandler {
             temperature: effective_settings.whisper_temperature,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
         };
-        let request = WhisperInferenceRequest {
-            audio_path: chunk.saved.path.to_string_lossy().to_string(),
-            language: effective_settings.whisper_language.clone(),
-            prompt: crate::application::summary::build_whisper_context_prompt(
+        let request = AsrRequest::local_file(
+            chunk.saved.path.clone(),
+            effective_settings.whisper_language.clone(),
+            crate::application::summary::build_whisper_context_prompt(
                 meeting_title.as_deref(),
                 Some(&chunk.user_id),
             ),
-        };
+        );
         let transcription = tokio::task::block_in_place(|| whisper.infer(&request));
         let mut segments = match transcription {
             Ok(output) => {

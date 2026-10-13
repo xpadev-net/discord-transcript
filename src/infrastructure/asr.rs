@@ -1,8 +1,12 @@
+use crate::application::asr::{AsrError, AsrPort, AsrRequest};
+pub use crate::application::asr::{
+    AsrError as WhisperParseError, AsrResult as WhisperTranscriptionResult,
+};
 use crate::domain::transcript::{
     MAX_DB_TIMESTAMP_MS, TranscriptSegment, TranscriptSource, is_valid_transcript_confidence,
 };
 use serde::Deserialize;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Formatter};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct WhisperInferenceRequest {
@@ -23,37 +27,12 @@ impl Debug for WhisperInferenceRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct WhisperTranscriptionResult {
-    pub text: String,
-    pub segments: Vec<TranscriptSegment>,
-    /// Raw response body returned by the Whisper server. Captured so callers
-    /// can persist it as a debug artifact without re-running inference.
-    pub raw_body: String,
-}
-
-#[derive(Debug)]
-pub enum WhisperParseError {
-    InvalidJson(String),
-    InvalidSegment(String),
-}
-
-impl Display for WhisperParseError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidJson(err) => write!(f, "invalid whisper response json: {err}"),
-            Self::InvalidSegment(err) => write!(f, "invalid whisper segment: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for WhisperParseError {}
-
 #[cfg(test)]
 fn message_contains_http_status(message: &str, status: u16) -> bool {
     http_status_from_message(message) == Some(status)
 }
 
+#[cfg(test)]
 fn http_status_from_message(message: &str) -> Option<u16> {
     let lower = message.to_ascii_lowercase();
     for marker in ["http_status=", "status="] {
@@ -70,6 +49,7 @@ fn http_status_from_message(message: &str) -> Option<u16> {
     None
 }
 
+#[cfg(test)]
 fn parse_status_after_marker(message: &str, marker: &str) -> Option<u16> {
     let index = message.find(marker)? + marker.len();
     let digits = message[index..]
@@ -79,43 +59,20 @@ fn parse_status_after_marker(message: &str, marker: &str) -> Option<u16> {
     parse_http_status_token(&digits)
 }
 
+#[cfg(test)]
 fn first_status_token(message: &str) -> Option<u16> {
     message
         .split(|ch: char| !ch.is_ascii_digit())
         .find_map(parse_http_status_token)
 }
 
+#[cfg(test)]
 fn parse_http_status_token(token: &str) -> Option<u16> {
     if token.len() != 3 {
         return None;
     }
     let status = token.parse::<u16>().ok()?;
     if status <= 599 { Some(status) } else { None }
-}
-
-impl WhisperParseError {
-    pub fn is_retriable(&self) -> bool {
-        match self {
-            Self::InvalidSegment(_) => false,
-            Self::InvalidJson(message) => {
-                if message.starts_with("malformed successful whisper response")
-                    || message.starts_with("non-retriable whisper command")
-                {
-                    return false;
-                }
-                if message.starts_with("retriable whisper transport failure") {
-                    return true;
-                }
-                if let Some(status) = http_status_from_message(message) {
-                    return status == 0 || status == 429 || (500..=599).contains(&status);
-                }
-                if !message.contains("whisper command failed") {
-                    return true;
-                }
-                true
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -190,6 +147,25 @@ pub trait WhisperClient {
         &self,
         request: &WhisperInferenceRequest,
     ) -> Result<WhisperTranscriptionResult, WhisperParseError>;
+}
+
+/// Compatibility bridge for existing infrastructure clients. New adapters
+/// should implement the application port directly when they support non-local
+/// sources; this bridge deliberately rejects object references.
+impl<T: WhisperClient> AsrPort for T {
+    fn infer(&self, request: &AsrRequest) -> Result<WhisperTranscriptionResult, AsrError> {
+        let Some(path) = request.source.local_path() else {
+            return Err(AsrError::InvalidAudioSource(
+                "legacy Whisper clients accept local files only".to_owned(),
+            ));
+        };
+        let legacy_request = WhisperInferenceRequest {
+            audio_path: path.to_string_lossy().into_owned(),
+            language: request.language.clone(),
+            prompt: request.prompt.clone(),
+        };
+        WhisperClient::infer(self, &legacy_request)
+    }
 }
 
 #[derive(Debug, Clone)]

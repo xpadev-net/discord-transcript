@@ -1,3 +1,4 @@
+use crate::application::asr::{AsrError, AsrPort, AsrRequest};
 use crate::domain::ai_memory::AiMemoryNote;
 use crate::domain::domain_knowledge::DomainKnowledgeItem;
 use crate::domain::feedback::{TranscriptFeedback, TranscriptFeedbackStatus};
@@ -12,7 +13,6 @@ use crate::domain::summary_template::{
 use crate::domain::transcript::{
     NormalizationConfig, normalize_segments, render_for_summary, sort_transcript_segments,
 };
-use crate::infrastructure::asr::{WhisperClient, WhisperInferenceRequest, WhisperParseError};
 use crate::infrastructure::workspace::{
     AGENT_OUTPUT_DIR, AGENT_SUMMARY_OUTPUT_FILENAME, AgentWorkspace, AgentWorkspaceBuilder,
     AgentWorkspaceError, CONTEXT_AI_MEMORY_FILENAME, CONTEXT_DOMAIN_KNOWLEDGE_FILENAME,
@@ -165,8 +165,8 @@ impl Display for SummaryError {
 
 impl std::error::Error for SummaryError {}
 
-impl From<WhisperParseError> for SummaryError {
-    fn from(value: WhisperParseError) -> Self {
+impl From<AsrError> for SummaryError {
+    fn from(value: AsrError) -> Self {
         Self::Asr(value.to_string())
     }
 }
@@ -303,16 +303,16 @@ struct SpeakerRosterEntry {
     display_name: Option<String>,
 }
 
-pub fn run_transcription<W: WhisperClient>(
+pub fn run_transcription<W: AsrPort>(
     whisper: &W,
     request: &SummaryRequest,
 ) -> Result<TranscriptionOutput, SummaryError> {
     if request.speaker_audio.is_empty() {
-        let transcription = whisper.infer(&WhisperInferenceRequest {
-            audio_path: request.audio_path.clone(),
-            language: request.language.clone(),
-            prompt: build_whisper_prompt(request, None),
-        })?;
+        let transcription = whisper.infer(&AsrRequest::local_file(
+            request.audio_path.clone(),
+            request.language.clone(),
+            build_whisper_prompt(request, None),
+        ))?;
         persist_whisper_debug_response(
             &request.workspace.mixdown_whisper_response_path(),
             &transcription.raw_body,
@@ -322,11 +322,11 @@ pub fn run_transcription<W: WhisperClient>(
 
     let mut merged_segments = Vec::new();
     for speaker in &request.speaker_audio {
-        let transcription = whisper.infer(&WhisperInferenceRequest {
-            audio_path: speaker.audio_path.clone(),
-            language: request.language.clone(),
-            prompt: build_whisper_prompt(request, Some(speaker)),
-        })?;
+        let transcription = whisper.infer(&AsrRequest::local_file(
+            speaker.audio_path.clone(),
+            request.language.clone(),
+            build_whisper_prompt(request, Some(speaker)),
+        ))?;
         persist_whisper_debug_response(
             &request.workspace.whisper_response_path(&speaker.speaker_id),
             &transcription.raw_body,
@@ -1600,7 +1600,7 @@ fn confidence_label(confidence: Option<crate::domain::confidence::ConfidencePerm
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-pub fn run_summary_pipeline<W: WhisperClient, C: ClaudeSummaryClient>(
+pub fn run_summary_pipeline<W: AsrPort, C: ClaudeSummaryClient>(
     whisper: &W,
     claude: &C,
     request: &SummaryRequest,
