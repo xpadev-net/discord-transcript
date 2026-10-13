@@ -5,7 +5,7 @@ use crate::infrastructure::storage_fs::{
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +39,13 @@ const CANCEL_INFLIGHT_WAIT: Duration = Duration::from_secs(65);
 /// How often the upload worker re-fetches remote tombstone objects so a
 /// delete issued by another process stops pending uploads here as well.
 const TOMBSTONE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// Pause between staging-file enqueue attempts so the reconciliation producer
+/// does not fill the upload queue faster than a slow object store can drain it.
+const RECONCILE_ENQUEUE_INTERVAL: Duration = Duration::from_millis(1);
+/// Retry transient list failures and queue saturation while the process stays
+/// up; successful scans are repeated less often to catch unreadable paths.
+const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(250);
+const RECONCILE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Task payload: chunk/audio bytes already in memory, or a file the worker
 /// reads lazily (so large artifacts never sit in queue memory).
@@ -202,6 +209,8 @@ struct UploadQueue {
     objects: Arc<dyn ObjectStore>,
     /// `{key_prefix}.tombstones/` — one object per deleted prefix.
     tombstone_prefix: String,
+    reconcile_stop: Arc<AtomicBool>,
+    reconciler: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl UploadQueue {
@@ -246,7 +255,37 @@ impl UploadQueue {
             cancel,
             objects,
             tombstone_prefix,
+            reconcile_stop: Arc::new(AtomicBool::new(false)),
+            reconciler: Mutex::new(None),
         }
+    }
+
+    fn start_reconciler(
+        self: &Arc<Self>,
+        objects: Arc<dyn ObjectStore>,
+        key_prefix: String,
+        storage_dir: PathBuf,
+    ) -> Result<(), std::io::Error> {
+        let mut reconciler = self.reconciler.lock().unwrap();
+        if reconciler
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(worker) = reconciler.take() {
+            let _ = worker.join();
+        }
+        let uploads = Arc::downgrade(self);
+        let stop = Arc::clone(&self.reconcile_stop);
+        *reconciler = Some(
+            std::thread::Builder::new()
+                .name("s3-reconcile".to_owned())
+                .spawn(move || {
+                    reconcile_staged_uploads_loop(uploads, objects, key_prefix, storage_dir, stop)
+                })?,
+        );
+        Ok(())
     }
 
     /// Refresh remote tombstones: deletes issued in another process write
@@ -527,6 +566,19 @@ impl UploadQueue {
 
 impl Drop for UploadQueue {
     fn drop(&mut self) {
+        self.reconcile_stop.store(true, Ordering::SeqCst);
+        if let Some(reconciler) = self.reconciler.lock().unwrap().take() {
+            let reconciler_thread = reconciler.thread().id();
+            if reconciler_thread == std::thread::current().id() {
+                // A final Weak upgrade can become the last Arc when the store
+                // is dropped during a scan. The stop flag makes that worker
+                // exit after this Drop returns; joining itself would deadlock.
+                drop(reconciler);
+            } else {
+                reconciler.thread().unpark();
+                let _ = reconciler.join();
+            }
+        }
         // Close the channel so the worker drains what's left, then wait for
         // it. Each remaining task is attempted once, so this is bounded by
         // task count × request timeout.
@@ -743,80 +795,43 @@ impl RecordingObjectStore {
     /// Object prefix holding one tombstone per deleted recording prefix.
     /// Tombstones live outside every deleted prefix so `delete_prefix` never
     /// removes its own marker.
+    #[cfg(test)]
     fn tombstone_prefix(&self) -> String {
         format!("{}.tombstones/", self.key_prefix)
     }
 
-    /// Re-enqueues staged files whose remote object is missing, on a
-    /// background thread. Pending uploads exist only in memory, so a restart
-    /// during an S3 outage would otherwise leave finished meetings' remote
-    /// copies missing until retention deleted the staging files. Call once
-    /// at process start; the scan costs one remote list plus a local walk.
+    /// Reconciles staged files whose remote object is missing on a background
+    /// thread. It retries failed listings and queue saturation while this
+    /// store is alive, so startup work is not lost until the next restart.
     pub fn reconcile_staged_uploads(&self) {
-        let this = self.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("s3-reconcile".to_owned())
-            .spawn(move || this.reconcile_staged_uploads_now())
-        {
+        if let Err(err) = self.uploads.start_reconciler(
+            Arc::clone(&self.objects),
+            self.key_prefix.clone(),
+            self.storage_dir.clone(),
+        ) {
             warn!(error = %err, "failed to spawn s3 reconcile thread");
         }
     }
 
     /// Synchronous body of `reconcile_staged_uploads`, split out for tests.
+    #[cfg(test)]
     fn reconcile_staged_uploads_now(&self) {
-        let remote: HashSet<String> = match self.objects.list_keys(&self.key_prefix) {
-            Ok(keys) => keys.into_iter().collect(),
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "s3 reconcile: cannot list remote objects; skipping"
-                );
-                return;
-            }
-        };
-        let tombstone_prefix = self.tombstone_prefix();
-        let tombstoned: Vec<String> = self
-            .objects
-            .list_keys(&tombstone_prefix)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|key| {
-                key.strip_prefix(tombstone_prefix.as_str())
-                    .map(str::to_owned)
-            })
-            .collect();
-        let mut files = Vec::new();
-        collect_staged_files(&self.storage_dir, &mut files);
-        let mut scanned = 0usize;
-        let mut queued = 0usize;
-        for path in files {
-            let Ok(rel) = path.strip_prefix(&self.storage_dir) else {
-                continue;
-            };
-            if !is_upload_candidate(rel) {
-                continue;
-            }
-            scanned += 1;
-            let Some(key) = self.object_key(&path) else {
-                continue;
-            };
-            if remote.contains(&key)
-                || tombstoned
-                    .iter()
-                    .any(|prefix| key.starts_with(prefix.as_str()))
-            {
-                continue;
-            }
-            match self.upload_file(&path, upload_content_type(rel)) {
-                Ok(true) => queued += 1,
-                Ok(false) => {}
-                Err(err) => warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "s3 reconcile: failed to enqueue staged file"
-                ),
-            }
-        }
+        let mut accepted = HashMap::new();
+        let scan = reconcile_staged_uploads_once(
+            &self.storage_dir,
+            &self.objects,
+            &self.key_prefix,
+            &self.tombstone_prefix(),
+            &self.uploads,
+            &mut accepted,
+            &AtomicBool::new(false),
+        );
+        let (scanned, queued) = scan
+            .map(|result| (result.scanned, result.queued))
+            .unwrap_or_else(|err| {
+                warn!(error = %err, "s3 reconcile: staging scan failed");
+                (0, 0)
+            });
         info!(
             scanned,
             queued, "s3 reconcile: re-enqueued staged files missing remotely"
@@ -824,20 +839,223 @@ impl RecordingObjectStore {
     }
 }
 
-/// Recursive file walk under `dir` (best effort; unreadable dirs are
-/// skipped — the next startup scan retries them).
-fn collect_staged_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_staged_files(&path, out);
-        } else if path.is_file() {
-            out.push(path);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedFileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug)]
+struct ReconcileScan {
+    scanned: usize,
+    queued: usize,
+    complete: bool,
+}
+
+fn staged_file_stamp(path: &Path) -> Option<StagedFileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(StagedFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn wait_reconciler(stop: &AtomicBool, delay: Duration) -> bool {
+    if stop.load(Ordering::SeqCst) {
+        return false;
+    }
+    std::thread::park_timeout(delay);
+    !stop.load(Ordering::SeqCst)
+}
+
+fn reconcile_staged_uploads_loop(
+    uploads: std::sync::Weak<UploadQueue>,
+    objects: Arc<dyn ObjectStore>,
+    key_prefix: String,
+    storage_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+) {
+    let tombstone_prefix = format!("{key_prefix}.tombstones/");
+    let mut accepted: HashMap<String, (PathBuf, StagedFileStamp)> = HashMap::new();
+    let mut retry_delay = RECONCILE_RETRY_BASE;
+
+    while !stop.load(Ordering::SeqCst) {
+        let Some(uploads) = uploads.upgrade() else {
+            return;
+        };
+        let scan = reconcile_staged_uploads_once(
+            &storage_dir,
+            &objects,
+            &key_prefix,
+            &tombstone_prefix,
+            &uploads,
+            &mut accepted,
+            &stop,
+        );
+        drop(uploads);
+
+        let delay = match scan {
+            Ok(scan) if scan.complete => {
+                info!(
+                    scanned = scan.scanned,
+                    queued = scan.queued,
+                    "s3 reconcile: staged-file scan complete"
+                );
+                return;
+            }
+            Ok(scan) => {
+                info!(
+                    scanned = scan.scanned,
+                    queued = scan.queued,
+                    "s3 reconcile: scan will resume after queue backpressure"
+                );
+                retry_delay = RECONCILE_RETRY_BASE;
+                retry_delay
+            }
+            Err(err) => {
+                warn!(error = %err, "s3 reconcile: scan failed; retrying");
+                let delay = retry_delay;
+                retry_delay = retry_delay
+                    .checked_mul(2)
+                    .unwrap_or(RECONCILE_RETRY_MAX)
+                    .min(RECONCILE_RETRY_MAX);
+                delay
+            }
+        };
+
+        if !wait_reconciler(&stop, delay) {
+            return;
         }
     }
+}
+
+fn reconcile_staged_uploads_once(
+    storage_dir: &Path,
+    objects: &Arc<dyn ObjectStore>,
+    key_prefix: &str,
+    tombstone_prefix: &str,
+    uploads: &UploadQueue,
+    accepted: &mut HashMap<String, (PathBuf, StagedFileStamp)>,
+    stop: &AtomicBool,
+) -> Result<ReconcileScan, String> {
+    let remote: HashSet<String> = objects
+        .list_keys(key_prefix)
+        .map_err(|err| format!("cannot list remote objects: {err}"))?
+        .into_iter()
+        .collect();
+    let tombstoned: Vec<String> = objects
+        .list_keys(tombstone_prefix)
+        .map_err(|err| format!("cannot list remote tombstones: {err}"))?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(tombstone_prefix).map(str::to_owned))
+        .collect();
+
+    accepted.retain(|_, (path, stamp)| staged_file_stamp(path).as_ref() == Some(stamp));
+    let mut files = Vec::new();
+    let mut complete = collect_staged_files(storage_dir, &mut files);
+    files.sort();
+    let mut scanned = 0usize;
+    let mut queued = 0usize;
+    for path in files {
+        if stop.load(Ordering::SeqCst) {
+            complete = false;
+            break;
+        }
+        let Ok(rel) = path.strip_prefix(storage_dir) else {
+            continue;
+        };
+        if !is_upload_candidate(rel) {
+            continue;
+        }
+        scanned += 1;
+        let Some(stamp) = staged_file_stamp(&path) else {
+            complete = false;
+            continue;
+        };
+        let rel_key = rel
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_key.is_empty() {
+            continue;
+        }
+        let key = format!("{key_prefix}{rel_key}");
+        if remote.contains(&key)
+            || tombstoned
+                .iter()
+                .any(|prefix| key.starts_with(prefix.as_str()))
+        {
+            accepted.remove(&key);
+            continue;
+        }
+        if accepted
+            .get(&key)
+            .is_some_and(|(_, accepted_stamp)| accepted_stamp == &stamp)
+        {
+            continue;
+        }
+        let task = UploadTask {
+            key: key.clone(),
+            source: UploadSource::File(path.clone()),
+            content_type: upload_content_type(rel).to_owned(),
+            path: path.clone(),
+            generation: 0,
+            attempts: 0,
+            not_before: Instant::now(),
+        };
+        match uploads.enqueue(task) {
+            Ok(()) => {
+                accepted.insert(key, (path, stamp));
+                queued += 1;
+                if !wait_reconciler(stop, RECONCILE_ENQUEUE_INTERVAL) {
+                    complete = false;
+                    break;
+                }
+            }
+            Err(err)
+                if err.contains("queue is full") || err.contains("queue task limit exceeded") =>
+            {
+                complete = false;
+                break;
+            }
+            Err(err) => {
+                complete = false;
+                warn!(path = %path.display(), error = %err, "s3 reconcile: failed to enqueue staged file");
+            }
+        }
+    }
+
+    Ok(ReconcileScan {
+        scanned,
+        queued,
+        complete,
+    })
+}
+
+/// Recursive file walk under `dir`. Returns false if any directory entry
+/// could not be read so the reconciler retries instead of losing that path.
+fn collect_staged_files(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        let path = entry.path();
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {
+                complete &= collect_staged_files(&path, out);
+            }
+            Ok(metadata) if metadata.is_file() => out.push(path),
+            Ok(_) => {}
+            Err(_) => complete = false,
+        }
+    }
+    complete
 }
 
 /// Whether a staged file (relative to `storage_dir`) is part of the uploaded
@@ -1040,10 +1258,16 @@ mod tests {
         lists: Mutex<Vec<String>>,
         deletes: Mutex<Vec<Vec<String>>>,
         list_result: Mutex<Vec<String>>,
+        list_failures: Mutex<HashMap<String, usize>>,
+        put_delay: Mutex<Duration>,
     }
 
     impl ObjectStore for FakeObjectStore {
         fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> Result<(), S3Error> {
+            let put_delay = *self.put_delay.lock().unwrap();
+            if !put_delay.is_zero() && !key.starts_with(".tombstones/") {
+                std::thread::sleep(put_delay);
+            }
             *self.attempts.lock().unwrap() += 1;
             if *self.panic_puts.lock().unwrap() {
                 panic!("injected put panic");
@@ -1070,6 +1294,20 @@ mod tests {
 
         fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
             self.lists.lock().unwrap().push(prefix.to_owned());
+            let should_fail = {
+                let mut failures = self.list_failures.lock().unwrap();
+                if let Some(remaining) = failures.get_mut(prefix)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(S3Error::Http("injected temporary list failure".to_owned()));
+            }
             Ok(self
                 .list_result
                 .lock()
@@ -1607,6 +1845,80 @@ mod tests {
             ],
             "only missing, non-tombstoned candidates are re-enqueued"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_retries_temporary_object_and_tombstone_list_failures() {
+        let base = temp_dir("reconcile_list_retry");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let staged = base.join("meeting/audio.wav");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        fake.list_failures
+            .lock()
+            .unwrap()
+            .extend([(String::new(), 2), (".tombstones/".to_owned(), 1)]);
+
+        objects.reconcile_staged_uploads();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && fake.puts.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        objects.wait_uploads_idle();
+
+        assert_eq!(
+            fake.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, _, _)| key.clone())
+                .collect::<Vec<_>>(),
+            vec!["meeting/audio.wav"]
+        );
+        let lists = fake.lists.lock().unwrap();
+        assert!(lists.iter().filter(|prefix| prefix.is_empty()).count() >= 3);
+        assert!(
+            lists
+                .iter()
+                .filter(|prefix| prefix.as_str() == ".tombstones/")
+                .count()
+                >= 2
+        );
+        drop(lists);
+        drop(objects);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_resumes_after_slow_uploads_fill_the_bounded_queue() {
+        const STAGED_FILES: usize = 80;
+        let base = temp_dir("reconcile_backpressure");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.put_delay.lock().unwrap() = Duration::from_millis(15);
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let meeting_dir = base.join("meeting");
+        std::fs::create_dir_all(&meeting_dir).unwrap();
+        for index in 0..STAGED_FILES {
+            std::fs::write(meeting_dir.join(format!("audio-{index:03}.wav")), b"audio").unwrap();
+        }
+
+        objects.reconcile_staged_uploads();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && fake.puts.lock().unwrap().len() < STAGED_FILES {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        objects.wait_uploads_idle();
+
+        let puts = fake.puts.lock().unwrap();
+        assert_eq!(puts.len(), STAGED_FILES);
+        let unique_keys: HashSet<&str> = puts.iter().map(|(key, _, _)| key.as_str()).collect();
+        assert_eq!(unique_keys.len(), STAGED_FILES);
+        drop(puts);
+        drop(objects);
         let _ = std::fs::remove_dir_all(&base);
     }
 
