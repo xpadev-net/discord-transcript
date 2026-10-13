@@ -15,3 +15,7 @@ SET status = CASE WHEN audio_path IS NULL THEN 'failed' ELSE 'queued' END,
     error_message = CASE WHEN audio_path IS NULL THEN 'audio path unavailable during outbox migration' ELSE NULL END,
     updated_at = NOW()
 WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_live_transcription_chunks_queued_outbox
+    ON live_transcription_chunks (start_ms, meeting_id, speaker_id, sequence)
+    WHERE status = 'queued' AND audio_path IS NOT NULL;

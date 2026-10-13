@@ -2107,6 +2107,7 @@ fn live_chunk_id(chunk: &PersistedChunk) -> String {
 }
 
 const RECOVER_INTERRUPTED_LIVE_TRANSCRIPTION_JOBS_SQL: &str = "UPDATE live_transcription_chunks SET status='queued', error_message=NULL, updated_at=NOW() WHERE status='running' AND audio_path IS NOT NULL";
+const LOAD_NEXT_LIVE_TRANSCRIPTION_JOB_SQL: &str = "SELECT c.id, c.meeting_id, c.speaker_id, c.sequence, c.start_ms, COALESCE(c.timeline_base_ms, c.start_ms), c.audio_path, m.title FROM live_transcription_chunks c JOIN meetings m ON m.id=c.meeting_id WHERE c.status='queued' AND c.audio_path IS NOT NULL ORDER BY c.start_ms, c.meeting_id, c.speaker_id, c.sequence LIMIT 1";
 
 fn recover_interrupted_live_transcription_jobs<E: SqlExecutor>(
     executor: &mut E,
@@ -2189,49 +2190,67 @@ fn load_next_live_transcription_job<E: SqlExecutor>(
     executor: &mut E,
     chunk_storage_dir: &str,
 ) -> Result<Option<LiveTranscriptionJob>, String> {
-    let rows = executor.query_rows(
-        "SELECT c.id, c.meeting_id, c.speaker_id, c.sequence, c.start_ms, \
-         COALESCE(c.timeline_base_ms, c.start_ms), c.audio_path, m.title \
-         FROM live_transcription_chunks c JOIN meetings m ON m.id=c.meeting_id \
-         WHERE c.status='queued' AND c.audio_path IS NOT NULL \
-         ORDER BY c.start_ms, c.meeting_id, c.speaker_id, c.sequence LIMIT 1",
-        &[],
-    )?;
+    let rows = executor.query_rows(LOAD_NEXT_LIVE_TRANSCRIPTION_JOB_SQL, &[])?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let value = |index: usize, name: &str| -> Result<String, String> {
-        row.get(index)
-            .and_then(|value| value.clone())
-            .ok_or_else(|| format!("queued live transcription row missing {name}"))
+    let Some(chunk_id) = row.first().and_then(Clone::clone) else {
+        return Err("queued live transcription row missing id".to_owned());
     };
-    let chunk_id = value(0, "id")?;
-    let meeting_id = value(1, "meeting_id")?;
-    let user_id = value(2, "speaker_id")?;
-    let sequence = value(3, "sequence")?
-        .parse::<u64>()
-        .map_err(|err| format!("invalid queued live transcription sequence: {err}"))?;
-    let start_ms = value(4, "start_ms")?
-        .parse::<u64>()
-        .map_err(|err| format!("invalid queued live transcription start: {err}"))?;
-    let timeline_base_ms = value(5, "timeline_base_ms")?
-        .parse::<u64>()
-        .map_err(|err| format!("invalid queued live transcription timeline base: {err}"))?;
-    let audio_path = std::path::PathBuf::from(value(6, "audio_path")?);
-    let root = std::path::Path::new(chunk_storage_dir)
-        .canonicalize()
-        .map_err(|err| format!("failed to resolve live transcription audio root: {err}"))?;
-    let audio_path = audio_path
-        .canonicalize()
-        .map_err(|err| format!("failed to resolve queued live audio path: {err}"))?;
-    if !audio_path.starts_with(&root) {
-        return Err("queued live audio path is outside the configured storage root".to_owned());
-    }
-    let size_bytes = std::fs::metadata(&audio_path)
-        .map_err(|err| format!("failed to stat queued live audio: {err}"))?
-        .len()
-        .try_into()
-        .map_err(|_| "queued live audio file exceeds addressable size".to_owned())?;
+    let decoded = (|| {
+        let value = |index: usize, name: &str| -> Result<String, String> {
+            row.get(index)
+                .and_then(|value| value.clone())
+                .ok_or_else(|| format!("queued live transcription row missing {name}"))
+        };
+        let meeting_id = value(1, "meeting_id")?;
+        let user_id = value(2, "speaker_id")?;
+        let sequence = value(3, "sequence")?
+            .parse::<u64>()
+            .map_err(|err| format!("invalid queued live transcription sequence: {err}"))?;
+        let start_ms = value(4, "start_ms")?
+            .parse::<u64>()
+            .map_err(|err| format!("invalid queued live transcription start: {err}"))?;
+        let timeline_base_ms = value(5, "timeline_base_ms")?
+            .parse::<u64>()
+            .map_err(|err| format!("invalid queued live transcription timeline base: {err}"))?;
+        let audio_path = std::path::PathBuf::from(value(6, "audio_path")?);
+        let root = std::path::Path::new(chunk_storage_dir)
+            .canonicalize()
+            .map_err(|err| format!("failed to resolve live transcription audio root: {err}"))?;
+        let audio_path = audio_path
+            .canonicalize()
+            .map_err(|err| format!("failed to resolve queued live audio path: {err}"))?;
+        if !audio_path.starts_with(&root) {
+            return Err("queued live audio path is outside the configured storage root".to_owned());
+        }
+        let size_bytes = std::fs::metadata(&audio_path)
+            .map_err(|err| format!("failed to stat queued live audio: {err}"))?
+            .len()
+            .try_into()
+            .map_err(|_| "queued live audio file exceeds addressable size".to_owned())?;
+        Ok(LiveTranscriptionJob {
+            chunk: PersistedChunk {
+                meeting_id,
+                user_id,
+                sequence,
+                start_ms,
+                saved: SavedChunk {
+                    path: audio_path,
+                    size_bytes,
+                },
+            },
+            base_start_ms: timeline_base_ms,
+            meeting_title: row.get(7).and_then(Clone::clone),
+        })
+    })();
+    let job = match decoded {
+        Ok(job) => job,
+        Err(reason) => {
+            quarantine_live_transcription_outbox_job(executor, &chunk_id, &reason)?;
+            return Ok(None);
+        }
+    };
     let updated = executor.execute(
         "UPDATE live_transcription_chunks SET status='running', error_message=NULL, \
          attempt_count=attempt_count + 1, updated_at=NOW() WHERE id=$1 AND status='queued'",
@@ -2240,21 +2259,20 @@ fn load_next_live_transcription_job<E: SqlExecutor>(
     if updated == 0 {
         return Ok(None);
     }
-    let meeting_title = row.get(7).and_then(Clone::clone);
-    Ok(Some(LiveTranscriptionJob {
-        chunk: PersistedChunk {
-            meeting_id,
-            user_id,
-            sequence,
-            start_ms,
-            saved: SavedChunk {
-                path: audio_path,
-                size_bytes,
-            },
-        },
-        base_start_ms: timeline_base_ms,
-        meeting_title,
-    }))
+    Ok(Some(job))
+}
+
+fn quarantine_live_transcription_outbox_job<E: SqlExecutor>(
+    executor: &mut E,
+    chunk_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    executor
+        .execute(
+            "UPDATE live_transcription_chunks SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1 AND status='queued'",
+            &[chunk_id.to_owned(), reason.to_owned()],
+        )
+        .map(|_| ())
 }
 
 fn persist_live_transcription_success<E: SqlExecutor>(
@@ -12921,6 +12939,50 @@ mod status_message_tests {
             executor.executed[0].0,
             RECOVER_INTERRUPTED_LIVE_TRANSCRIPTION_JOBS_SQL
         );
+    }
+
+    #[test]
+    fn unreadable_queued_audio_is_quarantined_so_later_jobs_can_run() {
+        let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::strict();
+        let root = std::env::temp_dir();
+        let missing_audio = root.join(format!(
+            "discord-transcript-missing-live-audio-{}-{}.wav",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        executor.register_query_rows_wildcard(
+            LOAD_NEXT_LIVE_TRANSCRIPTION_JOB_SQL,
+            0,
+            &[],
+            vec![crate::infrastructure::sql_store::sql_row_from_strings(
+                vec![
+                    "chunk-1".to_owned(),
+                    "m1".to_owned(),
+                    "alice".to_owned(),
+                    "1".to_owned(),
+                    "1000".to_owned(),
+                    "0".to_owned(),
+                    missing_audio.to_string_lossy().into_owned(),
+                    "meeting".to_owned(),
+                ],
+            )],
+        );
+        executor.register_execute_wildcard(
+            "UPDATE live_transcription_chunks SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1 AND status='queued'",
+            2,
+            &[0, 1],
+            1,
+        );
+
+        let job = load_next_live_transcription_job(&mut executor, &root.to_string_lossy())
+            .expect("unreadable outbox row should be quarantined");
+
+        assert!(job.is_none());
+        assert!(executor.executed.iter().any(|(sql, params)| {
+            sql.contains("status='failed'")
+                && params[0] == "chunk-1"
+                && params[1].contains("failed to resolve queued live audio path")
+        }));
     }
 
     #[test]
