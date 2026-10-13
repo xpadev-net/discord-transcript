@@ -49,15 +49,24 @@ WHERE stopped_at IS NOT NULL
 // the raw-audio workspace query instead of aliasing it.
 pub const RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL: &str = r#"
 SELECT m.id, m.guild_id, m.voice_channel_id
-FROM meetings m
-WHERE m.status IN ('posted', 'failed', 'aborted')
+FROM (
+  SELECT m.*,
+         CASE
+           WHEN s.meeting_id IS NULL THEN $1::text::integer
+           WHEN s.retention_transcript_ttl_days > 0 THEN s.retention_transcript_ttl_days
+         END AS transcript_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
+WHERE transcript_ttl_days IS NOT NULL
+  AND m.status IN ('posted', 'failed', 'aborted')
   AND (
     NOT EXISTS (
       SELECT 1
       FROM transcripts active_t
       WHERE active_t.meeting_id = m.id
         AND active_t.is_deleted = FALSE
-        AND active_t.created_at >= NOW() - (($1 || ' days')::interval)
+        AND active_t.created_at >= NOW() - ((m.transcript_ttl_days::text || ' days')::interval)
     )
   )
   AND (
@@ -65,9 +74,9 @@ WHERE m.status IN ('posted', 'failed', 'aborted')
       SELECT 1
       FROM transcripts expired_t
       WHERE expired_t.meeting_id = m.id
-        AND expired_t.created_at < NOW() - (($1 || ' days')::interval)
+        AND expired_t.created_at < NOW() - ((m.transcript_ttl_days::text || ' days')::interval)
     )
-    OR (m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - (($1 || ' days')::interval))
+    OR (m.stopped_at IS NOT NULL AND m.stopped_at < NOW() - ((m.transcript_ttl_days::text || ' days')::interval))
   )
 "#;
 
@@ -75,24 +84,33 @@ WHERE m.status IN ('posted', 'failed', 'aborted')
 // its own constant so future summary-specific filters can diverge.
 pub const RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL: &str = r#"
 SELECT m.id, m.guild_id, m.voice_channel_id
-FROM meetings m
-WHERE m.status IN ('posted', 'failed', 'aborted')
+FROM (
+  SELECT m.*,
+         CASE
+           WHEN s.meeting_id IS NULL THEN NULLIF($1::text::integer, 0)
+           WHEN s.retention_summary_ttl_days > 0 THEN s.retention_summary_ttl_days
+         END AS summary_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
+WHERE summary_ttl_days IS NOT NULL
+  AND m.status IN ('posted', 'failed', 'aborted')
   AND NOT EXISTS (
     SELECT 1
     FROM summaries active_s
     WHERE active_s.meeting_id = m.id
-      AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
+      AND active_s.created_at >= NOW() - ((m.summary_ttl_days::text || ' days')::interval)
   )
   AND (
     (
       m.stopped_at IS NOT NULL
-      AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+      AND m.stopped_at < NOW() - ((m.summary_ttl_days::text || ' days')::interval)
     )
     OR EXISTS (
     SELECT 1
     FROM summaries expired_s
     WHERE expired_s.meeting_id = m.id
-      AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+      AND expired_s.created_at < NOW() - ((m.summary_ttl_days::text || ' days')::interval)
     )
   )
 "#;
@@ -100,34 +118,56 @@ WHERE m.status IN ('posted', 'failed', 'aborted')
 pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts t
 SET is_deleted=TRUE
-FROM meetings m
+FROM (
+  SELECT m.id, m.status,
+         CASE
+           WHEN s.meeting_id IS NULL THEN $1::text::integer
+           WHEN s.retention_transcript_ttl_days > 0 THEN s.retention_transcript_ttl_days
+         END AS transcript_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
 WHERE t.meeting_id = m.id
   AND t.is_deleted=FALSE
-  AND t.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.transcript_ttl_days IS NOT NULL
+  AND t.created_at < NOW() - ((m.transcript_ttl_days::text || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_SUMMARIES_SQL: &str = r#"
-WITH expired_summary_meetings AS (
-  SELECT m.id
-  FROM meetings m
-  WHERE m.status IN ('posted', 'failed', 'aborted')
-    AND NOT EXISTS (
+WITH summary_retention AS (
+  SELECT m.id, m.status, m.stopped_at, m.title, m.summary_ttl_days
+  FROM (
+    SELECT m.*,
+           CASE
+             WHEN s.meeting_id IS NULL THEN NULLIF($1::text::integer, 0)
+             WHEN s.retention_summary_ttl_days > 0 THEN s.retention_summary_ttl_days
+           END AS summary_ttl_days
+    FROM meetings m
+    LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+  ) m
+  WHERE m.summary_ttl_days IS NOT NULL
+    AND m.status IN ('posted', 'failed', 'aborted')
+),
+expired_summary_meetings AS (
+  SELECT m.id, m.summary_ttl_days
+  FROM summary_retention m
+  WHERE NOT EXISTS (
     SELECT 1
     FROM summaries active_s
     WHERE active_s.meeting_id = m.id
-      AND active_s.created_at >= NOW() - (($1 || ' days')::interval)
+      AND active_s.created_at >= NOW() - ((m.summary_ttl_days::text || ' days')::interval)
     )
     AND (
       (
         m.stopped_at IS NOT NULL
-        AND m.stopped_at < NOW() - (($1 || ' days')::interval)
+        AND m.stopped_at < NOW() - ((m.summary_ttl_days::text || ' days')::interval)
       )
       OR EXISTS (
         SELECT 1
         FROM summaries expired_s
         WHERE expired_s.meeting_id = m.id
-          AND expired_s.created_at < NOW() - (($1 || ' days')::interval)
+          AND expired_s.created_at < NOW() - ((m.summary_ttl_days::text || ' days')::interval)
       )
     )
 ),
@@ -140,9 +180,10 @@ cleared_summary_titles AS (
   RETURNING m.id
 )
 DELETE FROM summaries s
-USING meetings m
+USING meetings m, summary_retention sr
 WHERE s.meeting_id = m.id
-  AND s.created_at < NOW() - (($1 || ' days')::interval)
+  AND sr.id = m.id
+  AND s.created_at < NOW() - ((sr.summary_ttl_days::text || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
   AND (
     m.id NOT IN (SELECT id FROM expired_summary_meetings)
@@ -187,19 +228,37 @@ WHERE a.meeting_id = m.id
 
 pub const RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL: &str = r#"
 DELETE FROM artifacts a
-USING meetings m
+USING (
+  SELECT m.id, m.status,
+         CASE
+           WHEN s.meeting_id IS NULL THEN $1::text::integer
+           WHEN s.retention_transcript_ttl_days > 0 THEN s.retention_transcript_ttl_days
+         END AS transcript_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
 WHERE a.meeting_id = m.id
   AND a.kind IN ('transcript', 'masked_transcript')
-  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.transcript_ttl_days IS NOT NULL
+  AND a.created_at < NOW() - ((m.transcript_ttl_days::text || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL: &str = r#"
 DELETE FROM artifacts a
-USING meetings m
+USING (
+  SELECT m.id, m.status,
+         CASE
+           WHEN s.meeting_id IS NULL THEN NULLIF($1::text::integer, 0)
+           WHEN s.retention_summary_ttl_days > 0 THEN s.retention_summary_ttl_days
+         END AS summary_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
 WHERE a.meeting_id = m.id
   AND a.kind IN ('summary', 'summary_markdown')
-  AND a.created_at < NOW() - (($1 || ' days')::interval)
+  AND m.summary_ttl_days IS NOT NULL
+  AND a.created_at < NOW() - ((m.summary_ttl_days::text || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
@@ -423,17 +482,19 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
         &mut errors,
     );
 
-    let summary_workspaces = if let Some(summary_ttl_days) = policy.summary_ttl_days {
-        let summary_ttl = summary_ttl_days.get().to_string();
-        collect_workspace_rows(
-            executor,
-            RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
-            std::slice::from_ref(&summary_ttl),
-            &mut errors,
-        )
-    } else {
-        Vec::new()
-    };
+    // Zero disables the legacy fallback while still honoring per-meeting
+    // summary snapshots. A present NULL snapshot remains unlimited.
+    let summary_ttl = policy
+        .summary_ttl_days
+        .map(|ttl| ttl.get())
+        .unwrap_or(0)
+        .to_string();
+    let summary_workspaces = collect_workspace_rows(
+        executor,
+        RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
+        std::slice::from_ref(&summary_ttl),
+        &mut errors,
+    );
 
     RetentionCleanupPlan {
         raw_workspaces,
@@ -809,22 +870,26 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
         Err(err) => errors.push(err),
     }
 
-    if let Some(summary_ttl_days) = policy.summary_ttl_days {
-        let summary_ttl = summary_ttl_days.get().to_string();
-        match executor.execute(
-            RETENTION_DELETE_SUMMARIES_SQL,
-            std::slice::from_ref(&summary_ttl),
-        ) {
-            Ok(count) => report.summaries_deleted += count,
-            Err(err) => errors.push(err),
-        }
-        match executor.execute(
-            RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
-            std::slice::from_ref(&summary_ttl),
-        ) {
-            Ok(count) => report.artifacts_deleted += count,
-            Err(err) => errors.push(err),
-        }
+    // Zero disables the legacy fallback while still honoring per-meeting
+    // summary snapshots.
+    let summary_ttl = policy
+        .summary_ttl_days
+        .map(|ttl| ttl.get())
+        .unwrap_or(0)
+        .to_string();
+    match executor.execute(
+        RETENTION_DELETE_SUMMARIES_SQL,
+        std::slice::from_ref(&summary_ttl),
+    ) {
+        Ok(count) => report.summaries_deleted += count,
+        Err(err) => errors.push(err),
+    }
+    match executor.execute(
+        RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
+        std::slice::from_ref(&summary_ttl),
+    ) {
+        Ok(count) => report.artifacts_deleted += count,
+        Err(err) => errors.push(err),
     }
 
     if errors.is_empty() {

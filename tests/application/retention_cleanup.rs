@@ -218,6 +218,14 @@ fn retention_cleanup_removes_expired_raw_audio_debug_and_marks_transcripts() {
     executor
         .execute_result
         .insert(query_key(RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, &["7"]), 5);
+    executor.execute_result.insert(
+        query_key(RETENTION_DELETE_SUMMARIES_SQL, &["0"]),
+        0,
+    );
+    executor.execute_result.insert(
+        query_key(RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, &["0"]),
+        0,
+    );
 
     let report = enforce_retention_policy(&mut executor, &layout, RetentionPolicy::default(), None)
         .expect("cleanup should succeed");
