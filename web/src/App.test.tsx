@@ -386,6 +386,7 @@ function transcriptResponse(segments: unknown[] = [transcriptSegment()]) {
     segments,
     status: "posted",
     is_final: true,
+    reset: false,
     updated_at: "2026-06-01T00:10:00Z",
   };
 }
@@ -636,6 +637,7 @@ describe("App access controls", () => {
       segments: [segment],
       status: "unknown",
       is_final: false,
+      reset: false,
       updated_at: null,
     });
     expect(normalizeTranscriptResponse(transcriptResponse([segment]))).toEqual(

@@ -490,6 +490,7 @@ export interface TranscriptResponse {
   segments: TranscriptSegment[];
   status: string;
   is_final: boolean;
+  reset: boolean;
   updated_at: string | null;
 }
 

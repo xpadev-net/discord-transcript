@@ -4146,6 +4146,7 @@ struct TranscriptResponse {
     segments: Vec<TranscriptSegmentResponse>,
     status: String,
     is_final: bool,
+    reset: bool,
     updated_at: Option<String>,
 }
 
@@ -11497,6 +11498,7 @@ async fn api_transcript_events(
             None::<TranscriptStreamCursor>,
             Duration::ZERO,
             0_u32,
+            false,
             permit,
             false,
             session,
@@ -11509,6 +11511,7 @@ async fn api_transcript_events(
             cursor,
             poll_delay,
             idle_polls,
+            final_snapshot_sent,
             permit,
             finished,
             session,
@@ -11553,8 +11556,17 @@ async fn api_transcript_events(
                 return Some((
                     Ok(event),
                     (
-                        state, user_id, meeting_id, cursor, poll_delay, idle_polls, permit, true,
-                        session, now,
+                        state,
+                        user_id,
+                        meeting_id,
+                        cursor,
+                        poll_delay,
+                        idle_polls,
+                        final_snapshot_sent,
+                        permit,
+                        true,
+                        session,
+                        now,
                     ),
                 ));
             }
@@ -11577,6 +11589,7 @@ async fn api_transcript_events(
                         cursor,
                         poll_delay,
                         idle_polls,
+                        final_snapshot_sent,
                         permit,
                         true,
                         session,
@@ -11586,7 +11599,40 @@ async fn api_transcript_events(
             }
 
             match load_transcript_response(&state, &meeting_id, cursor.as_ref()).await {
-                Ok((response, next_cursor)) => {
+                Ok((mut response, mut next_cursor)) => {
+                    if should_emit_final_transcript_snapshot(response.is_final, final_snapshot_sent)
+                    {
+                        match load_transcript_response(&state, &meeting_id, None).await {
+                            Ok((snapshot, snapshot_cursor)) => {
+                                response = snapshot;
+                                next_cursor = snapshot_cursor;
+                                response.reset = true;
+                            }
+                            Err(_) => {
+                                let event = Event::default()
+                                    .event("stream-error")
+                                    .data(r#"{"code":"transcript_unavailable"}"#);
+                                let retry_delay = next_transcript_sse_poll_delay(poll_delay, false);
+                                return Some((
+                                    Ok(event),
+                                    (
+                                        state,
+                                        user_id,
+                                        meeting_id,
+                                        cursor,
+                                        retry_delay,
+                                        0,
+                                        final_snapshot_sent,
+                                        permit,
+                                        false,
+                                        session,
+                                        last_session_check,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    let final_snapshot_sent = final_snapshot_sent || response.reset;
                     let had_segments = !response.segments.is_empty();
                     let is_final = response.is_final;
                     let next_idle_polls = next_transcript_sse_idle_polls(idle_polls, had_segments);
@@ -11618,6 +11664,7 @@ async fn api_transcript_events(
                             next_cursor.or(cursor),
                             next_poll_delay,
                             next_idle_polls,
+                            final_snapshot_sent,
                             permit,
                             is_final || stop_for_idle,
                             session,
@@ -11647,6 +11694,7 @@ async fn api_transcript_events(
                             cursor,
                             next_poll_delay,
                             next_idle_polls,
+                            final_snapshot_sent,
                             permit,
                             stop_for_idle,
                             session,
@@ -11679,6 +11727,7 @@ async fn load_transcript_response(
             segments,
             status: metadata.status,
             is_final,
+            reset: false,
             updated_at,
         },
         next_cursor,
@@ -11704,6 +11753,10 @@ fn transcript_metadata_is_final(metadata: &TranscriptMetadata) -> bool {
                 metadata.status.as_str(),
                 "recording" | "stopping" | "transcribing" | "summarizing" | "processing"
             ))
+}
+
+fn should_emit_final_transcript_snapshot(is_final: bool, snapshot_sent: bool) -> bool {
+    is_final && !snapshot_sent
 }
 
 async fn load_transcript_metadata(
@@ -17837,8 +17890,9 @@ mod session_reverify_tests {
 #[cfg(test)]
 mod transcript_source_api_tests {
     use super::{
-        SpeakerResponse, TranscriptSegmentResponse, api_transcript_sql,
-        sort_transcript_segment_responses, transcript_source_for_api,
+        SpeakerResponse, TranscriptResponse, TranscriptSegmentResponse, api_transcript_sql,
+        should_emit_final_transcript_snapshot, sort_transcript_segment_responses,
+        transcript_source_for_api,
     };
     use crate::domain::transcript::TranscriptSource;
 
@@ -17858,6 +17912,24 @@ mod transcript_source_api_tests {
     fn api_transcript_source_rejects_unknown_and_null() {
         assert!(transcript_source_for_api(Some("unknown".to_owned())).is_err());
         assert!(transcript_source_for_api(None).is_err());
+    }
+
+    #[test]
+    fn final_transcript_snapshot_is_emitted_once_per_stream() {
+        assert!(!should_emit_final_transcript_snapshot(false, false));
+        assert!(should_emit_final_transcript_snapshot(true, false));
+        assert!(!should_emit_final_transcript_snapshot(true, true));
+
+        let response = TranscriptResponse {
+            segments: Vec::new(),
+            status: "summarizing".to_owned(),
+            is_final: true,
+            reset: true,
+            updated_at: None,
+        };
+        let serialized = serde_json::to_value(response).expect("response serializes");
+        assert_eq!(serialized["reset"], true);
+        assert_eq!(serialized["is_final"], true);
     }
 
     #[test]

@@ -68,7 +68,33 @@ function transcript(status: string, isFinal: boolean): TranscriptResponse {
     segments: [],
     status,
     is_final: isFinal,
+    reset: false,
     updated_at: null,
+  };
+}
+
+function segment(
+  id: string,
+  source: "voice" | "vc_text",
+  startMs: number,
+  text: string,
+): TranscriptResponse["segments"][number] {
+  return {
+    id,
+    speaker_id: "speaker-1",
+    speaker: {
+      id: "speaker-1",
+      username: null,
+      nickname: null,
+      display_name: null,
+      display_label: "Speaker",
+    },
+    start_ms: startMs,
+    end_ms: startMs + 500,
+    text,
+    confidence: null,
+    is_noisy: false,
+    source,
   };
 }
 
@@ -105,6 +131,70 @@ afterEach(() => {
 });
 
 describe("useMeetingData completion tracking", () => {
+  it("replaces live segments with the ordered final snapshot and merges later deltas", async () => {
+    vi.mocked(fetchMeeting).mockResolvedValue(
+      meeting("meeting-1", "recording"),
+    );
+    vi.mocked(fetchTranscript).mockResolvedValue({
+      ...transcript("recording", false),
+      segments: [segment("live-1", "voice", 1_000, "temporary live text")],
+    });
+    vi.mocked(fetchSummary).mockResolvedValue({ markdown: null });
+
+    const { result } = renderHook(() => useMeetingData("meeting-1"));
+    await waitFor(() => expect(TestEventSource.latest).not.toBeNull());
+    await waitFor(() =>
+      expect(result.current.transcript?.[0]?.id).toBe("live-1"),
+    );
+    const source = TestEventSource.latest;
+    if (!source) {
+      throw new Error("EventSource was not created");
+    }
+
+    act(() =>
+      source.emit(
+        "segments",
+        JSON.stringify({
+          ...transcript("summarizing", true),
+          reset: true,
+          segments: [
+            segment("final-2", "voice", 2_000, "second final"),
+            segment("final-1", "voice", 500, "first final"),
+          ],
+        }),
+      ),
+    );
+
+    expect(result.current.transcript?.map(({ id }) => id)).toEqual([
+      "final-1",
+      "final-2",
+    ]);
+
+    act(() =>
+      source.emit(
+        "segments",
+        JSON.stringify({
+          ...transcript("summarizing", true),
+          segments: [
+            segment("final-3", "vc_text", 3_000, "later delta"),
+            segment("final-2", "voice", 2_000, "updated second final"),
+          ],
+        }),
+      ),
+    );
+
+    expect(result.current.transcript?.map(({ id }) => id)).toEqual([
+      "final-1",
+      "final-2",
+      "final-3",
+    ]);
+    expect(result.current.transcript?.map(({ text }) => text)).toEqual([
+      "first final",
+      "updated second final",
+      "later delta",
+    ]);
+  });
+
   it("fetches and displays the summary when a final transcript progresses to posted", async () => {
     let polledStatus = "summarizing";
     vi.mocked(fetchMeeting)

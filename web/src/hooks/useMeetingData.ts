@@ -391,8 +391,12 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
           applyTranscriptStatus(response);
           if (response.segments.length > 0) {
             setTranscript((current) =>
-              mergeTranscriptSegments(current, response.segments),
+              response.reset
+                ? mergeTranscriptSegments(null, response.segments)
+                : mergeTranscriptSegments(current, response.segments),
             );
+          } else if (response.reset) {
+            setTranscript([]);
           }
           if (response.is_final) {
             closeStream();

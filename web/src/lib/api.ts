@@ -1213,6 +1213,7 @@ export function normalizeTranscriptResponse(
       segments: parseTranscriptSegments(response),
       status: "unknown",
       is_final: false,
+      reset: false,
       updated_at: null,
     };
   }
@@ -1221,6 +1222,7 @@ export function normalizeTranscriptResponse(
     !Array.isArray(response.segments) ||
     typeof response.status !== "string" ||
     typeof response.is_final !== "boolean" ||
+    (response.reset !== undefined && typeof response.reset !== "boolean") ||
     !isNullableString(response.updated_at)
   ) {
     throw invalidTranscriptResponse();
@@ -1229,6 +1231,7 @@ export function normalizeTranscriptResponse(
     segments: parseTranscriptSegments(response.segments),
     status: response.status,
     is_final: response.is_final,
+    reset: response.reset === true,
     updated_at: response.updated_at,
   };
 }
