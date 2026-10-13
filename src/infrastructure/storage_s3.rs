@@ -31,6 +31,10 @@ const UPLOAD_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 /// tasks hold no inline bytes, so only a task count stops an upload backlog
 /// from growing without limit during a long outage.
 const UPLOAD_MAX_PENDING_TASKS: usize = 1024;
+/// Keep upload-worker capacity available for latency-sensitive recording
+/// writes while startup reconciliation drains older staging files.
+const RECONCILE_RESERVED_TASKS: usize = 16;
+const RECONCILE_PENDING_LIMIT: usize = UPLOAD_QUEUE_BOUND - RECONCILE_RESERVED_TASKS;
 /// How long `cancel_prefix` waits for an in-flight PUT under the prefix
 /// before giving up (the S3 request timeout bounds a single PUT at 60s).
 /// On expiry the delete is aborted with an error instead of racing a
@@ -42,10 +46,11 @@ const TOMBSTONE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Pause between staging-file enqueue attempts so the reconciliation producer
 /// does not fill the upload queue faster than a slow object store can drain it.
 const RECONCILE_ENQUEUE_INTERVAL: Duration = Duration::from_millis(1);
-/// Retry transient list failures and queue saturation while the process stays
-/// up; successful scans are repeated less often to catch unreadable paths.
+/// Retry transient list failures and incomplete staging-tree scans while the
+/// process stays up; queue pressure uses a shorter capped retry delay.
 const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(250);
 const RECONCILE_RETRY_MAX: Duration = Duration::from_secs(30);
+const RECONCILE_BACKPRESSURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// Task payload: chunk/audio bytes already in memory, or a file the worker
 /// reads lazily (so large artifacts never sit in queue memory).
@@ -511,7 +516,19 @@ impl UploadQueue {
     }
 
     /// Enqueues a PUT without blocking the caller.
-    fn enqueue(&self, mut task: UploadTask) -> Result<(), String> {
+    fn enqueue(&self, task: UploadTask) -> Result<(), String> {
+        self.enqueue_with_pending_limit(task, UPLOAD_MAX_PENDING_TASKS)
+    }
+
+    fn enqueue_reconciliation(&self, task: UploadTask) -> Result<(), String> {
+        self.enqueue_with_pending_limit(task, RECONCILE_PENDING_LIMIT)
+    }
+
+    fn enqueue_with_pending_limit(
+        &self,
+        mut task: UploadTask,
+        pending_limit: usize,
+    ) -> Result<(), String> {
         if self.cancel.lock().unwrap().is_cancelled(&task.key) {
             return Err("recording upload cancelled for deleted prefix".to_owned());
         }
@@ -524,9 +541,12 @@ impl UploadQueue {
         // The task cap covers file-backed uploads too — they hold no inline
         // bytes, so without it a long outage grows the delayed-retry backlog
         // without limit.
-        let used_tasks = self.pending.fetch_add(1, Ordering::SeqCst) + 1;
-        if used_tasks > UPLOAD_MAX_PENDING_TASKS {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
+        let reserved = self
+            .pending
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                (used < pending_limit).then_some(used + 1)
+            });
+        if reserved.is_err() {
             self.pending_bytes.fetch_sub(size, Ordering::SeqCst);
             return Err("recording upload queue task limit exceeded".to_owned());
         }
@@ -850,6 +870,29 @@ struct ReconcileScan {
     scanned: usize,
     queued: usize,
     complete: bool,
+    backpressured: bool,
+}
+
+fn incomplete_scan_retry_delay(scan: &ReconcileScan, retry_delay: &mut Duration) -> Duration {
+    let delay = if scan.backpressured {
+        (*retry_delay).min(RECONCILE_BACKPRESSURE_RETRY_MAX)
+    } else {
+        *retry_delay
+    };
+    *retry_delay = if scan.queued > 0 {
+        RECONCILE_RETRY_BASE
+    } else if scan.backpressured {
+        delay
+            .checked_mul(2)
+            .unwrap_or(RECONCILE_BACKPRESSURE_RETRY_MAX)
+            .min(RECONCILE_BACKPRESSURE_RETRY_MAX)
+    } else {
+        (*retry_delay)
+            .checked_mul(2)
+            .unwrap_or(RECONCILE_RETRY_MAX)
+            .min(RECONCILE_RETRY_MAX)
+    };
+    delay
 }
 
 fn staged_file_stamp(path: &Path) -> Option<StagedFileStamp> {
@@ -907,10 +950,9 @@ fn reconcile_staged_uploads_loop(
                 info!(
                     scanned = scan.scanned,
                     queued = scan.queued,
-                    "s3 reconcile: scan will resume after queue backpressure"
+                    "s3 reconcile: incomplete scan will resume"
                 );
-                retry_delay = RECONCILE_RETRY_BASE;
-                retry_delay
+                incomplete_scan_retry_delay(&scan, &mut retry_delay)
             }
             Err(err) => {
                 warn!(error = %err, "s3 reconcile: scan failed; retrying");
@@ -956,6 +998,7 @@ fn reconcile_staged_uploads_once(
     files.sort();
     let mut scanned = 0usize;
     let mut queued = 0usize;
+    let mut backpressured = false;
     for path in files {
         if stop.load(Ordering::SeqCst) {
             complete = false;
@@ -1004,7 +1047,7 @@ fn reconcile_staged_uploads_once(
             attempts: 0,
             not_before: Instant::now(),
         };
-        match uploads.enqueue(task) {
+        match uploads.enqueue_reconciliation(task) {
             Ok(()) => {
                 accepted.insert(key, (path, stamp));
                 queued += 1;
@@ -1017,6 +1060,7 @@ fn reconcile_staged_uploads_once(
                 if err.contains("queue is full") || err.contains("queue task limit exceeded") =>
             {
                 complete = false;
+                backpressured = true;
                 break;
             }
             Err(err) => {
@@ -1030,6 +1074,7 @@ fn reconcile_staged_uploads_once(
         scanned,
         queued,
         complete,
+        backpressured,
     })
 }
 
@@ -1907,19 +1952,79 @@ mod tests {
         }
 
         objects.reconcile_staged_uploads();
+        let reserve_deadline = Instant::now() + Duration::from_secs(5);
+        let mut reached_reconcile_limit = false;
+        while Instant::now() < reserve_deadline {
+            if objects.uploads.pending.load(Ordering::SeqCst) >= RECONCILE_PENDING_LIMIT {
+                reached_reconcile_limit = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            reached_reconcile_limit,
+            "reconciliation should stop at its reserved capacity"
+        );
+        objects
+            .put_bytes(&base.join("live_recording.wav"), b"live", "audio/wav")
+            .expect("live recording uploads should have reserved queue capacity");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && fake.puts.lock().unwrap().len() < STAGED_FILES {
+        while Instant::now() < deadline && fake.puts.lock().unwrap().len() < STAGED_FILES + 1 {
             std::thread::sleep(Duration::from_millis(10));
         }
         objects.wait_uploads_idle();
 
         let puts = fake.puts.lock().unwrap();
-        assert_eq!(puts.len(), STAGED_FILES);
+        assert_eq!(puts.len(), STAGED_FILES + 1);
         let unique_keys: HashSet<&str> = puts.iter().map(|(key, _, _)| key.as_str()).collect();
-        assert_eq!(unique_keys.len(), STAGED_FILES);
+        assert_eq!(unique_keys.len(), STAGED_FILES + 1);
         drop(puts);
         drop(objects);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_backs_off_when_staging_tree_is_unavailable() {
+        let base = temp_dir("reconcile_missing_tree");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+
+        objects.reconcile_staged_uploads();
+        std::thread::sleep(Duration::from_millis(1800));
+        let list_count = fake.lists.lock().unwrap().len();
+        assert!(
+            list_count <= 10,
+            "missing staging tree caused excessive LIST calls: {list_count}"
+        );
+
+        let staged = base.join("meeting/audio.wav");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && fake.puts.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fake.puts.lock().unwrap().len(), 1);
+        drop(objects);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconciliation_backpressure_uses_its_capped_delay_after_an_outage() {
+        let scan = ReconcileScan {
+            scanned: 64,
+            queued: RECONCILE_PENDING_LIMIT,
+            complete: false,
+            backpressured: true,
+        };
+        let mut retry_delay = RECONCILE_RETRY_MAX;
+
+        assert_eq!(
+            incomplete_scan_retry_delay(&scan, &mut retry_delay),
+            RECONCILE_BACKPRESSURE_RETRY_MAX
+        );
+        assert_eq!(retry_delay, RECONCILE_RETRY_BASE);
     }
 
     /// A rejected enqueue is fully rolled back: it can neither supersede
