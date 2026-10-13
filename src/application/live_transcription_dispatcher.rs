@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
-pub const DEFAULT_LIVE_TRANSCRIPTION_QUEUE_LIMIT: usize = 32;
+// Match the bounded recording-writer receipt count: no more than this many
+// persisted chunks can be awaiting live-dispatch admission at once.
+pub const DEFAULT_LIVE_TRANSCRIPTION_QUEUE_LIMIT: usize =
+    crate::application::recording_writer::DEFAULT_RECORDING_WRITER_TASK_LIMIT;
 
 /// Bounded admission for persisted live-transcription metadata. A single
 /// receiver worker performs ASR, so this queue never creates per-chunk waiter
@@ -41,6 +44,15 @@ impl<T> LiveTranscriptionDispatcher<T> {
         self.sender
             .try_send(item)
             .map_err(|error| error.into_inner())
+    }
+
+    /// Apply backpressure to the bounded recording-writer receipt pool instead
+    /// of spawning an unbounded queue of tasks when ASR is slower than storage.
+    pub async fn enqueue(&self, item: T) -> Result<(), T> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(item);
+        }
+        self.sender.send(item).await.map_err(|error| error.0)
     }
 
     pub fn stop_accepting(&self) {
@@ -91,5 +103,25 @@ mod tests {
         drop(dispatcher);
         worker.await.expect("dispatcher worker should finish");
         assert_eq!(completed.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test]
+    async fn async_enqueue_applies_backpressure_then_admits_without_loss() {
+        let (dispatcher, mut receiver) = LiveTranscriptionDispatcher::channel(1);
+        dispatcher.try_enqueue(1).expect("initial item should fit");
+        let blocked_dispatcher = dispatcher.clone();
+        let blocked = tokio::spawn(async move { blocked_dispatcher.enqueue(2).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !blocked.is_finished(),
+            "full queue should apply backpressure"
+        );
+
+        assert_eq!(receiver.recv().await, Some(1));
+        blocked
+            .await
+            .expect("enqueue task should finish")
+            .expect("open dispatcher should admit the waiting item");
+        assert_eq!(receiver.recv().await, Some(2));
     }
 }

@@ -3791,6 +3791,11 @@ struct LiveTranscriptionJob {
     meeting_title: Option<String>,
 }
 
+fn live_transcription_status_allows(status: MeetingStatus, summary_enabled: bool) -> bool {
+    matches!(status, MeetingStatus::Recording | MeetingStatus::Stopping)
+        || (status == MeetingStatus::Posted && !summary_enabled)
+}
+
 #[derive(Clone)]
 struct ScaffoldHandler {
     guild_id: GuildId,
@@ -4075,21 +4080,14 @@ impl ScaffoldHandler {
                 base_start_ms,
                 meeting_title: meeting_title.clone(),
             };
-            if !self
-                .live_transcription_is_active(&job.chunk.meeting_id)
-                .await
-            {
+            // The receipt permit remains held while this send applies
+            // backpressure, so blocked producers are bounded by the writer's
+            // task/byte budget. A closed dispatcher takes the durable failure
+            // path below; the audio artifact remains available for final ASR.
+            if let Err(job) = self.live_transcription_dispatcher.enqueue(job).await {
                 self.fail_live_transcription_job(
                     job,
-                    "recording stopped before live transcription was queued",
-                )
-                .await;
-                continue;
-            }
-            if let Err(job) = self.live_transcription_dispatcher.try_enqueue(job) {
-                self.fail_live_transcription_job(
-                    job,
-                    "live transcription queue is full or shutting down; final ASR will retry durable audio",
+                    "runtime stopped before live transcription admission",
                 )
                 .await;
             }
@@ -4189,36 +4187,30 @@ impl ScaffoldHandler {
             base_start_ms,
             meeting_title,
         } = job;
-        if !self.live_transcription_is_active(&chunk.meeting_id).await {
-            self.fail_live_transcription_job(
-                LiveTranscriptionJob {
-                    chunk,
-                    base_start_ms,
-                    meeting_title,
-                },
-                "recording stopped before queued live transcription started",
-            )
-            .await;
-            return;
-        }
-
-        let can_start = {
+        let can_start = !self.shutting_down.load(Ordering::Acquire) && {
             let mut service = self.service.lock().await;
-            let status_allows_live_write = service
+            let status = service
                 .store
                 .get_meeting(&chunk.meeting_id)
                 .ok()
                 .flatten()
-                .is_some_and(|meeting| {
-                    matches!(
-                        meeting.status,
-                        MeetingStatus::Recording | MeetingStatus::Stopping
-                    )
-                });
+                .map(|meeting| meeting.status);
+            let summary_enabled = if status == Some(MeetingStatus::Posted) {
+                service
+                    .store
+                    .get_effective_meeting_settings(&chunk.meeting_id)
+                    .ok()
+                    .flatten()
+                    .map(|settings| settings.summary_enabled)
+                    .unwrap_or(self.summary_enabled)
+            } else {
+                true
+            };
             let final_rows_exist =
                 final_transcript_rows_exist(&mut service.store.executor, &chunk.meeting_id)
                     .unwrap_or(true);
-            status_allows_live_write && !final_rows_exist
+            status.is_some_and(|status| live_transcription_status_allows(status, summary_enabled))
+                && !final_rows_exist
         };
         if !can_start {
             self.fail_live_transcription_job(
@@ -4336,17 +4328,23 @@ impl ScaffoldHandler {
             // critical section. Final transcript persistence uses the same
             // service lock, so it cannot interleave between the status check
             // and the live insert.
-            let status_allows_live_write = service
+            let status = service
                 .store
                 .get_meeting(&chunk.meeting_id)
                 .ok()
                 .flatten()
-                .is_some_and(|meeting| {
-                    matches!(
-                        meeting.status,
-                        MeetingStatus::Recording | MeetingStatus::Stopping
-                    )
-                });
+                .map(|meeting| meeting.status);
+            let summary_enabled = if status == Some(MeetingStatus::Posted) {
+                service
+                    .store
+                    .get_effective_meeting_settings(&chunk.meeting_id)
+                    .ok()
+                    .flatten()
+                    .map(|settings| settings.summary_enabled)
+                    .unwrap_or(self.summary_enabled)
+            } else {
+                true
+            };
             let final_rows_exist =
                 match final_transcript_rows_exist(&mut service.store.executor, &chunk.meeting_id) {
                     Ok(exists) => exists,
@@ -4361,7 +4359,11 @@ impl ScaffoldHandler {
                         true
                     }
                 };
-            let live_write_allowed = status_allows_live_write && !final_rows_exist;
+            let live_write_allowed = !self.shutting_down.load(Ordering::Acquire)
+                && status.is_some_and(|status| {
+                    live_transcription_status_allows(status, summary_enabled)
+                })
+                && !final_rows_exist;
             if !live_write_allowed {
                 let error_message =
                     "live transcription finished after final transcription started".to_owned();
@@ -4418,13 +4420,6 @@ impl ScaffoldHandler {
                 "failed to persist live transcription chunk"
             );
         }
-    }
-
-    async fn live_transcription_is_active(&self, meeting_id: &str) -> bool {
-        self.live_transcription_titles
-            .lock()
-            .await
-            .contains_key(meeting_id)
     }
 
     fn reject_if_shutting_down(&self) -> Result<(), String> {
@@ -12782,6 +12777,30 @@ mod status_message_tests {
             }),
             "source chunk should be marked failed"
         );
+    }
+
+    #[test]
+    fn live_transcription_drains_posted_meetings_only_when_summary_is_disabled() {
+        assert!(live_transcription_status_allows(
+            MeetingStatus::Recording,
+            true
+        ));
+        assert!(live_transcription_status_allows(
+            MeetingStatus::Stopping,
+            true
+        ));
+        assert!(live_transcription_status_allows(
+            MeetingStatus::Posted,
+            false
+        ));
+        assert!(!live_transcription_status_allows(
+            MeetingStatus::Posted,
+            true
+        ));
+        assert!(!live_transcription_status_allows(
+            MeetingStatus::Failed,
+            false
+        ));
     }
 
     #[test]
