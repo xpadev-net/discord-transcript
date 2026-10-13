@@ -18,6 +18,62 @@ pub struct PersistedChunk {
     pub saved: SavedChunk,
 }
 
+/// An immutable WAV chunk prepared for persistence. Its identity and bytes are
+/// fixed before storage I/O so retries always target the same chunk path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedChunk {
+    meeting_id: String,
+    user_id: String,
+    sequence: u64,
+    start_ms: u64,
+    wav: crate::audio::WavChunk,
+}
+
+impl PreparedChunk {
+    pub fn meeting_id(&self) -> &str {
+        &self.meeting_id
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn start_ms(&self) -> u64 {
+        self.start_ms
+    }
+
+    pub fn wav(&self) -> &crate::audio::WavChunk {
+        &self.wav
+    }
+
+    /// Persist this prepared chunk without changing its identity. Callers may
+    /// retain the value after an error and retry it later.
+    pub fn save<S: ChunkStorage>(&self, storage: &S) -> Result<SavedChunk, ChunkStorageError> {
+        storage.save_chunk(
+            &self.meeting_id,
+            &self.user_id,
+            self.sequence,
+            self.start_ms,
+            &self.wav.bytes,
+        )
+    }
+
+    /// Finalize completion metadata only after the storage write succeeds.
+    pub fn complete(self, saved: SavedChunk) -> PersistedChunk {
+        PersistedChunk {
+            meeting_id: self.meeting_id,
+            user_id: self.user_id,
+            sequence: self.sequence,
+            start_ms: self.start_ms,
+            saved,
+        }
+    }
+}
+
 /// Result of a flush operation.  Callers should inspect `failed` —
 /// those chunks have been retained by the session for retry, so callers
 /// can delay teardown without copying raw audio bytes.
@@ -49,14 +105,16 @@ impl AudioLoss {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedChunk {
     pub user_id: String,
+    pub sequence: u64,
     pub start_ms: u64,
     pub size_bytes: usize,
 }
 
 impl FailedChunk {
-    fn from_chunk(chunk: &RecorderOutputChunk) -> Self {
+    fn from_chunk(chunk: &PreparedChunk) -> Self {
         Self {
             user_id: chunk.user_id.clone(),
+            sequence: chunk.sequence,
             start_ms: chunk.start_ms,
             size_bytes: chunk.wav.bytes.len(),
         }
@@ -66,7 +124,7 @@ impl FailedChunk {
 #[derive(Debug)]
 struct PersistChunksResult {
     persisted: Vec<PersistedChunk>,
-    failed_chunks: Vec<RecorderOutputChunk>,
+    failed_chunks: Vec<PreparedChunk>,
     newly_failed: usize,
 }
 
@@ -76,7 +134,7 @@ pub struct RecordingSession<S: ChunkStorage> {
     recorder: RecorderEngine,
     storage: S,
     per_user_seq: HashMap<String, u64>,
-    pending_failed_chunks: Vec<RecorderOutputChunk>,
+    pending_failed_chunks: Vec<PreparedChunk>,
     audio_loss: AudioLoss,
     max_pending_failed_chunk_bytes: usize,
 }
@@ -133,18 +191,74 @@ impl<S: ChunkStorage> RecordingSession<S> {
     }
 
     pub fn flush_due(&mut self, now: Instant) -> Result<FlushResult, RecordingSessionError> {
-        let chunks = self.recorder.flush_due(now)?;
+        let generated = self.recorder.flush_due(now)?;
+        let chunks = self.prepare_chunks(generated);
         Ok(self.persist_chunks_with_pending(chunks, false))
     }
 
     pub fn flush_all(&mut self) -> Result<FlushResult, RecordingSessionError> {
-        let chunks = self.recorder.flush_all()?;
+        let generated = self.recorder.flush_all()?;
+        let chunks = self.prepare_chunks(generated);
         Ok(self.persist_chunks_with_pending(chunks, true))
+    }
+
+    /// Generate due WAV data and reserve stable sequence numbers without
+    /// performing storage I/O. Callers can move these values to a writer and
+    /// invoke [`PreparedChunk::save`] after releasing the session lock.
+    pub fn prepare_due(
+        &mut self,
+        now: Instant,
+    ) -> Result<Vec<PreparedChunk>, RecordingSessionError> {
+        let chunks = self.recorder.flush_due(now)?;
+        Ok(self.prepare_with_pending(chunks))
+    }
+
+    /// Generate all buffered WAV data without performing storage I/O.
+    pub fn prepare_all(&mut self) -> Result<Vec<PreparedChunk>, RecordingSessionError> {
+        let chunks = self.recorder.flush_all()?;
+        Ok(self.prepare_with_pending(chunks))
+    }
+
+    /// Return chunks that failed in an out-of-lock writer to the session's
+    /// bounded retry buffer. The success value reports audio evicted by this
+    /// retention attempt so callers can block teardown when it is non-empty.
+    /// A chunk for another meeting is returned unchanged.
+    pub fn retain_failed_prepared(
+        &mut self,
+        chunk: PreparedChunk,
+    ) -> Result<AudioLoss, PreparedChunk> {
+        if chunk.meeting_id != self.meeting_id {
+            return Err(chunk);
+        }
+        self.pending_failed_chunks.push(chunk);
+        Ok(self.enforce_pending_failed_limit())
+    }
+
+    fn prepare_with_pending(&mut self, chunks: Vec<RecorderOutputChunk>) -> Vec<PreparedChunk> {
+        let mut prepared = std::mem::take(&mut self.pending_failed_chunks);
+        prepared.extend(self.prepare_chunks(chunks));
+        prepared
+    }
+
+    fn prepare_chunks(&mut self, chunks: Vec<RecorderOutputChunk>) -> Vec<PreparedChunk> {
+        chunks
+            .into_iter()
+            .map(|chunk| {
+                let sequence = self.reserve_sequence(&chunk.user_id);
+                PreparedChunk {
+                    meeting_id: self.meeting_id.clone(),
+                    user_id: chunk.user_id,
+                    sequence,
+                    start_ms: chunk.start_ms,
+                    wav: chunk.wav,
+                }
+            })
+            .collect()
     }
 
     fn persist_chunks_with_pending(
         &mut self,
-        chunks: Vec<RecorderOutputChunk>,
+        chunks: Vec<PreparedChunk>,
         retry_pending_without_new_chunks: bool,
     ) -> FlushResult {
         if chunks.is_empty() && !retry_pending_without_new_chunks {
@@ -179,14 +293,15 @@ impl<S: ChunkStorage> RecordingSession<S> {
             .collect()
     }
 
-    fn enforce_pending_failed_limit(&mut self) {
+    fn enforce_pending_failed_limit(&mut self) -> AudioLoss {
+        let mut dropped = AudioLoss::default();
         let mut total_bytes: usize = self
             .pending_failed_chunks
             .iter()
             .map(|chunk| chunk.wav.bytes.len())
             .sum();
         if total_bytes <= self.max_pending_failed_chunk_bytes {
-            return;
+            return dropped;
         }
 
         let mut drop_count = 0usize;
@@ -204,6 +319,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
         if drop_count > 0 {
             self.pending_failed_chunks.drain(0..drop_count);
             self.audio_loss.record_drop(drop_count, drop_bytes);
+            dropped.record_drop(drop_count, drop_bytes);
             tracing::warn!(
                 meeting_id = %self.meeting_id,
                 dropped_chunks = drop_count,
@@ -213,6 +329,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
                 "pending failed audio chunk buffer exceeded memory limit; dropped oldest chunks"
             );
         }
+        dropped
     }
 
     /// Persist chunks best-effort.  Successfully saved chunks are returned in
@@ -220,7 +337,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
     /// so the caller can decide whether to retry or accept the loss.
     fn persist_chunks(
         &mut self,
-        chunks: Vec<RecorderOutputChunk>,
+        chunks: Vec<PreparedChunk>,
         existing_pending_count: usize,
     ) -> PersistChunksResult {
         let mut persisted = Vec::with_capacity(chunks.len());
@@ -228,27 +345,10 @@ impl<S: ChunkStorage> RecordingSession<S> {
         let mut newly_failed = 0usize;
 
         for (index, chunk) in chunks.into_iter().enumerate() {
-            let saved = self.storage.save_chunk(
-                &self.meeting_id,
-                &chunk.user_id,
-                // Sequence is assigned only after successful persistence to
-                // avoid gaps when a save fails. Downstream audio assembly sorts
-                // by start_ms first; sequence is only a filename/tie-breaker.
-                self.peek_next_sequence(&chunk.user_id),
-                chunk.start_ms,
-                &chunk.wav.bytes,
-            );
+            let saved = chunk.save(&self.storage);
             match saved {
                 Ok(saved) => {
-                    self.commit_sequence(&chunk.user_id);
-                    let seq = self.current_sequence(&chunk.user_id);
-                    persisted.push(PersistedChunk {
-                        meeting_id: self.meeting_id.clone(),
-                        user_id: chunk.user_id,
-                        sequence: seq,
-                        start_ms: chunk.start_ms,
-                        saved,
-                    });
+                    persisted.push(chunk.complete(saved));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -272,20 +372,12 @@ impl<S: ChunkStorage> RecordingSession<S> {
         }
     }
 
-    /// Returns the next sequence number without committing it.
-    fn peek_next_sequence(&self, user_id: &str) -> u64 {
-        self.per_user_seq.get(user_id).copied().unwrap_or(0) + 1
-    }
-
-    /// Commits the sequence number (increments the counter).
-    fn commit_sequence(&mut self, user_id: &str) {
+    /// Reserve a sequence when the prepared chunk is created, before storage
+    /// I/O. This prevents retries or out-of-lock writers from reusing a path.
+    fn reserve_sequence(&mut self, user_id: &str) -> u64 {
         let seq = self.per_user_seq.entry(user_id.to_owned()).or_insert(0);
         *seq += 1;
-    }
-
-    /// Returns the current (already committed) sequence number for a user.
-    fn current_sequence(&self, user_id: &str) -> u64 {
-        self.per_user_seq.get(user_id).copied().unwrap_or(0)
+        *seq
     }
 
     /// Re-key in-memory audio buffers and sequence counters from `old_id`
@@ -426,6 +518,101 @@ mod tests {
                 pcm_16le_bytes: vec![0, 0, 1, 0],
             },
         );
+    }
+
+    #[test]
+    fn prepared_chunk_freezes_identity_and_wav_bytes_before_storage() {
+        let failures = Arc::new(AtomicUsize::new(1));
+        let mut session = test_session(Arc::clone(&failures));
+        ingest_test_frame(&mut session, 1_000);
+
+        let mut prepared = session.prepare_all().expect("preparation should succeed");
+        assert_eq!(prepared.len(), 1);
+        let chunk = prepared.pop().expect("one chunk should be ready");
+        assert_eq!(chunk.meeting_id(), "meeting-1");
+        assert_eq!(chunk.user_id(), "u1");
+        assert_eq!(chunk.sequence(), 1);
+        assert_eq!(chunk.start_ms(), 1_000);
+        assert_eq!(&chunk.wav().bytes[0..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes(chunk.wav().bytes[24..28].try_into().unwrap()),
+            48_000
+        );
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            1,
+            "prepare must not write storage"
+        );
+
+        assert!(chunk.save(&session.storage).is_err());
+        failures.store(0, Ordering::SeqCst);
+        let saved = chunk
+            .save(&session.storage)
+            .expect("retry of the same prepared chunk should succeed");
+        let persisted = chunk.complete(saved);
+        assert_eq!(persisted.sequence, 1);
+        assert_eq!(persisted.start_ms, 1_000);
+        assert_eq!(persisted.user_id, "u1");
+        assert_eq!(session.per_user_seq.get("u1"), Some(&1));
+    }
+
+    #[test]
+    fn prepare_all_transfers_and_can_retain_failed_chunks_for_retry() {
+        let failures = Arc::new(AtomicUsize::new(2));
+        let mut session = test_session(Arc::clone(&failures));
+        ingest_test_frame(&mut session, 1_000);
+
+        let first = session
+            .flush_all()
+            .expect("sync wrapper should retain failure");
+        assert_eq!(first.failed.len(), 1);
+        assert_eq!(first.failed[0].sequence, 1);
+
+        let mut prepared = session.prepare_all().expect("preparation should succeed");
+        assert_eq!(prepared.len(), 1, "retained failures must be transferred");
+        let chunk = prepared.pop().unwrap();
+        assert_eq!(chunk.sequence(), 1);
+        assert!(chunk.save(&session.storage).is_err());
+        assert!(
+            session
+                .retain_failed_prepared(chunk)
+                .expect("same-meeting failure should re-enter the retry buffer")
+                .is_empty()
+        );
+
+        failures.store(0, Ordering::SeqCst);
+        let mut retry = session
+            .prepare_all()
+            .expect("retry preparation should succeed");
+        let chunk = retry
+            .pop()
+            .expect("retained chunk should be prepared again");
+        assert_eq!(chunk.sequence(), 1);
+        let persisted = chunk
+            .save(&session.storage)
+            .map(|saved| chunk.complete(saved))
+            .expect("retry should persist");
+        assert_eq!(persisted.sequence, 1);
+    }
+
+    #[test]
+    fn retaining_prepared_chunk_reports_retry_buffer_eviction() {
+        let mut session = test_session(Arc::new(AtomicUsize::new(0)));
+        session.set_pending_failed_chunk_limit_for_tests(1);
+        ingest_test_frame(&mut session, 1_000);
+        let chunk = session
+            .prepare_all()
+            .expect("preparation should succeed")
+            .pop()
+            .expect("one chunk should be ready");
+
+        let loss = session
+            .retain_failed_prepared(chunk)
+            .expect("same-meeting failure should enter bounded retention");
+        assert_eq!(loss.dropped_chunks, 1);
+        assert!(loss.dropped_bytes > 1);
+        assert_eq!(session.audio_loss, loss);
+        assert!(session.pending_failed_chunks.is_empty());
     }
 
     #[test]
