@@ -2772,6 +2772,26 @@ fn cleanup_agent_workspace_after_persist(
     }
 }
 
+fn persist_generated_summary<E: SqlExecutor>(
+    executor: &mut E,
+    meeting_id: &str,
+    markdown: &str,
+) -> Result<(), String> {
+    let summary_id = format!("{meeting_id}-s-1");
+    executor
+        .execute(
+            crate::infrastructure::sql::INSERT_SUMMARY_SQL,
+            &[
+                summary_id,
+                meeting_id.to_owned(),
+                markdown.to_owned(),
+                crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION.to_string(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("failed to persist generated summary: {err}"))
+}
+
 fn recover_summary_job_for_startup<E: SqlExecutor>(
     queue: &mut SqlJobQueue<E>,
     job_id: &str,
@@ -8766,29 +8786,28 @@ impl ScaffoldHandler {
         let agent_workspace =
             agent_workspace.expect("summary agent workspace should remain after success");
 
-        // Persist summary markdown to DB (best-effort), then remove the
-        // per-run agent workspace. The validated markdown is held in memory for
-        // AI-memory extraction and Discord posting after the workspace is gone.
+        // Persist summary markdown before removing the per-run agent workspace
+        // or allowing the caller to post and complete the job.
         self.refresh_summary_job_ownership(&claimed_job, "summary_persist")
             .await?;
-        {
-            let summary_id = format!("{}-s-1", claimed_job.meeting_id);
+        let persist_result = {
             let mut service = self.service.lock().await;
-            if let Err(err) = service.store.executor.execute(
-                crate::infrastructure::sql::INSERT_SUMMARY_SQL,
-                &[
-                    summary_id,
-                    claimed_job.meeting_id.clone(),
-                    markdown.clone(),
-                    crate::application::summary::SUMMARY_CONTEXT_SELECTION_VERSION.to_string(),
-                ],
-            ) {
-                warn!(
-                    meeting_id = %claimed_job.meeting_id,
-                    error = %err,
-                    "failed to persist summary"
-                );
-            }
+            persist_generated_summary(
+                &mut service.store.executor,
+                &claimed_job.meeting_id,
+                &markdown,
+            )
+        };
+        if let Err(err) = persist_result {
+            warn!(
+                meeting_id = %claimed_job.meeting_id,
+                error = %err,
+                "failed to persist summary; scheduling retry before cleanup or notification"
+            );
+            agent_workspace.retain_for_retry();
+            return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(
+                err
+            ));
         }
         // The summary is already persisted at this point, so cleanup is
         // best-effort housekeeping. A prompt-injected agent can tamper with
@@ -10386,6 +10405,26 @@ mod status_message_tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn generated_summary_persistence_failure_is_fatal_to_completion_path() {
+        let mut executor = FakeSqlExecutor::default();
+        executor.execute_error.insert(
+            format!("{}|*", crate::infrastructure::sql::INSERT_SUMMARY_SQL),
+            "database unavailable".to_owned(),
+        );
+
+        let err = persist_generated_summary(&mut executor, "m1", "## Summary\nresult")
+            .expect_err("database failure must prevent summary completion");
+
+        assert!(err.contains("failed to persist generated summary"));
+        assert!(err.contains("database unavailable"));
+        assert_eq!(executor.executed.len(), 1);
+        assert_eq!(
+            executor.executed[0].0,
+            crate::infrastructure::sql::INSERT_SUMMARY_SQL
+        );
+    }
 
     #[test]
     fn summary_job_processing_runs_only_in_all_role() {

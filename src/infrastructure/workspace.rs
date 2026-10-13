@@ -430,6 +430,11 @@ impl AgentWorkspace {
         self.cleanup_on_drop = false;
         cleanup_agent_workspace_root(&self.root, &self.root_identity, Some(&self.root_handle))
     }
+
+    /// Keep the workspace on disk when ownership is transferred to a retry.
+    pub fn retain_for_retry(mut self) {
+        self.cleanup_on_drop = false;
+    }
 }
 
 impl Drop for AgentWorkspace {
@@ -1477,6 +1482,21 @@ mod tests {
         std::fs::create_dir_all(&cursor_dir).expect("cursor dir");
         std::fs::write(cursor_dir.join(AGENT_CLEANUP_MARKER_FILENAME), marker)
             .expect("cleanup marker");
+    }
+
+    #[test]
+    fn retained_agent_workspace_survives_drop_for_retry() {
+        let meeting_root = unique_temp_dir("agent_workspace_retry");
+        std::fs::create_dir_all(&meeting_root).expect("meeting root should be created");
+        let agent_root = meeting_root.join("agent/summary-retry");
+        let workspace = AgentWorkspaceBuilder::new(&meeting_root, &agent_root)
+            .build()
+            .expect("agent workspace should be built");
+
+        workspace.retain_for_retry();
+
+        assert!(agent_root.is_dir(), "retry workspace should be retained");
+        std::fs::remove_dir_all(meeting_root).expect("test workspace should be removed");
     }
 
     #[test]
