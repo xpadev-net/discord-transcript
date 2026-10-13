@@ -8,6 +8,9 @@ use crate::application::command::{
     CommandError, PermissionSet, RecordStartPreflight, RecordStartRequest,
     record_start_after_preflight, validate_record_start_preconditions,
 };
+use crate::application::live_transcription_dispatcher::{
+    DEFAULT_LIVE_TRANSCRIPTION_QUEUE_LIMIT, LiveTranscriptionDispatcher,
+};
 use crate::application::recording_writer::{
     BoundedRecordingWriter, ChunkWriteOutcome, DEFAULT_RECORDING_WRITER_BYTE_LIMIT,
     DEFAULT_RECORDING_WRITER_TASK_LIMIT,
@@ -97,7 +100,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock, RwLockWriteGuard, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, RwLock, RwLockWriteGuard, mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -2249,6 +2252,7 @@ fn persist_live_transcription_success<E: SqlExecutor>(
 fn mark_live_transcription_chunk_failed<E: SqlExecutor>(
     executor: &mut E,
     chunk: &PersistedChunk,
+    timeline_base_ms: u64,
     error_message: &str,
 ) -> Result<(), String> {
     let chunk_id = live_chunk_id(chunk);
@@ -2262,8 +2266,21 @@ fn mark_live_transcription_chunk_failed<E: SqlExecutor>(
         )?;
         executor
             .execute(
-                "UPDATE live_transcription_chunks SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
-                &[chunk_id, error_message.to_owned()],
+                "INSERT INTO live_transcription_chunks \
+                 (id, meeting_id, speaker_id, sequence, start_ms, timeline_base_ms, status, error_message, attempt_count, updated_at) \
+                 VALUES ($1, $2, $3, $4::TEXT::BIGINT, $5::TEXT::BIGINT, $6::TEXT::BIGINT, 'failed', $7, 0, NOW()) \
+                 ON CONFLICT (id) DO UPDATE SET \
+                 status='failed', error_message=EXCLUDED.error_message, \
+                 timeline_base_ms=EXCLUDED.timeline_base_ms, updated_at=NOW()",
+                &[
+                    chunk_id,
+                    chunk.meeting_id.clone(),
+                    chunk.user_id.clone(),
+                    chunk.sequence.to_string(),
+                    chunk.start_ms.to_string(),
+                    timeline_base_ms.to_string(),
+                    error_message.to_owned(),
+                ],
             )
             .map(|_| ())
     })();
@@ -3484,6 +3501,8 @@ pub async fn run_bot(
         DEFAULT_RECORDING_WRITER_TASK_LIMIT,
         DEFAULT_RECORDING_WRITER_BYTE_LIMIT,
     );
+    let (live_transcription_dispatcher, live_transcription_receiver) =
+        LiveTranscriptionDispatcher::channel(DEFAULT_LIVE_TRANSCRIPTION_QUEUE_LIMIT);
 
     let handler = ScaffoldHandler {
         guild_id,
@@ -3497,11 +3516,11 @@ pub async fn run_bot(
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         recording_writer,
+        live_transcription_dispatcher,
         recording_startups: Arc::new(Mutex::new(HashMap::new())),
         recording_start_cleanup_retries: Arc::new(StdMutex::new(HashSet::new())),
         live_transcription_bases: Arc::new(Mutex::new(HashMap::new())),
         live_transcription_titles: Arc::new(Mutex::new(HashMap::new())),
-        live_transcription_gate: Arc::new(Semaphore::new(1)),
         auto_stop_states: Arc::new(Mutex::new(HashMap::new())),
         command_gate: Arc::new(RwLock::new(())),
         voice_event_gate: Arc::new(RwLock::new(())),
@@ -3573,6 +3592,7 @@ pub async fn run_bot(
         .register_songbird_with(Arc::clone(&voice_manager))
         .await
         .map_err(|err| RuntimeError::ClientInit(err.to_string()))?;
+    handler.start_live_transcription_dispatcher(live_transcription_receiver);
     let shard_manager = Arc::clone(&client.shard_manager);
     if handler.summary_job_processing_enabled {
         handler.spawn_summary_job_wakeup_listener(Arc::clone(&client.http), summary_job_wakeups);
@@ -3765,6 +3785,12 @@ fn load_runtime_summary_context<E: SqlExecutor>(
     })
 }
 
+struct LiveTranscriptionJob {
+    chunk: PersistedChunk,
+    base_start_ms: u64,
+    meeting_title: Option<String>,
+}
+
 #[derive(Clone)]
 struct ScaffoldHandler {
     guild_id: GuildId,
@@ -3773,11 +3799,11 @@ struct ScaffoldHandler {
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<MeetingChunkStorage>>>>,
     recording_writer: BoundedRecordingWriter<MeetingChunkStorage>,
+    live_transcription_dispatcher: LiveTranscriptionDispatcher<LiveTranscriptionJob>,
     recording_startups: Arc<Mutex<HashMap<String, String>>>,
     recording_start_cleanup_retries: Arc<StdMutex<HashSet<String>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
     live_transcription_titles: Arc<Mutex<HashMap<String, Option<String>>>>,
-    live_transcription_gate: Arc<Semaphore>,
     auto_stop_states: Arc<Mutex<HashMap<String, AutoStopState>>>,
     command_gate: Arc<RwLock<()>>,
     voice_event_gate: Arc<RwLock<()>>,
@@ -4008,20 +4034,94 @@ impl ScaffoldHandler {
         titles.get(meeting_id).cloned().flatten()
     }
 
-    fn spawn_live_transcription_tasks(
+    fn start_live_transcription_dispatcher(
+        &self,
+        mut receiver: mpsc::Receiver<LiveTranscriptionJob>,
+    ) {
+        let runtime = self.clone();
+        self.task_tracker.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = runtime.shutdown_token.cancelled() => {
+                        runtime.live_transcription_dispatcher.stop_accepting();
+                        receiver.close();
+                        while let Some(job) = receiver.recv().await {
+                            runtime.fail_live_transcription_job(
+                                job,
+                                "runtime shutdown before live transcription started",
+                            ).await;
+                        }
+                        break;
+                    }
+                    job = receiver.recv() => match job {
+                        Some(job) => runtime.process_live_transcription_job(job).await,
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
+
+    async fn enqueue_live_transcription_chunks(
         &self,
         chunks: Vec<PersistedChunk>,
         base_start_ms: u64,
         meeting_title: Option<String>,
     ) {
         for chunk in chunks {
-            let runtime = self.clone();
-            let meeting_title = meeting_title.clone();
-            self.spawn_background(async move {
-                runtime
-                    .process_live_transcription_chunk(chunk, base_start_ms, meeting_title)
-                    .await;
-            });
+            let job = LiveTranscriptionJob {
+                chunk,
+                base_start_ms,
+                meeting_title: meeting_title.clone(),
+            };
+            if !self
+                .live_transcription_is_active(&job.chunk.meeting_id)
+                .await
+            {
+                self.fail_live_transcription_job(
+                    job,
+                    "recording stopped before live transcription was queued",
+                )
+                .await;
+                continue;
+            }
+            if let Err(job) = self.live_transcription_dispatcher.try_enqueue(job) {
+                self.fail_live_transcription_job(
+                    job,
+                    "live transcription queue is full or shutting down; final ASR will retry durable audio",
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn fail_live_transcription_job(&self, job: LiveTranscriptionJob, reason: &str) {
+        let result = {
+            let mut service = self.service.lock().await;
+            mark_live_transcription_chunk_failed(
+                &mut service.store.executor,
+                &job.chunk,
+                job.base_start_ms,
+                reason,
+            )
+        };
+        match result {
+            Ok(()) => warn!(
+                meeting_id = %job.chunk.meeting_id,
+                speaker_id = %job.chunk.user_id,
+                sequence = job.chunk.sequence,
+                reason,
+                "live transcription deferred; durable audio remains available to final ASR"
+            ),
+            Err(error) => error!(
+                meeting_id = %job.chunk.meeting_id,
+                speaker_id = %job.chunk.user_id,
+                sequence = job.chunk.sequence,
+                reason,
+                error = %error,
+                "failed to durably record deferred live transcription"
+            ),
         }
     }
 
@@ -4040,7 +4140,8 @@ impl ScaffoldHandler {
                     )
                     .await;
                 let meeting_title = self.live_transcription_title(&chunk.meeting_id).await;
-                self.spawn_live_transcription_tasks(vec![chunk], base_start_ms, meeting_title);
+                self.enqueue_live_transcription_chunks(vec![chunk], base_start_ms, meeting_title)
+                    .await;
             }
             ChunkWriteOutcome::Failed { chunk, error } => {
                 let meeting_id = chunk.meeting_id().to_owned();
@@ -4082,24 +4183,55 @@ impl ScaffoldHandler {
         }
     }
 
-    async fn process_live_transcription_chunk(
-        &self,
-        chunk: PersistedChunk,
-        base_start_ms: u64,
-        meeting_title: Option<String>,
-    ) {
-        let Ok(_permit) = Arc::clone(&self.live_transcription_gate)
-            .acquire_owned()
-            .await
-        else {
-            warn!(
-                meeting_id = %chunk.meeting_id,
-                user_id = %chunk.user_id,
-                sequence = chunk.sequence,
-                "live transcription semaphore closed; skipping chunk"
-            );
+    async fn process_live_transcription_job(&self, job: LiveTranscriptionJob) {
+        let LiveTranscriptionJob {
+            chunk,
+            base_start_ms,
+            meeting_title,
+        } = job;
+        if !self.live_transcription_is_active(&chunk.meeting_id).await {
+            self.fail_live_transcription_job(
+                LiveTranscriptionJob {
+                    chunk,
+                    base_start_ms,
+                    meeting_title,
+                },
+                "recording stopped before queued live transcription started",
+            )
+            .await;
             return;
+        }
+
+        let can_start = {
+            let mut service = self.service.lock().await;
+            let status_allows_live_write = service
+                .store
+                .get_meeting(&chunk.meeting_id)
+                .ok()
+                .flatten()
+                .is_some_and(|meeting| {
+                    matches!(
+                        meeting.status,
+                        MeetingStatus::Recording | MeetingStatus::Stopping
+                    )
+                });
+            let final_rows_exist =
+                final_transcript_rows_exist(&mut service.store.executor, &chunk.meeting_id)
+                    .unwrap_or(true);
+            status_allows_live_write && !final_rows_exist
         };
+        if !can_start {
+            self.fail_live_transcription_job(
+                LiveTranscriptionJob {
+                    chunk,
+                    base_start_ms,
+                    meeting_title,
+                },
+                "meeting finalization started before queued live transcription",
+            )
+            .await;
+            return;
+        }
 
         if let Err(err) = {
             let mut service = self.service.lock().await;
@@ -4173,6 +4305,7 @@ impl ScaffoldHandler {
                     mark_live_transcription_chunk_failed(
                         &mut service.store.executor,
                         &chunk,
+                        base_start_ms,
                         &error_message,
                     )
                 };
@@ -4235,6 +4368,7 @@ impl ScaffoldHandler {
                 let mark_result = mark_live_transcription_chunk_failed(
                     &mut service.store.executor,
                     &chunk,
+                    base_start_ms,
                     &error_message,
                 );
                 if let Err(mark_err) = mark_result {
@@ -4263,6 +4397,7 @@ impl ScaffoldHandler {
                 mark_live_transcription_chunk_failed(
                     &mut service.store.executor,
                     &chunk,
+                    base_start_ms,
                     &error_message,
                 )
             };
@@ -4285,6 +4420,13 @@ impl ScaffoldHandler {
         }
     }
 
+    async fn live_transcription_is_active(&self, meeting_id: &str) -> bool {
+        self.live_transcription_titles
+            .lock()
+            .await
+            .contains_key(meeting_id)
+    }
+
     fn reject_if_shutting_down(&self) -> Result<(), String> {
         if self.shutting_down.load(Ordering::Acquire) {
             Err("shutdown in progress; try again after restart".to_owned())
@@ -4295,6 +4437,7 @@ impl ScaffoldHandler {
 
     async fn shutdown(&self, voice_manager: Arc<songbird::Songbird>, grace: Duration) {
         self.shutting_down.store(true, Ordering::Release);
+        self.live_transcription_dispatcher.stop_accepting();
         self.shutdown_token.cancel();
 
         {
@@ -5913,6 +6056,11 @@ impl ScaffoldHandler {
             .map_err(RecordingTeardownError::Stop)?
         };
 
+        self.live_transcription_titles
+            .lock()
+            .await
+            .remove(request.expected_meeting_id);
+
         let removed_session = {
             let _voice_event_guard = self.voice_event_gate.write().await;
             self.recording_writer.drain().await;
@@ -5930,10 +6078,6 @@ impl ScaffoldHandler {
                 request.guild_key,
                 request.expected_meeting_id,
             );
-        }
-        if let Some(session) = &removed_session {
-            let mut titles = self.live_transcription_titles.lock().await;
-            titles.remove(&session.meeting_id);
         }
         {
             let mut startups = self.recording_startups.lock().await;
@@ -12609,7 +12753,7 @@ mod status_message_tests {
         let mut executor = crate::infrastructure::sql_store::FakeSqlExecutor::default();
         let chunk = persisted_chunk_for_live_test();
 
-        mark_live_transcription_chunk_failed(&mut executor, &chunk, "boom")
+        mark_live_transcription_chunk_failed(&mut executor, &chunk, 1_000_000, "boom")
             .expect("failed chunk should be marked");
 
         assert!(
@@ -12622,8 +12766,19 @@ mod status_message_tests {
         );
         assert!(
             executor.executed.iter().any(|(sql, params)| {
-                sql.contains("UPDATE live_transcription_chunks SET status='failed'")
-                    && params == &vec!["m1-alice-7-1000000".to_owned(), "boom".to_owned()]
+                sql.contains("INSERT INTO live_transcription_chunks")
+                    && sql.contains("ON CONFLICT (id) DO UPDATE SET")
+                    && sql.contains("status='failed'")
+                    && params
+                        == &vec![
+                            "m1-alice-7-1000000".to_owned(),
+                            "m1".to_owned(),
+                            "alice".to_owned(),
+                            "7".to_owned(),
+                            "1000000".to_owned(),
+                            "1000000".to_owned(),
+                            "boom".to_owned(),
+                        ]
             }),
             "source chunk should be marked failed"
         );

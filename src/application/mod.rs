@@ -3,6 +3,7 @@ pub mod asr;
 pub mod auto_stop;
 pub mod bot;
 pub mod command;
+pub mod live_transcription_dispatcher;
 pub mod meeting_flow;
 pub mod recording_writer;
 pub mod recovery_runner;
