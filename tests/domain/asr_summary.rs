@@ -1429,6 +1429,82 @@ fn materialized_summary_context_excludes_unapproved_domain_knowledge() {
 }
 
 #[test]
+fn materialized_summary_context_matches_japanese_phrases_and_ngrams() {
+    let temp = unique_workspace("context_japanese_relevance", "m1");
+    let workspace = temp.workspace().clone();
+    let request = SummaryRequest {
+        meeting_id: "m1".to_owned(),
+        guild_id: "g1".to_owned(),
+        voice_channel_id: "vc1".to_owned(),
+        voice_channel_name: None,
+        title: Some("定例会議".to_owned()),
+        started_at: None,
+        stopped_at: None,
+        duration_seconds: None,
+        audio_path: workspace.mixdown_path().to_string_lossy().to_string(),
+        speaker_audio: vec![],
+        language: Some("ja".to_owned()),
+        workspace,
+    };
+    let updated_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp should be valid");
+    let item = |id: &str, title: &str, body: &str, allow: bool, active: bool| {
+        DomainKnowledgeItem {
+            id: id.to_owned(),
+            tenant_id: Some("tenant-g1".to_owned()),
+            guild_id: "g1".to_owned(),
+            content_type: DomainKnowledgeContentType::ProjectContext,
+            title: title.to_owned(),
+            body: body.to_owned(),
+            active,
+            allow_summary_context: allow,
+            version: 1,
+            updated_actor_user_id: None,
+            archived_at: None,
+            archived_actor_user_id: None,
+            created_at: updated_at,
+            updated_at,
+        }
+    };
+    let exact_body = "APPROVED_JAPANESE_EXACT_BODY";
+    let ngram_body = "APPROVED_JAPANESE_NGRAM_BODY";
+    let context = SummaryContextInput {
+        domain_knowledge: vec![
+            item("dk-exact", "顧客移行計画", exact_body, true, true),
+            item(
+                "dk-ngram",
+                "顧客移行計画に関する内部方針詳細",
+                ngram_body,
+                true,
+                true,
+            ),
+            item("dk-short", "計画", "SHORT_ONLY_BODY", true, true),
+            item("dk-denied", "顧客移行計画", "DENIED_JAPANESE_BODY", false, true),
+            item("dk-inactive", "顧客移行計画", "INACTIVE_JAPANESE_BODY", true, false),
+        ],
+        ..SummaryContextInput::default()
+    };
+
+    let manifest = materialize_summary_context(
+        &request,
+        &context,
+        Some("顧客移行計画に関する課題を整理しました。"),
+    )
+    .expect("context should materialize");
+
+    assert_eq!(manifest.domain_knowledge_count, 2);
+    let rendered = std::fs::read_to_string(request.workspace.context_domain_knowledge_path())
+        .expect("domain knowledge context should be readable");
+    assert!(rendered.contains(exact_body));
+    assert!(rendered.contains(ngram_body));
+    assert!(!rendered.contains("SHORT_ONLY_BODY"));
+    assert!(!rendered.contains("DENIED_JAPANESE_BODY"));
+    assert!(!rendered.contains("INACTIVE_JAPANESE_BODY"));
+}
+
+#[test]
 fn materialized_summary_context_rejects_single_common_token_overlap() {
     let temp = unique_workspace("context_common_token_overlap", "m1");
     let workspace = temp.workspace().clone();
@@ -1990,7 +2066,7 @@ fn materialized_summary_context_regenerates_legacy_unminimized_manifest() {
     )
     .expect("legacy context should be regenerated");
 
-    assert_eq!(manifest.context_selection_version, 2);
+    assert_eq!(manifest.context_selection_version, 3);
     assert_eq!(manifest.ai_memory_count, 0);
     let ai_memory_context =
         std::fs::read_to_string(request.workspace.context_ai_memory_path()).expect("AI memory");

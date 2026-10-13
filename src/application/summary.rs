@@ -135,7 +135,8 @@ pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
 /// v2: materialization also snapshots the protected context bodies used by
 /// the verbatim-leak check, so retries compare the bodies the agent actually
 /// received instead of whatever the store holds at check time.
-pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 2;
+/// v3: context relevance includes CJK phrases and character n-grams.
+pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct StubClaudeSummaryClient {
@@ -1291,7 +1292,47 @@ impl ContextRelevanceEvidence {
             || context_evidence_token_pairs(&tokens)
                 .into_iter()
                 .any(|phrase| self.normalized_haystack.contains(&phrase))
+            || self.contains_cjk_phrase(&normalized)
     }
+
+    fn contains_cjk_phrase(&self, normalized: &str) -> bool {
+        normalized
+            .split(|ch| !is_cjk_context_char(ch))
+            .filter(|run| run.chars().count() >= CJK_CONTEXT_NGRAM_CHARS)
+            .any(|run| {
+                if self.normalized_haystack.contains(run) {
+                    return true;
+                }
+
+                let matching_ngrams = run
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .windows(CJK_CONTEXT_NGRAM_CHARS)
+                    .map(|ngram| ngram.iter().collect::<String>())
+                    .filter(|ngram| self.normalized_haystack.contains(ngram))
+                    .collect::<HashSet<_>>();
+                matching_ngrams.len() >= CJK_CONTEXT_MIN_MATCHING_NGRAMS
+            })
+    }
+}
+
+const CJK_CONTEXT_NGRAM_CHARS: usize = 4;
+const CJK_CONTEXT_MIN_MATCHING_NGRAMS: usize = 2;
+
+fn is_cjk_context_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x11ff
+            | 0x2e80..=0x2fff
+            | 0x3040..=0x30ff
+            | 0x3130..=0x318f
+            | 0x31f0..=0x31ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xac00..=0xd7af
+            | 0xf900..=0xfaff
+            | 0x20000..=0x2fa1f
+    )
 }
 
 fn normalize_context_evidence(value: &str) -> String {
