@@ -105,7 +105,10 @@ function streamEventCode(data: string): string {
   return typeof code === "string" ? code : "unknown";
 }
 
-export function useMeetingData(meetingId: string | undefined): MeetingData {
+export function useMeetingData(
+  meetingId: string | undefined,
+  guildId?: string,
+): MeetingData {
   const [meeting, setMeeting] = useState<MeetingResponse | null>(null);
   const [transcript, setTranscript] = useState<TranscriptSegment[] | null>(
     null,
@@ -163,7 +166,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     setSummaryRetryCount(0);
 
     Promise.all([
-      fetchMeeting(meetingId, controller.signal)
+      fetchMeeting(meetingId, controller.signal, guildId)
         .then((response) => {
           if (!controller.signal.aborted) {
             setMeeting(response);
@@ -181,7 +184,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     });
 
     return () => controller.abort();
-  }, [meetingId]);
+  }, [meetingId, guildId]);
 
   useEffect(() => {
     const retryAttempt = transcriptRetryCount;
@@ -196,7 +199,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     setTranscript(null);
     setTranscriptState(null);
     setTranscriptError(null);
-    fetchTranscript(meetingId, controller.signal)
+    fetchTranscript(meetingId, controller.signal, guildId)
       .then((response) => {
         if (controller.signal.aborted) return;
         setTranscript((current) =>
@@ -214,6 +217,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     return () => controller.abort();
   }, [
     meetingId,
+    guildId,
     transcriptRetryCount,
     shouldStreamTranscript,
     applyTranscriptStatus,
@@ -231,7 +235,11 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     let timer: number | undefined;
     const pollMeetingStatus = async () => {
       try {
-        const latestMeeting = await fetchMeeting(meetingId, controller.signal);
+        const latestMeeting = await fetchMeeting(
+          meetingId,
+          controller.signal,
+          guildId,
+        );
         if (controller.signal.aborted) {
           return;
         }
@@ -269,7 +277,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         window.clearTimeout(timer);
       }
     };
-  }, [meetingId, shouldTrackMeetingCompletion]);
+  }, [meetingId, guildId, shouldTrackMeetingCompletion]);
 
   useEffect(() => {
     if (!meetingId || !shouldStreamTranscript) {
@@ -283,6 +291,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     let attempt = 0;
     let source: EventSource | null = null;
     let accessCheckInFlight = false;
+    let accessCheckController: AbortController | null = null;
 
     const closeStream = () => {
       if (closed) {
@@ -290,6 +299,8 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
       }
       closed = true;
       source?.close();
+      accessCheckController?.abort();
+      accessCheckController = null;
       if (reconnectTimer !== undefined) {
         window.clearTimeout(reconnectTimer);
       }
@@ -313,13 +324,16 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         return;
       }
       accessCheckInFlight = true;
-      fetchTranscript(meetingId)
+      const controller = new AbortController();
+      accessCheckController = controller;
+      fetchTranscript(meetingId, controller.signal, guildId)
         .then((response) => {
           accessCheckInFlight = false;
-          applyTranscriptStatus(response);
           if (closed) {
             return;
           }
+          accessCheckController = null;
+          applyTranscriptStatus(response);
           if (response.is_final) {
             closeStream();
             setTranscriptStreamState("closed");
@@ -333,6 +347,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
           if (closed) {
             return;
           }
+          accessCheckController = null;
           if (isForbiddenError(err)) {
             closeStream();
             setTranscriptStreamState("forbidden");
@@ -372,7 +387,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
           : "reconnecting",
       );
       setTranscriptStreamError(null);
-      source = new EventSource(getTranscriptEventsUrl(meetingId), {
+      source = new EventSource(getTranscriptEventsUrl(meetingId, guildId), {
         withCredentials: true,
       });
 
@@ -492,6 +507,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     };
   }, [
     meetingId,
+    guildId,
     shouldStreamTranscript,
     transcriptRetryCount,
     applyTranscriptStatus,
@@ -518,7 +534,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
     const controller = new AbortController();
     setSummary(null);
     setSummaryError(null);
-    fetchSummary(meetingId, controller.signal)
+    fetchSummary(meetingId, controller.signal, guildId)
       .then((response) => {
         if (!controller.signal.aborted) {
           setSummary(response);
@@ -534,7 +550,7 @@ export function useMeetingData(meetingId: string | undefined): MeetingData {
         }
       });
     return () => controller.abort();
-  }, [meetingId, meeting, shouldStreamTranscript, summaryRetryCount]);
+  }, [meetingId, guildId, meeting, shouldStreamTranscript, summaryRetryCount]);
 
   return {
     meeting,

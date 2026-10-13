@@ -2414,6 +2414,15 @@ async fn verify_meeting_access(
     meeting_id: &str,
     user_id: &str,
 ) -> Result<MeetingAccess, StatusCode> {
+    verify_meeting_read_access(state, meeting_id, user_id, None).await
+}
+
+async fn verify_meeting_read_access(
+    state: &WebState,
+    meeting_id: &str,
+    user_id: &str,
+    requested_guild_id: Option<&str>,
+) -> Result<MeetingAccess, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     // Look up the meeting's voice channel and guild ID in a single round-trip.
@@ -2428,10 +2437,17 @@ async fn verify_meeting_access(
         .ok_or(StatusCode::NOT_FOUND)?;
     let guild_id: String = row.get("guild_id");
     let channel_id: String = row.get("voice_channel_id");
-    let access = meeting_access_from_row(guild_id, channel_id.clone(), &auth.guild_id)?;
+    let requested_guild_id = normalize_meeting_read_guild_id(&guild_id, requested_guild_id)?;
+    let meeting_auth = match requested_guild_id.as_deref() {
+        Some(target_guild_id) if target_guild_id != auth.guild_id => {
+            require_user_can_access_target_guild(state, auth, user_id, target_guild_id).await?
+        }
+        Some(_) | None => auth.as_ref().clone(),
+    };
+    let access = meeting_access_from_row(guild_id, channel_id.clone(), &meeting_auth.guild_id)?;
     if current_user_has_rbac_permission_for_auth(
         state,
-        auth,
+        &meeting_auth,
         user_id,
         RbacPermission::MeetingView,
         false,
@@ -2444,12 +2460,27 @@ async fn verify_meeting_access(
     verify_meeting_access_after_row(
         access.guild_id,
         channel_id.clone(),
-        &auth.guild_id,
+        &meeting_auth.guild_id,
         user_id,
         &state.permission_cache,
-        || resolve_channel_permission_flags(state, auth, &channel_id, user_id),
+        || resolve_channel_permission_flags(state, &meeting_auth, &channel_id, user_id),
     )
     .await
+}
+
+fn normalize_meeting_read_guild_id(
+    meeting_guild_id: &str,
+    requested_guild_id: Option<&str>,
+) -> Result<Option<String>, StatusCode> {
+    requested_guild_id
+        .map(|requested| {
+            let normalized = normalize_target_guild_id(requested)?;
+            if normalized != meeting_guild_id {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            Ok(normalized)
+        })
+        .transpose()
 }
 
 /// Fetch guild info with caching. Guild data is shared across all requests
@@ -3434,6 +3465,11 @@ struct GuildMeetingsQuery {
     page: Option<u32>,
     limit: Option<u32>,
     voice_channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MeetingAccessQuery {
+    guild_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -11388,8 +11424,9 @@ async fn api_meeting(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Json<MeetingResponse>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let row = state
         .db
@@ -11473,8 +11510,9 @@ async fn api_transcript(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Json<TranscriptResponse>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let (response, _) = load_transcript_response(&state, &meeting_id, None).await?;
     Ok(Json(response))
@@ -11485,8 +11523,10 @@ async fn api_transcript_events(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Extension(AuthSession(session)): Extension<AuthSession>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
+    let requested_guild_id = query.guild_id;
     let permit =
         try_acquire_transcript_sse_permit(&state.transcript_sse_limiter, &user_id, &meeting_id)?;
 
@@ -11495,6 +11535,7 @@ async fn api_transcript_events(
             state,
             user_id,
             meeting_id,
+            requested_guild_id,
             None::<TranscriptStreamCursor>,
             Duration::ZERO,
             0_u32,
@@ -11508,6 +11549,7 @@ async fn api_transcript_events(
             state,
             user_id,
             meeting_id,
+            requested_guild_id,
             cursor,
             poll_delay,
             idle_polls,
@@ -11559,6 +11601,7 @@ async fn api_transcript_events(
                         state,
                         user_id,
                         meeting_id,
+                        requested_guild_id,
                         cursor,
                         poll_delay,
                         idle_polls,
@@ -11570,7 +11613,14 @@ async fn api_transcript_events(
                     ),
                 ));
             }
-            if let Err(status) = verify_meeting_access(&state, &meeting_id, &user_id).await {
+            if let Err(status) = verify_meeting_read_access(
+                &state,
+                &meeting_id,
+                &user_id,
+                requested_guild_id.as_deref(),
+            )
+            .await
+            {
                 let code = match status {
                     StatusCode::FORBIDDEN => "forbidden",
                     StatusCode::NOT_FOUND => "not_found",
@@ -11586,6 +11636,7 @@ async fn api_transcript_events(
                         state,
                         user_id,
                         meeting_id,
+                        requested_guild_id,
                         cursor,
                         poll_delay,
                         idle_polls,
@@ -11597,7 +11648,6 @@ async fn api_transcript_events(
                     ),
                 ));
             }
-
             match load_transcript_response(&state, &meeting_id, cursor.as_ref()).await {
                 Ok((mut response, mut next_cursor)) => {
                     if should_emit_final_transcript_snapshot(response.is_final, final_snapshot_sent)
@@ -11619,6 +11669,7 @@ async fn api_transcript_events(
                                         state,
                                         user_id,
                                         meeting_id,
+                                        requested_guild_id,
                                         cursor,
                                         retry_delay,
                                         0,
@@ -11661,6 +11712,7 @@ async fn api_transcript_events(
                             state,
                             user_id,
                             meeting_id,
+                            requested_guild_id,
                             next_cursor.or(cursor),
                             next_poll_delay,
                             next_idle_polls,
@@ -11691,6 +11743,7 @@ async fn api_transcript_events(
                             state,
                             user_id,
                             meeting_id,
+                            requested_guild_id,
                             cursor,
                             next_poll_delay,
                             next_idle_polls,
@@ -11876,8 +11929,9 @@ async fn api_transcript_state(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Json<TranscriptStateResponse>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let metadata = load_transcript_metadata(&state, &meeting_id).await?;
     let is_final = transcript_metadata_is_final(&metadata);
@@ -11904,8 +11958,9 @@ async fn api_summary(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Json<SummaryResponse>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let row = state
         .db
@@ -11924,9 +11979,10 @@ async fn api_audio(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let row = state
         .db
@@ -12060,8 +12116,9 @@ async fn api_speakers(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Json<Vec<SpeakerAudioResponse>>, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let rows = state
         .db
@@ -12194,9 +12251,10 @@ async fn api_speaker_audio(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path((meeting_id, speaker_id)): Path<(String, String)>,
+    Query(query): Query<MeetingAccessQuery>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
 
     let row = state
         .db
@@ -12435,9 +12493,12 @@ async fn api_debug_manifest(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     Path(meeting_id): Path<String>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Json<Vec<DebugArtifactEntry>>, StatusCode> {
-    let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
-    let raw_debug_allowed = verify_raw_debug_artifact_access(&state, &user_id)
+    let access =
+        verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref())
+            .await?;
+    let raw_debug_allowed = verify_raw_debug_artifact_access(&state, &user_id, &access.guild_id)
         .await
         .unwrap_or(false);
 
@@ -12457,6 +12518,13 @@ async fn api_debug_manifest(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let base_url = format!("/api/meetings/{}/debug/files", percent_encode(&meeting_id));
+    let debug_file_url = |artifact_id: &str| {
+        format!(
+            "{base_url}/{}?guild_id={}",
+            percent_encode(artifact_id),
+            percent_encode(&access.guild_id)
+        )
+    };
 
     // Pre-compute all static paths so the existence checks can run concurrently.
     let mixdown_primary = workspace.mixdown_path();
@@ -12570,10 +12638,7 @@ async fn api_debug_manifest(
         label: "Mixdown 音声".to_owned(),
         category: "audio",
         available: mixdown_available,
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::MixdownAudio.as_id()
-        ),
+        download_url: debug_file_url(StaticDebugArtifactKind::MixdownAudio.as_id()),
         filename: "mixdown.wav".to_owned(),
         content_type: "audio/wav",
     });
@@ -12586,10 +12651,7 @@ async fn api_debug_manifest(
             label: format!("Whisper送信音声 ({label_base})"),
             category: "audio",
             available: speaker_available,
-            download_url: format!(
-                "{base_url}/{}",
-                percent_encode(&format!("speaker_audio~{safe_speaker}"))
-            ),
+            download_url: debug_file_url(&format!("speaker_audio~{safe_speaker}")),
             filename: speaker_filename,
             content_type: "audio/wav",
         });
@@ -12600,10 +12662,7 @@ async fn api_debug_manifest(
                 label: format!("Whisperレスポンス ({label_base})"),
                 category: "whisper",
                 available: whisper_available,
-                download_url: format!(
-                    "{base_url}/{}",
-                    percent_encode(&format!("whisper~{safe_speaker}"))
-                ),
+                download_url: debug_file_url(&format!("whisper~{safe_speaker}")),
                 filename: format!("whisper_{safe_speaker}.json"),
                 content_type: "application/json",
             });
@@ -12617,10 +12676,7 @@ async fn api_debug_manifest(
             category: "whisper",
             available: mixdown_whisper_exists.unwrap_or(false)
                 || mixdown_whisper_legacy_exists.unwrap_or(false),
-            download_url: format!(
-                "{base_url}/{}",
-                StaticDebugArtifactKind::WhisperMixdown.as_id()
-            ),
+            download_url: debug_file_url(StaticDebugArtifactKind::WhisperMixdown.as_id()),
             filename: "whisper_mixdown.json".to_owned(),
             content_type: "application/json",
         });
@@ -12635,10 +12691,7 @@ async fn api_debug_manifest(
             category: "transcript",
             available: pre_correction_exists.unwrap_or(false)
                 || pre_correction_legacy_exists.unwrap_or(false),
-            download_url: format!(
-                "{base_url}/{}",
-                StaticDebugArtifactKind::TranscriptPreCorrection.as_id()
-            ),
+            download_url: debug_file_url(StaticDebugArtifactKind::TranscriptPreCorrection.as_id()),
             filename: "transcript_pre_correction.md".to_owned(),
             content_type: "text/markdown",
         });
@@ -12651,10 +12704,7 @@ async fn api_debug_manifest(
         label: "Transcript (補正後)".to_owned(),
         category: "transcript",
         available: masked_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::TranscriptPostCorrection.as_id()
-        ),
+        download_url: debug_file_url(StaticDebugArtifactKind::TranscriptPostCorrection.as_id()),
         filename: "transcript_masked.md".to_owned(),
         content_type: "text/markdown",
     });
@@ -12666,10 +12716,7 @@ async fn api_debug_manifest(
         label: "Transcript manifest".to_owned(),
         category: "transcript",
         available: manifest_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::TranscriptManifest.as_id()
-        ),
+        download_url: debug_file_url(StaticDebugArtifactKind::TranscriptManifest.as_id()),
         filename: "manifest.json".to_owned(),
         content_type: "application/json",
     });
@@ -12681,10 +12728,7 @@ async fn api_debug_manifest(
             category: "prompt",
             available: correction_prompt_exists.unwrap_or(false)
                 || correction_prompt_legacy_exists.unwrap_or(false),
-            download_url: format!(
-                "{base_url}/{}",
-                StaticDebugArtifactKind::CorrectionPrompt.as_id()
-            ),
+            download_url: debug_file_url(StaticDebugArtifactKind::CorrectionPrompt.as_id()),
             filename: "correction_prompt.txt".to_owned(),
             content_type: "text/plain",
         });
@@ -12695,10 +12739,7 @@ async fn api_debug_manifest(
             category: "prompt",
             available: summary_prompt_exists.unwrap_or(false)
                 || summary_prompt_legacy_exists.unwrap_or(false),
-            download_url: format!(
-                "{base_url}/{}",
-                StaticDebugArtifactKind::SummaryPrompt.as_id()
-            ),
+            download_url: debug_file_url(StaticDebugArtifactKind::SummaryPrompt.as_id()),
             filename: "summary_prompt.txt".to_owned(),
             content_type: "text/plain",
         });
@@ -12710,10 +12751,7 @@ async fn api_debug_manifest(
         category: "summary",
         available: meeting_title_exists.unwrap_or(false)
             || meeting_title_legacy_exists.unwrap_or(false),
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::MeetingTitle.as_id()
-        ),
+        download_url: debug_file_url(StaticDebugArtifactKind::MeetingTitle.as_id()),
         filename: "meeting_title.txt".to_owned(),
         content_type: "text/plain",
     });
@@ -12723,10 +12761,7 @@ async fn api_debug_manifest(
         label: "要約モデル生出力".to_owned(),
         category: "summary",
         available: summary_available,
-        download_url: format!(
-            "{base_url}/{}",
-            StaticDebugArtifactKind::SummaryOutput.as_id()
-        ),
+        download_url: debug_file_url(StaticDebugArtifactKind::SummaryOutput.as_id()),
         filename: "summary.md".to_owned(),
         content_type: "text/markdown",
     });
@@ -12739,10 +12774,13 @@ async fn api_debug_file(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
     headers: HeaderMap,
     Path((meeting_id, artifact_id)): Path<(String, String)>,
+    Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Response, StatusCode> {
-    let access = verify_meeting_access(&state, &meeting_id, &user_id).await?;
+    let access =
+        verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref())
+            .await?;
     if debug_artifact_requires_admin(&artifact_id) {
-        let allowed = verify_raw_debug_artifact_access(&state, &user_id).await?;
+        let allowed = verify_raw_debug_artifact_access(&state, &user_id, &access.guild_id).await?;
         authorize_debug_artifact_download(allowed)?;
     }
 
@@ -12838,11 +12876,17 @@ async fn api_debug_file(
 async fn verify_raw_debug_artifact_access(
     state: &WebState,
     user_id: &str,
+    guild_id: &str,
 ) -> Result<bool, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let target_auth = if auth.guild_id == guild_id {
+        auth.as_ref().clone()
+    } else {
+        target_auth_config(auth, guild_id)
+    };
     current_user_has_rbac_permission_for_auth(
         state,
-        auth,
+        &target_auth,
         user_id,
         raw_debug_artifact_permission(),
         false,
@@ -13640,8 +13684,8 @@ mod guild_api_tests {
         normalize_feedback_request, normalize_feedback_status_request,
         normalize_guild_bot_token_update, normalize_guild_meetings_pagination,
         normalize_guild_meetings_voice_channel_id, normalize_job_cancel_request,
-        normalize_job_list_query, normalize_job_retry_request, normalize_person_alias_request,
-        normalize_rbac_permission_names, normalize_rbac_role_id,
+        normalize_job_list_query, normalize_job_retry_request, normalize_meeting_read_guild_id,
+        normalize_person_alias_request, normalize_rbac_permission_names, normalize_rbac_role_id,
         normalize_summary_template_request, normalize_target_guild_id,
         parse_admin_guild_plan_assignment_list_query, parse_job_cancel_request_body,
         parse_job_list_query, parse_job_retry_request_body, permission_cache_ttl,
@@ -16279,6 +16323,62 @@ mod guild_api_tests {
             &tenant_by_guild_id,
             "guild-stale"
         ));
+    }
+
+    #[test]
+    fn meeting_read_scope_matches_the_requested_guild_without_expanding_mutations() {
+        assert_eq!(
+            normalize_meeting_read_guild_id("guild-target", Some("guild-target")),
+            Ok(Some("guild-target".to_owned()))
+        );
+        assert_eq!(
+            normalize_meeting_read_guild_id("guild-target", None),
+            Ok(None)
+        );
+        assert_eq!(
+            normalize_meeting_read_guild_id("guild-target", Some("guild-other")),
+            Err(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            normalize_meeting_read_guild_id("guild-target", Some("guild/other")),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let source = include_str!("web.rs");
+        let read_handler = source
+            .split_once("async fn api_meeting(")
+            .expect("meeting read handler should exist")
+            .1
+            .split_once("async fn api_list_summary_templates")
+            .expect("next read section should exist")
+            .0;
+        assert!(read_handler.contains("verify_meeting_read_access"));
+        assert!(read_handler.contains("query.guild_id.as_deref()"));
+        assert!(source.contains(
+            "require_user_can_access_target_guild(state, auth, user_id, target_guild_id)"
+        ));
+        assert!(
+            source.contains("verify_raw_debug_artifact_access(&state, &user_id, &access.guild_id)")
+        );
+        let transcript_events_handler = source
+            .split_once("async fn api_transcript_events(")
+            .expect("transcript event handler should exist")
+            .1
+            .split_once("async fn load_transcript_response(")
+            .expect("transcript loader should follow the event handler")
+            .0;
+        assert!(transcript_events_handler.contains("requested_guild_id.as_deref()"));
+        assert!(transcript_events_handler.contains("verify_meeting_read_access"));
+
+        let feedback_handler = source
+            .split_once("async fn api_create_meeting_feedback")
+            .expect("feedback mutation handler should exist")
+            .1
+            .split_once("async fn api_list_feedback")
+            .expect("next feedback handler should exist")
+            .0;
+        assert!(feedback_handler.contains("verify_meeting_access"));
+        assert!(!feedback_handler.contains("verify_meeting_read_access"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { AudioPlayer } from "../components/AudioPlayer";
 import { DebugDownloads } from "../components/DebugDownloads";
 import { ErrorBoundary } from "../components/ErrorBoundary";
@@ -392,8 +392,10 @@ function inProgressMessage(status: string | undefined): string | null {
   return null;
 }
 
-export function MeetingPage() {
+export function MeetingPage({ currentGuildId }: { currentGuildId?: string }) {
   const { meetingId } = useParams<{ meetingId: string }>();
+  const [searchParams] = useSearchParams();
+  const guildId = searchParams.get("guild_id") ?? undefined;
   const [audioElement, setAudioElement] = useState<HTMLAudioElement | null>(
     null,
   );
@@ -414,7 +416,9 @@ export function MeetingPage() {
     transcriptStreamError,
     retryTranscript,
     retrySummary,
-  } = useMeetingData(meetingId);
+  } = useMeetingData(meetingId, guildId);
+  const canSubmitFeedback =
+    !guildId || (currentGuildId !== undefined && guildId === currentGuildId);
   const { activeIndex, seekTo, seekNotice } = useAudioSync(
     audioElement,
     transcriptContainerRef,
@@ -455,7 +459,7 @@ export function MeetingPage() {
     setDebugArtifacts(null);
     setDebugError(false);
     setDebugLoading(true);
-    fetchDebugManifest(meetingId, controller.signal)
+    fetchDebugManifest(meetingId, controller.signal, guildId)
       .then((data) => {
         if (!controller.signal.aborted) {
           setDebugArtifacts(data);
@@ -472,7 +476,7 @@ export function MeetingPage() {
         }
       });
     return () => controller.abort();
-  }, [meetingId, showAudioAndDebug]);
+  }, [meetingId, guildId, showAudioAndDebug]);
 
   const clearFeedbackSuccessTimer = useCallback(() => {
     if (feedbackSuccessTimeoutRef.current !== null) {
@@ -514,6 +518,9 @@ export function MeetingPage() {
 
   const openFeedback = useCallback(
     (segment: TranscriptSegment, returnFocusTo: HTMLElement) => {
+      if (!canSubmitFeedback) {
+        return;
+      }
       feedbackReturnFocusRef.current = returnFocusTo;
       setFeedbackSegment(segment);
       setFeedbackDraft(emptyFeedbackDraft(segment));
@@ -521,7 +528,7 @@ export function MeetingPage() {
       clearFeedbackSuccessTimer();
       setFeedbackSuccess(null);
     },
-    [clearFeedbackSuccessTimer],
+    [canSubmitFeedback, clearFeedbackSuccessTimer],
   );
 
   const restoreFeedbackFocus = useCallback(() => {
@@ -544,7 +551,12 @@ export function MeetingPage() {
   const submitFeedback = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
-      if (!meetingId || !feedbackSegment || !feedbackDraft) {
+      if (
+        !canSubmitFeedback ||
+        !meetingId ||
+        !feedbackSegment ||
+        !feedbackDraft
+      ) {
         return;
       }
       const validationError = validateFeedbackDraft(
@@ -598,6 +610,7 @@ export function MeetingPage() {
     },
     [
       feedbackDraft,
+      canSubmitFeedback,
       feedbackSegment,
       meetingId,
       restoreFeedbackFocus,
@@ -628,7 +641,7 @@ export function MeetingPage() {
             <AudioPlayer
               key={meetingId}
               ref={setAudioElement}
-              src={meetingId ? getAudioUrl(meetingId) : ""}
+              src={meetingId ? getAudioUrl(meetingId, guildId) : ""}
             />
           ) : (
             <div className="audio-container audio-placeholder" role="status">
@@ -666,7 +679,7 @@ export function MeetingPage() {
               onSeek={seekTo}
               error={transcriptError}
               onRetry={retryTranscript}
-              onFeedback={openFeedback}
+              onFeedback={canSubmitFeedback ? openFeedback : undefined}
               streamState={transcriptStreamState}
               streamError={transcriptStreamError}
               isLive={isLive}

@@ -272,7 +272,10 @@ export function App() {
             />
           }
         />
-        <Route path="/meetings/:meetingId" element={<MeetingPage />} />
+        <Route
+          path="/meetings/:meetingId"
+          element={<MeetingPage currentGuildId={me?.guild_id} />}
+        />
         <Route
           path="/admin"
           element={
@@ -350,7 +353,10 @@ export function App() {
               forbidden={sessionForbidden}
               error={sessionError}
             >
-              <AdminRetentionPage selectedGuildName={currentGuildName} />
+              <AdminRetentionPage
+                selectedGuildId={me?.guild_id}
+                selectedGuildName={currentGuildName}
+              />
             </GuildAdminRoute>
           }
         />

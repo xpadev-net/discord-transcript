@@ -10,7 +10,14 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { buildLoginRedirectUrl, normalizeTranscriptResponse } from "./lib/api";
+import {
+  buildLoginRedirectUrl,
+  fetchMeeting,
+  getAudioUrl,
+  getSpeakerAudioUrl,
+  getTranscriptEventsUrl,
+  normalizeTranscriptResponse,
+} from "./lib/api";
 import { DashboardPage } from "./pages/DashboardPage";
 
 const settingsLinkName = "\u8a2d\u5b9a";
@@ -630,6 +637,27 @@ afterEach(() => {
 });
 
 describe("App access controls", () => {
+  it("carries the selected guild in meeting detail read URLs", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchMeeting("meeting-1", undefined, "guild target");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/meetings/meeting-1?guild_id=guild%20target",
+      { signal: undefined },
+    );
+    expect(getTranscriptEventsUrl("meeting-1", "guild target")).toBe(
+      "/api/meetings/meeting-1/transcript/events?guild_id=guild%20target",
+    );
+    expect(getAudioUrl("meeting-1", "guild target")).toBe(
+      "/api/meetings/meeting-1/audio?guild_id=guild%20target",
+    );
+    expect(getSpeakerAudioUrl("meeting-1", "speaker-1", "guild target")).toBe(
+      "/api/meetings/meeting-1/speakers/speaker-1/audio?guild_id=guild%20target",
+    );
+  });
+
   it("validates transcript response payloads before normalization", () => {
     const segment = transcriptSegment();
 
@@ -3444,6 +3472,20 @@ describe("App access controls", () => {
     expect(
       await screen.findByText("音声の読み込みが完了していません"),
     ).toBeTruthy();
+  });
+
+  it("hides transcript feedback on a read-only cross-guild meeting", async () => {
+    const { fetchMock } = meetingPageFetch();
+    const guildScopedFetch = vi.fn(
+      (input: RequestInfo | URL, init?: RequestInit) =>
+        fetchMock(input.toString().split("?")[0], init),
+    );
+    renderApp("/meetings/meeting-1?guild_id=guild-2", guildScopedFetch);
+
+    expect(await screen.findByText("Alpha term")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "00:05 のフィードバック" }),
+    ).toBeNull();
   });
 
   it("shows transcript panel retry UI for malformed responses and recovers", async () => {

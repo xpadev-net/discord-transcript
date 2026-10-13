@@ -21,6 +21,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 class TestEventSource {
   static latest: TestEventSource | null = null;
   static instances: TestEventSource[] = [];
+  readonly url: string;
   onopen: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   close = vi.fn();
@@ -29,7 +30,8 @@ class TestEventSource {
     Array<(event: MessageEvent<string>) => void>
   >();
 
-  constructor(_url: string, _options?: EventSourceInit) {
+  constructor(url: string, _options?: EventSourceInit) {
+    this.url = url;
     TestEventSource.latest = this;
     TestEventSource.instances.push(this);
   }
@@ -131,6 +133,64 @@ afterEach(() => {
 });
 
 describe("useMeetingData completion tracking", () => {
+  it("passes the selected guild scope to meeting, transcript, and SSE reads", async () => {
+    vi.mocked(fetchMeeting).mockResolvedValue(
+      meeting("meeting-1", "recording"),
+    );
+    vi.mocked(fetchTranscript).mockResolvedValue(
+      transcript("recording", false),
+    );
+    vi.mocked(fetchSummary).mockResolvedValue({ markdown: null });
+
+    renderHook(() => useMeetingData("meeting-1", "guild-target"));
+
+    await waitFor(() => expect(TestEventSource.latest).not.toBeNull());
+    expect(vi.mocked(fetchMeeting).mock.calls[0]?.[2]).toBe("guild-target");
+    expect(vi.mocked(fetchTranscript).mock.calls[0]?.[2]).toBe("guild-target");
+    expect(TestEventSource.latest?.url).toBe(
+      "/api/meetings/meeting-1/transcript/events?guild_id=guild-target",
+    );
+  });
+
+  it("ignores a stale access-check response after switching meetings", async () => {
+    const staleAccessCheck = deferred<TranscriptResponse>();
+    let meetingOneTranscriptRequests = 0;
+    vi.mocked(fetchMeeting).mockImplementation(async (id) =>
+      meeting(id, "recording"),
+    );
+    vi.mocked(fetchTranscript).mockImplementation(async (id) => {
+      if (id === "meeting-1" && ++meetingOneTranscriptRequests === 3) {
+        return staleAccessCheck.promise;
+      }
+      return transcript("recording", false);
+    });
+    vi.mocked(fetchSummary).mockResolvedValue({ markdown: null });
+
+    const { result, rerender } = renderHook(
+      ({ id, guildId }: { id: string; guildId: string }) =>
+        useMeetingData(id, guildId),
+      { initialProps: { id: "meeting-1", guildId: "guild-1" } },
+    );
+    await waitFor(() => expect(TestEventSource.latest).not.toBeNull());
+    const oldSource = TestEventSource.latest;
+    if (!oldSource) {
+      throw new Error("EventSource was not created");
+    }
+    act(() => oldSource.onerror?.(new Event("error")));
+    await waitFor(() => expect(fetchTranscript).toHaveBeenCalledTimes(3));
+
+    rerender({ id: "meeting-2", guildId: "guild-2" });
+    await waitFor(() => expect(result.current.meeting?.id).toBe("meeting-2"));
+    expect(vi.mocked(fetchTranscript).mock.calls[2]?.[1]?.aborted).toBe(true);
+    await act(async () => {
+      staleAccessCheck.resolve(transcript("posted", true));
+      await staleAccessCheck.promise;
+    });
+
+    expect(result.current.meeting).toEqual(meeting("meeting-2", "recording"));
+    expect(result.current.transcriptState?.status).toBe("recording");
+  });
+
   it("replaces live segments with the ordered final snapshot and merges later deltas", async () => {
     vi.mocked(fetchMeeting).mockResolvedValue(
       meeting("meeting-1", "recording"),

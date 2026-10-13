@@ -57,6 +57,15 @@ function basePath(meetingId: string): string {
   return `/api/meetings/${encodeURIComponent(meetingId)}`;
 }
 
+function meetingReadPath(
+  meetingId: string,
+  guildId?: string,
+  suffix = "",
+): string {
+  const path = `${basePath(meetingId)}${suffix}`;
+  return guildId ? `${path}?guild_id=${encodeURIComponent(guildId)}` : path;
+}
+
 function domainKnowledgePath(itemId?: string): string {
   const base = "/api/guild/domain-knowledge";
   return itemId ? `${base}/${encodeURIComponent(itemId)}` : base;
@@ -1111,8 +1120,9 @@ export function archiveSummaryTemplate(
 export function fetchMeeting(
   meetingId: string,
   signal?: AbortSignal,
+  guildId?: string,
 ): Promise<MeetingResponse> {
-  return fetch(basePath(meetingId), { signal }).then(
+  return fetch(meetingReadPath(meetingId, guildId), { signal }).then(
     handleResponse<MeetingResponse>,
   );
 }
@@ -1189,20 +1199,24 @@ function parseTranscriptSegments(payload: unknown[]): TranscriptSegment[] {
 export function fetchTranscript(
   meetingId: string,
   signal?: AbortSignal,
+  guildId?: string,
 ): Promise<TranscriptResponse> {
-  return fetch(`${basePath(meetingId)}/transcript`, { signal }).then(
-    (response) =>
-      handleResponse<unknown>(response).then(normalizeTranscriptResponse),
+  return fetch(meetingReadPath(meetingId, guildId, "/transcript"), {
+    signal,
+  }).then((response) =>
+    handleResponse<unknown>(response).then(normalizeTranscriptResponse),
   );
 }
 
 export function fetchTranscriptState(
   meetingId: string,
   signal?: AbortSignal,
+  guildId?: string,
 ): Promise<TranscriptStateResponse> {
-  return fetch(`${basePath(meetingId)}/transcript/state`, { signal }).then(
-    handleResponse<TranscriptStateResponse>,
-  );
+  return fetch(
+    `${basePath(meetingId)}/transcript/state${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`,
+    { signal },
+  ).then(handleResponse<TranscriptStateResponse>);
 }
 
 export function normalizeTranscriptResponse(
@@ -1236,8 +1250,11 @@ export function normalizeTranscriptResponse(
   };
 }
 
-export function getTranscriptEventsUrl(meetingId: string): string {
-  return `${basePath(meetingId)}/transcript/events`;
+export function getTranscriptEventsUrl(
+  meetingId: string,
+  guildId?: string,
+): string {
+  return `${basePath(meetingId)}/transcript/events${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`;
 }
 
 export function createMeetingFeedback(
@@ -1258,37 +1275,44 @@ export function createMeetingFeedback(
 export function fetchSummary(
   meetingId: string,
   signal?: AbortSignal,
+  guildId?: string,
 ): Promise<SummaryResponse> {
-  return fetch(`${basePath(meetingId)}/summary`, { signal }).then(
-    handleResponse<SummaryResponse>,
-  );
+  return fetch(
+    `${basePath(meetingId)}/summary${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`,
+    { signal },
+  ).then(handleResponse<SummaryResponse>);
 }
 
-export function getAudioUrl(meetingId: string): string {
-  return `${basePath(meetingId)}/audio`;
+export function getAudioUrl(meetingId: string, guildId?: string): string {
+  return `${basePath(meetingId)}/audio${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`;
 }
 
 export function fetchSpeakers(
   meetingId: string,
   signal?: AbortSignal,
+  guildId?: string,
 ): Promise<SpeakerAudioInfo[]> {
-  return fetch(`${basePath(meetingId)}/speakers`, { signal }).then(
-    handleResponse<SpeakerAudioInfo[]>,
-  );
+  return fetch(
+    `${basePath(meetingId)}/speakers${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`,
+    { signal },
+  ).then(handleResponse<SpeakerAudioInfo[]>);
 }
 
 export function getSpeakerAudioUrl(
   meetingId: string,
   speakerId: string,
+  guildId?: string,
 ): string {
-  return `${basePath(meetingId)}/speakers/${encodeURIComponent(speakerId)}/audio`;
+  return `${basePath(meetingId)}/speakers/${encodeURIComponent(speakerId)}/audio${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`;
 }
 
 export function fetchDebugManifest(
   meetingId: string,
   signal?: AbortSignal,
+  guildId?: string,
 ): Promise<DebugArtifact[]> {
-  return fetch(`${basePath(meetingId)}/debug/manifest`, { signal }).then(
-    handleResponse<DebugArtifact[]>,
-  );
+  return fetch(
+    `${basePath(meetingId)}/debug/manifest${guildId ? `?guild_id=${encodeURIComponent(guildId)}` : ""}`,
+    { signal },
+  ).then(handleResponse<DebugArtifact[]>);
 }

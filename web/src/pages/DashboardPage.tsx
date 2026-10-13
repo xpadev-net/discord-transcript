@@ -41,8 +41,9 @@ function displayVoiceChannel(meeting: MeetingListItem): string {
   );
 }
 
-function meetingPath(meetingId: string): string {
-  return `/meetings/${meetingId}`;
+function meetingPath(meetingId: string, guildId?: string | null): string {
+  const path = `/meetings/${encodeURIComponent(meetingId)}`;
+  return guildId ? `${path}?guild_id=${encodeURIComponent(guildId)}` : path;
 }
 
 function dashboardErrorMessage(error: unknown): string {
@@ -322,7 +323,7 @@ export function DashboardPage({
             </thead>
             <tbody>
               {activeData?.meetings.map((meeting) => {
-                const path = meetingPath(meeting.id);
+                const path = meetingPath(meeting.id, activeData?.guild_id);
                 return (
                   <tr key={meeting.id} className="meeting-table-row">
                     <td>
@@ -584,6 +585,7 @@ function AdminMetricCard({
 }
 
 interface AdminViewProps {
+  selectedGuildId?: string | null;
   selectedGuildName?: string;
   isSystemAdmin?: boolean;
   canManageSettings?: boolean;
@@ -1006,7 +1008,10 @@ export function AdminAuditPage({
   );
 }
 
-export function AdminRetentionPage({ selectedGuildName }: AdminViewProps) {
+export function AdminRetentionPage({
+  selectedGuildId,
+  selectedGuildName,
+}: AdminViewProps) {
   const [reloadKey, setReloadKey] = useState(0);
   const [settings, setSettings] = useState<GuildSettingsResponse | null>(null);
   const [meetings, setMeetings] = useState<MeetingListResponse | null>(null);
@@ -1130,7 +1135,7 @@ export function AdminRetentionPage({ selectedGuildName }: AdminViewProps) {
                       <td>
                         <Link
                           className="meeting-title-link meeting-table-cell-link"
-                          to={meetingPath(meeting.id)}
+                          to={meetingPath(meeting.id, selectedGuildId)}
                         >
                           {displayTitle(meeting)}
                         </Link>
