@@ -114,6 +114,7 @@ type HmacSha256 = Hmac<Sha256>;
 const SESSION_COOKIE_NAME: &str = "dt_session";
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 const SESSION_MEMBERSHIP_VERIFY_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
+const TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(30);
 const OAUTH_NONCE_COOKIE_NAME: &str = "dt_oauth_nonce";
 const OAUTH_NONCE_COOKIE_PATH: &str = "/auth/callback";
 const OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
@@ -776,6 +777,9 @@ pub struct AuthConfig {
 #[derive(Clone)]
 struct AuthUserId(String);
 
+#[derive(Clone)]
+struct AuthSession(SessionPayload);
+
 // ---------- Router ----------
 
 pub fn create_router(state: WebState) -> Router {
@@ -1089,6 +1093,9 @@ async fn require_auth(
     request
         .extensions_mut()
         .insert(AuthUserId(session.uid.clone()));
+    request
+        .extensions_mut()
+        .insert(AuthSession(session.clone()));
     let mut response = next.run(request).await;
     if let Some(cookie) = refreshed_session_cookie
         && let Ok(value) = header::HeaderValue::from_str(&cookie)
@@ -1963,9 +1970,64 @@ async fn session_is_revoked(
     Ok(row.is_some())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptSseSessionError {
+    Expired,
+    Revoked,
+    Unavailable,
+}
+
+async fn validate_transcript_sse_session<F, Fut, E>(
+    session: &SessionPayload,
+    now: u64,
+    is_revoked: F,
+) -> Result<(), TranscriptSseSessionError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<bool, E>>,
+{
+    if now >= session.exp {
+        return Err(TranscriptSseSessionError::Expired);
+    }
+
+    match is_revoked().await {
+        Ok(true) => Err(TranscriptSseSessionError::Revoked),
+        Ok(false) => Ok(()),
+        Err(_) => Err(TranscriptSseSessionError::Unavailable),
+    }
+}
+
+fn transcript_sse_should_revalidate_session(
+    last_checked: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    now.duration_since(last_checked) >= TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL
+}
+
+async fn revalidate_transcript_sse_session<F, Fut, E>(
+    session: &SessionPayload,
+    unix_now: u64,
+    last_checked: tokio::time::Instant,
+    now: tokio::time::Instant,
+    is_revoked: F,
+) -> Result<Option<tokio::time::Instant>, TranscriptSseSessionError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<bool, E>>,
+{
+    if unix_now >= session.exp {
+        return Err(TranscriptSseSessionError::Expired);
+    }
+    if !transcript_sse_should_revalidate_session(last_checked, now) {
+        return Ok(None);
+    }
+    validate_transcript_sse_session(session, unix_now, is_revoked).await?;
+    Ok(Some(now))
+}
+
 // ========== Auth: session helpers ==========
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SessionPayload {
     uid: String,
     gid: String,
@@ -11420,6 +11482,7 @@ async fn api_transcript(
 async fn api_transcript_events(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Extension(AuthSession(session)): Extension<AuthSession>,
     Path(meeting_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     verify_meeting_access(&state, &meeting_id, &user_id).await?;
@@ -11436,14 +11499,65 @@ async fn api_transcript_events(
             0_u32,
             permit,
             false,
+            session,
+            tokio::time::Instant::now(),
         ),
-        |(state, user_id, meeting_id, cursor, poll_delay, idle_polls, permit, finished)| async move {
+        |(
+            state,
+            user_id,
+            meeting_id,
+            cursor,
+            poll_delay,
+            idle_polls,
+            permit,
+            finished,
+            session,
+            last_session_check,
+        )| async move {
             if finished {
                 return None;
             }
 
             tokio::time::sleep(poll_delay).await;
 
+            let now = tokio::time::Instant::now();
+            let session_revalidation = revalidate_transcript_sse_session(
+                &session,
+                unix_now_secs(),
+                last_session_check,
+                now,
+                || async { session_is_revoked(&state.db, &session.uid, session.issued_at).await },
+            )
+            .await;
+            let (session_error, last_session_check) = match session_revalidation {
+                Ok(Some(checked_at)) => (None, checked_at),
+                Ok(None) => (None, last_session_check),
+                Err(error) => (Some(error), last_session_check),
+            };
+            if let Some(session_error) = session_error {
+                let code = match session_error {
+                    TranscriptSseSessionError::Expired | TranscriptSseSessionError::Revoked => {
+                        "unauthorized"
+                    }
+                    TranscriptSseSessionError::Unavailable => {
+                        warn!(
+                            user_id = %session.uid,
+                            "failed to revalidate session for transcript stream; closing stream"
+                        );
+                        "auth_unavailable"
+                    }
+                };
+                let event = Event::default()
+                    .event("stream-closed")
+                    .data(format!(r#"{{"code":"{code}"}}"#));
+                return Some((
+                    Ok(event),
+                    (
+                        state, user_id, meeting_id, cursor, poll_delay, idle_polls, permit, true,
+                        session, now,
+                    ),
+                ));
+            }
             if let Err(status) = verify_meeting_access(&state, &meeting_id, &user_id).await {
                 let code = match status {
                     StatusCode::FORBIDDEN => "forbidden",
@@ -11457,7 +11571,16 @@ async fn api_transcript_events(
                 return Some((
                     Ok(event),
                     (
-                        state, user_id, meeting_id, cursor, poll_delay, idle_polls, permit, true,
+                        state,
+                        user_id,
+                        meeting_id,
+                        cursor,
+                        poll_delay,
+                        idle_polls,
+                        permit,
+                        true,
+                        session,
+                        last_session_check,
                     ),
                 ));
             }
@@ -11497,6 +11620,8 @@ async fn api_transcript_events(
                             next_idle_polls,
                             permit,
                             is_final || stop_for_idle,
+                            session,
+                            last_session_check,
                         ),
                     ))
                 }
@@ -11524,6 +11649,8 @@ async fn api_transcript_events(
                             next_idle_polls,
                             permit,
                             stop_for_idle,
+                            session,
+                            last_session_check,
                         ),
                     ))
                 }
@@ -17813,10 +17940,13 @@ mod transcript_source_api_tests {
 #[cfg(test)]
 mod transcript_sse_limit_tests {
     use super::{
-        TRANSCRIPT_SSE_BASE_POLL_SECS, TRANSCRIPT_SSE_MAX_IDLE_POLLS,
-        TRANSCRIPT_SSE_MAX_PER_USER_MEETING, TRANSCRIPT_SSE_MAX_POLL_SECS, TranscriptSseLimiter,
-        next_transcript_sse_idle_polls, next_transcript_sse_poll_delay,
-        transcript_sse_idle_limit_reached, try_acquire_transcript_sse_permit,
+        SessionPayload, TRANSCRIPT_SSE_BASE_POLL_SECS, TRANSCRIPT_SSE_MAX_IDLE_POLLS,
+        TRANSCRIPT_SSE_MAX_PER_USER_MEETING, TRANSCRIPT_SSE_MAX_POLL_SECS,
+        TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL, TranscriptSseLimiter,
+        TranscriptSseSessionError, next_transcript_sse_idle_polls, next_transcript_sse_poll_delay,
+        revalidate_transcript_sse_session, transcript_sse_idle_limit_reached,
+        transcript_sse_should_revalidate_session, try_acquire_transcript_sse_permit,
+        validate_transcript_sse_session,
     };
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -17897,6 +18027,92 @@ mod transcript_sse_limit_tests {
         assert!(transcript_sse_idle_limit_reached(
             TRANSCRIPT_SSE_MAX_IDLE_POLLS
         ));
+    }
+
+    fn session(exp: u64) -> SessionPayload {
+        SessionPayload {
+            uid: "user-1".to_owned(),
+            gid: "guild-1".to_owned(),
+            exp,
+            issued_at: 1,
+            verified_at: 1,
+            reverify_attempt_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_sse_session_validation_stops_on_expiry_without_database_lookup() {
+        let revoked_lookup_called = std::sync::atomic::AtomicBool::new(false);
+        let result = validate_transcript_sse_session(&session(100), 100, || async {
+            revoked_lookup_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, ()>(false)
+        })
+        .await;
+
+        assert_eq!(result, Err(TranscriptSseSessionError::Expired));
+        assert!(!revoked_lookup_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn transcript_sse_session_validation_fails_closed_on_revocation_or_lookup_error() {
+        let revoked =
+            validate_transcript_sse_session(&session(200), 100, || async { Ok::<_, ()>(true) })
+                .await;
+        let unavailable =
+            validate_transcript_sse_session(&session(200), 100, || async { Err::<bool, _>(()) })
+                .await;
+
+        assert_eq!(revoked, Err(TranscriptSseSessionError::Revoked));
+        assert_eq!(unavailable, Err(TranscriptSseSessionError::Unavailable));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transcript_sse_session_revocation_check_runs_at_the_configured_interval() {
+        let checked_at = tokio::time::Instant::now();
+        assert!(!transcript_sse_should_revalidate_session(
+            checked_at,
+            checked_at + TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL - Duration::from_secs(1)
+        ));
+
+        tokio::time::advance(TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL).await;
+
+        assert!(transcript_sse_should_revalidate_session(
+            checked_at,
+            tokio::time::Instant::now()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transcript_sse_revalidation_skips_recent_check_and_closes_on_revocation() {
+        let session = session(200);
+        let checked_at = tokio::time::Instant::now();
+        let lookups = std::sync::atomic::AtomicUsize::new(0);
+
+        let recent_check = revalidate_transcript_sse_session(
+            &session,
+            100,
+            checked_at,
+            checked_at + TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL - Duration::from_secs(1),
+            || async {
+                lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, ()>(false)
+            },
+        )
+        .await;
+        assert_eq!(recent_check, Ok(None));
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        tokio::time::advance(TRANSCRIPT_SSE_SESSION_REVALIDATE_INTERVAL).await;
+        let revoked = revalidate_transcript_sse_session(
+            &session,
+            100,
+            checked_at,
+            tokio::time::Instant::now(),
+            || async { Ok::<_, ()>(true) },
+        )
+        .await;
+
+        assert_eq!(revoked, Err(TranscriptSseSessionError::Revoked));
     }
 }
 
