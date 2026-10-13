@@ -114,9 +114,14 @@ def assert_global_npm_installs_are_versioned(dockerfile: str) -> None:
         ), f"global npm installs in Dockerfile must include an explicit version: {spec}"
 
 
-def assert_default_image_is_production_without_claude(dockerfile: str) -> None:
+def assert_native_runtime_image(dockerfile: str) -> None:
     stages = dockerfile_stages(dockerfile)
     assert stages, "Dockerfile should define stages"
+
+    stage_map = dict(stages)
+    assert "FROM node:24-bookworm-slim AS frontend" in dockerfile, (
+        "frontend builder must keep Node.js"
+    )
 
     production_name, production_instructions = stages[-1]
     assert (
@@ -124,48 +129,46 @@ def assert_default_image_is_production_without_claude(dockerfile: str) -> None:
     ), "the final Dockerfile stage is the default image and must stay production"
 
     production_body = "\n".join(production_instructions)
-    assert "claude-code" not in production_body, "production image must not install Claude Code"
-    assert not any(
-        "claude-code" in spec
-        for instruction in production_instructions
-        for spec in global_npm_install_specs(instruction)
-    ), "production image must not install Claude Code through npm"
-
-
-def assert_unsafe_claude_target_is_pinned_and_verified(dockerfile: str) -> None:
-    stages = dict(dockerfile_stages(dockerfile))
-    assert "unsafe-claude" in stages, "Dockerfile should keep Claude Code in a named unsafe target"
-
-    body = "\n".join(stages["unsafe-claude"])
-    assert (
-        "ARG CLAUDE_CODE_VERSION=2.1.178" in body
-    ), "unsafe Claude target must pin an exact Claude Code version"
+    runtime = "\n".join(stage_map["runtime-base"])
+    production_image = f"{runtime}\n{production_body}".lower()
+    production_instructions = stage_map[production_name]
+    assert "FROM debian:bookworm-slim AS runtime-base" in dockerfile
     assert all(
-        marker in body
-        for marker in (
-            "ARG CLAUDE_CODE_INTEGRITY=sha512-",
-            "ARG CLAUDE_CODE_LINUX_X64_INTEGRITY=sha512-",
-            "ARG CLAUDE_CODE_LINUX_ARM64_INTEGRITY=sha512-",
-        )
-    ), "unsafe Claude target must pin package integrity values"
-    assert (
-        "claude --version" in body and "$CLAUDE_CODE_VERSION" in body
-    ), "unsafe Claude target must verify the installed claude version"
+        package in runtime
+        for package in ("curl", "ca-certificates", "libopus0", "libssl3")
+    ), "runtime image must retain required runtime libraries"
+    assert "COPY --from=frontend /app/web/dist /app/web/dist" in runtime
+    assert "USER app" in runtime and 'ENV STATIC_FILES_DIR=/app/web/dist' in runtime
+    assert not any(
+        marker in production_image for marker in ("node:", "nodejs", "npm ")
+    ), "production image must not add Node.js or npm in any final-stage layer"
+    assert "claude-code" not in production_image
+    frontend_copies = [
+        instruction
+        for instruction in stage_map["runtime-base"] + production_instructions
+        if instruction.upper().startswith("COPY")
+        and "--from=frontend" in instruction.lower()
+    ]
+    assert frontend_copies == [
+        "COPY --from=frontend /app/web/dist /app/web/dist"
+    ], "production image may copy only built static assets from the Node frontend stage"
+    assert all("unsafe-" not in name for name, _ in stages)
 
 
-def assert_compose_uses_unsafe_target() -> None:
-    compose = read_repo_file("docker-compose.unsafe-claude.yml")
-    assert (
-        "target: unsafe-claude" in compose
-    ), "unsafe Claude compose override should build the dedicated unsafe target"
+def assert_cli_override_files_removed() -> None:
+    for path in (
+        "docker-compose.unsafe-claude.yml",
+        "docker-compose.unsafe-cursor.yml",
+        "docker-compose.unsafe-opencode.yml",
+    ):
+        assert not (ROOT / path).exists(), f"obsolete CLI override remains: {path}"
 
 
 def main() -> None:
     dockerfile = read_repo_file("Dockerfile")
     assert_global_npm_installs_are_versioned(dockerfile)
-    assert_default_image_is_production_without_claude(dockerfile)
-    assert_unsafe_claude_target_is_pinned_and_verified(dockerfile)
-    assert_compose_uses_unsafe_target()
+    assert_native_runtime_image(dockerfile)
+    assert_cli_override_files_removed()
     print("Dockerfile policy checks passed.")
 
 
