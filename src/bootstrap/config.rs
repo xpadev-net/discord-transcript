@@ -23,7 +23,10 @@ impl AppRole {
         match raw.trim().to_ascii_lowercase().as_str() {
             "all" => Ok(Self::All),
             "web-bot" => Ok(Self::WebBot),
-            "worker" => Ok(Self::Worker),
+            "worker" => Err(ConfigError::InvalidEnv {
+                key,
+                value: "worker mode is retired; set APP_ROLE=all to keep recording and summary processing in the same process".to_owned(),
+            }),
             _ => Err(ConfigError::InvalidEnv {
                 key,
                 value: raw.to_owned(),

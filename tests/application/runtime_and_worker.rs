@@ -1367,38 +1367,14 @@ fn app_config_web_bot_role_still_requires_discord_gateway_credentials() {
 }
 
 #[test]
-fn app_config_worker_role_does_not_require_discord_gateway_credentials() {
-    let mut values = base_env();
+fn app_config_rejects_retired_worker_role_with_migration_message() {
+    let mut values = HashMap::new();
     values.insert("APP_ROLE".to_owned(), "worker".to_owned());
-    values.remove("DISCORD_TOKEN");
-    values.remove("DISCORD_GUILD_ID");
-
-    let config = AppConfig::from_map(&values).expect("config should load");
-
-    assert_eq!(config.app_role, AppRole::Worker);
-    assert_eq!(config.discord_token, "");
-    assert_eq!(config.discord_guild_id, "");
-    assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
-    assert_eq!(config.summary_model, "");
-    assert!(config.summary_allow_unsafe_agent_harness);
-}
-
-#[test]
-fn app_config_worker_role_still_requires_summary_harness_settings() {
-    let mut values = required_env_values();
-    values.insert("APP_ROLE".to_owned(), "worker".to_owned());
-    values.remove("DISCORD_TOKEN");
-    values.remove("DISCORD_GUILD_ID");
 
     let err = AppConfig::from_map(&values).expect_err("config should fail");
-
-    assert_eq!(
-        err,
-        ConfigError::MissingEnv {
-            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS"
-        }
-    );
+    let message = err.to_string();
+    assert!(message.contains("worker mode is retired"), "{message}");
+    assert!(message.contains("APP_ROLE=all"), "{message}");
 }
 
 #[test]
@@ -1482,14 +1458,14 @@ fn app_config_loads_from_env_for_web_bot_role_without_summary_harness_settings()
 }
 
 #[test]
-fn app_config_loads_from_env_for_worker_role_without_discord_gateway_credentials() {
+fn app_config_rejects_worker_role_from_env_with_migration_message() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref() == Ok(WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
     {
         return;
     }
 
     let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
-        .arg("app_config_from_env_child_loads_worker_role_without_discord_gateway_credentials")
+        .arg("app_config_from_env_child_rejects_worker_role_with_migration_message")
         .arg("--exact")
         .arg("--nocapture")
         .env_clear()
@@ -1605,22 +1581,17 @@ fn app_config_from_env_child_loads_web_bot_role_without_summary_harness_settings
 }
 
 #[test]
-fn app_config_from_env_child_loads_worker_role_without_discord_gateway_credentials() {
+fn app_config_from_env_child_rejects_worker_role_with_migration_message() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
         != Ok(WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
     {
         return;
     }
 
-    let config = AppConfig::from_env().expect("config should load");
-
-    assert_eq!(config.app_role, AppRole::Worker);
-    assert_eq!(config.discord_token, "");
-    assert_eq!(config.discord_guild_id, "");
-    assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
-    assert_eq!(config.summary_model, "");
-    assert!(config.summary_allow_unsafe_agent_harness);
+    let err = AppConfig::from_env().expect_err("worker role should fail before starting");
+    let message = err.to_string();
+    assert!(message.contains("worker mode is retired"), "{message}");
+    assert!(message.contains("APP_ROLE=all"), "{message}");
 }
 
 #[test]
