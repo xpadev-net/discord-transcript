@@ -11,18 +11,36 @@ use tracing::warn;
 // stay separate so their retention scopes can diverge without changing callers.
 pub const RETENTION_EXPIRED_RAW_WORKSPACES_SQL: &str = r#"
 SELECT id, guild_id, voice_channel_id
-FROM meetings
+FROM (
+  SELECT m.*,
+         CASE
+           WHEN s.meeting_id IS NULL THEN $1::text::integer
+           WHEN s.retention_raw_audio_ttl_days > 0 THEN s.retention_raw_audio_ttl_days
+         END AS raw_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
 WHERE stopped_at IS NOT NULL
-  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND raw_ttl_days IS NOT NULL
+  AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
   AND status IN ('posted', 'failed', 'aborted')
   AND retention_raw_cleaned_at IS NULL
 "#;
 
 pub const RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL: &str = r#"
 SELECT id, guild_id, voice_channel_id
-FROM meetings
+FROM (
+  SELECT m.*,
+         CASE
+           WHEN s.meeting_id IS NULL THEN $1::text::integer
+           WHEN s.retention_raw_audio_ttl_days > 0 THEN s.retention_raw_audio_ttl_days
+         END AS raw_ttl_days
+  FROM meetings m
+  LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+) m
 WHERE stopped_at IS NOT NULL
-  AND stopped_at < NOW() - (($1 || ' days')::interval)
+  AND raw_ttl_days IS NOT NULL
+  AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
   AND status IN ('posted', 'failed', 'aborted')
   AND retention_raw_cleaned_at IS NOT NULL
 "#;
@@ -143,13 +161,28 @@ WHERE a.meeting_id = m.id
 "#;
 
 pub const RETENTION_DELETE_RAW_ARTIFACTS_SQL: &str = r#"
+WITH expired_raw_meetings AS (
+  SELECT id
+  FROM (
+    SELECT m.id,
+           m.stopped_at,
+           m.status,
+           CASE
+             WHEN s.meeting_id IS NULL THEN $1::text::integer
+             WHEN s.retention_raw_audio_ttl_days > 0 THEN s.retention_raw_audio_ttl_days
+           END AS raw_ttl_days
+    FROM meetings m
+    LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+  ) raw_meetings
+  WHERE raw_ttl_days IS NOT NULL
+    AND stopped_at IS NOT NULL
+    AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
+    AND status IN ('posted', 'failed', 'aborted')
+)
 DELETE FROM artifacts a
-USING meetings m
+USING expired_raw_meetings m
 WHERE a.meeting_id = m.id
   AND a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')
-  AND m.stopped_at IS NOT NULL
-  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
-  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL: &str = r#"
@@ -171,13 +204,28 @@ WHERE a.meeting_id = m.id
 "#;
 
 pub const RETENTION_DELETE_DEBUG_ARTIFACTS_SQL: &str = r#"
+WITH expired_debug_meetings AS (
+  SELECT id
+  FROM (
+    SELECT m.id,
+           m.stopped_at,
+           m.status,
+           CASE
+             WHEN s.meeting_id IS NULL THEN $1::text::integer
+             WHEN s.retention_raw_audio_ttl_days > 0 THEN s.retention_raw_audio_ttl_days
+           END AS raw_ttl_days
+    FROM meetings m
+    LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
+  ) debug_meetings
+  WHERE raw_ttl_days IS NOT NULL
+    AND stopped_at IS NOT NULL
+    AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
+    AND status IN ('posted', 'failed', 'aborted')
+)
 DELETE FROM artifacts a
-USING meetings m
+USING expired_debug_meetings m
 WHERE a.meeting_id = m.id
   AND a.kind IN ('debug', 'debug_artifact', 'whisper_debug')
-  AND m.stopped_at IS NOT NULL
-  AND m.stopped_at < NOW() - (($1 || ' days')::interval)
-  AND m.status IN ('posted', 'failed', 'aborted')
 "#;
 
 pub const RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL: &str = r#"

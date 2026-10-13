@@ -667,6 +667,7 @@ def assert_ci_runs_postgres_contract_tests() -> None:
         "tests/infrastructure/postgres_active_meeting_unique.rs",
         "tests/infrastructure/postgres_migration_lock.rs",
         "tests/infrastructure/postgres_manual_retry.rs",
+        "tests/infrastructure/postgres_raw_retention.rs",
     )
     for path in postgres_tests:
         source = read_repo_file(path)
