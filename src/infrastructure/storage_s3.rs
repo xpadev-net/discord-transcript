@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -71,6 +71,84 @@ struct UploadTask {
     generation: u64,
     attempts: u32,
     not_before: Instant,
+    receipt: Option<Arc<UploadReceiptCell>>,
+}
+
+/// In-memory completion state for one object key and upload generation.
+/// Nothing in the receipt is serialized or persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadReceiptStatus {
+    Queued,
+    Retrying { attempts: u32, error: String },
+    Durable,
+    Failed(String),
+    Superseded,
+    Cancelled,
+    Shutdown,
+}
+
+impl UploadReceiptStatus {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Durable | Self::Failed(_) | Self::Superseded | Self::Cancelled | Self::Shutdown
+        )
+    }
+}
+
+#[derive(Debug)]
+struct UploadReceiptCell {
+    status: Mutex<UploadReceiptStatus>,
+    changed: Condvar,
+}
+
+impl UploadReceiptCell {
+    fn update(&self, status: UploadReceiptStatus) {
+        *self.status.lock().unwrap() = status;
+        self.changed.notify_all();
+    }
+}
+
+/// Tracks whether a queued object PUT is durably available in the store.
+/// Receipts are scoped to one key and generation and are only held in memory.
+#[derive(Debug)]
+pub struct UploadReceipt {
+    key: String,
+    generation: u64,
+    cell: Arc<UploadReceiptCell>,
+}
+
+impl UploadReceipt {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn status(&self) -> UploadReceiptStatus {
+        self.cell.status.lock().unwrap().clone()
+    }
+
+    /// Waits until the receipt changes from `observed`, returning its latest
+    /// state. Retry status is observable without consuming the receipt.
+    pub fn wait_for_change(&self, observed: &UploadReceiptStatus) -> UploadReceiptStatus {
+        let mut status = self.cell.status.lock().unwrap();
+        while *status == *observed && !status.is_terminal() {
+            status = self.cell.changed.wait(status).unwrap();
+        }
+        status.clone()
+    }
+
+    /// Waits for durable success or a terminal failure, including shutdown.
+    pub fn wait(&self) -> UploadReceiptStatus {
+        let mut status = self.cell.status.lock().unwrap();
+        while !status.is_terminal() {
+            status = self.cell.changed.wait(status).unwrap();
+        }
+        status.clone()
+    }
 }
 
 impl UploadTask {
@@ -80,6 +158,42 @@ impl UploadTask {
         match &self.source {
             UploadSource::Inline(bytes) => bytes.len(),
             UploadSource::File(_) => 0,
+        }
+    }
+}
+
+impl Drop for UploadTask {
+    fn drop(&mut self) {
+        if let Some(receipt) = &self.receipt {
+            let status = receipt.status.lock().unwrap();
+            if !status.is_terminal() {
+                drop(status);
+                receipt.update(UploadReceiptStatus::Shutdown);
+            }
+        }
+    }
+}
+
+fn is_retryable_upload_error(error: &S3Error) -> bool {
+    match error {
+        S3Error::Config(_) => false,
+        S3Error::Http(_) => true,
+        S3Error::Status { status, detail } => {
+            if *status == 408 || *status == 429 || *status >= 500 {
+                return true;
+            }
+            let detail = detail.to_ascii_lowercase();
+            [
+                "requesttimeout",
+                "requesttimeoutexception",
+                "slowdown",
+                "operationaborted",
+                "throttling",
+                "temporarilyunavailable",
+                "serviceunavailable",
+            ]
+            .iter()
+            .any(|code| detail.contains(code))
         }
     }
 }
@@ -335,13 +449,16 @@ impl UploadQueue {
         // it leaves: delivered, superseded, cancelled, or abandoned in drain.
         // `delivered` marks the write as landed so older queued generations
         // for the key stay superseded.
-        let settle = |task: &UploadTask, delivered: bool| {
+        let settle = |task: &UploadTask, status: UploadReceiptStatus, delivered: bool| {
             pending.fetch_sub(1, Ordering::SeqCst);
             pending_bytes.fetch_sub(task.counted_bytes(), Ordering::SeqCst);
             generations
                 .lock()
                 .unwrap()
                 .settle(&task.key, task.generation, delivered);
+            if let Some(receipt) = &task.receipt {
+                receipt.update(status);
+            }
         };
         let mut delayed: Vec<UploadTask> = Vec::new();
         let mut disconnected = false;
@@ -390,7 +507,7 @@ impl UploadQueue {
                     .unwrap()
                     .is_superseded(&task.key, task.generation)
                 {
-                    settle(&task, false);
+                    settle(&task, UploadReceiptStatus::Superseded, false);
                     continue;
                 }
                 // File-backed tasks stream from disk at upload time so large
@@ -404,7 +521,11 @@ impl UploadQueue {
                         path = %task.path.display(),
                         "upload source file is gone; dropping task"
                     );
-                    settle(&task, false);
+                    settle(
+                        &task,
+                        UploadReceiptStatus::Failed("upload source file is gone".to_owned()),
+                        false,
+                    );
                     continue;
                 }
                 // Check cancellation and mark the key in-flight atomically —
@@ -420,7 +541,7 @@ impl UploadQueue {
                             "failed to clean up object under deleted prefix"
                         );
                     }
-                    settle(&task, false);
+                    settle(&task, UploadReceiptStatus::Cancelled, false);
                     continue;
                 }
                 let result = match &task.source {
@@ -433,7 +554,7 @@ impl UploadQueue {
                 };
                 cancel.lock().unwrap().inflight.remove(&task.key);
                 match result {
-                    Ok(()) => settle(&task, true),
+                    Ok(()) => settle(&task, UploadReceiptStatus::Durable, true),
                     Err(err) => {
                         task.attempts += 1;
                         if disconnected {
@@ -444,7 +565,15 @@ impl UploadQueue {
                                 error = %err,
                                 "recording upload failed during shutdown drain; only the local staging copy remains"
                             );
-                            settle(&task, false);
+                            settle(&task, UploadReceiptStatus::Shutdown, false);
+                        } else if !is_retryable_upload_error(&err) {
+                            warn!(
+                                key = %task.key,
+                                attempts = task.attempts,
+                                error = %err,
+                                "recording upload failed permanently; only the local staging copy remains"
+                            );
+                            settle(&task, UploadReceiptStatus::Failed(err.to_string()), false);
                         } else {
                             let backoff = retry_base * (1 << task.attempts.min(5));
                             warn!(
@@ -454,6 +583,12 @@ impl UploadQueue {
                                 "recording upload failed; retrying"
                             );
                             task.not_before = Instant::now() + backoff;
+                            if let Some(receipt) = &task.receipt {
+                                receipt.update(UploadReceiptStatus::Retrying {
+                                    attempts: task.attempts,
+                                    error: err.to_string(),
+                                });
+                            }
                             delayed.push(task);
                         }
                     }
@@ -516,19 +651,20 @@ impl UploadQueue {
     }
 
     /// Enqueues a PUT without blocking the caller.
-    fn enqueue(&self, task: UploadTask) -> Result<(), String> {
+    fn enqueue(&self, task: UploadTask) -> Result<UploadReceipt, String> {
         self.enqueue_with_pending_limit(task, UPLOAD_MAX_PENDING_TASKS)
     }
 
     fn enqueue_reconciliation(&self, task: UploadTask) -> Result<(), String> {
         self.enqueue_with_pending_limit(task, RECONCILE_PENDING_LIMIT)
+            .map(|_| ())
     }
 
     fn enqueue_with_pending_limit(
         &self,
         mut task: UploadTask,
         pending_limit: usize,
-    ) -> Result<(), String> {
+    ) -> Result<UploadReceipt, String> {
         if self.cancel.lock().unwrap().is_cancelled(&task.key) {
             return Err("recording upload cancelled for deleted prefix".to_owned());
         }
@@ -551,6 +687,13 @@ impl UploadQueue {
             return Err("recording upload queue task limit exceeded".to_owned());
         }
         task.generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        let generation = task.generation;
+        let key = task.key.clone();
+        let cell = Arc::new(UploadReceiptCell {
+            status: Mutex::new(UploadReceiptStatus::Queued),
+            changed: Condvar::new(),
+        });
+        task.receipt = Some(Arc::clone(&cell));
         self.generations
             .lock()
             .unwrap()
@@ -560,7 +703,11 @@ impl UploadQueue {
             return Err("recording upload worker is gone".to_owned());
         };
         match sender.try_send(task) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(UploadReceipt {
+                key,
+                generation,
+                cell,
+            }),
             Err(std::sync::mpsc::TrySendError::Full(task)) => {
                 self.revert_enqueue(&task, size);
                 Err("recording upload queue is full".to_owned())
@@ -702,6 +849,18 @@ impl RecordingObjectStore {
     /// returns immediately. Only queue-level failures surface; the worker
     /// retries object-store failures itself.
     pub fn put_bytes(&self, path: &Path, bytes: &[u8], content_type: &str) -> Result<(), String> {
+        self.put_bytes_with_receipt(path, bytes, content_type)
+            .map(|_| ())
+    }
+
+    /// Enqueues an inline PUT and returns a receipt for the exact key and
+    /// generation, which becomes durable only after the object-store PUT.
+    pub fn put_bytes_with_receipt(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<UploadReceipt, String> {
         let Some(key) = self.object_key(path) else {
             return Err(format!(
                 "path {} is outside the chunk storage dir",
@@ -716,6 +875,7 @@ impl RecordingObjectStore {
             generation: 0, // assigned by `enqueue`
             attempts: 0,
             not_before: Instant::now(),
+            receipt: None,
         })
     }
 
@@ -724,13 +884,25 @@ impl RecordingObjectStore {
     /// queue memory or trip the inline byte cap. Missing files are reported
     /// as `Ok(false)` so callers can treat them as already deleted.
     pub fn upload_file(&self, path: &Path, content_type: &str) -> Result<bool, String> {
+        self.upload_file_with_receipt(path, content_type)
+            .map(|receipt| receipt.is_some())
+    }
+
+    /// Queues a file upload and returns an in-memory receipt for its exact
+    /// object key and generation. `None` means the path is outside the
+    /// mirrored tree or no longer exists.
+    pub fn upload_file_with_receipt(
+        &self,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<Option<UploadReceipt>, String> {
         let Some(key) = self.object_key(path) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !path.is_file() {
-            return Ok(false);
+            return Ok(None);
         }
-        self.uploads.enqueue(UploadTask {
+        let receipt = self.uploads.enqueue(UploadTask {
             key,
             source: UploadSource::File(path.to_path_buf()),
             content_type: content_type.to_owned(),
@@ -738,8 +910,9 @@ impl RecordingObjectStore {
             generation: 0, // assigned by `enqueue`
             attempts: 0,
             not_before: Instant::now(),
+            receipt: None,
         })?;
-        Ok(true)
+        Ok(Some(receipt))
     }
 
     /// Lists all object keys under `prefix` (paginates as needed).
@@ -1046,6 +1219,7 @@ fn reconcile_staged_uploads_once(
             generation: 0,
             attempts: 0,
             not_before: Instant::now(),
+            receipt: None,
         };
         match uploads.enqueue_reconciliation(task) {
             Ok(()) => {
@@ -1298,6 +1472,8 @@ mod tests {
         /// Every put_object call, success or failure.
         attempts: Mutex<usize>,
         fail_puts: Mutex<bool>,
+        timeout_put_failures: Mutex<usize>,
+        permanent_put_failures: Mutex<bool>,
         /// Kills the upload worker (panic) to exercise queue-disconnect paths.
         panic_puts: Mutex<bool>,
         lists: Mutex<Vec<String>>,
@@ -1316,6 +1492,21 @@ mod tests {
             *self.attempts.lock().unwrap() += 1;
             if *self.panic_puts.lock().unwrap() {
                 panic!("injected put panic");
+            }
+            let mut timeouts = self.timeout_put_failures.lock().unwrap();
+            if *timeouts > 0 && !key.starts_with(".tombstones/") {
+                *timeouts -= 1;
+                return Err(S3Error::Status {
+                    status: 400,
+                    detail: "<Error><Code>RequestTimeout</Code></Error>".to_owned(),
+                });
+            }
+            drop(timeouts);
+            if *self.permanent_put_failures.lock().unwrap() && !key.starts_with(".tombstones/") {
+                return Err(S3Error::Status {
+                    status: 403,
+                    detail: "injected permanent failure".to_owned(),
+                });
             }
             // Tombstone writes stay immune to `fail_puts` so a simulated
             // outage fails recording uploads without breaking deletes.
@@ -1554,6 +1745,177 @@ mod tests {
                 .upload_file(&base.join("workspaces/g/vc/m/audio/none.wav"), "audio/wav")
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn upload_receipt_reports_retry_then_durable_generation() {
+        let base = temp_dir("receipt_retry");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.fail_puts.lock().unwrap() = true;
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(20),
+        );
+        let path = base.join("workspaces/g/vc/m/audio/chunk.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+
+        let receipt = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .expect("staged file should enqueue");
+        assert_eq!(receipt.key(), "workspaces/g/vc/m/audio/chunk.wav");
+        assert_eq!(receipt.generation(), 0);
+        let retry = receipt.wait_for_change(&UploadReceiptStatus::Queued);
+        assert!(matches!(
+            retry,
+            UploadReceiptStatus::Retrying { attempts: 1, .. }
+        ));
+        *fake.fail_puts.lock().unwrap() = false;
+        assert_eq!(receipt.wait(), UploadReceiptStatus::Durable);
+        assert_eq!(
+            receipt.wait_for_change(&UploadReceiptStatus::Durable),
+            UploadReceiptStatus::Durable
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn inline_receipt_is_not_durable_before_the_put_finishes() {
+        let base = temp_dir("inline_receipt");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.put_delay.lock().unwrap() = Duration::from_millis(50);
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let path = base.join("workspaces/g/vc/m/audio/chunk.wav");
+
+        let receipt = objects
+            .put_bytes_with_receipt(&path, b"audio", "audio/wav")
+            .unwrap();
+        assert_eq!(receipt.status(), UploadReceiptStatus::Queued);
+        assert_eq!(receipt.wait(), UploadReceiptStatus::Durable);
+        assert_eq!(fake.puts.lock().unwrap()[0].1, b"audio");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn s3_request_timeout_status_400_is_retried() {
+        let base = temp_dir("receipt_request_timeout");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.timeout_put_failures.lock().unwrap() = 1;
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(1),
+        );
+
+        let receipt = objects
+            .put_bytes_with_receipt(
+                &base.join("workspaces/g/vc/m/audio/chunk.wav"),
+                b"audio",
+                "audio/wav",
+            )
+            .unwrap();
+        assert!(matches!(
+            receipt.wait_for_change(&UploadReceiptStatus::Queued),
+            UploadReceiptStatus::Retrying { attempts: 1, .. }
+        ));
+        assert_eq!(receipt.wait(), UploadReceiptStatus::Durable);
+        assert_eq!(*fake.attempts.lock().unwrap(), 2);
+        assert_eq!(fake.puts.lock().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn upload_receipt_reports_permanent_failure_and_shutdown() {
+        let base = temp_dir("receipt_fail");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.permanent_put_failures.lock().unwrap() = true;
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_millis(1),
+        );
+        let path = base.join("workspaces/g/vc/m/audio/forbidden.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+        let receipt = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(receipt.wait(), UploadReceiptStatus::Failed(_)));
+
+        *fake.permanent_put_failures.lock().unwrap() = false;
+        *fake.fail_puts.lock().unwrap() = true;
+        let shutdown_path = base.join("workspaces/g/vc/m/audio/shutdown.wav");
+        std::fs::write(&shutdown_path, b"audio").unwrap();
+        let shutdown_receipt = objects
+            .upload_file_with_receipt(&shutdown_path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        drop(objects);
+        assert_eq!(shutdown_receipt.wait(), UploadReceiptStatus::Shutdown);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn upload_receipts_do_not_confuse_superseded_generations() {
+        let base = temp_dir("receipt_generations");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.fail_puts.lock().unwrap() = true;
+        let objects = RecordingObjectStore::with_retry_base(
+            dyn_store,
+            String::new(),
+            900,
+            &base,
+            Duration::from_secs(1),
+        );
+        let path = base.join("workspaces/g/vc/m/audio/snapshot.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        let old = objects
+            .upload_file_with_receipt(&path, "application/json")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            old.wait_for_change(&UploadReceiptStatus::Queued),
+            UploadReceiptStatus::Retrying { .. }
+        ));
+
+        *fake.fail_puts.lock().unwrap() = false;
+        std::fs::write(&path, b"new").unwrap();
+        let new = objects
+            .upload_file_with_receipt(&path, "application/json")
+            .unwrap()
+            .unwrap();
+        assert_ne!(old.generation(), new.generation());
+        assert_eq!(new.wait(), UploadReceiptStatus::Durable);
+        assert_eq!(old.wait(), UploadReceiptStatus::Superseded);
+        assert_eq!(
+            fake.puts.lock().unwrap().as_slice(),
+            &[(
+                "workspaces/g/vc/m/audio/snapshot.json".to_owned(),
+                b"new".to_vec(),
+                "application/json".to_owned(),
+            )]
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
