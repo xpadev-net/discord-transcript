@@ -8,14 +8,19 @@ use discord_transcript::infrastructure::storage::{
 
 #[test]
 fn postgres_sql_contract_smoke_runs_migrations_and_core_queries() {
-    let Ok(database_url) = std::env::var("DISCORD_TRANSCRIPT_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping real Postgres SQL contract smoke test; set DISCORD_TRANSCRIPT_TEST_DATABASE_URL"
-        );
-        return;
+    let database_url = match std::env::var("DISCORD_TRANSCRIPT_TEST_DATABASE_URL") {
+        Ok(database_url) => database_url,
+        Err(_) if std::env::var_os("CI").is_some() => {
+            panic!("DISCORD_TRANSCRIPT_TEST_DATABASE_URL is required in CI")
+        }
+        Err(_) => {
+            eprintln!("skipping real Postgres SQL contract smoke test; set DISCORD_TRANSCRIPT_TEST_DATABASE_URL");
+            return;
+        }
     };
 
     let schema = format!("dt_sql_contract_{}", uuid::Uuid::new_v4().simple());
+    eprintln!("running real Postgres SQL contract smoke test in isolated schema {schema}");
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
     runtime.block_on(async {
         let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)

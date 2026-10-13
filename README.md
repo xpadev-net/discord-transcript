@@ -203,6 +203,13 @@ cargo test --locked --test mvp_core
 ```
 
 テストではインメモリのストア・スタブクライアントを使用するため、外部サービスは不要です。
+実 PostgreSQL を使う 3 件の契約テストは、`DISCORD_TRANSCRIPT_TEST_DATABASE_URL` が未設定のローカル実行では明示的に skip します。設定すると、各テストが UUID 付きの独立 schema を作成して実行します。CI では同 URL を必須にし、未設定ならテストを失敗させます。
+
+```bash
+# disposable なテスト用 PostgreSQL を指定して、全テスト内の実 DB 契約テストも実行
+DISCORD_TRANSCRIPT_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/discord_transcript_test \
+  cargo test --locked --workspace --all-targets --all-features -- --nocapture
+```
 
 ## CI
 
