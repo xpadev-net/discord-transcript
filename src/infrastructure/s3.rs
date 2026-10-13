@@ -20,6 +20,7 @@ const S3_SERVICE: &str = "s3";
 pub const DEFAULT_REGION: &str = "us-east-1";
 /// Default lifetime of presigned playback URLs handed to the frontend.
 pub const DEFAULT_PRESIGN_TTL_SECONDS: u64 = 900;
+const S3_LIST_PAGE_SIZE: usize = 1_000;
 /// SigV4 presigned URLs may live at most 7 days.
 pub const MAX_PRESIGN_TTL_SECONDS: u64 = 604_800;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -105,6 +106,20 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
 
     /// Lists all keys under `prefix` (paginates as needed).
     fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error>;
+
+    /// Visits keys under `prefix` without requiring callers to retain the
+    /// complete listing. Existing stores inherit a compatibility fallback;
+    /// streaming stores should override this method to bound memory by page.
+    fn visit_keys(
+        &self,
+        prefix: &str,
+        visitor: &mut (dyn FnMut(&str) -> Result<(), S3Error> + Send),
+    ) -> Result<(), S3Error> {
+        for key in self.list_keys(prefix)? {
+            visitor(&key)?;
+        }
+        Ok(())
+    }
 
     /// Deletes `keys` in batches. Unknown keys are ignored by the service.
     fn delete_keys(&self, keys: &[String]) -> Result<(), S3Error>;
@@ -661,8 +676,11 @@ impl S3Client {
         }
     }
 
-    async fn list_keys_async(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
-        let mut keys = Vec::new();
+    async fn visit_keys_async(
+        &self,
+        prefix: &str,
+        visitor: &mut (dyn FnMut(&str) -> Result<(), S3Error> + Send),
+    ) -> Result<(), S3Error> {
         let mut continuation: Option<String> = None;
         loop {
             // ListObjectsV2 lives on the bucket, not on an object key: for
@@ -678,6 +696,7 @@ impl S3Client {
             }
             let mut query = vec![
                 ("list-type".to_owned(), "2".to_owned()),
+                ("max-keys".to_owned(), S3_LIST_PAGE_SIZE.to_string()),
                 ("prefix".to_owned(), prefix.to_owned()),
             ];
             if let Some(token) = &continuation {
@@ -691,7 +710,9 @@ impl S3Client {
                 .await
                 .map_err(|err| S3Error::Http(err.to_string()))?;
             let page = parse_list_objects_v2(&body);
-            keys.extend(page.keys);
+            for key in &page.keys {
+                visitor(key)?;
+            }
             match (page.is_truncated, page.next_continuation) {
                 (true, Some(token)) => continuation = Some(token),
                 // Some S3-compatible services omit NextContinuationToken but
@@ -702,9 +723,19 @@ impl S3Client {
                         detail: "ListObjectsV2 truncated without a continuation token".to_owned(),
                     });
                 }
-                (false, _) => return Ok(keys),
+                (false, _) => return Ok(()),
             }
         }
+    }
+
+    async fn list_keys_async(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
+        let mut keys = Vec::new();
+        self.visit_keys_async(prefix, &mut |key| {
+            keys.push(key.to_owned());
+            Ok(())
+        })
+        .await?;
+        Ok(keys)
     }
 
     fn presigned_get_url_at(&self, key: &str, ttl: Duration, now: DateTime<Utc>) -> String {
@@ -822,6 +853,15 @@ impl ObjectStore for S3Client {
 
     fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
         self.block_on(async move { self.list_keys_async(prefix).await })
+    }
+
+    fn visit_keys(
+        &self,
+        prefix: &str,
+        visitor: &mut (dyn FnMut(&str) -> Result<(), S3Error> + Send),
+    ) -> Result<(), S3Error> {
+        let prefix = prefix.to_owned();
+        self.block_on(async move { self.visit_keys_async(&prefix, visitor).await })
     }
 
     fn delete_keys(&self, keys: &[String]) -> Result<(), S3Error> {
@@ -1074,6 +1114,9 @@ fn truncate_body(body: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     fn test_client(endpoint: Option<&str>, path_style: bool) -> S3Client {
         S3Client {
@@ -1178,6 +1221,76 @@ mod tests {
         assert_eq!(page.keys, vec!["a/b&c.wav", "a/d.wav"]);
         assert!(page.is_truncated);
         assert_eq!(page.next_continuation.as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn visit_keys_streams_each_s3_continuation_page() {
+        fn read_request_line(stream: &mut TcpStream) -> String {
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending request headers");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let request_lines = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&request_lines);
+        let server = std::thread::spawn(move || {
+            let pages = [
+                "<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>recordings/a.wav</Key></Contents><NextContinuationToken>cursor/2</NextContinuationToken></ListBucketResult>",
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>recordings/b.wav</Key></Contents></ListBucketResult>",
+            ];
+            for body in pages {
+                let (mut stream, _) = listener.accept().unwrap();
+                server_requests
+                    .lock()
+                    .unwrap()
+                    .push(read_request_line(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let client = S3Client::new(S3Settings {
+            bucket: "bucket".to_owned(),
+            endpoint: Some(endpoint),
+            region: DEFAULT_REGION.to_owned(),
+            access_key_id: "key".to_owned(),
+            secret_access_key: "secret".to_owned(),
+            key_prefix: String::new(),
+            path_style: true,
+            presign_ttl_seconds: DEFAULT_PRESIGN_TTL_SECONDS,
+        })
+        .unwrap();
+        let mut keys = Vec::new();
+        client
+            .visit_keys("recordings/", &mut |key| {
+                keys.push(key.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(keys, vec!["recordings/a.wav", "recordings/b.wav"]);
+        let requests = request_lines.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("max-keys=1000"));
+        assert!(requests[1].contains("continuation-token=cursor%2F2"));
+        assert!(requests[1].contains("max-keys=1000"));
     }
 
     #[test]

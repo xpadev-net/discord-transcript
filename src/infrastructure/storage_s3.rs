@@ -766,6 +766,9 @@ pub struct RecordingObjectStore {
     /// `CHUNK_STORAGE_DIR`: local workspace root mirrored into object keys.
     storage_dir: PathBuf,
     uploads: Arc<UploadQueue>,
+    /// Shared only by public store handles (the reconciler holds a Weak queue
+    /// reference), so dropping the final handle can stop an active scan.
+    reconcile_owner: Arc<()>,
 }
 
 impl RecordingObjectStore {
@@ -817,6 +820,7 @@ impl RecordingObjectStore {
             key_prefix,
             presign_ttl_seconds,
             storage_dir: storage_dir.into(),
+            reconcile_owner: Arc::new(()),
         }
     }
 
@@ -1032,6 +1036,17 @@ impl RecordingObjectStore {
     }
 }
 
+impl Drop for RecordingObjectStore {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.reconcile_owner) == 1 {
+            self.uploads.reconcile_stop.store(true, Ordering::SeqCst);
+            if let Some(reconciler) = self.uploads.reconciler.lock().unwrap().as_ref() {
+                reconciler.thread().unpark();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StagedFileStamp {
     len: u64,
@@ -1044,6 +1059,24 @@ struct ReconcileScan {
     queued: usize,
     complete: bool,
     backpressured: bool,
+}
+
+#[derive(Debug, Default)]
+struct TombstoneIndex {
+    prefixes: HashSet<String>,
+}
+
+impl TombstoneIndex {
+    fn insert(&mut self, prefix: String) {
+        self.prefixes.insert(prefix);
+    }
+
+    fn contains_prefix_of(&self, key: &str) -> bool {
+        self.prefixes.contains(key)
+            || key
+                .char_indices()
+                .any(|(index, _)| self.prefixes.contains(&key[..index]))
+    }
 }
 
 fn incomplete_scan_retry_delay(scan: &ReconcileScan, retry_delay: &mut Duration) -> Duration {
@@ -1153,25 +1186,15 @@ fn reconcile_staged_uploads_once(
     accepted: &mut HashMap<String, (PathBuf, StagedFileStamp)>,
     stop: &AtomicBool,
 ) -> Result<ReconcileScan, String> {
-    let remote: HashSet<String> = objects
-        .list_keys(key_prefix)
-        .map_err(|err| format!("cannot list remote objects: {err}"))?
-        .into_iter()
-        .collect();
-    let tombstoned: Vec<String> = objects
-        .list_keys(tombstone_prefix)
-        .map_err(|err| format!("cannot list remote tombstones: {err}"))?
-        .into_iter()
-        .filter_map(|key| key.strip_prefix(tombstone_prefix).map(str::to_owned))
-        .collect();
-
     accepted.retain(|_, (path, stamp)| staged_file_stamp(path).as_ref() == Some(stamp));
-    let mut files = Vec::new();
-    let mut complete = collect_staged_files(storage_dir, &mut files);
-    files.sort();
     let mut scanned = 0usize;
     let mut queued = 0usize;
     let mut backpressured = false;
+
+    let mut files = Vec::new();
+    let mut complete = collect_staged_files(storage_dir, &mut files);
+    files.sort();
+    let mut staged = HashMap::new();
     for path in files {
         if stop.load(Ordering::SeqCst) {
             complete = false;
@@ -1197,20 +1220,69 @@ fn reconcile_staged_uploads_once(
             continue;
         }
         let key = format!("{key_prefix}{rel_key}");
-        if remote.contains(&key)
-            || tombstoned
-                .iter()
-                .any(|prefix| key.starts_with(prefix.as_str()))
-        {
-            accepted.remove(&key);
-            continue;
-        }
         if accepted
             .get(&key)
             .is_some_and(|(_, accepted_stamp)| accepted_stamp == &stamp)
         {
             continue;
         }
+        staged.insert(key, (path, stamp));
+    }
+
+    let list_result = objects.visit_keys(key_prefix, &mut |key| {
+        if stop.load(Ordering::SeqCst) {
+            return Err(S3Error::Config("s3 reconciliation stopped".to_owned()));
+        }
+        staged.remove(key);
+        Ok(())
+    });
+    if stop.load(Ordering::SeqCst) {
+        return Ok(ReconcileScan {
+            scanned,
+            queued,
+            complete: false,
+            backpressured,
+        });
+    }
+    list_result.map_err(|err| format!("cannot list remote objects: {err}"))?;
+
+    // Check tombstones after the potentially long object listing so a deletion
+    // created during that scan cannot be missed before an upload is enqueued.
+    let mut tombstones = TombstoneIndex::default();
+    let tombstone_result = objects.visit_keys(tombstone_prefix, &mut |key| {
+        if stop.load(Ordering::SeqCst) {
+            return Err(S3Error::Config("s3 reconciliation stopped".to_owned()));
+        }
+        if let Some(prefix) = key.strip_prefix(tombstone_prefix) {
+            tombstones.insert(prefix.to_owned());
+        }
+        Ok(())
+    });
+    if stop.load(Ordering::SeqCst) {
+        return Ok(ReconcileScan {
+            scanned,
+            queued,
+            complete: false,
+            backpressured,
+        });
+    }
+    tombstone_result.map_err(|err| format!("cannot list remote tombstones: {err}"))?;
+    accepted.retain(|key, _| !tombstones.contains_prefix_of(key));
+
+    let mut staged: Vec<_> = staged.into_iter().collect();
+    staged.sort_by(|left, right| left.0.cmp(&right.0));
+    for (key, (path, stamp)) in staged {
+        if stop.load(Ordering::SeqCst) {
+            complete = false;
+            break;
+        }
+        if tombstones.contains_prefix_of(&key) {
+            accepted.remove(&key);
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(storage_dir) else {
+            continue;
+        };
         let task = UploadTask {
             key: key.clone(),
             source: UploadSource::File(path.clone()),
@@ -1480,6 +1552,7 @@ mod tests {
         deletes: Mutex<Vec<Vec<String>>>,
         list_result: Mutex<Vec<String>>,
         list_failures: Mutex<HashMap<String, usize>>,
+        list_delay: Mutex<Duration>,
         put_delay: Mutex<Duration>,
     }
 
@@ -1530,6 +1603,10 @@ mod tests {
 
         fn list_keys(&self, prefix: &str) -> Result<Vec<String>, S3Error> {
             self.lists.lock().unwrap().push(prefix.to_owned());
+            let list_delay = *self.list_delay.lock().unwrap();
+            if !list_delay.is_zero() {
+                std::thread::sleep(list_delay);
+            }
             let should_fail = {
                 let mut failures = self.list_failures.lock().unwrap();
                 if let Some(remaining) = failures.get_mut(prefix)
@@ -2370,6 +2447,76 @@ mod tests {
         assert_eq!(fake.puts.lock().unwrap().len(), 1);
         drop(objects);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_stops_after_store_shutdown_during_listing() {
+        let base = temp_dir("reconcile_shutdown_list");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.list_delay.lock().unwrap() = Duration::from_millis(100);
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+
+        objects.reconcile_staged_uploads();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && fake.lists.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!fake.lists.lock().unwrap().is_empty());
+        let started = Instant::now();
+        drop(objects);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            fake.lists.lock().unwrap().len(),
+            1,
+            "shutdown should stop before the object-prefix LIST"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_checks_tombstones_created_during_remote_scan() {
+        let base = temp_dir("reconcile_tombstone_during_scan");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.list_delay.lock().unwrap() = Duration::from_millis(100);
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let staged = base.join("meeting/audio.wav");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+
+        objects.reconcile_staged_uploads();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && fake.lists.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(fake.lists.lock().unwrap().as_slice(), &[String::new()]);
+        fake.list_result
+            .lock()
+            .unwrap()
+            .push(".tombstones/meeting/".to_owned());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && fake.lists.lock().unwrap().len() < 2 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        objects.wait_uploads_idle();
+        assert!(fake.puts.lock().unwrap().is_empty());
+        drop(objects);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tombstone_index_matches_prefixes_without_scanning_every_tombstone() {
+        let mut index = TombstoneIndex::default();
+        index.insert("workspaces/g/vc/m/audio/".to_owned());
+        index.insert("legacy/meeting".to_owned());
+
+        assert!(index.contains_prefix_of("workspaces/g/vc/m/audio/chunk.wav"));
+        assert!(index.contains_prefix_of("legacy/meeting/speakers/u.wav"));
+        assert!(!index.contains_prefix_of("workspaces/g/vc/other/audio/chunk.wav"));
     }
 
     #[test]
