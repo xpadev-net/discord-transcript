@@ -1399,7 +1399,9 @@ fn upload_content_type(rel: &Path) -> &'static str {
 /// shared background queue so the voice-ingest path never blocks on object
 /// I/O; only a saturated queue surfaces `Remote` (the session's
 /// pending-chunk retry then keeps re-attempting the save).
-#[derive(Debug)]
+type FailedStagedUploads = Arc<Mutex<HashMap<u64, Vec<(PathBuf, usize)>>>>;
+
+#[derive(Debug, Clone)]
 pub struct S3ChunkStorage {
     local: LocalChunkStorage,
     objects: RecordingObjectStore,
@@ -1407,7 +1409,7 @@ pub struct S3ChunkStorage {
     /// (path, byte length)). A retried save may stage under a different
     /// filename (sequence re-assigned, or the user re-keyed), so superseded
     /// duplicates are removed before they would double-count in assembly.
-    failed_staged: Mutex<HashMap<u64, Vec<(PathBuf, usize)>>>,
+    failed_staged: FailedStagedUploads,
 }
 
 impl S3ChunkStorage {
@@ -1465,7 +1467,7 @@ impl ChunkStorage for S3ChunkStorage {
 
 /// Runtime-selected chunk storage. Both variants keep a local workspace so
 /// downstream readers stay path-based; only the durable destination differs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MeetingChunkStorage {
     Local(LocalChunkStorage),
     S3(S3ChunkStorage),
@@ -1483,7 +1485,7 @@ impl MeetingChunkStorage {
             Some(objects) => Self::S3(S3ChunkStorage {
                 local,
                 objects,
-                failed_staged: Mutex::new(HashMap::new()),
+                failed_staged: Arc::new(Mutex::new(HashMap::new())),
             }),
             None => Self::Local(local),
         }

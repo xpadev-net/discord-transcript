@@ -190,6 +190,15 @@ impl<S: ChunkStorage> RecordingSession<S> {
         self.recorder.ingest_frame(user_id, frame);
     }
 
+    /// Clone the storage handle for an out-of-lock writer. Implementations
+    /// should share backend state across clones rather than duplicate queues.
+    pub fn storage_handle(&self) -> S
+    where
+        S: Clone,
+    {
+        self.storage.clone()
+    }
+
     pub fn flush_due(&mut self, now: Instant) -> Result<FlushResult, RecordingSessionError> {
         let generated = self.recorder.flush_due(now)?;
         let chunks = self.prepare_chunks(generated);
@@ -210,6 +219,9 @@ impl<S: ChunkStorage> RecordingSession<S> {
         now: Instant,
     ) -> Result<Vec<PreparedChunk>, RecordingSessionError> {
         let chunks = self.recorder.flush_due(now)?;
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
         Ok(self.prepare_with_pending(chunks))
     }
 
@@ -231,7 +243,17 @@ impl<S: ChunkStorage> RecordingSession<S> {
             return Err(chunk);
         }
         self.pending_failed_chunks.push(chunk);
+        self.sort_pending_failed_chunks();
         Ok(self.enforce_pending_failed_limit())
+    }
+
+    fn sort_pending_failed_chunks(&mut self) {
+        self.pending_failed_chunks.sort_by(|left, right| {
+            left.start_ms
+                .cmp(&right.start_ms)
+                .then_with(|| left.user_id.cmp(&right.user_id))
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
     }
 
     fn prepare_with_pending(&mut self, chunks: Vec<RecorderOutputChunk>) -> Vec<PreparedChunk> {
@@ -277,6 +299,7 @@ impl<S: ChunkStorage> RecordingSession<S> {
         retry_chunks.extend(chunks);
         let result = self.persist_chunks(retry_chunks, existing_pending_count);
         self.pending_failed_chunks = result.failed_chunks;
+        self.sort_pending_failed_chunks();
         self.enforce_pending_failed_limit();
         FlushResult {
             persisted: result.persisted,
@@ -593,6 +616,58 @@ mod tests {
             .map(|saved| chunk.complete(saved))
             .expect("retry should persist");
         assert_eq!(persisted.sequence, 1);
+    }
+
+    #[test]
+    fn prepare_due_does_not_retry_retained_chunks_without_fresh_audio() {
+        let mut session = test_session(Arc::new(AtomicUsize::new(0)));
+        ingest_test_frame(&mut session, 1_000);
+        let chunk = session
+            .prepare_all()
+            .expect("preparation should succeed")
+            .pop()
+            .expect("one chunk should be prepared");
+        session
+            .retain_failed_prepared(chunk)
+            .expect("same-meeting chunk should be retained");
+
+        assert!(
+            session
+                .prepare_due(std::time::Instant::now())
+                .expect("empty due flush should succeed")
+                .is_empty()
+        );
+        assert_eq!(session.pending_failed_chunks.len(), 1);
+    }
+
+    #[test]
+    fn failed_chunk_retention_evicts_oldest_audio_not_ack_arrival_order() {
+        let mut session = test_session(Arc::new(AtomicUsize::new(0)));
+        ingest_test_frame(&mut session, 1_000);
+        let older = session
+            .prepare_all()
+            .expect("preparation should succeed")
+            .pop()
+            .expect("older chunk should be prepared");
+        let chunk_bytes = older.wav().bytes.len();
+        ingest_test_frame(&mut session, 2_000);
+        let newer = session
+            .prepare_all()
+            .expect("preparation should succeed")
+            .pop()
+            .expect("newer chunk should be prepared");
+        session.set_pending_failed_chunk_limit_for_tests(chunk_bytes);
+
+        session
+            .retain_failed_prepared(newer)
+            .expect("newer chunk should be retained first");
+        let loss = session
+            .retain_failed_prepared(older)
+            .expect("older chunk should be retained second");
+
+        assert_eq!(loss.dropped_chunks, 1);
+        assert_eq!(session.pending_failed_chunks.len(), 1);
+        assert_eq!(session.pending_failed_chunks[0].start_ms(), 2_000);
     }
 
     #[test]

@@ -8,6 +8,10 @@ use crate::application::command::{
     CommandError, PermissionSet, RecordStartPreflight, RecordStartRequest,
     record_start_after_preflight, validate_record_start_preconditions,
 };
+use crate::application::recording_writer::{
+    BoundedRecordingWriter, ChunkWriteOutcome, DEFAULT_RECORDING_WRITER_BYTE_LIMIT,
+    DEFAULT_RECORDING_WRITER_TASK_LIMIT,
+};
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::retention_cleanup::{
     RETENTION_CLEANUP_INTERVAL, RetentionCleanupGate, apply_retention_database_cleanup,
@@ -27,7 +31,9 @@ use crate::audio::meeting_audio::{
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
 };
 use crate::audio::receiver::ReceiverConfig;
-use crate::audio::recording_session::{FlushResult, PersistedChunk, RecordingSession};
+use crate::audio::recording_session::{
+    FlushResult, PersistedChunk, PreparedChunk, RecordingSession,
+};
 use crate::audio::songbird_adapter::{AdaptedVoiceFrames, SsrcTracker, adapt_voice_tick};
 use crate::bootstrap::config::{AppConfig, AppRole, SummaryHarness, SummaryProvider};
 use crate::domain::authz::{
@@ -1292,6 +1298,9 @@ async fn remove_local_recording_state_after_terminal_absence_with_dependencies<
 ) -> Option<RecordingSession<C>> {
     let removed_session = {
         let _voice_event_guard = local.voice_event_gate.write().await;
+        if let Some(writer) = local.recording_writer {
+            writer.drain().await;
+        }
         let mut sessions = local.sessions.lock().await;
         remove_matching_recording_session_for_meeting(&mut sessions, guild_key, expected_meeting_id)
     };
@@ -1515,6 +1524,7 @@ struct RecordingLifecycleLocalState<'a, C: ChunkStorage> {
     live_transcription_titles: &'a Arc<Mutex<HashMap<String, Option<String>>>>,
     recording_startups: &'a Arc<Mutex<HashMap<String, String>>>,
     voice_event_gate: &'a Arc<RwLock<()>>,
+    recording_writer: Option<&'a BoundedRecordingWriter<MeetingChunkStorage>>,
     ssrc_tracker: &'a Arc<Mutex<SsrcTracker>>,
     ssrc_tracker_reset_gate: &'a Arc<Mutex<()>>,
 }
@@ -1632,6 +1642,9 @@ async fn clear_failed_recording_start_local_state_with_dependencies<
 
     let (removed_session, latest_tracker) = {
         let _voice_event_guard = local.voice_event_gate.write().await;
+        if let Some(writer) = local.recording_writer {
+            writer.drain().await;
+        }
         let mut removed_session = {
             let mut sessions = local.sessions.lock().await;
             remove_matching_recording_session_for_meeting(&mut sessions, guild_key, meeting_id)
@@ -1841,6 +1854,9 @@ where
     // unavailable, callers retry with the session/startup handles intact.
     let mut removed_session = {
         let _voice_event_guard = local.voice_event_gate.write().await;
+        if let Some(writer) = local.recording_writer {
+            writer.drain().await;
+        }
         let removed_session = {
             let mut sessions = local.sessions.lock().await;
             remove_matching_recording_session_for_meeting(
@@ -3464,6 +3480,11 @@ pub async fn run_bot(
     // `recording_objects` is shared with the web layer by the caller so a
     // delete issued through either path cancels this queue's pending uploads.
 
+    let recording_writer = BoundedRecordingWriter::new(
+        DEFAULT_RECORDING_WRITER_TASK_LIMIT,
+        DEFAULT_RECORDING_WRITER_BYTE_LIMIT,
+    );
+
     let handler = ScaffoldHandler {
         guild_id,
         service: Arc::new(Mutex::new(BotCommandService::new(SqlMeetingStore::new(
@@ -3475,6 +3496,7 @@ pub async fn run_bot(
         ))),
         ssrc_tracker: Arc::new(Mutex::new(SsrcTracker::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        recording_writer,
         recording_startups: Arc::new(Mutex::new(HashMap::new())),
         recording_start_cleanup_retries: Arc::new(StdMutex::new(HashSet::new())),
         live_transcription_bases: Arc::new(Mutex::new(HashMap::new())),
@@ -3750,6 +3772,7 @@ struct ScaffoldHandler {
     queue: Arc<Mutex<SqlJobQueue<PgSqlExecutor>>>,
     ssrc_tracker: Arc<Mutex<SsrcTracker>>,
     sessions: Arc<Mutex<HashMap<String, RecordingSession<MeetingChunkStorage>>>>,
+    recording_writer: BoundedRecordingWriter<MeetingChunkStorage>,
     recording_startups: Arc<Mutex<HashMap<String, String>>>,
     recording_start_cleanup_retries: Arc<StdMutex<HashSet<String>>>,
     live_transcription_bases: Arc<Mutex<HashMap<String, u64>>>,
@@ -3969,16 +3992,15 @@ impl ScaffoldHandler {
         self.task_tracker.spawn(future);
     }
 
-    async fn live_transcription_base_for_chunks(&self, chunks: &[PersistedChunk]) -> Option<u64> {
-        let base_start_ms = chunks.iter().map(|chunk| chunk.start_ms).min()?;
+    async fn live_transcription_base(&self, meeting_id: &str, batch_base_start_ms: u64) -> u64 {
         let mut bases = self.live_transcription_bases.lock().await;
         let entry = bases
-            .entry(chunks[0].meeting_id.clone())
-            .or_insert(base_start_ms);
-        if base_start_ms < *entry {
-            *entry = base_start_ms;
+            .entry(meeting_id.to_owned())
+            .or_insert(batch_base_start_ms);
+        if batch_base_start_ms < *entry {
+            *entry = batch_base_start_ms;
         }
-        Some(*entry)
+        *entry
     }
 
     async fn live_transcription_title(&self, meeting_id: &str) -> Option<String> {
@@ -4000,6 +4022,63 @@ impl ScaffoldHandler {
                     .process_live_transcription_chunk(chunk, base_start_ms, meeting_title)
                     .await;
             });
+        }
+    }
+
+    async fn complete_recording_chunk_write(
+        &self,
+        guild_key: &str,
+        batch_base_start_ms: u64,
+        outcome: ChunkWriteOutcome,
+    ) {
+        match outcome {
+            ChunkWriteOutcome::Persisted(chunk) => {
+                let base_start_ms = self
+                    .live_transcription_base(
+                        &chunk.meeting_id,
+                        batch_base_start_ms.min(chunk.start_ms),
+                    )
+                    .await;
+                let meeting_title = self.live_transcription_title(&chunk.meeting_id).await;
+                self.spawn_live_transcription_tasks(vec![chunk], base_start_ms, meeting_title);
+            }
+            ChunkWriteOutcome::Failed { chunk, error } => {
+                let meeting_id = chunk.meeting_id().to_owned();
+                let result = {
+                    let mut sessions = self.sessions.lock().await;
+                    sessions
+                        .get_mut(guild_key)
+                        .filter(|session| session.meeting_id == meeting_id)
+                        .map(|session| session.retain_failed_prepared(chunk))
+                };
+                match result {
+                    Some(Ok(loss)) if !loss.is_empty() => warn!(
+                        guild_id = %guild_key,
+                        meeting_id,
+                        dropped_chunks = loss.dropped_chunks,
+                        dropped_bytes = loss.dropped_bytes,
+                        error = %error,
+                        "recording writer retry buffer evicted failed audio"
+                    ),
+                    Some(Ok(_)) => warn!(
+                        guild_id = %guild_key,
+                        meeting_id,
+                        error = %error,
+                        "recording chunk write failed; chunk retained for retry"
+                    ),
+                    Some(Err(_)) => error!(
+                        guild_id = %guild_key,
+                        meeting_id,
+                        "recording writer returned a chunk for a different meeting"
+                    ),
+                    None => error!(
+                        guild_id = %guild_key,
+                        meeting_id,
+                        error = %error,
+                        "recording chunk failed after its session was removed"
+                    ),
+                }
+            }
         }
     }
 
@@ -4221,6 +4300,7 @@ impl ScaffoldHandler {
         {
             let _command_guard = self.command_gate.write().await;
             let _voice_event_guard = self.voice_event_gate.write().await;
+            self.recording_writer.drain().await;
             {
                 let _spawn_guard = self
                     .background_spawn_gate
@@ -4264,6 +4344,7 @@ impl ScaffoldHandler {
                     flushed, "recording sessions drained during shutdown"
                 );
             }
+            self.recording_writer.shutdown().await;
             {
                 let mut states = self.auto_stop_states.lock().await;
                 states.clear();
@@ -5717,6 +5798,7 @@ impl ScaffoldHandler {
             live_transcription_titles: &self.live_transcription_titles,
             recording_startups: &self.recording_startups,
             voice_event_gate: &self.voice_event_gate,
+            recording_writer: Some(&self.recording_writer),
             ssrc_tracker: &self.ssrc_tracker,
             ssrc_tracker_reset_gate: &self.ssrc_tracker_reset_gate,
         }
@@ -5781,6 +5863,7 @@ impl ScaffoldHandler {
         let mut final_flush_failed = false;
         {
             let _voice_event_guard = self.voice_event_gate.write().await;
+            self.recording_writer.drain().await;
             let tracker = {
                 let tracker = self.ssrc_tracker.lock().await;
                 tracker.clone()
@@ -5831,6 +5914,8 @@ impl ScaffoldHandler {
         };
 
         let removed_session = {
+            let _voice_event_guard = self.voice_event_gate.write().await;
+            self.recording_writer.drain().await;
             let mut sessions = self.sessions.lock().await;
             remove_matching_recording_session_for_meeting(
                 &mut sessions,
@@ -6591,6 +6676,7 @@ impl ScaffoldHandler {
                 );
                 let mut removed_session = {
                     let _voice_event_guard = self.voice_event_gate.write().await;
+                    self.recording_writer.drain().await;
                     let mut sessions = self.sessions.lock().await;
                     if sessions
                         .get(guild_key)
@@ -9223,35 +9309,76 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                 let tracker = self.tracker.lock().await;
                 let adapted = adapt_voice_tick(tick, ts, &tracker);
                 drop(tracker);
-                let persisted_chunks = {
+                let mut write_receipts = Vec::new();
+                {
                     let mut sessions = self.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&self.guild_id) {
-                        match ingest_voice_frames_into_session(session, &adapted) {
-                            Ok(chunks) => chunks,
+                        for (user_id, frame) in &adapted.per_user {
+                            session.ingest_frame(user_id, frame.clone());
+                        }
+                        match session.prepare_due(Instant::now()) {
+                            Ok(chunks) => {
+                                let batch_base_start_ms =
+                                    chunks.iter().map(PreparedChunk::start_ms).min();
+                                let storage = session.storage_handle();
+                                for chunk in chunks {
+                                    match self
+                                        .runtime
+                                        .recording_writer
+                                        .try_enqueue(chunk, storage.clone())
+                                    {
+                                        Ok(receipt) => {
+                                            write_receipts.push((receipt, batch_base_start_ms));
+                                        }
+                                        Err(chunk) => {
+                                            let sequence = chunk.sequence();
+                                            match session.retain_failed_prepared(chunk) {
+                                                Ok(loss) if !loss.is_empty() => error!(
+                                                    guild_id = %self.guild_id,
+                                                    sequence,
+                                                    dropped_chunks = loss.dropped_chunks,
+                                                    dropped_bytes = loss.dropped_bytes,
+                                                    "recording writer is full and retry retention evicted audio"
+                                                ),
+                                                Ok(_) => warn!(
+                                                    guild_id = %self.guild_id,
+                                                    sequence,
+                                                    "recording writer is full; prepared chunk retained for a later tick"
+                                                ),
+                                                Err(_) => error!(
+                                                    guild_id = %self.guild_id,
+                                                    sequence,
+                                                    "recording writer rejected a chunk for a different meeting"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             Err(err) => {
-                                warn!(guild_id = %self.guild_id, error = %err, "failed to ingest voice tick");
-                                Vec::new()
+                                warn!(guild_id = %self.guild_id, error = %err, "failed to prepare voice tick audio");
                             }
                         }
-                    } else {
-                        Vec::new()
                     }
-                };
-                if !persisted_chunks.is_empty()
-                    && let Some(base_start_ms) = self
-                        .runtime
-                        .live_transcription_base_for_chunks(&persisted_chunks)
-                        .await
-                {
-                    let meeting_title = self
-                        .runtime
-                        .live_transcription_title(&persisted_chunks[0].meeting_id)
-                        .await;
-                    self.runtime.spawn_live_transcription_tasks(
-                        persisted_chunks,
-                        base_start_ms,
-                        meeting_title,
-                    );
+                }
+                for (receipt, batch_base_start_ms) in write_receipts {
+                    let runtime = self.runtime.clone();
+                    let guild_key = self.guild_id.clone();
+                    let batch_base_start_ms = batch_base_start_ms.unwrap_or(0);
+                    self.runtime.task_tracker.spawn(async move {
+                        let completion = receipt.wait().await;
+                        completion
+                            .process(|outcome| async move {
+                                runtime
+                                    .complete_recording_chunk_write(
+                                        &guild_key,
+                                        batch_base_start_ms,
+                                        outcome,
+                                    )
+                                    .await;
+                            })
+                            .await;
+                    });
                 }
             }
             EventContext::DriverDisconnect(data) => {
@@ -11969,6 +12096,7 @@ mod status_message_tests {
                 live_transcription_titles: &self.live_transcription_titles,
                 recording_startups: &self.recording_startups,
                 voice_event_gate: &self.voice_event_gate,
+                recording_writer: None,
                 ssrc_tracker: &self.ssrc_tracker,
                 ssrc_tracker_reset_gate: &self.ssrc_tracker_reset_gate,
             }
