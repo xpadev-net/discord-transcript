@@ -103,7 +103,7 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
         insert_raw_and_debug_artifacts(&mut executor, meeting_id)?;
     }
 
-    let plan = collect_retention_cleanup_plan(&mut executor, RetentionPolicy::default());
+    let plan = collect_retention_cleanup_plan(&mut executor, "g1", RetentionPolicy::default());
     let raw_ids = sorted_ids(plan.raw_workspaces.iter().map(|row| row.meeting_id.as_str()));
     if raw_ids != ["m-expired", "m-legacy"] {
         return Err(format!("unexpected raw workspace targets: {raw_ids:?}"));
@@ -111,7 +111,7 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
 
     let debug_ids = executor.query_rows(
         RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL,
-        &["7".to_owned()],
+        &["7".to_owned(), "g1".to_owned()],
     )?;
     if !debug_ids.is_empty() {
         return Err(format!("uncleaned meetings must not be debug-only targets: {debug_ids:?}"));
@@ -122,7 +122,7 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
     )?;
     let debug_ids = executor.query_rows(
         RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL,
-        &["7".to_owned()],
+        &["7".to_owned(), "g1".to_owned()],
     )?;
     let debug_ids = sorted_ids(debug_ids.iter().filter_map(|row| {
         row.first().and_then(Option::as_deref)
@@ -191,8 +191,8 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
         return Err(format!("protected meeting S3 prefix was selected: {prefixes:?}"));
     }
 
-    executor.execute(RETENTION_DELETE_RAW_ARTIFACTS_SQL, &["7".to_owned()])?;
-    executor.execute(RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, &["7".to_owned()])?;
+    executor.execute(RETENTION_DELETE_RAW_ARTIFACTS_SQL, &["7".to_owned(), "g1".to_owned()])?;
+    executor.execute(RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, &["7".to_owned(), "g1".to_owned()])?;
     let remaining = executor.query_rows(
         "SELECT meeting_id, kind FROM artifacts ORDER BY meeting_id, kind",
         &[],

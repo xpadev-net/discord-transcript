@@ -25,6 +25,7 @@ WHERE stopped_at IS NOT NULL
   AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
   AND status IN ('posted', 'failed', 'aborted')
   AND retention_raw_cleaned_at IS NULL
+  AND guild_id = $2
 "#;
 
 pub const RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL: &str = r#"
@@ -43,6 +44,7 @@ WHERE stopped_at IS NOT NULL
   AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
   AND status IN ('posted', 'failed', 'aborted')
   AND retention_raw_cleaned_at IS NOT NULL
+  AND guild_id = $2
 "#;
 
 // See RETENTION_EXPIRED_RAW_WORKSPACES_SQL for why this intentionally mirrors
@@ -59,6 +61,7 @@ FROM (
   LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
 ) m
 WHERE transcript_ttl_days IS NOT NULL
+  AND m.guild_id = $2
   AND m.status IN ('posted', 'failed', 'aborted')
   AND (
     NOT EXISTS (
@@ -94,6 +97,7 @@ FROM (
   LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
 ) m
 WHERE summary_ttl_days IS NOT NULL
+  AND m.guild_id = $2
   AND m.status IN ('posted', 'failed', 'aborted')
   AND NOT EXISTS (
     SELECT 1
@@ -119,7 +123,7 @@ pub const RETENTION_MARK_TRANSCRIPTS_DELETED_SQL: &str = r#"
 UPDATE transcripts t
 SET is_deleted=TRUE
 FROM (
-  SELECT m.id, m.status,
+  SELECT m.id, m.guild_id, m.status,
          CASE
            WHEN s.meeting_id IS NULL THEN $1::text::integer
            WHEN s.retention_transcript_ttl_days > 0 THEN s.retention_transcript_ttl_days
@@ -129,6 +133,7 @@ FROM (
 ) m
 WHERE t.meeting_id = m.id
   AND t.is_deleted=FALSE
+  AND m.guild_id = $2
   AND m.transcript_ttl_days IS NOT NULL
   AND t.created_at < NOW() - ((m.transcript_ttl_days::text || ' days')::interval)
   AND m.status IN ('posted', 'failed', 'aborted')
@@ -136,7 +141,7 @@ WHERE t.meeting_id = m.id
 
 pub const RETENTION_DELETE_SUMMARIES_SQL: &str = r#"
 WITH summary_retention AS (
-  SELECT m.id, m.status, m.stopped_at, m.title, m.summary_ttl_days
+  SELECT m.id, m.guild_id, m.status, m.stopped_at, m.title, m.summary_ttl_days
   FROM (
     SELECT m.*,
            CASE
@@ -147,6 +152,7 @@ WITH summary_retention AS (
     LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
   ) m
   WHERE m.summary_ttl_days IS NOT NULL
+    AND m.guild_id = $2
     AND m.status IN ('posted', 'failed', 'aborted')
 ),
 expired_summary_meetings AS (
@@ -176,6 +182,7 @@ cleared_summary_titles AS (
   SET title=NULL,
       updated_at=NOW()
   WHERE m.title IS NOT NULL
+    AND m.guild_id = $2
     AND m.id IN (SELECT id FROM expired_summary_meetings)
   RETURNING m.id
 )
@@ -196,6 +203,7 @@ pub const RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL: &str = r#"
 DELETE FROM artifacts a
 USING meetings m
 WHERE a.meeting_id = m.id
+  AND m.guild_id = $1
   AND a.expires_at IS NOT NULL
   AND a.expires_at <= NOW()
   AND m.status IN ('posted', 'failed', 'aborted')
@@ -203,9 +211,10 @@ WHERE a.meeting_id = m.id
 
 pub const RETENTION_DELETE_RAW_ARTIFACTS_SQL: &str = r#"
 WITH expired_raw_meetings AS (
-  SELECT id
+  SELECT id, guild_id
   FROM (
     SELECT m.id,
+           m.guild_id,
            m.stopped_at,
            m.status,
            CASE
@@ -219,17 +228,19 @@ WITH expired_raw_meetings AS (
     AND stopped_at IS NOT NULL
     AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
     AND status IN ('posted', 'failed', 'aborted')
+    AND guild_id = $2
 )
 DELETE FROM artifacts a
 USING expired_raw_meetings m
 WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
   AND a.kind IN ('raw_audio', 'audio', 'mixdown_audio', 'speaker_audio')
 "#;
 
 pub const RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL: &str = r#"
 DELETE FROM artifacts a
 USING (
-  SELECT m.id, m.status,
+  SELECT m.id, m.guild_id, m.status,
          CASE
            WHEN s.meeting_id IS NULL THEN $1::text::integer
            WHEN s.retention_transcript_ttl_days > 0 THEN s.retention_transcript_ttl_days
@@ -238,6 +249,7 @@ USING (
   LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
 ) m
 WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
   AND a.kind IN ('transcript', 'masked_transcript')
   AND m.transcript_ttl_days IS NOT NULL
   AND a.created_at < NOW() - ((m.transcript_ttl_days::text || ' days')::interval)
@@ -247,7 +259,7 @@ WHERE a.meeting_id = m.id
 pub const RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL: &str = r#"
 DELETE FROM artifacts a
 USING (
-  SELECT m.id, m.status,
+  SELECT m.id, m.guild_id, m.status,
          CASE
            WHEN s.meeting_id IS NULL THEN NULLIF($1::text::integer, 0)
            WHEN s.retention_summary_ttl_days > 0 THEN s.retention_summary_ttl_days
@@ -256,6 +268,7 @@ USING (
   LEFT JOIN meeting_effective_settings s ON s.meeting_id = m.id
 ) m
 WHERE a.meeting_id = m.id
+  AND m.guild_id = $2
   AND a.kind IN ('summary', 'summary_markdown')
   AND m.summary_ttl_days IS NOT NULL
   AND a.created_at < NOW() - ((m.summary_ttl_days::text || ' days')::interval)
@@ -264,9 +277,10 @@ WHERE a.meeting_id = m.id
 
 pub const RETENTION_DELETE_DEBUG_ARTIFACTS_SQL: &str = r#"
 WITH expired_debug_meetings AS (
-  SELECT id
+  SELECT id, guild_id
   FROM (
     SELECT m.id,
+           m.guild_id,
            m.stopped_at,
            m.status,
            CASE
@@ -280,6 +294,7 @@ WITH expired_debug_meetings AS (
     AND stopped_at IS NOT NULL
     AND stopped_at < NOW() - ((raw_ttl_days::text || ' days')::interval)
     AND status IN ('posted', 'failed', 'aborted')
+    AND guild_id = $2
 )
 DELETE FROM artifacts a
 USING expired_debug_meetings m
@@ -292,6 +307,7 @@ UPDATE meetings
 SET retention_raw_cleaned_at=NOW(),
     updated_at=NOW()
 WHERE id=$1
+  AND guild_id=$2
   AND retention_raw_cleaned_at IS NULL
 "#;
 
@@ -399,10 +415,11 @@ impl RetentionStorageUsage {
 pub fn enforce_retention_policy<E: SqlExecutor>(
     executor: &mut E,
     workspace_layout: &MeetingWorkspaceLayout,
+    guild_id: &str,
     policy: RetentionPolicy,
     objects: Option<&RecordingObjectStore>,
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
-    let plan = collect_retention_cleanup_plan(executor, policy);
+    let plan = collect_retention_cleanup_plan(executor, guild_id, policy);
     let plan_errors = plan.errors.clone();
     let mut report = RetentionCleanupReport::default();
     let filesystem_result = apply_retention_filesystem_cleanup(workspace_layout, &plan, objects);
@@ -419,6 +436,7 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
     let raw_workspace_cleaned_meeting_ids = report.raw_workspace_cleaned_meeting_ids.clone();
     let database_error = match apply_retention_database_cleanup(
         executor,
+        guild_id,
         policy,
         &raw_workspace_cleaned_meeting_ids,
     ) {
@@ -455,30 +473,33 @@ pub fn enforce_retention_policy<E: SqlExecutor>(
 
 pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
     executor: &mut E,
+    guild_id: &str,
     policy: RetentionPolicy,
 ) -> RetentionCleanupPlan {
     let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
     let transcript_ttl = policy.transcript_ttl_days.get().to_string();
+    let raw_params = [raw_ttl, guild_id.to_owned()];
+    let transcript_params = [transcript_ttl, guild_id.to_owned()];
     let mut errors = Vec::new();
 
     let raw_workspaces = collect_workspace_rows(
         executor,
         RETENTION_EXPIRED_RAW_WORKSPACES_SQL,
-        std::slice::from_ref(&raw_ttl),
+        &raw_params,
         &mut errors,
     );
 
     let debug_workspaces = collect_workspace_rows(
         executor,
         RETENTION_EXPIRED_DEBUG_WORKSPACES_SQL,
-        std::slice::from_ref(&raw_ttl),
+        &raw_params,
         &mut errors,
     );
 
     let transcript_workspaces = collect_workspace_rows(
         executor,
         RETENTION_EXPIRED_TRANSCRIPT_WORKSPACES_SQL,
-        std::slice::from_ref(&transcript_ttl),
+        &transcript_params,
         &mut errors,
     );
 
@@ -489,10 +510,11 @@ pub fn collect_retention_cleanup_plan<E: SqlExecutor>(
         .map(|ttl| ttl.get())
         .unwrap_or(0)
         .to_string();
+    let summary_params = [summary_ttl, guild_id.to_owned()];
     let summary_workspaces = collect_workspace_rows(
         executor,
         RETENTION_EXPIRED_SUMMARY_WORKSPACES_SQL,
-        std::slice::from_ref(&summary_ttl),
+        &summary_params,
         &mut errors,
     );
 
@@ -817,6 +839,7 @@ pub fn apply_manual_meeting_filesystem_delete(
 
 pub fn apply_retention_database_cleanup<E: SqlExecutor>(
     executor: &mut E,
+    guild_id: &str,
     policy: RetentionPolicy,
     raw_workspace_cleaned_meeting_ids: &[String],
 ) -> Result<RetentionCleanupReport, RetentionCleanupError> {
@@ -824,48 +847,44 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
     let mut errors = Vec::new();
     let raw_ttl = policy.raw_audio_ttl_days.get().to_string();
     let transcript_ttl = policy.transcript_ttl_days.get().to_string();
+    let raw_params = [raw_ttl, guild_id.to_owned()];
+    let transcript_params = [transcript_ttl, guild_id.to_owned()];
 
     for meeting_id in raw_workspace_cleaned_meeting_ids {
         match executor.execute(
             RETENTION_MARK_RAW_WORKSPACE_CLEANED_SQL,
-            std::slice::from_ref(meeting_id),
+            &[meeting_id.clone(), guild_id.to_owned()],
         ) {
             Ok(count) => report.raw_workspaces_marked_cleaned += count,
             Err(err) => errors.push(err),
         }
     }
 
-    match executor.execute(
-        RETENTION_MARK_TRANSCRIPTS_DELETED_SQL,
-        std::slice::from_ref(&transcript_ttl),
-    ) {
+    match executor.execute(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &transcript_params) {
         Ok(count) => report.transcripts_marked_deleted += count,
         Err(err) => errors.push(err),
     }
-    match executor.execute(RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL, &[]) {
+    match executor.execute(
+        RETENTION_DELETE_EXPIRED_ARTIFACTS_SQL,
+        &[guild_id.to_owned()],
+    ) {
         Ok(count) => report.artifacts_deleted += count,
         Err(err) => errors.push(err),
     }
-    match executor.execute(
-        RETENTION_DELETE_RAW_ARTIFACTS_SQL,
-        std::slice::from_ref(&raw_ttl),
-    ) {
+    match executor.execute(RETENTION_DELETE_RAW_ARTIFACTS_SQL, &raw_params) {
         Ok(count) => report.artifacts_deleted += count,
         Err(err) => errors.push(err),
     }
     match executor.execute(
         RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL,
-        std::slice::from_ref(&transcript_ttl),
+        &transcript_params,
     ) {
         Ok(count) => report.artifacts_deleted += count,
         Err(err) => errors.push(err),
     }
     // Debug artifacts intentionally share the raw-audio TTL; add a
     // dedicated RETENTION_DEBUG_TTL_DAYS if independent control is needed.
-    match executor.execute(
-        RETENTION_DELETE_DEBUG_ARTIFACTS_SQL,
-        std::slice::from_ref(&raw_ttl),
-    ) {
+    match executor.execute(RETENTION_DELETE_DEBUG_ARTIFACTS_SQL, &raw_params) {
         Ok(count) => report.artifacts_deleted += count,
         Err(err) => errors.push(err),
     }
@@ -877,17 +896,12 @@ pub fn apply_retention_database_cleanup<E: SqlExecutor>(
         .map(|ttl| ttl.get())
         .unwrap_or(0)
         .to_string();
-    match executor.execute(
-        RETENTION_DELETE_SUMMARIES_SQL,
-        std::slice::from_ref(&summary_ttl),
-    ) {
+    let summary_params = [summary_ttl, guild_id.to_owned()];
+    match executor.execute(RETENTION_DELETE_SUMMARIES_SQL, &summary_params) {
         Ok(count) => report.summaries_deleted += count,
         Err(err) => errors.push(err),
     }
-    match executor.execute(
-        RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL,
-        std::slice::from_ref(&summary_ttl),
-    ) {
+    match executor.execute(RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, &summary_params) {
         Ok(count) => report.artifacts_deleted += count,
         Err(err) => errors.push(err),
     }

@@ -5235,9 +5235,10 @@ impl EventHandler for ScaffoldHandler {
 impl ScaffoldHandler {
     async fn run_startup_retention_cleanup(&self) -> Result<(), String> {
         let policy = self.retention_policy;
+        let guild_id = self.guild_id.get().to_string();
         let plan = {
             let mut service = self.service.lock().await;
-            collect_retention_cleanup_plan(&mut service.store.executor, policy)
+            collect_retention_cleanup_plan(&mut service.store.executor, &guild_id, policy)
         };
         if !plan.errors.is_empty() {
             warn!(
@@ -5269,6 +5270,7 @@ impl ScaffoldHandler {
             let mut service = self.service.lock().await;
             apply_retention_database_cleanup(
                 &mut service.store.executor,
+                &guild_id,
                 policy,
                 &report.raw_workspace_cleaned_meeting_ids,
             )

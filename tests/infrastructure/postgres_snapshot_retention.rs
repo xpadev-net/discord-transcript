@@ -48,7 +48,7 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
         ("stop-null", "failed", Some(7), Some(7)),
     ] {
         db.execute(
-            "INSERT INTO meetings (id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,title,status,stopped_at) VALUES ($1,'g','v','r','u','title',$2,CASE WHEN $2='posted' THEN NOW()-INTERVAL '35 days' ELSE NULL END)",
+            "INSERT INTO meetings (id,guild_id,voice_channel_id,report_channel_id,started_by_user_id,title,status,stopped_at) VALUES ($1,'g1','v','r','u','title',$2,CASE WHEN $2='posted' THEN NOW()-INTERVAL '35 days' ELSE NULL END)",
             &[id.to_owned(), status.to_owned()],
         )?;
         if let Some(transcript_ttl) = transcript_ttl {
@@ -86,7 +86,7 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
         }
     }
 
-    let plan = collect_retention_cleanup_plan(&mut db, RetentionPolicy::default());
+    let plan = collect_retention_cleanup_plan(&mut db, "g1", RetentionPolicy::default());
     let ids = |rows: &[discord_transcript::application::retention_cleanup::ExpiredWorkspaceRow]| {
         let mut ids = rows.iter().map(|row| row.meeting_id.clone()).collect::<Vec<_>>();
         ids.sort();
@@ -98,10 +98,10 @@ fn run_contract(database_url: &str, schema: &str) -> Result<(), String> {
     if ids(&plan.summary_workspaces) != ["expired", "stop-null"] {
         return Err(format!("unexpected summary workspaces: {:?}", ids(&plan.summary_workspaces)));
     }
-    db.execute(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30".to_owned()])?;
-    db.execute(RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, &["30".to_owned()])?;
-    db.execute(RETENTION_DELETE_SUMMARIES_SQL, &["0".to_owned()])?;
-    db.execute(RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, &["0".to_owned()])?;
+    db.execute(RETENTION_MARK_TRANSCRIPTS_DELETED_SQL, &["30".to_owned(), "g1".to_owned()])?;
+    db.execute(RETENTION_DELETE_TRANSCRIPT_ARTIFACTS_SQL, &["30".to_owned(), "g1".to_owned()])?;
+    db.execute(RETENTION_DELETE_SUMMARIES_SQL, &["0".to_owned(), "g1".to_owned()])?;
+    db.execute(RETENTION_DELETE_SUMMARY_ARTIFACTS_SQL, &["0".to_owned(), "g1".to_owned()])?;
     let transcript_rows = db.query_rows("SELECT meeting_id FROM transcripts WHERE is_deleted ORDER BY meeting_id", &[])?;
     let transcript_ids = transcript_rows.iter().filter_map(|row| row.first()?.as_deref()).collect::<Vec<_>>();
     if transcript_ids != ["expired", "legacy", "mixed", "stop-null", "unlimited"] {
