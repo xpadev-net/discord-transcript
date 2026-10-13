@@ -1,3 +1,4 @@
+use discord_transcript::application::retention_cleanup::RetentionCleanupGate;
 use discord_transcript::application::runtime::{BotRunExit, SummaryJobWakeups, run_bot};
 use discord_transcript::application::worker::{
     ProcessJobResult, SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobOptions,
@@ -264,6 +265,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
     };
 
     let summary_job_wakeups = SummaryJobWakeups::new();
+    let retention_cleanup_gate: RetentionCleanupGate = Arc::new(Mutex::new(()));
     // One store per process: web deletion endpoints and the bot's upload
     // queue must share it so `delete_prefix` cancels in-flight uploads too.
     let recording_objects = config
@@ -291,6 +293,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
         Arc::clone(&db_client),
         config.chunk_storage_dir.clone(),
         recording_objects.clone(),
+        Arc::clone(&retention_cleanup_gate),
         auth,
         reqwest::Client::builder()
             .use_rustls_tls()
@@ -367,6 +370,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             Some(Arc::clone(&meeting_permission_cache)),
             Some(Arc::clone(&meeting_guild_cache)),
             recording_objects.clone(),
+            Arc::clone(&retention_cleanup_gate),
         )
         .await?
         {

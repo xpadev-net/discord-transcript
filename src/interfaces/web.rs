@@ -29,8 +29,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::application::retention_cleanup::{
-    ExpiredWorkspaceRow, RetentionCleanupPlan, RetentionCleanupReport, RetentionDeletionTargets,
-    RetentionStorageUsage, apply_manual_meeting_filesystem_delete,
+    ExpiredWorkspaceRow, RetentionCleanupGate, RetentionCleanupPlan, RetentionCleanupReport,
+    RetentionDeletionTargets, RetentionStorageUsage, apply_manual_meeting_filesystem_delete,
     apply_retention_filesystem_cleanup, estimate_meeting_filesystem_usage,
 };
 use crate::application::runtime::SummaryJobWakeups;
@@ -383,6 +383,7 @@ pub struct GuildBotTokenRuntimeConfig {
 pub struct WebState {
     pub db: Arc<PgClient>,
     pub chunk_storage_dir: String,
+    pub retention_cleanup_gate: RetentionCleanupGate,
     /// Present iff `CHUNK_STORAGE_BACKEND=s3`: playback endpoints redirect
     /// to presigned GETs and retention deletes remote objects.
     pub recording_objects: Option<RecordingObjectStore>,
@@ -423,6 +424,7 @@ impl WebState {
         db: Arc<PgClient>,
         chunk_storage_dir: String,
         recording_objects: Option<RecordingObjectStore>,
+        retention_cleanup_gate: RetentionCleanupGate,
         auth: Option<Arc<AuthConfig>>,
         http_client: reqwest::Client,
         guild_bot_token: GuildBotTokenRuntimeConfig,
@@ -434,6 +436,7 @@ impl WebState {
             db,
             chunk_storage_dir,
             recording_objects,
+            retention_cleanup_gate,
             auth,
             http_client,
             guild_bot_token_cipher: guild_bot_token.cipher,
@@ -7467,6 +7470,7 @@ async fn api_admin_retention_cleanup_preview(
     body: Bytes,
 ) -> Result<Json<AdminRetentionCleanupPreviewResponse>, StatusCode> {
     require_system_admin_request(&state, &headers, &user_id).await?;
+    let _cleanup_guard = state.retention_cleanup_gate.lock().await;
     let guild_id = configured_guild_id(&state)?;
     let request = parse_optional_json_request_body::<AdminRetentionPolicyRequest>(&body)?;
     let policy = normalize_admin_retention_policy(&state, &guild_id, request.as_ref()).await?;
@@ -7481,6 +7485,7 @@ async fn api_admin_retention_cleanup_run(
     body: Bytes,
 ) -> Result<Json<AdminRetentionCleanupRunResponse>, StatusCode> {
     require_system_admin_request(&state, &headers, &user_id).await?;
+    let _cleanup_guard = state.retention_cleanup_gate.lock().await;
     let guild_id = configured_guild_id(&state)?;
     let request = parse_optional_json_request_body::<AdminRetentionPolicyRequest>(&body)?;
     let policy = normalize_admin_retention_policy(&state, &guild_id, request.as_ref()).await?;

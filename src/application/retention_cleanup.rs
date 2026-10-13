@@ -3,9 +3,43 @@ use crate::infrastructure::sql_store::SqlExecutor;
 use crate::infrastructure::storage_s3::RecordingObjectStore;
 use crate::infrastructure::workspace::{MeetingWorkspaceLayout, MeetingWorkspacePaths};
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+pub type RetentionCleanupGate = Arc<Mutex<()>>;
+pub const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+pub fn try_start_retention_cleanup_loop(started: &AtomicBool) -> bool {
+    started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+pub async fn run_periodic_retention_cleanup<F, Fut>(
+    shutdown_token: CancellationToken,
+    interval: Duration,
+    mut cleanup: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    while !shutdown_token.is_cancelled() {
+        if let Err(err) = cleanup().await {
+            warn!(error = %err, "periodic retention cleanup failed; it will retry next interval");
+        }
+        tokio::select! {
+            _ = shutdown_token.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
 
 // Raw-audio and transcript workspace queries share the same filters today, but
 // stay separate so their retention scopes can diverge without changing callers.
@@ -1137,4 +1171,109 @@ fn legacy_raw_audio_size(meeting_dir: &Path) -> Result<u64, String> {
         }
     }
     Ok(size)
+}
+
+#[cfg(test)]
+mod periodic_cleanup_tests {
+    use super::{run_periodic_retention_cleanup, try_start_retention_cleanup_loop};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn retention_cleanup_loop_can_only_start_once() {
+        let started = AtomicBool::new(false);
+        assert!(try_start_retention_cleanup_loop(&started));
+        assert!(!try_start_retention_cleanup_loop(&started));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_retention_cleanup_retries_after_errors_and_stops_on_shutdown() {
+        const INTERVAL: Duration = Duration::from_secs(60);
+        let shutdown_token = CancellationToken::new();
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let expired_runs = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let elapsed_seconds = Arc::clone(&elapsed_seconds);
+            let calls = Arc::clone(&calls);
+            let expired_runs = Arc::clone(&expired_runs);
+            let shutdown_token = shutdown_token.clone();
+            tokio::spawn(async move {
+                run_periodic_retention_cleanup(shutdown_token, INTERVAL, move || {
+                    let elapsed_seconds = Arc::clone(&elapsed_seconds);
+                    let calls = Arc::clone(&calls);
+                    let expired_runs = Arc::clone(&expired_runs);
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        if elapsed_seconds.load(Ordering::SeqCst) >= 60 {
+                            expired_runs.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if call == 0 {
+                            Err("temporary database error".to_owned())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(expired_runs.load(Ordering::SeqCst), 0);
+
+        elapsed_seconds.store(60, Ordering::SeqCst);
+        tokio::time::advance(INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(expired_runs.load(Ordering::SeqCst), 1);
+
+        shutdown_token.cancel();
+        task.await.expect("periodic cleanup task should stop");
+        tokio::time::advance(INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_retention_cleanup_waits_for_the_shared_cleanup_gate() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let manual_run_guard = gate.lock().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_token = CancellationToken::new();
+        let task = {
+            let gate = Arc::clone(&gate);
+            let calls = Arc::clone(&calls);
+            let shutdown_token = shutdown_token.clone();
+            tokio::spawn(async move {
+                run_periodic_retention_cleanup(
+                    shutdown_token,
+                    Duration::from_secs(60),
+                    move || {
+                        let gate = Arc::clone(&gate);
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            let _guard = gate.lock().await;
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(manual_run_guard);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        shutdown_token.cancel();
+        task.await.expect("periodic cleanup task should stop");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

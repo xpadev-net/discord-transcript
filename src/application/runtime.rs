@@ -9,8 +9,9 @@ use crate::application::command::{
 };
 use crate::application::recovery_runner::{RecoveryEffect, run_recovery};
 use crate::application::retention_cleanup::{
-    apply_retention_database_cleanup, apply_retention_filesystem_cleanup,
-    collect_retention_cleanup_plan,
+    RETENTION_CLEANUP_INTERVAL, RetentionCleanupGate, apply_retention_database_cleanup,
+    apply_retention_filesystem_cleanup, collect_retention_cleanup_plan,
+    run_periodic_retention_cleanup, try_start_retention_cleanup_loop,
 };
 use crate::application::stop::StopOutcome;
 use crate::application::summary::ClaudeSummaryClient;
@@ -3443,6 +3444,7 @@ pub async fn run_bot(
     // Shared with the web layer so its deletes cancel our pending uploads;
     // `Some` iff `CHUNK_STORAGE_BACKEND=s3`.
     recording_objects: Option<crate::infrastructure::storage_s3::RecordingObjectStore>,
+    retention_cleanup_gate: RetentionCleanupGate,
 ) -> Result<BotRunExit, RuntimeError> {
     let guild_id = config
         .discord_guild_id
@@ -3483,7 +3485,8 @@ pub async fn run_bot(
         voice_event_gate: Arc::new(RwLock::new(())),
         ssrc_tracker_reset_gate: Arc::new(Mutex::new(())),
         background_spawn_gate: Arc::new(StdMutex::new(())),
-        retention_cleanup_running: Arc::new(AtomicBool::new(false)),
+        retention_cleanup_loop_started: Arc::new(AtomicBool::new(false)),
+        retention_cleanup_gate,
         summary_job_processing_enabled: summary_job_processing_enabled_for_role(config.app_role),
         shutting_down: Arc::new(AtomicBool::new(false)),
         shutdown_token: CancellationToken::new(),
@@ -3758,7 +3761,8 @@ struct ScaffoldHandler {
     voice_event_gate: Arc<RwLock<()>>,
     ssrc_tracker_reset_gate: Arc<Mutex<()>>,
     background_spawn_gate: Arc<StdMutex<()>>,
-    retention_cleanup_running: Arc<AtomicBool>,
+    retention_cleanup_loop_started: Arc<AtomicBool>,
+    retention_cleanup_gate: RetentionCleanupGate,
     summary_job_processing_enabled: bool,
     shutting_down: Arc<AtomicBool>,
     shutdown_token: CancellationToken,
@@ -4340,22 +4344,36 @@ impl EventHandler for ScaffoldHandler {
             error!(error = %err, "failed to register guild commands");
         }
 
-        if self
-            .retention_cleanup_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if try_start_retention_cleanup_loop(&self.retention_cleanup_loop_started) {
             let retention_handler = self.clone();
+            let retention_cleanup_gate = Arc::clone(&self.retention_cleanup_gate);
+            let shutdown_token = self.shutdown_token.clone();
             self.spawn_background(async move {
-                if let Err(err) = retention_handler.run_startup_retention_cleanup().await {
-                    error!(error = %err, "startup retention cleanup failed");
-                }
-                retention_handler
-                    .retention_cleanup_running
-                    .store(false, Ordering::Release);
+                run_periodic_retention_cleanup(
+                    shutdown_token.clone(),
+                    RETENTION_CLEANUP_INTERVAL,
+                    move || {
+                        let retention_handler = retention_handler.clone();
+                        let cleanup_gate = Arc::clone(&retention_cleanup_gate);
+                        let shutdown_token = shutdown_token.clone();
+                        async move {
+                            let _guard = tokio::select! {
+                                guard = cleanup_gate.lock() => guard,
+                                _ = shutdown_token.cancelled() => return Ok(()),
+                            };
+                            if shutdown_token.is_cancelled() {
+                                return Ok(());
+                            }
+                            retention_handler.run_retention_cleanup().await
+                        }
+                    },
+                )
+                .await;
             });
         } else {
-            info!("startup retention cleanup already running; skipping duplicate ready event");
+            info!(
+                "periodic retention cleanup loop already started; skipping duplicate ready event"
+            );
         }
 
         let recovery_handler = self.clone();
@@ -5233,7 +5251,7 @@ impl EventHandler for ScaffoldHandler {
 }
 
 impl ScaffoldHandler {
-    async fn run_startup_retention_cleanup(&self) -> Result<(), String> {
+    async fn run_retention_cleanup(&self) -> Result<(), String> {
         let policy = self.retention_policy;
         let guild_id = self.guild_id.get().to_string();
         let plan = {
@@ -5302,7 +5320,7 @@ impl ScaffoldHandler {
                 artifacts_deleted = report.artifacts_deleted,
                 remote_objects_deleted = report.remote_objects_deleted,
                 error = %err,
-                "startup retention cleanup failed after partial work"
+                "retention cleanup failed after partial work"
             );
             Err(format!("retention database cleanup failed: {err}"))
         } else {
@@ -5321,7 +5339,7 @@ impl ScaffoldHandler {
                 summaries_deleted = report.summaries_deleted,
                 artifacts_deleted = report.artifacts_deleted,
                 remote_objects_deleted = report.remote_objects_deleted,
-                "startup retention cleanup completed"
+                "retention cleanup completed"
             );
             Ok(())
         }
