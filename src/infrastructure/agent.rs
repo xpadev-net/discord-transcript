@@ -521,7 +521,6 @@ pub struct NativeAgentSummaryClient {
     /// OAuth credential file for `chatgpt` (`CHATGPT_AUTH_FILE`): read,
     /// refreshed, and persisted by rig's authenticator on each run.
     pub auth_file: Option<PathBuf>,
-    pub allow_unsafe_agent_harness: bool,
     pub retry_policy: RetryPolicy,
     pub command_timeout: Duration,
     /// Max model turns per attempt; defaults to `DEFAULT_MAX_AGENT_TURNS`.
@@ -711,7 +710,10 @@ impl ClaudeSummaryClient for NativeAgentSummaryClient {
     }
 
     fn supports_untrusted_agent_workspace(&self) -> bool {
-        self.allow_unsafe_agent_harness
+        // Native exposes only tools scoped to the materialized workspace:
+        // input/ is read-only and output/ is write-only. Unlike CLI
+        // harnesses, it does not need the unsafe host-access opt-in.
+        true
     }
 
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
@@ -724,11 +726,6 @@ impl ClaudeSummaryClient for NativeAgentSummaryClient {
         workdir: Option<&Path>,
         output: AgentOutputContract,
     ) -> Result<String, SummaryError> {
-        if !self.supports_untrusted_agent_workspace() {
-            return Err(summary_engine_error(
-                "refusing to run native summary agent over untrusted transcript/context data without SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true",
-            ));
-        }
         let workdir = require_native_agent_workdir(workdir)?;
         self.summarize_attempts(prompt, workdir, output, || self.completion_model())
     }
@@ -911,7 +908,6 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
                     model: config.model,
                     api_key: Secret::from(config.api_key.unwrap_or_default()),
                     auth_file: config.auth_file,
-                    allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
                     retry_policy: config.retry_policy,
                     command_timeout: config.command_timeout,
                     max_agent_turns: DEFAULT_MAX_AGENT_TURNS,
@@ -1245,7 +1241,6 @@ mod tests {
             model: "test-model".to_owned(),
             api_key: Secret::from("test-key"),
             auth_file: None,
-            allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy {
                 max_attempts: 1,
                 initial_delay: Duration::from_millis(1),
@@ -1327,17 +1322,9 @@ mod tests {
     }
 
     #[test]
-    fn summarize_requires_unsafe_opt_in() {
-        let root = fresh_workdir();
-        let mut client = test_client();
-        client.allow_unsafe_agent_harness = false;
-        let err = client
-            .summarize_with_output_contract("prompt", Some(&root), SUMMARY_OUTPUT_CONTRACT)
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS")
-        );
+    fn native_supports_scoped_untrusted_workspace_without_cli_opt_in() {
+        let client = test_client();
+        assert!(client.supports_untrusted_agent_workspace());
     }
 
     #[test]
@@ -1426,12 +1413,13 @@ mod tests {
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("key".to_owned()),
             auth_file: None,
-            allow_unsafe_agent_harness: true,
+            allow_unsafe_agent_harness: false,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
         })
         .unwrap();
         assert!(matches!(native, SummaryClient::Native(_)));
+        assert!(native.supports_untrusted_agent_workspace());
 
         // Native without provider/key (summaries disabled) yields the
         // disabled client instead of a startup failure.

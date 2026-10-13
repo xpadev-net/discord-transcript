@@ -1292,11 +1292,12 @@ fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_setti
 }
 
 #[test]
-fn app_config_rejects_missing_unsafe_opt_in_even_when_summary_disabled() {
+fn app_config_rejects_missing_unsafe_opt_in_for_cli_even_when_summary_disabled() {
     // SUMMARY_ENABLED only defaults new meeting settings; stored or per-guild
     // summary_enabled=true values can still enqueue jobs, so harness-capable
-    // roles must always acknowledge the unsafe agent opt-in.
+    // roles using a CLI harness must always acknowledge the unsafe opt-in.
     let mut values = required_env_values();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.remove("CLAUDE_COMMAND");
     values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
     values.remove("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS");
@@ -1312,8 +1313,9 @@ fn app_config_rejects_missing_unsafe_opt_in_even_when_summary_disabled() {
 }
 
 #[test]
-fn app_config_rejects_missing_unsafe_profile_even_when_summary_disabled() {
+fn app_config_rejects_missing_unsafe_profile_for_cli_even_when_summary_disabled() {
     let mut values = required_env_values();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.remove("CLAUDE_COMMAND");
     values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
     values.insert(
@@ -1411,8 +1413,6 @@ fn app_config_loads_from_env_when_summary_disabled_without_summary_harness_setti
         .env("DATABASE_URL", "postgres://localhost/db")
         .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
         .env("SUMMARY_ENABLED", "false")
-        .env("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", "true")
-        .env("SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE", "local-dev")
         .output()
         .expect("child config test should run");
 
@@ -1490,7 +1490,7 @@ fn app_config_rejects_worker_role_from_env_with_migration_message() {
 }
 
 #[test]
-fn app_config_rejects_from_env_missing_unsafe_opt_in_even_when_summary_disabled() {
+fn app_config_rejects_from_env_missing_unsafe_opt_in_for_cli_even_when_summary_disabled() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
         == Ok(MISSING_UNSAFE_OPT_IN_FROM_ENV_CHILD_VALUE)
     {
@@ -1498,7 +1498,7 @@ fn app_config_rejects_from_env_missing_unsafe_opt_in_even_when_summary_disabled(
     }
 
     let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
-        .arg("app_config_from_env_child_rejects_missing_unsafe_opt_in_even_when_summary_disabled")
+        .arg("app_config_from_env_child_rejects_missing_unsafe_opt_in_for_cli_even_when_summary_disabled")
         .arg("--exact")
         .arg("--nocapture")
         .env_clear()
@@ -1512,6 +1512,7 @@ fn app_config_rejects_from_env_missing_unsafe_opt_in_even_when_summary_disabled(
         .env("DATABASE_URL", "postgres://localhost/db")
         .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
         .env("SUMMARY_ENABLED", "false")
+        .env("SUMMARY_HARNESS", "claude")
         .output()
         .expect("child config test should run");
 
@@ -1525,7 +1526,7 @@ fn app_config_rejects_from_env_missing_unsafe_opt_in_even_when_summary_disabled(
 }
 
 #[test]
-fn app_config_rejects_from_env_missing_unsafe_profile_even_when_summary_disabled() {
+fn app_config_rejects_from_env_missing_unsafe_profile_for_cli_even_when_summary_disabled() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
         == Ok(MISSING_UNSAFE_PROFILE_FROM_ENV_CHILD_VALUE)
     {
@@ -1533,7 +1534,7 @@ fn app_config_rejects_from_env_missing_unsafe_profile_even_when_summary_disabled
     }
 
     let output = Command::new(std::env::current_exe().expect("current test binary should exist"))
-        .arg("app_config_from_env_child_rejects_missing_unsafe_profile_even_when_summary_disabled")
+        .arg("app_config_from_env_child_rejects_missing_unsafe_profile_for_cli_even_when_summary_disabled")
         .arg("--exact")
         .arg("--nocapture")
         .env_clear()
@@ -1548,6 +1549,7 @@ fn app_config_rejects_from_env_missing_unsafe_profile_even_when_summary_disabled
         .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
         .env("SUMMARY_ENABLED", "false")
         .env("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", "true")
+        .env("SUMMARY_HARNESS", "claude")
         .output()
         .expect("child config test should run");
 
@@ -1606,14 +1608,14 @@ fn app_config_from_env_child_loads_summary_disabled_without_summary_harness_sett
     assert_eq!(config.summary_harness, SummaryHarness::Native);
     assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
-    assert!(config.summary_allow_unsafe_agent_harness);
+    assert!(!config.summary_allow_unsafe_agent_harness);
 }
 
 // The from_map() missing-setting tests above exercise the in-memory path;
 // from_env() reads the production environment through a separate path, so a
 // regression that skips either rejection there must also be caught.
 #[test]
-fn app_config_from_env_child_rejects_missing_unsafe_opt_in_even_when_summary_disabled() {
+fn app_config_from_env_child_rejects_missing_unsafe_opt_in_for_cli_even_when_summary_disabled() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
         != Ok(MISSING_UNSAFE_OPT_IN_FROM_ENV_CHILD_VALUE)
     {
@@ -1631,7 +1633,7 @@ fn app_config_from_env_child_rejects_missing_unsafe_opt_in_even_when_summary_dis
 }
 
 #[test]
-fn app_config_from_env_child_rejects_missing_unsafe_profile_even_when_summary_disabled() {
+fn app_config_from_env_child_rejects_missing_unsafe_profile_for_cli_even_when_summary_disabled() {
     if std::env::var(CONFIG_FROM_ENV_CHILD).as_deref()
         != Ok(MISSING_UNSAFE_PROFILE_FROM_ENV_CHILD_VALUE)
     {
@@ -1649,22 +1651,18 @@ fn app_config_from_env_child_rejects_missing_unsafe_profile_even_when_summary_di
 }
 
 #[test]
-fn app_config_rejects_default_harness_without_unsafe_opt_in() {
+fn app_config_native_loads_without_cli_unsafe_opt_in() {
     let values = required_env_values();
-
-    let err = AppConfig::from_map(&values).expect_err("config should fail closed");
-
-    assert_eq!(
-        err,
-        ConfigError::MissingEnv {
-            key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS"
-        }
-    );
+    let config = AppConfig::from_map(&values)
+        .expect("native config should load without CLI unsafe opt-in");
+    assert_eq!(config.summary_harness, SummaryHarness::Native);
+    assert!(!config.summary_allow_unsafe_agent_harness);
 }
 
 #[test]
 fn app_config_rejects_unsafe_agent_opt_in_without_dev_test_profile() {
     let mut values = required_env_values();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.insert(
         "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
         "true".to_owned(),
@@ -1683,6 +1681,7 @@ fn app_config_rejects_unsafe_agent_opt_in_without_dev_test_profile() {
 #[test]
 fn app_config_rejects_unsafe_agent_opt_in_for_production_profile() {
     let mut values = required_env_values();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.insert(
         "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
         "true".to_owned(),
@@ -1706,6 +1705,7 @@ fn app_config_rejects_unsafe_agent_opt_in_for_production_profile() {
 #[test]
 fn app_config_rejects_prompt_like_unsafe_agent_profile() {
     let mut values = required_env_values();
+    values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
     values.insert(
         "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
         "true".to_owned(),
@@ -1730,6 +1730,7 @@ fn app_config_rejects_prompt_like_unsafe_agent_profile() {
 fn app_config_accepts_all_dev_test_unsafe_agent_profiles() {
     for profile in ["local", "local-dev", "dev", "development", "test", "testing"] {
         let mut values = required_env_values();
+        values.insert("SUMMARY_HARNESS".to_owned(), "claude".to_owned());
         values.insert(
             "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS".to_owned(),
             "true".to_owned(),
@@ -1743,7 +1744,7 @@ fn app_config_accepts_all_dev_test_unsafe_agent_profiles() {
 
         assert_eq!(
             config.summary_harness,
-            SummaryHarness::Native,
+            SummaryHarness::Claude,
             "profile {profile} should be accepted"
         );
         assert!(config.summary_allow_unsafe_agent_harness);

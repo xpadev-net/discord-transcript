@@ -219,6 +219,8 @@ pub struct AppConfig {
     /// OAuth credential file for `summary_provider`
     /// (`<provider>.auth_file_env()` — currently `CHATGPT_AUTH_FILE`).
     pub summary_auth_file: Option<String>,
+    /// Explicit opt-in for CLI harness access to untrusted agent workspaces.
+    /// Native's compiled workspace tools do not use this setting.
     pub summary_allow_unsafe_agent_harness: bool,
     pub summary_enabled: bool,
     pub database_url: String,
@@ -312,11 +314,10 @@ impl AppConfig {
             .unwrap_or(SummaryHarness::Native);
         let summary_allow_unsafe_agent_harness =
             optional_env_parse_bool("SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS", false)?;
-        // The unsafe-agent opt-in acknowledgement is validated whenever the
-        // role can execute summary jobs, regardless of SUMMARY_ENABLED: that
-        // flag is only the default for new meeting settings, so stored or
-        // per-guild summary_enabled=true values can still enqueue jobs that
-        // run the harness against untrusted transcripts.
+        // CLI harnesses can reach beyond the per-job workspace, so their
+        // unsafe-agent acknowledgement is validated whenever the role can
+        // execute summary jobs, regardless of SUMMARY_ENABLED. Native uses
+        // only compiled tools scoped to the workspace and skips this gate.
         if app_role.requires_summary_harness_config() {
             validate_unsafe_agent_harness_opt_in(
                 summary_harness,
@@ -682,10 +683,16 @@ fn parse_database_ssl_mode(value: Option<String>) -> Result<String, ConfigError>
 }
 
 fn validate_unsafe_agent_harness_opt_in(
-    _harness: SummaryHarness,
+    harness: SummaryHarness,
     allow_unsafe_agent_harness: bool,
     unsafe_agent_harness_profile: Option<String>,
 ) -> Result<(), ConfigError> {
+    // Native exposes only its compiled, workspace-scoped file tools. The
+    // unsafe opt-in protects CLI harnesses, which can access the host
+    // workspace and environment.
+    if harness == SummaryHarness::Native {
+        return Ok(());
+    }
     if !allow_unsafe_agent_harness {
         return Err(ConfigError::MissingEnv {
             key: "SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS",

@@ -1,6 +1,6 @@
 # discord-transcript
 
-Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし、CLI 経由の LLM（Claude Code / Claude CLI、[Cursor Agent CLI](https://cursor.com/docs/cli/)、[OpenCode](https://opencode.ai/docs/cli/) など）で要約を生成して結果をテキストチャンネルに投稿する Bot です。
+Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし、既定のインプロセス native agent または明示的に許可された CLI harness で要約を生成して結果をテキストチャンネルに投稿する Bot です。
 
 ## 前提条件
 
@@ -9,7 +9,7 @@ Discord のボイスチャンネルを録音し、whisper.cpp で文字起こし
 | Rust (stable) | Edition 2024 |
 | PostgreSQL | 14 以上推奨 |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server | `/inference` エンドポイントが使えること |
-| 要約用 CLI | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示したローカル検証用途のみ（既定 harness は Claude、production Docker image には同梱しません） |
+| 要約用 CLI | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示したローカル検証用途のみ（既定 harness は native、production Docker image には同梱しません） |
 
 ## 環境構築
 
@@ -79,8 +79,8 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `CHATGPT_AUTH_FILE` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の OAuth クレデンシャルファイル。`auth login-chatgpt` サブコマンドで発行し、利用時に自動 refresh される |
 | `CHATGPT_ACCESS_TOKEN` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の静的アクセストークン（Enterprise 等）。設定時は auth file より優先 |
 | `CHATGPT_ACCOUNT_ID` | 未設定 | `CHATGPT_ACCESS_TOKEN` 使用時の ChatGPT アカウント ID（省略可） |
-| `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | untrusted transcript へエージェントを走らせる unsafe opt-in（native を含む全 harness で必須）。production では既定で拒否します。 |
-| `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE` | 未設定 | `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` のとき必須。`local` / `local-dev` / `dev` / `development` / `test` / `testing` のみ許可し、production-like な値では起動を拒否します。 |
+| `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS` | `false` | CLI harness が untrusted transcript を処理するための opt-in。native は `input/` 読み取り・`output/` 書き込みに限定した組み込み tools を使うため不要です。 |
+| `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE` | 未設定 | CLI harness で `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` のとき必須。`local` / `local-dev` / `dev` / `development` / `test` / `testing` のみ許可し、production-like な値では起動を拒否します。 |
 | `SUMMARY_COMMAND` | 未設定 | CLI harness 専用。設定時は **どの CLI harness でも最優先**で実行ファイルに使用。非 `claude` harness では **必須**（`CLAUDE_COMMAND` にはフォールバックしない） |
 | `SUMMARY_MODEL` | 未設定 | native では対象モデル id（例: `grok-code-fast-1`）。CLI harness では `CLAUDE_MODEL` より優先し、**`opencode` では必須**（`provider/model` 形式） |
 | `RUST_LOG` | `info,serenity=warn,songbird=warn` | ログレベル ([tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) 形式) |
@@ -88,7 +88,7 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 
 要約ジョブは録音・Discord gateway と同一プロセスで処理してください。旧 standalone worker によるプロセス分割はサポートしていません。
 
-> **Note:** 要約 CLI harness はワークスペースや環境へアクセスできるため、既定では起動を拒否します。ローカル検証で使う場合は `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示してください。production-like な profile では unsafe opt-in があっても起動しません。文字起こし補正（LLM によるトランスクリプト整形）は全文プロンプトを扱うため、unsafe opt-in 後も built-in CLI harness では実行しません。
+> **Note:** native は組み込み tools だけを使い、会議 workspace の `input/` を読み取り、`output/` に書き込みます。パス検証・サイズ上限・出力検証を適用し、任意 shell や環境アクセスは提供しません。CLI harness はワークスペースや環境へアクセスできるため、既定では起動を拒否します。ローカル検証で使う場合は `SUMMARY_ALLOW_UNSAFE_AGENT_HARNESS=true` と `SUMMARY_UNSAFE_AGENT_HARNESS_PROFILE=local-dev` を明示してください。production-like な profile では unsafe opt-in があっても起動しません。文字起こし補正（LLM によるトランスクリプト整形）は全文プロンプトを扱うため、unsafe opt-in 後も built-in CLI harness では実行しません。
 
 Docker Compose の通常サービスは、要約用 CLI やホストの LLM 認証ディレクトリを含めません。ローカル検証で必要な場合だけ、`LLM_CLAUDE_CONFIG_DIR` / `LLM_OPENCODE_DATA_DIR` / `LLM_CURSOR_CONFIG_DIR` のいずれか 1 つを絶対パスで設定し、対応する unsafe override file を明示的に追加してください。Claude Code のローカル検証では `unsafe-claude` Docker target を使い、固定バージョン・integrity・`claude --version` 検証付きで CLI を追加します。これらの override file は認証ディレクトリを read-only でマウントします。コンテナ内で OpenCode や Cursor を使う場合は、事前にホスト側で `opencode auth login` や Cursor CLI のログインを済ませてください。
 
