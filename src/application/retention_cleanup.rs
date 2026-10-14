@@ -1171,7 +1171,10 @@ fn legacy_raw_audio_size(meeting_dir: &Path) -> Result<u64, String> {
             entry.map_err(|err| format!("failed to read {}: {err}", meeting_dir.display()))?;
         let path = entry.path();
         let is_legacy_raw_audio = path.extension().and_then(|ext| ext.to_str()) == Some("wav")
-            || path.file_name().and_then(|name| name.to_str()) == Some("speakers");
+            || matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("speakers" | "transcription_chunks")
+            );
         if is_legacy_raw_audio {
             size = size.saturating_add(dir_size_if_present(&path)?);
         }
@@ -1182,7 +1185,8 @@ fn legacy_raw_audio_size(meeting_dir: &Path) -> Result<u64, String> {
 #[cfg(test)]
 mod periodic_cleanup_tests {
     use super::{
-        remove_legacy_raw_audio, run_periodic_retention_cleanup, try_start_retention_cleanup_loop,
+        legacy_raw_audio_size, remove_legacy_raw_audio, run_periodic_retention_cleanup,
+        try_start_retention_cleanup_loop,
     };
     use std::fs;
     use std::sync::Arc;
@@ -1210,6 +1214,7 @@ mod periodic_cleanup_tests {
         fs::create_dir_all(root.join("transcription_chunks")).unwrap();
         fs::write(root.join("transcription_chunks/chunk.wav"), b"audio").unwrap();
 
+        assert_eq!(legacy_raw_audio_size(&root).unwrap(), 5);
         assert!(remove_legacy_raw_audio(&root).unwrap());
         assert!(!root.join("transcription_chunks").exists());
         assert!(!root.exists());

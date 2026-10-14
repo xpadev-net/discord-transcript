@@ -72,7 +72,9 @@ use crate::infrastructure::storage::{
     StoreError, StoredMeeting,
 };
 use crate::infrastructure::storage_fs::{ChunkStorage, SavedChunk};
-use crate::infrastructure::storage_s3::{MeetingChunkStorage, UploadReceiptStatus};
+use crate::infrastructure::storage_s3::{
+    MeetingChunkStorage, UPLOAD_RECEIPT_WAIT_TIMEOUT, UploadReceiptStatus,
+};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
 use crate::interfaces::web::{
@@ -9332,16 +9334,25 @@ impl ScaffoldHandler {
                     for path in paths {
                         match objects.upload_file_with_receipt(&path, "audio/wav") {
                             Ok(Some(receipt)) => {
-                                let status = tokio::task::spawn_blocking(move || receipt.wait())
-                                    .await
-                                    .map_err(|err| {
-                                        format!("playback artifact upload task failed: {err}")
-                                    });
+                                let status = tokio::task::spawn_blocking(move || {
+                                    receipt.wait_timeout(UPLOAD_RECEIPT_WAIT_TIMEOUT)
+                                })
+                                .await
+                                .map_err(|err| {
+                                    format!("playback artifact upload task failed: {err}")
+                                });
                                 match status {
-                                    Ok(UploadReceiptStatus::Durable) => {}
-                                    Ok(status) => {
+                                    Ok(Some(UploadReceiptStatus::Durable)) => {}
+                                    Ok(Some(status)) => {
                                         upload_error = Some(format!(
                                             "playback artifact upload did not become durable for {}: {status:?}",
+                                            path.display()
+                                        ));
+                                        break;
+                                    }
+                                    Ok(None) => {
+                                        upload_error = Some(format!(
+                                            "playback artifact upload is still pending for {}",
                                             path.display()
                                         ));
                                         break;

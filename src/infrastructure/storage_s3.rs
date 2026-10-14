@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, warn};
 
 /// Shared S3 object-store handle plus the layout rules that mirror local
@@ -46,6 +46,12 @@ const TOMBSTONE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Pause between staging-file enqueue attempts so the reconciliation producer
 /// does not fill the upload queue faster than a slow object store can drain it.
 const RECONCILE_ENQUEUE_INTERVAL: Duration = Duration::from_millis(1);
+/// Bound one application job's synchronous wait while its upload task keeps
+/// retrying in the background. Retries for unchanged files reuse that task's
+/// receipt instead of superseding it.
+pub const UPLOAD_RECEIPT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_FILE_RECEIPT_CACHE_LIMIT: usize = UPLOAD_MAX_PENDING_TASKS * 2;
+const UPLOAD_FILE_RECEIPT_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Retry transient list failures and incomplete staging-tree scans while the
 /// process stays up; queue pressure uses a shorter capped retry delay.
 const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -111,11 +117,24 @@ impl UploadReceiptCell {
 
 /// Tracks whether a queued object PUT is durably available in the store.
 /// Receipts are scoped to one key and generation and are only held in memory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UploadReceipt {
     key: String,
     generation: u64,
     cell: Arc<UploadReceiptCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UploadFileSnapshot {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+struct CachedUploadReceipt {
+    snapshot: UploadFileSnapshot,
+    receipt: UploadReceipt,
+    last_used: Instant,
 }
 
 impl UploadReceipt {
@@ -331,6 +350,10 @@ struct UploadQueue {
     pending_bytes: Arc<AtomicUsize>,
     /// Per-key write ordering state (outstanding set + delivered marker).
     generations: Arc<Mutex<GenerationState>>,
+    /// Keeps exact file-upload receipts available across bounded application
+    /// waits, so retrying the same unchanged file does not enqueue a newer
+    /// generation over the upload that is already retrying.
+    file_receipts: Mutex<HashMap<String, CachedUploadReceipt>>,
     next_generation: AtomicU64,
     /// Cancellation state shared with the worker (see `CancelState`).
     cancel: Arc<Mutex<CancelState>>,
@@ -381,6 +404,7 @@ impl UploadQueue {
             pending,
             pending_bytes,
             generations,
+            file_receipts: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(0),
             cancel,
             objects,
@@ -666,6 +690,64 @@ impl UploadQueue {
         self.enqueue_with_pending_limit(task, UPLOAD_MAX_PENDING_TASKS)
     }
 
+    fn enqueue_file_with_receipt(&self, task: UploadTask) -> Result<UploadReceipt, String> {
+        let metadata = std::fs::metadata(&task.path).map_err(|err| {
+            format!(
+                "failed to stat upload source {}: {err}",
+                task.path.display()
+            )
+        })?;
+        let snapshot = UploadFileSnapshot {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        };
+        let key = task.key.clone();
+        let mut receipts = self.file_receipts.lock().unwrap();
+        receipts.retain(|_, cached| {
+            let status = cached.receipt.status();
+            !status.is_terminal()
+                || (matches!(status, UploadReceiptStatus::Durable)
+                    && cached.last_used.elapsed() < UPLOAD_FILE_RECEIPT_CACHE_TTL)
+        });
+        if let Some(cached) = receipts.get_mut(&key)
+            && cached.snapshot == snapshot
+            && matches!(
+                cached.receipt.status(),
+                UploadReceiptStatus::Queued
+                    | UploadReceiptStatus::Retrying { .. }
+                    | UploadReceiptStatus::Durable
+            )
+        {
+            cached.last_used = Instant::now();
+            return Ok(cached.receipt.clone());
+        }
+
+        let receipt = self.enqueue(task)?;
+        receipts.insert(
+            key,
+            CachedUploadReceipt {
+                snapshot,
+                receipt: receipt.clone(),
+                last_used: Instant::now(),
+            },
+        );
+        if receipts.len() > UPLOAD_FILE_RECEIPT_CACHE_LIMIT {
+            let mut terminal = receipts
+                .iter()
+                .filter(|(_, cached)| cached.receipt.status().is_terminal())
+                .map(|(key, cached)| (key.clone(), cached.last_used))
+                .collect::<Vec<_>>();
+            terminal.sort_by_key(|(_, last_used)| *last_used);
+            for (key, _) in terminal {
+                if receipts.len() <= UPLOAD_MAX_PENDING_TASKS {
+                    break;
+                }
+                receipts.remove(&key);
+            }
+        }
+        Ok(receipt)
+    }
+
     fn enqueue_reconciliation(&self, task: UploadTask) -> Result<(), String> {
         self.enqueue_with_pending_limit(task, RECONCILE_PENDING_LIMIT)
             .map(|_| ())
@@ -917,7 +999,7 @@ impl RecordingObjectStore {
         if !path.is_file() {
             return Ok(None);
         }
-        let receipt = self.uploads.enqueue(UploadTask {
+        let receipt = self.uploads.enqueue_file_with_receipt(UploadTask {
             key,
             source: UploadSource::File(path.to_path_buf()),
             content_type: content_type.to_owned(),
@@ -1860,6 +1942,47 @@ mod tests {
                 .upload_file(&base.join("workspaces/g/vc/m/audio/none.wav"), "audio/wav")
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn file_upload_retries_reuse_pending_receipt_and_changed_files_get_new_generation() {
+        let base = temp_dir("file_receipt_reuse");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.put_delay.lock().unwrap() = Duration::from_millis(50);
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let path = base.join("workspaces/g/vc/m/audio/chunk.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+
+        let first = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wait_timeout(Duration::from_millis(1)),
+            None,
+            "the first caller should be able to leave while the upload remains pending"
+        );
+        let retry = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.generation(), first.generation());
+        assert_eq!(retry.wait(), UploadReceiptStatus::Durable);
+
+        std::fs::write(&path, b"updated audio").unwrap();
+        let changed = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_ne!(changed.generation(), retry.generation());
+        assert_eq!(changed.wait(), UploadReceiptStatus::Durable);
+        let puts = fake.puts.lock().unwrap();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(puts[0].1, b"audio");
+        assert_eq!(puts[1].1, b"updated audio");
         let _ = std::fs::remove_dir_all(&base);
     }
 

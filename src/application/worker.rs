@@ -30,7 +30,9 @@ use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoreError, UsageEventStore,
 };
-use crate::infrastructure::storage_s3::{RecordingObjectStore, UploadReceipt, UploadReceiptStatus};
+use crate::infrastructure::storage_s3::{
+    RecordingObjectStore, UPLOAD_RECEIPT_WAIT_TIMEOUT, UploadReceipt, UploadReceiptStatus,
+};
 use crate::infrastructure::workspace::{
     AGENT_SUMMARY_OUTPUT_FILENAME, MeetingWorkspaceLayout, MeetingWorkspacePaths,
 };
@@ -931,7 +933,10 @@ pub(crate) fn durable_s3_audio_source(
 }
 
 fn upload_receipt_is_durable(receipt: UploadReceipt) -> bool {
-    matches!(receipt.wait(), UploadReceiptStatus::Durable)
+    matches!(
+        receipt.wait_timeout(UPLOAD_RECEIPT_WAIT_TIMEOUT),
+        Some(UploadReceiptStatus::Durable)
+    )
 }
 
 fn process_meeting_summary_with_ownership_check<S, W, C, F>(
