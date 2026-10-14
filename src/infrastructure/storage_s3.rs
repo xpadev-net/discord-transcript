@@ -3,7 +3,9 @@ use crate::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -46,6 +48,12 @@ const TOMBSTONE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Pause between staging-file enqueue attempts so the reconciliation producer
 /// does not fill the upload queue faster than a slow object store can drain it.
 const RECONCILE_ENQUEUE_INTERVAL: Duration = Duration::from_millis(1);
+/// Bound one application job's synchronous wait while its upload task keeps
+/// retrying in the background. Retries for unchanged files reuse that task's
+/// receipt instead of superseding it.
+pub const UPLOAD_RECEIPT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_FILE_RECEIPT_CACHE_LIMIT: usize = UPLOAD_MAX_PENDING_TASKS * 2;
+const UPLOAD_FILE_RECEIPT_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Retry transient list failures and incomplete staging-tree scans while the
 /// process stays up; queue pressure uses a shorter capped retry delay.
 const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -111,11 +119,50 @@ impl UploadReceiptCell {
 
 /// Tracks whether a queued object PUT is durably available in the store.
 /// Receipts are scoped to one key and generation and are only held in memory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UploadReceipt {
     key: String,
     generation: u64,
     cell: Arc<UploadReceiptCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UploadFileSnapshot {
+    len: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+struct CachedUploadReceipt {
+    snapshot: UploadFileSnapshot,
+    receipt: UploadReceipt,
+    last_used: Instant,
+}
+
+fn upload_file_sha256(path: &Path) -> Result<[u8; 32], String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to read upload source {}: {err}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to hash upload source {}: {err}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn upload_file_snapshot(path: &Path) -> Result<UploadFileSnapshot, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("failed to stat upload source {}: {err}", path.display()))?;
+    Ok(UploadFileSnapshot {
+        len: metadata.len(),
+        sha256: upload_file_sha256(path)?,
+    })
 }
 
 impl UploadReceipt {
@@ -331,6 +378,10 @@ struct UploadQueue {
     pending_bytes: Arc<AtomicUsize>,
     /// Per-key write ordering state (outstanding set + delivered marker).
     generations: Arc<Mutex<GenerationState>>,
+    /// Keeps exact file-upload receipts available across bounded application
+    /// waits, so retrying the same unchanged file does not enqueue a newer
+    /// generation over the upload that is already retrying.
+    file_receipts: Mutex<HashMap<String, CachedUploadReceipt>>,
     next_generation: AtomicU64,
     /// Cancellation state shared with the worker (see `CancelState`).
     cancel: Arc<Mutex<CancelState>>,
@@ -381,6 +432,7 @@ impl UploadQueue {
             pending,
             pending_bytes,
             generations,
+            file_receipts: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(0),
             cancel,
             objects,
@@ -666,6 +718,58 @@ impl UploadQueue {
         self.enqueue_with_pending_limit(task, UPLOAD_MAX_PENDING_TASKS)
     }
 
+    fn enqueue_file_with_receipt(
+        &self,
+        task: UploadTask,
+        snapshot: UploadFileSnapshot,
+    ) -> Result<UploadReceipt, String> {
+        let key = task.key.clone();
+        let mut receipts = self.file_receipts.lock().unwrap();
+        receipts.retain(|_, cached| {
+            let status = cached.receipt.status();
+            !status.is_terminal()
+                || (matches!(status, UploadReceiptStatus::Durable)
+                    && cached.last_used.elapsed() < UPLOAD_FILE_RECEIPT_CACHE_TTL)
+        });
+        if let Some(cached) = receipts.get_mut(&key)
+            && cached.snapshot == snapshot
+            && matches!(
+                cached.receipt.status(),
+                UploadReceiptStatus::Queued
+                    | UploadReceiptStatus::Retrying { .. }
+                    | UploadReceiptStatus::Durable
+            )
+        {
+            cached.last_used = Instant::now();
+            return Ok(cached.receipt.clone());
+        }
+
+        let receipt = self.enqueue(task)?;
+        receipts.insert(
+            key,
+            CachedUploadReceipt {
+                snapshot,
+                receipt: receipt.clone(),
+                last_used: Instant::now(),
+            },
+        );
+        if receipts.len() > UPLOAD_FILE_RECEIPT_CACHE_LIMIT {
+            let mut terminal = receipts
+                .iter()
+                .filter(|(_, cached)| cached.receipt.status().is_terminal())
+                .map(|(key, cached)| (key.clone(), cached.last_used))
+                .collect::<Vec<_>>();
+            terminal.sort_by_key(|(_, last_used)| *last_used);
+            for (key, _) in terminal {
+                if receipts.len() <= UPLOAD_MAX_PENDING_TASKS {
+                    break;
+                }
+                receipts.remove(&key);
+            }
+        }
+        Ok(receipt)
+    }
+
     fn enqueue_reconciliation(&self, task: UploadTask) -> Result<(), String> {
         self.enqueue_with_pending_limit(task, RECONCILE_PENDING_LIMIT)
             .map(|_| ())
@@ -911,23 +1015,68 @@ impl RecordingObjectStore {
         path: &Path,
         content_type: &str,
     ) -> Result<Option<UploadReceipt>, String> {
+        let Some((task, snapshot)) = self.file_upload_task(path, content_type)? else {
+            return Ok(None);
+        };
+        let receipt = self.uploads.enqueue_file_with_receipt(task, snapshot)?;
+        Ok(Some(receipt))
+    }
+
+    /// Hashes a file-backed upload off the async runtime before queuing it.
+    pub async fn upload_file_with_receipt_async(
+        &self,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<Option<UploadReceipt>, String> {
         let Some(key) = self.object_key(path) else {
             return Ok(None);
         };
         if !path.is_file() {
             return Ok(None);
         }
-        let receipt = self.uploads.enqueue(UploadTask {
+        let path_buf = path.to_path_buf();
+        let snapshot = tokio::task::spawn_blocking(move || upload_file_snapshot(&path_buf))
+            .await
+            .map_err(|err| format!("upload snapshot task failed: {err}"))??;
+        let task = UploadTask {
             key,
             source: UploadSource::File(path.to_path_buf()),
             content_type: content_type.to_owned(),
             path: path.to_path_buf(),
-            generation: 0, // assigned by `enqueue`
+            generation: 0,
             attempts: 0,
             not_before: Instant::now(),
             receipt: None,
-        })?;
+        };
+        let receipt = self.uploads.enqueue_file_with_receipt(task, snapshot)?;
         Ok(Some(receipt))
+    }
+
+    fn file_upload_task(
+        &self,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<Option<(UploadTask, UploadFileSnapshot)>, String> {
+        let Some(key) = self.object_key(path) else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let snapshot = upload_file_snapshot(path)?;
+        Ok(Some((
+            UploadTask {
+                key,
+                source: UploadSource::File(path.to_path_buf()),
+                content_type: content_type.to_owned(),
+                path: path.to_path_buf(),
+                generation: 0, // assigned by `enqueue`
+                attempts: 0,
+                not_before: Instant::now(),
+                receipt: None,
+            },
+            snapshot,
+        )))
     }
 
     /// Lists all object keys under `prefix` (paginates as needed).
@@ -969,8 +1118,9 @@ impl RecordingObjectStore {
     }
 
     /// Deletes only recording objects under a legacy flat meeting prefix:
-    /// top-level `*.wav` files and the `speakers/` subtree. Other objects
-    /// under the prefix (transcripts, context, ...) are left in place.
+    /// top-level `*.wav` files and the `speakers/` and
+    /// `transcription_chunks/` subtrees. Other objects under the prefix
+    /// (transcripts, context, ...) are left in place.
     /// Pending and in-flight uploads under the prefix are cancelled first.
     /// Returns how many keys were deleted.
     pub fn delete_legacy_recording_prefix(&self, prefix: &str) -> Result<usize, S3Error> {
@@ -981,8 +1131,10 @@ impl RecordingObjectStore {
             .into_iter()
             .filter_map(|key| {
                 let rel = key.strip_prefix(prefix)?;
-                ((rel.ends_with(".wav") && !rel.contains('/')) || rel.starts_with("speakers/"))
-                    .then_some(key)
+                ((rel.ends_with(".wav") && !rel.contains('/'))
+                    || rel.starts_with("speakers/")
+                    || rel.starts_with("transcription_chunks/"))
+                .then_some(key)
             })
             .collect::<Vec<_>>();
         let deleted = keys.len();
@@ -1362,8 +1514,9 @@ fn collect_staged_files(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
 
 /// Whether a staged file (relative to `storage_dir`) is part of the uploaded
 /// surface: workspace `audio/` trees except the transcription-only
-/// `transcription_speakers/`, or the legacy flat layout's `<meeting>/*.wav`
-/// and `<meeting>/speakers/**` (mirroring `delete_legacy_recording_prefix`).
+/// `transcription_speakers/`, or the legacy flat layout's `<meeting>/*.wav`,
+/// `<meeting>/speakers/**`, and `<meeting>/transcription_chunks/**` (mirroring
+/// `delete_legacy_recording_prefix`).
 fn is_upload_candidate(rel: &Path) -> bool {
     let components: Vec<String> = rel
         .components()
@@ -1390,7 +1543,7 @@ fn is_upload_candidate(rel: &Path) -> bool {
     }
     match components.as_slice() {
         [_, file] => file.ends_with(".wav"),
-        [_, dir, ..] => dir == "speakers",
+        [_, dir, ..] => dir == "speakers" || dir == "transcription_chunks",
         _ => false,
     }
 }
@@ -1860,6 +2013,82 @@ mod tests {
     }
 
     #[test]
+    fn file_upload_retries_reuse_pending_receipt_and_changed_files_get_new_generation() {
+        let base = temp_dir("file_receipt_reuse");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        *fake.put_delay.lock().unwrap() = Duration::from_millis(50);
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let path = base.join("workspaces/g/vc/m/audio/chunk.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+
+        let first = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wait_timeout(Duration::from_millis(1)),
+            None,
+            "the first caller should be able to leave while the upload remains pending"
+        );
+        let retry = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.generation(), first.generation());
+        assert_eq!(retry.wait(), UploadReceiptStatus::Durable);
+
+        // Rebuilding an identical artifact changes file metadata but must
+        // still reuse the durable generation based on its content.
+        std::fs::write(&path, b"audio").unwrap();
+        let identical = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(identical.generation(), retry.generation());
+
+        std::fs::write(&path, b"updated audio").unwrap();
+        let changed = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_ne!(changed.generation(), identical.generation());
+        assert_eq!(changed.wait(), UploadReceiptStatus::Durable);
+        let puts = fake.puts.lock().unwrap();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(puts[0].1, b"audio");
+        assert_eq!(puts[1].1, b"updated audio");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn async_file_upload_hashes_off_runtime_and_reuses_receipt() {
+        let base = temp_dir("async_file_receipt");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let path = base.join("workspaces/g/vc/m/audio/chunk.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+
+        let first = objects
+            .upload_file_with_receipt_async(&path, "audio/wav")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.wait(), UploadReceiptStatus::Durable);
+        let retry = objects
+            .upload_file_with_receipt_async(&path, "audio/wav")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.generation(), first.generation());
+        assert_eq!(fake.puts.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn upload_receipt_reports_retry_then_durable_generation() {
         let base = temp_dir("receipt_retry");
         let _ = std::fs::remove_dir_all(&base);
@@ -2176,6 +2405,32 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn delete_legacy_recording_prefix_removes_transcription_derivatives_only() {
+        let (fake, dyn_store) = fake_store();
+        *fake.list_result.lock().unwrap() = vec![
+            "legacy/g/vc/m/mixdown.wav".to_owned(),
+            "legacy/g/vc/m/speakers/user.wav".to_owned(),
+            "legacy/g/vc/m/transcription_chunks/chunk.wav".to_owned(),
+            "legacy/g/vc/m/transcript/final.json".to_owned(),
+        ];
+        let store = RecordingObjectStore::new(dyn_store, String::new(), 900, "/data");
+        assert_eq!(
+            store
+                .delete_legacy_recording_prefix("legacy/g/vc/m/")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            fake.deletes.lock().unwrap()[0],
+            vec![
+                "legacy/g/vc/m/mixdown.wav".to_owned(),
+                "legacy/g/vc/m/speakers/user.wav".to_owned(),
+                "legacy/g/vc/m/transcription_chunks/chunk.wav".to_owned(),
+            ]
+        );
+    }
+
     /// A remote tombstone written by another process's `delete_prefix` must
     /// cancel our queued upload for the prefix and clean up the object an
     /// earlier racing attempt may have created.
@@ -2338,11 +2593,10 @@ mod tests {
             "workspaces/g/vc/m/audio/ssrc_mapping.json".to_owned(),
             ".tombstones/legacy/".to_owned(),
         ];
-        // A legacy-layout meeting dir whose prefix was deleted remotely.
-        let legacy = base.join("legacy");
-        std::fs::create_dir_all(legacy.join("speakers")).unwrap();
-        std::fs::write(legacy.join("mixdown.wav"), b"old").unwrap();
-        std::fs::write(legacy.join("speakers/u.wav"), b"old").unwrap();
+        // A legacy-layout transcription derivative uses the flat meeting prefix.
+        let legacy = base.join("old_layout");
+        std::fs::create_dir_all(legacy.join("transcription_chunks")).unwrap();
+        std::fs::write(legacy.join("transcription_chunks/u.wav"), b"resampled").unwrap();
 
         objects.reconcile_staged_uploads_now();
         objects.wait_uploads_idle();
@@ -2358,6 +2612,7 @@ mod tests {
         assert_eq!(
             puts,
             vec![
+                "old_layout/transcription_chunks/u.wav".to_owned(),
                 "workspaces/g/vc/m/audio/speakers/u.wav".to_owned(),
                 "workspaces/g/vc/m/audio/u_1_0.wav".to_owned(),
             ],

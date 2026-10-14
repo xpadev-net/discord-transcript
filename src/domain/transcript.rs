@@ -1,4 +1,5 @@
 use crate::domain::speaker::{SpeakerProfile, display_label_for_id};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -10,7 +11,8 @@ pub fn is_valid_transcript_confidence(value: f32) -> bool {
     value.is_finite() && (MIN_TRANSCRIPT_CONFIDENCE..=MAX_TRANSCRIPT_CONFIDENCE).contains(&value)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptSource {
     Voice,
     VcText,
@@ -40,7 +42,7 @@ impl TranscriptSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptSegment {
     pub speaker_id: String,
     pub start_ms: u64,

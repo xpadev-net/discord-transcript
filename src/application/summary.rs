@@ -24,9 +24,11 @@ use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use tracing::warn;
 
@@ -173,10 +175,11 @@ mod summary_engine_compat_tests {
 
 #[cfg(test)]
 mod s3_transcription_source_tests {
-    use super::{SummaryRequest, run_transcription_with_s3_sources};
+    use super::{SummaryError, SummaryRequest, run_transcription_with_s3_sources};
     use crate::application::asr::{
         AsrError, AsrPort, AsrRequest, AsrResult, AudioSource, S3AudioObjectReference,
     };
+    use crate::domain::speaker::SpeakerAudioInput;
     use crate::infrastructure::workspace::MeetingWorkspaceLayout;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -190,6 +193,47 @@ mod s3_transcription_source_tests {
                 text: String::new(),
                 segments: Vec::new(),
                 raw_body: "{}".to_owned(),
+            })
+        }
+    }
+
+    struct FailOnceOnThirdChunkAsr {
+        calls: Mutex<Vec<String>>,
+        failed_third_chunk: std::sync::atomic::AtomicBool,
+    }
+
+    impl AsrPort for FailOnceOnThirdChunkAsr {
+        fn infer(&self, request: &AsrRequest) -> Result<AsrResult, AsrError> {
+            let chunk = request
+                .source
+                .local_path()
+                .and_then(std::path::Path::file_stem)
+                .expect("test requests should use named local chunk paths")
+                .to_string_lossy()
+                .into_owned();
+            self.calls.lock().unwrap().push(chunk.clone());
+            if chunk == "chunk-3"
+                && !self
+                    .failed_third_chunk
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(AsrError::InvalidJson(
+                    "synthetic third-chunk failure".to_owned(),
+                ));
+            }
+            Ok(AsrResult {
+                text: String::new(),
+                segments: vec![crate::domain::transcript::TranscriptSegment {
+                    speaker_id: String::new(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    text: chunk.clone(),
+                    confidence: None,
+                    is_noisy: false,
+                    source: crate::domain::transcript::TranscriptSource::Voice,
+                    merged_count: 1,
+                }],
+                raw_body: format!(r#"{{"chunk":"{chunk}"}}"#),
             })
         }
     }
@@ -233,6 +277,88 @@ mod s3_transcription_source_tests {
         assert_eq!(captured.language.as_deref(), Some("ja"));
         assert!(captured.prompt.as_deref().unwrap().contains("Design sync"));
     }
+
+    #[test]
+    fn successful_chunk_debug_responses_are_flushed_when_a_later_chunk_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "summary-s3-debug-failure-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        let workspace =
+            MeetingWorkspaceLayout::new(&root).for_meeting("guild", "channel", "meeting");
+        let request = SummaryRequest {
+            meeting_id: "meeting".to_owned(),
+            guild_id: "guild".to_owned(),
+            voice_channel_id: "channel".to_owned(),
+            voice_channel_name: None,
+            title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
+            audio_path: workspace
+                .audio_dir()
+                .join("mixdown.wav")
+                .to_string_lossy()
+                .into_owned(),
+            speaker_audio: (1..=3)
+                .map(|chunk| SpeakerAudioInput {
+                    speaker_id: "alice".to_owned(),
+                    audio_path: workspace
+                        .audio_dir()
+                        .join(format!("chunk-{chunk}.wav"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    offset_ms: (chunk - 1) * 1_000,
+                })
+                .collect(),
+            language: None,
+            workspace,
+        };
+        for speaker in &request.speaker_audio {
+            let path = std::path::Path::new(&speaker.audio_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, speaker.audio_path.as_bytes()).unwrap();
+        }
+        let asr = FailOnceOnThirdChunkAsr {
+            calls: Mutex::new(Vec::new()),
+            failed_third_chunk: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let result = run_transcription_with_s3_sources(&asr, &request, &HashMap::new());
+
+        assert!(matches!(result, Err(SummaryError::Asr(_))));
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(request.workspace.whisper_response_path("alice"))
+                .expect("earlier successful raw responses should be persisted"),
+        )
+        .expect("saved raw response should be valid JSON");
+        assert_eq!(
+            saved["chunks"],
+            serde_json::json!([{"chunk": "chunk-1"}, {"chunk": "chunk-2"}])
+        );
+
+        // The speaker aggregate can be rebuilt at the same path when a late
+        // live-ASR chunk finishes. Its content fingerprint must invalidate
+        // only that checkpoint even though speaker and offset are unchanged.
+        std::fs::write(&request.speaker_audio[0].audio_path, b"rebuilt aggregate")
+            .expect("updated speaker audio should be written");
+
+        let resumed = run_transcription_with_s3_sources(&asr, &request, &HashMap::new())
+            .expect("retry should resume from successful chunk checkpoints");
+        assert_eq!(
+            *asr.calls.lock().unwrap(),
+            ["chunk-1", "chunk-2", "chunk-3", "chunk-1", "chunk-3"]
+        );
+        assert_eq!(resumed.segments.len(), 1);
+        assert_eq!(resumed.segments[0].text, "chunk-1 chunk-2 chunk-3");
+        assert_eq!(resumed.segments[0].start_ms, 0);
+        assert_eq!(resumed.segments[0].end_ms, 3_000);
+        assert_eq!(resumed.segments[0].merged_count, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +397,121 @@ pub struct TranscriptionOutput {
     pub segments: Vec<crate::domain::transcript::TranscriptSegment>,
     pub transcript_for_summary: String,
     pub masking_stats: MaskingStats,
+}
+
+const FINAL_ASR_CHECKPOINT_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FinalAsrChunkCheckpoint {
+    version: u8,
+    audio_path: String,
+    audio_fingerprint: String,
+    speaker_id: String,
+    offset_ms: u64,
+    language: Option<String>,
+    prompt: Option<String>,
+    segments: Vec<crate::domain::transcript::TranscriptSegment>,
+    raw_response: serde_json::Value,
+}
+
+fn final_asr_audio_fingerprint(audio_path: &str) -> std::io::Result<String> {
+    let mut file = fs::File::open(audio_path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn final_asr_chunk_checkpoint_path(
+    request: &SummaryRequest,
+    audio_path: &str,
+) -> std::path::PathBuf {
+    let digest = Sha256::digest(audio_path.as_bytes());
+    let key = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    request
+        .workspace
+        .final_asr_checkpoint_dir()
+        .join(format!("{key}.json"))
+}
+
+fn load_final_asr_chunk_checkpoint(
+    request: &SummaryRequest,
+    speaker: &SpeakerAudioInput,
+    prompt: Option<&str>,
+    audio_fingerprint: &str,
+) -> Option<FinalAsrChunkCheckpoint> {
+    let checkpoint: FinalAsrChunkCheckpoint = serde_json::from_slice(
+        &fs::read(final_asr_chunk_checkpoint_path(
+            request,
+            &speaker.audio_path,
+        ))
+        .ok()?,
+    )
+    .ok()?;
+    (checkpoint.version == FINAL_ASR_CHECKPOINT_VERSION
+        && checkpoint.audio_path == speaker.audio_path
+        && checkpoint.audio_fingerprint == audio_fingerprint
+        && checkpoint.speaker_id == speaker.speaker_id
+        && checkpoint.offset_ms == speaker.offset_ms
+        && checkpoint.language == request.language
+        && checkpoint.prompt.as_deref() == prompt)
+        .then_some(checkpoint)
+}
+
+fn persist_final_asr_chunk_checkpoint(
+    request: &SummaryRequest,
+    speaker: &SpeakerAudioInput,
+    audio_fingerprint: String,
+    prompt: Option<String>,
+    segments: Vec<crate::domain::transcript::TranscriptSegment>,
+    raw_response: serde_json::Value,
+) -> Result<(), String> {
+    let path = final_asr_chunk_checkpoint_path(request, &speaker.audio_path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "final ASR checkpoint path has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create final ASR checkpoint directory: {err}"))?;
+    let checkpoint = FinalAsrChunkCheckpoint {
+        version: FINAL_ASR_CHECKPOINT_VERSION,
+        audio_path: speaker.audio_path.clone(),
+        audio_fingerprint,
+        speaker_id: speaker.speaker_id.clone(),
+        offset_ms: speaker.offset_ms,
+        language: request.language.clone(),
+        prompt,
+        segments,
+        raw_response,
+    };
+    let bytes = serde_json::to_vec(&checkpoint)
+        .map_err(|err| format!("failed to encode final ASR checkpoint: {err}"))?;
+    let tmp_path = path.with_extension("json.part");
+    let mut tmp_file = fs::File::create(&tmp_path)
+        .map_err(|err| format!("failed to write final ASR checkpoint: {err}"))?;
+    std::io::Write::write_all(&mut tmp_file, &bytes)
+        .map_err(|err| format!("failed to write final ASR checkpoint: {err}"))?;
+    tmp_file
+        .sync_all()
+        .map_err(|err| format!("failed to flush final ASR checkpoint: {err}"))?;
+    drop(tmp_file);
+    if let Err(err) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed to finalize final ASR checkpoint: {err}"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -434,39 +675,108 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
     }
 
     let mut merged_segments = Vec::new();
+    let mut speaker_debug_responses =
+        std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
     for speaker in &request.speaker_audio {
         let prompt = build_whisper_prompt(request, Some(speaker));
-        let transcription = whisper.infer(
-            &s3_sources
-                .get(std::path::Path::new(&speaker.audio_path))
-                .cloned()
-                .map_or_else(
-                    || {
-                        AsrRequest::local_file(
-                            speaker.audio_path.clone(),
-                            request.language.clone(),
-                            prompt.clone(),
-                        )
-                    },
-                    |source| {
-                        AsrRequest::s3_object(source, request.language.clone(), prompt.clone())
-                    },
-                ),
-        )?;
-        persist_whisper_debug_response(
-            &request.workspace.whisper_response_path(&speaker.speaker_id),
-            &transcription.raw_body,
-        );
-        for mut segment in transcription.segments {
-            segment.speaker_id = speaker.speaker_id.clone();
-            segment.start_ms = segment.start_ms.saturating_add(speaker.offset_ms);
-            segment.end_ms = segment.end_ms.saturating_add(speaker.offset_ms);
-            merged_segments.push(segment);
+        let audio_fingerprint = final_asr_audio_fingerprint(&speaker.audio_path).ok();
+        let (checkpoint, needs_persist) = if let Some(checkpoint) =
+            audio_fingerprint.as_deref().and_then(|fingerprint| {
+                load_final_asr_chunk_checkpoint(request, speaker, prompt.as_deref(), fingerprint)
+            }) {
+            (checkpoint, false)
+        } else {
+            let transcription_result = whisper.infer(
+                &s3_sources
+                    .get(std::path::Path::new(&speaker.audio_path))
+                    .cloned()
+                    .map_or_else(
+                        || {
+                            AsrRequest::local_file(
+                                speaker.audio_path.clone(),
+                                request.language.clone(),
+                                prompt.clone(),
+                            )
+                        },
+                        |source| {
+                            AsrRequest::s3_object(source, request.language.clone(), prompt.clone())
+                        },
+                    ),
+            );
+            let transcription = match transcription_result {
+                Ok(transcription) => transcription,
+                Err(err) => {
+                    persist_speaker_debug_responses(&request.workspace, &speaker_debug_responses);
+                    return Err(err.into());
+                }
+            };
+            let raw_response = serde_json::from_str(&transcription.raw_body)
+                .unwrap_or(serde_json::Value::String(transcription.raw_body));
+            let segments = transcription
+                .segments
+                .into_iter()
+                .map(|mut segment| {
+                    segment.speaker_id = speaker.speaker_id.clone();
+                    segment.start_ms = segment.start_ms.saturating_add(speaker.offset_ms);
+                    segment.end_ms = segment.end_ms.saturating_add(speaker.offset_ms);
+                    segment
+                })
+                .collect();
+            (
+                FinalAsrChunkCheckpoint {
+                    version: FINAL_ASR_CHECKPOINT_VERSION,
+                    audio_path: speaker.audio_path.clone(),
+                    audio_fingerprint: audio_fingerprint.clone().unwrap_or_default(),
+                    speaker_id: speaker.speaker_id.clone(),
+                    offset_ms: speaker.offset_ms,
+                    language: request.language.clone(),
+                    prompt: prompt.clone(),
+                    segments,
+                    raw_response,
+                },
+                audio_fingerprint.is_some()
+                    && final_asr_audio_fingerprint(&speaker.audio_path).ok() == audio_fingerprint,
+            )
+        };
+        speaker_debug_responses
+            .entry(speaker.speaker_id.clone())
+            .or_default()
+            .push(checkpoint.raw_response.clone());
+        if needs_persist
+            && let Err(err) = persist_final_asr_chunk_checkpoint(
+                request,
+                speaker,
+                checkpoint.audio_fingerprint.clone(),
+                checkpoint.prompt.clone(),
+                checkpoint.segments.clone(),
+                checkpoint.raw_response.clone(),
+            )
+        {
+            persist_speaker_debug_responses(&request.workspace, &speaker_debug_responses);
+            return Err(SummaryError::SummaryEngine(err));
         }
+        merged_segments.extend(checkpoint.segments);
     }
+
+    persist_speaker_debug_responses(&request.workspace, &speaker_debug_responses);
 
     sort_transcript_segments(&mut merged_segments);
     build_transcription_output(merged_segments)
+}
+
+fn persist_speaker_debug_responses(
+    workspace: &MeetingWorkspacePaths,
+    speaker_debug_responses: &std::collections::HashMap<String, Vec<serde_json::Value>>,
+) {
+    for (speaker_id, responses) in speaker_debug_responses {
+        let body = if responses.len() == 1 {
+            serde_json::to_string(&responses[0])
+        } else {
+            serde_json::to_string(&serde_json::json!({ "chunks": responses }))
+        }
+        .unwrap_or_else(|_| "{}".to_owned());
+        persist_whisper_debug_response(&workspace.whisper_response_path(speaker_id), &body);
+    }
 }
 
 pub fn build_whisper_prompt(
