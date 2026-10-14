@@ -6,7 +6,11 @@ import type {
   SummaryResponse,
   TranscriptResponse,
 } from "../lib/types";
-import { useMeetingData } from "./useMeetingData";
+import {
+  createTranscriptSegmentIndex,
+  mergeTranscriptSegmentIndex,
+  useMeetingData,
+} from "./useMeetingData";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -99,6 +103,59 @@ function segment(
     source,
   };
 }
+
+describe("transcript segment index", () => {
+  it("upserts unordered deltas, repositions moved IDs, and keeps timestamp tie order", () => {
+    const initial = [
+      segment("later", "voice", 2_000, "later"),
+      segment("tie-b", "voice", 1_000, "tie b"),
+      segment("tie-a", "voice", 1_000, "tie a"),
+    ];
+    const original = initial.map((item) => ({ ...item }));
+    const index = createTranscriptSegmentIndex(initial);
+    const delta = [
+      segment("new-mid", "vc_text", 1_500, "new mid"),
+      segment("later", "voice", 500, "moved earlier"),
+      segment("tie-b", "voice", 1_000, "updated tie b"),
+    ];
+    const deltaOriginal = delta.map((item) => ({ ...item }));
+
+    const merged = mergeTranscriptSegmentIndex(index, delta);
+
+    expect(merged.segments.map(({ id }) => id)).toEqual([
+      "later",
+      "tie-a",
+      "tie-b",
+      "new-mid",
+    ]);
+    expect(merged.byKey.get("later")?.text).toBe("moved earlier");
+    expect(merged.byKey.get("tie-b")?.text).toBe("updated tie b");
+    expect(initial).toEqual(original);
+    expect(delta).toEqual(deltaOriginal);
+  });
+
+  it("avoids rebuilding the ID map or sorting for a small delta on a long transcript", () => {
+    const initial = Array.from({ length: 10_000 }, (_, index) =>
+      segment(`segment-${index}`, "voice", index * 1_000, `text-${index}`),
+    );
+    const index = createTranscriptSegmentIndex(initial);
+    const originalMiddle = initial[5_000];
+    const map = index.byKey;
+    const sort = vi.spyOn(Array.prototype, "sort");
+    const delta = [
+      segment("segment-5000", "voice", 5_000_000, "updated middle"),
+    ];
+
+    const merged = mergeTranscriptSegmentIndex(index, delta);
+
+    expect(sort).not.toHaveBeenCalled();
+    expect(merged.byKey).toBe(map);
+    expect(merged.segments).toHaveLength(10_000);
+    expect(merged.byKey.get("segment-5000")?.text).toBe("updated middle");
+    expect(initial[5_000]).toBe(originalMiddle);
+    expect(originalMiddle?.text).toBe("text-5000");
+  });
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

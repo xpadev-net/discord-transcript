@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchMeeting,
   fetchSummary,
@@ -55,24 +55,79 @@ function transcriptSegmentKey(segment: TranscriptSegment): string {
   );
 }
 
-function mergeTranscriptSegments(
-  current: TranscriptSegment[] | null,
-  incoming: TranscriptSegment[],
-): TranscriptSegment[] {
-  const byKey = new Map<string, TranscriptSegment>();
-  for (const segment of current ?? []) {
-    byKey.set(transcriptSegmentKey(segment), segment);
-  }
-  for (const segment of incoming) {
-    byKey.set(transcriptSegmentKey(segment), segment);
-  }
-  return Array.from(byKey.values()).sort(
-    (a, b) =>
-      a.start_ms - b.start_ms ||
-      a.end_ms - b.end_ms ||
-      a.speaker_id.localeCompare(b.speaker_id) ||
-      transcriptSegmentKey(a).localeCompare(transcriptSegmentKey(b)),
+export interface TranscriptSegmentIndex {
+  segments: TranscriptSegment[];
+  byKey: Map<string, TranscriptSegment>;
+}
+
+function compareTranscriptSegments(
+  a: TranscriptSegment,
+  b: TranscriptSegment,
+): number {
+  return (
+    a.start_ms - b.start_ms ||
+    a.end_ms - b.end_ms ||
+    a.speaker_id.localeCompare(b.speaker_id) ||
+    transcriptSegmentKey(a).localeCompare(transcriptSegmentKey(b))
   );
+}
+
+export function createTranscriptSegmentIndex(
+  segments: TranscriptSegment[],
+): TranscriptSegmentIndex {
+  const byKey = new Map<string, TranscriptSegment>();
+  for (const segment of segments) {
+    byKey.set(transcriptSegmentKey(segment), segment);
+  }
+  const ordered = Array.from(byKey.values()).sort(compareTranscriptSegments);
+  return { segments: ordered, byKey };
+}
+
+function transcriptSegmentPosition(
+  segments: TranscriptSegment[],
+  target: TranscriptSegment,
+): number {
+  let low = 0;
+  let high = segments.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const middleSegment = segments[middle];
+    if (middleSegment && compareTranscriptSegments(middleSegment, target) < 0) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+export function mergeTranscriptSegmentIndex(
+  current: TranscriptSegmentIndex,
+  incoming: TranscriptSegment[],
+): TranscriptSegmentIndex {
+  if (incoming.length === 0) {
+    return current;
+  }
+
+  const segments = current.segments.slice();
+  for (const segment of incoming) {
+    const key = transcriptSegmentKey(segment);
+    const existing = current.byKey.get(key);
+    if (existing) {
+      const existingPosition = transcriptSegmentPosition(segments, existing);
+      if (compareTranscriptSegments(existing, segment) === 0) {
+        segments[existingPosition] = segment;
+        current.byKey.set(key, segment);
+        continue;
+      }
+      segments.splice(existingPosition, 1);
+    }
+
+    const insertAt = transcriptSegmentPosition(segments, segment);
+    segments.splice(insertAt, 0, segment);
+    current.byKey.set(key, segment);
+  }
+  return { segments, byKey: current.byKey };
 }
 
 function isForbiddenError(error: unknown): boolean {
@@ -113,6 +168,7 @@ export function useMeetingData(
   const [transcript, setTranscript] = useState<TranscriptSegment[] | null>(
     null,
   );
+  const transcriptIndexRef = useRef(createTranscriptSegmentIndex([]));
   const [transcriptState, setTranscriptState] =
     useState<TranscriptStateResponse | null>(null);
   const [summary, setSummary] = useState<SummaryResponse | null>(null);
@@ -133,6 +189,24 @@ export function useMeetingData(
   const [summaryRetryCount, setSummaryRetryCount] = useState(0);
   const shouldStreamTranscript = isLiveMeetingStatus(meeting?.status);
 
+  const replaceTranscript = useCallback(
+    (segments: TranscriptSegment[] | null) => {
+      const index = createTranscriptSegmentIndex(segments ?? []);
+      transcriptIndexRef.current = index;
+      setTranscript(segments === null ? null : index.segments);
+    },
+    [],
+  );
+
+  const mergeTranscript = useCallback((segments: TranscriptSegment[]) => {
+    const index = mergeTranscriptSegmentIndex(
+      transcriptIndexRef.current,
+      segments,
+    );
+    transcriptIndexRef.current = index;
+    setTranscript(index.segments);
+  }, []);
+
   const applyTranscriptStatus = useCallback((response: TranscriptResponse) => {
     setTranscriptState(transcriptStateFromResponse(response));
     if (response.is_final) {
@@ -152,6 +226,7 @@ export function useMeetingData(
     if (!meetingId) {
       setLoading(false);
       setMeetingCompletionTrackingEnabled(false);
+      replaceTranscript(null);
       return;
     }
 
@@ -184,29 +259,29 @@ export function useMeetingData(
     });
 
     return () => controller.abort();
-  }, [meetingId, guildId]);
+  }, [meetingId, guildId, replaceTranscript]);
 
   useEffect(() => {
     const retryAttempt = transcriptRetryCount;
     if (!meetingId) {
-      setTranscript(null);
+      replaceTranscript(null);
       setTranscriptState(null);
       setTranscriptError(null);
       return;
     }
 
     const controller = new AbortController();
-    setTranscript(null);
+    replaceTranscript(null);
     setTranscriptState(null);
     setTranscriptError(null);
     fetchTranscript(meetingId, controller.signal, guildId)
       .then((response) => {
         if (controller.signal.aborted) return;
-        setTranscript((current) =>
-          shouldStreamTranscript
-            ? mergeTranscriptSegments(current, response.segments)
-            : response.segments,
-        );
+        if (shouldStreamTranscript) {
+          mergeTranscript(response.segments);
+        } else {
+          replaceTranscript(response.segments);
+        }
         applyTranscriptStatus(response);
       })
       .catch(() => {
@@ -221,6 +296,8 @@ export function useMeetingData(
     transcriptRetryCount,
     shouldStreamTranscript,
     applyTranscriptStatus,
+    mergeTranscript,
+    replaceTranscript,
   ]);
 
   const shouldTrackMeetingCompletion =
@@ -405,13 +482,13 @@ export function useMeetingData(
           );
           applyTranscriptStatus(response);
           if (response.segments.length > 0) {
-            setTranscript((current) =>
-              response.reset
-                ? mergeTranscriptSegments(null, response.segments)
-                : mergeTranscriptSegments(current, response.segments),
-            );
+            if (response.reset) {
+              replaceTranscript(response.segments);
+            } else {
+              mergeTranscript(response.segments);
+            }
           } else if (response.reset) {
-            setTranscript([]);
+            replaceTranscript([]);
           }
           if (response.is_final) {
             closeStream();
@@ -511,6 +588,8 @@ export function useMeetingData(
     shouldStreamTranscript,
     transcriptRetryCount,
     applyTranscriptStatus,
+    mergeTranscript,
+    replaceTranscript,
   ]);
 
   useEffect(() => {
