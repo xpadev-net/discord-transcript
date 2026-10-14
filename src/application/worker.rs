@@ -889,21 +889,22 @@ pub(crate) fn durable_s3_audio_source(
         return Ok(None);
     };
     let durable = if path.is_file() {
-        let receipt = objects
-            .upload_file_with_receipt(path, "audio/wav")
-            .map_err(|err| {
-                WorkerError::Summary(format!("failed to enqueue ASR audio upload: {err}"))
-            })?
-            .ok_or_else(|| {
-                WorkerError::Summary("ASR audio artifact disappeared before upload".to_owned())
-            })?;
+        let receipt = match objects.upload_file_with_receipt(path, "audio/wav") {
+            Ok(Some(receipt)) => receipt,
+            // Local audio remains a valid input when S3 is unavailable or its
+            // upload queue cannot accept another artifact.
+            Ok(None) | Err(_) => return Ok(None),
+        };
         match receipt.wait_timeout(Duration::from_secs(30)) {
             Some(UploadReceiptStatus::Durable) => true,
             Some(UploadReceiptStatus::Superseded) => return Ok(None),
-            Some(status) => {
-                return Err(WorkerError::Summary(format!(
-                    "ASR audio upload did not become durable: {status:?}"
-                )));
+            Some(
+                UploadReceiptStatus::Failed(_)
+                | UploadReceiptStatus::Cancelled
+                | UploadReceiptStatus::Shutdown,
+            ) => return Ok(None),
+            Some(UploadReceiptStatus::Queued | UploadReceiptStatus::Retrying { .. }) => {
+                unreachable!("wait_timeout only returns terminal upload states")
             }
             // The source is still available locally; the background upload
             // can finish independently without blocking this summary job.
