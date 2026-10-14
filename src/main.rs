@@ -821,10 +821,11 @@ async fn ensure_summary_thread(
     meeting_id: &str,
     existing_thread_id: Option<String>,
 ) -> Result<u64, String> {
-    if let Some(thread_id) = existing_thread_id {
-        return thread_id
-            .parse::<u64>()
-            .map_err(|err| format!("invalid summary thread id: {err}"));
+    let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
+    if let Some(thread_id) = saved_thread_id {
+        if ChannelId::new(thread_id).to_channel(http).await.is_ok() {
+            return Ok(thread_id);
+        }
     }
     let channel_id = channel_id
         .parse::<u64>()
@@ -836,7 +837,13 @@ async fn ensure_summary_thread(
     let parent = MessageId::new(message_id);
     if let Ok(message) = channel.message(http, parent).await {
         if let Some(thread) = message.thread {
-            return Ok(thread.id.get());
+            if ChannelId::new(thread.id.get())
+                .to_channel(http)
+                .await
+                .is_ok()
+            {
+                return Ok(thread.id.get());
+            }
         }
     }
     match channel
@@ -853,7 +860,13 @@ async fn ensure_summary_thread(
             // create call. Re-read the parent and use the thread it now points to.
             if let Ok(message) = channel.message(http, parent).await {
                 if let Some(thread) = message.thread {
-                    return Ok(thread.id.get());
+                    if ChannelId::new(thread.id.get())
+                        .to_channel(http)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(thread.id.get());
+                    }
                 }
             }
             Err(create_error.to_string())

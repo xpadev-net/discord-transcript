@@ -8403,22 +8403,20 @@ impl ScaffoldHandler {
         let Ok(metadata) = service.store.get_status_message_metadata(meeting_id) else {
             return Ok(fallback_channel_id);
         };
+        let existing_thread_id = metadata.summary_thread_id;
         let (Some(status_channel), Some(status_message)) = (
             metadata.status_message_channel_id,
             metadata.status_message_id,
         ) else {
             return Ok(fallback_channel_id);
         };
-        if let Some(thread_id) = metadata.summary_thread_id {
-            return Ok(thread_id.parse::<u64>().unwrap_or(fallback_channel_id));
-        }
         drop(service);
         let thread_id = match ensure_summary_thread(
             http,
             &status_channel,
             &status_message,
             meeting_id,
-            None,
+            existing_thread_id,
         )
         .await
         {
@@ -11528,10 +11526,11 @@ async fn ensure_summary_thread(
     meeting_id: &str,
     existing_thread_id: Option<String>,
 ) -> Result<u64, String> {
-    if let Some(thread_id) = existing_thread_id {
-        return thread_id
-            .parse::<u64>()
-            .map_err(|err| format!("invalid summary thread id: {err}"));
+    let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
+    if let Some(thread_id) = saved_thread_id {
+        if ChannelId::new(thread_id).to_channel(http).await.is_ok() {
+            return Ok(thread_id);
+        }
     }
     let channel_id = channel_id
         .parse::<u64>()
@@ -11542,7 +11541,13 @@ async fn ensure_summary_thread(
     let channel = ChannelId::new(channel_id);
     if let Ok(message) = channel.message(http, MessageId::new(message_id)).await {
         if let Some(thread) = message.thread {
-            return Ok(thread.id.get());
+            if ChannelId::new(thread.id.get())
+                .to_channel(http)
+                .await
+                .is_ok()
+            {
+                return Ok(thread.id.get());
+            }
         }
     }
     match channel
@@ -11557,7 +11562,13 @@ async fn ensure_summary_thread(
         Err(create_error) => {
             if let Ok(message) = channel.message(http, MessageId::new(message_id)).await {
                 if let Some(thread) = message.thread {
-                    return Ok(thread.id.get());
+                    if ChannelId::new(thread.id.get())
+                        .to_channel(http)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(thread.id.get());
+                    }
                 }
             }
             Err(create_error.to_string())
