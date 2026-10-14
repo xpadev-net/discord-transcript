@@ -148,6 +148,8 @@ cargo run --release --locked
 
 - **Guilds** (サーバー情報の取得)
 - **Guild Voice States** (ボイスチャンネルの参加・退出検出)
+- **Guild Members** (agent によるサーバーユーザー検索、一覧、投稿先チャンネルの閲覧者確認。Developer Portal の Privileged Gateway Intents で有効化が必要)
+- **Message Content** (agent のメッセージ検索。Developer Portal の Privileged Gateway Intents で有効化が必要)
 
 ### 必要な Bot Permission
 
@@ -155,7 +157,7 @@ cargo run --release --locked
 - Speak (ボイスチャンネルでの送受信)
 - Send Messages (テキストチャンネルへのメッセージ送信)
 - View Channel (VC テキストチャットの閲覧)
-- Read Message History (会議中 VC チャット履歴の取得)
+- Read Message History (会議中 VC チャット履歴の取得、native agent によるメッセージ検索)
 - Use Slash Commands
 
 ### スラッシュコマンド

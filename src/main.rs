@@ -442,17 +442,6 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         backoff_multiplier: config.integration_retry_backoff_multiplier,
         max_delay: Duration::from_millis(config.integration_retry_max_delay_ms),
     };
-    let summary_client = build_summary_client(SummaryClientConfig {
-        harness: config.summary_harness,
-        command_path: config.summary_command.clone(),
-        model: config.summary_model.clone(),
-        provider: config.summary_provider,
-        api_key: config.summary_api_key.clone(),
-        auth_file: config.summary_auth_file.clone().map(PathBuf::from),
-        allow_unsafe_agent_harness: false,
-        retry_policy,
-        command_timeout: DEFAULT_COMMAND_TIMEOUT,
-    })?;
     let recording_objects = config
         .chunk_storage_s3
         .as_ref()
@@ -526,6 +515,32 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
                             worker_shutdown.clone(),
                             SUMMARY_JOB_HEARTBEAT_INTERVAL,
                         );
+                        let discord_bot_token = match resolve_effective_bot_token(
+                            &token_db_client,
+                            &config.discord_guild_id,
+                            &config.discord_token,
+                            guild_bot_token_cipher.as_ref(),
+                        ).await {
+                            Ok(token) if !token.trim().is_empty() => Some(token),
+                            Ok(_) => None,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "could not resolve Discord bot token for summary lookup tools; disabling Discord tools for this job");
+                                None
+                            }
+                        };
+                        let summary_client = build_summary_client(SummaryClientConfig {
+                            harness: config.summary_harness,
+                            command_path: config.summary_command.clone(),
+                            model: config.summary_model.clone(),
+                            provider: config.summary_provider,
+                            api_key: config.summary_api_key.clone(),
+                            auth_file: config.summary_auth_file.clone().map(PathBuf::from),
+                            allow_unsafe_agent_harness: false,
+                            retry_policy,
+                            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+                            discord_bot_token,
+                            discord_guild_id: Some(config.discord_guild_id.clone()),
+                        })?;
                         // Transcription and summary generation are
                         // synchronous and long-running; on a runtime with a
                         // single worker thread they would starve the lease

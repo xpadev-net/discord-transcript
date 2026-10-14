@@ -36,6 +36,7 @@ use tracing::warn;
 pub struct SummaryRequest {
     pub meeting_id: String,
     pub guild_id: String,
+    pub report_channel_id: String,
     pub voice_channel_id: String,
     pub voice_channel_name: Option<String>,
     pub title: Option<String>,
@@ -135,7 +136,7 @@ pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
 /// received instead of whatever the store holds at check time.
 /// v3: context relevance includes CJK phrases and character n-grams.
 /// v4: the post-summary leak check recognizes long CJK verbatim copies.
-pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 4;
+pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct StubSummaryEngine {
@@ -251,6 +252,7 @@ mod s3_transcription_source_tests {
         let request = SummaryRequest {
             meeting_id: "meeting".to_owned(),
             guild_id: "guild".to_owned(),
+            report_channel_id: "report".to_owned(),
             voice_channel_id: "channel".to_owned(),
             voice_channel_name: None,
             title: Some("Design sync".to_owned()),
@@ -292,6 +294,7 @@ mod s3_transcription_source_tests {
         let request = SummaryRequest {
             meeting_id: "meeting".to_owned(),
             guild_id: "guild".to_owned(),
+            report_channel_id: "report".to_owned(),
             voice_channel_id: "channel".to_owned(),
             voice_channel_name: None,
             title: None,
@@ -534,6 +537,8 @@ pub struct TranscriptManifest {
 pub struct SummaryContextManifest {
     pub meeting_id: String,
     pub guild_id: String,
+    #[serde(default)]
+    pub report_channel_id: String,
     pub voice_channel_id: String,
     #[serde(default)]
     pub voice_channel_name: Option<String>,
@@ -1147,6 +1152,7 @@ pub fn materialize_summary_context(
     let manifest = SummaryContextManifest {
         meeting_id: request.meeting_id.clone(),
         guild_id: request.guild_id.clone(),
+        report_channel_id: request.report_channel_id.clone(),
         voice_channel_id: request.voice_channel_id.clone(),
         voice_channel_name: request.voice_channel_name.clone(),
         started_at: format_optional_utc(request.started_at),

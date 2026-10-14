@@ -3968,6 +3968,8 @@ pub async fn run_bot(
         summary_provider: config.summary_provider,
         summary_api_key: config.summary_api_key.clone(),
         summary_auth_file: config.summary_auth_file.clone(),
+        discord_bot_token: config.discord_token.clone(),
+        discord_guild_id: config.discord_guild_id.clone(),
         whisper_language: config.whisper_language.clone(),
         whisper_beam_size: config.whisper_beam_size,
         whisper_suppress_non_speech: config.whisper_suppress_non_speech,
@@ -3998,7 +4000,9 @@ pub async fn run_bot(
 
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_VOICE_STATES
-        | GatewayIntents::GUILD_MODERATION;
+        | GatewayIntents::GUILD_MODERATION
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::MESSAGE_CONTENT;
     let songbird_config =
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
     let voice_manager = songbird::Songbird::serenity_from_config(songbird_config);
@@ -4258,6 +4262,8 @@ struct ScaffoldHandler {
     summary_provider: Option<SummaryProvider>,
     summary_api_key: Option<String>,
     summary_auth_file: Option<String>,
+    discord_bot_token: String,
+    discord_guild_id: String,
     whisper_language: Option<String>,
     whisper_beam_size: u32,
     whisper_suppress_non_speech: bool,
@@ -8673,6 +8679,8 @@ impl ScaffoldHandler {
             allow_unsafe_agent_harness: false,
             retry_policy: self.integration_retry_policy,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            discord_bot_token: Some(self.discord_bot_token.clone()),
+            discord_guild_id: Some(self.discord_guild_id.clone()),
         })
         .map_err(|err| SummaryJobRunError::Terminal(err.to_string()))?;
         let job_id = format!("summary-{meeting_id}");
@@ -9172,6 +9180,7 @@ impl ScaffoldHandler {
         let request = crate::application::summary::SummaryRequest {
             meeting_id: claimed_job.meeting_id.clone(),
             guild_id: meeting.guild_id.clone(),
+            report_channel_id: meeting.report_channel_id.clone(),
             voice_channel_id: meeting.voice_channel_id.clone(),
             voice_channel_name: meeting.voice_channel_name.clone(),
             title: meeting.title.clone(),

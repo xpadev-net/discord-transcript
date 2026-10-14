@@ -321,6 +321,7 @@ fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
     let request = SummaryRequest {
         meeting_id: "m".to_owned(),
         guild_id: "g".to_owned(),
+        report_channel_id: "report".to_owned(),
         voice_channel_id: "vc".to_owned(),
         voice_channel_name: None,
         title: None,
@@ -501,6 +502,7 @@ fn ai_memory_agent_workspace_materializes_same_lockdown_configs() {
     let request = SummaryRequest {
         meeting_id: "m".to_owned(),
         guild_id: "g".to_owned(),
+        report_channel_id: "report".to_owned(),
         voice_channel_id: "vc".to_owned(),
         voice_channel_name: None,
         title: None,
