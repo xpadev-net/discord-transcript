@@ -126,24 +126,18 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     store.executor.execute(
         "INSERT INTO meetings (id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, status, started_at) SELECT 'page-' || n, CASE WHEN n % 10 = 0 THEN 'g-page-plan' ELSE 'g-other' END, 'vc-plan', 'report', 'user', 'posted', TIMESTAMPTZ '2025-01-01 00:00:00+00' - (n / 100) * INTERVAL '1 minute' FROM generate_series(1, 10000) AS n",
         &[],
-    )
-    .map_err(|err| format!("cursor fixture insert failed: {err}"))?;
-    store
-        .executor
-        .run_migration("ANALYZE meetings")
-        .map_err(|err| format!("cursor fixture analyze failed: {err}"))?;
+    )?;
+    store.executor.run_migration("ANALYZE meetings")?;
     let first_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
         .replace("$1", "'g-page-plan'")
-        .replace("$2::TEXT IS NULL", "TRUE")
-        .replace("$2", "'vc-plan'")
+        .replace("$2::TEXT[]", "NULL::TEXT[]")
         .replace("$3::TEXT IS NULL", "TRUE")
-        .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
-        .replace("$4::TEXT", "'unused'")
-        .replace("$5", "21");
-    let first_page = store
-        .executor
-        .query_rows(&first_page_sql, &[])
-        .map_err(|err| format!("first cursor page query failed: {err}"))?;
+        .replace("$3", "'vc-plan'")
+        .replace("$4::TEXT IS NULL", "NULL::TEXT IS NULL")
+        .replace("$4::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
+        .replace("$5::TEXT", "'unused'")
+        .replace("$6", "21");
+    let first_page = store.executor.query_rows(&first_page_sql, &[])?;
     if first_page.len() != 21 {
         return Err(format!("expected 21 rows in first cursor page, got {}", first_page.len()));
     }
@@ -152,42 +146,55 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     let cursor_id = last.first().and_then(Option::as_deref).unwrap();
     let second_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
         .replace("$1", "'g-page-plan'")
-        .replace("$2::TEXT IS NULL", "TRUE")
-        .replace("$2", "'vc-plan'")
-        .replace("$3::TEXT IS NULL", "FALSE")
-        .replace("$3::TEXT::TIMESTAMPTZ", &format!("TIMESTAMPTZ '{cursor_time}'"))
-        .replace("$4::TEXT", &format!("'{cursor_id}'"))
-        .replace("$5", "21");
-    let second_page = store
+        .replace("$2::TEXT[]", "NULL::TEXT[]")
+        .replace("$3::TEXT IS NULL", "TRUE")
+        .replace("$3", "'vc-plan'")
+        .replace("$4::TEXT IS NULL", "FALSE")
+        .replace("$4::TEXT::TIMESTAMPTZ", &format!("TIMESTAMPTZ '{cursor_time}'"))
+        .replace("$5::TEXT", &format!("'{cursor_id}'"))
+        .replace("$6", "21");
+    let second_page = store.executor.query_rows(&second_page_sql, &[])?;
+    if second_page.len() != 21 {
+        return Err(format!(
+            "expected 21 rows in second cursor page, got {}",
+            second_page.len()
+        ));
+    }
+    let actual_ids = first_page
+        .iter()
+        .chain(second_page.iter())
+        .filter_map(|row| row.first().and_then(Option::as_deref))
+        .collect::<Vec<_>>();
+    let expected_rows = store
         .executor
-        .query_rows(&second_page_sql, &[])
-        .map_err(|err| format!("second cursor page query failed: {err}"))?;
-    let first_ids = first_page
+        .query_rows(
+            "SELECT id FROM meetings WHERE guild_id = 'g-page-plan' ORDER BY started_at DESC, id DESC LIMIT 42",
+            &[],
+        )?;
+    let expected_ids = expected_rows
         .iter()
         .filter_map(|row| row.first().and_then(Option::as_deref))
-        .collect::<std::collections::HashSet<_>>();
-    if second_page.iter().any(|row| {
-        row.first()
-            .and_then(Option::as_deref)
-            .is_some_and(|id| first_ids.contains(id))
-    }) {
-        return Err("cursor pages must not repeat meeting IDs".to_owned());
+        .collect::<Vec<_>>();
+    if actual_ids != expected_ids {
+        return Err(format!(
+            "cursor pages should match the first 42 ordered meetings: got {} rows and {} expected",
+            actual_ids.len(),
+            expected_ids.len()
+        ));
     }
     let plan_sql = format!(
         "EXPLAIN (FORMAT TEXT) {}",
         LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
             .replace("$1", "'g-page-plan'")
-            .replace("$2::TEXT IS NULL", "TRUE")
-            .replace("$2", "'vc-plan'")
-            .replace("$3::TEXT IS NULL", "FALSE")
-            .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
-            .replace("$4::TEXT", "'page-100'")
-            .replace("$5", "21"),
+            .replace("$2::TEXT[]", "NULL::TEXT[]")
+            .replace("$3::TEXT IS NULL", "TRUE")
+            .replace("$3", "'vc-plan'")
+            .replace("$4::TEXT IS NULL", "FALSE")
+            .replace("$4::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
+            .replace("$5::TEXT", "'page-100'")
+            .replace("$6", "21"),
     );
-    let plan = store
-        .executor
-        .query_rows(&plan_sql, &[])
-        .map_err(|err| format!("cursor query EXPLAIN failed: {err}"))?;
+    let plan = store.executor.query_rows(&plan_sql, &[])?;
     if plan.is_empty() || !plan.iter().any(|row| {
         row.first()
             .and_then(Option::as_deref)

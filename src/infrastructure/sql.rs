@@ -2105,10 +2105,11 @@ SELECT id,
        voice_channel_name
 FROM meetings
 WHERE guild_id = $1
-  AND ($2::TEXT IS NULL OR voice_channel_id = $2)
-  AND ($3::TEXT IS NULL OR (started_at, id) < ($3::TEXT::TIMESTAMPTZ, $4::TEXT))
+  AND ($2::TEXT[] IS NULL OR voice_channel_id = ANY($2::TEXT[]))
+  AND ($3::TEXT IS NULL OR voice_channel_id = $3)
+  AND ($4::TEXT IS NULL OR (started_at, id) < ($4::TEXT::TIMESTAMPTZ, $5::TEXT))
 ORDER BY meetings.started_at DESC, meetings.id DESC
-LIMIT $5
+LIMIT $6
 "#;
 
 pub const COUNT_GUILD_MEETINGS_SQL: &str = r#"
@@ -2133,26 +2134,6 @@ WHERE guild_id = $1
   AND ($3::TEXT IS NULL OR voice_channel_id = $3)
 ORDER BY started_at DESC
 LIMIT $4 OFFSET $5
-"#;
-
-pub const LIST_VISIBLE_GUILD_MEETINGS_AFTER_CURSOR_SQL: &str = r#"
-SELECT id,
-       status,
-       to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as started_at,
-       to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as cursor_started_at,
-       to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as stopped_at,
-       meeting_duration_seconds,
-       title,
-       stop_reason,
-       voice_channel_id,
-       voice_channel_name
-FROM meetings
-WHERE guild_id = $1
-  AND voice_channel_id = ANY($2::TEXT[])
-  AND ($3::TEXT IS NULL OR voice_channel_id = $3)
-  AND ($4::TEXT IS NULL OR (started_at, id) < ($4::TEXT::TIMESTAMPTZ, $5::TEXT))
-ORDER BY meetings.started_at DESC, meetings.id DESC
-LIMIT $6
 "#;
 
 pub const COUNT_VISIBLE_GUILD_MEETINGS_SQL: &str = r#"

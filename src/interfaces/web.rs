@@ -91,8 +91,8 @@ use crate::infrastructure::sql::{
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_JOBS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
     LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL, LIST_GUILD_MEETINGS_SQL, LIST_GUILD_RBAC_ROLE_GRANTS_SQL,
     LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
-    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_AFTER_CURSOR_SQL,
-    LIST_VISIBLE_GUILD_MEETINGS_SQL, PRUNE_STALE_AUDIT_EVENTS_SQL, RESET_GUILD_RBAC_ROLE_GRANT_SQL,
+    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
+    PRUNE_STALE_AUDIT_EVENTS_SQL, RESET_GUILD_RBAC_ROLE_GRANT_SQL,
     RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL,
     UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, UPDATE_ADMIN_PLAN_QUOTA_SQL, UPDATE_ADMIN_PLAN_SQL,
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
@@ -4686,6 +4686,28 @@ fn guild_meetings_next_cursor(rows: &[tokio_postgres::Row]) -> Option<String> {
         started_at: row.try_get("cursor_started_at").ok()?,
         id: row.try_get("id").ok()?,
     })
+}
+
+fn guild_meetings_cursor_response(
+    guild_id: String,
+    voice_channels: Vec<GuildMeetingVoiceChannelResponse>,
+    page: u32,
+    limit: u32,
+    mut rows: Vec<tokio_postgres::Row>,
+) -> GuildMeetingsResponse {
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    GuildMeetingsResponse {
+        guild_id,
+        meetings: rows.iter().map(guild_meeting_entry_from_row).collect(),
+        voice_channels,
+        page,
+        limit,
+        total: None,
+        next_cursor: has_more
+            .then(|| guild_meetings_next_cursor(&rows))
+            .flatten(),
+    }
 }
 
 const DISCORD_SNOWFLAKE_MIN_LEN: usize = 17;
@@ -9537,16 +9559,13 @@ async fn list_guild_meetings_for_auth(
     query: GuildMeetingsQuery,
     voice_channel_filter: Option<String>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
+    let raw_cursor = query.cursor.as_deref().filter(|cursor| !cursor.is_empty());
     let cursor_mode = match query.pagination.as_deref() {
-        None if query.cursor.is_none() => false,
+        None if raw_cursor.is_none() => false,
         Some("cursor") => true,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
-    let cursor = query
-        .cursor
-        .as_deref()
-        .map(decode_guild_meetings_cursor)
-        .transpose()?;
+    let cursor = raw_cursor.map(decode_guild_meetings_cursor).transpose()?;
     let (page, limit) = normalize_guild_meetings_pagination(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
@@ -9565,12 +9584,13 @@ async fn list_guild_meetings_for_auth(
         if cursor_mode {
             let cursor_started_at = cursor.as_ref().map(|cursor| cursor.started_at.clone());
             let cursor_id = cursor.as_ref().map(|cursor| cursor.id.clone());
-            let mut rows = state
+            let rows = state
                 .db
                 .query(
                     LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL,
                     &[
                         &auth.guild_id,
+                        &None::<Vec<String>>,
                         &voice_channel_filter,
                         &cursor_started_at,
                         &cursor_id,
@@ -9579,21 +9599,13 @@ async fn list_guild_meetings_for_auth(
                 )
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let has_more = rows.len() > limit as usize;
-            rows.truncate(limit as usize);
-            let next_cursor = has_more
-                .then(|| guild_meetings_next_cursor(&rows))
-                .flatten();
-            let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
-            return Ok(Json(GuildMeetingsResponse {
-                guild_id: auth.guild_id.clone(),
-                meetings,
+            return Ok(Json(guild_meetings_cursor_response(
+                auth.guild_id.clone(),
                 voice_channels,
                 page,
                 limit,
-                total: None,
-                next_cursor,
-            }));
+                rows,
+            )));
         }
         let count_row = state
             .db
@@ -9646,10 +9658,10 @@ async fn list_guild_meetings_for_auth(
     if cursor_mode {
         let cursor_started_at = cursor.as_ref().map(|cursor| cursor.started_at.clone());
         let cursor_id = cursor.as_ref().map(|cursor| cursor.id.clone());
-        let mut rows = state
+        let rows = state
             .db
             .query(
-                LIST_VISIBLE_GUILD_MEETINGS_AFTER_CURSOR_SQL,
+                LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL,
                 &[
                     &auth.guild_id,
                     &visible_channel_ids,
@@ -9661,21 +9673,13 @@ async fn list_guild_meetings_for_auth(
             )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let has_more = rows.len() > limit as usize;
-        rows.truncate(limit as usize);
-        let next_cursor = has_more
-            .then(|| guild_meetings_next_cursor(&rows))
-            .flatten();
-        let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
-        return Ok(Json(GuildMeetingsResponse {
-            guild_id: auth.guild_id.clone(),
-            meetings,
+        return Ok(Json(guild_meetings_cursor_response(
+            auth.guild_id.clone(),
             voice_channels,
             page,
             limit,
-            total: None,
-            next_cursor,
-        }));
+            rows,
+        )));
     }
 
     let count_row = state
