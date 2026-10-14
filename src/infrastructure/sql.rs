@@ -1575,17 +1575,17 @@ WHERE id = $1
 pub const RETRY_JOB_SQL: &str = r#"
 UPDATE jobs
 SET
-  status = CASE WHEN retry_count + 1 > $3::integer THEN 'failed' ELSE 'queued' END,
+  status = CASE WHEN retry_count + 1 > $3::text::integer THEN 'failed' ELSE 'queued' END,
   retry_count = retry_count + 1,
   error_message = $2,
   next_run_at = CASE
-    WHEN retry_count + 1 > $3::integer THEN NULL
+    WHEN retry_count + 1 > $3::text::integer THEN NULL
     ELSE NOW() + make_interval(secs => LEAST(900, 30 * POWER(2, LEAST(retry_count, 5))::integer))
   END,
   leased_until = NULL,
   claim_token = NULL,
-  finished_at = CASE WHEN retry_count + 1 > $3::integer THEN NOW() ELSE NULL END,
-  dead_lettered_at = CASE WHEN retry_count + 1 > $3::integer THEN NOW() ELSE NULL END,
+  finished_at = CASE WHEN retry_count + 1 > $3::text::integer THEN NOW() ELSE NULL END,
+  dead_lettered_at = CASE WHEN retry_count + 1 > $3::text::integer THEN NOW() ELSE NULL END,
   canceled_at = NULL,
   cancel_reason = NULL,
   updated_at = NOW()

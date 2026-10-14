@@ -800,6 +800,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rig-agent",
  "rig-core",
+ "rig-reqwest",
  "serde",
  "serde_json",
  "serenity",

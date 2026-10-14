@@ -16,6 +16,7 @@ regex = "1.12.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rig-agent = "0.43"
 rig-core = { version = "0.43", features = ["reqwest"] }
+rig-reqwest = "0.43"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serenity = { version = "0.12.5", default-features = false, features = ["default_native_tls", "client", "gateway", "model"] }

@@ -51,6 +51,7 @@ pub struct AudioChunkManifestEntry {
     pub duration_ms: u64,
     pub sample_rate: u32,
     pub file_size_bytes: u64,
+    pub pcm_data_size_bytes: u64,
     pub path: PathBuf,
 }
 
@@ -234,6 +235,71 @@ pub fn scan_chunk_manifest(meeting_dir: &Path) -> Result<Vec<AudioChunkManifestE
             meeting_dir.display(),
             speaker_count
         ));
+    }
+    chunks.sort_by(|left, right| {
+        left.start_ms
+            .cmp(&right.start_ms)
+            .then(left.speaker_id.cmp(&right.speaker_id))
+            .then(left.sequence.cmp(&right.sequence))
+    });
+    Ok(chunks)
+}
+
+/// Scans raw chunk metadata for a mixdown without retaining PCM or applying the
+/// S3 upload byte budget. Per-file size, chunk-count, format, and meeting-span
+/// limits remain in force; the aggregate input may exceed the in-memory
+/// `load_chunks` budget because the mixdown reader streams bounded windows.
+pub fn scan_mixdown_chunk_manifest(
+    meeting_dir: &Path,
+) -> Result<Vec<AudioChunkManifestEntry>, String> {
+    let entries = fs::read_dir(meeting_dir).map_err(|err| {
+        format!(
+            "failed to read meeting dir {}: {err}",
+            meeting_dir.display()
+        )
+    })?;
+    let mut chunks = Vec::new();
+    let mut skipped_chunks = 0u32;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if path.is_dir()
+            || !path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+            || path.file_stem().and_then(|stem| stem.to_str()) == Some("mixdown")
+        {
+            continue;
+        }
+        match load_chunk_metadata(&path) {
+            Ok(chunk) => {
+                if chunks.len() >= MAX_MEETING_AUDIO_CHUNKS {
+                    return Err(format!(
+                        "too many audio chunks in {}: max {MAX_MEETING_AUDIO_CHUNKS}",
+                        meeting_dir.display()
+                    ));
+                }
+                chunks.push(chunk);
+            }
+            Err(reason) => {
+                skipped_chunks += 1;
+                warn!(
+                    meeting_dir = %meeting_dir.display(),
+                    chunk_path = %path.display(),
+                    skipped_chunks,
+                    reason = %reason,
+                    "skipping corrupt audio chunk for mixdown"
+                );
+            }
+        }
+    }
+    if chunks.is_empty() {
+        return Err(if skipped_chunks > 0 {
+            format!("no audio chunks found for meeting (skipped {skipped_chunks} corrupt chunk(s))")
+        } else {
+            "no audio chunks found for meeting".to_owned()
+        });
     }
     chunks.sort_by(|left, right| {
         left.start_ms
@@ -502,6 +568,7 @@ fn load_chunk_metadata(path: &Path) -> Result<AudioChunkManifestEntry, String> {
         duration_ms,
         sample_rate,
         file_size_bytes,
+        pcm_data_size_bytes: data_size,
         path: path.to_path_buf(),
     })
 }

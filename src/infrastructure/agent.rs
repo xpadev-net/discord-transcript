@@ -551,7 +551,10 @@ impl NativeAgentSummaryClient {
         )
     }
 
-    fn completion_model(&self) -> Result<DynModel<Completion>, SummaryError> {
+    fn completion_model(
+        &self,
+        opencode_session_id: Option<&str>,
+    ) -> Result<DynModel<Completion>, SummaryError> {
         match self.provider {
             SummaryProvider::OpenCodeGo => {
                 if self.api_key.is_empty() {
@@ -560,8 +563,31 @@ impl NativeAgentSummaryClient {
                         self.provider
                     )));
                 }
+                let session_id = opencode_session_id.ok_or_else(|| {
+                    summary_engine_error("OpenCode Go summary session ID was not initialized")
+                })?;
+                let mut headers = rig_reqwest::reqwest::header::HeaderMap::new();
+                let session_header =
+                    rig_reqwest::reqwest::header::HeaderValue::from_bytes(session_id.as_bytes())
+                        .map_err(|err| {
+                            summary_engine_error(format!(
+                                "failed to construct OpenCode Go session header: {err}"
+                            ))
+                        })?;
+                headers.insert(
+                    rig_reqwest::reqwest::header::HeaderName::from_static("x-opencode-session"),
+                    session_header,
+                );
+                let http = rig_reqwest::reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .map_err(|err| {
+                        summary_engine_error(format!(
+                            "failed to initialize OpenCode Go HTTP client: {err}"
+                        ))
+                    })?;
                 let config = OpenAIConfig::with_key(&OPENCODE_GO_DIALECT, self.api_key.expose());
-                let client = config.client();
+                let client = config.connect(rig_reqwest::ReqwestClient::from(http));
                 match opencode_go_route(&self.model) {
                     CompletionRoute::Responses => Ok(client.responses(self.model.clone()).erase()),
                     CompletionRoute::ChatCompletions => Ok(client.chat(self.model.clone()).erase()),
@@ -727,7 +753,16 @@ impl SummaryEngine for NativeAgentSummaryClient {
         output: AgentOutputContract,
     ) -> Result<String, SummaryError> {
         let workdir = require_native_agent_workdir(workdir)?;
-        self.summarize_attempts(prompt, workdir, output, || self.completion_model())
+        self.summarize_attempts(prompt, workdir, output, || {
+            // A retry is a clean agent run, so it gets a new provider
+            // session. The model built here is reused for every completion
+            // and tool-call continuation within that attempt.
+            let opencode_session_id = match self.provider {
+                SummaryProvider::OpenCodeGo => Some(uuid::Uuid::new_v4().to_string()),
+                SummaryProvider::ChatGpt => None,
+            };
+            self.completion_model(opencode_session_id.as_deref())
+        })
     }
 }
 
