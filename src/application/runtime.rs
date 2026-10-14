@@ -8756,6 +8756,9 @@ impl ScaffoldHandler {
                     "falling back to legacy mixdown path"
                 );
             }
+            // Keep final-ASR inputs bounded by preparing one staged WAV at a
+            // time. The S3 scanner also enforces the aggregate object-store
+            // upload budget; local ASR only needs the per-chunk and span caps.
             let s3_manifest = if self.recording_objects.is_some() {
                 match scan_chunk_manifest(&meeting_dir) {
                     Ok(manifest) => Some(manifest),
@@ -8783,11 +8786,35 @@ impl ScaffoldHandler {
                     }
                 }
             } else {
-                None
+                match scan_mixdown_chunk_manifest(&meeting_dir) {
+                    Ok(manifest) => Some(manifest),
+                    Err(err) => {
+                        let err_string = format!("audio manifest failed: {err}");
+                        let mut queue = self.queue.lock().await;
+                        let exhausted = retry_claimed_summary_job(
+                            &mut *queue,
+                            &claimed_job,
+                            err_string.clone(),
+                            self.summary_max_retries,
+                            "transcription_manifest",
+                        );
+                        drop(queue);
+                        if exhausted {
+                            let mut service = self.service.lock().await;
+                            let _ = mark_summary_meeting_failed_from_summary_state(
+                                &mut service.store,
+                                &claimed_job.meeting_id,
+                                err_string.clone(),
+                            );
+                            return Err(SummaryJobRunError::Terminal(err_string));
+                        }
+                        return Err(retry_scheduled_error(&claimed_job, err_string));
+                    }
+                }
             };
             // This artifact remains available for playback; S3 final ASR uses
             // the manifest-built per-chunk inputs below, never this mixdown.
-            let audio_path = if s3_manifest.is_some() {
+            let audio_path = if self.recording_objects.is_some() {
                 meeting_dir
                     .join("mixdown.wav")
                     .to_string_lossy()
@@ -9003,7 +9030,7 @@ impl ScaffoldHandler {
             SummaryInputSource::Audio {
                 s3_manifest: Some(_),
                 ..
-            } => None,
+            } if self.recording_objects.is_some() => None,
             SummaryInputSource::Audio {
                 completed_live_chunks,
                 ..
@@ -9023,7 +9050,7 @@ impl ScaffoldHandler {
                         ..
                     },
                     _,
-                ) => Vec::new(),
+                ) if self.recording_objects.is_some() => Vec::new(),
                 (_, None) => speaker_audio
                     .iter()
                     .map(|input| PathBuf::from(&input.audio_path))
@@ -9136,13 +9163,14 @@ impl ScaffoldHandler {
                 ..
             } if !completed_live_chunks.is_empty()
         );
-        let require_s3_chunk_sources = matches!(
-            &summary_input_source,
-            SummaryInputSource::Audio {
-                s3_manifest: Some(_),
-                ..
-            }
-        );
+        let require_s3_chunk_sources = self.recording_objects.is_some()
+            && matches!(
+                &summary_input_source,
+                SummaryInputSource::Audio {
+                    s3_manifest: Some(_),
+                    ..
+                }
+            );
         let transcription = if matches!(&summary_input_source, SummaryInputSource::FinalTranscript)
         {
             crate::application::summary::build_transcription_output(final_segments.clone())
