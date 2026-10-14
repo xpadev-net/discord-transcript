@@ -1,7 +1,7 @@
 use crate::application::ai_memory_extraction::AiMemoryExtractionStore;
 use crate::application::asr::AsrPort;
 use crate::application::recovery_runner::{RecoveryEffect, RecoveryRunnerError, run_recovery};
-use crate::application::summary::ClaudeSummaryClient;
+use crate::application::summary::SummaryEngine;
 use crate::application::worker::{
     ProcessMeetingInput, ProcessMeetingOutput, WorkerError, process_meeting_summary,
 };
@@ -73,7 +73,7 @@ pub struct MeetingFlowInput<'a, W, C> {
     recovery_candidate: &'a RecoveryCandidate,
     now: Instant,
     whisper: &'a W,
-    claude: &'a C,
+    summary_engine: &'a C,
     summary_input: &'a ProcessMeetingInput,
     retention_records: &'a [ArtifactRecord],
     now_unix_seconds: u64,
@@ -86,7 +86,7 @@ impl<'a, W, C> MeetingFlowInput<'a, W, C> {
         recovery_candidate: &'a RecoveryCandidate,
         now: Instant,
         whisper: &'a W,
-        claude: &'a C,
+        summary_engine: &'a C,
         summary_input: &'a ProcessMeetingInput,
         retention_records: &'a [ArtifactRecord],
         now_unix_seconds: u64,
@@ -96,7 +96,7 @@ impl<'a, W, C> MeetingFlowInput<'a, W, C> {
             recovery_candidate,
             now,
             whisper,
-            claude,
+            summary_engine,
             summary_input,
             retention_records,
             now_unix_seconds,
@@ -112,13 +112,18 @@ pub fn run_meeting_flow<S, C, W, FS>(
 ) -> Result<MeetingFlowOutput, MeetingFlowError>
 where
     S: MeetingStore + AiMemoryExtractionStore,
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
     W: AsrPort,
     FS: ChunkStorage,
 {
     let recovery_effect = run_recovery(store, input.recovery_candidate)?;
     let flush_result = recording_session.flush_due(input.now)?;
-    let summary = process_meeting_summary(store, input.whisper, input.claude, input.summary_input)?;
+    let summary = process_meeting_summary(
+        store,
+        input.whisper,
+        input.summary_engine,
+        input.summary_input,
+    )?;
     let cleanup_candidates = select_cleanup_candidates(
         input.retention_records,
         input.now_unix_seconds,

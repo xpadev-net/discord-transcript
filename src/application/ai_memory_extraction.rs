@@ -1,5 +1,5 @@
 use crate::application::summary::{
-    AgentOutputContract, ClaudeSummaryClient, SummaryContextManifest, SummaryRequest,
+    AgentOutputContract, SummaryContextManifest, SummaryEngine, SummaryRequest,
     ensure_untrusted_agent_workspace_supported,
 };
 use crate::domain::ai_memory::{AiMemorySourceType, AiMemoryTag, NewAiMemoryNote};
@@ -183,7 +183,7 @@ impl<E: SqlExecutor> AiMemoryExtractionStore for SqlMeetingStore<E> {
 
 pub fn run_post_meeting_ai_memory_extraction<S, C>(
     store: &mut S,
-    claude: &C,
+    summary_engine: &C,
     request: &SummaryRequest,
     final_transcript: &str,
     final_summary_markdown: &str,
@@ -191,13 +191,13 @@ pub fn run_post_meeting_ai_memory_extraction<S, C>(
 ) -> Result<usize, AiMemoryExtractionError>
 where
     S: AiMemoryExtractionStore,
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
 {
     if !store.supports_ai_memory_extraction() {
         return Ok(0);
     }
     let candidates = extract_ai_memory_candidates(
-        claude,
+        summary_engine,
         request,
         final_transcript,
         final_summary_markdown,
@@ -220,24 +220,24 @@ where
 }
 
 pub fn extract_ai_memory_candidates<C>(
-    claude: &C,
+    summary_engine: &C,
     request: &SummaryRequest,
     final_transcript: &str,
     final_summary_markdown: &str,
     context: &SummaryContextManifest,
 ) -> Result<Vec<ValidatedAiMemoryCandidate>, AiMemoryExtractionError>
 where
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
 {
     if final_transcript.trim().is_empty() {
         return Ok(Vec::new());
     }
-    ensure_untrusted_agent_workspace_supported(claude)
+    ensure_untrusted_agent_workspace_supported(summary_engine)
         .map_err(|err| AiMemoryExtractionError::Llm(err.to_string()))?;
     let agent_workspace =
         materialize_new_ai_memory_agent_workspace(request, final_summary_markdown)?;
     let prompt = build_ai_memory_extraction_prompt(request, context, agent_workspace.root());
-    let raw = claude
+    let raw = summary_engine
         .summarize_with_output_contract(
             &prompt,
             Some(agent_workspace.root()),
