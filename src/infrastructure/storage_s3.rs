@@ -969,8 +969,9 @@ impl RecordingObjectStore {
     }
 
     /// Deletes only recording objects under a legacy flat meeting prefix:
-    /// top-level `*.wav` files and the `speakers/` subtree. Other objects
-    /// under the prefix (transcripts, context, ...) are left in place.
+    /// top-level `*.wav` files and the `speakers/` and
+    /// `transcription_chunks/` subtrees. Other objects under the prefix
+    /// (transcripts, context, ...) are left in place.
     /// Pending and in-flight uploads under the prefix are cancelled first.
     /// Returns how many keys were deleted.
     pub fn delete_legacy_recording_prefix(&self, prefix: &str) -> Result<usize, S3Error> {
@@ -981,8 +982,10 @@ impl RecordingObjectStore {
             .into_iter()
             .filter_map(|key| {
                 let rel = key.strip_prefix(prefix)?;
-                ((rel.ends_with(".wav") && !rel.contains('/')) || rel.starts_with("speakers/"))
-                    .then_some(key)
+                ((rel.ends_with(".wav") && !rel.contains('/'))
+                    || rel.starts_with("speakers/")
+                    || rel.starts_with("transcription_chunks/"))
+                .then_some(key)
             })
             .collect::<Vec<_>>();
         let deleted = keys.len();
@@ -1362,8 +1365,9 @@ fn collect_staged_files(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
 
 /// Whether a staged file (relative to `storage_dir`) is part of the uploaded
 /// surface: workspace `audio/` trees except the transcription-only
-/// `transcription_speakers/`, or the legacy flat layout's `<meeting>/*.wav`
-/// and `<meeting>/speakers/**` (mirroring `delete_legacy_recording_prefix`).
+/// `transcription_speakers/`, or the legacy flat layout's `<meeting>/*.wav`,
+/// `<meeting>/speakers/**`, and `<meeting>/transcription_chunks/**` (mirroring
+/// `delete_legacy_recording_prefix`).
 fn is_upload_candidate(rel: &Path) -> bool {
     let components: Vec<String> = rel
         .components()
@@ -1390,7 +1394,7 @@ fn is_upload_candidate(rel: &Path) -> bool {
     }
     match components.as_slice() {
         [_, file] => file.ends_with(".wav"),
-        [_, dir, ..] => dir == "speakers",
+        [_, dir, ..] => dir == "speakers" || dir == "transcription_chunks",
         _ => false,
     }
 }
@@ -2176,6 +2180,32 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn delete_legacy_recording_prefix_removes_transcription_derivatives_only() {
+        let (fake, dyn_store) = fake_store();
+        *fake.list_result.lock().unwrap() = vec![
+            "legacy/g/vc/m/mixdown.wav".to_owned(),
+            "legacy/g/vc/m/speakers/user.wav".to_owned(),
+            "legacy/g/vc/m/transcription_chunks/chunk.wav".to_owned(),
+            "legacy/g/vc/m/transcript/final.json".to_owned(),
+        ];
+        let store = RecordingObjectStore::new(dyn_store, String::new(), 900, "/data");
+        assert_eq!(
+            store
+                .delete_legacy_recording_prefix("legacy/g/vc/m/")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            fake.deletes.lock().unwrap()[0],
+            vec![
+                "legacy/g/vc/m/mixdown.wav".to_owned(),
+                "legacy/g/vc/m/speakers/user.wav".to_owned(),
+                "legacy/g/vc/m/transcription_chunks/chunk.wav".to_owned(),
+            ]
+        );
+    }
+
     /// A remote tombstone written by another process's `delete_prefix` must
     /// cancel our queued upload for the prefix and clean up the object an
     /// earlier racing attempt may have created.
@@ -2338,11 +2368,10 @@ mod tests {
             "workspaces/g/vc/m/audio/ssrc_mapping.json".to_owned(),
             ".tombstones/legacy/".to_owned(),
         ];
-        // A legacy-layout meeting dir whose prefix was deleted remotely.
-        let legacy = base.join("legacy");
-        std::fs::create_dir_all(legacy.join("speakers")).unwrap();
-        std::fs::write(legacy.join("mixdown.wav"), b"old").unwrap();
-        std::fs::write(legacy.join("speakers/u.wav"), b"old").unwrap();
+        // A legacy-layout transcription derivative uses the flat meeting prefix.
+        let legacy = base.join("old_layout");
+        std::fs::create_dir_all(legacy.join("transcription_chunks")).unwrap();
+        std::fs::write(legacy.join("transcription_chunks/u.wav"), b"resampled").unwrap();
 
         objects.reconcile_staged_uploads_now();
         objects.wait_uploads_idle();
@@ -2358,6 +2387,7 @@ mod tests {
         assert_eq!(
             puts,
             vec![
+                "old_layout/transcription_chunks/u.wav".to_owned(),
                 "workspaces/g/vc/m/audio/speakers/u.wav".to_owned(),
                 "workspaces/g/vc/m/audio/u_1_0.wav".to_owned(),
             ],

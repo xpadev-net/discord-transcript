@@ -1042,8 +1042,9 @@ fn delete_meeting_recording_objects(
         .map_err(|err| format!("object store delete failed: {err}"))
 }
 
-/// Deletes the legacy flat-layout recording objects (`<meeting>/*.wav` and
-/// `<meeting>/speakers/**`) that playback-artifact uploads and pre-workspace
+/// Deletes the legacy flat-layout recording objects (`<meeting>/*.wav`,
+/// `<meeting>/speakers/**`, and `<meeting>/transcription_chunks/**`) that
+/// playback-artifact uploads, final-ASR resampling, and pre-workspace
 /// recordings create, while leaving other objects under the meeting prefix
 /// (transcripts, context, ...) untouched.
 fn delete_legacy_recording_objects(
@@ -1101,6 +1102,11 @@ fn remove_legacy_raw_audio(meeting_dir: &Path) -> Result<bool, String> {
     }
 
     match remove_dir_if_present(&meeting_dir.join("speakers")) {
+        Ok(true) => removed = true,
+        Ok(false) => {}
+        Err(err) => errors.push(err),
+    }
+    match remove_dir_if_present(&meeting_dir.join("transcription_chunks")) {
         Ok(true) => removed = true,
         Ok(false) => {}
         Err(err) => errors.push(err),
@@ -1175,10 +1181,14 @@ fn legacy_raw_audio_size(meeting_dir: &Path) -> Result<u64, String> {
 
 #[cfg(test)]
 mod periodic_cleanup_tests {
-    use super::{run_periodic_retention_cleanup, try_start_retention_cleanup_loop};
+    use super::{
+        remove_legacy_raw_audio, run_periodic_retention_cleanup, try_start_retention_cleanup_loop,
+    };
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -1186,6 +1196,23 @@ mod periodic_cleanup_tests {
         let started = AtomicBool::new(false);
         assert!(try_start_retention_cleanup_loop(&started));
         assert!(!try_start_retention_cleanup_loop(&started));
+    }
+
+    #[test]
+    fn legacy_raw_audio_cleanup_removes_transcription_derivatives() {
+        let root = std::env::temp_dir().join(format!(
+            "legacy_retention_transcription_chunks_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("transcription_chunks")).unwrap();
+        fs::write(root.join("transcription_chunks/chunk.wav"), b"audio").unwrap();
+
+        assert!(remove_legacy_raw_audio(&root).unwrap());
+        assert!(!root.join("transcription_chunks").exists());
+        assert!(!root.exists());
     }
 
     #[tokio::test(start_paused = true)]

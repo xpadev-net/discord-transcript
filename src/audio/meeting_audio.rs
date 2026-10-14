@@ -239,14 +239,30 @@ pub fn speaker_audio_inputs_from_manifest(
     processed_chunks: &[ProcessedAudioChunk],
 ) -> Vec<SpeakerAudioInput> {
     let meeting_start_ms = manifest_meeting_start_ms(chunks);
+    let ssrc_mapping = chunks
+        .first()
+        .and_then(|chunk| chunk.path.parent())
+        .map(load_ssrc_mapping)
+        .unwrap_or_default();
     let processed = processed_chunks
         .iter()
-        .map(|chunk| (chunk.speaker_id.as_str(), chunk.sequence, chunk.start_ms))
+        .map(|chunk| {
+            let speaker_id = ssrc_mapping
+                .get(&chunk.speaker_id)
+                .cloned()
+                .or_else(|| {
+                    SsrcTracker::parse_ssrc_fallback(&chunk.speaker_id).and_then(|ssrc| {
+                        ssrc_mapping.get(&SsrcTracker::fallback_key(ssrc)).cloned()
+                    })
+                })
+                .unwrap_or_else(|| chunk.speaker_id.clone());
+            (speaker_id, chunk.sequence, chunk.start_ms)
+        })
         .collect::<HashSet<_>>();
     chunks
         .iter()
         .filter(|chunk| {
-            !processed.contains(&(chunk.speaker_id.as_str(), chunk.sequence, chunk.start_ms))
+            !processed.contains(&(chunk.speaker_id.clone(), chunk.sequence, chunk.start_ms))
         })
         .map(|chunk| SpeakerAudioInput {
             speaker_id: chunk.speaker_id.clone(),
@@ -999,6 +1015,33 @@ mod manifest_tests {
             start_ms: 12_000,
         }];
         assert!(speaker_audio_inputs_from_manifest(&chunks, &completed).is_empty());
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn manifest_filters_live_chunks_after_ssrc_mapping_resolves_speaker() {
+        let root = std::env::temp_dir().join(format!(
+            "discord_transcript_manifest_ssrc_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let path = root.join("ssrc%3A13829_3_12000.wav");
+        write_sparse_wav(&path, 96_000, 48_000);
+        fs::write(
+            root.join(SSRC_MAPPING_FILENAME),
+            br#"{"ssrc_to_user":{"13829":"user-42"}}"#,
+        )
+        .expect("SSRC mapping should be written");
+
+        let chunks = scan_chunk_manifest(&root).expect("manifest scan should succeed");
+        assert_eq!(chunks[0].speaker_id, "user-42");
+        let processed = [ProcessedAudioChunk {
+            speaker_id: "ssrc:13829".to_owned(),
+            sequence: 3,
+            start_ms: 12_000,
+        }];
+        assert!(speaker_audio_inputs_from_manifest(&chunks, &processed).is_empty());
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 
