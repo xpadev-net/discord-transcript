@@ -256,7 +256,57 @@ pub fn speaker_audio_inputs_from_manifest(
         .and_then(|chunk| chunk.path.parent())
         .map(load_ssrc_mapping)
         .unwrap_or_default();
-    let processed = processed_chunks
+    let processed = normalized_processed_chunks(&ssrc_mapping, processed_chunks);
+    chunks
+        .iter()
+        .filter(|chunk| {
+            !processed.contains(&(chunk.speaker_id.clone(), chunk.sequence, chunk.start_ms))
+        })
+        .map(|chunk| SpeakerAudioInput {
+            speaker_id: chunk.speaker_id.clone(),
+            audio_path: chunk.path.to_string_lossy().into_owned(),
+            offset_ms: chunk.start_ms.saturating_sub(meeting_start_ms),
+        })
+        .collect()
+}
+
+/// Returns the original manifest WAVs already submitted to live ASR.
+pub fn manifest_audio_paths_for_processed_chunks(
+    chunks: &[AudioChunkManifestEntry],
+    processed_chunks: &[ProcessedAudioChunk],
+) -> Vec<String> {
+    let ssrc_mapping = chunks
+        .first()
+        .and_then(|chunk| chunk.path.parent())
+        .map(load_ssrc_mapping)
+        .unwrap_or_default();
+    let processed = normalized_processed_chunks(&ssrc_mapping, processed_chunks);
+    chunks
+        .iter()
+        .filter(|chunk| {
+            processed.contains(&(chunk.speaker_id.clone(), chunk.sequence, chunk.start_ms))
+        })
+        .map(|chunk| chunk.path.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Combines live-ASR WAVs with the exact prepared paths selected for final ASR.
+pub fn manifest_asr_usage_audio_paths(
+    chunks: &[AudioChunkManifestEntry],
+    processed_chunks: &[ProcessedAudioChunk],
+    prepared_inputs: &[SpeakerAudioInput],
+) -> Vec<String> {
+    manifest_audio_paths_for_processed_chunks(chunks, processed_chunks)
+        .into_iter()
+        .chain(prepared_inputs.iter().map(|input| input.audio_path.clone()))
+        .collect()
+}
+
+fn normalized_processed_chunks(
+    ssrc_mapping: &HashMap<String, String>,
+    processed_chunks: &[ProcessedAudioChunk],
+) -> HashSet<(String, u64, u64)> {
+    processed_chunks
         .iter()
         .map(|chunk| {
             let speaker_id = ssrc_mapping
@@ -269,17 +319,6 @@ pub fn speaker_audio_inputs_from_manifest(
                 })
                 .unwrap_or_else(|| chunk.speaker_id.clone());
             (speaker_id, chunk.sequence, chunk.start_ms)
-        })
-        .collect::<HashSet<_>>();
-    chunks
-        .iter()
-        .filter(|chunk| {
-            !processed.contains(&(chunk.speaker_id.clone(), chunk.sequence, chunk.start_ms))
-        })
-        .map(|chunk| SpeakerAudioInput {
-            speaker_id: chunk.speaker_id.clone(),
-            audio_path: chunk.path.to_string_lossy().into_owned(),
-            offset_ms: chunk.start_ms.saturating_sub(meeting_start_ms),
         })
         .collect()
 }
@@ -352,10 +391,16 @@ pub fn prepare_manifest_asr_inputs(
                 (pcm, entry.sample_rate)
             };
             if needs_resample && output_rate != 16_000 {
-                return Err(format!(
-                    "failed to resample manifest chunk {} to 16000 Hz",
-                    input_path.display()
-                ));
+                warn!(
+                    speaker_id = %input.speaker_id,
+                    sample_rate = entry.sample_rate,
+                    "resampling skipped: unsupported sample rate (expected 48000)"
+                );
+                if !needs_trim {
+                    *speaker_end_ms = (*speaker_end_ms).max(chunk_end_ms);
+                    prepared.push(input);
+                    continue;
+                }
             }
             let dir = match &output_dir {
                 Some(dir) => dir.clone(),
@@ -1178,6 +1223,49 @@ mod manifest_tests {
         let trimmed = load_chunk_metadata(Path::new(&inputs[1].audio_path))
             .expect("overlap-trimmed WAV should be valid");
         assert_eq!(trimmed.duration_ms, 500);
+        let usage_paths = manifest_asr_usage_audio_paths(&chunks, &[], &inputs);
+        assert_eq!(
+            usage_paths.len(),
+            2,
+            "fully skipped chunk must not be metered"
+        );
+        assert!(usage_paths[1].contains("transcription_chunks"));
+
+        let live = [ProcessedAudioChunk {
+            speaker_id: "speaker".to_owned(),
+            sequence: 1,
+            start_ms: 1_000,
+        }];
+        let final_inputs = prepare_manifest_asr_inputs(&chunks, &live, false)
+            .expect("remaining chunks should be prepared");
+        let usage_paths = manifest_asr_usage_audio_paths(&chunks, &live, &final_inputs);
+        assert_eq!(
+            usage_paths.len(),
+            2,
+            "live and final ASR audio must both be metered"
+        );
+        assert!(usage_paths[0].ends_with("speaker_1_1000.wav"));
+        assert!(usage_paths[1].ends_with("speaker_2_1500.wav"));
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn manifest_resampling_keeps_unsupported_rate_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "discord_transcript_manifest_rate_fallback_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let path = root.join("speaker_1_1000.wav");
+        write_sparse_wav(&path, 16_000, 8_000);
+
+        let chunks = scan_chunk_manifest(&root).expect("8 kHz WAV should be supported");
+        let inputs = prepare_manifest_asr_inputs(&chunks, &[], true)
+            .expect("unsupported conversion should keep the original input rate");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(Path::new(&inputs[0].audio_path), path);
+        assert_eq!(load_chunk_metadata(&path).unwrap().sample_rate, 8_000);
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 

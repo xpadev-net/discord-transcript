@@ -32,7 +32,8 @@ use crate::application::worker::{
 use crate::audio::meeting_audio::{
     AudioChunkManifestEntry, ProcessedAudioChunk, build_speaker_audio_inputs,
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
-    manifest_meeting_start_ms, prepare_manifest_asr_inputs, scan_chunk_manifest,
+    manifest_asr_usage_audio_paths, manifest_meeting_start_ms, prepare_manifest_asr_inputs,
+    scan_chunk_manifest,
 };
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{
@@ -9125,13 +9126,13 @@ impl ScaffoldHandler {
             let audio_input_paths = match &summary_input_source {
                 SummaryInputSource::Audio {
                     s3_manifest: Some(manifest),
+                    completed_live_chunks,
                     ..
-                } => Some(
-                    manifest
-                        .iter()
-                        .map(|chunk| chunk.path.to_string_lossy().into_owned())
-                        .collect(),
-                ),
+                } => Some(manifest_asr_usage_audio_paths(
+                    manifest,
+                    completed_live_chunks,
+                    &request.speaker_audio,
+                )),
                 _ => None,
             };
             self.record_asr_seconds_usage(
