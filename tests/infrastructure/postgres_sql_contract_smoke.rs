@@ -55,6 +55,9 @@ fn postgres_sql_contract_smoke_runs_migrations_and_core_queries() {
 
 fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String> {
     let mut executor = PgSqlExecutor::connect(database_url)?;
+    if let Some(threads) = postgres_executor_thread_count() {
+        assert_eq!(threads, 1);
+    }
     executor.run_migration(&format!("SET search_path TO {schema}"))?;
     let mut store = SqlMeetingStore::new(executor);
     store.apply_pending_migrations()?;
@@ -119,7 +122,37 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
         return Err(format!("expected title update to persist, got {row:?}"));
     }
 
+    for _ in 0..128 {
+        let rows = store.executor.query_rows("SELECT 1", &[])?;
+        if rows.first().and_then(|row| row.first()).and_then(Option::as_deref) != Some("1") {
+            return Err(format!("unexpected repeated executor response: {rows:?}"));
+        }
+    }
+    if let Some(threads) = postgres_executor_thread_count() {
+        assert_eq!(threads, 1);
+    }
+    drop(store);
+    if let Some(threads) = postgres_executor_thread_count() {
+        assert_eq!(threads, 0);
+    }
+
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn postgres_executor_thread_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/task").ok().map(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
+            .filter(|name| name.trim() == "pg-sql-executor")
+            .count()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn postgres_executor_thread_count() -> Option<usize> {
+    None
 }
 
 fn meeting_request(id: &str, guild_id: &str, voice_channel_id: &str) -> CreateMeetingRequest {
