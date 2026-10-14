@@ -8967,7 +8967,7 @@ impl ScaffoldHandler {
                                 Some(speaker.speaker_id.clone()),
                                 Some(speaker.offset_ms),
                                 upload_receipts.remove(Path::new(&speaker.audio_path)),
-                                !Path::new(&speaker.audio_path)
+                                Path::new(&speaker.audio_path)
                                     .parent()
                                     .and_then(Path::file_name)
                                     .is_none_or(|name| name != "transcription_chunks"),
