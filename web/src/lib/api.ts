@@ -154,17 +154,78 @@ export function buildLoginRedirectUrl(path: string): string {
   return `/auth/login?redirect=${encodeURIComponent(path)}`;
 }
 
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+
+  constructor(status: number, code: string | null, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export class ApiResponseValidationError extends Error {
+  readonly code = "response_validation";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiResponseValidationError";
+  }
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof ApiError;
+}
+
+export function isApiResponseValidationError(
+  error: unknown,
+): error is ApiResponseValidationError {
+  return error instanceof ApiResponseValidationError;
+}
+
+function responseApiError(response: Response): Promise<ApiError> {
+  return response
+    .clone()
+    .json()
+    .catch(() => null)
+    .then((payload: unknown) => {
+      const responseCode =
+        payload &&
+        typeof payload === "object" &&
+        "code" in payload &&
+        typeof payload.code === "string"
+          ? payload.code
+          : null;
+      const code = responseCode?.trim() ? responseCode : null;
+      return new ApiError(
+        response.status,
+        code,
+        `${response.status} ${response.statusText}`,
+      );
+    });
+}
+
+function rejectApiResponse(response: Response): Promise<never> {
+  return responseApiError(response).then((error) => Promise.reject(error));
+}
+
+function rejectForbiddenResponse(response: Response): Promise<never> {
+  return responseApiError(response).then((error) =>
+    Promise.reject(new ApiError(403, error.code ?? "forbidden", "forbidden")),
+  );
+}
+
 function handleResponse<T>(response: Response): Promise<T> {
   if (response.status === 401) {
     window.location.href = buildLoginRedirectUrl(
       window.location.pathname + window.location.search + window.location.hash,
     );
-    return new Promise(() => {});
+    return rejectApiResponse(response);
   }
   if (!response.ok) {
-    return Promise.reject(
-      new Error(`${response.status} ${response.statusText}`),
-    );
+    return rejectApiResponse(response);
   }
   return response.json() as Promise<T>;
 }
@@ -176,48 +237,45 @@ function handleGuildSettingsResponse(
     return handleResponse<GuildSettingsResponse>(response);
   }
   if (!response.ok) {
-    return response
-      .clone()
-      .json()
-      .catch(() => null)
-      .then((payload: unknown) => {
-        const code =
-          payload &&
-          typeof payload === "object" &&
-          "code" in payload &&
-          typeof payload.code === "string"
-            ? payload.code
-            : null;
-        if (response.status === 403 && (!code || code === "forbidden")) {
-          throw new Error("forbidden");
-        }
-        throw new Error(code ?? `${response.status} ${response.statusText}`);
-      });
+    return responseApiError(response).then((error) => {
+      if (
+        response.status === 403 &&
+        (!error.code || error.code === "forbidden")
+      ) {
+        throw new ApiError(
+          response.status,
+          error.code ?? "forbidden",
+          "forbidden",
+        );
+      }
+      if (error.code) {
+        throw new ApiError(response.status, error.code, error.code);
+      }
+      throw error;
+    });
   }
   return handleResponse<GuildSettingsResponse>(response);
 }
 
 function handleMeResponse(response: Response): Promise<MeResponse> {
   if (response.status === 403) {
-    throw new Error("forbidden");
+    return rejectForbiddenResponse(response);
   }
   return handleResponse<MeResponse>(response);
 }
 
 function handleAdminResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    return Promise.reject(
-      new Error(`${response.status} ${response.statusText}`),
-    );
+    return rejectApiResponse(response);
   }
   return response.json() as Promise<T>;
 }
 
-function invalidMeetingListResponse(): Error {
-  return new Error("会議一覧のレスポンス形式が不正です");
+function invalidMeetingListResponse(): ApiResponseValidationError {
+  return new ApiResponseValidationError("会議一覧のレスポンス形式が不正です");
 }
 
-class TranscriptResponseValidationError extends Error {
+class TranscriptResponseValidationError extends ApiResponseValidationError {
   constructor() {
     super("文字起こしのレスポンス形式が不正です");
     this.name = "TranscriptResponseValidationError";
@@ -348,14 +406,21 @@ function handleGuildMeetingsResponse(
   response: Response,
 ): Promise<MeetingListResponse> {
   if (response.status === 403) {
-    throw new Error("forbidden");
+    return rejectForbiddenResponse(response);
   }
-  return handleResponse<unknown>(response).then(parseMeetingListResponse);
+  return handleResponse<unknown>(response)
+    .then(parseMeetingListResponse)
+    .catch((error: unknown) => {
+      if (error instanceof SyntaxError) {
+        throw invalidMeetingListResponse();
+      }
+      throw error;
+    });
 }
 
 function handleGuildJobsResponse(response: Response): Promise<GuildJob[]> {
   if (response.status === 403) {
-    throw new Error("forbidden");
+    return rejectForbiddenResponse(response);
   }
   return handleResponse<GuildJob[]>(response);
 }
@@ -1217,7 +1282,14 @@ export function fetchTranscript(
   return fetch(meetingReadPath(meetingId, guildId, "/transcript"), {
     signal,
   }).then((response) =>
-    handleResponse<unknown>(response).then(normalizeTranscriptResponse),
+    handleResponse<unknown>(response)
+      .then(normalizeTranscriptResponse)
+      .catch((error: unknown) => {
+        if (error instanceof SyntaxError) {
+          throw invalidTranscriptResponse();
+        }
+        throw error;
+      }),
   );
 }
 
