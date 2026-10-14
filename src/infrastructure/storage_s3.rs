@@ -149,6 +149,17 @@ impl UploadReceipt {
         }
         status.clone()
     }
+
+    /// Waits for a terminal upload state for at most `timeout`.
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<UploadReceiptStatus> {
+        let status = self.cell.status.lock().unwrap();
+        let (status, _) = self
+            .cell
+            .changed
+            .wait_timeout_while(status, timeout, |status| !status.is_terminal())
+            .unwrap();
+        status.is_terminal().then(|| status.clone())
+    }
 }
 
 impl UploadTask {
@@ -1539,6 +1550,27 @@ mod tests {
     use crate::infrastructure::workspace::MeetingWorkspaceLayout;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    #[test]
+    fn upload_receipt_wait_timeout_returns_while_upload_is_retrying() {
+        let receipt = UploadReceipt {
+            key: "audio.wav".to_owned(),
+            generation: 1,
+            cell: Arc::new(UploadReceiptCell {
+                status: Mutex::new(UploadReceiptStatus::Retrying {
+                    attempts: 1,
+                    error: "temporary failure".to_owned(),
+                }),
+                changed: Condvar::new(),
+            }),
+        };
+
+        assert_eq!(receipt.wait_timeout(Duration::from_millis(10)), None);
+        assert!(matches!(
+            receipt.status(),
+            UploadReceiptStatus::Retrying { .. }
+        ));
+    }
 
     #[derive(Debug, Default)]
     struct FakeObjectStore {

@@ -26,7 +26,7 @@ use crate::application::summary::SummaryEngine;
 use crate::application::worker::{
     SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobHeartbeatGuard, SummaryNotificationReceipt,
     SummaryStatusNotification, SummaryUrlNotification, complete_summary_job_after_notification,
-    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+    durable_s3_audio_source, enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
     spawn_summary_job_heartbeat,
 };
 use crate::audio::meeting_audio::{
@@ -56,7 +56,9 @@ use crate::domain::usage::{
 };
 use crate::domain::{JobType, MeetingStatus, StopReason};
 use crate::infrastructure::agent::{SummaryClientConfig, build_summary_client};
-use crate::infrastructure::integrations::{CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT};
+use crate::infrastructure::integrations::{
+    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, S3StreamingWhisperClient,
+};
 use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
@@ -4098,6 +4100,26 @@ fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
 }
 
 impl ScaffoldHandler {
+    fn whisper_client(
+        &self,
+        settings: &EffectiveMeetingSettings,
+    ) -> Result<S3StreamingWhisperClient, crate::application::asr::AsrError> {
+        S3StreamingWhisperClient::new(
+            CommandWhisperClient {
+                endpoint: self.whisper_endpoint.clone(),
+                curl_bin: "curl".to_owned(),
+                retry_policy: self.integration_retry_policy,
+                beam_size: settings.whisper_beam_size,
+                suppress_non_speech: settings.whisper_suppress_non_speech,
+                prompt: settings.whisper_prompt.clone(),
+                vad: settings.whisper_vad,
+                temperature: settings.whisper_temperature,
+                command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            },
+            self.recording_objects.clone(),
+        )
+    }
+
     fn meeting_settings_defaults(&self) -> MeetingSettingsDefaults {
         MeetingSettingsDefaults {
             whisper_language: self.whisper_language.clone(),
@@ -8346,17 +8368,9 @@ impl ScaffoldHandler {
         meeting_id: &str,
     ) -> Result<RuntimeSummaryJobOutput, SummaryJobRunError> {
         let effective_settings = self.effective_settings_for_meeting(meeting_id).await?;
-        let whisper = CommandWhisperClient {
-            endpoint: self.whisper_endpoint.clone(),
-            curl_bin: "curl".to_owned(),
-            retry_policy: self.integration_retry_policy,
-            beam_size: effective_settings.whisper_beam_size,
-            suppress_non_speech: effective_settings.whisper_suppress_non_speech,
-            prompt: effective_settings.whisper_prompt.clone(),
-            vad: effective_settings.whisper_vad,
-            temperature: effective_settings.whisper_temperature,
-            command_timeout: DEFAULT_COMMAND_TIMEOUT,
-        };
+        let whisper = self
+            .whisper_client(&effective_settings)
+            .map_err(|err| SummaryJobRunError::Terminal(err.to_string()))?;
         let summary_client = build_summary_client(SummaryClientConfig {
             harness: self.summary_harness,
             command_path: self.summary_command.clone(),
@@ -8709,6 +8723,7 @@ impl ScaffoldHandler {
             },
         };
 
+        let mut upload_receipts = HashMap::new();
         // Under the s3 backend, mirror the playback artifacts (mixdown +
         // per-speaker wavs) to the object store. Uploads are queued in the
         // background; a missing local file or enqueue failure only warns —
@@ -8717,9 +8732,11 @@ impl ScaffoldHandler {
             let artifact_paths = std::iter::once(std::path::Path::new(&audio_path))
                 .chain(playback_speaker_paths.iter().map(|path| path.as_path()));
             for path in artifact_paths {
-                match objects.upload_file(path, "audio/wav") {
-                    Ok(true) => {}
-                    Ok(false) => warn!(
+                match objects.upload_file_with_receipt(path, "audio/wav") {
+                    Ok(Some(receipt)) => {
+                        upload_receipts.insert(path.to_path_buf(), receipt);
+                    }
+                    Ok(None) => warn!(
                         meeting_id = %claimed_job.meeting_id,
                         path = %path.display(),
                         "recording artifact missing locally; skipping object upload"
@@ -8798,7 +8815,51 @@ impl ScaffoldHandler {
             crate::application::summary::build_transcription_output(live_segments.clone())
         } else {
             tokio::task::block_in_place(|| {
-                crate::application::summary::run_transcription(&whisper, &request)
+                let s3_sources = if let Some(objects) = &self.recording_objects {
+                    (|| {
+                        let mut sources = HashMap::new();
+                        if request.speaker_audio.is_empty()
+                            && let Some(source) = durable_s3_audio_source(
+                                objects,
+                                Path::new(&request.audio_path),
+                                None,
+                                None,
+                                upload_receipts.remove(Path::new(&request.audio_path)),
+                            )
+                            .map_err(|err| {
+                                crate::application::summary::SummaryError::SummaryEngine(
+                                    err.to_string(),
+                                )
+                            })?
+                        {
+                            sources.insert(PathBuf::from(&request.audio_path), source);
+                        }
+                        for speaker in &request.speaker_audio {
+                            if let Some(source) = durable_s3_audio_source(
+                                objects,
+                                Path::new(&speaker.audio_path),
+                                Some(speaker.speaker_id.clone()),
+                                Some(speaker.offset_ms),
+                                upload_receipts.remove(Path::new(&speaker.audio_path)),
+                            )
+                            .map_err(|err| {
+                                crate::application::summary::SummaryError::SummaryEngine(
+                                    err.to_string(),
+                                )
+                            })? {
+                                sources.insert(PathBuf::from(&speaker.audio_path), source);
+                            }
+                        }
+                        Ok::<_, crate::application::summary::SummaryError>(sources)
+                    })()
+                } else {
+                    Ok(HashMap::new())
+                };
+                s3_sources.and_then(|sources| {
+                    crate::application::summary::run_transcription_with_s3_sources(
+                        &whisper, &request, &sources,
+                    )
+                })
             })
             .and_then(|mut output| {
                 if live_segments.is_empty() {

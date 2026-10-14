@@ -15,7 +15,7 @@ use discord_transcript::infrastructure::bot_token::{
     BotTokenCipher, BotTokenResolveError, resolve_effective_bot_token,
 };
 use discord_transcript::infrastructure::integrations::{
-    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT,
+    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, S3StreamingWhisperClient,
 };
 use discord_transcript::infrastructure::queue::JobQueue;
 use discord_transcript::infrastructure::retry::RetryPolicy;
@@ -441,17 +441,6 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
         backoff_multiplier: config.integration_retry_backoff_multiplier,
         max_delay: Duration::from_millis(config.integration_retry_max_delay_ms),
     };
-    let whisper = CommandWhisperClient {
-        endpoint: config.whisper_endpoint.clone(),
-        curl_bin: "curl".to_owned(),
-        retry_policy,
-        beam_size: config.whisper_beam_size,
-        suppress_non_speech: config.whisper_suppress_non_speech,
-        prompt: config.whisper_prompt.clone(),
-        vad: config.whisper_vad,
-        temperature: config.whisper_temperature,
-        command_timeout: DEFAULT_COMMAND_TIMEOUT,
-    };
     let summary_client = build_summary_client(SummaryClientConfig {
         harness: config.summary_harness,
         command_path: config.summary_command.clone(),
@@ -482,6 +471,20 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
     if let Some(objects) = &recording_objects {
         objects.reconcile_staged_uploads();
     }
+    let whisper = S3StreamingWhisperClient::new(
+        CommandWhisperClient {
+            endpoint: config.whisper_endpoint.clone(),
+            curl_bin: "curl".to_owned(),
+            retry_policy,
+            beam_size: config.whisper_beam_size,
+            suppress_non_speech: config.whisper_suppress_non_speech,
+            prompt: config.whisper_prompt.clone(),
+            vad: config.whisper_vad,
+            temperature: config.whisper_temperature,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+        },
+        recording_objects.clone(),
+    )?;
     let options = SummaryJobOptions {
         max_retries: config.summary_max_retries,
         audio_base_dir: config.chunk_storage_dir.clone(),

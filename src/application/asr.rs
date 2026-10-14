@@ -89,6 +89,18 @@ impl AsrRequest {
             prompt,
         }
     }
+
+    pub fn s3_object(
+        reference: S3AudioObjectReference,
+        language: Option<String>,
+        prompt: Option<String>,
+    ) -> Self {
+        Self {
+            source: AudioSource::S3Object(reference),
+            language,
+            prompt,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,7 +1,7 @@
 use crate::application::ai_memory_extraction::{
     AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
-use crate::application::asr::AsrPort;
+use crate::application::asr::{AsrPort, S3AudioObjectReference};
 use crate::application::runtime::{has_nonempty_audio_chunk, merge_user_chunks_to_mixdown};
 use crate::application::summary::{
     SpeakerAudioInput, SummaryContextInput, SummaryEngine, SummaryError, SummaryRequest,
@@ -10,7 +10,7 @@ use crate::application::summary::{
     materialize_new_summary_agent_workspace, materialize_or_load_summary_context,
     persist_correction_prompt_debug_artifact, persist_meeting_title_debug_artifact,
     persist_pre_correction_transcript_debug_artifact, persist_summary_prompt_debug_artifact,
-    run_transcription, write_transcript_files,
+    run_transcription_with_s3_sources, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::confidence::ConfidencePermille;
@@ -30,13 +30,14 @@ use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoreError, UsageEventStore,
 };
-use crate::infrastructure::storage_s3::RecordingObjectStore;
+use crate::infrastructure::storage_s3::{RecordingObjectStore, UploadReceipt, UploadReceiptStatus};
 use crate::infrastructure::workspace::{
     AGENT_SUMMARY_OUTPUT_FILENAME, MeetingWorkspaceLayout, MeetingWorkspacePaths,
 };
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
@@ -878,11 +879,86 @@ where
     process_meeting_summary_with_ownership_check(store, whisper, summary_engine, input, || Ok(()))
 }
 
+pub(crate) fn durable_s3_audio_source(
+    objects: &RecordingObjectStore,
+    path: &std::path::Path,
+    speaker_id: Option<String>,
+    offset_ms: Option<u64>,
+    receipt: Option<UploadReceipt>,
+) -> Result<Option<S3AudioObjectReference>, WorkerError> {
+    let Some(key) = objects.object_key(path) else {
+        return Ok(None);
+    };
+    let durable = if path.is_file() {
+        let receipt = match receipt {
+            Some(receipt) => receipt,
+            None => match objects.upload_file_with_receipt(path, "audio/wav") {
+                Ok(Some(receipt)) => receipt,
+                // Local audio remains a valid input when S3 is unavailable or its
+                // upload queue cannot accept another artifact.
+                Ok(None) | Err(_) => return Ok(None),
+            },
+        };
+        match receipt.wait_timeout(Duration::from_secs(30)) {
+            Some(UploadReceiptStatus::Durable) => true,
+            Some(UploadReceiptStatus::Superseded) => return Ok(None),
+            Some(
+                UploadReceiptStatus::Failed(_)
+                | UploadReceiptStatus::Cancelled
+                | UploadReceiptStatus::Shutdown,
+            ) => return Ok(None),
+            Some(UploadReceiptStatus::Queued | UploadReceiptStatus::Retrying { .. }) => {
+                unreachable!("wait_timeout only returns terminal upload states")
+            }
+            // The source is still available locally; the background upload
+            // can finish independently without blocking this summary job.
+            None => return Ok(None),
+        }
+    } else {
+        objects.object_exists(path).map_err(|err| {
+            WorkerError::Summary(format!("failed to verify existing ASR audio object: {err}"))
+        })?
+    };
+    if !durable {
+        return Err(WorkerError::Summary(format!(
+            "ASR audio object is not durable for {}",
+            path.display()
+        )));
+    }
+    S3AudioObjectReference::new(key, speaker_id, offset_ms)
+        .map(Some)
+        .map_err(|err| WorkerError::Summary(err.to_string()))
+}
+
 fn process_meeting_summary_with_ownership_check<S, W, C, F>(
     store: &mut S,
     whisper: &W,
     summary_engine: &C,
     input: &ProcessMeetingInput,
+    ensure_owned: F,
+) -> Result<ProcessMeetingOutput, WorkerError>
+where
+    S: MeetingStore + AiMemoryExtractionStore,
+    W: AsrPort,
+    C: SummaryEngine,
+    F: FnMut() -> Result<(), WorkerError>,
+{
+    process_meeting_summary_with_s3_sources(
+        store,
+        whisper,
+        summary_engine,
+        input,
+        &HashMap::new(),
+        ensure_owned,
+    )
+}
+
+fn process_meeting_summary_with_s3_sources<S, W, C, F>(
+    store: &mut S,
+    whisper: &W,
+    summary_engine: &C,
+    input: &ProcessMeetingInput,
+    s3_sources: &HashMap<std::path::PathBuf, S3AudioObjectReference>,
     mut ensure_owned: F,
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
@@ -910,7 +986,7 @@ where
 
     ensure_owned()?;
     advance_to_transcribing(store, &input.meeting_id)?;
-    let transcription_result = run_transcription(whisper, &request);
+    let transcription_result = run_transcription_with_s3_sources(whisper, &request, s3_sources);
     ensure_owned()?;
     let transcription = match transcription_result {
         Ok(value) => value,
@@ -1521,6 +1597,7 @@ where
             .map_err(WorkerError::Summary)?;
         let speaker_audio = build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
             .map_err(WorkerError::Summary)?;
+        let mut pending_s3_sources = HashMap::new();
         if let Some(objects) = &options.recording_objects {
             // Playback artifacts must exist in the object store for the web
             // presigned-URL path. Uploads warn rather than fail the job: the
@@ -1532,10 +1609,13 @@ where
                     .iter()
                     .map(|input| std::path::Path::new(&input.audio_path)),
             );
+            let mut upload_receipts = HashMap::new();
             for path in artifact_paths {
-                match objects.upload_file(path, "audio/wav") {
-                    Ok(true) => {}
-                    Ok(false) => warn!(
+                match objects.upload_file_with_receipt(path, "audio/wav") {
+                    Ok(Some(receipt)) => {
+                        upload_receipts.insert(path.to_path_buf(), receipt);
+                    }
+                    Ok(None) => warn!(
                         meeting_id = %job.meeting_id,
                         path = %path.display(),
                         "playback artifact missing locally; skipped object upload"
@@ -1546,6 +1626,31 @@ where
                         error = %err,
                         "failed to upload playback artifact to object store"
                     ),
+                }
+            }
+            // Reuse these same generations for ASR instead of enqueueing a
+            // second PUT for audio that was already selected for playback.
+            if speaker_audio.is_empty()
+                && let Some(source) = durable_s3_audio_source(
+                    objects,
+                    std::path::Path::new(&mixdown_path),
+                    None,
+                    None,
+                    upload_receipts.remove(std::path::Path::new(&mixdown_path)),
+                )?
+            {
+                pending_s3_sources.insert(std::path::PathBuf::from(&mixdown_path), source);
+            }
+            for speaker in &speaker_audio {
+                if let Some(source) = durable_s3_audio_source(
+                    objects,
+                    std::path::Path::new(&speaker.audio_path),
+                    Some(speaker.speaker_id.clone()),
+                    Some(speaker.offset_ms),
+                    upload_receipts.remove(std::path::Path::new(&speaker.audio_path)),
+                )? {
+                    pending_s3_sources
+                        .insert(std::path::PathBuf::from(&speaker.audio_path), source);
                 }
             }
         }
@@ -1574,9 +1679,14 @@ where
                 )
                 .map_err(WorkerError::from)?,
         };
-        process_meeting_summary_with_ownership_check(store, whisper, summary_engine, &input, || {
-            queue.heartbeat(&job).map_err(WorkerError::from)
-        })
+        process_meeting_summary_with_s3_sources(
+            store,
+            whisper,
+            summary_engine,
+            &input,
+            &pending_s3_sources,
+            || queue.heartbeat(&job).map_err(WorkerError::from),
+        )
         .map(Some)
     })();
     match result {
