@@ -157,6 +157,9 @@ FROM job_counts, meeting_counts, live_chunk_counts
 
 const PERMISSION_CACHE_TTL_SECS: u64 = 300;
 const PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS: u64 = 5;
+const RBAC_ROLE_RESOLUTION_TTL_SECS: u64 = PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS;
+const RBAC_ROLE_RESOLUTION_FAILURE_BACKOFF_SECS: u64 = 1;
+const RBAC_ROLE_RESOLUTION_INFLIGHT_TIMEOUT_SECS: u64 = 5;
 /// Recompute budget when permission invalidations keep racing an access check.
 const PERMISSION_CHECK_MAX_STALE_RETRIES: usize = 2;
 const MEMBERSHIP_CACHE_TTL_SECS: u64 = 5;
@@ -190,6 +193,65 @@ pub struct PermissionCacheState {
     /// Bumped under the write lock whenever an invalidation removes entries,
     /// so an in-flight permission check cannot re-store a pre-invalidation result.
     revision: AtomicU64,
+}
+
+#[derive(Default)]
+struct RbacRoleResolutionCache {
+    state: Mutex<RbacRoleResolutionCacheState>,
+}
+
+#[derive(Default)]
+struct RbacRoleResolutionCacheState {
+    entries: HashMap<(String, String), (Result<RbacRoleResolution, StatusCode>, Instant)>,
+    in_flight: HashMap<(String, String), watch::Sender<()>>,
+    revision: u64,
+}
+
+#[derive(Clone)]
+enum RbacRoleResolution {
+    Available {
+        is_admin: bool,
+        member_roles: Vec<String>,
+        role_grants: Vec<RbacRoleGrant>,
+    },
+    MemberLookupFailed(StatusCode),
+}
+
+struct RbacRoleResolutionFlightGuard {
+    cache: Arc<RbacRoleResolutionCache>,
+    key: (String, String),
+    sender: watch::Sender<()>,
+    active: bool,
+}
+
+impl RbacRoleResolutionFlightGuard {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for RbacRoleResolutionFlightGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let cache = Arc::clone(&self.cache);
+        let key = self.key.clone();
+        let sender = self.sender.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut state = cache.state.lock().await;
+                if state
+                    .in_flight
+                    .get(&key)
+                    .is_some_and(|current| current.same_channel(&sender))
+                {
+                    state.in_flight.remove(&key);
+                    sender.send_replace(());
+                }
+            });
+        }
+    }
 }
 
 impl PermissionCacheState {
@@ -362,7 +424,8 @@ impl GuildAdminCheck {
         match self {
             Self::Admin => Ok(true),
             Self::NotAdmin => Ok(false),
-            Self::BotAccessDenied | Self::RateLimited => Err(StatusCode::BAD_GATEWAY),
+            Self::BotAccessDenied => Err(StatusCode::BAD_GATEWAY),
+            Self::RateLimited => Err(StatusCode::TOO_MANY_REQUESTS),
         }
     }
 }
@@ -403,6 +466,8 @@ pub struct WebState {
     operational_metrics_cache: OperationalMetricsCache,
     /// Cache: (user_id, channel_id) -> (computed channel access, expires_at)
     pub permission_cache: PermissionCache,
+    /// Short-lived role/grant snapshots for transcript reads.
+    rbac_role_resolution_cache: Arc<RbacRoleResolutionCache>,
     /// Cache: guild info (shared across all requests)
     pub guild_cache: GuildCache,
     /// Cache: current user's OAuth-visible guild list, populated at login.
@@ -453,6 +518,7 @@ impl WebState {
             bot_token_revision_tx: guild_bot_token.revision_tx,
             operational_metrics_cache: Arc::new(Mutex::new(None)),
             permission_cache: Arc::new(PermissionCacheState::default()),
+            rbac_role_resolution_cache: Arc::new(RbacRoleResolutionCache::default()),
             guild_cache: Arc::new(tokio::sync::RwLock::new(GuildCacheState::default())),
             user_guilds_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             membership_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -2445,12 +2511,13 @@ async fn verify_meeting_read_access(
     let requested_guild_id = normalize_meeting_read_guild_id(&guild_id, requested_guild_id)?;
     let meeting_auth = match requested_guild_id.as_deref() {
         Some(target_guild_id) if target_guild_id != auth.guild_id => {
+            // Recheck installation and guild membership before using cached roles.
             require_user_can_access_target_guild(state, auth, user_id, target_guild_id).await?
         }
         Some(_) | None => auth.as_ref().clone(),
     };
     let access = meeting_access_from_row(guild_id, channel_id.clone(), &meeting_auth.guild_id)?;
-    if current_user_has_rbac_permission_for_auth(
+    if current_user_has_rbac_permission_for_transcript_read(
         state,
         &meeting_auth,
         user_id,
@@ -2968,7 +3035,11 @@ async fn check_guild_admin_permission_with_bot_auth(
     // Handle request errors as retryable upstream failures.
     if let Err(err) = member_resp {
         warn!(error = %err, "discord member API request failed");
-        return Err(StatusCode::BAD_GATEWAY);
+        return Err(if err.is_timeout() {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        });
     }
 
     let resp_status = member_resp.as_ref().unwrap().status();
@@ -6164,13 +6235,20 @@ async fn fetch_member_roles_for_rbac(
         .await
         .map_err(|err| {
             warn!(error = %err, user_id = %user_id, "discord member role lookup request failed");
-            StatusCode::BAD_GATEWAY
+            if err.is_timeout() {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
         })?;
     if response.status() == reqwest::StatusCode::NOT_FOUND
         || response.status() == reqwest::StatusCode::FORBIDDEN
         || response.status() == reqwest::StatusCode::UNAUTHORIZED
     {
         return Err(StatusCode::FORBIDDEN);
+    }
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     if !response.status().is_success() {
         warn!(
@@ -6185,6 +6263,412 @@ async fn fetch_member_roles_for_rbac(
         StatusCode::BAD_GATEWAY
     })?;
     Ok(member.roles)
+}
+
+async fn current_user_has_rbac_permission_for_transcript_read(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+    permission: RbacPermission,
+    has_channel_view: bool,
+    is_meeting_starter: bool,
+) -> Result<bool, StatusCode> {
+    let snapshot = resolve_rbac_role_snapshot(
+        &state.rbac_role_resolution_cache,
+        &auth.guild_id,
+        user_id,
+        || async {
+            let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+            let resolution =
+                check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, false)
+                    .await?;
+            let is_admin = resolution.decision.into_status_result()?;
+            if is_admin {
+                return Ok(RbacRoleResolution::Available {
+                    is_admin: true,
+                    member_roles: Vec::new(),
+                    role_grants: Vec::new(),
+                });
+            }
+            let member_roles = match resolution.member_roles {
+                Some(member_roles) => member_roles,
+                None => {
+                    return Ok(RbacRoleResolution::MemberLookupFailed(
+                        StatusCode::FORBIDDEN,
+                    ));
+                }
+            };
+            let grants = load_guild_rbac_role_grants(state, &auth.guild_id).await?;
+            let role_grants = rbac_role_grants_from_responses(&auth.guild_id, &grants)?;
+            Ok(RbacRoleResolution::Available {
+                is_admin: false,
+                member_roles,
+                role_grants,
+            })
+        },
+    )
+    .await?;
+
+    let (member_role_source, role_grants) = match &snapshot {
+        RbacRoleResolution::Available { is_admin: true, .. } => return Ok(true),
+        RbacRoleResolution::Available {
+            is_admin: false,
+            member_roles,
+            role_grants,
+        } => (
+            MemberRoleSource::Available(member_roles),
+            role_grants.as_slice(),
+        ),
+        RbacRoleResolution::MemberLookupFailed(status) => {
+            warn!(
+                status = %status,
+                guild_id = %auth.guild_id,
+                user_id = %user_id,
+                "denying transcript RBAC permission after member role lookup failure"
+            );
+            (MemberRoleSource::LookupFailed, &[] as &[RbacRoleGrant])
+        }
+    };
+    Ok(resolve_rbac_permission(
+        permission,
+        &auth.guild_id,
+        RbacSubject {
+            is_bot_admin: false,
+            is_guild_admin: false,
+            has_channel_view,
+            is_meeting_starter,
+        },
+        member_role_source,
+        role_grants,
+    )
+    .allowed)
+}
+
+async fn resolve_rbac_role_snapshot<F, Fut>(
+    cache: &Arc<RbacRoleResolutionCache>,
+    guild_id: &str,
+    user_id: &str,
+    mut resolve: F,
+) -> Result<RbacRoleResolution, StatusCode>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<RbacRoleResolution, StatusCode>>,
+{
+    let key = (guild_id.to_owned(), user_id.to_owned());
+    for _ in 0..=PERMISSION_CHECK_MAX_STALE_RETRIES {
+        enum Start {
+            Cached(Result<RbacRoleResolution, StatusCode>),
+            Follower(watch::Receiver<()>),
+            Leader(watch::Sender<()>, u64),
+        }
+        let start = {
+            let mut state = cache.state.lock().await;
+            let now = Instant::now();
+            if let Some((result, expires_at)) = state.entries.get(&key)
+                && now < *expires_at
+            {
+                Start::Cached(result.clone())
+            } else {
+                state.entries.remove(&key);
+                if let Some(sender) = state.in_flight.get(&key) {
+                    Start::Follower(sender.subscribe())
+                } else {
+                    let (sender, _) = watch::channel(());
+                    let revision = state.revision;
+                    state.in_flight.insert(key.clone(), sender.clone());
+                    Start::Leader(sender, revision)
+                }
+            }
+        };
+        match start {
+            Start::Cached(result) => return result,
+            Start::Follower(mut receiver) => {
+                let notified = tokio::time::timeout(
+                    Duration::from_secs(RBAC_ROLE_RESOLUTION_INFLIGHT_TIMEOUT_SECS),
+                    receiver.changed(),
+                )
+                .await;
+                if notified.is_err() {
+                    return Err(StatusCode::GATEWAY_TIMEOUT);
+                }
+            }
+            Start::Leader(sender, observed_revision) => {
+                let mut flight_guard = RbacRoleResolutionFlightGuard {
+                    cache: Arc::clone(cache),
+                    key: key.clone(),
+                    sender: sender.clone(),
+                    active: true,
+                };
+                let result = tokio::time::timeout(
+                    Duration::from_secs(RBAC_ROLE_RESOLUTION_INFLIGHT_TIMEOUT_SECS),
+                    resolve(),
+                )
+                .await
+                .unwrap_or(Err(StatusCode::GATEWAY_TIMEOUT));
+                let mut state = cache.state.lock().await;
+                state.in_flight.remove(&key);
+                let invalidated = state.revision != observed_revision;
+                if !invalidated {
+                    let ttl = if matches!(&result, Ok(RbacRoleResolution::Available { .. })) {
+                        RBAC_ROLE_RESOLUTION_TTL_SECS
+                    } else {
+                        RBAC_ROLE_RESOLUTION_FAILURE_BACKOFF_SECS
+                    };
+                    state.entries.insert(
+                        key.clone(),
+                        (result.clone(), Instant::now() + Duration::from_secs(ttl)),
+                    );
+                    if state.entries.len() > 10_000 {
+                        let now = Instant::now();
+                        state.entries.retain(|_, (_, expires_at)| *expires_at > now);
+                    }
+                }
+                sender.send_replace(());
+                flight_guard.disarm();
+                if !invalidated {
+                    return result;
+                }
+            }
+        }
+    }
+    Err(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+async fn invalidate_rbac_role_resolution_cache_for_guild(
+    cache: &RbacRoleResolutionCache,
+    guild_id: &str,
+) {
+    let mut state = cache.state.lock().await;
+    state
+        .entries
+        .retain(|(cached_guild_id, _), _| cached_guild_id != guild_id);
+    state.revision = state.revision.wrapping_add(1);
+}
+
+async fn clear_rbac_role_resolution_cache(cache: &RbacRoleResolutionCache) {
+    let mut state = cache.state.lock().await;
+    state.entries.clear();
+    state.revision = state.revision.wrapping_add(1);
+}
+
+#[cfg(test)]
+mod rbac_role_resolution_cache_tests {
+    use super::{
+        RbacRoleResolution, RbacRoleResolutionCache, clear_rbac_role_resolution_cache,
+        invalidate_rbac_role_resolution_cache_for_guild, resolve_rbac_role_snapshot,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    fn snapshot(role_id: &str) -> RbacRoleResolution {
+        RbacRoleResolution::Available {
+            is_admin: false,
+            member_roles: vec![role_id.to_owned()],
+            role_grants: Vec::new(),
+        }
+    }
+
+    fn assert_role(snapshot: RbacRoleResolution, expected: &str) {
+        assert!(
+            matches!(snapshot, RbacRoleResolution::Available { member_roles, .. } if member_roles.iter().any(|role| role == expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_transcript_checks_share_one_role_and_grant_resolution() {
+        let cache = Arc::new(RbacRoleResolutionCache::default());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let first_lookups = Arc::clone(&lookups);
+        let second_lookups = Arc::clone(&lookups);
+        let (first, second) = tokio::join!(
+            resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || {
+                let first_lookups = Arc::clone(&first_lookups);
+                async move {
+                    first_lookups.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok(snapshot("role-a"))
+                }
+            }),
+            resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || {
+                let second_lookups = Arc::clone(&second_lookups);
+                async move {
+                    second_lookups.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok(snapshot("role-a"))
+                }
+            }),
+        );
+
+        assert!(first.is_ok() && second.is_ok());
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+        let cached_lookups = Arc::clone(&lookups);
+        let cached = resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || {
+            let cached_lookups = Arc::clone(&cached_lookups);
+            async move {
+                cached_lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot("unexpected"))
+            }
+        })
+        .await
+        .expect("recent role resolution should be cached");
+        assert_role(cached, "role-a");
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rbac_snapshots_are_scoped_and_invalidated_by_guild() {
+        let cache = Arc::new(RbacRoleResolutionCache::default());
+        for (guild_id, user_id, role_id) in [
+            ("guild-a", "user-a", "role-a"),
+            ("guild-a", "user-b", "role-b"),
+            ("guild-b", "user-a", "role-c"),
+        ] {
+            let resolved = resolve_rbac_role_snapshot(&cache, guild_id, user_id, || async move {
+                Ok(snapshot(role_id))
+            })
+            .await
+            .expect("each subject receives its own role snapshot");
+            assert_role(resolved, role_id);
+        }
+
+        invalidate_rbac_role_resolution_cache_for_guild(&cache, "guild-a").await;
+        let refreshed = resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || async {
+            Ok(snapshot("role-new"))
+        })
+        .await
+        .expect("guild invalidation forces a fresh role snapshot");
+        assert_role(refreshed, "role-new");
+
+        let other_guild = resolve_rbac_role_snapshot(&cache, "guild-b", "user-a", || async {
+            Ok(snapshot("unexpected"))
+        })
+        .await
+        .expect("unrelated guild snapshot remains valid");
+        assert_role(other_guild, "role-c");
+    }
+
+    #[tokio::test]
+    async fn member_lookup_failures_are_shared_as_denials_and_token_clear_invalidates() {
+        let cache = Arc::new(RbacRoleResolutionCache::default());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let first_lookups = Arc::clone(&lookups);
+        let first = resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || {
+            let first_lookups = Arc::clone(&first_lookups);
+            async move {
+                first_lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(RbacRoleResolution::MemberLookupFailed(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                ))
+            }
+        })
+        .await
+        .expect("a failed role lookup is represented as a fail-closed decision");
+
+        let second_lookups = Arc::clone(&lookups);
+        let second = resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || {
+            let second_lookups = Arc::clone(&second_lookups);
+            async move {
+                second_lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot("must-not-be-used"))
+            }
+        })
+        .await
+        .expect("rate-limited lookup failure is briefly shared");
+        assert!(
+            matches!(first, RbacRoleResolution::MemberLookupFailed(_))
+                && matches!(second, RbacRoleResolution::MemberLookupFailed(_))
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+        clear_rbac_role_resolution_cache(&cache).await;
+        let refreshed = resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || async {
+            Ok(snapshot("after-token-change"))
+        })
+        .await
+        .expect("token cache invalidation clears the RBAC snapshot");
+        assert_role(refreshed, "after-token-change");
+    }
+
+    #[tokio::test]
+    async fn guild_invalidation_discards_an_in_flight_snapshot_before_returning_it() {
+        let cache = Arc::new(RbacRoleResolutionCache::default());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookup_count = Arc::clone(&lookups);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let leader_cache = Arc::clone(&cache);
+        let leader = tokio::spawn(async move {
+            let mut started_tx = Some(started_tx);
+            let mut release_rx = Some(release_rx);
+            resolve_rbac_role_snapshot(&leader_cache, "guild-a", "user-a", || {
+                let call = lookup_count.fetch_add(1, Ordering::SeqCst);
+                let started_tx = (call == 0).then(|| started_tx.take()).flatten();
+                let release_rx = (call == 0).then(|| release_rx.take()).flatten();
+                async move {
+                    if call == 0 {
+                        if let Some(started_tx) = started_tx {
+                            let _ = started_tx.send(());
+                        }
+                        let release_rx = release_rx.expect("only first lookup waits");
+                        let _ = release_rx.await;
+                        Ok(snapshot("stale-role"))
+                    } else {
+                        Ok(snapshot("fresh-role"))
+                    }
+                }
+            })
+            .await
+        });
+
+        started_rx.await.expect("first lookup starts");
+        invalidate_rbac_role_resolution_cache_for_guild(&cache, "guild-a").await;
+        release_tx.send(()).expect("release stale lookup");
+        let resolved = leader
+            .await
+            .expect("leader task completes")
+            .expect("resolution retries after invalidation");
+        assert_role(resolved, "fresh-role");
+        assert_eq!(lookups.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_single_flight_leader_releases_waiters() {
+        let cache = Arc::new(RbacRoleResolutionCache::default());
+        let leader_cache = Arc::clone(&cache);
+        let leader = tokio::spawn(async move {
+            resolve_rbac_role_snapshot(&leader_cache, "guild-a", "user-a", || async {
+                std::future::pending::<Result<RbacRoleResolution, axum::http::StatusCode>>().await
+            })
+            .await
+        });
+        for _ in 0..100 {
+            if !cache.state.lock().await.in_flight.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.state.lock().await.in_flight.len(), 1);
+        leader.abort();
+        let _ = leader.await;
+
+        for _ in 0..100 {
+            if cache.state.lock().await.in_flight.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(cache.state.lock().await.in_flight.is_empty());
+        let resolved = resolve_rbac_role_snapshot(&cache, "guild-a", "user-a", || async {
+            Ok(snapshot("retry-role"))
+        })
+        .await
+        .expect("a new caller can lead after cancellation cleanup");
+        assert_role(resolved, "retry-role");
+    }
 }
 
 fn rbac_role_grants_from_responses(
@@ -9715,6 +10199,11 @@ async fn update_guild_rbac_role_grant(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let response = rbac_role_grant_response_from_row(&row);
+    invalidate_rbac_role_resolution_cache_for_guild(
+        &state.rbac_role_resolution_cache,
+        &auth.guild_id,
+    )
+    .await;
     Ok(response)
 }
 
@@ -9806,6 +10295,11 @@ async fn reset_guild_rbac_role_grant(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let response = rbac_role_grant_response_from_row(&row);
+    invalidate_rbac_role_resolution_cache_for_guild(
+        &state.rbac_role_resolution_cache,
+        &auth.guild_id,
+    )
+    .await;
     Ok(response)
 }
 
@@ -11577,6 +12071,7 @@ async fn invalidate_discord_caches(state: &WebState) {
     invalidate_guild_cache(&state.guild_cache).await;
     state.membership_cache.write().await.clear();
     clear_permission_cache(&state.permission_cache).await;
+    clear_rbac_role_resolution_cache(&state.rbac_role_resolution_cache).await;
 }
 
 fn advance_bot_token_revision(sender: &watch::Sender<u64>) {
@@ -16130,7 +16625,7 @@ mod guild_api_tests {
         );
         assert_eq!(
             GuildAdminCheck::RateLimited.into_status_result(),
-            Err(StatusCode::BAD_GATEWAY)
+            Err(StatusCode::TOO_MANY_REQUESTS)
         );
         assert_eq!(GuildAdminCheck::NotAdmin.into_status_result(), Ok(false));
     }
