@@ -818,7 +818,7 @@ describe("App access controls", () => {
     renderApp("/admin/plans", fetchMock);
 
     await screen.findByRole("link", { name: "Plans" });
-    fireEvent.change(screen.getByLabelText("管理トークン"), {
+    fireEvent.change(await screen.findByLabelText("管理トークン"), {
       target: { value: "admin-token" },
     });
     fireEvent.click(screen.getByRole("button", { name: "適用" }));
@@ -826,6 +826,30 @@ describe("App access controls", () => {
     await screen.findByText("Default Plan");
     screen.getByText("Beta Plan");
     screen.getByText("guild-1 -> Default Plan");
+  });
+
+  it("keeps the system admin guard ahead of lazy plan content", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url === "/api/me/guilds") {
+        return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    renderApp("/admin/plans", fetchMock);
+
+    expect(await screen.findByText(forbiddenTitle)).toBeTruthy();
+    expect(screen.queryByLabelText("管理トークン")).toBeNull();
   });
 
   it("loads the admin usage overview from read-only guild APIs", async () => {
