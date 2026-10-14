@@ -7,6 +7,16 @@ import {
 } from "react";
 import { ForbiddenState } from "../components/ForbiddenState";
 import {
+  emptyRetentionAdminDraft,
+  type RetentionAdminDraft,
+  retentionMeetingDeleteRequest,
+  retentionMeetingPreviewKeyFor,
+  retentionPolicyKey,
+  retentionPolicyRequestFromDraft,
+  sameRetentionTargets,
+  validateRetentionPolicyDraft,
+} from "../features/settings/retentionDraft";
+import {
   activateDomainKnowledgeItem,
   activateSummaryTemplate,
   archiveAiMemoryNote,
@@ -49,7 +59,6 @@ import type {
   AdminRetentionMeetingDelete,
   AdminRetentionMeetingDeletePreview,
   AdminRetentionOverview,
-  AdminRetentionPolicyRequest,
   AdminRetentionTargets,
   AiMemoryNote,
   AiMemoryTag,
@@ -105,14 +114,6 @@ type ActiveOperation =
   | "rbac-load"
   | "rbac-save"
   | "rbac-reset";
-
-interface RetentionAdminDraft {
-  token: string;
-  summary_ttl_days: string;
-  meeting_id: string;
-  reason: string;
-  targets: AdminRetentionTargets;
-}
 
 interface DomainKnowledgeDraft {
   id: string | null;
@@ -294,21 +295,6 @@ function emptyPersonAliasDraft(): PersonAliasDraft {
   };
 }
 
-function emptyRetentionAdminDraft(): RetentionAdminDraft {
-  return {
-    token: "",
-    summary_ttl_days: "",
-    meeting_id: "",
-    reason: "",
-    targets: {
-      raw_audio: true,
-      transcript: true,
-      summary: true,
-      debug: true,
-    },
-  };
-}
-
 function emptyRbacDraft(): RbacDraft {
   return {
     selectedRoleId: null,
@@ -361,91 +347,6 @@ function formatBytes(value: number): string {
     unit += 1;
   }
   return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
-function retentionPolicyRequestFromDraft(
-  draft: RetentionAdminDraft,
-  form: SettingsForm | null,
-): AdminRetentionPolicyRequest {
-  const summaryTtl = draft.summary_ttl_days.trim();
-  return {
-    raw_audio_ttl_days: form
-      ? readNumber(form.retention_raw_audio_ttl_days)
-      : undefined,
-    transcript_ttl_days: form
-      ? readNumber(form.retention_transcript_ttl_days)
-      : undefined,
-    summary_ttl_days: summaryTtl === "" ? undefined : readNumber(summaryTtl),
-  };
-}
-
-function validateRetentionPolicyDraft(
-  draft: RetentionAdminDraft,
-  form: SettingsForm | null,
-): string | null {
-  if (!form) {
-    return "設定を読み込んでから保持条件を確認してください";
-  }
-  const rawAudioTtlDays = readNumber(form.retention_raw_audio_ttl_days);
-  const transcriptTtlDays = readNumber(form.retention_transcript_ttl_days);
-  const summaryTtl = draft.summary_ttl_days.trim();
-  const summaryTtlDays = summaryTtl === "" ? null : readNumber(summaryTtl);
-  if (
-    !Number.isFinite(rawAudioTtlDays) ||
-    !Number.isFinite(transcriptTtlDays) ||
-    rawAudioTtlDays < 1 ||
-    rawAudioTtlDays > 365 ||
-    transcriptTtlDays < 1 ||
-    transcriptTtlDays > 365 ||
-    (summaryTtlDays !== null &&
-      (!Number.isFinite(summaryTtlDays) ||
-        summaryTtlDays < 1 ||
-        summaryTtlDays > 365))
-  ) {
-    return "保持日数は1から365の整数で入力してください";
-  }
-  return null;
-}
-
-function retentionPolicyKey(request: AdminRetentionPolicyRequest): string {
-  return [
-    request.raw_audio_ttl_days ?? "",
-    request.transcript_ttl_days ?? "",
-    request.summary_ttl_days ?? "",
-  ].join("|");
-}
-
-function retentionMeetingDeleteRequest(draft: RetentionAdminDraft) {
-  const reason = draft.reason.trim();
-  return {
-    targets: draft.targets,
-    reason: reason === "" ? null : reason,
-  };
-}
-
-function retentionMeetingPreviewKeyFor(
-  meetingId: string,
-  targets: AdminRetentionTargets,
-): string {
-  return [
-    meetingId,
-    targets.raw_audio ? "raw" : "",
-    targets.transcript ? "transcript" : "",
-    targets.summary ? "summary" : "",
-    targets.debug ? "debug" : "",
-  ].join("|");
-}
-
-function sameRetentionTargets(
-  left: AdminRetentionTargets,
-  right: AdminRetentionTargets,
-): boolean {
-  return (
-    left.raw_audio === right.raw_audio &&
-    left.transcript === right.transcript &&
-    left.summary === right.summary &&
-    left.debug === right.debug
-  );
 }
 
 function domainKnowledgeDraftFromItem(
