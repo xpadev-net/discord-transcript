@@ -3,12 +3,14 @@ use crate::infrastructure::storage_fs::{
     ChunkStorage, ChunkStorageError, LocalChunkStorage, SavedChunk,
 };
 use crate::infrastructure::workspace::MeetingWorkspacePaths;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Shared S3 object-store handle plus the layout rules that mirror local
@@ -127,7 +129,7 @@ pub struct UploadReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UploadFileSnapshot {
     len: u64,
-    modified: Option<SystemTime>,
+    sha256: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -135,6 +137,23 @@ struct CachedUploadReceipt {
     snapshot: UploadFileSnapshot,
     receipt: UploadReceipt,
     last_used: Instant,
+}
+
+fn upload_file_sha256(path: &Path) -> Result<[u8; 32], String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to read upload source {}: {err}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to hash upload source {}: {err}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 impl UploadReceipt {
@@ -699,7 +718,7 @@ impl UploadQueue {
         })?;
         let snapshot = UploadFileSnapshot {
             len: metadata.len(),
-            modified: metadata.modified().ok(),
+            sha256: upload_file_sha256(&task.path)?,
         };
         let key = task.key.clone();
         let mut receipts = self.file_receipts.lock().unwrap();
@@ -1972,12 +1991,21 @@ mod tests {
         assert_eq!(retry.generation(), first.generation());
         assert_eq!(retry.wait(), UploadReceiptStatus::Durable);
 
+        // Rebuilding an identical artifact changes file metadata but must
+        // still reuse the durable generation based on its content.
+        std::fs::write(&path, b"audio").unwrap();
+        let identical = objects
+            .upload_file_with_receipt(&path, "audio/wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(identical.generation(), retry.generation());
+
         std::fs::write(&path, b"updated audio").unwrap();
         let changed = objects
             .upload_file_with_receipt(&path, "audio/wav")
             .unwrap()
             .unwrap();
-        assert_ne!(changed.generation(), retry.generation());
+        assert_ne!(changed.generation(), identical.generation());
         assert_eq!(changed.wait(), UploadReceiptStatus::Durable);
         let puts = fake.puts.lock().unwrap();
         assert_eq!(puts.len(), 2);
