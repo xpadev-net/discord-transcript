@@ -2703,7 +2703,7 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         let rows = self
             .executor
             .query_rows(
-                "SELECT report_channel_id, status_message_channel_id, status_message_id FROM meetings WHERE id=$1 LIMIT 1",
+                "SELECT report_channel_id, status_message_channel_id, status_message_id, summary_thread_id FROM meetings WHERE id=$1 LIMIT 1",
                 &[meeting_id.to_owned()],
             )
             .map_err(StoreError::Backend)?;
@@ -2720,11 +2720,13 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
         })?;
         let status_message_channel_id = row.get(1).and_then(|v| v.clone());
         let status_message_id = row.get(2).and_then(|v| v.clone());
+        let summary_thread_id = row.get(3).and_then(|v| v.clone());
 
         Ok(StatusMessageMetadata {
             report_channel_id,
             status_message_channel_id,
             status_message_id,
+            summary_thread_id,
         })
     }
 
@@ -2739,6 +2741,26 @@ impl<E: SqlExecutor> MeetingStore for SqlMeetingStore<E> {
             .execute(
                 "UPDATE meetings SET status_message_channel_id=$1, status_message_id=$2, updated_at=NOW() WHERE id=$3",
                 &[channel_id, message_id, meeting_id.to_owned()],
+            )
+            .map_err(StoreError::Backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn set_summary_thread_id(
+        &mut self,
+        meeting_id: &str,
+        thread_id: String,
+    ) -> Result<(), StoreError> {
+        let affected = self
+            .executor
+            .execute(
+                "UPDATE meetings SET summary_thread_id=$1, updated_at=NOW() WHERE id=$2",
+                &[thread_id, meeting_id.to_owned()],
             )
             .map_err(StoreError::Backend)?;
         if affected == 0 {

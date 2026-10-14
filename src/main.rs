@@ -28,7 +28,7 @@ use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, 
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
 use discord_transcript::infrastructure::storage_s3::RecordingObjectStore;
 use discord_transcript::interfaces::web;
-use serenity::all::{ChannelId, EditMessage};
+use serenity::all::{ChannelId, CreateThread, EditMessage, MessageId};
 use serenity::http::Http;
 use std::env;
 use std::path::PathBuf;
@@ -684,50 +684,57 @@ async fn notify_standalone_worker_summary(
         .flatten()
         .and_then(|row| row.get::<_, Option<bool>>(0))
         .unwrap_or(false);
-    let thread_parent = if summary_in_status_thread {
-        store
-            .get_status_message_metadata(&meeting.id)
-            .ok()
-            .and_then(|metadata| {
-                Some((
-                    metadata.status_message_channel_id?.parse::<u64>().ok()?,
-                    metadata.status_message_id?.parse::<u64>().ok()?,
-                ))
-            })
-    } else {
-        None
-    };
-    if let Some((thread_channel_id, status_message_id)) = thread_parent {
-        post_summary_to_status_thread(&http, thread_channel_id, status_message_id, &chunks)
-    } else {
-        post_summary_to_report_channel(&http, report_channel_id, &chunks)
-    }
-    .await
-    .map_err(WorkerError::Completion)?;
-
-    let url_notification = if let Some(url) =
-        meeting_url(config.public_base_url.as_deref(), &meeting.id)
-    {
-        let url_msg = format!("詳細はこちら: {url}");
-        let post = if let Some((channel_id, status_message_id)) = thread_parent {
-            post_summary_to_status_thread(&http, channel_id, status_message_id, &[url_msg]).await
-        } else {
-            post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await
-        };
-        match post {
-            Ok(()) => SummaryUrlNotification::Posted,
-            Err(err) => {
-                tracing::warn!(
-                    meeting_id = %meeting.id,
-                    error = %err,
-                    "failed to post meeting URL from standalone worker"
-                );
-                SummaryUrlNotification::FailedBestEffort
+    let posting_channel_id = if summary_in_status_thread {
+        let metadata = store.get_status_message_metadata(&meeting.id).ok();
+        match metadata.and_then(|m| {
+            Some((
+                m.status_message_channel_id?,
+                m.status_message_id?,
+                m.summary_thread_id,
+            ))
+        }) {
+            Some((status_channel, status_message, existing_thread)) => {
+                let thread_id = ensure_summary_thread(
+                    &http,
+                    &status_channel,
+                    &status_message,
+                    &meeting.id,
+                    existing_thread,
+                )
+                .await
+                .map_err(WorkerError::Completion)?;
+                store
+                    .set_summary_thread_id(&meeting.id, thread_id.to_string())
+                    .map_err(|err| WorkerError::Completion(err.to_string()))?;
+                thread_id
             }
+            None => report_channel_id,
         }
     } else {
-        SummaryUrlNotification::NotConfigured
+        report_channel_id
     };
+    post_summary_to_report_channel(&http, posting_channel_id, &chunks)
+        .await
+        .map_err(WorkerError::Completion)?;
+
+    let url_notification =
+        if let Some(url) = meeting_url(config.public_base_url.as_deref(), &meeting.id) {
+            let url_msg = format!("詳細はこちら: {url}");
+            let post = post_summary_to_report_channel(&http, posting_channel_id, &[url_msg]).await;
+            match post {
+                Ok(()) => SummaryUrlNotification::Posted,
+                Err(err) => {
+                    tracing::warn!(
+                        meeting_id = %meeting.id,
+                        error = %err,
+                        "failed to post meeting URL from standalone worker"
+                    );
+                    SummaryUrlNotification::FailedBestEffort
+                }
+            }
+        } else {
+            SummaryUrlNotification::NotConfigured
+        };
 
     let status_notification =
         match upsert_summary_completed_status_message(&http, store, &meeting.id, config).await {
@@ -800,29 +807,51 @@ async fn post_summary_to_report_channel(
     Ok(())
 }
 
-async fn post_summary_to_status_thread(
+async fn ensure_summary_thread(
     http: &Http,
-    channel_id: u64,
-    status_message_id: u64,
-    chunks: &[String],
-) -> Result<(), String> {
-    let channel = ChannelId::new(channel_id);
-    let parent = serenity::all::MessageId::new(status_message_id);
-    for chunk in chunks {
-        if chunk.trim().is_empty() {
-            continue;
-        }
-        channel
-            .send_message(
-                http,
-                serenity::all::CreateMessage::new()
-                    .content(chunk)
-                    .reference_message((channel, parent)),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
+    channel_id: &str,
+    message_id: &str,
+    meeting_id: &str,
+    existing_thread_id: Option<String>,
+) -> Result<u64, String> {
+    if let Some(thread_id) = existing_thread_id {
+        return thread_id
+            .parse::<u64>()
+            .map_err(|err| format!("invalid summary thread id: {err}"));
     }
-    Ok(())
+    let channel_id = channel_id
+        .parse::<u64>()
+        .map_err(|err| format!("invalid status channel id: {err}"))?;
+    let message_id = message_id
+        .parse::<u64>()
+        .map_err(|err| format!("invalid status message id: {err}"))?;
+    let channel = ChannelId::new(channel_id);
+    let parent = MessageId::new(message_id);
+    if let Ok(message) = channel.message(http, parent).await {
+        if let Some(thread) = message.thread {
+            return Ok(thread.id.get());
+        }
+    }
+    match channel
+        .create_thread_from_message(
+            http,
+            parent,
+            CreateThread::new(format!("要約 {meeting_id}")),
+        )
+        .await
+    {
+        Ok(thread) => Ok(thread.id.get()),
+        Err(create_error) => {
+            // Another worker may have created the thread between the lookup and
+            // create call. Re-read the parent and use the thread it now points to.
+            if let Ok(message) = channel.message(http, parent).await {
+                if let Some(thread) = message.thread {
+                    return Ok(thread.id.get());
+                }
+            }
+            Err(create_error.to_string())
+        }
+    }
 }
 
 async fn upsert_summary_completed_status_message(

@@ -579,6 +579,10 @@ impl MeetingStore for ExtractingInMemoryStore {
             .set_status_message(meeting_id, channel_id, message_id)
     }
 
+    fn set_summary_thread_id(&mut self, meeting_id: &str, thread_id: String) -> Result<(), StoreError> {
+        self.inner.set_summary_thread_id(meeting_id, thread_id)
+    }
+
     fn upsert_effective_meeting_settings(
         &mut self,
         meeting_id: &str,

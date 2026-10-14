@@ -15,6 +15,7 @@ pub struct StatusMessageMetadata {
     pub report_channel_id: String,
     pub status_message_channel_id: Option<String>,
     pub status_message_id: Option<String>,
+    pub summary_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +116,12 @@ pub trait MeetingStore: UsageEventStore {
         meeting_id: &str,
         channel_id: String,
         message_id: String,
+    ) -> Result<(), StoreError>;
+
+    fn set_summary_thread_id(
+        &mut self,
+        meeting_id: &str,
+        thread_id: String,
     ) -> Result<(), StoreError>;
 
     fn upsert_effective_meeting_settings(
@@ -278,6 +285,7 @@ impl EffectiveMeetingSettings {
 #[derive(Debug, Default)]
 pub struct InMemoryMeetingStore {
     meetings: HashMap<String, StoredMeeting>,
+    summary_thread_ids: HashMap<String, String>,
     effective_settings: HashMap<String, EffectiveMeetingSettings>,
     usage_events: HashMap<String, UsageEvent>,
 }
@@ -592,6 +600,7 @@ impl MeetingStore for InMemoryMeetingStore {
             report_channel_id: meeting.report_channel_id.clone(),
             status_message_channel_id: meeting.status_message_channel_id.clone(),
             status_message_id: meeting.status_message_id.clone(),
+            summary_thread_id: self.summary_thread_ids.get(meeting_id).cloned(),
         })
     }
 
@@ -608,6 +617,21 @@ impl MeetingStore for InMemoryMeetingStore {
         };
         meeting.status_message_channel_id = Some(channel_id);
         meeting.status_message_id = Some(message_id);
+        Ok(())
+    }
+
+    fn set_summary_thread_id(
+        &mut self,
+        meeting_id: &str,
+        thread_id: String,
+    ) -> Result<(), StoreError> {
+        if !self.meetings.contains_key(meeting_id) {
+            return Err(StoreError::NotFound {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        self.summary_thread_ids
+            .insert(meeting_id.to_owned(), thread_id);
         Ok(())
     }
 
