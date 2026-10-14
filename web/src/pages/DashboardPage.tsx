@@ -4,6 +4,7 @@ import {
   fetchGuildJobs,
   fetchGuildMeetings,
   fetchGuildSettings,
+  isApiError,
 } from "../lib/api";
 import { formatDate, formatDuration } from "../lib/formatters";
 import {
@@ -47,7 +48,7 @@ function meetingPath(meetingId: string, guildId?: string | null): string {
 }
 
 function dashboardErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message === "forbidden") {
+  if (isApiError(error) && error.status === 403) {
     return "\u3053\u306e\u30ae\u30eb\u30c9\u306e\u4f1a\u8b70\u3092\u8868\u793a\u3059\u308b\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093";
   }
   return error instanceof Error
@@ -489,7 +490,7 @@ function jobTypeLabel(jobType: string): string {
 }
 
 function adminErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message === "forbidden") {
+  if (isApiError(error) && error.status === 403) {
     return "この管理ビューを表示する権限がありません";
   }
   return error instanceof Error

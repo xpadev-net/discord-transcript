@@ -3502,7 +3502,12 @@ describe("App access controls", () => {
         return Promise.resolve(jsonResponse(guildsResponse().slice(0, 1)));
       }
       if (url.startsWith("/api/guilds/guild-1/meetings")) {
-        return Promise.resolve(emptyResponse(403));
+        return Promise.resolve(
+          jsonResponse(
+            { code: "membership_denied", message: "server wording changed" },
+            403,
+          ),
+        );
       }
       return Promise.resolve(emptyResponse(404));
     });

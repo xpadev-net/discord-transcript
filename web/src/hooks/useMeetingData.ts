@@ -4,6 +4,7 @@ import {
   fetchSummary,
   fetchTranscript,
   getTranscriptEventsUrl,
+  isApiError,
   isTranscriptResponseValidationError,
   normalizeTranscriptResponse,
 } from "../lib/api";
@@ -131,11 +132,11 @@ export function mergeTranscriptSegmentIndex(
 }
 
 function isForbiddenError(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("403");
+  return isApiError(error) && error.status === 403;
 }
 
 function isNotFoundError(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("404");
+  return isApiError(error) && error.status === 404;
 }
 
 function transcriptFetchErrorMessage(retryAttempt: number): string {

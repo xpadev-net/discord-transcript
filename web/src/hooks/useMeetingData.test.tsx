@@ -1,6 +1,11 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchMeeting, fetchSummary, fetchTranscript } from "../lib/api";
+import {
+  ApiError,
+  fetchMeeting,
+  fetchSummary,
+  fetchTranscript,
+} from "../lib/api";
 import type {
   MeetingResponse,
   SummaryResponse,
@@ -498,7 +503,11 @@ describe("useMeetingData completion tracking", () => {
     vi.mocked(fetchMeeting)
       .mockResolvedValueOnce(meeting("meeting-1", "recording"))
       .mockRejectedValue(
-        new Error(`${status} ${status === 403 ? "Forbidden" : "Not Found"}`),
+        new ApiError(
+          status,
+          status === 403 ? "forbidden" : "not_found",
+          `${status} ${status === 403 ? "Forbidden" : "Not Found"}`,
+        ),
       );
     vi.mocked(fetchTranscript).mockResolvedValue(
       transcript("recording", false),
