@@ -54,10 +54,9 @@ fn postgres_sql_contract_smoke_runs_migrations_and_core_queries() {
 }
 
 fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String> {
-    let threads_before_executor = current_os_thread_count();
     let mut executor = PgSqlExecutor::connect(database_url)?;
-    if let Some(before) = threads_before_executor {
-        assert_eq!(current_os_thread_count(), Some(before + 1));
+    if let Some(threads) = postgres_executor_thread_count() {
+        assert_eq!(threads, 1);
     }
     executor.run_migration(&format!("SET search_path TO {schema}"))?;
     let mut store = SqlMeetingStore::new(executor);
@@ -129,24 +128,30 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
             return Err(format!("unexpected repeated executor response: {rows:?}"));
         }
     }
-    if let Some(before) = threads_before_executor {
-        assert_eq!(current_os_thread_count(), Some(before + 1));
+    if let Some(threads) = postgres_executor_thread_count() {
+        assert_eq!(threads, 1);
     }
     drop(store);
-    if let Some(before) = threads_before_executor {
-        assert_eq!(current_os_thread_count(), Some(before));
+    if let Some(threads) = postgres_executor_thread_count() {
+        assert_eq!(threads, 0);
     }
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn current_os_thread_count() -> Option<usize> {
-    std::fs::read_dir("/proc/self/task").ok().map(|entries| entries.count())
+fn postgres_executor_thread_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/task").ok().map(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
+            .filter(|name| name.trim() == "postgres-executor")
+            .count()
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn current_os_thread_count() -> Option<usize> {
+fn postgres_executor_thread_count() -> Option<usize> {
     None
 }
 
