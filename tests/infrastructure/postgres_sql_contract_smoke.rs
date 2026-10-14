@@ -128,16 +128,13 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
         &[],
     )?;
     store.executor.run_migration("ANALYZE meetings")?;
-    let first_page_sql = format!(
-        "{}",
-        LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
-            .replace("$1", "'g-page-plan'")
-            .replace("$2::TEXT IS NULL", "TRUE")
-            .replace("$3::TEXT IS NULL", "TRUE")
-            .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
-            .replace("$4::TEXT", "'unused'")
-            .replace("$5", "21"),
-    );
+    let first_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
+        .replace("$1", "'g-page-plan'")
+        .replace("$2::TEXT IS NULL", "TRUE")
+        .replace("$3::TEXT IS NULL", "TRUE")
+        .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
+        .replace("$4::TEXT", "'unused'")
+        .replace("$5", "21");
     let first_page = store.executor.query_rows(&first_page_sql, &[])?;
     if first_page.len() != 21 {
         return Err(format!("expected 21 rows in first cursor page, got {}", first_page.len()));
