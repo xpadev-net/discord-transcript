@@ -1,7 +1,7 @@
 use crate::application::ai_memory_extraction::{
     AiMemoryExtractionStore, extract_ai_memory_candidates,
 };
-use crate::application::asr::{AsrPort, AsrRequest};
+use crate::application::asr::{AsrPort, AsrRequest, S3AudioObjectReference};
 use crate::application::auto_stop::{AutoStopSignal, AutoStopState};
 use crate::application::bot::{BotCommandService, StartCommandInput, StopCommandInput};
 use crate::application::command::{
@@ -71,7 +71,7 @@ use crate::infrastructure::storage::{
     StoreError, StoredMeeting,
 };
 use crate::infrastructure::storage_fs::{ChunkStorage, SavedChunk};
-use crate::infrastructure::storage_s3::MeetingChunkStorage;
+use crate::infrastructure::storage_s3::{MeetingChunkStorage, UploadReceiptStatus};
 use crate::interfaces::posting::{DISCORD_MESSAGE_LIMIT, split_discord_message};
 use crate::interfaces::vc_text::{fetch_vc_text_messages, warn_and_fallback_on_vc_text_error};
 use crate::interfaces::web::{
@@ -4595,25 +4595,63 @@ impl ScaffoldHandler {
                 );
                 EffectiveMeetingSettings::from_defaults(&self.meeting_settings_defaults())
             });
-        let whisper = CommandWhisperClient {
-            endpoint: self.whisper_endpoint.clone(),
-            curl_bin: "curl".to_owned(),
-            retry_policy: self.integration_retry_policy,
-            beam_size: effective_settings.whisper_beam_size,
-            suppress_non_speech: effective_settings.whisper_suppress_non_speech,
-            prompt: effective_settings.whisper_prompt.clone(),
-            vad: effective_settings.whisper_vad,
-            temperature: effective_settings.whisper_temperature,
-            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+        let live_job = LiveTranscriptionJob {
+            chunk: chunk.clone(),
+            base_start_ms,
+            meeting_title: meeting_title.clone(),
         };
-        let request = AsrRequest::local_file(
-            chunk.saved.path.clone(),
-            effective_settings.whisper_language.clone(),
-            crate::application::summary::build_whisper_context_prompt(
-                meeting_title.as_deref(),
-                Some(&chunk.user_id),
-            ),
+        let whisper = match self.whisper_client(&effective_settings) {
+            Ok(whisper) => whisper,
+            Err(error) => {
+                self.retry_live_transcription_job(&live_job, &error.to_string())
+                    .await;
+                return;
+            }
+        };
+        let language = effective_settings.whisper_language.clone();
+        let prompt = crate::application::summary::build_whisper_context_prompt(
+            meeting_title.as_deref(),
+            Some(&chunk.user_id),
         );
+        // The recording writer only enqueues the initial mirrored S3 upload.
+        // Wait for a receipt for this exact chunk before Whisper reads it.
+        let request = if let Some(objects) = self.recording_objects.clone() {
+            let path = chunk.saved.path.clone();
+            let speaker_id = chunk.user_id.clone();
+            let offset_ms = chunk.start_ms.saturating_sub(base_start_ms);
+            let result = tokio::task::block_in_place(|| {
+                let receipt = objects
+                    .upload_file_with_receipt(&path, "audio/wav")
+                    .map_err(|error| format!("failed to enqueue live audio S3 upload: {error}"))?
+                    .ok_or_else(|| "live audio is missing from S3 storage".to_owned())?;
+                match receipt.wait_timeout(Duration::from_secs(30)) {
+                    Some(UploadReceiptStatus::Durable) => {}
+                    Some(status) => {
+                        return Err(format!(
+                            "live audio S3 upload did not become durable: {status:?}"
+                        ));
+                    }
+                    None => return Err("timed out waiting for live audio S3 durability".to_owned()),
+                }
+                let reference = S3AudioObjectReference::new(
+                    receipt.key().to_owned(),
+                    Some(speaker_id),
+                    Some(offset_ms),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(AsrRequest::s3_object(reference, language, prompt))
+            });
+            match result {
+                Ok(request) => request,
+                Err(reason) => {
+                    warn!(meeting_id = %chunk.meeting_id, reason, "live audio is not durable in S3; retrying transcription");
+                    self.retry_live_transcription_job(&live_job, &reason).await;
+                    return;
+                }
+            }
+        } else {
+            AsrRequest::local_file(chunk.saved.path.clone(), language, prompt)
+        };
         let transcription = tokio::task::block_in_place(|| whisper.infer(&request));
         let mut segments = match transcription {
             Ok(output) => {
