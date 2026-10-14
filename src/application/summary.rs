@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use tracing::warn;
 
@@ -316,6 +317,11 @@ mod s3_transcription_source_tests {
             language: None,
             workspace,
         };
+        for speaker in &request.speaker_audio {
+            let path = std::path::Path::new(&speaker.audio_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, speaker.audio_path.as_bytes()).unwrap();
+        }
         let asr = FailOnceOnThirdChunkAsr {
             calls: Mutex::new(Vec::new()),
             failed_third_chunk: std::sync::atomic::AtomicBool::new(false),
@@ -334,11 +340,17 @@ mod s3_transcription_source_tests {
             serde_json::json!([{"chunk": "chunk-1"}, {"chunk": "chunk-2"}])
         );
 
+        // The speaker aggregate can be rebuilt at the same path when a late
+        // live-ASR chunk finishes. Its content fingerprint must invalidate
+        // only that checkpoint even though speaker and offset are unchanged.
+        std::fs::write(&request.speaker_audio[0].audio_path, b"rebuilt aggregate")
+            .expect("updated speaker audio should be written");
+
         let resumed = run_transcription_with_s3_sources(&asr, &request, &HashMap::new())
             .expect("retry should resume from successful chunk checkpoints");
         assert_eq!(
             *asr.calls.lock().unwrap(),
-            ["chunk-1", "chunk-2", "chunk-3", "chunk-3"]
+            ["chunk-1", "chunk-2", "chunk-3", "chunk-1", "chunk-3"]
         );
         assert_eq!(resumed.segments.len(), 1);
         assert_eq!(resumed.segments[0].text, "chunk-1 chunk-2 chunk-3");
@@ -393,12 +405,31 @@ const FINAL_ASR_CHECKPOINT_VERSION: u8 = 1;
 struct FinalAsrChunkCheckpoint {
     version: u8,
     audio_path: String,
+    audio_fingerprint: String,
     speaker_id: String,
     offset_ms: u64,
     language: Option<String>,
     prompt: Option<String>,
     segments: Vec<crate::domain::transcript::TranscriptSegment>,
     raw_response: serde_json::Value,
+}
+
+fn final_asr_audio_fingerprint(audio_path: &str) -> std::io::Result<String> {
+    let mut file = fs::File::open(audio_path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn final_asr_chunk_checkpoint_path(
@@ -420,6 +451,7 @@ fn load_final_asr_chunk_checkpoint(
     request: &SummaryRequest,
     speaker: &SpeakerAudioInput,
     prompt: Option<&str>,
+    audio_fingerprint: &str,
 ) -> Option<FinalAsrChunkCheckpoint> {
     let checkpoint: FinalAsrChunkCheckpoint = serde_json::from_slice(
         &fs::read(final_asr_chunk_checkpoint_path(
@@ -431,6 +463,7 @@ fn load_final_asr_chunk_checkpoint(
     .ok()?;
     (checkpoint.version == FINAL_ASR_CHECKPOINT_VERSION
         && checkpoint.audio_path == speaker.audio_path
+        && checkpoint.audio_fingerprint == audio_fingerprint
         && checkpoint.speaker_id == speaker.speaker_id
         && checkpoint.offset_ms == speaker.offset_ms
         && checkpoint.language == request.language
@@ -441,6 +474,7 @@ fn load_final_asr_chunk_checkpoint(
 fn persist_final_asr_chunk_checkpoint(
     request: &SummaryRequest,
     speaker: &SpeakerAudioInput,
+    audio_fingerprint: String,
     prompt: Option<String>,
     segments: Vec<crate::domain::transcript::TranscriptSegment>,
     raw_response: serde_json::Value,
@@ -454,6 +488,7 @@ fn persist_final_asr_chunk_checkpoint(
     let checkpoint = FinalAsrChunkCheckpoint {
         version: FINAL_ASR_CHECKPOINT_VERSION,
         audio_path: speaker.audio_path.clone(),
+        audio_fingerprint,
         speaker_id: speaker.speaker_id.clone(),
         offset_ms: speaker.offset_ms,
         language: request.language.clone(),
@@ -644,9 +679,11 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
         std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
     for speaker in &request.speaker_audio {
         let prompt = build_whisper_prompt(request, Some(speaker));
+        let audio_fingerprint = final_asr_audio_fingerprint(&speaker.audio_path).ok();
         let (checkpoint, needs_persist) = if let Some(checkpoint) =
-            load_final_asr_chunk_checkpoint(request, speaker, prompt.as_deref())
-        {
+            audio_fingerprint.as_deref().and_then(|fingerprint| {
+                load_final_asr_chunk_checkpoint(request, speaker, prompt.as_deref(), fingerprint)
+            }) {
             (checkpoint, false)
         } else {
             let transcription_result = whisper.infer(
@@ -689,6 +726,7 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
                 FinalAsrChunkCheckpoint {
                     version: FINAL_ASR_CHECKPOINT_VERSION,
                     audio_path: speaker.audio_path.clone(),
+                    audio_fingerprint: audio_fingerprint.clone().unwrap_or_default(),
                     speaker_id: speaker.speaker_id.clone(),
                     offset_ms: speaker.offset_ms,
                     language: request.language.clone(),
@@ -696,7 +734,8 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
                     segments,
                     raw_response,
                 },
-                true,
+                audio_fingerprint.is_some()
+                    && final_asr_audio_fingerprint(&speaker.audio_path).ok() == audio_fingerprint,
             )
         };
         speaker_debug_responses
@@ -707,6 +746,7 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
             && let Err(err) = persist_final_asr_chunk_checkpoint(
                 request,
                 speaker,
+                checkpoint.audio_fingerprint.clone(),
                 checkpoint.prompt.clone(),
                 checkpoint.segments.clone(),
                 checkpoint.raw_response.clone(),

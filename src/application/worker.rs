@@ -931,10 +931,7 @@ pub(crate) fn durable_s3_audio_source(
 }
 
 fn upload_receipt_is_durable(receipt: UploadReceipt) -> bool {
-    matches!(
-        receipt.wait_timeout(Duration::from_secs(30)),
-        Some(UploadReceiptStatus::Durable)
-    )
+    matches!(receipt.wait(), UploadReceiptStatus::Durable)
 }
 
 fn process_meeting_summary_with_ownership_check<S, W, C, F>(
