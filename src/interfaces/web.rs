@@ -346,6 +346,11 @@ enum GuildAdminCheck {
     RateLimited,
 }
 
+struct GuildAdminResolution {
+    decision: GuildAdminCheck,
+    member_roles: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuildAdminFallback {
     Strict,
@@ -2909,7 +2914,7 @@ async fn check_guild_admin_permission_with_bot_auth(
     user_id: &str,
     bot_auth: &str,
     use_cache: bool,
-) -> Result<GuildAdminCheck, StatusCode> {
+) -> Result<GuildAdminResolution, StatusCode> {
     let cache_key = guild_admin_permission_cache_key(&auth.guild_id, user_id);
     // Snapshot the cache revision before computing so a permission event that
     // lands mid-check keeps this stale result out of the cache.
@@ -2921,10 +2926,13 @@ async fn check_guild_admin_permission_with_bot_auth(
         if let Some(&(permission, expires_at)) = cache.get(&cache_key)
             && Instant::now() < expires_at
         {
-            return Ok(if permission.is_admin {
-                GuildAdminCheck::Admin
-            } else {
-                GuildAdminCheck::NotAdmin
+            return Ok(GuildAdminResolution {
+                decision: if permission.is_admin {
+                    GuildAdminCheck::Admin
+                } else {
+                    GuildAdminCheck::NotAdmin
+                },
+                member_roles: None,
             });
         }
     }
@@ -2940,7 +2948,10 @@ async fn check_guild_admin_permission_with_bot_auth(
             cache_guild_admin_permission(state, &auth.guild_id, user_id, true, observed_revision)
                 .await;
         }
-        return Ok(GuildAdminCheck::Admin);
+        return Ok(GuildAdminResolution {
+            decision: GuildAdminCheck::Admin,
+            member_roles: None,
+        });
     }
 
     // Slow path: fetch member roles and check ADMINISTRATOR bit
@@ -2975,7 +2986,10 @@ async fn check_guild_admin_permission_with_bot_auth(
                     )
                     .await;
                 }
-                return Ok(GuildAdminCheck::NotAdmin);
+                return Ok(GuildAdminResolution {
+                    decision: GuildAdminCheck::NotAdmin,
+                    member_roles: None,
+                });
             }
             GuildAdminCheck::BotAccessDenied => {
                 warn!(
@@ -2983,11 +2997,17 @@ async fn check_guild_admin_permission_with_bot_auth(
                     user_id = %user_id,
                     "discord member API denied bot token during admin check"
                 );
-                return Ok(GuildAdminCheck::BotAccessDenied);
+                return Ok(GuildAdminResolution {
+                    decision: GuildAdminCheck::BotAccessDenied,
+                    member_roles: None,
+                });
             }
             GuildAdminCheck::RateLimited => {
                 warn!(status = %resp_status, "discord member API rate limited");
-                return Ok(GuildAdminCheck::RateLimited);
+                return Ok(GuildAdminResolution {
+                    decision: GuildAdminCheck::RateLimited,
+                    member_roles: None,
+                });
             }
             GuildAdminCheck::Admin => {}
         }
@@ -3020,10 +3040,13 @@ async fn check_guild_admin_permission_with_bot_auth(
         cache_guild_admin_permission(state, &auth.guild_id, user_id, is_admin, observed_revision)
             .await;
     }
-    Ok(if is_admin {
-        GuildAdminCheck::Admin
-    } else {
-        GuildAdminCheck::NotAdmin
+    Ok(GuildAdminResolution {
+        decision: if is_admin {
+            GuildAdminCheck::Admin
+        } else {
+            GuildAdminCheck::NotAdmin
+        },
+        member_roles: Some(member.roles),
     })
 }
 
@@ -3032,16 +3055,35 @@ async fn check_guild_admin_permission_for_settings(
     auth: &AuthConfig,
     user_id: &str,
 ) -> Result<bool, StatusCode> {
+    check_guild_admin_permission_for_settings_with_roles(state, auth, user_id)
+        .await
+        .map(|(is_admin, _)| is_admin)
+}
+
+async fn check_guild_admin_permission_for_settings_with_roles(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<(bool, Option<Vec<String>>), StatusCode> {
     let effective_result = match bot_auth_header_for_guild(state, auth).await {
         Ok(bot_auth) => {
             check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, true).await
         }
         Err(status) => Err(status),
     };
-    if !should_retry_settings_admin_check_with_global(&effective_result) {
-        return effective_result.and_then(GuildAdminCheck::into_status_result);
+    let effective_check = effective_result
+        .as_ref()
+        .map(|resolution| resolution.decision)
+        .map_err(|status| *status);
+    if !should_retry_settings_admin_check_with_global(&effective_check) {
+        return effective_result.and_then(|resolution| {
+            Ok((
+                resolution.decision.into_status_result()?,
+                resolution.member_roles,
+            ))
+        });
     }
-    match &effective_result {
+    match &effective_check {
         Ok(GuildAdminCheck::BotAccessDenied) => warn!(
             user_id = %user_id,
             guild_id = %auth.guild_id,
@@ -3059,7 +3101,12 @@ async fn check_guild_admin_permission_for_settings(
     let global_bot_auth = format!("Bot {}", auth.bot_token);
     check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false)
         .await
-        .and_then(GuildAdminCheck::into_status_result)
+        .and_then(|resolution| {
+            Ok((
+                resolution.decision.into_status_result()?,
+                resolution.member_roles,
+            ))
+        })
 }
 
 async fn check_guild_admin_permission_strict(
@@ -3070,7 +3117,7 @@ async fn check_guild_admin_permission_strict(
     let bot_auth = bot_auth_header_for_guild(state, auth).await?;
     check_guild_admin_permission_with_bot_auth(state, auth, user_id, &bot_auth, false)
         .await
-        .and_then(GuildAdminCheck::into_status_result)
+        .and_then(|resolution| resolution.decision.into_status_result())
 }
 
 async fn check_guild_admin_permission_with_fallback(
@@ -6172,6 +6219,78 @@ fn rbac_role_grants_from_responses(
         .collect()
 }
 
+struct RbacRequestContext {
+    guild_id: String,
+    is_admin: bool,
+    member_roles: Option<Vec<String>>,
+    role_grants: Vec<RbacRoleGrant>,
+}
+
+impl RbacRequestContext {
+    fn allows(&self, permission: RbacPermission) -> bool {
+        if self.is_admin {
+            return true;
+        }
+        let member_role_source = self
+            .member_roles
+            .as_deref()
+            .map(MemberRoleSource::Available)
+            .unwrap_or(MemberRoleSource::LookupFailed);
+        resolve_rbac_permission(
+            permission,
+            &self.guild_id,
+            RbacSubject {
+                is_bot_admin: false,
+                is_guild_admin: false,
+                has_channel_view: false,
+                is_meeting_starter: false,
+            },
+            member_role_source,
+            &self.role_grants,
+        )
+        .allowed
+    }
+}
+
+async fn build_rbac_request_context<FetchRoles, RolesFuture, FetchGrants, GrantsFuture>(
+    guild_id: String,
+    is_admin: bool,
+    member_roles: Option<Vec<String>>,
+    fetch_member_roles: FetchRoles,
+    fetch_role_grants: FetchGrants,
+) -> Result<RbacRequestContext, StatusCode>
+where
+    FetchRoles: FnOnce() -> RolesFuture,
+    RolesFuture: std::future::Future<Output = Result<Vec<String>, StatusCode>>,
+    FetchGrants: FnOnce() -> GrantsFuture,
+    GrantsFuture: std::future::Future<Output = Result<Vec<RbacRoleGrant>, StatusCode>>,
+{
+    if is_admin {
+        return Ok(RbacRequestContext {
+            guild_id,
+            is_admin,
+            member_roles: None,
+            role_grants: Vec::new(),
+        });
+    }
+
+    let member_roles = match member_roles {
+        Some(member_roles) => Some(member_roles),
+        None => fetch_member_roles().await.ok(),
+    };
+    let role_grants = if member_roles.is_some() {
+        fetch_role_grants().await?
+    } else {
+        Vec::new()
+    };
+    Ok(RbacRequestContext {
+        guild_id,
+        is_admin,
+        member_roles,
+        role_grants,
+    })
+}
+
 async fn current_user_has_rbac_permission_for_auth(
     state: &WebState,
     auth: &AuthConfig,
@@ -6650,61 +6769,36 @@ async fn api_me(
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
 ) -> Result<Json<CurrentUserResponse>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let is_admin = check_guild_admin_permission_for_settings(&state, auth, &user_id).await?;
-    let can_manage_settings = current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::SettingsManage,
-        false,
-        false,
+    let (is_admin, member_roles) =
+        check_guild_admin_permission_for_settings_with_roles(&state, auth, &user_id).await?;
+    let context = build_rbac_request_context(
+        auth.guild_id.clone(),
+        is_admin,
+        member_roles,
+        || async {
+            fetch_member_roles_for_rbac(&state, auth, &user_id)
+                .await
+                .inspect_err(|status| {
+                    warn!(
+                        status = %status,
+                        guild_id = %auth.guild_id,
+                        user_id = %user_id,
+                        "denying api/me RBAC permissions after member role lookup failure"
+                    );
+                })
+        },
+        || async {
+            let grants = load_guild_rbac_role_grants(&state, &auth.guild_id).await?;
+            rbac_role_grants_from_responses(&auth.guild_id, &grants)
+        },
     )
     .await?;
-    let can_view_usage = current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::UsageView,
-        false,
-        false,
-    )
-    .await?;
-    let can_view_admin = current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::AdminView,
-        false,
-        false,
-    )
-    .await?;
-    let can_reprocess_meetings = current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::MeetingReprocess,
-        false,
-        false,
-    )
-    .await?;
-    let can_manage_domain_knowledge = current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::DomainKnowledgeManage,
-        false,
-        false,
-    )
-    .await?;
-    let can_manage_summary_templates = current_user_has_rbac_permission_for_settings_recovery(
-        &state,
-        auth,
-        &user_id,
-        RbacPermission::SummaryTemplateManage,
-        false,
-        false,
-    )
-    .await?;
+    let can_manage_settings = context.allows(RbacPermission::SettingsManage);
+    let can_view_usage = context.allows(RbacPermission::UsageView);
+    let can_view_admin = context.allows(RbacPermission::AdminView);
+    let can_reprocess_meetings = context.allows(RbacPermission::MeetingReprocess);
+    let can_manage_domain_knowledge = context.allows(RbacPermission::DomainKnowledgeManage);
+    let can_manage_summary_templates = context.allows(RbacPermission::SummaryTemplateManage);
     Ok(Json(CurrentUserResponse {
         user_id,
         guild_id: auth.guild_id.clone(),
@@ -6716,6 +6810,81 @@ async fn api_me(
         can_manage_domain_knowledge,
         can_manage_summary_templates,
     }))
+}
+
+#[cfg(test)]
+mod api_me_rbac_context_tests {
+    use super::{RbacRequestContext, RbacRoleGrant, build_rbac_request_context};
+    use crate::domain::authz::RbacPermission;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn member_roles_and_grants_are_loaded_once_per_request_context() {
+        let role_reads = Arc::new(AtomicUsize::new(0));
+        let grant_reads = Arc::new(AtomicUsize::new(0));
+
+        let first_role_reads = Arc::clone(&role_reads);
+        let first_grant_reads = Arc::clone(&grant_reads);
+        let first: RbacRequestContext = build_rbac_request_context(
+            "guild-a".to_owned(),
+            false,
+            None,
+            move || async move {
+                first_role_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["role-a".to_owned()])
+            },
+            move || async move {
+                first_grant_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![RbacRoleGrant {
+                    guild_id: "guild-a".to_owned(),
+                    discord_role_id: "role-a".to_owned(),
+                    permission: RbacPermission::SettingsManage,
+                }])
+            },
+        )
+        .await
+        .expect("first request authorization context loads");
+
+        for permission in RbacPermission::ALL {
+            let _ = first.allows(permission);
+        }
+        assert_eq!(role_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_reads.load(Ordering::SeqCst), 1);
+        assert!(first.allows(RbacPermission::SettingsManage));
+        assert!(!first.allows(RbacPermission::UsageView));
+
+        let second_role_reads = Arc::clone(&role_reads);
+        let second_grant_reads = Arc::clone(&grant_reads);
+        let second = build_rbac_request_context(
+            "guild-b".to_owned(),
+            false,
+            None,
+            move || async move {
+                second_role_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["role-b".to_owned()])
+            },
+            move || async move {
+                second_grant_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![RbacRoleGrant {
+                    guild_id: "guild-b".to_owned(),
+                    discord_role_id: "role-b".to_owned(),
+                    permission: RbacPermission::UsageView,
+                }])
+            },
+        )
+        .await
+        .expect("second request authorization context loads independently");
+
+        assert_eq!(role_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(grant_reads.load(Ordering::SeqCst), 2);
+        assert!(second.allows(RbacPermission::UsageView));
+        assert!(!second.allows(RbacPermission::SettingsManage));
+        assert!(first.allows(RbacPermission::SettingsManage));
+        assert!(!first.allows(RbacPermission::UsageView));
+    }
 }
 
 async fn api_me_guilds(
@@ -16053,7 +16222,7 @@ mod guild_api_tests {
 
         assert!(
             handler_section(source, "async fn api_me", "async fn api_me_guilds")
-                .contains("current_user_has_rbac_permission_for_settings_recovery")
+                .contains("check_guild_admin_permission_for_settings_with_roles")
         );
         assert!(
             handler_section(
