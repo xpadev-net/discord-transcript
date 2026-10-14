@@ -24,11 +24,11 @@ import type {
 
 const PAGE_SIZE = 20;
 
-function displayTitle(meeting: MeetingListItem): string {
+export function displayTitle(meeting: MeetingListItem): string {
   return displayMeetingTitle(meeting);
 }
 
-function displayDate(value: string | null): string {
+export function displayDate(value: string | null): string {
   return value ? formatDate(value) : "--";
 }
 
@@ -42,7 +42,10 @@ function displayVoiceChannel(meeting: MeetingListItem): string {
   );
 }
 
-function meetingPath(meetingId: string, guildId?: string | null): string {
+export function meetingPath(
+  meetingId: string,
+  guildId?: string | null,
+): string {
   const path = `/meetings/${encodeURIComponent(meetingId)}`;
   return guildId ? `${path}?guild_id=${encodeURIComponent(guildId)}` : path;
 }
@@ -449,7 +452,7 @@ export function DashboardPage({
   );
 }
 
-const ADMIN_MEETING_LIMIT = 100;
+export const ADMIN_MEETING_LIMIT = 100;
 const ADMIN_JOB_LIMIT = 100;
 
 const jobStatuses: Array<GuildJobStatus | ""> = [
@@ -489,7 +492,7 @@ function jobTypeLabel(jobType: string): string {
   return jobTypeLabels[jobType as GuildJobType] ?? jobType;
 }
 
-function adminErrorMessage(error: unknown): string {
+export function adminErrorMessage(error: unknown): string {
   if (isApiError(error) && error.status === 403) {
     return "この管理ビューを表示する権限がありません";
   }
@@ -498,7 +501,7 @@ function adminErrorMessage(error: unknown): string {
     : "管理情報の読み込みに失敗しました";
 }
 
-function formatCount(value: number): string {
+export function formatCount(value: number): string {
   return new Intl.NumberFormat().format(value);
 }
 
@@ -522,7 +525,10 @@ function latestIso(values: Array<string | null>): string | null {
   return newest === undefined ? null : new Date(newest).toISOString();
 }
 
-function daysSince(value: string | null, now = Date.now()): number | null {
+export function daysSince(
+  value: string | null,
+  now = Date.now(),
+): number | null {
   if (!value) {
     return null;
   }
@@ -533,7 +539,10 @@ function daysSince(value: string | null, now = Date.now()): number | null {
   return Math.max(0, Math.floor((now - time) / 86_400_000));
 }
 
-function isRetentionCandidate(value: string | null, ttlDays: number): boolean {
+export function isRetentionCandidate(
+  value: string | null,
+  ttlDays: number,
+): boolean {
   const ageDays = daysSince(value);
   return ageDays !== null && ageDays >= ttlDays;
 }
@@ -542,7 +551,7 @@ function isRetryableJob(job: GuildJob): boolean {
   return job.status === "failed" && job.dead_lettered_at === null;
 }
 
-function AdminHeader({
+export function AdminHeader({
   title,
   description,
   guildName,
@@ -564,7 +573,7 @@ function AdminHeader({
   );
 }
 
-function AdminLoading() {
+export function AdminLoading() {
   return (
     <output className="loading settings-panel-message">
       <span className="loading-spinner" />
@@ -573,7 +582,7 @@ function AdminLoading() {
   );
 }
 
-function AdminError({
+export function AdminError({
   message,
   onRetry,
 }: {
@@ -590,7 +599,7 @@ function AdminError({
   );
 }
 
-function AdminMetricCard({
+export function AdminMetricCard({
   label,
   value,
   detail,
@@ -608,7 +617,7 @@ function AdminMetricCard({
   );
 }
 
-interface AdminViewProps {
+export interface AdminViewProps {
   selectedGuildId?: string | null;
   selectedGuildName?: string;
   isSystemAdmin?: boolean;
@@ -1028,159 +1037,6 @@ export function AdminAuditPage({
           </div>
         </dl>
       </section>
-    </main>
-  );
-}
-
-export function AdminRetentionPage({
-  selectedGuildId,
-  selectedGuildName,
-}: AdminViewProps) {
-  const [reloadKey, setReloadKey] = useState(0);
-  const [settings, setSettings] = useState<GuildSettingsResponse | null>(null);
-  const [meetings, setMeetings] = useState<MeetingListResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    document.title = "Retention";
-  }, []);
-
-  useEffect(() => {
-    void reloadKey;
-    const controller = new AbortController();
-    setLoading(true);
-    setError(null);
-    Promise.all([
-      fetchGuildSettings(undefined, controller.signal),
-      fetchGuildMeetings(null, 1, ADMIN_MEETING_LIMIT, null, controller.signal),
-    ])
-      .then(([settingsResponse, meetingsResponse]) => {
-        if (!controller.signal.aborted) {
-          setSettings(settingsResponse);
-          setMeetings(meetingsResponse);
-        }
-      })
-      .catch((err: unknown) => {
-        if (!controller.signal.aborted) {
-          setError(adminErrorMessage(err));
-        }
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) {
-          setLoading(false);
-        }
-      });
-    return () => controller.abort();
-  }, [reloadKey]);
-
-  const meetingItems = meetings?.meetings ?? [];
-  const rawTtl = settings?.retention_raw_audio_ttl_days ?? 0;
-  const transcriptTtl = settings?.retention_transcript_ttl_days ?? 0;
-  const candidates = meetingItems.filter((meeting) => {
-    const candidateDate = meeting.stopped_at ?? meeting.started_at;
-    return (
-      isRetentionCandidate(candidateDate, rawTtl) ||
-      isRetentionCandidate(candidateDate, transcriptTtl)
-    );
-  });
-
-  return (
-    <main className="admin-page">
-      <AdminHeader
-        title="Retention"
-        description="削除候補と保持ポリシー"
-        guildName={selectedGuildName}
-        actions={
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() => setReloadKey((current) => current + 1)}
-            disabled={loading}
-          >
-            {"再読み込み"}
-          </button>
-        }
-      />
-
-      {error ? (
-        <AdminError
-          message={error}
-          onRetry={() => setReloadKey((current) => current + 1)}
-        />
-      ) : loading ? (
-        <AdminLoading />
-      ) : (
-        <div className="admin-view-layout">
-          <section className="admin-metric-grid admin-wide-section">
-            <AdminMetricCard
-              label="Raw audio TTL"
-              value={`${rawTtl || "--"} days`}
-              detail="Settings value"
-            />
-            <AdminMetricCard
-              label="Transcript TTL"
-              value={`${transcriptTtl || "--"} days`}
-              detail="Settings value"
-            />
-            <AdminMetricCard
-              label="Deletion candidates"
-              value={formatCount(candidates.length)}
-              detail={`visible ${meetingItems.length} meetings`}
-            />
-          </section>
-
-          <section className="admin-table-shell admin-wide-section">
-            <table className="meeting-table admin-table">
-              <thead>
-                <tr>
-                  <th scope="col">{"Meeting"}</th>
-                  <th scope="col">{"Stopped"}</th>
-                  <th scope="col">{"Age"}</th>
-                  <th scope="col">{"Raw audio"}</th>
-                  <th scope="col">{"Transcript"}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {candidates.map((meeting) => {
-                  const candidateDate =
-                    meeting.stopped_at ?? meeting.started_at;
-                  const ageDays = daysSince(candidateDate);
-                  const rawCandidate = isRetentionCandidate(
-                    candidateDate,
-                    rawTtl,
-                  );
-                  const transcriptCandidate = isRetentionCandidate(
-                    candidateDate,
-                    transcriptTtl,
-                  );
-                  return (
-                    <tr key={meeting.id}>
-                      <td>
-                        <Link
-                          className="meeting-title-link meeting-table-cell-link"
-                          to={meetingPath(meeting.id, selectedGuildId)}
-                        >
-                          {displayTitle(meeting)}
-                        </Link>
-                      </td>
-                      <td>{displayDate(candidateDate)}</td>
-                      <td>{ageDays === null ? "--" : `${ageDays} days`}</td>
-                      <td>{rawCandidate ? "Candidate" : "--"}</td>
-                      <td>{transcriptCandidate ? "Candidate" : "--"}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {candidates.length === 0 ? (
-              <div className="empty-state dashboard-panel-message">
-                {"表示中の会議には削除候補がありません"}
-              </div>
-            ) : null}
-          </section>
-        </div>
-      )}
     </main>
   );
 }

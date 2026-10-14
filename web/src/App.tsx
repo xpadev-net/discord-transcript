@@ -1,14 +1,12 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { Navigate, Route, Routes, useParams } from "react-router-dom";
 import { ForbiddenState } from "./components/ForbiddenState";
 import { Nav } from "./components/Nav";
 import { fetchMe, fetchMeGuilds } from "./lib/api";
 import type { MeResponse, UserGuild } from "./lib/types";
-import { AdminPlansPage } from "./pages/AdminPlansPage";
 import {
   AdminAuditPage,
   AdminJobsPage,
-  AdminRetentionPage,
   AdminUsagePage,
   DashboardPage,
 } from "./pages/DashboardPage";
@@ -16,6 +14,17 @@ import { MeetingPage } from "./pages/MeetingPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 const selectedGuildStorageKey = "dt.selectedGuildId";
+
+const LazyAdminPlansPage = lazy(() =>
+  import("./pages/AdminPlansPage").then((module) => ({
+    default: module.AdminPlansPage,
+  })),
+);
+const LazyAdminRetentionPage = lazy(() =>
+  import("./pages/AdminRetentionPage").then((module) => ({
+    default: module.AdminRetentionPage,
+  })),
+);
 
 function readStoredGuildId(): string | null {
   try {
@@ -353,10 +362,12 @@ export function App() {
               forbidden={sessionForbidden}
               error={sessionError}
             >
-              <AdminRetentionPage
-                selectedGuildId={me?.guild_id}
-                selectedGuildName={currentGuildName}
-              />
+              <Suspense fallback={<AdminRouteLoading />}>
+                <LazyAdminRetentionPage
+                  selectedGuildId={me?.guild_id}
+                  selectedGuildName={currentGuildName}
+                />
+              </Suspense>
             </GuildAdminRoute>
           }
         />
@@ -448,8 +459,21 @@ function GuildAdminRoute(props: AdminRouteProps) {
 function SystemAdminRoute(props: AdminRouteProps) {
   return (
     <AdminRouteFrame {...props} forbiddenMessage="システム管理権限が必要です">
-      <AdminPlansPage />
+      <Suspense fallback={<AdminRouteLoading />}>
+        <LazyAdminPlansPage />
+      </Suspense>
     </AdminRouteFrame>
+  );
+}
+
+function AdminRouteLoading() {
+  return (
+    <main className="admin-page">
+      <output className="loading settings-panel-message">
+        <span className="loading-spinner" />
+        {"読み込み中"}
+      </output>
+    </main>
   );
 }
 
