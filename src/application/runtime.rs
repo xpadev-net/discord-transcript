@@ -8970,7 +8970,7 @@ impl ScaffoldHandler {
                                 !Path::new(&speaker.audio_path)
                                     .parent()
                                     .and_then(Path::file_name)
-                                    .is_some_and(|name| name == "transcription_chunks"),
+                                    .is_none_or(|name| name != "transcription_chunks"),
                                 require_s3_chunk_sources,
                             )
                             .map_err(|err| {
