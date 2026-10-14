@@ -8811,55 +8811,59 @@ impl ScaffoldHandler {
         } else if request.speaker_audio.is_empty() && has_completed_live_chunks {
             crate::application::summary::build_transcription_output(live_segments.clone())
         } else {
-            let s3_sources = if let Some(objects) = &self.recording_objects {
-                (|| {
-                    let mut sources = HashMap::new();
-                    if let Some(source) =
-                        durable_s3_audio_source(objects, Path::new(&request.audio_path), None, None)
+            tokio::task::block_in_place(|| {
+                let s3_sources = if let Some(objects) = &self.recording_objects {
+                    (|| {
+                        let mut sources = HashMap::new();
+                        if request.speaker_audio.is_empty()
+                            && let Some(source) = durable_s3_audio_source(
+                                objects,
+                                Path::new(&request.audio_path),
+                                None,
+                                None,
+                            )
                             .map_err(|err| {
                                 crate::application::summary::SummaryError::SummaryEngine(
                                     err.to_string(),
                                 )
                             })?
-                    {
-                        sources.insert(PathBuf::from(&request.audio_path), source);
-                    }
-                    for speaker in &request.speaker_audio {
-                        if let Some(source) = durable_s3_audio_source(
-                            objects,
-                            Path::new(&speaker.audio_path),
-                            Some(speaker.speaker_id.clone()),
-                            Some(speaker.offset_ms),
-                        )
-                        .map_err(|err| {
-                            crate::application::summary::SummaryError::SummaryEngine(
-                                err.to_string(),
-                            )
-                        })? {
-                            sources.insert(PathBuf::from(&speaker.audio_path), source);
+                        {
+                            sources.insert(PathBuf::from(&request.audio_path), source);
                         }
-                    }
-                    Ok::<_, crate::application::summary::SummaryError>(sources)
-                })()
-            } else {
-                Ok(HashMap::new())
-            };
-            s3_sources
-                .and_then(|sources| {
-                    tokio::task::block_in_place(|| {
-                        crate::application::summary::run_transcription_with_s3_sources(
-                            &whisper, &request, &sources,
-                        )
-                    })
+                        for speaker in &request.speaker_audio {
+                            if let Some(source) = durable_s3_audio_source(
+                                objects,
+                                Path::new(&speaker.audio_path),
+                                Some(speaker.speaker_id.clone()),
+                                Some(speaker.offset_ms),
+                            )
+                            .map_err(|err| {
+                                crate::application::summary::SummaryError::SummaryEngine(
+                                    err.to_string(),
+                                )
+                            })? {
+                                sources.insert(PathBuf::from(&speaker.audio_path), source);
+                            }
+                        }
+                        Ok::<_, crate::application::summary::SummaryError>(sources)
+                    })()
+                } else {
+                    Ok(HashMap::new())
+                };
+                s3_sources.and_then(|sources| {
+                    crate::application::summary::run_transcription_with_s3_sources(
+                        &whisper, &request, &sources,
+                    )
                 })
-                .and_then(|mut output| {
-                    if live_segments.is_empty() {
-                        return Ok(output);
-                    }
-                    output.segments.extend(live_segments.clone());
-                    sort_transcript_segments(&mut output.segments);
-                    crate::application::summary::build_transcription_output(output.segments)
-                })
+            })
+            .and_then(|mut output| {
+                if live_segments.is_empty() {
+                    return Ok(output);
+                }
+                output.segments.extend(live_segments.clone());
+                sort_transcript_segments(&mut output.segments);
+                crate::application::summary::build_transcription_output(output.segments)
+            })
         };
         let mut transcription = match transcription {
             Ok(t) => t,

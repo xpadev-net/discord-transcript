@@ -899,17 +899,15 @@ pub(crate) fn durable_s3_audio_source(
             })?;
         match receipt.wait_timeout(Duration::from_secs(30)) {
             Some(UploadReceiptStatus::Durable) => true,
-            Some(UploadReceiptStatus::Superseded) => false,
+            Some(UploadReceiptStatus::Superseded) => return Ok(None),
             Some(status) => {
                 return Err(WorkerError::Summary(format!(
                     "ASR audio upload did not become durable: {status:?}"
                 )));
             }
-            None => {
-                return Err(WorkerError::Summary(
-                    "timed out waiting for ASR audio upload durability".to_owned(),
-                ));
-            }
+            // The source is still available locally; the background upload
+            // can finish independently without blocking this summary job.
+            None => return Ok(None),
         }
     } else {
         objects.object_exists(path).map_err(|err| {
@@ -1649,12 +1647,14 @@ where
         };
         let mut s3_sources = HashMap::new();
         if let Some(objects) = &options.recording_objects {
-            if let Some(source) = durable_s3_audio_source(
-                objects,
-                std::path::Path::new(&input.audio_path),
-                None,
-                None,
-            )? {
+            if input.speaker_audio.is_empty()
+                && let Some(source) = durable_s3_audio_source(
+                    objects,
+                    std::path::Path::new(&input.audio_path),
+                    None,
+                    None,
+                )?
+            {
                 s3_sources.insert(std::path::PathBuf::from(&input.audio_path), source);
             }
             for speaker in &input.speaker_audio {
