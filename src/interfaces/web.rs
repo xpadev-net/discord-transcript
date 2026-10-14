@@ -3102,10 +3102,10 @@ async fn check_guild_admin_permission_for_settings_with_roles(
     check_guild_admin_permission_with_bot_auth(state, auth, user_id, &global_bot_auth, false)
         .await
         .and_then(|resolution| {
-            Ok((
-                resolution.decision.into_status_result()?,
-                resolution.member_roles,
-            ))
+            // Settings recovery is only a fallback for routes that separately
+            // authorize with the guild-scoped token. Do not advertise RBAC
+            // grants based on roles fetched with the global token here.
+            Ok((resolution.decision.into_status_result()?, None))
         })
 }
 
