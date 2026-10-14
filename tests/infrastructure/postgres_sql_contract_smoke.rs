@@ -135,6 +135,7 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     let first_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
         .replace("$1", "'g-page-plan'")
         .replace("$2::TEXT IS NULL", "TRUE")
+        .replace("$2", "'vc-plan'")
         .replace("$3::TEXT IS NULL", "TRUE")
         .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
         .replace("$4::TEXT", "'unused'")
@@ -152,6 +153,7 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     let second_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
         .replace("$1", "'g-page-plan'")
         .replace("$2::TEXT IS NULL", "TRUE")
+        .replace("$2", "'vc-plan'")
         .replace("$3::TEXT IS NULL", "FALSE")
         .replace("$3::TEXT::TIMESTAMPTZ", &format!("TIMESTAMPTZ '{cursor_time}'"))
         .replace("$4::TEXT", &format!("'{cursor_id}'"))
@@ -176,6 +178,7 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
         LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
             .replace("$1", "'g-page-plan'")
             .replace("$2::TEXT IS NULL", "TRUE")
+            .replace("$2", "'vc-plan'")
             .replace("$3::TEXT IS NULL", "FALSE")
             .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
             .replace("$4::TEXT", "'page-100'")
