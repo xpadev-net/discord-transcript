@@ -890,29 +890,23 @@ pub(crate) fn durable_s3_audio_source(
         return Ok(None);
     };
     let durable = if path.is_file() {
-        let receipt = match receipt {
-            Some(receipt) => receipt,
-            None => match objects.upload_file_with_receipt(path, "audio/wav") {
-                Ok(Some(receipt)) => receipt,
-                // Local audio remains a valid input when S3 is unavailable or its
-                // upload queue cannot accept another artifact.
-                Ok(None) | Err(_) => return Ok(None),
-            },
-        };
-        match receipt.wait_timeout(Duration::from_secs(30)) {
-            Some(UploadReceiptStatus::Durable) => true,
-            Some(UploadReceiptStatus::Superseded) => return Ok(None),
-            Some(
-                UploadReceiptStatus::Failed(_)
-                | UploadReceiptStatus::Cancelled
-                | UploadReceiptStatus::Shutdown,
-            ) => return Ok(None),
-            Some(UploadReceiptStatus::Queued | UploadReceiptStatus::Retrying { .. }) => {
-                unreachable!("wait_timeout only returns terminal upload states")
+        match receipt {
+            Some(receipt) => upload_receipt_is_durable(receipt),
+            None if objects.object_exists(path).map_err(|err| {
+                WorkerError::Summary(format!("failed to verify ASR audio object: {err}"))
+            })? =>
+            {
+                true
             }
-            // The source is still available locally; the background upload
-            // can finish independently without blocking this summary job.
-            None => return Ok(None),
+            None => {
+                let receipt = match objects.upload_file_with_receipt(path, "audio/wav") {
+                    Ok(Some(receipt)) => receipt,
+                    // Local audio remains a valid input when S3 is unavailable or its
+                    // upload queue cannot accept another artifact.
+                    Ok(None) | Err(_) => return Ok(None),
+                };
+                upload_receipt_is_durable(receipt)
+            }
         }
     } else {
         objects.object_exists(path).map_err(|err| {
@@ -928,6 +922,13 @@ pub(crate) fn durable_s3_audio_source(
     S3AudioObjectReference::new(key, speaker_id, offset_ms)
         .map(Some)
         .map_err(|err| WorkerError::Summary(err.to_string()))
+}
+
+fn upload_receipt_is_durable(receipt: UploadReceipt) -> bool {
+    matches!(
+        receipt.wait_timeout(Duration::from_secs(30)),
+        Some(UploadReceiptStatus::Durable)
+    )
 }
 
 fn process_meeting_summary_with_ownership_check<S, W, C, F>(

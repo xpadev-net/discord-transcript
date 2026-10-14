@@ -30,8 +30,9 @@ use crate::application::worker::{
     spawn_summary_job_heartbeat,
 };
 use crate::audio::meeting_audio::{
-    ProcessedAudioChunk, build_speaker_audio_inputs,
+    AudioChunkManifestEntry, ProcessedAudioChunk, build_speaker_audio_inputs,
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
+    scan_chunk_manifest, speaker_audio_inputs_from_manifest,
 };
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{
@@ -8273,11 +8274,22 @@ impl ScaffoldHandler {
         meeting_id: &str,
         job_id: &str,
         audio_path: &str,
+        audio_input_paths: Option<Vec<String>>,
         transcription: &crate::application::summary::TranscriptionOutput,
     ) {
         let audio_path_for_read = audio_path.to_owned();
         let quantity = match tokio::task::spawn_blocking(move || {
-            crate::application::worker::asr_seconds_from_audio_path(&audio_path_for_read)
+            if let Some(paths) = audio_input_paths {
+                paths.iter().try_fold(0i64, |total, path| {
+                    total
+                        .checked_add(crate::application::worker::asr_seconds_from_audio_path(
+                            path,
+                        )?)
+                        .ok_or_else(|| "ASR audio duration total overflow".to_owned())
+                })
+            } else {
+                crate::application::worker::asr_seconds_from_audio_path(&audio_path_for_read)
+            }
         })
         .await
         {
@@ -8483,6 +8495,7 @@ impl ScaffoldHandler {
             Audio {
                 meeting_dir: PathBuf,
                 completed_live_chunks: Vec<ProcessedAudioChunk>,
+                s3_manifest: Option<Vec<AudioChunkManifestEntry>>,
             },
         }
         let (audio_path, live_segments, summary_input_source) = if recovered_from_final_segments {
@@ -8564,45 +8577,92 @@ impl ScaffoldHandler {
                     "falling back to legacy mixdown path"
                 );
             }
-            let audio_path = match merge_user_chunks_to_mixdown(
-                &meeting_dir,
-                effective_settings.whisper_resample_to_16k,
-            ) {
-                Ok(path) => path,
-                Err(err) => {
-                    let err_string = format!("merge failed: {err}");
-                    let mut queue = self.queue.lock().await;
-                    let exhausted = retry_claimed_summary_job(
-                        &mut *queue,
-                        &claimed_job,
-                        err_string.clone(),
-                        self.summary_max_retries,
-                        "merge",
-                    );
-                    drop(queue);
-                    if exhausted {
-                        let mut service = self.service.lock().await;
-                        let _ = mark_summary_meeting_failed_from_summary_state(
-                            &mut service.store,
-                            &claimed_job.meeting_id,
+            let s3_manifest = if self.recording_objects.is_some() {
+                match scan_chunk_manifest(&meeting_dir) {
+                    Ok(manifest) => Some(manifest),
+                    Err(err) => {
+                        let err_string = format!("S3 manifest failed: {err}");
+                        let mut queue = self.queue.lock().await;
+                        let exhausted = retry_claimed_summary_job(
+                            &mut *queue,
+                            &claimed_job,
                             err_string.clone(),
+                            self.summary_max_retries,
+                            "transcription_manifest",
                         );
-                        return Err(SummaryJobRunError::Terminal(err_string));
+                        drop(queue);
+                        if exhausted {
+                            let mut service = self.service.lock().await;
+                            let _ = mark_summary_meeting_failed_from_summary_state(
+                                &mut service.store,
+                                &claimed_job.meeting_id,
+                                err_string.clone(),
+                            );
+                            return Err(SummaryJobRunError::Terminal(err_string));
+                        }
+                        return Err(retry_scheduled_error(&claimed_job, err_string));
                     }
-                    return Err(retry_scheduled_error(&claimed_job, err_string));
+                }
+            } else {
+                None
+            };
+            let audio_path = if s3_manifest.is_some() {
+                meeting_dir
+                    .join("mixdown.wav")
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                match merge_user_chunks_to_mixdown(
+                    &meeting_dir,
+                    effective_settings.whisper_resample_to_16k,
+                ) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let err_string = format!("merge failed: {err}");
+                        let mut queue = self.queue.lock().await;
+                        let exhausted = retry_claimed_summary_job(
+                            &mut *queue,
+                            &claimed_job,
+                            err_string.clone(),
+                            self.summary_max_retries,
+                            "merge",
+                        );
+                        drop(queue);
+                        if exhausted {
+                            let mut service = self.service.lock().await;
+                            let _ = mark_summary_meeting_failed_from_summary_state(
+                                &mut service.store,
+                                &claimed_job.meeting_id,
+                                err_string.clone(),
+                            );
+                            return Err(SummaryJobRunError::Terminal(err_string));
+                        }
+                        return Err(retry_scheduled_error(&claimed_job, err_string));
+                    }
                 }
             };
 
-            let final_timeline_base_ms = match load_chunks(&meeting_dir) {
-                Ok(chunks) => Some(compute_meeting_start_ms(&chunks)),
-                Err(err) => {
-                    warn!(
-                        meeting_id = %meeting.id,
-                        error = %err,
-                        "failed to compute final transcript timeline base; live transcript rows will not be timeline-adjusted"
-                    );
-                    None
-                }
+            let final_timeline_base_ms = match &s3_manifest {
+                Some(chunks) => Some(
+                    chunks
+                        .iter()
+                        .map(|chunk| chunk.start_ms)
+                        .filter(|start_ms| *start_ms > 0)
+                        .min()
+                        .or_else(|| chunks.iter().map(|chunk| chunk.start_ms).min())
+                        .unwrap_or(0),
+                ),
+                None => match load_chunks(&meeting_dir) {
+                    Ok(chunks) => Some(compute_meeting_start_ms(&chunks)),
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %meeting.id,
+                            error = %err,
+                            "failed to compute final transcript timeline base; live transcript rows will not be timeline-adjusted"
+                        );
+                        None
+                    }
+                },
             };
 
             let (live_segments, completed_live_chunks) = {
@@ -8650,6 +8710,7 @@ impl ScaffoldHandler {
                 SummaryInputSource::Audio {
                     meeting_dir,
                     completed_live_chunks,
+                    s3_manifest,
                 },
             )
         };
@@ -8664,14 +8725,24 @@ impl ScaffoldHandler {
         let speaker_audio = match match &summary_input_source {
             SummaryInputSource::FinalTranscript => Ok(Vec::new()),
             SummaryInputSource::Audio {
+                meeting_dir: _,
+                completed_live_chunks,
+                s3_manifest: Some(manifest),
+            } => Ok(speaker_audio_inputs_from_manifest(
+                manifest,
+                completed_live_chunks,
+            )),
+            SummaryInputSource::Audio {
                 meeting_dir,
                 completed_live_chunks,
+                s3_manifest: None,
             } if completed_live_chunks.is_empty() => {
                 build_speaker_audio_inputs(meeting_dir, effective_settings.whisper_resample_to_16k)
             }
             SummaryInputSource::Audio {
                 meeting_dir,
                 completed_live_chunks,
+                s3_manifest: None,
             } => build_speaker_audio_inputs_excluding_processed_chunks(
                 meeting_dir,
                 effective_settings.whisper_resample_to_16k,
@@ -8727,6 +8798,11 @@ impl ScaffoldHandler {
         // never lands under `speakers/`.
         let playback_speaker_dir: Option<PathBuf> = match &summary_input_source {
             SummaryInputSource::Audio {
+                meeting_dir,
+                s3_manifest: Some(_),
+                ..
+            } => Some(meeting_dir.clone()),
+            SummaryInputSource::Audio {
                 completed_live_chunks,
                 ..
             } if completed_live_chunks.is_empty() => None,
@@ -8768,6 +8844,7 @@ impl ScaffoldHandler {
         // the local copy is still authoritative for this run.
         if let Some(objects) = &self.recording_objects {
             let artifact_paths = std::iter::once(std::path::Path::new(&audio_path))
+                .filter(|path| path.is_file())
                 .chain(playback_speaker_paths.iter().map(|path| path.as_path()));
             for path in artifact_paths {
                 match objects.upload_file_with_receipt(path, "audio/wav") {
@@ -8846,6 +8923,13 @@ impl ScaffoldHandler {
                 ..
             } if !completed_live_chunks.is_empty()
         );
+        let require_s3_chunk_sources = matches!(
+            &summary_input_source,
+            SummaryInputSource::Audio {
+                s3_manifest: Some(_),
+                ..
+            }
+        );
         let transcription = if matches!(&summary_input_source, SummaryInputSource::FinalTranscript)
         {
             crate::application::summary::build_transcription_output(final_segments.clone())
@@ -8873,7 +8957,7 @@ impl ScaffoldHandler {
                             sources.insert(PathBuf::from(&request.audio_path), source);
                         }
                         for speaker in &request.speaker_audio {
-                            if let Some(source) = durable_s3_audio_source(
+                            let source = durable_s3_audio_source(
                                 objects,
                                 Path::new(&speaker.audio_path),
                                 Some(speaker.speaker_id.clone()),
@@ -8884,7 +8968,18 @@ impl ScaffoldHandler {
                                 crate::application::summary::SummaryError::SummaryEngine(
                                     err.to_string(),
                                 )
-                            })? {
+                            })?;
+                            if require_s3_chunk_sources && source.is_none() {
+                                return Err(
+                                    crate::application::summary::SummaryError::SummaryEngine(
+                                        format!(
+                                            "S3 final ASR chunk is not durable: {}",
+                                            speaker.audio_path
+                                        ),
+                                    ),
+                                );
+                            }
+                            if let Some(source) = source {
                                 sources.insert(PathBuf::from(&speaker.audio_path), source);
                             }
                         }
@@ -8964,12 +9059,22 @@ impl ScaffoldHandler {
             }
         };
 
-        if !recovered_from_final_segments {
+        if !recovered_from_final_segments
+            && (!require_s3_chunk_sources || !request.speaker_audio.is_empty())
+        {
+            let audio_input_paths = require_s3_chunk_sources.then(|| {
+                request
+                    .speaker_audio
+                    .iter()
+                    .map(|speaker| speaker.audio_path.clone())
+                    .collect()
+            });
             self.record_asr_seconds_usage(
                 &meeting.guild_id,
                 &claimed_job.meeting_id,
                 &claimed_job.id,
                 &request.audio_path,
+                audio_input_paths,
                 &transcription,
             )
             .await;

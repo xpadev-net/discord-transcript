@@ -60,7 +60,7 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `INTEGRATION_RETRY_INITIAL_DELAY_MS` | `200` | リトライ初回遅延 (ms) |
 | `INTEGRATION_RETRY_BACKOFF_MULTIPLIER` | `2` | 指数バックオフの倍率 |
 | `INTEGRATION_RETRY_MAX_DELAY_MS` | `5000` | リトライ最大遅延 (ms) |
-| `CHUNK_STORAGE_BACKEND` | `local` | 録音データの保管先。`local` はローカルファイル、`s3` は S3 / S3 互換ストレージ（ローカルファイルは録音中の一次配置のみ、S3 が正本）。`s3` 時は `CHUNK_STORAGE_S3_*` が必須で、再生は presigned GET URL で配信します。 |
+| `CHUNK_STORAGE_BACKEND` | `local` | 録音データの保管先。`local` はローカルファイル、`s3` は S3 / S3 互換ストレージ（ローカルファイルは録音中の一次配置のみ、S3 が正本）。`s3` 時は `CHUNK_STORAGE_S3_*` が必須で、再生は presigned GET URL で配信します。final ASR はdurableなraw WAVを1 chunkずつWhisperへstreamし、ASR用mixdownは作りません（最大4,096 chunk、timeline span 24時間、合計512 MiB）。 |
 | `CHUNK_STORAGE_S3_BUCKET` | - | backend が `s3` のとき必須。保存先バケット |
 | `CHUNK_STORAGE_S3_ACCESS_KEY_ID` | - | backend が `s3` のとき必須 |
 | `CHUNK_STORAGE_S3_SECRET_ACCESS_KEY` | - | backend が `s3` のとき必須 |
