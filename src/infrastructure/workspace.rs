@@ -255,6 +255,10 @@ impl MeetingWorkspacePaths {
         self.root.join("audio")
     }
 
+    pub fn final_asr_checkpoint_dir(&self) -> PathBuf {
+        self.audio_dir().join(".final_asr_checkpoints")
+    }
+
     pub fn transcript_dir(&self) -> PathBuf {
         self.root.join("transcript")
     }

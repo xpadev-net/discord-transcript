@@ -9332,15 +9332,13 @@ impl ScaffoldHandler {
                     for path in paths {
                         match objects.upload_file_with_receipt(&path, "audio/wav") {
                             Ok(Some(receipt)) => {
-                                let durable = tokio::task::spawn_blocking(move || {
-                                    receipt.wait_timeout(Duration::from_secs(30))
-                                })
-                                .await
-                                .map_err(|err| {
-                                    format!("playback artifact upload task failed: {err}")
-                                });
-                                match durable {
-                                    Ok(Some(UploadReceiptStatus::Durable)) => {}
+                                let status = tokio::task::spawn_blocking(move || receipt.wait())
+                                    .await
+                                    .map_err(|err| {
+                                        format!("playback artifact upload task failed: {err}")
+                                    });
+                                match status {
+                                    Ok(UploadReceiptStatus::Durable) => {}
                                     Ok(status) => {
                                         upload_error = Some(format!(
                                             "playback artifact upload did not become durable for {}: {status:?}",
