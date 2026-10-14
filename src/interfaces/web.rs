@@ -2494,6 +2494,23 @@ async fn verify_meeting_read_access(
     user_id: &str,
     requested_guild_id: Option<&str>,
 ) -> Result<MeetingAccess, StatusCode> {
+    verify_meeting_read_access_with_rbac_cache(
+        state,
+        meeting_id,
+        user_id,
+        requested_guild_id,
+        false,
+    )
+    .await
+}
+
+async fn verify_meeting_read_access_with_rbac_cache(
+    state: &WebState,
+    meeting_id: &str,
+    user_id: &str,
+    requested_guild_id: Option<&str>,
+    use_rbac_cache: bool,
+) -> Result<MeetingAccess, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     // Look up the meeting's voice channel and guild ID in a single round-trip.
@@ -2517,16 +2534,28 @@ async fn verify_meeting_read_access(
         Some(_) | None => auth.as_ref().clone(),
     };
     let access = meeting_access_from_row(guild_id, channel_id.clone(), &meeting_auth.guild_id)?;
-    if current_user_has_rbac_permission_for_transcript_read(
-        state,
-        &meeting_auth,
-        user_id,
-        RbacPermission::MeetingView,
-        false,
-        false,
-    )
-    .await?
-    {
+    let can_view_meeting = if use_rbac_cache {
+        current_user_has_rbac_permission_for_transcript_read(
+            state,
+            &meeting_auth,
+            user_id,
+            RbacPermission::MeetingView,
+            false,
+            false,
+        )
+        .await?
+    } else {
+        current_user_has_rbac_permission_for_auth(
+            state,
+            &meeting_auth,
+            user_id,
+            RbacPermission::MeetingView,
+            false,
+            false,
+        )
+        .await?
+    };
+    if can_view_meeting {
         return Ok(access);
     }
     verify_meeting_access_after_row(
@@ -12189,7 +12218,14 @@ async fn api_transcript_events(
     Path(meeting_id): Path<String>,
     Query(query): Query<MeetingAccessQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    verify_meeting_read_access(&state, &meeting_id, &user_id, query.guild_id.as_deref()).await?;
+    verify_meeting_read_access_with_rbac_cache(
+        &state,
+        &meeting_id,
+        &user_id,
+        query.guild_id.as_deref(),
+        true,
+    )
+    .await?;
     let requested_guild_id = query.guild_id;
     let permit =
         try_acquire_transcript_sse_permit(&state.transcript_sse_limiter, &user_id, &meeting_id)?;
@@ -12277,11 +12313,12 @@ async fn api_transcript_events(
                     ),
                 ));
             }
-            if let Err(status) = verify_meeting_read_access(
+            if let Err(status) = verify_meeting_read_access_with_rbac_cache(
                 &state,
                 &meeting_id,
                 &user_id,
                 requested_guild_id.as_deref(),
+                true,
             )
             .await
             {
