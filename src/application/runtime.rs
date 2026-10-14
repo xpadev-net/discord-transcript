@@ -9013,46 +9013,6 @@ impl ScaffoldHandler {
             })
         };
 
-        // S3 final ASR must not wait for playback-only artifacts that load the
-        // full PCM timeline. Build and upload them only after transcription.
-        if let Some(objects) = &self.recording_objects {
-            let playback_dir = match &summary_input_source {
-                SummaryInputSource::Audio { meeting_dir, .. } => Some(meeting_dir.clone()),
-                SummaryInputSource::FinalTranscript => Some(workspace.audio_dir()),
-            };
-            if let Some(playback_dir) = playback_dir {
-                let resample = effective_settings.whisper_resample_to_16k;
-                let artifacts = tokio::task::spawn_blocking(move || {
-                    let mixdown = merge_user_chunks_to_mixdown(&playback_dir, resample)?;
-                    let speakers = build_speaker_audio_inputs(&playback_dir, resample)?;
-                    Ok::<_, String>(
-                        std::iter::once(PathBuf::from(mixdown))
-                            .chain(
-                                speakers
-                                    .into_iter()
-                                    .map(|speaker| PathBuf::from(speaker.audio_path)),
-                            )
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .await;
-                match artifacts {
-                    Ok(Ok(paths)) => {
-                        for path in paths {
-                            if let Err(err) = objects.upload_file_with_receipt(&path, "audio/wav") {
-                                warn!(meeting_id = %claimed_job.meeting_id, path = %path.display(), error = %err, "failed to queue playback artifact upload");
-                            }
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "failed to build playback artifacts after final transcription")
-                    }
-                    Err(err) => {
-                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "playback artifact task failed after final transcription")
-                    }
-                }
-            }
-        }
         let mut transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
@@ -9289,6 +9249,49 @@ impl ScaffoldHandler {
                 return Err(SummaryJobRunError::TerminalStatusUpdated(err));
             }
             return Err(retry_scheduled_error(&claimed_job, err));
+        }
+
+        // Persist successful ASR before rebuilding playback-only PCM artifacts.
+        // Large S3-backed meetings can exhaust memory while mixing down, so a
+        // retry must be able to recover the completed transcript without
+        // repeating Whisper inference.
+        if let Some(objects) = &self.recording_objects {
+            let playback_dir = match &summary_input_source {
+                SummaryInputSource::Audio { meeting_dir, .. } => Some(meeting_dir.clone()),
+                SummaryInputSource::FinalTranscript => Some(workspace.audio_dir()),
+            };
+            if let Some(playback_dir) = playback_dir {
+                let resample = effective_settings.whisper_resample_to_16k;
+                let artifacts = tokio::task::spawn_blocking(move || {
+                    let mixdown = merge_user_chunks_to_mixdown(&playback_dir, resample)?;
+                    let speakers = build_speaker_audio_inputs(&playback_dir, resample)?;
+                    Ok::<_, String>(
+                        std::iter::once(PathBuf::from(mixdown))
+                            .chain(
+                                speakers
+                                    .into_iter()
+                                    .map(|speaker| PathBuf::from(speaker.audio_path)),
+                            )
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .await;
+                match artifacts {
+                    Ok(Ok(paths)) => {
+                        for path in paths {
+                            if let Err(err) = objects.upload_file_with_receipt(&path, "audio/wav") {
+                                warn!(meeting_id = %claimed_job.meeting_id, path = %path.display(), error = %err, "failed to queue playback artifact upload");
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "failed to build playback artifacts after final transcription")
+                    }
+                    Err(err) => {
+                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "playback artifact task failed after final transcription")
+                    }
+                }
+            }
         }
 
         // Resolve speaker labels for summarization and snapshot to DB (best-effort)
