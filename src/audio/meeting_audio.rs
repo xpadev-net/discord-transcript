@@ -256,6 +256,58 @@ pub fn speaker_audio_inputs_from_manifest(
         .collect()
 }
 
+/// Prepares at most one raw chunk's PCM at a time; S3 final ASR never joins
+/// samples across chunks in the bot process.
+pub fn prepare_manifest_asr_inputs(
+    chunks: &[AudioChunkManifestEntry],
+    processed_chunks: &[ProcessedAudioChunk],
+    resample_to_16k: bool,
+) -> Result<Vec<SpeakerAudioInput>, String> {
+    let inputs = speaker_audio_inputs_from_manifest(chunks, processed_chunks);
+    if !resample_to_16k {
+        return Ok(inputs);
+    }
+    let output_dir = chunks
+        .first()
+        .and_then(|chunk| chunk.path.parent())
+        .ok_or_else(|| "manifest WAV path has no parent directory".to_owned())?
+        .join("transcription_chunks");
+    fs::create_dir_all(&output_dir)
+        .map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let sample_rates = chunks
+        .iter()
+        .map(|chunk| (chunk.path.as_path(), chunk.sample_rate))
+        .collect::<HashMap<_, _>>();
+    inputs
+        .into_iter()
+        .map(|mut input| {
+            let input_path = Path::new(&input.audio_path);
+            let sample_rate = sample_rates
+                .get(input_path)
+                .copied()
+                .ok_or_else(|| format!("manifest entry missing for {}", input.audio_path))?;
+            if sample_rate == 16_000 {
+                return Ok(input);
+            }
+            let (_, pcm) = read_wav_pcm(input_path)?;
+            let (pcm, output_rate) = resample_pcm_16le(&pcm, sample_rate, 16_000);
+            if output_rate != 16_000 {
+                return Ok(input);
+            }
+            let file_name = input_path
+                .file_name()
+                .ok_or_else(|| "manifest WAV path has no file name".to_owned())?;
+            let output_path = output_dir.join(file_name);
+            let wav = build_wav_bytes_raw(&pcm, output_rate, 1, 16)
+                .map_err(|err| format!("failed to encode resampled chunk: {err}"))?;
+            fs::write(&output_path, wav)
+                .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
+            input.audio_path = output_path.to_string_lossy().into_owned();
+            Ok(input)
+        })
+        .collect()
+}
+
 pub fn manifest_meeting_start_ms(chunks: &[AudioChunkManifestEntry]) -> u64 {
     chunks
         .iter()
@@ -306,6 +358,7 @@ fn load_chunk_metadata(path: &Path) -> Result<AudioChunkManifestEntry, String> {
         || data_size > MAX_WAV_CHUNK_PCM_BYTES as u64
         || !data_size.is_multiple_of(u64::from(block_align))
         || riff_size < 36u64.saturating_add(data_size)
+        || 8u64.saturating_add(riff_size) > file_size_bytes
         || 44u64.saturating_add(data_size) > file_size_bytes
     {
         return Err(format!(
@@ -894,7 +947,7 @@ fn remove_stale_speaker_wavs(
 #[cfg(test)]
 mod manifest_tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, Write};
 
     fn write_sparse_wav(path: &Path, pcm_bytes: u32, sample_rate: u32) {
         let mut header = [0u8; WAV_HEADER_BYTES];
@@ -946,6 +999,54 @@ mod manifest_tests {
             start_ms: 12_000,
         }];
         assert!(speaker_audio_inputs_from_manifest(&chunks, &completed).is_empty());
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn manifest_asr_inputs_resample_each_chunk_to_configured_rate() {
+        let root = std::env::temp_dir().join(format!(
+            "discord_transcript_manifest_resample_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let path = root.join("speaker_1_1000.wav");
+        write_sparse_wav(&path, 96_000, 48_000);
+
+        let chunks = scan_chunk_manifest(&root).expect("metadata scan should succeed");
+        let inputs = prepare_manifest_asr_inputs(&chunks, &[], true)
+            .expect("single chunk resampling should succeed");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            load_chunk_metadata(Path::new(&inputs[0].audio_path))
+                .expect("resampled WAV should be valid")
+                .sample_rate,
+            16_000
+        );
+        assert!(Path::new(&inputs[0].audio_path).starts_with(root.join("transcription_chunks")));
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn manifest_skips_riff_body_larger_than_staged_file() {
+        let root = std::env::temp_dir().join(format!(
+            "discord_transcript_manifest_corrupt_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let path = root.join("speaker_1_1000.wav");
+        write_sparse_wav(&path, 2_000, 16_000);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("fixture should open");
+        file.seek(std::io::SeekFrom::Start(4))
+            .expect("RIFF size should be seekable");
+        file.write_all(&10_000u32.to_le_bytes())
+            .expect("invalid RIFF size should be written");
+
+        assert!(scan_chunk_manifest(&root).is_err());
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 }

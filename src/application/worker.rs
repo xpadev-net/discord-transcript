@@ -886,6 +886,7 @@ pub(crate) fn durable_s3_audio_source(
     offset_ms: Option<u64>,
     receipt: Option<UploadReceipt>,
     immutable_object: bool,
+    require_durable: bool,
 ) -> Result<Option<S3AudioObjectReference>, WorkerError> {
     let Some(key) = objects.object_key(path) else {
         return Ok(None);
@@ -916,6 +917,9 @@ pub(crate) fn durable_s3_audio_source(
         })?
     };
     if !durable {
+        if !require_durable {
+            return Ok(None);
+        }
         return Err(WorkerError::Summary(format!(
             "ASR audio object is not durable for {}",
             path.display()
@@ -1641,6 +1645,7 @@ where
                     None,
                     upload_receipts.remove(std::path::Path::new(&mixdown_path)),
                     false,
+                    false,
                 )?
             {
                 pending_s3_sources.insert(std::path::PathBuf::from(&mixdown_path), source);
@@ -1652,6 +1657,7 @@ where
                     Some(speaker.speaker_id.clone()),
                     Some(speaker.offset_ms),
                     upload_receipts.remove(std::path::Path::new(&speaker.audio_path)),
+                    false,
                     false,
                 )? {
                     pending_s3_sources

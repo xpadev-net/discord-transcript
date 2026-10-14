@@ -434,6 +434,8 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
     }
 
     let mut merged_segments = Vec::new();
+    let mut speaker_debug_responses =
+        std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
     for speaker in &request.speaker_audio {
         let prompt = build_whisper_prompt(request, Some(speaker));
         let transcription = whisper.infer(
@@ -453,16 +455,32 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
                     },
                 ),
         )?;
-        persist_whisper_debug_response(
-            &request.workspace.whisper_response_path(&speaker.speaker_id),
-            &transcription.raw_body,
-        );
+        speaker_debug_responses
+            .entry(speaker.speaker_id.clone())
+            .or_default()
+            .push(
+                serde_json::from_str(&transcription.raw_body)
+                    .unwrap_or_else(|_| serde_json::Value::String(transcription.raw_body.clone())),
+            );
         for mut segment in transcription.segments {
             segment.speaker_id = speaker.speaker_id.clone();
             segment.start_ms = segment.start_ms.saturating_add(speaker.offset_ms);
             segment.end_ms = segment.end_ms.saturating_add(speaker.offset_ms);
             merged_segments.push(segment);
         }
+    }
+
+    for (speaker_id, responses) in speaker_debug_responses {
+        let body = if responses.len() == 1 {
+            serde_json::to_string(&responses[0])
+        } else {
+            serde_json::to_string(&serde_json::json!({ "chunks": responses }))
+        }
+        .unwrap_or_else(|_| "{}".to_owned());
+        persist_whisper_debug_response(
+            &request.workspace.whisper_response_path(&speaker_id),
+            &body,
+        );
     }
 
     sort_transcript_segments(&mut merged_segments);

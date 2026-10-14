@@ -32,7 +32,7 @@ use crate::application::worker::{
 use crate::audio::meeting_audio::{
     AudioChunkManifestEntry, ProcessedAudioChunk, build_speaker_audio_inputs,
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
-    manifest_meeting_start_ms, scan_chunk_manifest, speaker_audio_inputs_from_manifest,
+    manifest_meeting_start_ms, prepare_manifest_asr_inputs, scan_chunk_manifest,
 };
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{
@@ -8608,32 +8608,39 @@ impl ScaffoldHandler {
             };
             // This artifact remains available for playback; S3 final ASR uses
             // the manifest-built per-chunk inputs below, never this mixdown.
-            let audio_path = match merge_user_chunks_to_mixdown(
-                &meeting_dir,
-                effective_settings.whisper_resample_to_16k,
-            ) {
-                Ok(path) => path,
-                Err(err) => {
-                    let err_string = format!("merge failed: {err}");
-                    let mut queue = self.queue.lock().await;
-                    let exhausted = retry_claimed_summary_job(
-                        &mut *queue,
-                        &claimed_job,
-                        err_string.clone(),
-                        self.summary_max_retries,
-                        "merge",
-                    );
-                    drop(queue);
-                    if exhausted {
-                        let mut service = self.service.lock().await;
-                        let _ = mark_summary_meeting_failed_from_summary_state(
-                            &mut service.store,
-                            &claimed_job.meeting_id,
+            let audio_path = if s3_manifest.is_some() {
+                meeting_dir
+                    .join("mixdown.wav")
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                match merge_user_chunks_to_mixdown(
+                    &meeting_dir,
+                    effective_settings.whisper_resample_to_16k,
+                ) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let err_string = format!("merge failed: {err}");
+                        let mut queue = self.queue.lock().await;
+                        let exhausted = retry_claimed_summary_job(
+                            &mut *queue,
+                            &claimed_job,
                             err_string.clone(),
+                            self.summary_max_retries,
+                            "merge",
                         );
-                        return Err(SummaryJobRunError::Terminal(err_string));
+                        drop(queue);
+                        if exhausted {
+                            let mut service = self.service.lock().await;
+                            let _ = mark_summary_meeting_failed_from_summary_state(
+                                &mut service.store,
+                                &claimed_job.meeting_id,
+                                err_string.clone(),
+                            );
+                            return Err(SummaryJobRunError::Terminal(err_string));
+                        }
+                        return Err(retry_scheduled_error(&claimed_job, err_string));
                     }
-                    return Err(retry_scheduled_error(&claimed_job, err_string));
                 }
             };
 
@@ -8715,10 +8722,11 @@ impl ScaffoldHandler {
                 meeting_dir: _,
                 completed_live_chunks,
                 s3_manifest: Some(manifest),
-            } => Ok(speaker_audio_inputs_from_manifest(
+            } => prepare_manifest_asr_inputs(
                 manifest,
                 completed_live_chunks,
-            )),
+                effective_settings.whisper_resample_to_16k,
+            ),
             SummaryInputSource::Audio {
                 meeting_dir,
                 completed_live_chunks,
@@ -8785,10 +8793,9 @@ impl ScaffoldHandler {
         // never lands under `speakers/`.
         let playback_speaker_dir: Option<PathBuf> = match &summary_input_source {
             SummaryInputSource::Audio {
-                meeting_dir,
                 s3_manifest: Some(_),
                 ..
-            } => Some(meeting_dir.clone()),
+            } => None,
             SummaryInputSource::Audio {
                 completed_live_chunks,
                 ..
@@ -8800,29 +8807,37 @@ impl ScaffoldHandler {
                 Some(workspace.audio_dir())
             }
         };
-        let playback_speaker_paths: Vec<PathBuf> = match playback_speaker_dir {
-            None => speaker_audio
-                .iter()
-                .map(|input| PathBuf::from(&input.audio_path))
-                .collect(),
-            Some(meeting_dir) => match build_speaker_audio_inputs(
-                &meeting_dir,
-                effective_settings.whisper_resample_to_16k,
-            ) {
-                Ok(outputs) => outputs
+        let playback_speaker_paths: Vec<PathBuf> =
+            match (&summary_input_source, playback_speaker_dir) {
+                (
+                    SummaryInputSource::Audio {
+                        s3_manifest: Some(_),
+                        ..
+                    },
+                    _,
+                ) => Vec::new(),
+                (_, None) => speaker_audio
                     .iter()
                     .map(|input| PathBuf::from(&input.audio_path))
                     .collect(),
-                Err(err) => {
-                    warn!(
-                        meeting_id = %claimed_job.meeting_id,
-                        error = %err,
-                        "failed to build complete speaker playback files"
-                    );
-                    Vec::new()
-                }
-            },
-        };
+                (_, Some(meeting_dir)) => match build_speaker_audio_inputs(
+                    &meeting_dir,
+                    effective_settings.whisper_resample_to_16k,
+                ) {
+                    Ok(outputs) => outputs
+                        .iter()
+                        .map(|input| PathBuf::from(&input.audio_path))
+                        .collect(),
+                    Err(err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %err,
+                            "failed to build complete speaker playback files"
+                        );
+                        Vec::new()
+                    }
+                },
+            };
 
         let mut upload_receipts = HashMap::new();
         // Under the s3 backend, mirror the playback artifacts (mixdown +
@@ -8935,6 +8950,7 @@ impl ScaffoldHandler {
                                 None,
                                 upload_receipts.remove(Path::new(&request.audio_path)),
                                 false,
+                                false,
                             )
                             .map_err(|err| {
                                 crate::application::summary::SummaryError::SummaryEngine(
@@ -8951,6 +8967,10 @@ impl ScaffoldHandler {
                                 Some(speaker.speaker_id.clone()),
                                 Some(speaker.offset_ms),
                                 upload_receipts.remove(Path::new(&speaker.audio_path)),
+                                !Path::new(&speaker.audio_path)
+                                    .parent()
+                                    .and_then(Path::file_name)
+                                    .is_some_and(|name| name == "transcription_chunks"),
                                 require_s3_chunk_sources,
                             )
                             .map_err(|err| {
@@ -8992,6 +9012,47 @@ impl ScaffoldHandler {
                 crate::application::summary::build_transcription_output(output.segments)
             })
         };
+
+        // S3 final ASR must not wait for playback-only artifacts that load the
+        // full PCM timeline. Build and upload them only after transcription.
+        if let Some(objects) = &self.recording_objects {
+            let playback_dir = match &summary_input_source {
+                SummaryInputSource::Audio { meeting_dir, .. } => Some(meeting_dir.clone()),
+                SummaryInputSource::FinalTranscript => Some(workspace.audio_dir()),
+            };
+            if let Some(playback_dir) = playback_dir {
+                let resample = effective_settings.whisper_resample_to_16k;
+                let artifacts = tokio::task::spawn_blocking(move || {
+                    let mixdown = merge_user_chunks_to_mixdown(&playback_dir, resample)?;
+                    let speakers = build_speaker_audio_inputs(&playback_dir, resample)?;
+                    Ok::<_, String>(
+                        std::iter::once(PathBuf::from(mixdown))
+                            .chain(
+                                speakers
+                                    .into_iter()
+                                    .map(|speaker| PathBuf::from(speaker.audio_path)),
+                            )
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .await;
+                match artifacts {
+                    Ok(Ok(paths)) => {
+                        for path in paths {
+                            if let Err(err) = objects.upload_file_with_receipt(&path, "audio/wav") {
+                                warn!(meeting_id = %claimed_job.meeting_id, path = %path.display(), error = %err, "failed to queue playback artifact upload");
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "failed to build playback artifacts after final transcription")
+                    }
+                    Err(err) => {
+                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "playback artifact task failed after final transcription")
+                    }
+                }
+            }
+        }
         let mut transcription = match transcription {
             Ok(t) => t,
             Err(err) => {
@@ -9048,16 +9109,19 @@ impl ScaffoldHandler {
             }
         };
 
-        if !recovered_from_final_segments
-            && (!require_s3_chunk_sources || !request.speaker_audio.is_empty())
-        {
-            let audio_input_paths = require_s3_chunk_sources.then(|| {
-                request
-                    .speaker_audio
-                    .iter()
-                    .map(|speaker| speaker.audio_path.clone())
-                    .collect()
-            });
+        if !recovered_from_final_segments {
+            let audio_input_paths = match &summary_input_source {
+                SummaryInputSource::Audio {
+                    s3_manifest: Some(manifest),
+                    ..
+                } => Some(
+                    manifest
+                        .iter()
+                        .map(|chunk| chunk.path.to_string_lossy().into_owned())
+                        .collect(),
+                ),
+                _ => None,
+            };
             self.record_asr_seconds_usage(
                 &meeting.guild_id,
                 &claimed_job.meeting_id,
