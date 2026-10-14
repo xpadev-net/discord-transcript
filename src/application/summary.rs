@@ -2129,6 +2129,14 @@ pub fn build_summary_prompt_with_context(
     } else {
         String::new()
     };
+    let generated_title_heading_instruction = if context
+        .map(|context| context.summary_template_path.is_none())
+        .unwrap_or(true)
+    {
+        "Begin the markdown with one concise level-one heading (`# <meeting topic>`) that states the main subject discussed. Derive it from the discussion content; do not use a participant list or count, generic meeting metadata, the existing meeting title, or the voice-channel name as the heading.\n"
+    } else {
+        ""
+    };
 
     format!(
         "You are an assistant that summarizes meeting transcripts.\n\
@@ -2139,7 +2147,8 @@ Files available:\n\
 {context_files}\
 \n\
 Keep speaker attributions by reading the materialized speaker roster when available and using the provided speaker names when describing Summary, Decisions, TODO, and Open Questions.\n\
-Output in markdown using the exact sections below:\n\
+{generated_title_heading_instruction}\
+Then include the exact summary sections below in this order:\n\
 ## Summary\n\
 ## Decisions\n\
 ## TODO\n\

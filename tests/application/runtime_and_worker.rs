@@ -2301,7 +2301,7 @@ fn worker_generates_persists_posts_and_debugs_title_from_summary() {
         .to_owned(),
     };
     let claude = StubClaudeSummaryClient {
-        mocked_markdown: "```sh\n# Not the meeting title\n```\n\n## Summary\nAlpha launch risk review and release blockers were discussed.\n\n## TODO\n- Follow up".to_owned(),
+        mocked_markdown: "# Alpha launch risk review\n\n## Summary\nAlpha launch risk review and release blockers were discussed.\n\n## TODO\n- Follow up".to_owned(),
     };
     let temp = temp_workspace("m1_generated_title");
     let workspace = temp.workspace().clone();
@@ -2335,22 +2335,22 @@ fn worker_generates_persists_posts_and_debugs_title_from_summary() {
 
     assert_eq!(
         output.title,
-        "Alpha launch risk review and release blockers were discussed"
+        "Alpha launch risk review"
     );
     assert_eq!(
         store.get("m1").and_then(|meeting| meeting.title.as_deref()),
-        Some("Alpha launch risk review and release blockers were discussed")
+        Some("Alpha launch risk review")
     );
     assert!(
         output.chunks[0]
-            .starts_with("# Alpha launch risk review and release blockers were discussed\n\n"),
+            .starts_with("# Alpha launch risk review\n\n"),
         "Discord post chunks should include the generated meeting title"
     );
     assert!(output.chunks[0].contains("## Summary"));
     assert_eq!(
         std::fs::read_to_string(workspace.meeting_title_debug_path())
             .expect("meeting title debug artifact"),
-        "Alpha launch risk review and release blockers were discussed"
+        "Alpha launch risk review"
     );
 }
 

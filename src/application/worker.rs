@@ -1215,6 +1215,7 @@ where
         input.voice_channel_name.as_deref(),
         &input.voice_channel_id,
         &input.meeting_id,
+        context_manifest.summary_template_path.is_none(),
     );
     ensure_owned()?;
     store.set_meeting_title(&input.meeting_id, title.clone())?;
@@ -1222,7 +1223,11 @@ where
     persist_meeting_title_debug_artifact(&request.workspace, &title);
     ensure_owned()?;
 
-    let post_markdown = markdown_with_title_for_post(&title, &markdown);
+    let post_markdown = markdown_with_title_for_post(
+        &title,
+        &markdown,
+        context_manifest.summary_template_path.is_some(),
+    );
     let chunks = split_discord_message(&post_markdown, DISCORD_MESSAGE_LIMIT);
     info!(
         meeting_id = %input.meeting_id,
@@ -1245,9 +1250,12 @@ pub(crate) fn derive_meeting_title(
     voice_channel_name: Option<&str>,
     voice_channel_id: &str,
     meeting_id: &str,
+    allow_generated_heading: bool,
 ) -> String {
-    sanitize_meeting_title(existing_title)
-        .or_else(|| extract_title_from_summary_markdown(markdown))
+    allow_generated_heading
+        .then(|| extract_title_from_summary_markdown(markdown))
+        .flatten()
+        .or_else(|| sanitize_meeting_title(existing_title))
         .unwrap_or_else(|| fallback_meeting_title(voice_channel_name, voice_channel_id, meeting_id))
 }
 
@@ -1256,7 +1264,7 @@ fn sanitize_meeting_title(value: Option<&str>) -> Option<String> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .trim_matches(['#', '*', '_', '`', '"', '\''])
+        .trim_matches(['*', '_', '`', '"', '\''])
         .trim()
         .to_owned();
     if normalized.is_empty()
@@ -1269,74 +1277,43 @@ fn sanitize_meeting_title(value: Option<&str>) -> Option<String> {
 }
 
 fn extract_title_from_summary_markdown(markdown: &str) -> Option<String> {
-    let mut saw_summary_heading = false;
-    let mut in_code_block = false;
-    for line in markdown.lines() {
-        let line = line.trim();
-        if line.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-        if in_code_block || line.is_empty() || line == "---" {
-            continue;
-        }
-        if let Some(heading) = line.strip_prefix('#') {
-            let heading = heading.trim_start_matches('#').trim();
-            if let Some(title) = sanitize_meeting_title(Some(heading)) {
-                if !matches_builtin_summary_heading(&title) {
-                    return Some(title);
-                }
-                saw_summary_heading = true;
-            }
-            continue;
-        }
-        if let Some(title) = line
-            .strip_prefix("Title:")
-            .or_else(|| line.strip_prefix("タイトル:"))
-            .and_then(|value| sanitize_meeting_title(Some(value)))
-        {
-            return Some(title);
-        }
-        if saw_summary_heading && let Some(title) = title_from_summary_text_line(line) {
-            return Some(title);
-        }
-    }
-    None
+    let title = normalized_leading_h1(markdown)?;
+    (!matches_builtin_summary_heading(&title)).then_some(title)
 }
 
-fn title_from_summary_text_line(line: &str) -> Option<String> {
-    let without_marker = line
-        .trim_start_matches(['-', '*', '・'])
-        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.')
-        .trim();
-    let first_sentence = without_marker
-        .split(['。', '.', '!', '?', '\n'])
-        .next()
-        .unwrap_or(without_marker)
-        .trim();
-    let title = first_sentence
-        .trim_matches(['#', '*', '_', '`', '"', '\'', ':', '：'])
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let title = truncate_title_at_word_boundary(&title);
-    sanitize_meeting_title(Some(&title))
+fn normalized_leading_h1(markdown: &str) -> Option<String> {
+    sanitize_meeting_title(leading_h1_content(markdown))
 }
 
-fn truncate_title_at_word_boundary(title: &str) -> String {
-    if title.chars().count() <= MEETING_TITLE_MAX_CHARS {
-        return title.to_owned();
+fn leading_h1_content(markdown: &str) -> Option<&str> {
+    let line = markdown.lines().find(|line| !line.trim().is_empty())?;
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
     }
-    let mut truncated = title
-        .chars()
-        .take(MEETING_TITLE_MAX_CHARS)
-        .collect::<String>();
-    if let Some((prefix, _)) = truncated.rsplit_once(' ')
-        && !prefix.trim().is_empty()
-    {
-        truncated = prefix.to_owned();
+    let after_marker = line[indentation..].strip_prefix('#')?;
+    let heading = after_marker
+        .strip_prefix(' ')
+        .or_else(|| after_marker.strip_prefix('\t'))?;
+    let heading = strip_atx_closing_sequence(heading).trim();
+    (!heading.is_empty()).then_some(heading)
+}
+
+fn strip_atx_closing_sequence(heading: &str) -> &str {
+    let trimmed = heading.trim_end();
+    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte == b'#') {
+        return "";
     }
-    truncated.trim().to_owned()
+    let content_end = trimmed.trim_end_matches('#').len();
+    if content_end == trimmed.len() {
+        return trimmed;
+    }
+    let content = &trimmed[..content_end];
+    if content.ends_with(' ') || content.ends_with('\t') {
+        content.trim_end()
+    } else {
+        trimmed
+    }
 }
 
 fn matches_builtin_summary_heading(title: &str) -> bool {
@@ -1358,17 +1335,34 @@ fn fallback_meeting_title(
         .unwrap_or_else(|| format!("Meeting {}", meeting_id))
 }
 
-pub(crate) fn markdown_with_title_for_post(title: &str, markdown: &str) -> String {
-    let trimmed = markdown.trim_start();
-    let expected_heading = format!("# {title}");
-    if trimmed
-        .lines()
-        .next()
-        .is_some_and(|line| line.trim() == expected_heading)
+pub(crate) fn markdown_with_title_for_post(
+    title: &str,
+    markdown: &str,
+    preserve_template_heading: bool,
+) -> String {
+    if preserve_template_heading && leading_h1_content(markdown).is_some() {
+        return markdown.to_owned();
+    }
+    let normalized_title = sanitize_meeting_title(Some(title));
+    if normalized_title
+        .as_deref()
+        .is_some_and(|expected| normalized_leading_h1(markdown).as_deref() == Some(expected))
     {
         return markdown.to_owned();
     }
-    format!("# {title}\n\n{}", markdown.trim_start())
+    format!("# {title}\n\n{}", trim_leading_blank_lines(markdown))
+}
+
+fn trim_leading_blank_lines(markdown: &str) -> &str {
+    let mut offset = 0;
+    for line in markdown.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if !content.trim().is_empty() {
+            return &markdown[offset..];
+        }
+        offset += line.len();
+    }
+    &markdown[offset..]
 }
 
 pub(crate) fn persist_generated_summary_markdown(
@@ -1976,6 +1970,125 @@ mod tests {
     use crate::infrastructure::asr::StubWhisperClient;
     use crate::infrastructure::storage::StoredMeeting;
     use std::path::PathBuf;
+
+    #[test]
+    fn derive_meeting_title_preserves_existing_title_for_custom_template_heading() {
+        assert_eq!(
+            derive_meeting_title(
+                Some("Previously generated topic"),
+                "# Executive Summary\n\n## Summary\nDiscussion details",
+                Some("Roadmap VC"),
+                "vc",
+                "m1",
+                false,
+            ),
+            "Previously generated topic"
+        );
+    }
+
+    #[test]
+    fn derive_meeting_title_does_not_extract_a_fenced_heading() {
+        assert_eq!(
+            derive_meeting_title(
+                None,
+                "```md\n# Not the meeting title\n```\n\n## Summary\nDiscussion details",
+                Some("Roadmap VC"),
+                "vc",
+                "m1",
+                true,
+            ),
+            "Roadmap VC meeting"
+        );
+    }
+
+    #[test]
+    fn derive_meeting_title_does_not_extract_an_indented_code_heading() {
+        assert_eq!(
+            derive_meeting_title(
+                Some("Previously generated topic"),
+                "    # Release planning\n\n## Summary\nDiscussion details",
+                Some("Roadmap VC"),
+                "vc",
+                "m1",
+                true,
+            ),
+            "Previously generated topic"
+        );
+    }
+
+    #[test]
+    fn derive_meeting_title_accepts_markdown_h1_with_up_to_three_leading_spaces() {
+        for indentation in 1..=3 {
+            let markdown = format!("{}# Valid topic\n\n## Summary", " ".repeat(indentation));
+            assert_eq!(
+                derive_meeting_title(None, &markdown, Some("Roadmap VC"), "vc", "m1", true),
+                "Valid topic"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_meeting_title_accepts_tab_delimiter_after_atx_marker() {
+        assert_eq!(
+            derive_meeting_title(
+                None,
+                "#\tRelease planning\n\n## Summary",
+                Some("Roadmap VC"),
+                "vc",
+                "m1",
+                true,
+            ),
+            "Release planning"
+        );
+    }
+
+    #[test]
+    fn derive_meeting_title_preserves_hash_punctuation_and_strips_closing_sequence() {
+        assert_eq!(
+            derive_meeting_title(None, "# C#\n\n## Summary", None, "vc", "m1", true),
+            "C#"
+        );
+        assert_eq!(
+            derive_meeting_title(None, "# Topic ###\n\n## Summary", None, "vc", "m1", true),
+            "Topic"
+        );
+        assert_eq!(
+            derive_meeting_title(
+                Some("Previously generated topic"),
+                "# ###\n\n## Summary",
+                None,
+                "vc",
+                "m1",
+                true,
+            ),
+            "Previously generated topic"
+        );
+    }
+
+    #[test]
+    fn post_formatter_preserves_custom_template_heading() {
+        let markdown = "# Executive Summary\n\n## Findings\nDetails";
+        assert_eq!(
+            markdown_with_title_for_post("Roadmap VC meeting", markdown, true),
+            markdown
+        );
+        assert!(
+            markdown_with_title_for_post("Roadmap VC meeting", markdown, false)
+                .starts_with("# Roadmap VC meeting\n\n# Executive Summary")
+        );
+
+        let oversized_heading = format!("# {}\n\n## Findings", "x".repeat(81));
+        assert_eq!(
+            markdown_with_title_for_post("Roadmap VC meeting", &oversized_heading, true),
+            oversized_heading
+        );
+
+        let indented_code = "    # Example\n\n## Findings";
+        assert!(
+            markdown_with_title_for_post("Roadmap VC meeting", indented_code, true)
+                .starts_with("# Roadmap VC meeting\n\n    # Example")
+        );
+    }
 
     struct SummaryOnlyTestClient;
 

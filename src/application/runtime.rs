@@ -10071,6 +10071,7 @@ impl ScaffoldHandler {
             meeting.voice_channel_name.as_deref(),
             &meeting.voice_channel_id,
             &claimed_job.meeting_id,
+            context_manifest.summary_template_path.is_none(),
         );
         self.refresh_summary_job_ownership(&claimed_job, "title_persistence")
             .await?;
@@ -10139,8 +10140,11 @@ impl ScaffoldHandler {
             &request.workspace,
             &title,
         );
-        let post_markdown =
-            crate::application::worker::markdown_with_title_for_post(&title, &markdown);
+        let post_markdown = crate::application::worker::markdown_with_title_for_post(
+            &title,
+            &markdown,
+            context_manifest.summary_template_path.is_some(),
+        );
         let chunks = split_discord_message(&post_markdown, DISCORD_MESSAGE_LIMIT);
 
         // NOTE: mark_done is NOT called here. The caller (run_summary_and_notify)

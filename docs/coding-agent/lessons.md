@@ -392,3 +392,59 @@ Prevention:
 
 Evidence:
 - `gh-review-hook 65` exited 2 with runtime-token staleness and redundant validation timestamp findings; fixes were applied before the next validation/review cycle.
+
+## 2026-10-15 — Validate Worker Reports Before Returning  [tags: delegation, validation]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/meeting-title-generation-plan.md
+- Task/Wave: Task_1 report integration
+- Roles involved: Orchestrator | Worker
+
+Symptom:
+- The Worker report omitted required schema fields on the initial response and first correction, so report validation failed twice before a valid report was returned.
+
+Root cause:
+- The Worker followed the one-YAML-block instruction but did not validate the report against the canonical schema before returning it.
+
+Fix applied:
+- Requested the missing fields, then validated the corrected report using `validate_worker_report.py` before proceeding to Reviewer dispatch.
+
+Prevention:
+- Repo rule candidate: none
+- Harness migration candidate:
+  - category: validation
+  - proposed_home: `plugins/coding-agent-orchestration-harness/skills/subagent-report-contract/SKILL.md`
+  - generalized_rule: Workers should validate their completed YAML report against the canonical report validator before returning it.
+  - suggested_change: Add a final self-validation step to the Worker report instructions and dispatch checklist.
+- Troubleshooting note/candidate: none
+- Dispatch/plan guardrail: Validate Worker reports immediately after receipt and send the validator's exact missing keys in any correction request.
+- Residual risk / waiver: none
+
+Evidence:
+- `validate_worker_report.py --stdin` rejected two report versions with schema errors; it passed after the missing required fields were corrected.
+
+## 2026-10-15 — Separate Title Normalization From Eligibility  [tags: review, validation]
+
+Context:
+- Plan: docs/coding-agent/plans/completed/meeting-title-generation-plan.md
+- Task/Wave: Task_1 review follow-up
+- Roles involved: Orchestrator | Reviewer
+
+Symptom:
+- A duplicate-heading fix reused the title-candidate parser, which rejected built-in headings and therefore could still prepend a duplicate for a matching built-in heading.
+
+Root cause:
+- The implementation coupled normalization used for equality with eligibility rules used to accept generated titles.
+
+Fix applied:
+- Split leading-H1 normalization from generated-title eligibility and used normalization alone for post de-duplication.
+
+Prevention:
+- Repo rule candidate: none
+- Harness migration candidate: none
+- Troubleshooting note/candidate: none
+- Dispatch/plan guardrail: When a helper serves both normalization and policy eligibility, keep those decisions separate if another consumer needs the normalized value regardless of eligibility.
+- Residual risk / waiver: none
+
+Evidence:
+- Reviewer identified the edge during delta review; the revised helper passed `rtk cargo check --workspace --all-targets --all-features` and the follow-up review was APPROVED.
