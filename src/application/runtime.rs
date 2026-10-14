@@ -32,7 +32,7 @@ use crate::application::worker::{
 use crate::audio::meeting_audio::{
     AudioChunkManifestEntry, ProcessedAudioChunk, build_speaker_audio_inputs,
     build_speaker_audio_inputs_excluding_processed_chunks, compute_meeting_start_ms, load_chunks,
-    scan_chunk_manifest, speaker_audio_inputs_from_manifest,
+    manifest_meeting_start_ms, scan_chunk_manifest, speaker_audio_inputs_from_manifest,
 };
 use crate::audio::receiver::ReceiverConfig;
 use crate::audio::recording_session::{
@@ -8606,52 +8606,39 @@ impl ScaffoldHandler {
             } else {
                 None
             };
-            let audio_path = if s3_manifest.is_some() {
-                meeting_dir
-                    .join("mixdown.wav")
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                match merge_user_chunks_to_mixdown(
-                    &meeting_dir,
-                    effective_settings.whisper_resample_to_16k,
-                ) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        let err_string = format!("merge failed: {err}");
-                        let mut queue = self.queue.lock().await;
-                        let exhausted = retry_claimed_summary_job(
-                            &mut *queue,
-                            &claimed_job,
+            // This artifact remains available for playback; S3 final ASR uses
+            // the manifest-built per-chunk inputs below, never this mixdown.
+            let audio_path = match merge_user_chunks_to_mixdown(
+                &meeting_dir,
+                effective_settings.whisper_resample_to_16k,
+            ) {
+                Ok(path) => path,
+                Err(err) => {
+                    let err_string = format!("merge failed: {err}");
+                    let mut queue = self.queue.lock().await;
+                    let exhausted = retry_claimed_summary_job(
+                        &mut *queue,
+                        &claimed_job,
+                        err_string.clone(),
+                        self.summary_max_retries,
+                        "merge",
+                    );
+                    drop(queue);
+                    if exhausted {
+                        let mut service = self.service.lock().await;
+                        let _ = mark_summary_meeting_failed_from_summary_state(
+                            &mut service.store,
+                            &claimed_job.meeting_id,
                             err_string.clone(),
-                            self.summary_max_retries,
-                            "merge",
                         );
-                        drop(queue);
-                        if exhausted {
-                            let mut service = self.service.lock().await;
-                            let _ = mark_summary_meeting_failed_from_summary_state(
-                                &mut service.store,
-                                &claimed_job.meeting_id,
-                                err_string.clone(),
-                            );
-                            return Err(SummaryJobRunError::Terminal(err_string));
-                        }
-                        return Err(retry_scheduled_error(&claimed_job, err_string));
+                        return Err(SummaryJobRunError::Terminal(err_string));
                     }
+                    return Err(retry_scheduled_error(&claimed_job, err_string));
                 }
             };
 
             let final_timeline_base_ms = match &s3_manifest {
-                Some(chunks) => Some(
-                    chunks
-                        .iter()
-                        .map(|chunk| chunk.start_ms)
-                        .filter(|start_ms| *start_ms > 0)
-                        .min()
-                        .or_else(|| chunks.iter().map(|chunk| chunk.start_ms).min())
-                        .unwrap_or(0),
-                ),
+                Some(chunks) => Some(manifest_meeting_start_ms(chunks)),
                 None => match load_chunks(&meeting_dir) {
                     Ok(chunks) => Some(compute_meeting_start_ms(&chunks)),
                     Err(err) => {
@@ -8947,6 +8934,7 @@ impl ScaffoldHandler {
                                 None,
                                 None,
                                 upload_receipts.remove(Path::new(&request.audio_path)),
+                                false,
                             )
                             .map_err(|err| {
                                 crate::application::summary::SummaryError::SummaryEngine(
@@ -8963,6 +8951,7 @@ impl ScaffoldHandler {
                                 Some(speaker.speaker_id.clone()),
                                 Some(speaker.offset_ms),
                                 upload_receipts.remove(Path::new(&speaker.audio_path)),
+                                require_s3_chunk_sources,
                             )
                             .map_err(|err| {
                                 crate::application::summary::SummaryError::SummaryEngine(

@@ -885,6 +885,7 @@ pub(crate) fn durable_s3_audio_source(
     speaker_id: Option<String>,
     offset_ms: Option<u64>,
     receipt: Option<UploadReceipt>,
+    immutable_object: bool,
 ) -> Result<Option<S3AudioObjectReference>, WorkerError> {
     let Some(key) = objects.object_key(path) else {
         return Ok(None);
@@ -892,9 +893,10 @@ pub(crate) fn durable_s3_audio_source(
     let durable = if path.is_file() {
         match receipt {
             Some(receipt) => upload_receipt_is_durable(receipt),
-            None if objects.object_exists(path).map_err(|err| {
-                WorkerError::Summary(format!("failed to verify ASR audio object: {err}"))
-            })? =>
+            None if immutable_object
+                && objects.object_exists(path).map_err(|err| {
+                    WorkerError::Summary(format!("failed to verify ASR audio object: {err}"))
+                })? =>
             {
                 true
             }
@@ -1638,6 +1640,7 @@ where
                     None,
                     None,
                     upload_receipts.remove(std::path::Path::new(&mixdown_path)),
+                    false,
                 )?
             {
                 pending_s3_sources.insert(std::path::PathBuf::from(&mixdown_path), source);
@@ -1649,6 +1652,7 @@ where
                     Some(speaker.speaker_id.clone()),
                     Some(speaker.offset_ms),
                     upload_receipts.remove(std::path::Path::new(&speaker.audio_path)),
+                    false,
                 )? {
                     pending_s3_sources
                         .insert(std::path::PathBuf::from(&speaker.audio_path), source);

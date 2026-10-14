@@ -238,13 +238,7 @@ pub fn speaker_audio_inputs_from_manifest(
     chunks: &[AudioChunkManifestEntry],
     processed_chunks: &[ProcessedAudioChunk],
 ) -> Vec<SpeakerAudioInput> {
-    let meeting_start_ms = chunks
-        .iter()
-        .map(|chunk| chunk.start_ms)
-        .filter(|start_ms| *start_ms > 0)
-        .min()
-        .or_else(|| chunks.iter().map(|chunk| chunk.start_ms).min())
-        .unwrap_or(0);
+    let meeting_start_ms = manifest_meeting_start_ms(chunks);
     let processed = processed_chunks
         .iter()
         .map(|chunk| (chunk.speaker_id.as_str(), chunk.sequence, chunk.start_ms))
@@ -260,6 +254,16 @@ pub fn speaker_audio_inputs_from_manifest(
             offset_ms: chunk.start_ms.saturating_sub(meeting_start_ms),
         })
         .collect()
+}
+
+pub fn manifest_meeting_start_ms(chunks: &[AudioChunkManifestEntry]) -> u64 {
+    chunks
+        .iter()
+        .map(|chunk| chunk.start_ms)
+        .filter(|start_ms| *start_ms > 0)
+        .min()
+        .or_else(|| chunks.iter().map(|chunk| chunk.start_ms).min())
+        .unwrap_or(0)
 }
 
 fn load_chunk_metadata(path: &Path) -> Result<AudioChunkManifestEntry, String> {
