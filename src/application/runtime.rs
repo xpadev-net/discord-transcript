@@ -2116,6 +2116,19 @@ struct LiveTranscriptionInferencePermit {
     job_claimed: bool,
 }
 
+async fn with_service_lock_blocking<T, R, F>(service: &Mutex<T>, operation: F) -> R
+where
+    T: Send,
+    R: Send,
+    F: FnOnce(&mut T) -> R + Send,
+{
+    let mut service = service.lock().await;
+    // `block_in_place` hands this worker's other tasks to Tokio's backup
+    // workers. There is deliberately no await or JoinHandle wait while the
+    // service guard is held, preserving the existing DB-operation ordering.
+    tokio::task::block_in_place(|| operation(&mut service))
+}
+
 impl LiveTranscriptionInferencePermit {
     fn try_acquire() -> Option<Self> {
         LIVE_TRANSCRIPTION_INFERENCE_ACTIVE
@@ -4324,14 +4337,14 @@ impl ScaffoldHandler {
             };
             let mut attempt = 0u32;
             let result = loop {
-                let result = {
-                    let mut service = self.service.lock().await;
+                let result = with_service_lock_blocking(&self.service, |service| {
                     persist_live_transcription_chunk_queued(
                         &mut service.store.executor,
                         &job.chunk,
                         job.base_start_ms,
                     )
-                };
+                })
+                .await;
                 attempt += 1;
                 if result.is_ok()
                     || attempt >= MAX_LIVE_OUTBOX_PERSIST_ATTEMPTS
@@ -4358,15 +4371,15 @@ impl ScaffoldHandler {
     }
 
     async fn fail_live_transcription_job(&self, job: LiveTranscriptionJob, reason: &str) {
-        let result = {
-            let mut service = self.service.lock().await;
+        let result = with_service_lock_blocking(&self.service, |service| {
             mark_live_transcription_chunk_failed(
                 &mut service.store.executor,
                 &job.chunk,
                 job.base_start_ms,
                 reason,
             )
-        };
+        })
+        .await;
         match result {
             Ok(()) => warn!(
                 meeting_id = %job.chunk.meeting_id,
@@ -4390,10 +4403,10 @@ impl ScaffoldHandler {
     }
 
     async fn retry_live_transcription_job(&self, job: &LiveTranscriptionJob, reason: &str) {
-        let result = {
-            let mut service = self.service.lock().await;
+        let result = with_service_lock_blocking(&self.service, |service| {
             requeue_live_transcription_chunk(&mut service.store.executor, &job.chunk, reason)
-        };
+        })
+        .await;
         if let Err(error) = result {
             LIVE_TRANSCRIPTION_RECOVERY_NEEDED.store(true, Ordering::Release);
             error!(
@@ -4594,15 +4607,15 @@ impl ScaffoldHandler {
                     return;
                 }
                 let error_message = err.to_string();
-                let mark_result = {
-                    let mut service = self.service.lock().await;
+                let mark_result = with_service_lock_blocking(&self.service, |service| {
                     mark_live_transcription_chunk_failed(
                         &mut service.store.executor,
                         &chunk,
                         base_start_ms,
                         &error_message,
                     )
-                };
+                })
+                .await;
                 if let Err(mark_err) = mark_result {
                     LIVE_TRANSCRIPTION_RECOVERY_NEEDED.store(true, Ordering::Release);
                     warn!(
@@ -4630,8 +4643,7 @@ impl ScaffoldHandler {
             Rejected,
             Retry(String),
         }
-        let write_decision = {
-            let mut service = self.service.lock().await;
+        let write_decision = with_service_lock_blocking(&self.service, |service| {
             // Keep the finalization admission check and live row write in one
             // critical section. Final transcript persistence uses the same
             // service lock, so it cannot interleave between the status check
@@ -4670,7 +4682,8 @@ impl ScaffoldHandler {
                     &segments,
                 )),
             }
-        };
+        })
+        .await;
         match write_decision {
             LiveWriteDecision::Retry(reason) => {
                 warn!(
@@ -4702,15 +4715,15 @@ impl ScaffoldHandler {
             }
             LiveWriteDecision::Persist(Err(err)) => {
                 let error_message = err.to_string();
-                let mark_result = {
-                    let mut service = self.service.lock().await;
+                let mark_result = with_service_lock_blocking(&self.service, |service| {
                     mark_live_transcription_chunk_failed(
                         &mut service.store.executor,
                         &chunk,
                         base_start_ms,
                         &error_message,
                     )
-                };
+                })
+                .await;
                 if let Err(mark_err) = mark_result {
                     LIVE_TRANSCRIPTION_RECOVERY_NEEDED.store(true, Ordering::Release);
                     warn!(
@@ -11000,6 +11013,39 @@ mod status_message_tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_live_transcription_save_does_not_block_other_tokio_tasks() {
+        let service = Arc::new(tokio::sync::Mutex::new(()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let saving_service = Arc::clone(&service);
+        let saving = tokio::spawn(async move {
+            with_service_lock_blocking(&saving_service, move |_| {
+                entered_tx.send(()).expect("test receiver remains open");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("test releases the simulated slow database");
+            })
+            .await;
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking save starts");
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            progress_tx.send(()).expect("test receiver remains open");
+        });
+        progress_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unrelated Tokio task progresses while the database save is slow");
+
+        release_tx
+            .send(())
+            .expect("save remains blocked until released");
+        saving.await.expect("save task completes");
+    }
 
     #[test]
     fn generated_summary_persistence_failure_is_fatal_to_completion_path() {
