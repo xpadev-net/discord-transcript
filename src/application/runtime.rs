@@ -3047,6 +3047,22 @@ fn persist_generated_summary<E: SqlExecutor>(
         .map_err(|err| format!("failed to persist generated summary: {err}"))
 }
 
+struct SqlSummaryPersistenceAdapter<'a, E> {
+    executor: &'a mut E,
+}
+
+impl<E: SqlExecutor> crate::application::summary_persistence::SummaryPersistencePort
+    for SqlSummaryPersistenceAdapter<'_, E>
+{
+    fn persist_generated_summary(
+        &mut self,
+        meeting_id: &str,
+        markdown: &str,
+    ) -> Result<(), String> {
+        persist_generated_summary(self.executor, meeting_id, markdown)
+    }
+}
+
 fn recover_summary_job_for_startup<E: SqlExecutor>(
     queue: &mut SqlJobQueue<E>,
     job_id: &str,
@@ -9359,29 +9375,35 @@ impl ScaffoldHandler {
             .await?;
         let persist_result = {
             let mut service = self.service.lock().await;
-            persist_generated_summary(
-                &mut service.store.executor,
+            let mut persistence = SqlSummaryPersistenceAdapter {
+                executor: &mut service.store.executor,
+            };
+            crate::application::summary_persistence::persist_summary(
+                &mut persistence,
                 &claimed_job.meeting_id,
                 &markdown,
+                agent_workspace,
             )
         };
-        if let Err(err) = persist_result {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                error = %err,
-                "failed to persist summary; scheduling retry before cleanup or notification"
-            );
-            agent_workspace.retain_for_retry();
-            return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(
-                err
-            ));
+        match persist_result {
+            crate::application::summary_persistence::SummaryPersistenceOutcome::Persisted(
+                workspace,
+            ) => cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, workspace),
+            crate::application::summary_persistence::SummaryPersistenceOutcome::Retry {
+                context: workspace,
+                error: err,
+            } => {
+                workspace.retain_for_retry();
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "failed to persist summary; scheduling retry before cleanup or notification"
+                );
+                return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(
+                    err
+                ));
+            }
         }
-        // The summary is already persisted at this point, so cleanup is
-        // best-effort housekeeping. A prompt-injected agent can tamper with
-        // the cleanup marker or other workspace contents to make cleanup
-        // fail; reverting the meeting and requeueing the job here would let
-        // the agent turn cleanup into a repeated-LLM-work DoS.
-        cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, agent_workspace);
 
         let ai_memory_extraction_supported = {
             let service = self.service.lock().await;

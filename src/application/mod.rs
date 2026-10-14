@@ -11,4 +11,5 @@ pub mod retention_cleanup;
 pub mod runtime;
 pub mod stop;
 pub mod summary;
+pub mod summary_persistence;
 pub mod worker;
