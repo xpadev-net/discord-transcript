@@ -333,7 +333,10 @@ export function App() {
               forbidden={sessionForbidden}
               error={sessionError}
             >
-              <AdminJobsPage selectedGuildName={currentGuildName} />
+              <AdminJobsPage
+                selectedGuildName={currentGuildName}
+                canReprocessMeetings={me?.can_reprocess_meetings === true}
+              />
             </GuildAdminRoute>
           }
         />

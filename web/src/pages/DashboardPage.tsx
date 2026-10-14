@@ -5,6 +5,7 @@ import {
   fetchGuildMeetings,
   fetchGuildSettings,
   isApiError,
+  retryGuildJob,
 } from "../lib/api";
 import { formatDate, formatDuration } from "../lib/formatters";
 import {
@@ -622,6 +623,7 @@ export interface AdminViewProps {
   selectedGuildName?: string;
   isSystemAdmin?: boolean;
   canManageSettings?: boolean;
+  canReprocessMeetings?: boolean;
 }
 
 export function AdminUsagePage({
@@ -808,7 +810,10 @@ export function AdminUsagePage({
   );
 }
 
-export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
+export function AdminJobsPage({
+  selectedGuildName,
+  canReprocessMeetings = false,
+}: AdminViewProps) {
   const [filters, setFilters] = useState<{
     status: GuildJobStatus | "";
     jobType: GuildJobType | "";
@@ -817,6 +822,8 @@ export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
   const [jobs, setJobs] = useState<GuildJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [retryError, setRetryError] = useState<string | null>(null);
 
   useEffect(() => {
     document.title = "Jobs";
@@ -827,6 +834,7 @@ export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setRetryError(null);
     fetchGuildJobs({
       status: filters.status,
       jobType: filters.jobType,
@@ -853,6 +861,39 @@ export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
 
   const failedJobs = jobs.filter((job) => job.status === "failed").length;
   const retryableJobs = jobs.filter(isRetryableJob).length;
+
+  async function handleRetry(job: GuildJob) {
+    if (
+      !canReprocessMeetings ||
+      job.job_type !== "summarize" ||
+      !["failed", "canceled"].includes(job.status)
+    ) {
+      return;
+    }
+    if (!window.confirm("この会議の要約を再実行しますか？")) {
+      return;
+    }
+    setRetryError(null);
+    setRetryingJobId(job.id);
+    try {
+      const retriedJob = await retryGuildJob(job.id);
+      setJobs((current) =>
+        current.map((currentJob) =>
+          currentJob.id === retriedJob.id ? retriedJob : currentJob,
+        ),
+      );
+      setReloadKey((current) => current + 1);
+    } catch (retryFailure) {
+      setRetryError(
+        isApiError(retryFailure) &&
+          retryFailure.code === "retry_input_unavailable"
+          ? "元音声が保持されていないため、要約を再実行できません。"
+          : "要約の再実行に失敗しました。ジョブを再読み込みして確認してください。",
+      );
+    } finally {
+      setRetryingJobId(null);
+    }
+  }
 
   return (
     <main className="admin-page">
@@ -921,6 +962,11 @@ export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
         <AdminLoading />
       ) : (
         <>
+          {retryError ? (
+            <p className="panel-error settings-panel-message" role="alert">
+              {retryError}
+            </p>
+          ) : null}
           <section className="admin-metric-grid">
             <AdminMetricCard
               label="Visible jobs"
@@ -951,6 +997,9 @@ export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
                   <th scope="col">{"Next run"}</th>
                   <th scope="col">{"Updated"}</th>
                   <th scope="col">{"Error"}</th>
+                  {canReprocessMeetings ? (
+                    <th scope="col">{"Actions"}</th>
+                  ) : null}
                 </tr>
               </thead>
               <tbody>
@@ -977,6 +1026,23 @@ export function AdminJobsPage({ selectedGuildName }: AdminViewProps) {
                     </td>
                     <td>{formatDate(job.updated_at)}</td>
                     <td>{job.error_message ?? job.cancel_reason ?? "--"}</td>
+                    {canReprocessMeetings ? (
+                      <td>
+                        {job.job_type === "summarize" &&
+                        ["failed", "canceled"].includes(job.status) ? (
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => void handleRetry(job)}
+                            disabled={retryingJobId !== null}
+                          >
+                            {retryingJobId === job.id
+                              ? "再実行中…"
+                              : "要約を再実行"}
+                          </button>
+                        ) : null}
+                      </td>
+                    ) : null}
                   </tr>
                 ))}
               </tbody>

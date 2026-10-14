@@ -503,6 +503,14 @@ export function fetchGuildJobs(
   return fetch(path, { signal: options.signal }).then(handleGuildJobsResponse);
 }
 
+export function retryGuildJob(jobId: string): Promise<GuildJob> {
+  return fetch(`${guildJobsPath()}/${encodeURIComponent(jobId)}/retry`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  }).then(handleResponse<GuildJob>);
+}
+
 export function fetchGuildSettings(
   guildId?: string,
   signal?: AbortSignal,
