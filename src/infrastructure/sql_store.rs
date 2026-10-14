@@ -59,7 +59,9 @@ use crate::infrastructure::storage::{
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use tokio_postgres::{Client as PgClient, NoTls, Row};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread::JoinHandle;
+use tokio_postgres::{NoTls, Row};
 
 const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64 / 1_000_000;
 
@@ -2830,34 +2832,56 @@ fn effective_settings_values(settings: &EffectiveMeetingSettings) -> Vec<String>
     ]
 }
 
+const PG_EXECUTOR_QUEUE_CAPACITY: usize = 64;
+
+enum PgExecutorOperation {
+    Execute(String, Vec<String>),
+    QueryActiveMeeting(String),
+    QueryRows(String, Vec<String>),
+    Migration(String),
+    Shutdown,
+}
+
+enum PgExecutorResult {
+    Execute(u64),
+    ActiveMeeting(Box<Option<StoredMeeting>>),
+    Rows(Vec<SqlRow>),
+    Migration,
+}
+
+struct PgExecutorRequest {
+    operation: PgExecutorOperation,
+    reply: mpsc::Sender<Result<PgExecutorResult, String>>,
+}
+
 pub struct PgSqlExecutor {
-    client: Option<PgClient>,
-    runtime: Option<tokio::runtime::Runtime>,
+    requests: Option<SyncSender<PgExecutorRequest>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl PgSqlExecutor {
     pub fn connect(connection_str: &str) -> Result<Self, String> {
-        let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
         let conn_str = connection_str.to_owned();
-        let client = std::thread::scope(|s| {
-            s.spawn(|| {
-                let (client, connection) = runtime
-                    .block_on(tokio_postgres::connect(&conn_str, NoTls))
-                    .map_err(|err| err.to_string())?;
-                runtime.spawn(async move {
-                    if let Err(err) = connection.await {
-                        tracing::error!(error = %err, "postgres connection error");
-                    }
-                });
-                Ok::<_, String>(client)
-            })
-            .join()
-            .map_err(|_| "postgres connect thread panicked".to_owned())?
-        })?;
-        Ok(Self {
-            client: Some(client),
-            runtime: Some(runtime),
-        })
+        let (requests, receiver) = mpsc::sync_channel(PG_EXECUTOR_QUEUE_CAPACITY);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("postgres-executor".to_owned())
+            .spawn(move || pg_executor_worker(conn_str, receiver, ready_tx))
+            .map_err(|err| format!("failed to start postgres executor: {err}"))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                requests: Some(requests),
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err("postgres executor stopped during connect".to_owned())
+            }
+        }
     }
 
     pub fn connect_with_ssl_mode(
@@ -2877,108 +2901,158 @@ impl PgSqlExecutor {
         Self::connect(&conn)
     }
 
-    fn runtime(&self) -> Result<&tokio::runtime::Runtime, String> {
-        self.runtime
+    fn request(&self, operation: PgExecutorOperation) -> Result<PgExecutorResult, String> {
+        let (reply, response) = mpsc::channel();
+        self.requests
             .as_ref()
-            .ok_or_else(|| "postgres runtime already shut down".to_owned())
-    }
-
-    fn client(&self) -> Result<&PgClient, String> {
-        self.client
-            .as_ref()
-            .ok_or_else(|| "postgres client already shut down".to_owned())
+            .ok_or_else(|| "postgres executor already shut down".to_owned())?
+            .send(PgExecutorRequest { operation, reply })
+            .map_err(|_| "postgres executor worker disconnected".to_owned())?;
+        response
+            .recv()
+            .map_err(|_| "postgres executor worker dropped its response".to_owned())?
     }
 }
 
 impl Drop for PgSqlExecutor {
     fn drop(&mut self) {
-        self.client.take();
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
+        if let Some(requests) = self.requests.take() {
+            let (reply, _response) = mpsc::channel();
+            let _ = requests.send(PgExecutorRequest {
+                operation: PgExecutorOperation::Shutdown,
+                reply,
+            });
+        }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("postgres executor thread panicked during shutdown");
         }
     }
 }
 
+fn pg_executor_worker(
+    connection_str: String,
+    requests: Receiver<PgExecutorRequest>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return;
+        }
+    };
+    let (client, connection) =
+        match runtime.block_on(tokio_postgres::connect(&connection_str, NoTls)) {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = ready.send(Err(error.to_string()));
+                return;
+            }
+        };
+    runtime.spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::error!(error = %error, "postgres connection error");
+        }
+    });
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+
+    while let Ok(request) = requests.recv() {
+        if matches!(request.operation, PgExecutorOperation::Shutdown) {
+            break;
+        }
+        let result = match request.operation {
+            PgExecutorOperation::Execute(sql, params) => {
+                let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                    .iter()
+                    .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+                    .collect();
+                runtime
+                    .block_on(client.execute(&sql, &bind))
+                    .map(PgExecutorResult::Execute)
+                    .map_err(|error| {
+                        if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+                        {
+                            let constraint = error
+                                .as_db_error()
+                                .and_then(|db_error| db_error.constraint())
+                                .unwrap_or("");
+                            format!("{UNIQUE_VIOLATION_PREFIX}{constraint}: {error}")
+                        } else {
+                            error.to_string()
+                        }
+                    })
+            }
+            PgExecutorOperation::QueryActiveMeeting(guild_id) => {
+                let sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at, meeting_duration_seconds FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
+                runtime
+                    .block_on(client.query(sql, &[&guild_id]))
+                    .map_err(|error| error.to_string())
+                    .and_then(|rows| rows.first().map(row_to_stored_meeting).transpose())
+                    .map(|meeting| PgExecutorResult::ActiveMeeting(Box::new(meeting)))
+            }
+            PgExecutorOperation::QueryRows(sql, params) => {
+                let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                    .iter()
+                    .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+                    .collect();
+                runtime
+                    .block_on(client.query(&sql, &bind))
+                    .map_err(|error| error.to_string())
+                    .and_then(|rows| rows.into_iter().map(pg_row_to_optional_strings).collect())
+                    .map(PgExecutorResult::Rows)
+            }
+            PgExecutorOperation::Migration(sql) => runtime
+                .block_on(client.batch_execute(&sql))
+                .map(|()| PgExecutorResult::Migration)
+                .map_err(|error| error.to_string()),
+            PgExecutorOperation::Shutdown => unreachable!(),
+        };
+        let _ = request.reply.send(result);
+    }
+    drop(client);
+    runtime.shutdown_background();
+}
+
 impl SqlExecutor for PgSqlExecutor {
     fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String> {
-        let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        let client = self.client()?;
-        let runtime = self.runtime()?;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                runtime.block_on(client.execute(sql, &bind)).map_err(|err| {
-                    if err.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-                        let constraint = err
-                            .as_db_error()
-                            .and_then(|db_err| db_err.constraint())
-                            .unwrap_or("");
-                        format!("{UNIQUE_VIOLATION_PREFIX}{constraint}: {err}")
-                    } else {
-                        err.to_string()
-                    }
-                })
-            })
-            .join()
-            .map_err(|_| "db execute thread panicked".to_owned())?
-        })
+        match self.request(PgExecutorOperation::Execute(
+            sql.to_owned(),
+            params.to_vec(),
+        ))? {
+            PgExecutorResult::Execute(rows) => Ok(rows),
+            _ => Err("postgres executor returned an unexpected execute response".to_owned()),
+        }
     }
 
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String> {
-        let sql = "SELECT id, guild_id, voice_channel_id, voice_channel_name, report_channel_id, status_message_channel_id, status_message_id, started_by_user_id, title, status, stop_reason, error_message, to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS started_at, to_char(stopped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS stopped_at, meeting_duration_seconds FROM meetings WHERE guild_id=$1 AND status IN ('scheduled','recording','stopping') ORDER BY started_at DESC LIMIT 1";
-        let client = self.client()?;
-        let runtime = self.runtime()?;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                runtime
-                    .block_on(client.query(sql, &[&guild_id]))
-                    .map_err(|err| err.to_string())?
-                    .first()
-                    .map(row_to_stored_meeting)
-                    .transpose()
-            })
-            .join()
-            .map_err(|_| "db query thread panicked".to_owned())?
-        })
+        match self.request(PgExecutorOperation::QueryActiveMeeting(guild_id.to_owned()))? {
+            PgExecutorResult::ActiveMeeting(meeting) => Ok(*meeting),
+            _ => Err("postgres executor returned an unexpected active-meeting response".to_owned()),
+        }
     }
 
     fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<SqlRow>, String> {
-        let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        let client = self.client()?;
-        let runtime = self.runtime()?;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                runtime
-                    .block_on(client.query(sql, &bind))
-                    .map_err(|err| err.to_string())
-                    .and_then(|rows| {
-                        rows.into_iter()
-                            .map(pg_row_to_optional_strings)
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-            })
-            .join()
-            .map_err(|_| "db query thread panicked".to_owned())?
-        })
+        match self.request(PgExecutorOperation::QueryRows(
+            sql.to_owned(),
+            params.to_vec(),
+        ))? {
+            PgExecutorResult::Rows(rows) => Ok(rows),
+            _ => Err("postgres executor returned an unexpected query response".to_owned()),
+        }
     }
 
     fn run_migration(&mut self, migration_sql: &str) -> Result<(), String> {
-        let client = self.client()?;
-        let runtime = self.runtime()?;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                runtime
-                    .block_on(client.batch_execute(migration_sql))
-                    .map_err(|err| err.to_string())
-            })
-            .join()
-            .map_err(|_| "db migration thread panicked".to_owned())?
-        })
+        match self.request(PgExecutorOperation::Migration(migration_sql.to_owned()))? {
+            PgExecutorResult::Migration => Ok(()),
+            _ => Err("postgres executor returned an unexpected migration response".to_owned()),
+        }
     }
 }
 
