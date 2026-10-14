@@ -20,6 +20,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -183,7 +184,6 @@ impl S3StreamingWhisperClient {
     ) -> Result<Self, WhisperParseError> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
-            .timeout(local.command_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| {
@@ -233,6 +233,7 @@ impl S3StreamingWhisperClient {
                     vad,
                     temperature,
                 },
+                self.local.command_timeout,
             )
             .await
         })
@@ -271,11 +272,14 @@ async fn stream_s3_audio_to_whisper(
     source_url: &str,
     whisper_endpoint: &str,
     options: WhisperFormOptions<'_>,
+    timeout: Duration,
 ) -> Result<WhisperTranscriptionResult, WhisperParseError> {
-    let source =
-        client.get(source_url).send().await.map_err(|_| {
-            WhisperParseError::InvalidJson("S3 audio GET transport failure".to_owned())
-        })?;
+    let source = client
+        .get(source_url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|_| WhisperParseError::InvalidJson("S3 audio GET transport failure".to_owned()))?;
     if !source.status().is_success() {
         return Err(WhisperParseError::InvalidJson(format!(
             "S3 audio GET failed: status={}",
@@ -287,7 +291,35 @@ async fn stream_s3_audio_to_whisper(
             "S3 audio GET response omitted Content-Length".to_owned(),
         )
     })?;
-    let source_body = reqwest::Body::wrap_stream(source.bytes_stream());
+    let (source_done_tx, mut source_done_rx) = tokio::sync::oneshot::channel();
+    let source_failed = std::sync::Arc::new(AtomicBool::new(false));
+    let source_failed_in_stream = source_failed.clone();
+    let source_stream = futures_util::stream::unfold(
+        (
+            source.bytes_stream(),
+            Some(source_done_tx),
+            source_failed_in_stream,
+        ),
+        |(mut bytes, done, failed)| async move {
+            match bytes.next().await {
+                Some(Ok(chunk)) => Some((Ok(chunk), (bytes, done, failed))),
+                Some(Err(_)) => {
+                    failed.store(true, Ordering::Release);
+                    Some((
+                        Err(std::io::Error::other("S3 audio GET body read failure")),
+                        (bytes, done, failed),
+                    ))
+                }
+                None => {
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
+                    None
+                }
+            }
+        },
+    );
+    let source_body = reqwest::Body::wrap_stream(source_stream);
     let file = reqwest::multipart::Part::stream_with_length(source_body, content_length)
         .file_name("audio.wav")
         .mime_str("audio/wav")
@@ -311,14 +343,32 @@ async fn stream_s3_audio_to_whisper(
         form = form.text("prompt", prompt.to_owned());
     }
 
-    let response = client
-        .post(whisper_endpoint)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|_| {
-            WhisperParseError::InvalidJson("Whisper streaming POST transport failure".to_owned())
-        })?;
+    let post = client.post(whisper_endpoint).multipart(form).send();
+    tokio::pin!(post);
+    let (response, whisper_deadline) = tokio::select! {
+        transfer = tokio::time::timeout(timeout, &mut source_done_rx) => match transfer {
+            Err(_) => return Err(WhisperParseError::InvalidJson("S3 audio GET body timed out".to_owned())),
+            Ok(Err(_)) if source_failed.load(Ordering::Acquire) => return Err(WhisperParseError::InvalidJson("S3 audio GET body read failure".to_owned())),
+            Ok(Err(_)) => return Err(WhisperParseError::InvalidJson("S3 audio GET body stream ended unexpectedly".to_owned())),
+            Ok(Ok(())) => {
+                let deadline = tokio::time::Instant::now() + timeout;
+                let response = tokio::time::timeout_at(deadline, &mut post).await
+                    .map_err(|_| WhisperParseError::InvalidJson("Whisper streaming POST timed out".to_owned()))?
+                    .map_err(|_| WhisperParseError::InvalidJson("Whisper streaming POST transport failure".to_owned()))?;
+                (response, deadline)
+            },
+        },
+        result = &mut post => {
+            let response = result.map_err(|_| {
+                if source_failed.load(Ordering::Acquire) {
+                    WhisperParseError::InvalidJson("S3 audio GET body read failure".to_owned())
+                } else {
+                    WhisperParseError::InvalidJson("Whisper streaming POST transport failure".to_owned())
+                }
+            })?;
+            (response, tokio::time::Instant::now() + timeout)
+        },
+    };
     if !response.status().is_success() {
         return Err(WhisperParseError::InvalidJson(format!(
             "Whisper streaming POST failed: status={}",
@@ -327,7 +377,17 @@ async fn stream_s3_audio_to_whisper(
     }
     let mut response_stream = response.bytes_stream();
     let mut body = Vec::new();
-    while let Some(chunk) = response_stream.next().await {
+    loop {
+        let chunk = tokio::time::timeout_at(whisper_deadline, response_stream.next())
+            .await
+            .map_err(|_| {
+                WhisperParseError::InvalidJson(
+                    "Whisper streaming POST response timed out".to_owned(),
+                )
+            })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|_| {
             WhisperParseError::InvalidJson("Whisper streaming response body read failed".to_owned())
         })?;
@@ -1773,6 +1833,37 @@ mod tests {
             whisper_listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    fn s3_body_read_failure_is_not_reported_as_whisper_transport_failure() {
+        let s3_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s3_address = s3_listener.local_addr().unwrap();
+        let s3_server = std::thread::spawn(move || {
+            let (stream, _) = s3_listener.accept().unwrap();
+            let mut request = BufReader::new(stream);
+            let _ = read_http_request(&mut request);
+            request
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .unwrap();
+        });
+        let whisper_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let whisper_address = whisper_listener.local_addr().unwrap();
+        let client = test_s3_whisper_client(
+            format!("http://{s3_address}/audio.wav?X-Amz-Signature=private-signature"),
+            format!("http://{whisper_address}"),
+        );
+
+        let error = crate::application::asr::AsrPort::infer(&client, &s3_audio_request())
+            .expect_err("truncated S3 body must fail");
+        s3_server.join().unwrap();
+        assert!(
+            matches!(error, AsrError::InvalidJson(ref message) if message.contains("S3 audio GET body read failure"))
+        );
+        assert!(!error.to_string().contains("Whisper streaming POST"));
     }
 
     #[test]
