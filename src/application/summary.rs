@@ -171,6 +171,70 @@ mod summary_engine_compat_tests {
     }
 }
 
+#[cfg(test)]
+mod s3_transcription_source_tests {
+    use super::{SummaryRequest, run_transcription_with_s3_sources};
+    use crate::application::asr::{
+        AsrError, AsrPort, AsrRequest, AsrResult, AudioSource, S3AudioObjectReference,
+    };
+    use crate::infrastructure::workspace::MeetingWorkspaceLayout;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct RecordingAsr(Mutex<Option<AsrRequest>>);
+
+    impl AsrPort for RecordingAsr {
+        fn infer(&self, request: &AsrRequest) -> Result<AsrResult, AsrError> {
+            *self.0.lock().unwrap() = Some(request.clone());
+            Ok(AsrResult {
+                text: String::new(),
+                segments: Vec::new(),
+                raw_body: "{}".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn mirrored_mixdown_is_sent_to_asr_as_trusted_s3_object() {
+        let root = std::env::temp_dir().join(format!("summary-s3-source-{}", std::process::id()));
+        let workspace =
+            MeetingWorkspaceLayout::new(&root).for_meeting("guild", "channel", "meeting");
+        let audio_path = workspace
+            .audio_dir()
+            .join("mixdown.wav")
+            .to_string_lossy()
+            .into_owned();
+        let request = SummaryRequest {
+            meeting_id: "meeting".to_owned(),
+            guild_id: "guild".to_owned(),
+            voice_channel_id: "channel".to_owned(),
+            voice_channel_name: None,
+            title: Some("Design sync".to_owned()),
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
+            audio_path: audio_path.clone(),
+            speaker_audio: Vec::new(),
+            language: Some("ja".to_owned()),
+            workspace,
+        };
+        let source =
+            S3AudioObjectReference::new("recordings/guild/meeting/mixdown.wav", None, None)
+                .unwrap();
+        let sources = HashMap::from([(std::path::PathBuf::from(&audio_path), source)]);
+        let asr = RecordingAsr(Mutex::new(None));
+
+        run_transcription_with_s3_sources(&asr, &request, &sources).unwrap();
+
+        let captured = asr.0.lock().unwrap().clone().unwrap();
+        assert!(
+            matches!(captured.source, AudioSource::S3Object(ref audio) if audio.key() == "recordings/guild/meeting/mixdown.wav")
+        );
+        assert_eq!(captured.language.as_deref(), Some("ja"));
+        assert!(captured.prompt.as_deref().unwrap().contains("Design sync"));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryError {
     Asr(String),
@@ -332,12 +396,36 @@ pub fn run_transcription<W: AsrPort>(
     whisper: &W,
     request: &SummaryRequest,
 ) -> Result<TranscriptionOutput, SummaryError> {
+    run_transcription_with_s3_sources(whisper, request, &std::collections::HashMap::new())
+}
+
+pub fn run_transcription_with_s3_sources<W: AsrPort>(
+    whisper: &W,
+    request: &SummaryRequest,
+    s3_sources: &std::collections::HashMap<
+        std::path::PathBuf,
+        crate::application::asr::S3AudioObjectReference,
+    >,
+) -> Result<TranscriptionOutput, SummaryError> {
     if request.speaker_audio.is_empty() {
-        let transcription = whisper.infer(&AsrRequest::local_file(
-            request.audio_path.clone(),
-            request.language.clone(),
-            build_whisper_prompt(request, None),
-        ))?;
+        let prompt = build_whisper_prompt(request, None);
+        let transcription = whisper.infer(
+            &s3_sources
+                .get(std::path::Path::new(&request.audio_path))
+                .cloned()
+                .map_or_else(
+                    || {
+                        AsrRequest::local_file(
+                            request.audio_path.clone(),
+                            request.language.clone(),
+                            prompt.clone(),
+                        )
+                    },
+                    |source| {
+                        AsrRequest::s3_object(source, request.language.clone(), prompt.clone())
+                    },
+                ),
+        )?;
         persist_whisper_debug_response(
             &request.workspace.mixdown_whisper_response_path(),
             &transcription.raw_body,
@@ -347,11 +435,24 @@ pub fn run_transcription<W: AsrPort>(
 
     let mut merged_segments = Vec::new();
     for speaker in &request.speaker_audio {
-        let transcription = whisper.infer(&AsrRequest::local_file(
-            speaker.audio_path.clone(),
-            request.language.clone(),
-            build_whisper_prompt(request, Some(speaker)),
-        ))?;
+        let prompt = build_whisper_prompt(request, Some(speaker));
+        let transcription = whisper.infer(
+            &s3_sources
+                .get(std::path::Path::new(&speaker.audio_path))
+                .cloned()
+                .map_or_else(
+                    || {
+                        AsrRequest::local_file(
+                            speaker.audio_path.clone(),
+                            request.language.clone(),
+                            prompt.clone(),
+                        )
+                    },
+                    |source| {
+                        AsrRequest::s3_object(source, request.language.clone(), prompt.clone())
+                    },
+                ),
+        )?;
         persist_whisper_debug_response(
             &request.workspace.whisper_response_path(&speaker.speaker_id),
             &transcription.raw_body,

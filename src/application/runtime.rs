@@ -26,7 +26,7 @@ use crate::application::summary::SummaryEngine;
 use crate::application::worker::{
     SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobHeartbeatGuard, SummaryNotificationReceipt,
     SummaryStatusNotification, SummaryUrlNotification, complete_summary_job_after_notification,
-    enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
+    durable_s3_audio_source, enqueue_summary_job, mark_summary_meeting_failed_from_summary_state,
     spawn_summary_job_heartbeat,
 };
 use crate::audio::meeting_audio::{
@@ -8811,17 +8811,55 @@ impl ScaffoldHandler {
         } else if request.speaker_audio.is_empty() && has_completed_live_chunks {
             crate::application::summary::build_transcription_output(live_segments.clone())
         } else {
-            tokio::task::block_in_place(|| {
-                crate::application::summary::run_transcription(&whisper, &request)
-            })
-            .and_then(|mut output| {
-                if live_segments.is_empty() {
-                    return Ok(output);
-                }
-                output.segments.extend(live_segments.clone());
-                sort_transcript_segments(&mut output.segments);
-                crate::application::summary::build_transcription_output(output.segments)
-            })
+            let s3_sources = if let Some(objects) = &self.recording_objects {
+                (|| {
+                    let mut sources = HashMap::new();
+                    if let Some(source) =
+                        durable_s3_audio_source(objects, Path::new(&request.audio_path), None, None)
+                            .map_err(|err| {
+                                crate::application::summary::SummaryError::SummaryEngine(
+                                    err.to_string(),
+                                )
+                            })?
+                    {
+                        sources.insert(PathBuf::from(&request.audio_path), source);
+                    }
+                    for speaker in &request.speaker_audio {
+                        if let Some(source) = durable_s3_audio_source(
+                            objects,
+                            Path::new(&speaker.audio_path),
+                            Some(speaker.speaker_id.clone()),
+                            Some(speaker.offset_ms),
+                        )
+                        .map_err(|err| {
+                            crate::application::summary::SummaryError::SummaryEngine(
+                                err.to_string(),
+                            )
+                        })? {
+                            sources.insert(PathBuf::from(&speaker.audio_path), source);
+                        }
+                    }
+                    Ok::<_, crate::application::summary::SummaryError>(sources)
+                })()
+            } else {
+                Ok(HashMap::new())
+            };
+            s3_sources
+                .and_then(|sources| {
+                    tokio::task::block_in_place(|| {
+                        crate::application::summary::run_transcription_with_s3_sources(
+                            &whisper, &request, &sources,
+                        )
+                    })
+                })
+                .and_then(|mut output| {
+                    if live_segments.is_empty() {
+                        return Ok(output);
+                    }
+                    output.segments.extend(live_segments.clone());
+                    sort_transcript_segments(&mut output.segments);
+                    crate::application::summary::build_transcription_output(output.segments)
+                })
         };
         let mut transcription = match transcription {
             Ok(t) => t,

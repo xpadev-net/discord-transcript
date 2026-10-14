@@ -167,7 +167,10 @@ pub struct S3StreamingWhisperClient {
 impl std::fmt::Debug for S3StreamingWhisperClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3StreamingWhisperClient")
-            .field("local", &self.local)
+            .field(
+                "whisper_endpoint",
+                &sanitize_whisper_endpoint_for_log(&self.local.endpoint),
+            )
             .field("s3_configured", &self.objects.is_some())
             .finish_non_exhaustive()
     }
@@ -1718,6 +1721,14 @@ mod tests {
             format!("http://{whisper_address}"),
         );
         assert!(!format!("{client:?}").contains("private-signature"));
+        let debug_client = test_s3_whisper_client(
+            format!("http://{s3_address}/audio.wav"),
+            format!("http://user:password@{whisper_address}/?api_key=secret-token"),
+        );
+        let debug_output = format!("{debug_client:?}");
+        assert!(!debug_output.contains("user:password"));
+        assert!(!debug_output.contains("secret-token"));
+        assert!(debug_output.contains("REDACTED"));
         assert!(!format!("{:?}", s3_audio_request()).contains("meeting prompt"));
         let result = crate::application::asr::AsrPort::infer(&client, &s3_audio_request())
             .expect("S3 audio should be forwarded to Whisper");
