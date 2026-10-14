@@ -1834,7 +1834,7 @@ ON CONFLICT (guild_id) DO UPDATE SET
     retention_raw_audio_ttl_days = EXCLUDED.retention_raw_audio_ttl_days,
     retention_transcript_ttl_days = EXCLUDED.retention_transcript_ttl_days,
     summary_enabled = EXCLUDED.summary_enabled,
-    summary_in_status_thread = EXCLUDED.summary_in_status_thread,
+    summary_in_status_thread = COALESCE(EXCLUDED.summary_in_status_thread, guild_settings.summary_in_status_thread),
     updated_at = NOW()
 "#;
 

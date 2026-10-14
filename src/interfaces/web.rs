@@ -3999,8 +3999,7 @@ struct GuildSettingsUpdateRequest {
     retention_raw_audio_ttl_days: i32,
     retention_transcript_ttl_days: i32,
     summary_enabled: bool,
-    #[serde(default)]
-    summary_in_status_thread: bool,
+    summary_in_status_thread: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -14402,7 +14401,7 @@ mod guild_api_tests {
             retention_raw_audio_ttl_days: 7,
             retention_transcript_ttl_days: 30,
             summary_enabled: true,
-            summary_in_status_thread: false,
+            summary_in_status_thread: Some(false),
         }
     }
 
