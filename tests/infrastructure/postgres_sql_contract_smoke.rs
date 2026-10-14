@@ -124,7 +124,7 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     }
 
     store.executor.execute(
-        "INSERT INTO meetings (id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, status, started_at) SELECT 'page-' || n, CASE WHEN n % 10 = 0 THEN 'g-page-plan' ELSE 'g-other' END, 'vc-plan', 'report', 'user', 'completed', TIMESTAMPTZ '2025-01-01 00:00:00+00' - (n / 100) * INTERVAL '1 minute' FROM generate_series(1, 10000) AS n",
+        "INSERT INTO meetings (id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, status, started_at) SELECT 'page-' || n, CASE WHEN n % 10 = 0 THEN 'g-page-plan' ELSE 'g-other' END, 'vc-plan', 'report', 'user', 'posted', TIMESTAMPTZ '2025-01-01 00:00:00+00' - (n / 100) * INTERVAL '1 minute' FROM generate_series(1, 10000) AS n",
         &[],
     )
     .map_err(|err| format!("cursor fixture insert failed: {err}"))?;
