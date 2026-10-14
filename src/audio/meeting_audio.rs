@@ -223,6 +223,18 @@ pub fn scan_chunk_manifest(meeting_dir: &Path) -> Result<Vec<AudioChunkManifestE
             chunk.speaker_id.clone_from(real_speaker_id);
         }
     }
+    let speaker_count = chunks
+        .iter()
+        .map(|chunk| chunk.speaker_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if speaker_count > MAX_SPEAKER_AUDIO_OUTPUTS {
+        return Err(format!(
+            "too many speaker audio outputs in {}: {} (max {MAX_SPEAKER_AUDIO_OUTPUTS})",
+            meeting_dir.display(),
+            speaker_count
+        ));
+    }
     chunks.sort_by(|left, right| {
         left.start_ms
             .cmp(&right.start_ms)
@@ -1166,6 +1178,27 @@ mod manifest_tests {
         let trimmed = load_chunk_metadata(Path::new(&inputs[1].audio_path))
             .expect("overlap-trimmed WAV should be valid");
         assert_eq!(trimmed.duration_ms, 500);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn manifest_rejects_too_many_speakers_before_asr() {
+        let root = std::env::temp_dir().join(format!(
+            "discord_transcript_manifest_speaker_limit_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        for speaker in 0..=MAX_SPEAKER_AUDIO_OUTPUTS {
+            write_sparse_wav(
+                &root.join(format!("speaker{speaker:03}_1_1000.wav")),
+                3_200,
+                16_000,
+            );
+        }
+
+        let error = scan_chunk_manifest(&root).expect_err("speaker limit should be enforced");
+        assert!(error.contains("too many speaker audio outputs"));
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 }

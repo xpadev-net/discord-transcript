@@ -8742,27 +8742,56 @@ impl ScaffoldHandler {
                 meeting_dir: _,
                 completed_live_chunks,
                 s3_manifest: Some(manifest),
-            } => prepare_manifest_asr_inputs(
-                manifest,
-                completed_live_chunks,
-                effective_settings.whisper_resample_to_16k,
-            ),
-            SummaryInputSource::Audio {
-                meeting_dir,
-                completed_live_chunks,
-                s3_manifest: None,
-            } if completed_live_chunks.is_empty() => {
-                build_speaker_audio_inputs(meeting_dir, effective_settings.whisper_resample_to_16k)
+            } => {
+                let manifest = manifest.clone();
+                let completed_live_chunks = completed_live_chunks.clone();
+                let resample = effective_settings.whisper_resample_to_16k;
+                match tokio::task::spawn_blocking(move || {
+                    prepare_manifest_asr_inputs(&manifest, &completed_live_chunks, resample)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => Err(format!("manifest ASR input task failed: {err}")),
+                }
             }
             SummaryInputSource::Audio {
                 meeting_dir,
                 completed_live_chunks,
                 s3_manifest: None,
-            } => build_speaker_audio_inputs_excluding_processed_chunks(
+            } if completed_live_chunks.is_empty() => {
+                let meeting_dir = meeting_dir.clone();
+                let resample = effective_settings.whisper_resample_to_16k;
+                match tokio::task::spawn_blocking(move || {
+                    build_speaker_audio_inputs(&meeting_dir, resample)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => Err(format!("speaker audio input task failed: {err}")),
+                }
+            }
+            SummaryInputSource::Audio {
                 meeting_dir,
-                effective_settings.whisper_resample_to_16k,
                 completed_live_chunks,
-            ),
+                s3_manifest: None,
+            } => {
+                let meeting_dir = meeting_dir.clone();
+                let completed_live_chunks = completed_live_chunks.clone();
+                let resample = effective_settings.whisper_resample_to_16k;
+                match tokio::task::spawn_blocking(move || {
+                    build_speaker_audio_inputs_excluding_processed_chunks(
+                        &meeting_dir,
+                        resample,
+                        &completed_live_chunks,
+                    )
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => Err(format!("speaker audio input task failed: {err}")),
+                }
+            }
         } {
             Ok(value) => value,
             Err(err) => {
