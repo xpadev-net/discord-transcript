@@ -126,8 +126,12 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     store.executor.execute(
         "INSERT INTO meetings (id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, status, started_at) SELECT 'page-' || n, CASE WHEN n % 10 = 0 THEN 'g-page-plan' ELSE 'g-other' END, 'vc-plan', 'report', 'user', 'completed', TIMESTAMPTZ '2025-01-01 00:00:00+00' - (n / 100) * INTERVAL '1 minute' FROM generate_series(1, 10000) AS n",
         &[],
-    )?;
-    store.executor.run_migration("ANALYZE meetings")?;
+    )
+    .map_err(|err| format!("cursor fixture insert failed: {err}"))?;
+    store
+        .executor
+        .run_migration("ANALYZE meetings")
+        .map_err(|err| format!("cursor fixture analyze failed: {err}"))?;
     let first_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
         .replace("$1", "'g-page-plan'")
         .replace("$2::TEXT IS NULL", "TRUE")
@@ -135,7 +139,10 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
         .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
         .replace("$4::TEXT", "'unused'")
         .replace("$5", "21");
-    let first_page = store.executor.query_rows(&first_page_sql, &[])?;
+    let first_page = store
+        .executor
+        .query_rows(&first_page_sql, &[])
+        .map_err(|err| format!("first cursor page query failed: {err}"))?;
     if first_page.len() != 21 {
         return Err(format!("expected 21 rows in first cursor page, got {}", first_page.len()));
     }
@@ -149,7 +156,10 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
         .replace("$3::TEXT::TIMESTAMPTZ", &format!("TIMESTAMPTZ '{cursor_time}'"))
         .replace("$4::TEXT", &format!("'{cursor_id}'"))
         .replace("$5", "21");
-    let second_page = store.executor.query_rows(&second_page_sql, &[])?;
+    let second_page = store
+        .executor
+        .query_rows(&second_page_sql, &[])
+        .map_err(|err| format!("second cursor page query failed: {err}"))?;
     let first_ids = first_page
         .iter()
         .filter_map(|row| row.first().and_then(Option::as_deref))
@@ -171,7 +181,10 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
             .replace("$4::TEXT", "'page-100'")
             .replace("$5", "21"),
     );
-    let plan = store.executor.query_rows(&plan_sql, &[])?;
+    let plan = store
+        .executor
+        .query_rows(&plan_sql, &[])
+        .map_err(|err| format!("cursor query EXPLAIN failed: {err}"))?;
     if plan.is_empty() || !plan.iter().any(|row| {
         row.first()
             .and_then(Option::as_deref)
