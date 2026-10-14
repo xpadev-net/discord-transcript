@@ -8723,6 +8723,7 @@ impl ScaffoldHandler {
             },
         };
 
+        let mut upload_receipts = HashMap::new();
         // Under the s3 backend, mirror the playback artifacts (mixdown +
         // per-speaker wavs) to the object store. Uploads are queued in the
         // background; a missing local file or enqueue failure only warns —
@@ -8731,9 +8732,11 @@ impl ScaffoldHandler {
             let artifact_paths = std::iter::once(std::path::Path::new(&audio_path))
                 .chain(playback_speaker_paths.iter().map(|path| path.as_path()));
             for path in artifact_paths {
-                match objects.upload_file(path, "audio/wav") {
-                    Ok(true) => {}
-                    Ok(false) => warn!(
+                match objects.upload_file_with_receipt(path, "audio/wav") {
+                    Ok(Some(receipt)) => {
+                        upload_receipts.insert(path.to_path_buf(), receipt);
+                    }
+                    Ok(None) => warn!(
                         meeting_id = %claimed_job.meeting_id,
                         path = %path.display(),
                         "recording artifact missing locally; skipping object upload"
@@ -8821,6 +8824,7 @@ impl ScaffoldHandler {
                                 Path::new(&request.audio_path),
                                 None,
                                 None,
+                                upload_receipts.remove(Path::new(&request.audio_path)),
                             )
                             .map_err(|err| {
                                 crate::application::summary::SummaryError::SummaryEngine(
@@ -8836,6 +8840,7 @@ impl ScaffoldHandler {
                                 Path::new(&speaker.audio_path),
                                 Some(speaker.speaker_id.clone()),
                                 Some(speaker.offset_ms),
+                                upload_receipts.remove(Path::new(&speaker.audio_path)),
                             )
                             .map_err(|err| {
                                 crate::application::summary::SummaryError::SummaryEngine(

@@ -30,7 +30,7 @@ use crate::infrastructure::sql_store::{SqlExecutor, SqlMeetingStore};
 use crate::infrastructure::storage::{
     EffectiveMeetingSettings, InMemoryMeetingStore, MeetingStore, StoreError, UsageEventStore,
 };
-use crate::infrastructure::storage_s3::{RecordingObjectStore, UploadReceiptStatus};
+use crate::infrastructure::storage_s3::{RecordingObjectStore, UploadReceipt, UploadReceiptStatus};
 use crate::infrastructure::workspace::{
     AGENT_SUMMARY_OUTPUT_FILENAME, MeetingWorkspaceLayout, MeetingWorkspacePaths,
 };
@@ -884,16 +884,20 @@ pub(crate) fn durable_s3_audio_source(
     path: &std::path::Path,
     speaker_id: Option<String>,
     offset_ms: Option<u64>,
+    receipt: Option<UploadReceipt>,
 ) -> Result<Option<S3AudioObjectReference>, WorkerError> {
     let Some(key) = objects.object_key(path) else {
         return Ok(None);
     };
     let durable = if path.is_file() {
-        let receipt = match objects.upload_file_with_receipt(path, "audio/wav") {
-            Ok(Some(receipt)) => receipt,
-            // Local audio remains a valid input when S3 is unavailable or its
-            // upload queue cannot accept another artifact.
-            Ok(None) | Err(_) => return Ok(None),
+        let receipt = match receipt {
+            Some(receipt) => receipt,
+            None => match objects.upload_file_with_receipt(path, "audio/wav") {
+                Ok(Some(receipt)) => receipt,
+                // Local audio remains a valid input when S3 is unavailable or its
+                // upload queue cannot accept another artifact.
+                Ok(None) | Err(_) => return Ok(None),
+            },
         };
         match receipt.wait_timeout(Duration::from_secs(30)) {
             Some(UploadReceiptStatus::Durable) => true,
@@ -1593,6 +1597,7 @@ where
             .map_err(WorkerError::Summary)?;
         let speaker_audio = build_speaker_audio_inputs(&meeting_dir, resample_to_16k)
             .map_err(WorkerError::Summary)?;
+        let mut pending_s3_sources = HashMap::new();
         if let Some(objects) = &options.recording_objects {
             // Playback artifacts must exist in the object store for the web
             // presigned-URL path. Uploads warn rather than fail the job: the
@@ -1604,10 +1609,13 @@ where
                     .iter()
                     .map(|input| std::path::Path::new(&input.audio_path)),
             );
+            let mut upload_receipts = HashMap::new();
             for path in artifact_paths {
-                match objects.upload_file(path, "audio/wav") {
-                    Ok(true) => {}
-                    Ok(false) => warn!(
+                match objects.upload_file_with_receipt(path, "audio/wav") {
+                    Ok(Some(receipt)) => {
+                        upload_receipts.insert(path.to_path_buf(), receipt);
+                    }
+                    Ok(None) => warn!(
                         meeting_id = %job.meeting_id,
                         path = %path.display(),
                         "playback artifact missing locally; skipped object upload"
@@ -1618,6 +1626,31 @@ where
                         error = %err,
                         "failed to upload playback artifact to object store"
                     ),
+                }
+            }
+            // Reuse these same generations for ASR instead of enqueueing a
+            // second PUT for audio that was already selected for playback.
+            if speaker_audio.is_empty()
+                && let Some(source) = durable_s3_audio_source(
+                    objects,
+                    std::path::Path::new(&mixdown_path),
+                    None,
+                    None,
+                    upload_receipts.remove(std::path::Path::new(&mixdown_path)),
+                )?
+            {
+                pending_s3_sources.insert(std::path::PathBuf::from(&mixdown_path), source);
+            }
+            for speaker in &speaker_audio {
+                if let Some(source) = durable_s3_audio_source(
+                    objects,
+                    std::path::Path::new(&speaker.audio_path),
+                    Some(speaker.speaker_id.clone()),
+                    Some(speaker.offset_ms),
+                    upload_receipts.remove(std::path::Path::new(&speaker.audio_path)),
+                )? {
+                    pending_s3_sources
+                        .insert(std::path::PathBuf::from(&speaker.audio_path), source);
                 }
             }
         }
@@ -1646,35 +1679,12 @@ where
                 )
                 .map_err(WorkerError::from)?,
         };
-        let mut s3_sources = HashMap::new();
-        if let Some(objects) = &options.recording_objects {
-            if input.speaker_audio.is_empty()
-                && let Some(source) = durable_s3_audio_source(
-                    objects,
-                    std::path::Path::new(&input.audio_path),
-                    None,
-                    None,
-                )?
-            {
-                s3_sources.insert(std::path::PathBuf::from(&input.audio_path), source);
-            }
-            for speaker in &input.speaker_audio {
-                if let Some(source) = durable_s3_audio_source(
-                    objects,
-                    std::path::Path::new(&speaker.audio_path),
-                    Some(speaker.speaker_id.clone()),
-                    Some(speaker.offset_ms),
-                )? {
-                    s3_sources.insert(std::path::PathBuf::from(&speaker.audio_path), source);
-                }
-            }
-        }
         process_meeting_summary_with_s3_sources(
             store,
             whisper,
             summary_engine,
             &input,
-            &s3_sources,
+            &pending_s3_sources,
             || queue.heartbeat(&job).map_err(WorkerError::from),
         )
         .map(Some)
