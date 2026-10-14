@@ -8869,7 +8869,10 @@ impl ScaffoldHandler {
                 .filter(|path| path.is_file())
                 .chain(playback_speaker_paths.iter().map(|path| path.as_path()));
             for path in artifact_paths {
-                match objects.upload_file_with_receipt(path, "audio/wav") {
+                match objects
+                    .upload_file_with_receipt_async(path, "audio/wav")
+                    .await
+                {
                     Ok(Some(receipt)) => {
                         upload_receipts.insert(path.to_path_buf(), receipt);
                     }
@@ -9332,7 +9335,10 @@ impl ScaffoldHandler {
                 Ok(paths) => {
                     let mut upload_error = None;
                     for path in paths {
-                        match objects.upload_file_with_receipt(&path, "audio/wav") {
+                        match objects
+                            .upload_file_with_receipt_async(&path, "audio/wav")
+                            .await
+                        {
                             Ok(Some(receipt)) => {
                                 let status = tokio::task::spawn_blocking(move || {
                                     receipt.wait_timeout(UPLOAD_RECEIPT_WAIT_TIMEOUT)

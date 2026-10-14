@@ -156,6 +156,15 @@ fn upload_file_sha256(path: &Path) -> Result<[u8; 32], String> {
     Ok(hasher.finalize().into())
 }
 
+fn upload_file_snapshot(path: &Path) -> Result<UploadFileSnapshot, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("failed to stat upload source {}: {err}", path.display()))?;
+    Ok(UploadFileSnapshot {
+        len: metadata.len(),
+        sha256: upload_file_sha256(path)?,
+    })
+}
+
 impl UploadReceipt {
     pub fn key(&self) -> &str {
         &self.key
@@ -709,17 +718,11 @@ impl UploadQueue {
         self.enqueue_with_pending_limit(task, UPLOAD_MAX_PENDING_TASKS)
     }
 
-    fn enqueue_file_with_receipt(&self, task: UploadTask) -> Result<UploadReceipt, String> {
-        let metadata = std::fs::metadata(&task.path).map_err(|err| {
-            format!(
-                "failed to stat upload source {}: {err}",
-                task.path.display()
-            )
-        })?;
-        let snapshot = UploadFileSnapshot {
-            len: metadata.len(),
-            sha256: upload_file_sha256(&task.path)?,
-        };
+    fn enqueue_file_with_receipt(
+        &self,
+        task: UploadTask,
+        snapshot: UploadFileSnapshot,
+    ) -> Result<UploadReceipt, String> {
         let key = task.key.clone();
         let mut receipts = self.file_receipts.lock().unwrap();
         receipts.retain(|_, cached| {
@@ -1012,23 +1015,68 @@ impl RecordingObjectStore {
         path: &Path,
         content_type: &str,
     ) -> Result<Option<UploadReceipt>, String> {
+        let Some((task, snapshot)) = self.file_upload_task(path, content_type)? else {
+            return Ok(None);
+        };
+        let receipt = self.uploads.enqueue_file_with_receipt(task, snapshot)?;
+        Ok(Some(receipt))
+    }
+
+    /// Hashes a file-backed upload off the async runtime before queuing it.
+    pub async fn upload_file_with_receipt_async(
+        &self,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<Option<UploadReceipt>, String> {
         let Some(key) = self.object_key(path) else {
             return Ok(None);
         };
         if !path.is_file() {
             return Ok(None);
         }
-        let receipt = self.uploads.enqueue_file_with_receipt(UploadTask {
+        let path_buf = path.to_path_buf();
+        let snapshot = tokio::task::spawn_blocking(move || upload_file_snapshot(&path_buf))
+            .await
+            .map_err(|err| format!("upload snapshot task failed: {err}"))??;
+        let task = UploadTask {
             key,
             source: UploadSource::File(path.to_path_buf()),
             content_type: content_type.to_owned(),
             path: path.to_path_buf(),
-            generation: 0, // assigned by `enqueue`
+            generation: 0,
             attempts: 0,
             not_before: Instant::now(),
             receipt: None,
-        })?;
+        };
+        let receipt = self.uploads.enqueue_file_with_receipt(task, snapshot)?;
         Ok(Some(receipt))
+    }
+
+    fn file_upload_task(
+        &self,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<Option<(UploadTask, UploadFileSnapshot)>, String> {
+        let Some(key) = self.object_key(path) else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let snapshot = upload_file_snapshot(path)?;
+        Ok(Some((
+            UploadTask {
+                key,
+                source: UploadSource::File(path.to_path_buf()),
+                content_type: content_type.to_owned(),
+                path: path.to_path_buf(),
+                generation: 0, // assigned by `enqueue`
+                attempts: 0,
+                not_before: Instant::now(),
+                receipt: None,
+            },
+            snapshot,
+        )))
     }
 
     /// Lists all object keys under `prefix` (paginates as needed).
@@ -2011,6 +2059,32 @@ mod tests {
         assert_eq!(puts.len(), 2);
         assert_eq!(puts[0].1, b"audio");
         assert_eq!(puts[1].1, b"updated audio");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn async_file_upload_hashes_off_runtime_and_reuses_receipt() {
+        let base = temp_dir("async_file_receipt");
+        let _ = std::fs::remove_dir_all(&base);
+        let (fake, dyn_store) = fake_store();
+        let objects = RecordingObjectStore::new(dyn_store, String::new(), 900, &base);
+        let path = base.join("workspaces/g/vc/m/audio/chunk.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+
+        let first = objects
+            .upload_file_with_receipt_async(&path, "audio/wav")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.wait(), UploadReceiptStatus::Durable);
+        let retry = objects
+            .upload_file_with_receipt_async(&path, "audio/wav")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.generation(), first.generation());
+        assert_eq!(fake.puts.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&base);
     }
 

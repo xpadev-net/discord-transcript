@@ -279,49 +279,100 @@ pub fn prepare_manifest_asr_inputs(
     processed_chunks: &[ProcessedAudioChunk],
     resample_to_16k: bool,
 ) -> Result<Vec<SpeakerAudioInput>, String> {
-    let inputs = speaker_audio_inputs_from_manifest(chunks, processed_chunks);
-    if !resample_to_16k {
-        return Ok(inputs);
-    }
-    let output_dir = chunks
-        .first()
-        .and_then(|chunk| chunk.path.parent())
-        .ok_or_else(|| "manifest WAV path has no parent directory".to_owned())?
-        .join("transcription_chunks");
-    fs::create_dir_all(&output_dir)
-        .map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    let sample_rates = chunks
+    let meeting_start_ms = manifest_meeting_start_ms(chunks);
+    let entries = chunks
         .iter()
-        .map(|chunk| (chunk.path.as_path(), chunk.sample_rate))
+        .map(|chunk| (chunk.path.as_path(), chunk))
         .collect::<HashMap<_, _>>();
-    inputs
-        .into_iter()
-        .map(|mut input| {
-            let input_path = Path::new(&input.audio_path);
-            let sample_rate = sample_rates
-                .get(input_path)
-                .copied()
-                .ok_or_else(|| format!("manifest entry missing for {}", input.audio_path))?;
-            if sample_rate == 16_000 {
-                return Ok(input);
+    let mut inputs = speaker_audio_inputs_from_manifest(chunks, processed_chunks);
+    inputs.sort_by(|left, right| {
+        left.speaker_id
+            .cmp(&right.speaker_id)
+            .then(left.offset_ms.cmp(&right.offset_ms))
+            .then(left.audio_path.cmp(&right.audio_path))
+    });
+
+    let mut speaker_ends = HashMap::<String, u64>::new();
+    let mut output_dir: Option<PathBuf> = None;
+    let mut prepared = Vec::with_capacity(inputs.len());
+    for mut input in inputs {
+        let input_path = Path::new(&input.audio_path);
+        let entry = entries
+            .get(input_path)
+            .ok_or_else(|| format!("manifest entry missing for {}", input.audio_path))?;
+        let chunk_end_ms = entry.start_ms.saturating_add(entry.duration_ms);
+        let speaker_end_ms = speaker_ends.entry(input.speaker_id.clone()).or_default();
+        let overlap_ms = speaker_end_ms.saturating_sub(entry.start_ms);
+        if overlap_ms >= entry.duration_ms && overlap_ms > 0 {
+            debug!(
+                speaker_id = %input.speaker_id,
+                sequence = entry.sequence,
+                "skipping fully overlapped manifest chunk for final ASR"
+            );
+            continue;
+        }
+
+        let needs_trim = overlap_ms > 0;
+        let needs_resample = resample_to_16k && entry.sample_rate != 16_000;
+        if needs_trim || needs_resample {
+            let (_, mut pcm) = read_wav_pcm(input_path)?;
+            let mut effective_start_ms = entry.start_ms;
+            if needs_trim {
+                let samples_to_skip = overlap_ms.saturating_mul(entry.sample_rate as u64) / 1_000;
+                let bytes_to_skip = samples_to_skip.saturating_mul(2) as usize;
+                if bytes_to_skip >= pcm.len() {
+                    continue;
+                }
+                pcm.drain(..bytes_to_skip);
+                effective_start_ms = effective_start_ms.saturating_add(
+                    samples_to_skip.saturating_mul(1_000) / entry.sample_rate as u64,
+                );
+                debug!(
+                    speaker_id = %input.speaker_id,
+                    sequence = entry.sequence,
+                    overlap_ms,
+                    "trimming overlapping manifest chunk for final ASR"
+                );
             }
-            let (_, pcm) = read_wav_pcm(input_path)?;
-            let (pcm, output_rate) = resample_pcm_16le(&pcm, sample_rate, 16_000);
-            if output_rate != 16_000 {
-                return Ok(input);
+            let (pcm, output_rate) = if needs_resample {
+                resample_pcm_16le(&pcm, entry.sample_rate, 16_000)
+            } else {
+                (pcm, entry.sample_rate)
+            };
+            if needs_resample && output_rate != 16_000 {
+                return Err(format!(
+                    "failed to resample manifest chunk {} to 16000 Hz",
+                    input_path.display()
+                ));
             }
+            let dir = match &output_dir {
+                Some(dir) => dir.clone(),
+                None => {
+                    let dir = input_path
+                        .parent()
+                        .ok_or_else(|| "manifest WAV path has no parent directory".to_owned())?
+                        .join("transcription_chunks");
+                    fs::create_dir_all(&dir)
+                        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+                    output_dir = Some(dir.clone());
+                    dir
+                }
+            };
             let file_name = input_path
                 .file_name()
                 .ok_or_else(|| "manifest WAV path has no file name".to_owned())?;
-            let output_path = output_dir.join(file_name);
+            let output_path = dir.join(format!("{}.asr.wav", file_name.to_string_lossy()));
             let wav = build_wav_bytes_raw(&pcm, output_rate, 1, 16)
-                .map_err(|err| format!("failed to encode resampled chunk: {err}"))?;
+                .map_err(|err| format!("failed to encode prepared chunk: {err}"))?;
             fs::write(&output_path, wav)
                 .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
             input.audio_path = output_path.to_string_lossy().into_owned();
-            Ok(input)
-        })
-        .collect()
+            input.offset_ms = effective_start_ms.saturating_sub(meeting_start_ms);
+        }
+        *speaker_end_ms = (*speaker_end_ms).max(chunk_end_ms);
+        prepared.push(input);
+    }
+    Ok(prepared)
 }
 
 pub fn manifest_meeting_start_ms(chunks: &[AudioChunkManifestEntry]) -> u64 {
@@ -1090,6 +1141,31 @@ mod manifest_tests {
             .expect("invalid RIFF size should be written");
 
         assert!(scan_chunk_manifest(&root).is_err());
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn manifest_asr_inputs_trim_and_skip_same_speaker_overlaps() {
+        let root = std::env::temp_dir().join(format!(
+            "discord_transcript_manifest_overlap_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        write_sparse_wav(&root.join("speaker_1_1000.wav"), 32_000, 16_000);
+        write_sparse_wav(&root.join("speaker_2_1500.wav"), 32_000, 16_000);
+        write_sparse_wav(&root.join("speaker_3_1800.wav"), 3_200, 16_000);
+
+        let chunks = scan_chunk_manifest(&root).expect("metadata scan should succeed");
+        let inputs = prepare_manifest_asr_inputs(&chunks, &[], false)
+            .expect("overlapping chunks should be prepared");
+        assert_eq!(inputs.len(), 2, "fully overlapped chunk should be skipped");
+        assert_eq!(inputs[0].offset_ms, 0);
+        assert_eq!(inputs[1].offset_ms, 1_000);
+        assert!(Path::new(&inputs[1].audio_path).starts_with(root.join("transcription_chunks")));
+        let trimmed = load_chunk_metadata(Path::new(&inputs[1].audio_path))
+            .expect("overlap-trimmed WAV should be valid");
+        assert_eq!(trimmed.duration_ms, 500);
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 }
