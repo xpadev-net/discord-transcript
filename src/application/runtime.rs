@@ -621,6 +621,28 @@ fn recoverable_audio_dir_with_legacy_fallback(
     }))
 }
 
+fn final_transcript_playback_dir(
+    primary_dir: PathBuf,
+    legacy_dir: PathBuf,
+) -> Result<PathBuf, String> {
+    if let Some(audio_dir) =
+        recoverable_audio_dir_with_legacy_fallback(primary_dir.clone(), legacy_dir.clone())?
+    {
+        return Ok(audio_dir.path);
+    }
+    if primary_dir.join("mixdown.wav").is_file() {
+        return Ok(primary_dir);
+    }
+    if legacy_dir.join("mixdown.wav").is_file() {
+        return Ok(legacy_dir);
+    }
+    Err(format!(
+        "no recoverable audio chunks or playback mixdown found in {} or {}",
+        primary_dir.display(),
+        legacy_dir.display()
+    ))
+}
+
 pub(crate) fn has_recoverable_audio_with_legacy_fallback(
     primary_dir: PathBuf,
     legacy_dir: PathBuf,
@@ -9250,43 +9272,145 @@ impl ScaffoldHandler {
         // Persist successful ASR before rebuilding playback-only PCM artifacts.
         // Large S3-backed meetings can exhaust memory while mixing down, so a
         // retry must be able to recover the completed transcript without
-        // repeating Whisper inference.
+        // repeating Whisper inference. Recovery re-discovers the audio source
+        // because the resolved primary/legacy path is not stored with transcript rows.
         if let Some(objects) = &self.recording_objects {
-            let playback_dir = match &summary_input_source {
-                SummaryInputSource::Audio { meeting_dir, .. } => Some(meeting_dir.clone()),
-                SummaryInputSource::FinalTranscript => Some(workspace.audio_dir()),
+            let (playback_dir, primary_dir, legacy_dir) = match &summary_input_source {
+                SummaryInputSource::Audio { meeting_dir, .. } => {
+                    (Some(meeting_dir.clone()), None, None)
+                }
+                SummaryInputSource::FinalTranscript => (
+                    None,
+                    Some(workspace.audio_dir()),
+                    Some(
+                        crate::infrastructure::workspace::MeetingWorkspaceLayout::new(
+                            &self.chunk_storage_dir,
+                        )
+                        .legacy_meeting_dir(&meeting.id),
+                    ),
+                ),
             };
-            if let Some(playback_dir) = playback_dir {
-                let resample = effective_settings.whisper_resample_to_16k;
-                let artifacts = tokio::task::spawn_blocking(move || {
-                    let mixdown = merge_user_chunks_to_mixdown(&playback_dir, resample)?;
-                    let speakers = build_speaker_audio_inputs(&playback_dir, resample)?;
-                    Ok::<_, String>(
-                        std::iter::once(PathBuf::from(mixdown))
-                            .chain(
-                                speakers
-                                    .into_iter()
-                                    .map(|speaker| PathBuf::from(speaker.audio_path)),
-                            )
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .await;
-                match artifacts {
-                    Ok(Ok(paths)) => {
-                        for path in paths {
-                            if let Err(err) = objects.upload_file_with_receipt(&path, "audio/wav") {
-                                warn!(meeting_id = %claimed_job.meeting_id, path = %path.display(), error = %err, "failed to queue playback artifact upload");
+            let resample = effective_settings.whisper_resample_to_16k;
+            let artifacts = tokio::task::spawn_blocking(move || {
+                let playback_dir = match playback_dir {
+                    Some(playback_dir) => playback_dir,
+                    None => final_transcript_playback_dir(
+                        primary_dir.expect("recovered transcript has primary workspace"),
+                        legacy_dir.expect("recovered transcript has legacy workspace"),
+                    )?,
+                };
+                let has_chunks = has_nonempty_audio_chunk(&playback_dir)?;
+                let mixdown = if has_chunks {
+                    PathBuf::from(merge_user_chunks_to_mixdown(&playback_dir, resample)?)
+                } else {
+                    let mixdown = playback_dir.join("mixdown.wav");
+                    if !mixdown.is_file() {
+                        return Err(format!(
+                            "no audio chunks or playback mixdown found in {}",
+                            playback_dir.display()
+                        ));
+                    }
+                    mixdown
+                };
+                let speakers = if has_chunks {
+                    build_speaker_audio_inputs(&playback_dir, resample)?
+                        .into_iter()
+                        .map(|speaker| PathBuf::from(speaker.audio_path))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                Ok::<_, String>(std::iter::once(mixdown).chain(speakers).collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|err| format!("playback artifact task failed: {err}"))
+            .and_then(|result| result);
+
+            let artifact_error = match artifacts {
+                Ok(paths) => {
+                    let mut upload_error = None;
+                    for path in paths {
+                        match objects.upload_file_with_receipt(&path, "audio/wav") {
+                            Ok(Some(receipt)) => {
+                                let durable = tokio::task::spawn_blocking(move || {
+                                    receipt.wait_timeout(Duration::from_secs(30))
+                                })
+                                .await
+                                .map_err(|err| {
+                                    format!("playback artifact upload task failed: {err}")
+                                });
+                                match durable {
+                                    Ok(Some(UploadReceiptStatus::Durable)) => {}
+                                    Ok(status) => {
+                                        upload_error = Some(format!(
+                                            "playback artifact upload did not become durable for {}: {status:?}",
+                                            path.display()
+                                        ));
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        upload_error = Some(err);
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                upload_error = Some(format!(
+                                    "playback artifact was missing during upload: {}",
+                                    path.display()
+                                ));
+                                break;
+                            }
+                            Err(err) => {
+                                upload_error = Some(format!(
+                                    "failed to queue playback artifact upload for {}: {err}",
+                                    path.display()
+                                ));
+                                break;
                             }
                         }
                     }
-                    Ok(Err(err)) => {
-                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "failed to build playback artifacts after final transcription")
-                    }
-                    Err(err) => {
-                        warn!(meeting_id = %claimed_job.meeting_id, error = %err, "playback artifact task failed after final transcription")
-                    }
+                    upload_error
                 }
+                Err(err) => Some(err),
+            };
+
+            if let Some(err) = artifact_error {
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "playback artifacts are not ready; retrying after final transcript persistence"
+                );
+                self.refresh_summary_job_ownership(&claimed_job, "playback_artifacts")
+                    .await?;
+                let retry_result = {
+                    let mut service = self.service.lock().await;
+                    let mut queue = self.queue.lock().await;
+                    retry_summary_job_after_transcribing_phase_failure(
+                        &mut service.store,
+                        &mut *queue,
+                        &claimed_job,
+                        err.clone(),
+                        self.summary_max_retries,
+                        "playback_artifacts",
+                        MeetingStatus::Transcribing,
+                    )
+                };
+                let exhausted = match retry_result {
+                    Ok(exhausted) => exhausted,
+                    Err(retry_err) => {
+                        warn!(
+                            meeting_id = %claimed_job.meeting_id,
+                            error = %retry_err,
+                            "failed to update playback artifact retry state"
+                        );
+                        true
+                    }
+                };
+                if exhausted {
+                    return Err(SummaryJobRunError::TerminalStatusUpdated(err));
+                }
+                return Err(retry_scheduled_error(&claimed_job, err));
             }
         }
 
@@ -11674,6 +11798,22 @@ mod status_message_tests {
                 meeting_id: "m1".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn final_transcript_recovery_rediscovers_legacy_playback_audio() {
+        let temp = runtime_temp_dir("final_transcript_legacy_playback");
+        let layout = crate::infrastructure::workspace::MeetingWorkspaceLayout::new(&temp.path);
+        let primary_dir = layout.for_meeting("g1", "vc", "m1").audio_dir();
+        let legacy_dir = layout.legacy_meeting_dir("m1");
+        std::fs::create_dir_all(&primary_dir).expect("primary workspace should exist");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy audio directory should exist");
+        write_test_wav(&legacy_dir.join("user-1.wav"));
+
+        let recovered_dir = final_transcript_playback_dir(primary_dir, legacy_dir.clone())
+            .expect("final transcript recovery should locate legacy audio");
+
+        assert_eq!(recovered_dir, legacy_dir);
     }
 
     #[test]
