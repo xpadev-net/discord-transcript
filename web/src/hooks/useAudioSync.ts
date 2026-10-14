@@ -76,29 +76,28 @@ export function useAudioSync(
 
       if (newIndex === prevIndexRef.current) return;
 
-      // Auto-scroll to active segment
-      if (newIndex >= 0 && !userScrolledRef.current) {
-        const container = containerRef.current;
-        if (container) {
-          const segmentEls = container.querySelectorAll(".segment");
-          if (newIndex < segmentEls.length) {
-            const segEl = segmentEls[newIndex];
-            const containerRect = container.getBoundingClientRect();
-            const segRect = segEl.getBoundingClientRect();
-            const offset =
-              segRect.top - containerRect.top - containerRect.height / 3;
-            container.scrollBy({ top: offset, behavior: "smooth" });
-          }
-        }
-      }
-
       prevIndexRef.current = newIndex;
       setActiveIndex(newIndex);
     };
 
     audio.addEventListener("timeupdate", handleTimeUpdate);
     return () => audio.removeEventListener("timeupdate", handleTimeUpdate);
-  }, [audioElement, containerRef, segments]);
+  }, [audioElement, segments]);
+
+  // Run after TranscriptPanel has mounted a newly active offscreen row.
+  useEffect(() => {
+    if (activeIndex < 0 || userScrolledRef.current) return;
+    const container = containerRef.current;
+    const segment = container?.querySelector<HTMLElement>(
+      `[data-index="${activeIndex}"] .segment`,
+    );
+    if (!container || !segment) return;
+    const containerRect = container.getBoundingClientRect();
+    const segmentRect = segment.getBoundingClientRect();
+    const offset =
+      segmentRect.top - containerRect.top - containerRect.height / 3;
+    container.scrollBy({ top: offset, behavior: "smooth" });
+  }, [activeIndex, containerRef.current]);
 
   const showSeekNotice = useCallback((message: string) => {
     setSeekNotice(message);
