@@ -4666,6 +4666,7 @@ fn decode_guild_meetings_cursor(value: &str) -> Result<GuildMeetingsCursor, Stat
         serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
     if cursor.id.is_empty()
         || cursor.id.len() > 128
+        || cursor.id.chars().any(char::is_control)
         || DateTime::parse_from_rfc3339(&cursor.started_at).is_err()
     {
         return Err(StatusCode::BAD_REQUEST);
@@ -16977,6 +16978,15 @@ mod guild_api_tests {
         );
         assert_eq!(
             decode_guild_meetings_cursor(&"a".repeat(513)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let invalid_id = GuildMeetingsCursor {
+            started_at: "2025-01-02T03:04:05Z".to_owned(),
+            id: "meeting\0id".to_owned(),
+        };
+        let encoded = encode_guild_meetings_cursor(&invalid_id).unwrap();
+        assert_eq!(
+            decode_guild_meetings_cursor(&encoded),
             Err(StatusCode::BAD_REQUEST)
         );
     }
