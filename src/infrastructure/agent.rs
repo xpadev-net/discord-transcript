@@ -37,7 +37,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::application::summary::{
-    AgentOutputContract, ClaudeSummaryClient, SUMMARY_OUTPUT_CONTRACT, SummaryError,
+    AgentOutputContract, SUMMARY_OUTPUT_CONTRACT, SummaryEngine, SummaryError,
 };
 use crate::bootstrap::config::{SummaryHarness, SummaryProvider};
 use crate::infrastructure::integrations::{
@@ -701,7 +701,7 @@ fn require_native_agent_workdir(workdir: Option<&Path>) -> Result<&Path, Summary
     Ok(workdir)
 }
 
-impl ClaudeSummaryClient for NativeAgentSummaryClient {
+impl SummaryEngine for NativeAgentSummaryClient {
     fn supports_transcript_correction(&self) -> bool {
         // The GEC correction prompt does not instruct the agent to write
         // `output/` (it predates the file contract), so native correction is
@@ -798,7 +798,7 @@ impl SummaryClient {
     }
 }
 
-impl ClaudeSummaryClient for SummaryClient {
+impl SummaryEngine for SummaryClient {
     fn supports_transcript_correction(&self) -> bool {
         match self {
             Self::Cli(client) => client.supports_transcript_correction(),

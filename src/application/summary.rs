@@ -77,7 +77,8 @@ pub struct SummaryResult {
     pub masking_stats: MaskingStats,
 }
 
-pub trait ClaudeSummaryClient {
+/// Provider-neutral application port for transcript correction and summaries.
+pub trait SummaryEngine {
     fn supports_transcript_correction(&self) -> bool {
         true
     }
@@ -101,6 +102,9 @@ pub trait ClaudeSummaryClient {
         )))
     }
 }
+
+/// Compatibility re-export for existing CLI adapters and downstream callers.
+pub use SummaryEngine as ClaudeSummaryClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentOutputContract {
@@ -132,17 +136,38 @@ pub const SUMMARY_OUTPUT_CONTRACT: AgentOutputContract =
 pub(crate) const SUMMARY_CONTEXT_SELECTION_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
-pub struct StubClaudeSummaryClient {
+pub struct StubSummaryEngine {
     pub mocked_markdown: String,
 }
 
-impl ClaudeSummaryClient for StubClaudeSummaryClient {
+/// Compatibility name retained while legacy harnesses migrate separately.
+pub type StubClaudeSummaryClient = StubSummaryEngine;
+
+impl SummaryEngine for StubSummaryEngine {
     fn supports_untrusted_agent_workspace(&self) -> bool {
         true
     }
 
     fn summarize(&self, _prompt: &str, _workdir: Option<&Path>) -> Result<String, SummaryError> {
         Ok(self.mocked_markdown.clone())
+    }
+}
+
+#[cfg(test)]
+mod summary_engine_compat_tests {
+    use super::{ClaudeSummaryClient, StubClaudeSummaryClient};
+
+    #[test]
+    fn legacy_claude_names_remain_compatible() {
+        let engine = StubClaudeSummaryClient {
+            mocked_markdown: "## Summary".to_owned(),
+        };
+
+        assert!(engine.supports_untrusted_agent_workspace());
+        assert_eq!(
+            engine.summarize("prompt", None).expect("stub succeeds"),
+            "## Summary"
+        );
     }
 }
 
@@ -1600,9 +1625,9 @@ fn confidence_label(confidence: Option<crate::domain::confidence::ConfidencePerm
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-pub fn run_summary_pipeline<W: AsrPort, C: ClaudeSummaryClient>(
+pub fn run_summary_pipeline<W: AsrPort, C: SummaryEngine>(
     whisper: &W,
-    claude: &C,
+    summary_engine: &C,
     request: &SummaryRequest,
 ) -> Result<SummaryResult, SummaryError> {
     let transcription = run_transcription(whisper, request)?;
@@ -1611,11 +1636,11 @@ pub fn run_summary_pipeline<W: AsrPort, C: ClaudeSummaryClient>(
     // would mislead a reader into thinking the GEC step had executed.
     let manifest = write_transcript_files(request, &transcription)?;
     let context_manifest = load_summary_context_manifest(request)?;
-    ensure_untrusted_agent_workspace_supported(claude)?;
+    ensure_untrusted_agent_workspace_supported(summary_engine)?;
     let prompt = build_summary_prompt_with_context(request, &manifest, context_manifest.as_ref());
     persist_summary_prompt_debug_artifact(&request.workspace, &prompt);
     let agent_workspace = materialize_new_summary_agent_workspace(request)?;
-    let markdown = claude.summarize(&prompt, Some(agent_workspace.root()))?;
+    let markdown = summary_engine.summarize(&prompt, Some(agent_workspace.root()))?;
     let message_chunks = split_discord_message(&markdown, DISCORD_MESSAGE_LIMIT);
 
     Ok(SummaryResult {
@@ -1627,10 +1652,10 @@ pub fn run_summary_pipeline<W: AsrPort, C: ClaudeSummaryClient>(
     })
 }
 
-pub fn ensure_untrusted_agent_workspace_supported<C: ClaudeSummaryClient>(
-    claude: &C,
+pub fn ensure_untrusted_agent_workspace_supported<C: SummaryEngine>(
+    summary_engine: &C,
 ) -> Result<(), SummaryError> {
-    if claude.supports_untrusted_agent_workspace() {
+    if summary_engine.supports_untrusted_agent_workspace() {
         return Ok(());
     }
     Err(SummaryError::SummaryEngine(
@@ -2052,8 +2077,8 @@ fn correction_ai_hint_priority_label(context: &SummaryContextManifest) -> String
 ///
 /// This step corrects misrecognized kanji, adds proper punctuation, and
 /// normalizes numbers in the Whisper output using Claude.
-pub fn correct_transcript<C: ClaudeSummaryClient>(
-    claude: &C,
+pub fn correct_transcript<C: SummaryEngine>(
+    summary_engine: &C,
     transcript: &str,
     language: Option<&str>,
 ) -> Result<String, SummaryError> {
@@ -2061,23 +2086,23 @@ pub fn correct_transcript<C: ClaudeSummaryClient>(
         return Ok(transcript.to_owned());
     }
     let prompt = build_correction_prompt(transcript, language);
-    correct_transcript_with_prompt(claude, transcript, &prompt)
+    correct_transcript_with_prompt(summary_engine, transcript, &prompt)
 }
 
 /// Run the LLM-based transcript correction step using a pre-built prompt.
 /// Use this variant when the prompt has already been constructed (for
 /// example by [`persist_correction_prompt_debug_artifact`]) to avoid the
 /// non-trivial cost of rebuilding it for large transcripts.
-pub fn correct_transcript_with_prompt<C: ClaudeSummaryClient>(
-    claude: &C,
+pub fn correct_transcript_with_prompt<C: SummaryEngine>(
+    summary_engine: &C,
     transcript: &str,
     prompt: &str,
 ) -> Result<String, SummaryError> {
-    correct_transcript_with_prompt_and_workdir(claude, transcript, prompt, None)
+    correct_transcript_with_prompt_and_workdir(summary_engine, transcript, prompt, None)
 }
 
-pub fn correct_transcript_with_prompt_and_workdir<C: ClaudeSummaryClient>(
-    claude: &C,
+pub fn correct_transcript_with_prompt_and_workdir<C: SummaryEngine>(
+    summary_engine: &C,
     transcript: &str,
     prompt: &str,
     workdir: Option<&Path>,
@@ -2085,12 +2110,12 @@ pub fn correct_transcript_with_prompt_and_workdir<C: ClaudeSummaryClient>(
     if transcript.trim().is_empty() {
         return Ok(transcript.to_owned());
     }
-    if !claude.supports_transcript_correction() {
+    if !summary_engine.supports_transcript_correction() {
         return Err(SummaryError::SummaryEngine(
             "transcript correction is not supported by this summary harness".to_owned(),
         ));
     }
-    let corrected = claude.summarize(prompt, workdir)?;
+    let corrected = summary_engine.summarize(prompt, workdir)?;
     validate_correction_output(transcript, &corrected)?;
     Ok(mask_pii(trim_trailing_line_endings(&corrected)).text)
 }

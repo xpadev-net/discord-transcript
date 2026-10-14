@@ -22,7 +22,7 @@ use crate::application::retention_cleanup::{
     run_periodic_retention_cleanup, try_start_retention_cleanup_loop,
 };
 use crate::application::stop::StopOutcome;
-use crate::application::summary::ClaudeSummaryClient;
+use crate::application::summary::SummaryEngine;
 use crate::application::worker::{
     SUMMARY_JOB_HEARTBEAT_INTERVAL, SummaryJobHeartbeatGuard, SummaryNotificationReceipt,
     SummaryStatusNotification, SummaryUrlNotification, complete_summary_job_after_notification,

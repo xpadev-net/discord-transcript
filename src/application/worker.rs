@@ -4,7 +4,7 @@ use crate::application::ai_memory_extraction::{
 use crate::application::asr::AsrPort;
 use crate::application::runtime::{has_nonempty_audio_chunk, merge_user_chunks_to_mixdown};
 use crate::application::summary::{
-    ClaudeSummaryClient, SpeakerAudioInput, SummaryContextInput, SummaryError, SummaryRequest,
+    SpeakerAudioInput, SummaryContextInput, SummaryEngine, SummaryError, SummaryRequest,
     TranscriptionOutput, build_correction_prompt_with_context, build_summary_prompt_with_context,
     correct_transcript_with_prompt_and_workdir, ensure_untrusted_agent_workspace_supported,
     materialize_new_summary_agent_workspace, materialize_or_load_summary_context,
@@ -867,28 +867,28 @@ pub(crate) fn mark_summary_meeting_failed_from_summary_state<S: MeetingStore>(
 pub fn process_meeting_summary<S, W, C>(
     store: &mut S,
     whisper: &W,
-    claude: &C,
+    summary_engine: &C,
     input: &ProcessMeetingInput,
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
     S: MeetingStore + AiMemoryExtractionStore,
     W: AsrPort,
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
 {
-    process_meeting_summary_with_ownership_check(store, whisper, claude, input, || Ok(()))
+    process_meeting_summary_with_ownership_check(store, whisper, summary_engine, input, || Ok(()))
 }
 
 fn process_meeting_summary_with_ownership_check<S, W, C, F>(
     store: &mut S,
     whisper: &W,
-    claude: &C,
+    summary_engine: &C,
     input: &ProcessMeetingInput,
     mut ensure_owned: F,
 ) -> Result<ProcessMeetingOutput, WorkerError>
 where
     S: MeetingStore + AiMemoryExtractionStore,
     W: AsrPort,
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
     F: FnMut() -> Result<(), WorkerError>,
 {
     info!(meeting_id = %input.meeting_id, "summary pipeline started");
@@ -982,7 +982,7 @@ where
     };
 
     // Apply LLM-based error correction to the transcript before summarization.
-    let transcription = if !claude.supports_transcript_correction() {
+    let transcription = if !summary_engine.supports_transcript_correction() {
         info!(
             meeting_id = %input.meeting_id,
             "skipping LLM transcript correction (not supported by summary harness)"
@@ -1009,7 +1009,7 @@ where
         });
 
         match correct_transcript_with_prompt_and_workdir(
-            claude,
+            summary_engine,
             &transcription.transcript_for_summary,
             &correction_prompt,
             Some(request.workspace.root()),
@@ -1036,7 +1036,7 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    if let Err(err) = ensure_untrusted_agent_workspace_supported(claude) {
+    if let Err(err) = ensure_untrusted_agent_workspace_supported(summary_engine) {
         error!(meeting_id = %input.meeting_id, error = %err, "summary harness cannot safely process untrusted agent workspace");
         revert_to_stopping_for_retry(store, &input.meeting_id, MeetingStatus::Summarizing);
         return Err(WorkerError::from(err));
@@ -1055,7 +1055,7 @@ where
             return Err(WorkerError::from(err));
         }
     };
-    let markdown_result = claude.summarize(&prompt, Some(agent_workspace.root()));
+    let markdown_result = summary_engine.summarize(&prompt, Some(agent_workspace.root()));
     ensure_owned()?;
     let markdown = match markdown_result {
         Ok(value) => value,
@@ -1089,7 +1089,7 @@ where
     }
     if store.supports_ai_memory_extraction() {
         match extract_ai_memory_candidates(
-            claude,
+            summary_engine,
             &request,
             &transcription.transcript_for_summary,
             &markdown,
@@ -1386,19 +1386,19 @@ pub fn process_next_summary_job<S, Q, W, C>(
     store: &mut S,
     queue: &mut Q,
     whisper: &W,
-    claude: &C,
+    summary_engine: &C,
     options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
     S: MeetingStore + SummaryContextStore + AiMemoryExtractionStore,
     Q: JobQueue,
     W: AsrPort,
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
 {
     let Some(job) = queue.claim_next(JobType::Summarize)? else {
         return Ok(None);
     };
-    process_claimed_summary_job(store, queue, job, whisper, claude, options)
+    process_claimed_summary_job(store, queue, job, whisper, summary_engine, options)
 }
 
 /// Process a summary job the caller has already claimed. Separating the claim
@@ -1411,14 +1411,14 @@ pub fn process_claimed_summary_job<S, Q, W, C>(
     queue: &mut Q,
     job: Job,
     whisper: &W,
-    claude: &C,
+    summary_engine: &C,
     options: &SummaryJobOptions,
 ) -> Result<Option<ProcessJobResult>, WorkerError>
 where
     S: MeetingStore + SummaryContextStore + AiMemoryExtractionStore,
     Q: JobQueue,
     W: AsrPort,
-    C: ClaudeSummaryClient,
+    C: SummaryEngine,
 {
     info!(job_id = %job.id, meeting_id = %job.meeting_id, "claimed summary job");
 
@@ -1574,7 +1574,7 @@ where
                 )
                 .map_err(WorkerError::from)?,
         };
-        process_meeting_summary_with_ownership_check(store, whisper, claude, &input, || {
+        process_meeting_summary_with_ownership_check(store, whisper, summary_engine, &input, || {
             queue.heartbeat(&job).map_err(WorkerError::from)
         })
         .map(Some)
@@ -1834,6 +1834,7 @@ pub fn enqueue_summary_job<Q: JobQueue>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::summary::ClaudeSummaryClient;
     use crate::audio::build_wav_bytes_raw;
     use crate::infrastructure::asr::StubWhisperClient;
     use crate::infrastructure::storage::StoredMeeting;
