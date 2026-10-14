@@ -56,7 +56,9 @@ use crate::domain::usage::{
 };
 use crate::domain::{JobType, MeetingStatus, StopReason};
 use crate::infrastructure::agent::{SummaryClientConfig, build_summary_client};
-use crate::infrastructure::integrations::{CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT};
+use crate::infrastructure::integrations::{
+    CommandWhisperClient, DEFAULT_COMMAND_TIMEOUT, S3StreamingWhisperClient,
+};
 use crate::infrastructure::queue::{Job, JobQueue, retry_delay_seconds};
 use crate::infrastructure::retry::RetryPolicy;
 use crate::infrastructure::sql::{
@@ -4098,6 +4100,26 @@ fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
 }
 
 impl ScaffoldHandler {
+    fn whisper_client(
+        &self,
+        settings: &EffectiveMeetingSettings,
+    ) -> Result<S3StreamingWhisperClient, crate::application::asr::AsrError> {
+        S3StreamingWhisperClient::new(
+            CommandWhisperClient {
+                endpoint: self.whisper_endpoint.clone(),
+                curl_bin: "curl".to_owned(),
+                retry_policy: self.integration_retry_policy,
+                beam_size: settings.whisper_beam_size,
+                suppress_non_speech: settings.whisper_suppress_non_speech,
+                prompt: settings.whisper_prompt.clone(),
+                vad: settings.whisper_vad,
+                temperature: settings.whisper_temperature,
+                command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            },
+            self.recording_objects.clone(),
+        )
+    }
+
     fn meeting_settings_defaults(&self) -> MeetingSettingsDefaults {
         MeetingSettingsDefaults {
             whisper_language: self.whisper_language.clone(),
@@ -8346,17 +8368,9 @@ impl ScaffoldHandler {
         meeting_id: &str,
     ) -> Result<RuntimeSummaryJobOutput, SummaryJobRunError> {
         let effective_settings = self.effective_settings_for_meeting(meeting_id).await?;
-        let whisper = CommandWhisperClient {
-            endpoint: self.whisper_endpoint.clone(),
-            curl_bin: "curl".to_owned(),
-            retry_policy: self.integration_retry_policy,
-            beam_size: effective_settings.whisper_beam_size,
-            suppress_non_speech: effective_settings.whisper_suppress_non_speech,
-            prompt: effective_settings.whisper_prompt.clone(),
-            vad: effective_settings.whisper_vad,
-            temperature: effective_settings.whisper_temperature,
-            command_timeout: DEFAULT_COMMAND_TIMEOUT,
-        };
+        let whisper = self
+            .whisper_client(&effective_settings)
+            .map_err(|err| SummaryJobRunError::Terminal(err.to_string()))?;
         let summary_client = build_summary_client(SummaryClientConfig {
             harness: self.summary_harness,
             command_path: self.summary_command.clone(),
