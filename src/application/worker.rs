@@ -1797,13 +1797,27 @@ where
 /// format chunks or interleaved metadata chunks return `Err` so the caller
 /// can warn and skip the observe-only ASR usage event without failing.
 pub(crate) fn asr_seconds_from_audio_path(audio_path: &str) -> Result<i64, String> {
+    asr_seconds_from_audio_paths(std::iter::once(audio_path))
+}
+
+pub(crate) fn asr_seconds_from_audio_paths<'a>(
+    audio_paths: impl IntoIterator<Item = &'a str>,
+) -> Result<i64, String> {
+    let duration_ms = audio_paths.into_iter().try_fold(0_u64, |total, path| {
+        total
+            .checked_add(asr_audio_duration_ms_from_audio_path(path)?)
+            .ok_or_else(|| "ASR audio duration total overflow".to_owned())
+    })?;
+    Ok(duration_ms.div_ceil(1000).min(i64::MAX as u64) as i64)
+}
+
+fn asr_audio_duration_ms_from_audio_path(audio_path: &str) -> Result<u64, String> {
     let mut file =
         File::open(audio_path).map_err(|err| format!("failed to open ASR audio file: {err}"))?;
     let mut header = [0_u8; 44];
     file.read_exact(&mut header)
         .map_err(|err| format!("failed to read ASR audio header: {err}"))?;
-    let duration_ms = wav_header_duration_ms(&header)?;
-    Ok(duration_ms.div_ceil(1000).min(i64::MAX as u64) as i64)
+    wav_header_duration_ms(&header)
 }
 
 fn wav_header_duration_ms(header: &[u8; 44]) -> Result<u64, String> {
@@ -2006,6 +2020,32 @@ mod tests {
         let wav = build_wav_bytes_raw(&vec![0; 2_000], 1_000, 1, 16).expect("wav should build");
         std::fs::write(workspace.mixdown_path(), wav).expect("mixdown should be written");
         TempWorkspaceGuard { base, workspace }
+    }
+
+    #[test]
+    fn aggregate_asr_usage_rounds_only_after_summing_chunk_durations() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("asr-duration-aggregate-{nanos}"));
+        std::fs::create_dir_all(&root).expect("duration fixture directory should be created");
+        let wav = build_wav_bytes_raw(&vec![0; 1_000], 1_000, 1, 16)
+            .expect("500 ms wav fixture should build");
+        let paths = [root.join("first.wav"), root.join("second.wav")];
+        for path in &paths {
+            std::fs::write(path, &wav).expect("duration fixture should be written");
+        }
+
+        let seconds = asr_seconds_from_audio_paths(
+            paths
+                .iter()
+                .map(|path| path.to_str().expect("fixture path should be UTF-8")),
+        )
+        .expect("aggregate duration should be readable");
+
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(seconds, 1);
     }
 
     fn stopping_meeting() -> StoredMeeting {

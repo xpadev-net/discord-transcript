@@ -173,10 +173,11 @@ mod summary_engine_compat_tests {
 
 #[cfg(test)]
 mod s3_transcription_source_tests {
-    use super::{SummaryRequest, run_transcription_with_s3_sources};
+    use super::{SummaryError, SummaryRequest, run_transcription_with_s3_sources};
     use crate::application::asr::{
         AsrError, AsrPort, AsrRequest, AsrResult, AudioSource, S3AudioObjectReference,
     };
+    use crate::domain::speaker::SpeakerAudioInput;
     use crate::infrastructure::workspace::MeetingWorkspaceLayout;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -190,6 +191,25 @@ mod s3_transcription_source_tests {
                 text: String::new(),
                 segments: Vec::new(),
                 raw_body: "{}".to_owned(),
+            })
+        }
+    }
+
+    struct FailAfterTwoAsr(Mutex<usize>);
+
+    impl AsrPort for FailAfterTwoAsr {
+        fn infer(&self, _request: &AsrRequest) -> Result<AsrResult, AsrError> {
+            let mut call = self.0.lock().unwrap();
+            *call += 1;
+            if *call == 3 {
+                return Err(AsrError::InvalidJson(
+                    "synthetic third-call failure".to_owned(),
+                ));
+            }
+            Ok(AsrResult {
+                text: String::new(),
+                segments: Vec::new(),
+                raw_body: format!(r#"{{"chunk":{}}}"#, *call),
             })
         }
     }
@@ -232,6 +252,62 @@ mod s3_transcription_source_tests {
         );
         assert_eq!(captured.language.as_deref(), Some("ja"));
         assert!(captured.prompt.as_deref().unwrap().contains("Design sync"));
+    }
+
+    #[test]
+    fn successful_chunk_debug_responses_are_flushed_when_a_later_chunk_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "summary-s3-debug-failure-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        let workspace =
+            MeetingWorkspaceLayout::new(&root).for_meeting("guild", "channel", "meeting");
+        let request = SummaryRequest {
+            meeting_id: "meeting".to_owned(),
+            guild_id: "guild".to_owned(),
+            voice_channel_id: "channel".to_owned(),
+            voice_channel_name: None,
+            title: None,
+            started_at: None,
+            stopped_at: None,
+            duration_seconds: None,
+            audio_path: workspace
+                .audio_dir()
+                .join("mixdown.wav")
+                .to_string_lossy()
+                .into_owned(),
+            speaker_audio: (1..=3)
+                .map(|chunk| SpeakerAudioInput {
+                    speaker_id: "alice".to_owned(),
+                    audio_path: workspace
+                        .audio_dir()
+                        .join(format!("chunk-{chunk}.wav"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    offset_ms: (chunk - 1) * 1_000,
+                })
+                .collect(),
+            language: None,
+            workspace,
+        };
+        let asr = FailAfterTwoAsr(Mutex::new(0));
+
+        let result = run_transcription_with_s3_sources(&asr, &request, &HashMap::new());
+
+        assert!(matches!(result, Err(SummaryError::Asr(_))));
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(request.workspace.whisper_response_path("alice"))
+                .expect("earlier successful raw responses should be persisted"),
+        )
+        .expect("saved raw response should be valid JSON");
+        assert_eq!(
+            saved["chunks"],
+            serde_json::json!([{"chunk": 1}, {"chunk": 2}])
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -438,7 +514,7 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
         std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
     for speaker in &request.speaker_audio {
         let prompt = build_whisper_prompt(request, Some(speaker));
-        let transcription = whisper.infer(
+        let transcription_result = whisper.infer(
             &s3_sources
                 .get(std::path::Path::new(&speaker.audio_path))
                 .cloned()
@@ -454,7 +530,14 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
                         AsrRequest::s3_object(source, request.language.clone(), prompt.clone())
                     },
                 ),
-        )?;
+        );
+        let transcription = match transcription_result {
+            Ok(transcription) => transcription,
+            Err(err) => {
+                persist_speaker_debug_responses(&request.workspace, &speaker_debug_responses);
+                return Err(err.into());
+            }
+        };
         speaker_debug_responses
             .entry(speaker.speaker_id.clone())
             .or_default()
@@ -470,6 +553,16 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
         }
     }
 
+    persist_speaker_debug_responses(&request.workspace, &speaker_debug_responses);
+
+    sort_transcript_segments(&mut merged_segments);
+    build_transcription_output(merged_segments)
+}
+
+fn persist_speaker_debug_responses(
+    workspace: &MeetingWorkspacePaths,
+    speaker_debug_responses: &std::collections::HashMap<String, Vec<serde_json::Value>>,
+) {
     for (speaker_id, responses) in speaker_debug_responses {
         let body = if responses.len() == 1 {
             serde_json::to_string(&responses[0])
@@ -477,14 +570,8 @@ pub fn run_transcription_with_s3_sources<W: AsrPort>(
             serde_json::to_string(&serde_json::json!({ "chunks": responses }))
         }
         .unwrap_or_else(|_| "{}".to_owned());
-        persist_whisper_debug_response(
-            &request.workspace.whisper_response_path(&speaker_id),
-            &body,
-        );
+        persist_whisper_debug_response(&workspace.whisper_response_path(speaker_id), &body);
     }
-
-    sort_transcript_segments(&mut merged_segments);
-    build_transcription_output(merged_segments)
 }
 
 pub fn build_whisper_prompt(

@@ -8280,13 +8280,9 @@ impl ScaffoldHandler {
         let audio_path_for_read = audio_path.to_owned();
         let quantity = match tokio::task::spawn_blocking(move || {
             if let Some(paths) = audio_input_paths {
-                paths.iter().try_fold(0i64, |total, path| {
-                    total
-                        .checked_add(crate::application::worker::asr_seconds_from_audio_path(
-                            path,
-                        )?)
-                        .ok_or_else(|| "ASR audio duration total overflow".to_owned())
-                })
+                crate::application::worker::asr_seconds_from_audio_paths(
+                    paths.iter().map(String::as_str),
+                )
             } else {
                 crate::application::worker::asr_seconds_from_audio_path(&audio_path_for_read)
             }
