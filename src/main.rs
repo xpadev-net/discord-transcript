@@ -28,7 +28,7 @@ use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, 
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
 use discord_transcript::infrastructure::storage_s3::RecordingObjectStore;
 use discord_transcript::interfaces::web;
-use serenity::all::{ChannelId, EditMessage};
+use serenity::all::{ChannelId, CreateThread, EditMessage, EditThread, MessageId};
 use serenity::http::Http;
 use std::env;
 use std::path::PathBuf;
@@ -321,6 +321,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             )
             .expect("retention_transcript_ttl_days exceeds i32::MAX"),
             summary_enabled: config.summary_enabled,
+            summary_in_status_thread: false,
         },
     );
     let meeting_permission_cache = Arc::clone(&web_state.permission_cache);
@@ -673,14 +674,61 @@ async fn notify_standalone_worker_summary(
         .build();
 
     let chunks = summary_chunks_with_voice_channel_metadata(&meeting, result.output.chunks.clone());
-    post_summary_to_report_channel(&http, report_channel_id, &chunks)
+    let summary_in_status_thread = token_db_client
+        .query_opt(
+            "SELECT summary_in_status_thread FROM guild_settings WHERE guild_id=$1",
+            &[&meeting.guild_id],
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.get::<_, Option<bool>>(0))
+        .unwrap_or(false);
+    let posting_channel_id = if summary_in_status_thread {
+        let metadata = store.get_status_message_metadata(&meeting.id).ok();
+        match metadata.and_then(|m| {
+            Some((
+                m.status_message_channel_id?,
+                m.status_message_id?,
+                m.summary_thread_id,
+            ))
+        }) {
+            Some((status_channel, status_message, existing_thread)) => match ensure_summary_thread(
+                &http,
+                &status_channel,
+                &status_message,
+                &meeting.id,
+                existing_thread,
+            )
+            .await
+            {
+                Ok(thread_id) => {
+                    if let Err(err) =
+                        store.set_summary_thread_id(&meeting.id, thread_id.to_string())
+                    {
+                        tracing::warn!(meeting_id = %meeting.id, error = %err, "failed to save summary thread id; reusing created thread");
+                    }
+                    thread_id
+                }
+                Err(err) => {
+                    tracing::warn!(meeting_id = %meeting.id, error = %err, "failed to create summary thread; posting to report channel");
+                    report_channel_id
+                }
+            },
+            None => report_channel_id,
+        }
+    } else {
+        report_channel_id
+    };
+    post_summary_to_report_channel(&http, posting_channel_id, &chunks)
         .await
         .map_err(WorkerError::Completion)?;
 
     let url_notification =
         if let Some(url) = meeting_url(config.public_base_url.as_deref(), &meeting.id) {
             let url_msg = format!("詳細はこちら: {url}");
-            match post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await {
+            let post = post_summary_to_report_channel(&http, posting_channel_id, &[url_msg]).await;
+            match post {
                 Ok(()) => SummaryUrlNotification::Posted,
                 Err(err) => {
                     tracing::warn!(
@@ -764,6 +812,76 @@ async fn post_summary_to_report_channel(
             .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+async fn ensure_summary_thread(
+    http: &Http,
+    channel_id: &str,
+    message_id: &str,
+    meeting_id: &str,
+    existing_thread_id: Option<String>,
+) -> Result<u64, String> {
+    let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
+    if let Some(thread_id) = saved_thread_id
+        && let Ok(thread_id) = validate_summary_thread(http, thread_id).await
+    {
+        return Ok(thread_id);
+    }
+    let channel_id = channel_id
+        .parse::<u64>()
+        .map_err(|err| format!("invalid status channel id: {err}"))?;
+    let message_id = message_id
+        .parse::<u64>()
+        .map_err(|err| format!("invalid status message id: {err}"))?;
+    let channel = ChannelId::new(channel_id);
+    let parent = MessageId::new(message_id);
+    if let Ok(message) = channel.message(http, parent).await
+        && let Some(thread) = message.thread
+        && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
+    {
+        return Ok(thread_id);
+    }
+    match channel
+        .create_thread_from_message(
+            http,
+            parent,
+            CreateThread::new(format!("要約 {meeting_id}")),
+        )
+        .await
+    {
+        Ok(thread) => Ok(thread.id.get()),
+        Err(create_error) => {
+            // Another worker may have created the thread between the lookup and
+            // create call. Re-read the parent and use the thread it now points to.
+            if let Ok(message) = channel.message(http, parent).await
+                && let Some(thread) = message.thread
+                && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
+            {
+                return Ok(thread_id);
+            }
+            Err(create_error.to_string())
+        }
+    }
+}
+
+async fn validate_summary_thread(http: &Http, thread_id: u64) -> Result<u64, String> {
+    let channel_id = ChannelId::new(thread_id);
+    let channel = channel_id
+        .to_channel(http)
+        .await
+        .map_err(|err| err.to_string())?
+        .guild()
+        .ok_or_else(|| "summary thread is not a guild channel".to_owned())?;
+    let metadata = channel
+        .thread_metadata
+        .ok_or_else(|| "summary channel is not a thread".to_owned())?;
+    if metadata.archived || metadata.locked {
+        channel_id
+            .edit_thread(http, EditThread::new().archived(false).locked(false))
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(thread_id)
 }
 
 async fn upsert_summary_completed_status_message(

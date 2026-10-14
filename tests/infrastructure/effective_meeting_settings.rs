@@ -69,6 +69,7 @@ fn effective_settings_resolve_applies_nullable_guild_overrides() {
         retention_raw_audio_ttl_days: Some(21),
         retention_transcript_ttl_days: Some(90),
         summary_enabled: Some(false),
+        summary_in_status_thread: None,
     };
 
     let resolved = EffectiveMeetingSettings::resolve(&defaults(), Some(&guild));
@@ -175,6 +176,7 @@ fn existing_meeting_snapshot_is_not_changed_by_later_guild_settings_resolution()
         retention_raw_audio_ttl_days: Some(7),
         retention_transcript_ttl_days: Some(30),
         summary_enabled: Some(true),
+        summary_in_status_thread: None,
     };
     let later = GuildSettingsForSnapshot {
         whisper_language: Some("en".to_owned()),
@@ -184,6 +186,7 @@ fn existing_meeting_snapshot_is_not_changed_by_later_guild_settings_resolution()
         retention_raw_audio_ttl_days: Some(21),
         retention_transcript_ttl_days: Some(90),
         summary_enabled: Some(false),
+        summary_in_status_thread: None,
     };
     let mut store = InMemoryMeetingStore::new();
     let snapshot = EffectiveMeetingSettings::resolve(&defaults(), Some(&initial));

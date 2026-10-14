@@ -152,6 +152,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0033_live_transcription_outbox",
         sql: include_str!("../../migrations/0033_live_transcription_outbox.sql"),
     },
+    Migration {
+        version: "0034_summary_status_thread",
+        sql: include_str!("../../migrations/0034_summary_status_thread.sql"),
+    },
+    Migration {
+        version: "0035_summary_thread_id",
+        sql: include_str!("../../migrations/0035_summary_thread_id.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -276,6 +284,10 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0032_domain_knowledge_summary_approval.sql"),
     "\n",
     include_str!("../../migrations/0033_live_transcription_outbox.sql"),
+    "\n",
+    include_str!("../../migrations/0034_summary_status_thread.sql"),
+    "\n",
+    include_str!("../../migrations/0035_summary_thread_id.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"
@@ -1812,8 +1824,8 @@ pub const UPSERT_GUILD_SETTINGS_SQL: &str = r#"
 INSERT INTO guild_settings (
     guild_id, whisper_language, whisper_language_explicit, whisper_vad,
     auto_stop_grace_seconds, retention_raw_audio_ttl_days,
-    retention_transcript_ttl_days, summary_enabled, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+    retention_transcript_ttl_days, summary_enabled, summary_in_status_thread, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
 ON CONFLICT (guild_id) DO UPDATE SET
     whisper_language = EXCLUDED.whisper_language,
     whisper_language_explicit = EXCLUDED.whisper_language_explicit,
@@ -1822,6 +1834,7 @@ ON CONFLICT (guild_id) DO UPDATE SET
     retention_raw_audio_ttl_days = EXCLUDED.retention_raw_audio_ttl_days,
     retention_transcript_ttl_days = EXCLUDED.retention_transcript_ttl_days,
     summary_enabled = EXCLUDED.summary_enabled,
+    summary_in_status_thread = COALESCE(EXCLUDED.summary_in_status_thread, guild_settings.summary_in_status_thread),
     updated_at = NOW()
 "#;
 
@@ -1902,7 +1915,7 @@ LIMIT $3::integer
 pub const GET_GUILD_SETTINGS_SQL: &str = r#"
 SELECT whisper_language, whisper_language_explicit, whisper_vad,
        auto_stop_grace_seconds, retention_raw_audio_ttl_days,
-       retention_transcript_ttl_days, summary_enabled,
+       retention_transcript_ttl_days, summary_enabled, summary_in_status_thread,
        (
          bot_token_ciphertext IS NOT NULL
          AND bot_token_nonce IS NOT NULL
@@ -1918,7 +1931,7 @@ WHERE guild_id = $1
 pub const GET_GUILD_SETTINGS_FOR_MEETING_SNAPSHOT_SQL: &str = r#"
 SELECT whisper_language, whisper_language_explicit, whisper_vad,
        auto_stop_grace_seconds, retention_raw_audio_ttl_days,
-       retention_transcript_ttl_days, summary_enabled
+       retention_transcript_ttl_days, summary_enabled, summary_in_status_thread
 FROM guild_settings
 WHERE guild_id = $1
 "#;

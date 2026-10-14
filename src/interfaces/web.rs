@@ -442,6 +442,7 @@ pub struct GuildSettingsDefaults {
     pub retention_raw_audio_ttl_days: i32,
     pub retention_transcript_ttl_days: i32,
     pub summary_enabled: bool,
+    pub summary_in_status_thread: bool,
 }
 
 #[derive(Clone, Default)]
@@ -3978,6 +3979,7 @@ struct GuildSettingsResponse {
     retention_raw_audio_ttl_days: i32,
     retention_transcript_ttl_days: i32,
     summary_enabled: bool,
+    summary_in_status_thread: bool,
     discord_bot_token_registered: bool,
     discord_bot_token_updated_at: Option<String>,
     discord_bot_token_last_validated_at: Option<String>,
@@ -3997,6 +3999,7 @@ struct GuildSettingsUpdateRequest {
     retention_raw_audio_ttl_days: i32,
     retention_transcript_ttl_days: i32,
     summary_enabled: bool,
+    summary_in_status_thread: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -4314,6 +4317,7 @@ struct StoredGuildSettings {
     retention_raw_audio_ttl_days: Option<i32>,
     retention_transcript_ttl_days: Option<i32>,
     summary_enabled: Option<bool>,
+    summary_in_status_thread: Option<bool>,
     discord_bot_token_registered: bool,
     discord_bot_token_updated_at: Option<String>,
     discord_bot_token_last_validated_at: Option<String>,
@@ -6207,6 +6211,7 @@ fn guild_settings_response(
             retention_raw_audio_ttl_days: 0,
             retention_transcript_ttl_days: 0,
             summary_enabled: false,
+            summary_in_status_thread: false,
             discord_bot_token_registered: false,
             discord_bot_token_updated_at: None,
             discord_bot_token_last_validated_at: None,
@@ -6226,6 +6231,7 @@ fn guild_settings_response(
         retention_raw_audio_ttl_days: None,
         retention_transcript_ttl_days: None,
         summary_enabled: None,
+        summary_in_status_thread: None,
         discord_bot_token_registered: false,
         discord_bot_token_updated_at: None,
         discord_bot_token_last_validated_at: None,
@@ -6251,6 +6257,9 @@ fn guild_settings_response(
             .retention_transcript_ttl_days
             .unwrap_or(defaults.retention_transcript_ttl_days),
         summary_enabled: stored.summary_enabled.unwrap_or(defaults.summary_enabled),
+        summary_in_status_thread: stored
+            .summary_in_status_thread
+            .unwrap_or(defaults.summary_in_status_thread),
         discord_bot_token_registered: stored.discord_bot_token_registered,
         discord_bot_token_updated_at: stored.discord_bot_token_updated_at,
         discord_bot_token_last_validated_at: stored.discord_bot_token_last_validated_at,
@@ -9642,6 +9651,7 @@ async fn load_guild_settings(
         retention_raw_audio_ttl_days: row.get("retention_raw_audio_ttl_days"),
         retention_transcript_ttl_days: row.get("retention_transcript_ttl_days"),
         summary_enabled: row.get("summary_enabled"),
+        summary_in_status_thread: row.get("summary_in_status_thread"),
         discord_bot_token_registered: row.get("discord_bot_token_registered"),
         discord_bot_token_updated_at: row.get("bot_token_updated_at"),
         discord_bot_token_last_validated_at: row.get("bot_token_last_validated_at"),
@@ -9950,6 +9960,7 @@ async fn api_update_target_guild_settings(
                 &request.retention_raw_audio_ttl_days,
                 &request.retention_transcript_ttl_days,
                 &request.summary_enabled,
+                &request.summary_in_status_thread,
             ],
         )
         .await
@@ -9974,6 +9985,7 @@ async fn api_update_target_guild_settings(
                 "retention_raw_audio_ttl_days": request.retention_raw_audio_ttl_days,
                 "retention_transcript_ttl_days": request.retention_transcript_ttl_days,
                 "summary_enabled": request.summary_enabled,
+                "summary_in_status_thread": request.summary_in_status_thread,
             }),
         ),
     )
@@ -10017,6 +10029,7 @@ async fn api_update_guild_settings(
                 &request.retention_raw_audio_ttl_days,
                 &request.retention_transcript_ttl_days,
                 &request.summary_enabled,
+                &request.summary_in_status_thread,
             ],
         )
         .await
@@ -10037,6 +10050,7 @@ async fn api_update_guild_settings(
                 "retention_raw_audio_ttl_days": request.retention_raw_audio_ttl_days,
                 "retention_transcript_ttl_days": request.retention_transcript_ttl_days,
                 "summary_enabled": request.summary_enabled,
+                "summary_in_status_thread": request.summary_in_status_thread,
             }),
         ),
     )
@@ -14387,6 +14401,7 @@ mod guild_api_tests {
             retention_raw_audio_ttl_days: 7,
             retention_transcript_ttl_days: 30,
             summary_enabled: true,
+            summary_in_status_thread: Some(false),
         }
     }
 
@@ -14398,6 +14413,7 @@ mod guild_api_tests {
             retention_raw_audio_ttl_days: 14,
             retention_transcript_ttl_days: 60,
             summary_enabled: true,
+            summary_in_status_thread: false,
         }
     }
 
@@ -14566,6 +14582,7 @@ mod guild_api_tests {
             retention_raw_audio_ttl_days: Some(21),
             retention_transcript_ttl_days: Some(90),
             summary_enabled: Some(false),
+            summary_in_status_thread: Some(true),
             discord_bot_token_registered: registered,
             discord_bot_token_updated_at: registered.then(|| "2026-05-31T00:00:00Z".to_owned()),
             discord_bot_token_last_validated_at: registered

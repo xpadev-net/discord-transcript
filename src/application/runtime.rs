@@ -85,9 +85,10 @@ use crate::interfaces::web::{
 use chrono::{DateTime, Utc};
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
-    CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    EditMessage, GatewayIntents, Guild, GuildChannel, GuildId, GuildMemberUpdateEvent, Interaction,
-    Member, Message, PartialGuild, Ready, Role, RoleId, User, UserId, VoiceState,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateThread,
+    EditInteractionResponse, EditMessage, EditThread, GatewayIntents, Guild, GuildChannel, GuildId,
+    GuildMemberUpdateEvent, Interaction, Member, Message, MessageId, PartialGuild, Ready, Role,
+    RoleId, User, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -8115,8 +8116,12 @@ impl ScaffoldHandler {
                             chunks
                         }
                     };
-                    if let Err(err) =
-                        post_summary_to_report_channel(&http, report_channel_id, &chunks).await
+                    let target_channel = self.summary_post_channel(&http, meeting_id, report_channel_id).await;
+                    let post_result = match &target_channel {
+                        Ok(channel_id) => post_summary_to_channel(&http, *channel_id, &chunks).await,
+                        Err(err) => Err(err.clone()),
+                    };
+                    if let Err(err) = post_result
                     {
                         let error_message = format!("summary posting failed: {err}");
                         let exhausted = {
@@ -8183,9 +8188,10 @@ impl ScaffoldHandler {
                     // Post meeting URL if PUBLIC_BASE_URL is configured
                     let url_notification = if let Some(ref url) = summary_url {
                         let url_msg = format!("詳細はこちら: {url}");
-                        if let Err(err) =
-                            post_summary_to_report_channel(&http, report_channel_id, &[url_msg])
-                                .await
+                        if let Err(err) = match &target_channel {
+                            Ok(channel_id) => post_summary_to_channel(&http, *channel_id, &[url_msg]).await,
+                            Err(err) => Err(err.clone()),
+                        }
                         {
                             warn!(meeting_id = %meeting_id, error = %err, "failed to post meeting URL");
                             SummaryUrlNotification::FailedBestEffort
@@ -8529,6 +8535,63 @@ impl ScaffoldHandler {
                 metadata.report_channel_id
             )
         })
+    }
+
+    async fn summary_post_channel(
+        &self,
+        http: &Http,
+        meeting_id: &str,
+        fallback_channel_id: u64,
+    ) -> Result<u64, String> {
+        let mut service = self.service.lock().await;
+        let meeting = service.store.get_meeting(meeting_id).ok().flatten();
+        let Some(meeting) = meeting else {
+            return Ok(fallback_channel_id);
+        };
+        let enabled = service
+            .store
+            .get_guild_settings_for_meeting_snapshot(&meeting.guild_id)
+            .ok()
+            .flatten()
+            .and_then(|settings| settings.summary_in_status_thread)
+            .unwrap_or(false);
+        if !enabled {
+            return Ok(fallback_channel_id);
+        }
+        let Ok(metadata) = service.store.get_status_message_metadata(meeting_id) else {
+            return Ok(fallback_channel_id);
+        };
+        let existing_thread_id = metadata.summary_thread_id;
+        let (Some(status_channel), Some(status_message)) = (
+            metadata.status_message_channel_id,
+            metadata.status_message_id,
+        ) else {
+            return Ok(fallback_channel_id);
+        };
+        drop(service);
+        let thread_id = match ensure_summary_thread(
+            http,
+            &status_channel,
+            &status_message,
+            meeting_id,
+            existing_thread_id,
+        )
+        .await
+        {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                warn!(meeting_id, error = %err, "failed to create summary thread; posting to report channel");
+                return Ok(fallback_channel_id);
+            }
+        };
+        let mut service = self.service.lock().await;
+        if let Err(err) = service
+            .store
+            .set_summary_thread_id(meeting_id, thread_id.to_string())
+        {
+            warn!(meeting_id, error = %err, "failed to save summary thread id; reusing created thread");
+        }
+        Ok(thread_id)
     }
 
     async fn load_meeting(&self, meeting_id: &str) -> Result<StoredMeeting, String> {
@@ -11638,6 +11701,81 @@ async fn post_summary_to_report_channel(
     Ok(())
 }
 
+async fn post_summary_to_channel(
+    http: &Http,
+    channel_id: u64,
+    chunks: &[String],
+) -> Result<(), String> {
+    post_summary_to_report_channel(http, channel_id, chunks).await
+}
+
+async fn validate_summary_thread(http: &Http, thread_id: u64) -> Result<u64, String> {
+    let channel_id = ChannelId::new(thread_id);
+    let channel = channel_id
+        .to_channel(http)
+        .await
+        .map_err(|err| err.to_string())?
+        .guild()
+        .ok_or_else(|| "summary thread is not a guild channel".to_owned())?;
+    let metadata = channel
+        .thread_metadata
+        .ok_or_else(|| "summary channel is not a thread".to_owned())?;
+    if metadata.archived || metadata.locked {
+        channel_id
+            .edit_thread(http, EditThread::new().archived(false).locked(false))
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(thread_id)
+}
+
+async fn ensure_summary_thread(
+    http: &Http,
+    channel_id: &str,
+    message_id: &str,
+    meeting_id: &str,
+    existing_thread_id: Option<String>,
+) -> Result<u64, String> {
+    let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
+    if let Some(thread_id) = saved_thread_id
+        && let Ok(thread_id) = validate_summary_thread(http, thread_id).await
+    {
+        return Ok(thread_id);
+    }
+    let channel_id = channel_id
+        .parse::<u64>()
+        .map_err(|err| format!("invalid status channel id: {err}"))?;
+    let message_id = message_id
+        .parse::<u64>()
+        .map_err(|err| format!("invalid status message id: {err}"))?;
+    let channel = ChannelId::new(channel_id);
+    if let Ok(message) = channel.message(http, MessageId::new(message_id)).await
+        && let Some(thread) = message.thread
+        && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
+    {
+        return Ok(thread_id);
+    }
+    match channel
+        .create_thread_from_message(
+            http,
+            MessageId::new(message_id),
+            CreateThread::new(format!("要約 {meeting_id}")),
+        )
+        .await
+    {
+        Ok(thread) => Ok(thread.id.get()),
+        Err(create_error) => {
+            if let Ok(message) = channel.message(http, MessageId::new(message_id)).await
+                && let Some(thread) = message.thread
+                && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
+            {
+                return Ok(thread_id);
+            }
+            Err(create_error.to_string())
+        }
+    }
+}
+
 fn meeting_voice_channel_display(meeting: &StoredMeeting) -> String {
     meeting
         .voice_channel_name
@@ -13232,6 +13370,14 @@ mod status_message_tests {
         ) -> Result<(), crate::infrastructure::storage::StoreError> {
             self.inner
                 .set_status_message(meeting_id, channel_id, message_id)
+        }
+
+        fn set_summary_thread_id(
+            &mut self,
+            meeting_id: &str,
+            thread_id: String,
+        ) -> Result<(), crate::infrastructure::storage::StoreError> {
+            self.inner.set_summary_thread_id(meeting_id, thread_id)
         }
 
         fn upsert_effective_meeting_settings(

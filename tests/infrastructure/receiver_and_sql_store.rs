@@ -318,9 +318,12 @@ fn schema_constrains_transcript_confidence_to_unit_range() {
     assert!(incremental_schema.contains("NOT VALID"));
     assert_eq!(
         MIGRATIONS.last().expect("latest migration").version,
-        "0033_live_transcription_outbox"
+        "0035_summary_thread_id"
     );
-    let live_outbox_migration = MIGRATIONS.last().expect("latest migration");
+    let live_outbox_migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == "0033_live_transcription_outbox")
+        .expect("live transcription outbox migration");
     assert!(live_outbox_migration.sql.contains("ADD COLUMN IF NOT EXISTS audio_path TEXT"));
     assert!(live_outbox_migration.sql.contains("idx_live_transcription_chunks_queued_outbox"));
 }
@@ -727,13 +730,14 @@ fn sql_store_set_status_with_cas_returns_conflict_when_status_mismatch() {
 #[test]
 fn sql_store_reads_and_sets_status_message_metadata() {
     let mut executor = FakeSqlExecutor::default();
-    let query_sql = "SELECT report_channel_id, status_message_channel_id, status_message_id FROM meetings WHERE id=$1 LIMIT 1";
+    let query_sql = "SELECT report_channel_id, status_message_channel_id, status_message_id, summary_thread_id FROM meetings WHERE id=$1 LIMIT 1";
     executor.query_rows_result.insert(
         format!("{query_sql}|{}", "m1"),
         vec![sql_row_from_strings(vec![
             "c-report".to_owned(),
             "c-status".to_owned(),
             "m-status".to_owned(),
+            "thread-1".to_owned(),
         ])],
     );
 
@@ -747,6 +751,7 @@ fn sql_store_reads_and_sets_status_message_metadata() {
         Some("c-status")
     );
     assert_eq!(metadata.status_message_id.as_deref(), Some("m-status"));
+    assert_eq!(metadata.summary_thread_id.as_deref(), Some("thread-1"));
 
     store
         .set_status_message("m1", "c-new".to_owned(), "msg-2".to_owned())

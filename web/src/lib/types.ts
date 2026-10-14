@@ -92,6 +92,7 @@ export interface GuildSettingsResponse {
   retention_raw_audio_ttl_days: number;
   retention_transcript_ttl_days: number;
   summary_enabled: boolean;
+  summary_in_status_thread: boolean;
   discord_bot_token_registered: boolean;
   discord_bot_token_updated_at: string | null;
   discord_bot_token_last_validated_at: string | null;
@@ -110,6 +111,7 @@ export interface UpdateGuildSettingsRequest {
   retention_raw_audio_ttl_days: number;
   retention_transcript_ttl_days: number;
   summary_enabled: boolean;
+  summary_in_status_thread: boolean;
 }
 
 export interface UpdateGuildBotTokenRequest {

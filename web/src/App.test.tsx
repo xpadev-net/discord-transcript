@@ -73,6 +73,7 @@ function settingsResponse() {
     retention_raw_audio_ttl_days: 14,
     retention_transcript_ttl_days: 60,
     summary_enabled: true,
+    summary_in_status_thread: false,
     discord_bot_token_registered: false,
     discord_bot_token_updated_at: null,
     discord_bot_token_last_validated_at: null,

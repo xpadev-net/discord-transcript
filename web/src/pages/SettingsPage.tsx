@@ -85,6 +85,7 @@ interface SettingsForm {
   retention_raw_audio_ttl_days: string;
   retention_transcript_ttl_days: string;
   summary_enabled: boolean;
+  summary_in_status_thread: boolean;
   whisper_language_enabled: boolean;
   whisper_language_value: string;
 }
@@ -524,6 +525,7 @@ function formFromSettings(settings: GuildSettingsResponse): SettingsForm {
       settings.retention_transcript_ttl_days,
     ),
     summary_enabled: settings.summary_enabled,
+    summary_in_status_thread: settings.summary_in_status_thread,
   };
 }
 
@@ -541,6 +543,7 @@ function requestFromForm(form: SettingsForm): UpdateGuildSettingsRequest {
       form.retention_transcript_ttl_days,
     ),
     summary_enabled: form.summary_enabled,
+    summary_in_status_thread: form.summary_in_status_thread,
   };
 }
 
@@ -2438,6 +2441,17 @@ export function SettingsPage({
                 }
               />
               <span>{"\u8981\u7d04\u3092\u6709\u52b9\u306b\u3059\u308b"}</span>
+            </label>
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={form.summary_in_status_thread}
+                disabled={controlsDisabled}
+                onChange={(event) =>
+                  updateForm({ summary_in_status_thread: event.target.checked })
+                }
+              />
+              <span>{"要約をステータスメッセージのスレッドに投稿する"}</span>
             </label>
           </section>
 
