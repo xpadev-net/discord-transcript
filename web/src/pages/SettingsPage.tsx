@@ -2447,7 +2447,9 @@ export function SettingsPage({
                 type="checkbox"
                 checked={form.summary_in_status_thread}
                 disabled={controlsDisabled}
-                onChange={(event) => updateForm({ summary_in_status_thread: event.target.checked })}
+                onChange={(event) =>
+                  updateForm({ summary_in_status_thread: event.target.checked })
+                }
               />
               <span>{"要約をステータスメッセージのスレッドに投稿する"}</span>
             </label>
