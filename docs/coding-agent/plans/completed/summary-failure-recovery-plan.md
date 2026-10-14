@@ -175,6 +175,10 @@
 - Keep mixdown temporary files inside the meeting workspace and clean them on failure.
 
 ## Progress Log (append-only)
+- 2026-10-15 production rollout follow-up:
+  - Summary: After the application became healthy on the new image, startup recovery logs showed live transcript loading failing on PostgreSQL column index 4. The row adapter handled non-null `f64` but not nullable `f64`, so NULL transcript confidence values caused the load to fail and forced the final audio transcription path. Added nullable floating-point conversion.
+  - Validation evidence: Production log identifies the row-conversion failure; local format/compile and Codex review are pending. The earlier 512 MiB error appears in the subsequent ASR input construction path, which the user explicitly scoped out as a Whisper transcription failure.
+  - Notes: Follow-up changes keep the requested focus on non-Whisper summary context loading.
 - 2026-10-15 GitHub review follow-up:
   - Summary: GitHub Codex review identified a regression where a valid but far-future chunk caused manifest scanning to reject the entire mixdown before the streaming cluster builder could skip or truncate it. Removed the redundant manifest-wide span rejection; downstream wall-clock cap remains responsible for placement and truncation.
   - Validation evidence: Existing regression coverage `mixdown_skips_chunks_beyond_meeting_wall_clock_cap` exercises this behavior; local tests were not run. Formatting, compile, CI, and fresh Codex review are pending.

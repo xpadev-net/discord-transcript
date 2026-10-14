@@ -3179,6 +3179,10 @@ fn pg_row_to_optional_strings(row: Row) -> Result<SqlRow, String> {
             values.push(v.map(|value| value.to_string()));
             continue;
         }
+        if let Ok(v) = row.try_get::<usize, Option<f64>>(idx) {
+            values.push(v.map(|value| value.to_string()));
+            continue;
+        }
         if let Ok(v) = row.try_get::<usize, i64>(idx) {
             values.push(Some(v.to_string()));
             continue;
