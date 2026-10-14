@@ -9378,26 +9378,31 @@ impl ScaffoldHandler {
             let mut persistence = SqlSummaryPersistenceAdapter {
                 executor: &mut service.store.executor,
             };
-            crate::application::summary_persistence::persist_before_cleanup(
+            crate::application::summary_persistence::persist_summary(
                 &mut persistence,
                 &claimed_job.meeting_id,
                 &markdown,
                 agent_workspace,
-                |workspace| workspace.retain_for_retry(),
-                |workspace| {
-                    cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, workspace)
-                },
             )
         };
-        if let Err(err) = persist_result {
-            warn!(
-                meeting_id = %claimed_job.meeting_id,
-                error = %err,
-                "failed to persist summary; scheduling retry before cleanup or notification"
-            );
-            return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(
-                err
-            ));
+        match persist_result {
+            crate::application::summary_persistence::SummaryPersistenceOutcome::Persisted(
+                workspace,
+            ) => cleanup_agent_workspace_after_persist(&claimed_job.meeting_id, workspace),
+            crate::application::summary_persistence::SummaryPersistenceOutcome::Retry {
+                context: workspace,
+                error: err,
+            } => {
+                workspace.retain_for_retry();
+                warn!(
+                    meeting_id = %claimed_job.meeting_id,
+                    error = %err,
+                    "failed to persist summary; scheduling retry before cleanup or notification"
+                );
+                return_summary_retry!(crate::application::summary::SummaryError::SummaryEngine(
+                    err
+                ));
+            }
         }
 
         let ai_memory_extraction_supported = {

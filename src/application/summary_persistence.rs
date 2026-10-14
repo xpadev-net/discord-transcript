@@ -4,37 +4,33 @@ pub trait SummaryPersistencePort {
     -> Result<(), String>;
 }
 
-/// Persists a generated summary before running either workspace follow-up.
-/// Persistence failures retain the workspace for retry and never run cleanup.
-pub fn persist_before_cleanup<P, C, F, Context>(
+/// The runtime applies the follow-up after releasing its service lock.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SummaryPersistenceOutcome<Context> {
+    Persisted(Context),
+    Retry { context: Context, error: String },
+}
+
+/// Persists a generated summary and returns the follow-up decision without
+/// doing workspace IO while the persistence adapter is borrowed.
+pub fn persist_summary<P, Context>(
     port: &mut P,
     meeting_id: &str,
     markdown: &str,
     context: Context,
-    retain_for_retry: F,
-    cleanup_after_persist: C,
-) -> Result<(), String>
+) -> SummaryPersistenceOutcome<Context>
 where
     P: SummaryPersistencePort,
-    C: FnOnce(Context),
-    F: FnOnce(Context),
 {
     match port.persist_generated_summary(meeting_id, markdown) {
-        Ok(()) => {
-            cleanup_after_persist(context);
-            Ok(())
-        }
-        Err(err) => {
-            retain_for_retry(context);
-            Err(err)
-        }
+        Ok(()) => SummaryPersistenceOutcome::Persisted(context),
+        Err(error) => SummaryPersistenceOutcome::Retry { context, error },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SummaryPersistencePort, persist_before_cleanup};
-    use std::cell::Cell;
+    use super::{SummaryPersistenceOutcome, SummaryPersistencePort, persist_summary};
 
     struct FakeSummaryPersistence {
         result: Result<(), String>,
@@ -51,44 +47,31 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_retains_workspace_without_cleanup() {
+    fn persistence_failure_returns_retry_outcome_with_workspace_context() {
         let mut port = FakeSummaryPersistence {
             result: Err("database unavailable".to_owned()),
         };
-        let retained = Cell::new(false);
-        let cleaned = Cell::new(false);
 
-        let result = persist_before_cleanup(
-            &mut port,
-            "m1",
-            "## Summary",
-            (),
-            |_| retained.set(true),
-            |_| cleaned.set(true),
+        let outcome = persist_summary(&mut port, "m1", "## Summary", "workspace-for-retry");
+
+        assert_eq!(
+            outcome,
+            SummaryPersistenceOutcome::Retry {
+                context: "workspace-for-retry",
+                error: "database unavailable".to_owned(),
+            }
         );
-
-        assert_eq!(result, Err("database unavailable".to_owned()));
-        assert!(retained.get());
-        assert!(!cleaned.get());
     }
 
     #[test]
-    fn persistence_success_cleans_workspace_without_retry() {
+    fn persistence_success_returns_workspace_for_cleanup() {
         let mut port = FakeSummaryPersistence { result: Ok(()) };
-        let retained = Cell::new(false);
-        let cleaned = Cell::new(false);
 
-        let result = persist_before_cleanup(
-            &mut port,
-            "m1",
-            "## Summary",
-            (),
-            |_| retained.set(true),
-            |_| cleaned.set(true),
+        let outcome = persist_summary(&mut port, "m1", "## Summary", "workspace-after-persist");
+
+        assert_eq!(
+            outcome,
+            SummaryPersistenceOutcome::Persisted("workspace-after-persist")
         );
-
-        assert_eq!(result, Ok(()));
-        assert!(!retained.get());
-        assert!(cleaned.get());
     }
 }
