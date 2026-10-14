@@ -54,7 +54,8 @@ export interface MeetingListResponse {
   voice_channels: MeetingVoiceChannel[];
   page: number;
   limit: number;
-  total: number;
+  total: number | null;
+  next_cursor: string | null;
 }
 
 export type GuildJobStatus =

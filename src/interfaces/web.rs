@@ -6,6 +6,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
@@ -87,10 +89,10 @@ use crate::infrastructure::sql::{
     LIST_ACTIVE_TENANT_GUILDS_BY_GUILD_IDS_SQL, LIST_ADMIN_GUILD_PLAN_ASSIGNMENTS_SQL,
     LIST_ADMIN_PLAN_QUOTAS_SQL, LIST_ADMIN_PLANS_SQL, LIST_AI_MEMORY_NOTES_SQL,
     LIST_DOMAIN_KNOWLEDGE_SQL, LIST_GUILD_JOBS_SQL, LIST_GUILD_MEETING_VOICE_CHANNELS_SQL,
-    LIST_GUILD_MEETINGS_SQL, LIST_GUILD_RBAC_ROLE_GRANTS_SQL, LIST_PERSON_ALIASES_SQL,
-    LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
-    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_SQL,
-    PRUNE_STALE_AUDIT_EVENTS_SQL, RESET_GUILD_RBAC_ROLE_GRANT_SQL,
+    LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL, LIST_GUILD_MEETINGS_SQL, LIST_GUILD_RBAC_ROLE_GRANTS_SQL,
+    LIST_PERSON_ALIASES_SQL, LIST_SUMMARY_TEMPLATES_SQL, LIST_TRANSCRIPT_FEEDBACK_SQL,
+    LIST_VISIBLE_GUILD_MEETING_VOICE_CHANNELS_SQL, LIST_VISIBLE_GUILD_MEETINGS_AFTER_CURSOR_SQL,
+    LIST_VISIBLE_GUILD_MEETINGS_SQL, PRUNE_STALE_AUDIT_EVENTS_SQL, RESET_GUILD_RBAC_ROLE_GRANT_SQL,
     RESOLVE_SINGLE_ACTIVE_TENANT_GUILD_SQL, SET_AI_MEMORY_PINNED_SQL,
     UPDATE_ADMIN_GUILD_PLAN_ASSIGNMENT_SQL, UPDATE_ADMIN_PLAN_QUOTA_SQL, UPDATE_ADMIN_PLAN_SQL,
     UPDATE_AI_MEMORY_NOTE_SQL, UPDATE_DOMAIN_KNOWLEDGE_SQL, UPDATE_PERSON_ALIAS_SQL,
@@ -3607,11 +3609,13 @@ struct CurrentUserGuildResponse {
     installed: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct GuildMeetingsQuery {
     page: Option<u32>,
     limit: Option<u32>,
     voice_channel_id: Option<String>,
+    pagination: Option<String>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3645,7 +3649,14 @@ struct GuildMeetingsResponse {
     voice_channels: Vec<GuildMeetingVoiceChannelResponse>,
     page: u32,
     limit: u32,
-    total: i64,
+    total: Option<i64>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GuildMeetingsCursor {
+    started_at: String,
+    id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -4642,6 +4653,38 @@ fn normalize_guild_meetings_pagination(query: &GuildMeetingsQuery) -> (u32, u32)
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     (page, limit)
+}
+
+fn decode_guild_meetings_cursor(value: &str) -> Result<GuildMeetingsCursor, StatusCode> {
+    if value.len() > 512 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let cursor: GuildMeetingsCursor =
+        serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if cursor.id.is_empty()
+        || cursor.id.len() > 128
+        || DateTime::parse_from_rfc3339(&cursor.started_at).is_err()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(cursor)
+}
+
+fn encode_guild_meetings_cursor(cursor: &GuildMeetingsCursor) -> Option<String> {
+    serde_json::to_vec(cursor)
+        .ok()
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn guild_meetings_next_cursor(rows: &[tokio_postgres::Row]) -> Option<String> {
+    let row = rows.last()?;
+    encode_guild_meetings_cursor(&GuildMeetingsCursor {
+        started_at: row.try_get("cursor_started_at").ok()?,
+        id: row.try_get("id").ok()?,
+    })
 }
 
 const DISCORD_SNOWFLAKE_MIN_LEN: usize = 17;
@@ -9493,6 +9536,16 @@ async fn list_guild_meetings_for_auth(
     query: GuildMeetingsQuery,
     voice_channel_filter: Option<String>,
 ) -> Result<Json<GuildMeetingsResponse>, StatusCode> {
+    let cursor_mode = match query.pagination.as_deref() {
+        None if query.cursor.is_none() => false,
+        Some("cursor") => true,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_guild_meetings_cursor)
+        .transpose()?;
     let (page, limit) = normalize_guild_meetings_pagination(&query);
     let offset = i64::from(page.saturating_sub(1)) * i64::from(limit);
     let limit_i64 = i64::from(limit);
@@ -9508,6 +9561,39 @@ async fn list_guild_meetings_for_auth(
 
     if can_view_all_meetings {
         let voice_channels = list_admin_guild_meeting_voice_channels(state, auth).await?;
+        if cursor_mode {
+            let cursor_started_at = cursor.as_ref().map(|cursor| cursor.started_at.clone());
+            let cursor_id = cursor.as_ref().map(|cursor| cursor.id.clone());
+            let mut rows = state
+                .db
+                .query(
+                    LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL,
+                    &[
+                        &auth.guild_id,
+                        &voice_channel_filter,
+                        &cursor_started_at,
+                        &cursor_id,
+                        &(limit_i64 + 1),
+                    ],
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            let next_cursor = has_more
+                .then(|| guild_meetings_next_cursor(&rows))
+                .flatten();
+            let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
+            return Ok(Json(GuildMeetingsResponse {
+                guild_id: auth.guild_id.clone(),
+                meetings,
+                voice_channels,
+                page,
+                limit,
+                total: None,
+                next_cursor,
+            }));
+        }
         let count_row = state
             .db
             .query_one(
@@ -9534,7 +9620,8 @@ async fn list_guild_meetings_for_auth(
             voice_channels,
             page,
             limit,
-            total,
+            total: Some(total),
+            next_cursor: None,
         }));
     }
 
@@ -9548,11 +9635,47 @@ async fn list_guild_meetings_for_auth(
             voice_channels: Vec::new(),
             page,
             limit,
-            total: 0,
+            total: if cursor_mode { None } else { Some(0) },
+            next_cursor: None,
         }));
     }
     let voice_channels =
         list_visible_guild_meeting_voice_channels(state, auth, &visible_channel_ids).await?;
+
+    if cursor_mode {
+        let cursor_started_at = cursor.as_ref().map(|cursor| cursor.started_at.clone());
+        let cursor_id = cursor.as_ref().map(|cursor| cursor.id.clone());
+        let mut rows = state
+            .db
+            .query(
+                LIST_VISIBLE_GUILD_MEETINGS_AFTER_CURSOR_SQL,
+                &[
+                    &auth.guild_id,
+                    &visible_channel_ids,
+                    &voice_channel_filter,
+                    &cursor_started_at,
+                    &cursor_id,
+                    &(limit_i64 + 1),
+                ],
+            )
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next_cursor = has_more
+            .then(|| guild_meetings_next_cursor(&rows))
+            .flatten();
+        let meetings = rows.iter().map(guild_meeting_entry_from_row).collect();
+        return Ok(Json(GuildMeetingsResponse {
+            guild_id: auth.guild_id.clone(),
+            meetings,
+            voice_channels,
+            page,
+            limit,
+            total: None,
+            next_cursor,
+        }));
+    }
 
     let count_row = state
         .db
@@ -9586,7 +9709,8 @@ async fn list_guild_meetings_for_auth(
         voice_channels,
         page,
         limit,
-        total,
+        total: Some(total),
+        next_cursor: None,
     }))
 }
 
@@ -14367,18 +14491,20 @@ mod guild_api_tests {
         DiscordBotTokenValidationError, DiscordBotTokenValidationStage, DiscordGuild,
         DiscordGuildFull, DiscordRoleFull, DomainKnowledgeListQuery, DomainKnowledgeUpsertRequest,
         GUILD_CACHE_REFRESH_INFLIGHT_SECS, GuildAdminCheck, GuildBotTokenUpdateRequest, GuildCache,
-        GuildCacheState, GuildMeetingsQuery, GuildRbacRoleGrantResponse, GuildSettingsCapabilities,
-        GuildSettingsDefaults, GuildSettingsUpdateRequest, JobCancelRequest, JobListQuery,
-        JobRetryRequest, PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
+        GuildCacheState, GuildMeetingsCursor, GuildMeetingsQuery, GuildRbacRoleGrantResponse,
+        GuildSettingsCapabilities, GuildSettingsDefaults, GuildSettingsUpdateRequest,
+        JobCancelRequest, JobListQuery, JobRetryRequest,
+        PERMISSION_CACHE_SENSITIVE_POSITIVE_TTL_SECS, PersonAliasUpsertRequest,
         StoredGuildSettings, SummaryTemplateUpsertRequest, TranscriptFeedbackRequest,
         TranscriptFeedbackResponse, TranscriptFeedbackStatusRequest, advance_bot_token_revision,
         authorize_system_admin_request, bot_auth_header_from_cache_with_resolver,
         classify_discord_bot_token_validation_status, current_user_guilds_response,
-        discord_user_guilds_api_status, guild_admin_member_status_decision,
-        guild_admin_permission_cache_key, guild_admin_required_result,
-        guild_bot_token_delete_is_noop, guild_info_from_cache_with_resolver,
-        guild_settings_read_allowed, guild_settings_response, meeting_feedback_create_audit_detail,
-        meeting_feedback_idempotency_key, normalize_admin_guild_plan_assignment_list_query,
+        decode_guild_meetings_cursor, discord_user_guilds_api_status, encode_guild_meetings_cursor,
+        guild_admin_member_status_decision, guild_admin_permission_cache_key,
+        guild_admin_required_result, guild_bot_token_delete_is_noop,
+        guild_info_from_cache_with_resolver, guild_settings_read_allowed, guild_settings_response,
+        meeting_feedback_create_audit_detail, meeting_feedback_idempotency_key,
+        normalize_admin_guild_plan_assignment_list_query,
         normalize_admin_guild_plan_assignment_request, normalize_admin_plan_quota_request,
         normalize_admin_plan_request, normalize_ai_memory_request,
         normalize_domain_knowledge_list_filter, normalize_domain_knowledge_request,
@@ -16812,7 +16938,8 @@ mod guild_api_tests {
             normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: None,
                 limit: None,
-                voice_channel_id: None
+                voice_channel_id: None,
+                ..GuildMeetingsQuery::default()
             }),
             (1, 20)
         );
@@ -16820,7 +16947,8 @@ mod guild_api_tests {
             normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: Some(0),
                 limit: Some(0),
-                voice_channel_id: None
+                voice_channel_id: None,
+                ..GuildMeetingsQuery::default()
             }),
             (1, 1)
         );
@@ -16828,9 +16956,28 @@ mod guild_api_tests {
             normalize_guild_meetings_pagination(&GuildMeetingsQuery {
                 page: Some(2),
                 limit: Some(250),
-                voice_channel_id: None
+                voice_channel_id: None,
+                ..GuildMeetingsQuery::default()
             }),
             (2, 100)
+        );
+    }
+
+    #[test]
+    fn guild_meetings_cursor_round_trips_and_rejects_invalid_values() {
+        let cursor = GuildMeetingsCursor {
+            started_at: "2025-01-02T03:04:05.123456Z".to_owned(),
+            id: "meeting-42".to_owned(),
+        };
+        let encoded = encode_guild_meetings_cursor(&cursor).unwrap();
+        assert_eq!(decode_guild_meetings_cursor(&encoded), Ok(cursor));
+        assert_eq!(
+            decode_guild_meetings_cursor("invalid"),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            decode_guild_meetings_cursor(&"a".repeat(513)),
+            Err(StatusCode::BAD_REQUEST)
         );
     }
 
@@ -16841,6 +16988,7 @@ mod guild_api_tests {
                 page: None,
                 limit: None,
                 voice_channel_id: None,
+                ..GuildMeetingsQuery::default()
             }),
             Ok(None)
         );
@@ -16849,6 +16997,7 @@ mod guild_api_tests {
                 page: None,
                 limit: None,
                 voice_channel_id: Some("  ".to_owned()),
+                ..GuildMeetingsQuery::default()
             }),
             Ok(None)
         );
@@ -16857,6 +17006,7 @@ mod guild_api_tests {
                 page: None,
                 limit: None,
                 voice_channel_id: Some("\t".to_owned()),
+                ..GuildMeetingsQuery::default()
             }),
             Err(StatusCode::BAD_REQUEST)
         );
@@ -16869,6 +17019,7 @@ mod guild_api_tests {
                 page: None,
                 limit: None,
                 voice_channel_id: Some(" 123456789012345678 ".to_owned()),
+                ..GuildMeetingsQuery::default()
             }),
             Ok(Some("123456789012345678".to_owned()))
         );
@@ -16889,6 +17040,7 @@ mod guild_api_tests {
                     page: None,
                     limit: None,
                     voice_channel_id: Some(voice_channel_id.to_owned()),
+                    ..GuildMeetingsQuery::default()
                 }),
                 Err(StatusCode::BAD_REQUEST),
                 "{voice_channel_id:?} should be rejected"
@@ -16903,6 +17055,7 @@ mod guild_api_tests {
                 page: None,
                 limit: None,
                 voice_channel_id: Some(" vc-2 ".to_owned()),
+                ..GuildMeetingsQuery::default()
             }),
             Err(StatusCode::BAD_REQUEST)
         );

@@ -211,6 +211,7 @@ function meetingsResponse(
     page: 1,
     limit: 20,
     total: meetings.length,
+    next_cursor: null,
   };
 }
 
@@ -2372,7 +2373,16 @@ describe("App access controls", () => {
   it("shows dashboard error UI for malformed meeting list responses", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = input.toString();
-      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+      if (url === "/api/me") {
+        return Promise.resolve(
+          jsonResponse({
+            user_id: "member-1",
+            guild_id: "guild-1",
+            is_admin: false,
+          }),
+        );
+      }
+      if (url.startsWith("/api/guild/meetings")) {
         return Promise.resolve(
           jsonResponse({
             ...meetingsResponse("guild-1"),
@@ -2383,15 +2393,7 @@ describe("App access controls", () => {
       return Promise.resolve(emptyResponse(404));
     });
 
-    vi.stubGlobal("fetch", fetchMock);
-    render(
-      <MemoryRouter>
-        <DashboardPage
-          selectedGuildId="guild-1"
-          selectedGuildName="Guild One"
-        />
-      </MemoryRouter>,
-    );
+    renderApp("/", fetchMock);
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("会議一覧のレスポンス形式が不正です");
@@ -2488,7 +2490,7 @@ describe("App access controls", () => {
 
     expect(await screen.findByText("Guild Two meeting")).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/guilds/guild-2/meetings?page=1&limit=20",
+      "/api/guilds/guild-2/meetings?limit=20&pagination=cursor&page=1",
       expect.anything(),
     );
   });
@@ -2647,7 +2649,7 @@ describe("App access controls", () => {
     expect(await screen.findByText("VC Two meeting")).toBeTruthy();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/guilds/guild-1/meetings?page=1&limit=20&voice_channel_id=vc-2",
+        "/api/guilds/guild-1/meetings?limit=20&pagination=cursor&page=1&voice_channel_id=vc-2",
         expect.anything(),
       ),
     );
@@ -2658,10 +2660,70 @@ describe("App access controls", () => {
       const unfilteredCalls = fetchMock.mock.calls.filter(
         ([calledUrl]) =>
           calledUrl.toString() ===
-          "/api/guilds/guild-1/meetings?page=1&limit=20",
+          "/api/guilds/guild-1/meetings?limit=20&pagination=cursor&page=1",
       );
       expect(unfilteredCalls.length).toBeGreaterThanOrEqual(2);
     });
+  });
+
+  it("uses meeting cursors for dashboard next and previous navigation", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.startsWith("/api/guilds/guild-1/meetings")) {
+        const cursor = new URL(`http://localhost${url}`).searchParams.get(
+          "cursor",
+        );
+        const firstPage = cursor === null;
+        return Promise.resolve(
+          jsonResponse({
+            ...meetingsResponse("guild-1", [
+              meetingItem({
+                id: firstPage ? "meeting-page-1" : "meeting-page-2",
+                title: firstPage ? "Cursor Page One" : "Cursor Page Two",
+              }),
+            ]),
+            total: null,
+            next_cursor: firstPage ? "opaque-cursor-1" : null,
+          }),
+        );
+      }
+      return Promise.resolve(emptyResponse(404));
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <MemoryRouter>
+        <DashboardPage
+          selectedGuildId="guild-1"
+          selectedGuildName="Guild One"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Cursor Page One")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "次へ" }));
+    expect(await screen.findByText("Cursor Page Two")).toBeTruthy();
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([calledUrl]) => {
+          const url = new URL(calledUrl.toString(), "http://localhost");
+          return (
+            url.pathname === "/api/guilds/guild-1/meetings" &&
+            url.searchParams.get("cursor") === "opaque-cursor-1"
+          );
+        }),
+      ).toBe(true),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "前へ" }));
+    expect(await screen.findByText("Cursor Page One")).toBeTruthy();
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([calledUrl]) =>
+          calledUrl.toString().startsWith("/api/guilds/guild-1/meetings"),
+        ).length,
+      ).toBeGreaterThanOrEqual(3),
+    );
   });
 
   it("shows an empty state when the selected VC has no meetings", async () => {
@@ -2724,7 +2786,7 @@ describe("App access controls", () => {
       const unfilteredCalls = fetchMock.mock.calls.filter(
         ([calledUrl]) =>
           calledUrl.toString() ===
-          "/api/guilds/guild-1/meetings?page=1&limit=20",
+          "/api/guilds/guild-1/meetings?limit=20&pagination=cursor&page=1",
       );
       expect(unfilteredCalls.length).toBeGreaterThanOrEqual(2);
     });
@@ -3379,7 +3441,7 @@ describe("App access controls", () => {
 
     expect(await screen.findByText("Fallback VC Two")).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/guild/meetings?page=1&limit=20&voice_channel_id=vc-2",
+      "/api/guild/meetings?limit=20&pagination=cursor&page=1&voice_channel_id=vc-2",
       expect.anything(),
     );
   });

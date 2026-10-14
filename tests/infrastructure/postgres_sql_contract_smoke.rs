@@ -2,6 +2,7 @@ use discord_transcript::domain::{MeetingStatus, StopReason};
 use discord_transcript::infrastructure::sql_store::{
     PgSqlExecutor, SqlExecutor, SqlMeetingStore,
 };
+use discord_transcript::infrastructure::sql::LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL;
 use discord_transcript::infrastructure::storage::{
     CreateMeetingRequest, MeetingStore, StopTransition, StoreError,
 };
@@ -121,6 +122,67 @@ fn run_sql_contract_smoke(database_url: &str, schema: &str) -> Result<(), String
     if row.get(1).and_then(|value| value.as_deref()) != Some("SQL contract smoke") {
         return Err(format!("expected title update to persist, got {row:?}"));
     }
+
+    store.executor.execute(
+        "INSERT INTO meetings (id, guild_id, voice_channel_id, report_channel_id, started_by_user_id, status, started_at) SELECT 'page-' || n, CASE WHEN n % 10 = 0 THEN 'g-page-plan' ELSE 'g-other' END, 'vc-plan', 'report', 'user', 'completed', TIMESTAMPTZ '2025-01-01 00:00:00+00' - (n / 100) * INTERVAL '1 minute' FROM generate_series(1, 10000) AS n",
+        &[],
+    )?;
+    store.executor.run_migration("ANALYZE meetings")?;
+    let first_page_sql = format!(
+        "{}",
+        LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
+            .replace("$1", "'g-page-plan'")
+            .replace("$2::TEXT IS NULL", "TRUE")
+            .replace("$3::TEXT IS NULL", "TRUE")
+            .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
+            .replace("$4::TEXT", "'unused'")
+            .replace("$5", "21"),
+    );
+    let first_page = store.executor.query_rows(&first_page_sql, &[])?;
+    if first_page.len() != 21 {
+        return Err(format!("expected 21 rows in first cursor page, got {}", first_page.len()));
+    }
+    let last = first_page.last().expect("first page should contain rows");
+    let cursor_time = last.get(3).and_then(Option::as_deref).unwrap();
+    let cursor_id = last.first().and_then(Option::as_deref).unwrap();
+    let second_page_sql = LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
+        .replace("$1", "'g-page-plan'")
+        .replace("$2::TEXT IS NULL", "TRUE")
+        .replace("$3::TEXT IS NULL", "FALSE")
+        .replace("$3::TEXT::TIMESTAMPTZ", &format!("TIMESTAMPTZ '{cursor_time}'"))
+        .replace("$4::TEXT", &format!("'{cursor_id}'"))
+        .replace("$5", "21");
+    let second_page = store.executor.query_rows(&second_page_sql, &[])?;
+    let first_ids = first_page
+        .iter()
+        .filter_map(|row| row.first().and_then(Option::as_deref))
+        .collect::<std::collections::HashSet<_>>();
+    if second_page.iter().any(|row| {
+        row.first()
+            .and_then(Option::as_deref)
+            .is_some_and(|id| first_ids.contains(id))
+    }) {
+        return Err("cursor pages must not repeat meeting IDs".to_owned());
+    }
+    let plan_sql = format!(
+        "EXPLAIN (FORMAT TEXT) {}",
+        LIST_GUILD_MEETINGS_AFTER_CURSOR_SQL
+            .replace("$1", "'g-page-plan'")
+            .replace("$2::TEXT IS NULL", "TRUE")
+            .replace("$3::TEXT IS NULL", "FALSE")
+            .replace("$3::TEXT::TIMESTAMPTZ", "TIMESTAMPTZ '2025-01-01 00:00:00+00'")
+            .replace("$4::TEXT", "'page-100'")
+            .replace("$5", "21"),
+    );
+    let plan = store.executor.query_rows(&plan_sql, &[])?;
+    if plan.is_empty() || !plan.iter().any(|row| {
+        row.first()
+            .and_then(Option::as_deref)
+            .is_some_and(|line| line.contains("idx_meetings_guild_started"))
+    }) {
+        return Err(format!("expected the guild/start index in cursor query plan, got {plan:?}"));
+    }
+    eprintln!("representative cursor query plan: {plan:?}");
 
     for _ in 0..128 {
         let rows = store.executor.query_rows("SELECT 1", &[])?;

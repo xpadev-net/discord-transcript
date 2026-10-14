@@ -70,7 +70,12 @@ export function DashboardPage({
   loadingGuildSelection = false,
   noSelectableGuilds = false,
 }: DashboardPageProps) {
-  const [request, setRequest] = useState({ page: 1, reloadKey: 0 });
+  const [request, setRequest] = useState({
+    page: 1,
+    reloadKey: 0,
+    cursor: null as string | null,
+    cursorHistory: [] as Array<string | null>,
+  });
   const [data, setData] = useState<MeetingListResponse | null>(null);
   const [selectedVoiceChannelId, setSelectedVoiceChannelId] = useState<
     string | null
@@ -97,7 +102,12 @@ export function DashboardPage({
     }
     previousGuildIdRef.current = selectedGuildId;
     setSelectedVoiceChannelId(null);
-    setRequest((current) => ({ ...current, page: 1 }));
+    setRequest((current) => ({
+      ...current,
+      page: 1,
+      cursor: null,
+      cursorHistory: [],
+    }));
   }, [selectedGuildId]);
 
   useEffect(() => {
@@ -124,6 +134,7 @@ export function DashboardPage({
       PAGE_SIZE,
       selectedVoiceChannelId,
       controller.signal,
+      { mode: "cursor", cursor: request.cursor },
     )
       .then((response) => {
         if (
@@ -186,21 +197,25 @@ export function DashboardPage({
   }, [activeData, selectedVoiceChannelId]);
 
   const totalPages = useMemo(() => {
-    if (!activeData) {
-      return 1;
+    if (!activeData || activeData.total === null) {
+      return request.page;
     }
     return Math.max(1, Math.ceil(activeData.total / PAGE_SIZE));
-  }, [activeData]);
+  }, [activeData, request.page]);
 
   const showingFrom =
-    activeData && activeData.total > 0 ? (request.page - 1) * PAGE_SIZE + 1 : 0;
+    activeData && activeData.meetings.length > 0
+      ? (request.page - 1) * PAGE_SIZE + 1
+      : 0;
   const showingTo =
-    activeData && activeData.total > 0
-      ? Math.min(request.page * PAGE_SIZE, activeData.total)
+    activeData && activeData.meetings.length > 0
+      ? showingFrom + activeData.meetings.length - 1
       : 0;
   const meetingCountText =
-    activeData && activeData.total > 0
-      ? `${showingFrom}-${showingTo} / ${activeData.total}`
+    activeData && activeData.meetings.length > 0
+      ? activeData.total === null
+        ? `${showingFrom}-${showingTo}`
+        : `${showingFrom}-${showingTo} / ${activeData.total}`
       : selectedVoiceChannelId
         ? "\u3053\u306eVC\u306e\u4f1a\u8b70\u306f\u3042\u308a\u307e\u305b\u3093"
         : "\u4f1a\u8b70\u306f\u307e\u3060\u3042\u308a\u307e\u305b\u3093";
@@ -255,6 +270,8 @@ export function DashboardPage({
                 setRequest((current) => ({
                   page: 1,
                   reloadKey: current.reloadKey + 1,
+                  cursor: null,
+                  cursorHistory: [],
                 }));
               }}
               disabled={
@@ -397,14 +414,18 @@ export function DashboardPage({
               setRequest((current) => ({
                 ...current,
                 page: Math.max(1, current.page - 1),
+                cursor: current.cursorHistory.at(-1) ?? null,
+                cursorHistory: current.cursorHistory.slice(0, -1),
               }))
             }
-            disabled={loading || page <= 1}
+            disabled={loading || request.cursorHistory.length === 0}
           >
             {"\u524d\u3078"}
           </button>
           <span>
-            {page} / {totalPages}
+            {activeData.total === null
+              ? `${page}ページ`
+              : `${page} / ${totalPages}`}
           </span>
           <button
             type="button"
@@ -412,10 +433,12 @@ export function DashboardPage({
             onClick={() =>
               setRequest((current) => ({
                 ...current,
-                page: Math.min(totalPages, current.page + 1),
+                page: current.page + 1,
+                cursor: activeData.next_cursor,
+                cursorHistory: [...current.cursorHistory, current.cursor],
               }))
             }
-            disabled={loading || page >= totalPages}
+            disabled={loading || !activeData.next_cursor}
           >
             {"\u6b21\u3078"}
           </button>

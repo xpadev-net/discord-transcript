@@ -306,7 +306,10 @@ function parseMeetingListResponse(payload: unknown): MeetingListResponse {
     !Array.isArray(payload.voice_channels) ||
     !isFiniteNumber(payload.page) ||
     !isFiniteNumber(payload.limit) ||
-    !isFiniteNumber(payload.total)
+    !(payload.total === null || isFiniteNumber(payload.total)) ||
+    !(
+      payload.next_cursor === undefined || isNullableString(payload.next_cursor)
+    )
   ) {
     throw invalidMeetingListResponse();
   }
@@ -334,7 +337,10 @@ function parseMeetingListResponse(payload: unknown): MeetingListResponse {
     voice_channels: voiceChannels,
     page: payload.page,
     limit: payload.limit,
-    total: payload.total,
+    total: payload.total === null ? null : Number(payload.total),
+    next_cursor: isNullableString(payload.next_cursor)
+      ? payload.next_cursor
+      : null,
   };
 }
 
@@ -387,11 +393,18 @@ export function fetchGuildMeetings(
   limit = 20,
   voiceChannelId?: string | null,
   signal?: AbortSignal,
+  pagination?: { mode: "cursor"; cursor: string | null },
 ): Promise<MeetingListResponse> {
-  const params = new URLSearchParams({
-    page: String(page),
-    limit: String(limit),
-  });
+  const params = new URLSearchParams(
+    pagination
+      ? { limit: String(limit) }
+      : { page: String(page), limit: String(limit) },
+  );
+  if (pagination) {
+    params.set("pagination", pagination.mode);
+    params.set("page", String(page));
+    if (pagination.cursor) params.set("cursor", pagination.cursor);
+  }
   const normalizedVoiceChannelId = voiceChannelId?.trim();
   if (normalizedVoiceChannelId) {
     params.set("voice_channel_id", normalizedVoiceChannelId);
