@@ -822,10 +822,10 @@ async fn ensure_summary_thread(
     existing_thread_id: Option<String>,
 ) -> Result<u64, String> {
     let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
-    if let Some(thread_id) = saved_thread_id {
-        if ChannelId::new(thread_id).to_channel(http).await.is_ok() {
-            return Ok(thread_id);
-        }
+    if let Some(thread_id) = saved_thread_id
+        && ChannelId::new(thread_id).to_channel(http).await.is_ok()
+    {
+        return Ok(thread_id);
     }
     let channel_id = channel_id
         .parse::<u64>()
@@ -835,16 +835,14 @@ async fn ensure_summary_thread(
         .map_err(|err| format!("invalid status message id: {err}"))?;
     let channel = ChannelId::new(channel_id);
     let parent = MessageId::new(message_id);
-    if let Ok(message) = channel.message(http, parent).await {
-        if let Some(thread) = message.thread {
-            if ChannelId::new(thread.id.get())
-                .to_channel(http)
-                .await
-                .is_ok()
-            {
-                return Ok(thread.id.get());
-            }
-        }
+    if let Ok(message) = channel.message(http, parent).await
+        && let Some(thread) = message.thread
+        && ChannelId::new(thread.id.get())
+            .to_channel(http)
+            .await
+            .is_ok()
+    {
+        return Ok(thread.id.get());
     }
     match channel
         .create_thread_from_message(
@@ -858,16 +856,14 @@ async fn ensure_summary_thread(
         Err(create_error) => {
             // Another worker may have created the thread between the lookup and
             // create call. Re-read the parent and use the thread it now points to.
-            if let Ok(message) = channel.message(http, parent).await {
-                if let Some(thread) = message.thread {
-                    if ChannelId::new(thread.id.get())
-                        .to_channel(http)
-                        .await
-                        .is_ok()
-                    {
-                        return Ok(thread.id.get());
-                    }
-                }
+            if let Ok(message) = channel.message(http, parent).await
+                && let Some(thread) = message.thread
+                && ChannelId::new(thread.id.get())
+                    .to_channel(http)
+                    .await
+                    .is_ok()
+            {
+                return Ok(thread.id.get());
             }
             Err(create_error.to_string())
         }
