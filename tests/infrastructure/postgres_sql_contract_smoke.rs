@@ -145,7 +145,7 @@ fn postgres_executor_thread_count() -> Option<usize> {
         entries
             .filter_map(Result::ok)
             .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
-            .filter(|name| name.trim() == "postgres-executor")
+            .filter(|name| name.trim() == "pg-sql-executor")
             .count()
     })
 }

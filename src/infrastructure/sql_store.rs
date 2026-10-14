@@ -2865,7 +2865,7 @@ impl PgSqlExecutor {
         let (requests, receiver) = mpsc::sync_channel(PG_EXECUTOR_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = std::thread::Builder::new()
-            .name("postgres-executor".to_owned())
+            .name("pg-sql-executor".to_owned())
             .spawn(move || pg_executor_worker(conn_str, receiver, ready_tx))
             .map_err(|err| format!("failed to start postgres executor: {err}"))?;
         match ready_rx.recv() {
