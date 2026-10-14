@@ -148,6 +148,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0032_domain_knowledge_summary_approval",
         sql: include_str!("../../migrations/0032_domain_knowledge_summary_approval.sql"),
     },
+    Migration {
+        version: "0033_live_transcription_outbox",
+        sql: include_str!("../../migrations/0033_live_transcription_outbox.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -270,6 +274,8 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0031_meetings_guild_channel_index.sql"),
     "\n",
     include_str!("../../migrations/0032_domain_knowledge_summary_approval.sql"),
+    "\n",
+    include_str!("../../migrations/0033_live_transcription_outbox.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"

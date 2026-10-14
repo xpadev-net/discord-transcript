@@ -318,8 +318,11 @@ fn schema_constrains_transcript_confidence_to_unit_range() {
     assert!(incremental_schema.contains("NOT VALID"));
     assert_eq!(
         MIGRATIONS.last().expect("latest migration").version,
-        "0032_domain_knowledge_summary_approval"
+        "0033_live_transcription_outbox"
     );
+    let live_outbox_migration = MIGRATIONS.last().expect("latest migration");
+    assert!(live_outbox_migration.sql.contains("ADD COLUMN IF NOT EXISTS audio_path TEXT"));
+    assert!(live_outbox_migration.sql.contains("idx_live_transcription_chunks_queued_outbox"));
 }
 
 #[test]
