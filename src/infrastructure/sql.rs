@@ -1753,9 +1753,9 @@ pub const UPSERT_MEETING_SPEAKER_SQL: &str = r#"
 INSERT INTO meeting_speakers (meeting_id, speaker_id, username, nickname, display_name, updated_at)
 VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NOW())
 ON CONFLICT (meeting_id, speaker_id) DO UPDATE SET
-    username = EXCLUDED.username,
-    nickname = EXCLUDED.nickname,
-    display_name = EXCLUDED.display_name,
+    username = COALESCE(EXCLUDED.username, meeting_speakers.username),
+    nickname = COALESCE(EXCLUDED.nickname, meeting_speakers.nickname),
+    display_name = COALESCE(EXCLUDED.display_name, meeting_speakers.display_name),
     updated_at = NOW()
 "#;
 

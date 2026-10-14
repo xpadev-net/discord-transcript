@@ -10094,6 +10094,47 @@ impl ScaffoldHandler {
         profiles
     }
 
+    async fn resolve_and_upsert_live_speaker(
+        &self,
+        http: Arc<Http>,
+        meeting_id: String,
+        speaker_id: String,
+    ) {
+        let Ok(user_id) = speaker_id.parse::<u64>() else {
+            return;
+        };
+        let member = match http.get_member(self.guild_id, UserId::new(user_id)).await {
+            Ok(member) => member,
+            Err(err) => {
+                warn!(
+                    meeting_id = %meeting_id,
+                    speaker_id = %speaker_id,
+                    error = %err,
+                    "failed to fetch member while resolving live speaker"
+                );
+                return;
+            }
+        };
+        let mut service = self.service.lock().await;
+        if let Err(err) = service.store.executor.execute(
+            crate::infrastructure::sql::UPSERT_MEETING_SPEAKER_SQL,
+            &[
+                meeting_id.clone(),
+                speaker_id.clone(),
+                member.user.name,
+                member.nick.unwrap_or_default(),
+                member.user.global_name.unwrap_or_default(),
+            ],
+        ) {
+            warn!(
+                meeting_id = %meeting_id,
+                speaker_id = %speaker_id,
+                error = %err,
+                "failed to upsert live meeting speaker snapshot"
+            );
+        }
+    }
+
     async fn load_guild_and_speakers(
         &self,
         meeting_id: &str,
@@ -10210,6 +10251,15 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                                 );
                             }
                             session.persist_ssrc_mapping(&snapshot_tracker);
+                            let meeting_id = session.meeting_id.clone();
+                            drop(sessions);
+                            let runtime = self.runtime.clone();
+                            let http = Arc::clone(&self.http);
+                            self.runtime.task_tracker.spawn(async move {
+                                runtime
+                                    .resolve_and_upsert_live_speaker(http, meeting_id, user_id_str)
+                                    .await;
+                            });
                         }
                     }
                 }
