@@ -897,13 +897,18 @@ pub(crate) fn durable_s3_audio_source(
             .ok_or_else(|| {
                 WorkerError::Summary("ASR audio artifact disappeared before upload".to_owned())
             })?;
-        match receipt.wait() {
-            UploadReceiptStatus::Durable => true,
-            UploadReceiptStatus::Superseded => false,
-            status => {
+        match receipt.wait_timeout(Duration::from_secs(30)) {
+            Some(UploadReceiptStatus::Durable) => true,
+            Some(UploadReceiptStatus::Superseded) => false,
+            Some(status) => {
                 return Err(WorkerError::Summary(format!(
                     "ASR audio upload did not become durable: {status:?}"
                 )));
+            }
+            None => {
+                return Err(WorkerError::Summary(
+                    "timed out waiting for ASR audio upload durability".to_owned(),
+                ));
             }
         }
     } else {
