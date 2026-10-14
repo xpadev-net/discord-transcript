@@ -1836,7 +1836,7 @@ fn required_bool_column(row: &SqlRow, idx: usize, field: &str) -> Result<bool, S
 fn parse_guild_settings_for_snapshot_row(
     row: &SqlRow,
 ) -> Result<GuildSettingsForSnapshot, StoreError> {
-    if row.len() < 7 {
+    if row.len() < 8 {
         return Err(StoreError::Backend(format!(
             "invalid guild settings snapshot row length: {}",
             row.len()
@@ -1854,6 +1854,7 @@ fn parse_guild_settings_for_snapshot_row(
             "retention_transcript_ttl_days",
         )?,
         summary_enabled: optional_bool_column(row, 6, "summary_enabled")?,
+        summary_in_status_thread: optional_bool_column(row, 7, "summary_in_status_thread")?,
     })
 }
 

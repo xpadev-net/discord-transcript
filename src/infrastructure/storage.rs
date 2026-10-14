@@ -206,6 +206,7 @@ pub struct GuildSettingsForSnapshot {
     pub retention_raw_audio_ttl_days: Option<u32>,
     pub retention_transcript_ttl_days: Option<u32>,
     pub summary_enabled: Option<bool>,
+    pub summary_in_status_thread: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

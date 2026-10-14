@@ -85,9 +85,10 @@ use crate::interfaces::web::{
 use chrono::{DateTime, Utc};
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
-    CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    EditMessage, GatewayIntents, Guild, GuildChannel, GuildId, GuildMemberUpdateEvent, Interaction,
-    Member, Message, PartialGuild, Ready, Role, RoleId, User, UserId, VoiceState,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+    EditInteractionResponse, EditMessage, GatewayIntents, Guild, GuildChannel, GuildId,
+    GuildMemberUpdateEvent, Interaction, Member, Message, PartialGuild, Ready, Role, RoleId, User,
+    UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -7957,8 +7958,18 @@ impl ScaffoldHandler {
                             chunks
                         }
                     };
-                    if let Err(err) =
+                    let post_result = if self.summary_in_status_thread_for_meeting(meeting_id).await {
+                        match self.status_message_metadata(meeting_id).await {
+                            Ok(metadata) => match (metadata.status_message_channel_id, metadata.status_message_id) {
+                                (Some(channel), Some(message)) => post_summary_to_status_thread(&http, channel, message, &chunks).await,
+                                _ => post_summary_to_report_channel(&http, report_channel_id, &chunks).await,
+                            },
+                            Err(err) => Err(err),
+                        }
+                    } else {
                         post_summary_to_report_channel(&http, report_channel_id, &chunks).await
+                    };
+                    if let Err(err) = post_result
                     {
                         let error_message = format!("summary posting failed: {err}");
                         let exhausted = {
@@ -8371,6 +8382,20 @@ impl ScaffoldHandler {
                 metadata.report_channel_id
             )
         })
+    }
+
+    async fn summary_in_status_thread_for_meeting(&self, meeting_id: &str) -> bool {
+        let mut service = self.service.lock().await;
+        let Ok(Some(meeting)) = service.store.get_meeting(meeting_id) else {
+            return false;
+        };
+        service
+            .store
+            .get_guild_settings_for_meeting_snapshot(&meeting.guild_id)
+            .ok()
+            .flatten()
+            .and_then(|settings| settings.summary_in_status_thread)
+            .unwrap_or(false)
     }
 
     async fn load_meeting(&self, meeting_id: &str) -> Result<StoredMeeting, String> {
@@ -11442,6 +11467,39 @@ async fn post_summary_to_report_channel(
         }
         channel
             .say(http, chunk)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn post_summary_to_status_thread(
+    http: &Http,
+    channel_id: String,
+    message_id: String,
+    chunks: &[String],
+) -> Result<(), String> {
+    let channel = ChannelId::new(
+        channel_id
+            .parse::<u64>()
+            .map_err(|err| format!("invalid status channel id: {err}"))?,
+    );
+    let parent = serenity::all::MessageId::new(
+        message_id
+            .parse::<u64>()
+            .map_err(|err| format!("invalid status message id: {err}"))?,
+    );
+    for chunk in chunks {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        channel
+            .send_message(
+                http,
+                CreateMessage::new()
+                    .content(chunk)
+                    .reference_message((channel, parent)),
+            )
             .await
             .map_err(|err| err.to_string())?;
     }

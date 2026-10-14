@@ -321,6 +321,7 @@ async fn run_web_and_gateway(config: AppConfig) -> Result<(), Box<dyn std::error
             )
             .expect("retention_transcript_ttl_days exceeds i32::MAX"),
             summary_enabled: config.summary_enabled,
+            summary_in_status_thread: false,
         },
     );
     let meeting_permission_cache = Arc::clone(&web_state.permission_cache);
@@ -673,27 +674,60 @@ async fn notify_standalone_worker_summary(
         .build();
 
     let chunks = summary_chunks_with_voice_channel_metadata(&meeting, result.output.chunks.clone());
-    post_summary_to_report_channel(&http, report_channel_id, &chunks)
+    let summary_in_status_thread = token_db_client
+        .query_opt(
+            "SELECT summary_in_status_thread FROM guild_settings WHERE guild_id=$1",
+            &[&meeting.guild_id],
+        )
         .await
-        .map_err(WorkerError::Completion)?;
+        .ok()
+        .flatten()
+        .and_then(|row| row.get::<_, Option<bool>>(0))
+        .unwrap_or(false);
+    let thread_parent = if summary_in_status_thread {
+        store
+            .get_status_message_metadata(&meeting.id)
+            .ok()
+            .and_then(|metadata| {
+                Some((
+                    metadata.status_message_channel_id?.parse::<u64>().ok()?,
+                    metadata.status_message_id?.parse::<u64>().ok()?,
+                ))
+            })
+    } else {
+        None
+    };
+    if let Some((thread_channel_id, status_message_id)) = thread_parent {
+        post_summary_to_status_thread(&http, thread_channel_id, status_message_id, &chunks)
+    } else {
+        post_summary_to_report_channel(&http, report_channel_id, &chunks)
+    }
+    .await
+    .map_err(WorkerError::Completion)?;
 
-    let url_notification =
-        if let Some(url) = meeting_url(config.public_base_url.as_deref(), &meeting.id) {
-            let url_msg = format!("詳細はこちら: {url}");
-            match post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await {
-                Ok(()) => SummaryUrlNotification::Posted,
-                Err(err) => {
-                    tracing::warn!(
-                        meeting_id = %meeting.id,
-                        error = %err,
-                        "failed to post meeting URL from standalone worker"
-                    );
-                    SummaryUrlNotification::FailedBestEffort
-                }
-            }
+    let url_notification = if let Some(url) =
+        meeting_url(config.public_base_url.as_deref(), &meeting.id)
+    {
+        let url_msg = format!("詳細はこちら: {url}");
+        let post = if let Some((channel_id, status_message_id)) = thread_parent {
+            post_summary_to_status_thread(&http, channel_id, status_message_id, &[url_msg]).await
         } else {
-            SummaryUrlNotification::NotConfigured
+            post_summary_to_report_channel(&http, report_channel_id, &[url_msg]).await
         };
+        match post {
+            Ok(()) => SummaryUrlNotification::Posted,
+            Err(err) => {
+                tracing::warn!(
+                    meeting_id = %meeting.id,
+                    error = %err,
+                    "failed to post meeting URL from standalone worker"
+                );
+                SummaryUrlNotification::FailedBestEffort
+            }
+        }
+    } else {
+        SummaryUrlNotification::NotConfigured
+    };
 
     let status_notification =
         match upsert_summary_completed_status_message(&http, store, &meeting.id, config).await {
@@ -760,6 +794,31 @@ async fn post_summary_to_report_channel(
         }
         channel
             .say(http, chunk)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn post_summary_to_status_thread(
+    http: &Http,
+    channel_id: u64,
+    status_message_id: u64,
+    chunks: &[String],
+) -> Result<(), String> {
+    let channel = ChannelId::new(channel_id);
+    let parent = serenity::all::MessageId::new(status_message_id);
+    for chunk in chunks {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        channel
+            .send_message(
+                http,
+                serenity::all::CreateMessage::new()
+                    .content(chunk)
+                    .reference_message((channel, parent)),
+            )
             .await
             .map_err(|err| err.to_string())?;
     }
