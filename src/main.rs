@@ -693,21 +693,28 @@ async fn notify_standalone_worker_summary(
                 m.summary_thread_id,
             ))
         }) {
-            Some((status_channel, status_message, existing_thread)) => {
-                let thread_id = ensure_summary_thread(
-                    &http,
-                    &status_channel,
-                    &status_message,
-                    &meeting.id,
-                    existing_thread,
-                )
-                .await
-                .map_err(WorkerError::Completion)?;
-                store
-                    .set_summary_thread_id(&meeting.id, thread_id.to_string())
-                    .map_err(|err| WorkerError::Completion(err.to_string()))?;
-                thread_id
-            }
+            Some((status_channel, status_message, existing_thread)) => match ensure_summary_thread(
+                &http,
+                &status_channel,
+                &status_message,
+                &meeting.id,
+                existing_thread,
+            )
+            .await
+            {
+                Ok(thread_id) => {
+                    if let Err(err) =
+                        store.set_summary_thread_id(&meeting.id, thread_id.to_string())
+                    {
+                        tracing::warn!(meeting_id = %meeting.id, error = %err, "failed to save summary thread id; reusing created thread");
+                    }
+                    thread_id
+                }
+                Err(err) => {
+                    tracing::warn!(meeting_id = %meeting.id, error = %err, "failed to create summary thread; posting to report channel");
+                    report_channel_id
+                }
+            },
             None => report_channel_id,
         }
     } else {

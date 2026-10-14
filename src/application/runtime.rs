@@ -8410,18 +8410,31 @@ impl ScaffoldHandler {
             return Ok(fallback_channel_id);
         };
         if let Some(thread_id) = metadata.summary_thread_id {
-            return thread_id
-                .parse::<u64>()
-                .map_err(|err| format!("invalid summary thread id: {err}"));
+            return Ok(thread_id.parse::<u64>().unwrap_or(fallback_channel_id));
         }
         drop(service);
-        let thread_id =
-            ensure_summary_thread(http, &status_channel, &status_message, meeting_id, None).await?;
+        let thread_id = match ensure_summary_thread(
+            http,
+            &status_channel,
+            &status_message,
+            meeting_id,
+            None,
+        )
+        .await
+        {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                warn!(meeting_id, error = %err, "failed to create summary thread; posting to report channel");
+                return Ok(fallback_channel_id);
+            }
+        };
         let mut service = self.service.lock().await;
-        service
+        if let Err(err) = service
             .store
             .set_summary_thread_id(meeting_id, thread_id.to_string())
-            .map_err(|err| err.to_string())?;
+        {
+            warn!(meeting_id, error = %err, "failed to save summary thread id; reusing created thread");
+        }
         Ok(thread_id)
     }
 
