@@ -86,7 +86,7 @@ use chrono::{DateTime, Utc};
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
     CreateInteractionResponse, CreateInteractionResponseMessage, CreateThread,
-    EditInteractionResponse, EditMessage, GatewayIntents, Guild, GuildChannel, GuildId,
+    EditInteractionResponse, EditMessage, EditThread, GatewayIntents, Guild, GuildChannel, GuildId,
     GuildMemberUpdateEvent, Interaction, Member, Message, MessageId, PartialGuild, Ready, Role,
     RoleId, User, UserId, VoiceState,
 };
@@ -11519,6 +11519,26 @@ async fn post_summary_to_channel(
     post_summary_to_report_channel(http, channel_id, chunks).await
 }
 
+async fn validate_summary_thread(http: &Http, thread_id: u64) -> Result<u64, String> {
+    let channel_id = ChannelId::new(thread_id);
+    let channel = channel_id
+        .to_channel(http)
+        .await
+        .map_err(|err| err.to_string())?
+        .guild()
+        .ok_or_else(|| "summary thread is not a guild channel".to_owned())?;
+    let metadata = channel
+        .thread_metadata
+        .ok_or_else(|| "summary channel is not a thread".to_owned())?;
+    if metadata.archived || metadata.locked {
+        channel_id
+            .edit_thread(http, EditThread::new().archived(false).locked(false))
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(thread_id)
+}
+
 async fn ensure_summary_thread(
     http: &Http,
     channel_id: &str,
@@ -11528,7 +11548,7 @@ async fn ensure_summary_thread(
 ) -> Result<u64, String> {
     let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
     if let Some(thread_id) = saved_thread_id
-        && ChannelId::new(thread_id).to_channel(http).await.is_ok()
+        && let Ok(thread_id) = validate_summary_thread(http, thread_id).await
     {
         return Ok(thread_id);
     }
@@ -11541,12 +11561,9 @@ async fn ensure_summary_thread(
     let channel = ChannelId::new(channel_id);
     if let Ok(message) = channel.message(http, MessageId::new(message_id)).await
         && let Some(thread) = message.thread
-        && ChannelId::new(thread.id.get())
-            .to_channel(http)
-            .await
-            .is_ok()
+        && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
     {
-        return Ok(thread.id.get());
+        return Ok(thread_id);
     }
     match channel
         .create_thread_from_message(
@@ -11560,12 +11577,9 @@ async fn ensure_summary_thread(
         Err(create_error) => {
             if let Ok(message) = channel.message(http, MessageId::new(message_id)).await
                 && let Some(thread) = message.thread
-                && ChannelId::new(thread.id.get())
-                    .to_channel(http)
-                    .await
-                    .is_ok()
+                && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
             {
-                return Ok(thread.id.get());
+                return Ok(thread_id);
             }
             Err(create_error.to_string())
         }

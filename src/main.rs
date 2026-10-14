@@ -28,7 +28,7 @@ use discord_transcript::infrastructure::sql_store::{PgSqlExecutor, SqlJobQueue, 
 use discord_transcript::infrastructure::storage::{MeetingStore, StoredMeeting};
 use discord_transcript::infrastructure::storage_s3::RecordingObjectStore;
 use discord_transcript::interfaces::web;
-use serenity::all::{ChannelId, CreateThread, EditMessage, MessageId};
+use serenity::all::{ChannelId, CreateThread, EditMessage, EditThread, MessageId};
 use serenity::http::Http;
 use std::env;
 use std::path::PathBuf;
@@ -823,7 +823,7 @@ async fn ensure_summary_thread(
 ) -> Result<u64, String> {
     let saved_thread_id = existing_thread_id.and_then(|id| id.parse::<u64>().ok());
     if let Some(thread_id) = saved_thread_id
-        && ChannelId::new(thread_id).to_channel(http).await.is_ok()
+        && let Ok(thread_id) = validate_summary_thread(http, thread_id).await
     {
         return Ok(thread_id);
     }
@@ -837,12 +837,9 @@ async fn ensure_summary_thread(
     let parent = MessageId::new(message_id);
     if let Ok(message) = channel.message(http, parent).await
         && let Some(thread) = message.thread
-        && ChannelId::new(thread.id.get())
-            .to_channel(http)
-            .await
-            .is_ok()
+        && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
     {
-        return Ok(thread.id.get());
+        return Ok(thread_id);
     }
     match channel
         .create_thread_from_message(
@@ -858,16 +855,33 @@ async fn ensure_summary_thread(
             // create call. Re-read the parent and use the thread it now points to.
             if let Ok(message) = channel.message(http, parent).await
                 && let Some(thread) = message.thread
-                && ChannelId::new(thread.id.get())
-                    .to_channel(http)
-                    .await
-                    .is_ok()
+                && let Ok(thread_id) = validate_summary_thread(http, thread.id.get()).await
             {
-                return Ok(thread.id.get());
+                return Ok(thread_id);
             }
             Err(create_error.to_string())
         }
     }
+}
+
+async fn validate_summary_thread(http: &Http, thread_id: u64) -> Result<u64, String> {
+    let channel_id = ChannelId::new(thread_id);
+    let channel = channel_id
+        .to_channel(http)
+        .await
+        .map_err(|err| err.to_string())?
+        .guild()
+        .ok_or_else(|| "summary thread is not a guild channel".to_owned())?;
+    let metadata = channel
+        .thread_metadata
+        .ok_or_else(|| "summary channel is not a thread".to_owned())?;
+    if metadata.archived || metadata.locked {
+        channel_id
+            .edit_thread(http, EditThread::new().archived(false).locked(false))
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(thread_id)
 }
 
 async fn upsert_summary_completed_status_message(
