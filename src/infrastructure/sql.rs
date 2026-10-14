@@ -2107,7 +2107,7 @@ FROM meetings
 WHERE guild_id = $1
   AND ($2::TEXT IS NULL OR voice_channel_id = $2)
   AND ($3::TEXT IS NULL OR (started_at, id) < ($3::TEXT::TIMESTAMPTZ, $4::TEXT))
-ORDER BY started_at DESC, id DESC
+ORDER BY meetings.started_at DESC, meetings.id DESC
 LIMIT $5
 "#;
 
@@ -2151,7 +2151,7 @@ WHERE guild_id = $1
   AND voice_channel_id = ANY($2::TEXT[])
   AND ($3::TEXT IS NULL OR voice_channel_id = $3)
   AND ($4::TEXT IS NULL OR (started_at, id) < ($4::TEXT::TIMESTAMPTZ, $5::TEXT))
-ORDER BY started_at DESC, id DESC
+ORDER BY meetings.started_at DESC, meetings.id DESC
 LIMIT $6
 "#;
 
