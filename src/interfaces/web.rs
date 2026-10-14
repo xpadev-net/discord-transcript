@@ -3999,6 +3999,7 @@ struct GuildSettingsUpdateRequest {
     retention_raw_audio_ttl_days: i32,
     retention_transcript_ttl_days: i32,
     summary_enabled: bool,
+    #[serde(default)]
     summary_in_status_thread: bool,
 }
 
