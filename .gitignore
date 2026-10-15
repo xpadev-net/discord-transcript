@@ -1,4 +1,5 @@
 /target
+/.local/prompt-lab/
 .env
 web/node_modules/
 web/dist/
