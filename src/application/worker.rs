@@ -5,12 +5,14 @@ use crate::application::asr::{AsrPort, S3AudioObjectReference};
 use crate::application::runtime::{has_nonempty_audio_chunk, merge_user_chunks_to_mixdown};
 use crate::application::summary::{
     SpeakerAudioInput, SummaryContextInput, SummaryEngine, SummaryError, SummaryRequest,
-    TranscriptionOutput, build_correction_prompt_with_context, build_summary_prompt_with_context,
-    correct_transcript_with_prompt_and_workdir, ensure_untrusted_agent_workspace_supported,
+    TranscriptionOutput, append_correction_context_from_workspace,
+    build_correction_prompt_with_context, build_summary_prompt_with_context,
+    correct_transcript_with_discord_context, ensure_untrusted_agent_workspace_supported,
     materialize_new_summary_agent_workspace, materialize_or_load_summary_context,
-    persist_correction_prompt_debug_artifact, persist_meeting_title_debug_artifact,
-    persist_pre_correction_transcript_debug_artifact, persist_summary_prompt_debug_artifact,
-    run_transcription_with_s3_sources, write_transcript_files,
+    persist_correction_prompt_debug_artifact, persist_enriched_correction_prompt_debug_artifact,
+    persist_meeting_title_debug_artifact, persist_pre_correction_transcript_debug_artifact,
+    persist_summary_prompt_debug_artifact, run_transcription_with_s3_sources,
+    summary_context_leak_bodies_for_workspace, write_transcript_files,
 };
 use crate::audio::meeting_audio::build_speaker_audio_inputs;
 use crate::domain::confidence::ConfidencePermille;
@@ -1095,12 +1097,31 @@ where
             )
         });
 
-        match correct_transcript_with_prompt_and_workdir(
-            summary_engine,
-            &transcription.transcript_for_summary,
+        let correction_result = match append_correction_context_from_workspace(
             &correction_prompt,
-            Some(request.workspace.root()),
+            &request.workspace,
         ) {
+            Ok(correction_prompt) => {
+                persist_enriched_correction_prompt_debug_artifact(
+                    &request.workspace,
+                    &correction_prompt,
+                );
+                let protected_bodies = summary_context_leak_bodies_for_workspace(
+                    &request.workspace,
+                    &input.summary_context,
+                );
+                correct_transcript_with_discord_context(
+                    summary_engine,
+                    &transcription.transcript_for_summary,
+                    &correction_prompt,
+                    None,
+                    Some(&request.report_channel_id),
+                    &protected_bodies,
+                )
+            }
+            Err(err) => Err(err),
+        };
+        match correction_result {
             Ok(corrected) => TranscriptionOutput {
                 transcript_for_summary: corrected,
                 ..transcription

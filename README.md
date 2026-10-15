@@ -150,6 +150,8 @@ cargo run --release --locked
 - **Guild Members** (agent によるサーバーユーザー検索、一覧、投稿先チャンネルの閲覧者確認。Developer Portal の Privileged Gateway Intents で有効化が必要)
 - **Message Content** (agent のメッセージ検索。Developer Portal の Privileged Gateway Intents で有効化が必要)
 
+native agent は要約時と文字起こし補正時に Discord lookup tools を利用できます。補正では、文字起こしにすでに現れている人名・用語の確認にだけ使い、Discord の内容から発言を補ったり意味を変えたりしないよう制限しています。
+
 ### 必要な Bot Permission
 
 - Connect (ボイスチャンネルへの接続)
