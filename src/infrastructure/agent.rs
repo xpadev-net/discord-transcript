@@ -1488,13 +1488,12 @@ pub enum SummaryClient {
 const DISABLED_SUMMARY_ERROR: &str = "summary harness `native` is selected but provider credentials are missing (expected only when summaries are disabled)";
 
 impl SummaryClient {
-    /// Full-transcript correction remains disabled until its output contract
-    /// names a file. The native agent prompt currently says "output only the transcript"
-    /// rather than naming the output file — keep it disabled until the
-    /// prompt is rewritten for the file contract.
+    /// Native correction returns a bounded, leak-checked response directly,
+    /// without using the summary file output contract.
     pub fn can_run_llm_transcript_correction(&self) -> bool {
         match self {
-            Self::Native(_) | Self::Disabled => false,
+            Self::Native(_) => true,
+            Self::Disabled => false,
         }
     }
 }
