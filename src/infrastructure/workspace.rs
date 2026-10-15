@@ -1,7 +1,6 @@
 use crate::infrastructure::storage_fs::{
     legacy_sanitize_path_component, sanitize_path_component, sanitize_path_component_candidates,
 };
-use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -37,17 +36,10 @@ pub const CONTEXT_SUMMARY_TEMPLATE_FILENAME: &str = "summary_template.txt";
 pub const CONTEXT_LEAK_CHECK_BODIES_FILENAME: &str = "leak_check_bodies.json";
 pub const AGENT_INPUT_DIR: &str = "input";
 pub const AGENT_OUTPUT_DIR: &str = "output";
-pub const AGENT_CURSOR_DIR: &str = ".cursor";
-pub const AGENT_CLAUDE_DIR: &str = ".claude";
 pub const AGENT_WORKSPACE_PARENT_DIR: &str = "agent";
-pub const AGENT_CURSOR_CONFIG_FILENAME: &str = "cli.json";
-pub const AGENT_CLAUDE_SETTINGS_FILENAME: &str = "settings.json";
-pub const AGENT_CLAUDE_MCP_CONFIG_FILENAME: &str = "mcp_servers.json";
-pub const AGENT_OPENCODE_CONFIG_FILENAME: &str = "opencode.json";
 pub const AGENT_SUMMARY_OUTPUT_FILENAME: &str = "summary.md";
-
-#[cfg(unix)]
 const AGENT_CLEANUP_MARKER_FILENAME: &str = ".cleanup-token";
+
 #[cfg(unix)]
 const AGENT_CLEANUP_MARKER_LEN: u64 = 36;
 
@@ -66,7 +58,6 @@ pub struct MeetingWorkspacePaths {
 pub struct AgentWorkspace {
     root: PathBuf,
     expected_output_path: PathBuf,
-    cursor_config_path: PathBuf,
     root_identity: AgentWorkspaceRootIdentity,
     // Held open for the workspace's lifetime: an open directory fd pins the
     // root inode so the filesystem cannot recycle it to a different directory
@@ -125,7 +116,6 @@ pub enum AgentWorkspaceError {
         path: PathBuf,
         source: io::Error,
     },
-    Serialize(serde_json::Error),
 }
 
 impl Display for AgentWorkspaceError {
@@ -164,40 +154,11 @@ impl Display for AgentWorkspaceError {
                     path.display()
                 )
             }
-            Self::Serialize(err) => write!(f, "failed to serialize agent workspace config: {err}"),
         }
     }
 }
 
 impl std::error::Error for AgentWorkspaceError {}
-
-#[derive(Debug, Serialize)]
-struct CursorCliConfig {
-    permissions: CursorPermissions,
-}
-
-#[derive(Debug, Serialize)]
-struct CursorPermissions {
-    allow: Vec<String>,
-    deny: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ClaudeSettingsConfig {
-    permissions: ClaudePermissions,
-    #[serde(rename = "disableAllHooks")]
-    disable_all_hooks: bool,
-    #[serde(rename = "enableAllProjectMcpServers")]
-    enable_all_project_mcp_servers: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ClaudePermissions {
-    allow: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    ask: Vec<String>,
-    deny: Vec<String>,
-}
 
 impl MeetingWorkspaceLayout {
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
@@ -422,10 +383,6 @@ impl AgentWorkspace {
         &self.expected_output_path
     }
 
-    pub fn cursor_config_path(&self) -> &Path {
-        &self.cursor_config_path
-    }
-
     pub fn cleanup(&self) -> Result<(), AgentWorkspaceError> {
         cleanup_agent_workspace_root(&self.root, &self.root_identity, Some(&self.root_handle))
     }
@@ -545,13 +502,9 @@ impl AgentWorkspaceBuilder {
     ) -> Result<AgentWorkspace, AgentWorkspaceError> {
         let input_dir = self.agent_root.join(AGENT_INPUT_DIR);
         let output_dir = self.agent_root.join(AGENT_OUTPUT_DIR);
-        let cursor_dir = self.agent_root.join(AGENT_CURSOR_DIR);
-
         create_agent_dir(&input_dir)?;
         create_agent_dir(&output_dir)?;
-        prepare_cursor_dir_for_config(&agent_root, &cursor_dir)?;
 
-        let mut allowed_reads = Vec::new();
         let mut destinations = HashSet::new();
         for input in &self.inputs {
             let source_metadata = validate_copy_source(&meeting_root, &agent_root, &input.source)?;
@@ -569,7 +522,6 @@ impl AgentWorkspaceBuilder {
                 &input.destination,
                 &source_metadata,
             )?;
-            allowed_reads.push(permission_path(&input.destination));
         }
 
         let expected_output_relative = self
@@ -580,28 +532,10 @@ impl AgentWorkspaceBuilder {
                 reason: "expected output must be inside the agent workspace",
             })?;
         validate_agent_relative_path(expected_output_relative, AGENT_OUTPUT_DIR)?;
-        let cursor_config_path = cursor_dir.join(AGENT_CURSOR_CONFIG_FILENAME);
-        validate_agent_parent_dir(&agent_root, &cursor_config_path)?;
-        write_cursor_config(
-            &self.agent_root,
-            Path::new(AGENT_CURSOR_DIR).join(AGENT_CURSOR_CONFIG_FILENAME),
-            allowed_reads,
-            permission_path(expected_output_relative),
-        )?;
-        write_claude_settings_config(
-            &self.agent_root,
-            Path::new(AGENT_CLAUDE_DIR).join(AGENT_CLAUDE_SETTINGS_FILENAME),
-        )?;
-        write_claude_mcp_config(
-            &self.agent_root,
-            Path::new(AGENT_CLAUDE_DIR).join(AGENT_CLAUDE_MCP_CONFIG_FILENAME),
-        )?;
-        write_opencode_config(&self.agent_root, Path::new(AGENT_OPENCODE_CONFIG_FILENAME))?;
 
         Ok(AgentWorkspace {
             root: self.agent_root,
             expected_output_path: self.expected_output_path,
-            cursor_config_path,
             root_identity,
             root_handle,
             cleanup_on_drop: true,
@@ -867,18 +801,19 @@ fn cleanup_agent_workspace_root(
 
 #[cfg(unix)]
 fn cleanup_marker_relative_path() -> PathBuf {
-    Path::new(AGENT_CURSOR_DIR).join(AGENT_CLEANUP_MARKER_FILENAME)
+    PathBuf::from(AGENT_CLEANUP_MARKER_FILENAME)
 }
 
 #[cfg(unix)]
 fn initialize_cleanup_marker(agent_root: &Path) -> Result<(), AgentWorkspaceError> {
-    create_agent_dir(&agent_root.join(AGENT_CURSOR_DIR))?;
     let marker = uuid::Uuid::new_v4().to_string();
-    write_new_file_no_symlink(
-        agent_root,
-        &cleanup_marker_relative_path(),
-        marker.as_bytes(),
-    )
+    let mut file = create_cleanup_marker_file(agent_root)?;
+    use std::io::Write;
+    file.write_all(marker.as_bytes())
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: agent_root.join(cleanup_marker_relative_path()),
+            source: err,
+        })
 }
 
 #[cfg(not(unix))]
@@ -887,19 +822,36 @@ fn initialize_cleanup_marker(_agent_root: &Path) -> Result<(), AgentWorkspaceErr
 }
 
 #[cfg(unix)]
-fn prepare_cursor_dir_for_config(
-    canonical_agent_root: &Path,
-    cursor_dir: &Path,
-) -> Result<(), AgentWorkspaceError> {
-    validate_agent_dir(canonical_agent_root, cursor_dir)
-}
+fn create_cleanup_marker_file(agent_root: &Path) -> Result<fs::File, AgentWorkspaceError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
 
-#[cfg(not(unix))]
-fn prepare_cursor_dir_for_config(
-    _canonical_agent_root: &Path,
-    cursor_dir: &Path,
-) -> Result<(), AgentWorkspaceError> {
-    create_agent_dir(cursor_dir)
+    let marker_path = agent_root.join(cleanup_marker_relative_path());
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(agent_root)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: agent_root.to_path_buf(),
+            source: err,
+        })?;
+    let name = CString::new(AGENT_CLEANUP_MARKER_FILENAME).expect("constant has no NUL bytes");
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(AgentWorkspaceError::Io {
+            path: marker_path,
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
 #[cfg(unix)]
@@ -1290,183 +1242,8 @@ pub(crate) fn validate_agent_relative_path(
 }
 
 fn validate_agent_writable_path(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
-    if path == Path::new(AGENT_OPENCODE_CONFIG_FILENAME) {
-        return Ok(path.to_path_buf());
-    }
     validate_agent_relative_path(path, AGENT_INPUT_DIR)
         .or_else(|_| validate_agent_relative_path(path, AGENT_OUTPUT_DIR))
-        .or_else(|_| validate_agent_relative_path(path, AGENT_CURSOR_DIR))
-        .or_else(|_| validate_agent_relative_path(path, AGENT_CLAUDE_DIR))
-}
-
-fn permission_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn write_cursor_config(
-    agent_root: &Path,
-    relative_path: impl AsRef<Path>,
-    allowed_reads: Vec<String>,
-    expected_output: String,
-) -> Result<(), AgentWorkspaceError> {
-    let mut allow = allowed_reads
-        .into_iter()
-        .map(|path| format!("Read({path})"))
-        .collect::<Vec<_>>();
-    allow.push(format!("Write({expected_output})"));
-
-    let config = CursorCliConfig {
-        permissions: CursorPermissions {
-            allow,
-            deny: vec![
-                "Read(.env)".to_owned(),
-                cleanup_marker_deny_rule(),
-                "Read(debug/**)".to_owned(),
-                "Read(../**)".to_owned(),
-                "Read(.claude/**)".to_owned(),
-                "Read(opencode.json)".to_owned(),
-                "Write(input/**)".to_owned(),
-                "Write(.cursor/**)".to_owned(),
-                "Write(.claude/**)".to_owned(),
-                "Write(opencode.json)".to_owned(),
-                "Shell(*)".to_owned(),
-            ],
-        },
-    };
-    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
-    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
-}
-
-/// Write Claude Code project settings that keep the harness to a minimal,
-/// file-only toolset. Deny rules cannot be overridden by user-level allow
-/// rules, so dangerous tools stay blocked even when the operator's global
-/// Claude settings would otherwise permit them.
-fn write_claude_settings_config(
-    agent_root: &Path,
-    relative_path: impl AsRef<Path>,
-) -> Result<(), AgentWorkspaceError> {
-    let config = ClaudeSettingsConfig {
-        permissions: ClaudePermissions {
-            allow: vec![
-                format!("Read(./{AGENT_INPUT_DIR}/**)"),
-                format!("Write(./{AGENT_OUTPUT_DIR}/**)"),
-            ],
-            ask: vec!["Glob".to_owned(), "Grep".to_owned()],
-            deny: vec![
-                "Read(../**)".to_owned(),
-                "Read(.env*)".to_owned(),
-                "Read(**/.env*)".to_owned(),
-                format!("Read(./{AGENT_CURSOR_DIR}/**)"),
-                format!("Read(./{AGENT_CLAUDE_DIR}/**)"),
-                format!("Read(./{AGENT_OPENCODE_CONFIG_FILENAME})"),
-                "Write(../**)".to_owned(),
-                format!("Write(./{AGENT_INPUT_DIR}/**)"),
-                format!("Write(./{AGENT_CURSOR_DIR}/**)"),
-                format!("Write(./{AGENT_CLAUDE_DIR}/**)"),
-                format!("Write(./{AGENT_OPENCODE_CONFIG_FILENAME})"),
-                "Edit".to_owned(),
-                "MultiEdit".to_owned(),
-                "NotebookEdit".to_owned(),
-                "Bash".to_owned(),
-                "WebFetch".to_owned(),
-                "WebSearch".to_owned(),
-                "Task".to_owned(),
-            ],
-        },
-        disable_all_hooks: true,
-        enable_all_project_mcp_servers: false,
-    };
-    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
-    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
-}
-
-/// Write an empty Claude MCP config referenced by `--mcp-config` +
-/// `--strict-mcp-config` so no MCP servers from any other scope can load.
-fn write_claude_mcp_config(
-    agent_root: &Path,
-    relative_path: impl AsRef<Path>,
-) -> Result<(), AgentWorkspaceError> {
-    let json = serde_json::to_vec_pretty(&serde_json::json!({ "mcpServers": {} }))
-        .map_err(AgentWorkspaceError::Serialize)?;
-    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
-}
-
-/// Write an OpenCode project config that denies every tool/action by default
-/// and re-allows only the file operations the summarization contract needs
-/// inside the generated workspace. `opencode run` is non-interactive, so
-/// anything not explicitly allowed cannot be approved at runtime.
-fn write_opencode_config(
-    agent_root: &Path,
-    relative_path: impl AsRef<Path>,
-) -> Result<(), AgentWorkspaceError> {
-    let config = serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "permission": {
-            "*": "deny",
-            "read": {
-                "*": "deny",
-                format!("{AGENT_INPUT_DIR}/**"): "allow",
-                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
-            },
-            "glob": "allow",
-            "grep": "allow",
-            "edit": {
-                "*": "deny",
-                format!("{AGENT_OUTPUT_DIR}/**"): "allow",
-            },
-            "bash": "deny",
-            "webfetch": "deny",
-            "task": "deny",
-            "external_directory": "deny",
-            "doom_loop": "deny",
-        },
-    });
-    let json = serde_json::to_vec_pretty(&config).map_err(AgentWorkspaceError::Serialize)?;
-    write_new_file_no_symlink(agent_root, relative_path.as_ref(), &json)
-}
-
-#[cfg(unix)]
-fn cleanup_marker_deny_rule() -> String {
-    format!(
-        "Read({}/{})",
-        AGENT_CURSOR_DIR, AGENT_CLEANUP_MARKER_FILENAME
-    )
-}
-
-#[cfg(not(unix))]
-fn cleanup_marker_deny_rule() -> String {
-    "Read(.cursor/.cleanup-token)".to_owned()
-}
-
-#[cfg(unix)]
-fn write_new_file_no_symlink(
-    agent_root: &Path,
-    relative_path: &Path,
-    bytes: &[u8],
-) -> Result<(), AgentWorkspaceError> {
-    use std::io::Write;
-
-    let mut file = create_new_file_under_agent_root(agent_root, relative_path)?;
-    file.write_all(bytes)
-        .map_err(|err| AgentWorkspaceError::Io {
-            path: agent_root.join(relative_path),
-            source: err,
-        })
-}
-
-#[cfg(not(unix))]
-fn write_new_file_no_symlink(
-    agent_root: &Path,
-    relative_path: &Path,
-    _bytes: &[u8],
-) -> Result<(), AgentWorkspaceError> {
-    Err(AgentWorkspaceError::InvalidPath {
-        path: agent_root.join(relative_path),
-        reason: "agent workspace materialization requires Unix no-follow write support",
-    })
 }
 
 #[cfg(all(test, unix))]
@@ -1482,9 +1259,8 @@ mod tests {
     }
 
     fn write_cleanup_marker(agent_root: &Path, marker: &str) {
-        let cursor_dir = agent_root.join(AGENT_CURSOR_DIR);
-        std::fs::create_dir_all(&cursor_dir).expect("cursor dir");
-        std::fs::write(cursor_dir.join(AGENT_CLEANUP_MARKER_FILENAME), marker)
+        std::fs::create_dir_all(agent_root).expect("agent root");
+        std::fs::write(agent_root.join(AGENT_CLEANUP_MARKER_FILENAME), marker)
             .expect("cleanup marker");
     }
 

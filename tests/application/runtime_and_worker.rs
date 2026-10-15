@@ -80,7 +80,6 @@ fn required_env_values() -> HashMap<String, String> {
     values.insert("DISCORD_TOKEN".to_owned(), "token".to_owned());
     values.insert("DISCORD_GUILD_ID".to_owned(), "guild".to_owned());
     values.insert("WHISPER_ENDPOINT".to_owned(), "http://whisper".to_owned());
-    values.insert("CLAUDE_COMMAND".to_owned(), "claude".to_owned());
     values.insert("DATABASE_URL".to_owned(), "postgres://localhost/db".to_owned());
     values.insert("CHUNK_STORAGE_DIR".to_owned(), "/tmp/chunks".to_owned());
     values
@@ -1035,12 +1034,9 @@ fn ai_memory_agent_workspace_uses_candidate_output_permission() {
             .expect("summary input should exist"),
         "## Summary\nvalidated"
     );
-    let cursor_config = std::fs::read_to_string(agent_workspace.cursor_config_path())
-        .expect("cursor config should exist");
-    assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
-    assert!(cursor_config.contains("Read(input/summary/summary.md)"));
-    assert!(cursor_config.contains("Write(output/ai_memory_candidates.json)"));
-    assert!(!cursor_config.contains("summary_template.txt"));
+    assert!(!agent_root.join(".cursor").exists());
+    assert!(!agent_root.join(".claude").exists());
+    assert!(!agent_root.join("opencode.json").exists());
     assert!(!agent_root.join("input/context/summary_template.txt").exists());
     assert!(!agent_root.join("debug").exists());
     assert!(!agent_root.join("audio").exists());
@@ -1145,7 +1141,6 @@ fn app_config_loads_from_map() {
     // Native is the default harness; without provider settings the
     // summary client reports disabled rather than failing config.
     assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
     assert_eq!(config.database_url, "postgres://localhost/db");
     assert_eq!(config.database_ssl_mode, "disable");
@@ -1279,14 +1274,12 @@ fn app_config_s3_rejects_unknown_backend() {
 #[test]
 fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_settings() {
     let mut values = base_env();
-    values.remove("CLAUDE_COMMAND");
     values.insert("SUMMARY_ENABLED".to_owned(), "false".to_owned());
 
     let config = AppConfig::from_map(&values).expect("config should load");
 
     assert!(!config.summary_enabled);
     assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
 }
 
@@ -1294,7 +1287,6 @@ fn app_config_loads_from_map_when_summary_disabled_without_summary_harness_setti
 fn app_config_web_bot_role_does_not_require_summary_harness_settings() {
     let mut values = required_env_values();
     values.insert("APP_ROLE".to_owned(), "web-bot".to_owned());
-    values.remove("CLAUDE_COMMAND");
 
     let config = AppConfig::from_map(&values).expect("config should load");
 
@@ -1303,7 +1295,6 @@ fn app_config_web_bot_role_does_not_require_summary_harness_settings() {
     assert_eq!(config.discord_guild_id, "guild");
     assert!(config.summary_enabled);
     assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
 }
 
@@ -1427,7 +1418,6 @@ fn app_config_rejects_worker_role_from_env_with_migration_message() {
         .env(CONFIG_FROM_ENV_CHILD, WORKER_ROLE_CONFIG_FROM_ENV_CHILD_VALUE)
         .env("APP_ROLE", "worker")
         .env("WHISPER_ENDPOINT", "http://whisper")
-        .env("CLAUDE_COMMAND", "claude")
         .env("DATABASE_URL", "postgres://localhost/db")
         .env("CHUNK_STORAGE_DIR", "/tmp/chunks")
         .output()
@@ -1457,7 +1447,6 @@ fn app_config_from_env_child_loads_web_bot_role_without_summary_harness_settings
     assert_eq!(config.discord_guild_id, "guild");
     assert!(config.summary_enabled);
     assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
 }
 
@@ -1485,7 +1474,6 @@ fn app_config_from_env_child_loads_summary_disabled_without_summary_harness_sett
 
     assert!(!config.summary_enabled);
     assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
 }
 
@@ -1499,8 +1487,7 @@ fn app_config_rejects_retired_cli_harnesses_with_migration_message() {
         let err = AppConfig::from_map(&values).expect_err("legacy CLI harness should be retired");
         let message = err.to_string();
         assert!(message.contains("SUMMARY_HARNESS"), "{message}");
-        assert!(message.contains("retired"), "{message}");
-        assert!(message.contains("native"), "{message}");
+        assert!(message.contains("removed"), "{message}");
         assert!(message.contains("SUMMARY_PROVIDER"), "{message}");
     }
 }
@@ -1517,8 +1504,8 @@ fn app_config_from_env_child_rejects_retired_cli_harness_before_other_settings()
         Err(err) => err.to_string(),
         Ok(_) => panic!("CLI harness should fail before config loading"),
     };
-    assert!(message.contains("retired"), "{message}");
-    assert!(message.contains("SUMMARY_HARNESS=native"), "{message}");
+    assert!(message.contains("removed"), "{message}");
+    assert!(message.contains("SUMMARY_PROVIDER"), "{message}");
 }
 
 #[test]
@@ -1664,7 +1651,6 @@ fn app_config_defaults_to_native_harness() {
 
     let config = AppConfig::from_map(&values).expect("config should load");
     assert_eq!(config.summary_harness, SummaryHarness::Native);
-    assert_eq!(config.summary_command, "");
     assert_eq!(config.summary_model, "");
     assert_eq!(config.summary_provider, None);
     assert_eq!(config.summary_api_key, None);

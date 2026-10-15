@@ -2417,7 +2417,7 @@ pub fn build_transcription_output(
     })
 }
 
-/// Build the prompt sent to the Claude harness for ASR error correction.
+/// Build the prompt sent to the summary provider for ASR error correction.
 ///
 /// Returns an empty string when the transcript is empty so callers can skip
 /// invoking the LLM entirely. The output is exposed as a debug artifact, so
@@ -2565,7 +2565,7 @@ pub fn append_correction_context_from_workspace(
 /// Apply LLM-based Generative Error Correction to the transcript text.
 ///
 /// This step corrects misrecognized kanji, adds proper punctuation, and
-/// normalizes numbers in the Whisper output using Claude.
+/// normalizes numbers in the Whisper output using the configured model.
 pub fn correct_transcript<C: SummaryEngine>(
     summary_engine: &C,
     transcript: &str,

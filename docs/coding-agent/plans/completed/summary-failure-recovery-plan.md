@@ -50,7 +50,7 @@
   - `src/infrastructure/sql.rs`
 - Existing patterns or references:
   - `origin/master` contains the deployed native agent/provider implementation; local branch source does not.
-  - `docs/coding-agent/plans/active/summary-agent-workspace-plan.md` defines the isolated agent workspace and output contract.
+  - `docs/coding-agent/plans/completed/summary-agent-workspace-plan.md` defines the isolated agent workspace and output contract.
   - OpenCode Go's service error requires `x-opencode-session`; OpenCode documents a stable session identifier per conversation: https://docs.opencode.ai/docs/go/.
   - `docs/coding-agent/rules/{index,common,orchestrator}.md` are absent; lessons log consulted.
 - Design record consulted and deviations from its acceptance:

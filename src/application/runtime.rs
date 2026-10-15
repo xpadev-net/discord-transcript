@@ -3963,7 +3963,6 @@ pub async fn run_bot(
         auto_stop_grace_seconds: config.auto_stop_grace_seconds,
         whisper_endpoint: config.whisper_endpoint.clone(),
         summary_harness: config.summary_harness,
-        summary_command: config.summary_command.clone(),
         summary_model: config.summary_model.clone(),
         summary_provider: config.summary_provider,
         summary_api_key: config.summary_api_key.clone(),
@@ -4257,7 +4256,6 @@ struct ScaffoldHandler {
     auto_stop_grace_seconds: u64,
     whisper_endpoint: String,
     summary_harness: SummaryHarness,
-    summary_command: String,
     summary_model: String,
     summary_provider: Option<SummaryProvider>,
     summary_api_key: Option<String>,
@@ -8671,12 +8669,10 @@ impl ScaffoldHandler {
             .map_err(|err| SummaryJobRunError::Terminal(err.to_string()))?;
         let summary_client = build_summary_client(SummaryClientConfig {
             harness: self.summary_harness,
-            command_path: self.summary_command.clone(),
             model: self.summary_model.clone(),
             provider: self.summary_provider,
             api_key: self.summary_api_key.clone(),
             auth_file: self.summary_auth_file.clone().map(std::path::PathBuf::from),
-            allow_unsafe_agent_harness: false,
             retry_policy: self.integration_retry_policy,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             discord_bot_token: Some(self.discord_bot_token.clone()),
@@ -9850,13 +9846,12 @@ impl ScaffoldHandler {
             }
         };
 
-        // LLM transcript correction uses one large prompt; only stdin-based harnesses (Claude) are safe.
-        // argv-based OpenCode / Cursor would pass the full transcript on the command line.
+        // Transcript correction still uses a free-form text response rather
+        // than the native agent's file output contract, so it remains disabled.
         let corrected_transcript = if !summary_client.can_run_llm_transcript_correction() {
             info!(
                 meeting_id = %claimed_job.meeting_id,
-                harness = %self.summary_harness,
-                "skipping LLM transcript correction (not supported for argv-based summary harness)"
+                "skipping LLM transcript correction (native output contract is not defined for correction)"
             );
             summary_transcript
         } else {
@@ -14415,13 +14410,8 @@ mod status_message_tests {
         // A prompt-injected agent rewriting the cleanup marker must not be
         // able to keep transcript copies on disk: the workspace inode is
         // unchanged, so cleanup still removes it.
-        std::fs::write(
-            agent_root
-                .join(crate::infrastructure::workspace::AGENT_CURSOR_DIR)
-                .join(".cleanup-token"),
-            "tampered-marker",
-        )
-        .expect("tamper cleanup marker");
+        std::fs::write(agent_root.join(".cleanup-token"), "tampered-marker")
+            .expect("tamper cleanup marker");
 
         cleanup_agent_workspace_after_persist("m1", agent_workspace);
 

@@ -70,9 +70,8 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 | `CHUNK_STORAGE_S3_FORCE_PATH_STYLE` | endpoint 指定時 `true`、AWS 時 `false` | path-style (`endpoint/bucket/key`) を強制。多くの S3 互換サービスで必要 |
 | `CHUNK_STORAGE_S3_PRESIGN_TTL_SECONDS` | `900` | 再生用 presigned GET URL の有効秒数（最大 604800） |
 | `AUTO_STOP_GRACE_SECONDS` | `60` | ボイスチャネルが空またはボット切断後に自動停止するまでの猶予秒数 |
-| `SUMMARY_HARNESS` | `native` | `native`（インプロセス agent）のみ対応。旧 `claude` / `cursor_agent` / `opencode` は廃止済みで、設定すると `SUMMARY_HARNESS=native` と `SUMMARY_PROVIDER` への移行案内を出して終了します。 |
-| `SUMMARY_PROVIDER` | 未設定 | `SUMMARY_HARNESS=native` のモデルプロバイダ（`opencode_go` / `chatgpt`） |
-| `OPENCODE_API_KEY` | 未設定 | native の OpenCode Go provider 用 API キー（console.opencode.ai）。`grok*`/`gpt*` 系モデルは `/responses`、その他は `/chat/completions` で呼び出し |
+| `SUMMARY_PROVIDER` | 未設定 | インプロセス要約 agent のモデルプロバイダ（`opencode_go` / `chatgpt`） |
+| `OPENCODE_API_KEY` | 未設定 | OpenCode Go API 用キー（console.opencode.ai）。 |
 | `CHATGPT_AUTH_FILE` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の OAuth クレデンシャルファイル。`auth login-chatgpt` サブコマンドで発行し、利用時に自動 refresh される |
 | `CHATGPT_ACCESS_TOKEN` | 未設定 | `SUMMARY_PROVIDER=chatgpt` の静的アクセストークン（Enterprise 等）。設定時は auth file より優先 |
 | `CHATGPT_ACCOUNT_ID` | 未設定 | `CHATGPT_ACCESS_TOKEN` 使用時の ChatGPT アカウント ID（省略可） |
@@ -82,11 +81,11 @@ SQL ファイルを個別に `psql` で適用する手順は通常の運用手�
 
 要約ジョブは録音・Discord gateway と同一プロセスで処理してください。旧 standalone worker によるプロセス分割はサポートしていません。
 
-> **Note:** native は組み込み tools だけを使い、会議 workspace の `input/` を読み取り、`output/` に書き込みます。パス検証・サイズ上限・出力検証を適用し、任意 shell や環境アクセスは提供しません。旧 CLI harness の実行・認証ディレクトリの mount はサポートしていません。ChatGPT の native provider は `auth login-chatgpt` で OAuth credential を発行するか、`CHATGPT_ACCESS_TOKEN` を設定してください。
+> **Note:** 要約は組み込み tools だけを使い、会議 workspace の `input/` を読み取り、`output/` に書き込みます。パス検証・サイズ上限・出力検証を適用し、任意 shell や外部 coding CLI は起動しません。旧 `SUMMARY_HARNESS` の CLI 値（`claude` / `cursor_agent` / `opencode` / `codex` / `codex_cli`）は設定エラーになります。ChatGPT provider は `auth login-chatgpt` で OAuth credential を発行するか、`CHATGPT_ACCESS_TOKEN` を設定してください。
 
 Compose の `app` は Discord voice (songbird) の UDP 通信のため host network を使います。Web UI は既定で `127.0.0.1` に bind します。外部公開する場合は、リバースプロキシなどの公開経路を決めた上で `WEB_BIND_HOST` を明示的に変更してください。`migrate` は compose network 上の `db:5432` に接続するため host network を使いません。
 
-公開 GHCR イメージには Claude Code / Cursor Agent CLI / OpenCode を同梱しません。native provider を使う場合は、必要な API key または ChatGPT OAuth credential を設定してください。
+要約に必要な provider API key または ChatGPT OAuth credential を設定してください。
 
 ### ワークスペース構造
 

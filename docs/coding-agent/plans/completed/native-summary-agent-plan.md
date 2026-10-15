@@ -1,8 +1,8 @@
 # Plan: Native Summary Agent (ChatGPT subscription / OpenCode Go)
 
-- status: approved
+- status: completed
 - generated: 2026-10-07
-- last_updated: 2026-10-07
+- last_updated: 2026-10-15
 - date_basis: UTC
 - work_type: code
 
@@ -13,6 +13,13 @@
   - **ChatGPT subscription** via "Sign in with ChatGPT" OAuth (the Codex-style auth; upstream `https://chatgpt.com/backend-api/codex/responses`).
   - **OpenCode Go API key** (subscription plan; endpoints under `https://opencode.ai/zen/go/v1/*`, `Authorization: Bearer $OPENCODE_API_KEY`).
 - Preserve the existing agent-workspace contract: the model may only read files under `input/` and write files under `output/`; the app validates the expected output file exactly as today (`read_validated_agent_output`).
+
+## Final implementation status (2026-10-15)
+
+- The deferred CLI removal is complete: subprocess summary clients, CLI command configuration, and Claude/Cursor/OpenCode workspace config generation have been removed.
+- `SUMMARY_HARNESS` accepts only `native`; old CLI values, including `codex` and `codex_cli`, are rejected. The native provider APIs remain available.
+- Workspace creation writes its reserved root-level cleanup marker through a dedicated `openat` path; model-writable paths remain limited to `input/` and `output/`.
+- PR validation passed `cargo check --tests`; cleanup marker regression tests passed after their fixture setup was corrected.
 
 ## Background / Current State
 

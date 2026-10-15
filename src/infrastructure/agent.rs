@@ -1,12 +1,10 @@
 //! Workspace tools for the native in-process summary agent.
 //!
-//! Instead of spawning a coding CLI (`claude`, `opencode`, `cursor-agent`),
-//! the native harness (`SUMMARY_HARNESS=native`) runs the agentic tool-call
-//! loop inside the worker process via `rig`. The model sees exactly three
+//! The summary agent runs its tool-call loop inside the worker process via
+//! `rig`. The model sees exactly three
 //! tools — `list_input_files`, `read_input_file`, `write_output_file` —
 //! scoped to the per-job agent workspace (`input/` read-only, `output/`
-//! write-only), which keeps the deny-by-default posture of the CLI
-//! harnesses without depending on their binaries or config files.
+//! write-only).
 //!
 //! Providers: `opencode_go` (OpenCode Go subscription, API key) and
 //! `chatgpt` (ChatGPT subscription via "Sign in with ChatGPT" OAuth — a
@@ -41,9 +39,7 @@ use crate::application::summary::{
     SummaryError, summary_output_verbatim_leak_in_bodies,
 };
 use crate::bootstrap::config::{SummaryHarness, SummaryProvider};
-use crate::infrastructure::integrations::{
-    HarnessCliSummaryClient, read_validated_agent_output, remove_stale_agent_output,
-};
+use crate::infrastructure::integrations::{read_validated_agent_output, remove_stale_agent_output};
 use crate::infrastructure::retry::{RetryPolicy, retry_with_backoff};
 use crate::infrastructure::workspace::{
     AGENT_INPUT_DIR, AGENT_OUTPUT_DIR, validate_agent_relative_path,
@@ -1111,7 +1107,7 @@ fn opencode_go_route(model: &str) -> CompletionRoute {
     }
 }
 
-/// In-process agent client for `SUMMARY_HARNESS=native`.
+/// In-process summary agent client.
 #[derive(Debug)]
 pub struct NativeAgentSummaryClient {
     pub provider: SummaryProvider,
@@ -1478,14 +1474,12 @@ impl NativeAgentSummaryClient {
     }
 }
 
-/// Runtime-selected summary client: the CLI harnesses, the native agent, or
-/// a placeholder for a native harness selected while summaries are disabled
+/// Runtime-selected summary client: the native agent or a placeholder
 /// (provider credentials are not collected in that state).
 #[derive(Debug)]
 pub enum SummaryClient {
-    Cli(HarnessCliSummaryClient),
     Native(NativeAgentSummaryClient),
-    /// Configured `SUMMARY_HARNESS=native` without provider credentials —
+    /// Native summary without provider credentials —
     /// only possible when the summary runtime is disabled, so every summary
     /// method reports a configuration error rather than running.
     Disabled,
@@ -1494,12 +1488,10 @@ pub enum SummaryClient {
 const DISABLED_SUMMARY_ERROR: &str = "summary harness `native` is selected but provider credentials are missing (expected only when summaries are disabled)";
 
 impl SummaryClient {
-    /// Whether this harness can safely accept a full-transcript correction prompt.
-    /// Native returns the correction directly; CLI harnesses remain
-    /// disabled because they pass the prompt through argv.
+    /// Native correction returns a bounded, leak-checked response directly,
+    /// without using the summary file output contract.
     pub fn can_run_llm_transcript_correction(&self) -> bool {
         match self {
-            Self::Cli(client) => client.can_run_llm_transcript_correction(),
             Self::Native(_) => true,
             Self::Disabled => false,
         }
@@ -1509,7 +1501,6 @@ impl SummaryClient {
 impl SummaryEngine for SummaryClient {
     fn supports_transcript_correction(&self) -> bool {
         match self {
-            Self::Cli(client) => client.supports_transcript_correction(),
             Self::Native(client) => client.supports_transcript_correction(),
             Self::Disabled => false,
         }
@@ -1517,7 +1508,6 @@ impl SummaryEngine for SummaryClient {
 
     fn supports_untrusted_agent_workspace(&self) -> bool {
         match self {
-            Self::Cli(client) => client.supports_untrusted_agent_workspace(),
             Self::Native(client) => client.supports_untrusted_agent_workspace(),
             Self::Disabled => false,
         }
@@ -1525,13 +1515,12 @@ impl SummaryEngine for SummaryClient {
 
     fn summarize(&self, prompt: &str, workdir: Option<&Path>) -> Result<String, SummaryError> {
         match self {
-            Self::Cli(client) => client.summarize(prompt, workdir),
             Self::Native(client) => client.summarize(prompt, workdir),
             Self::Disabled => Err(summary_engine_error(DISABLED_SUMMARY_ERROR)),
         }
     }
 
-    /// Dispatch correction to the configured harness.
+    /// Dispatch correction to the native summary client.
     fn correct_transcript(
         &self,
         prompt: &str,
@@ -1539,7 +1528,6 @@ impl SummaryEngine for SummaryClient {
         discord_report_channel_id: Option<&str>,
     ) -> Result<String, SummaryError> {
         match self {
-            Self::Cli(client) => client.correct_transcript(prompt, workdir, None),
             Self::Native(client) => {
                 client.correct_transcript(prompt, workdir, discord_report_channel_id)
             }
@@ -1554,28 +1542,24 @@ impl SummaryEngine for SummaryClient {
         output: AgentOutputContract,
     ) -> Result<String, SummaryError> {
         match self {
-            Self::Cli(client) => client.summarize_with_output_contract(prompt, workdir, output),
             Self::Native(client) => client.summarize_with_output_contract(prompt, workdir, output),
             Self::Disabled => Err(summary_engine_error(DISABLED_SUMMARY_ERROR)),
         }
     }
 }
 
-/// Everything `build_summary_client` needs, lifted out of the argument
-/// list: the harness picks which variant is constructed; `provider` and
-/// `api_key` are required for `SummaryHarness::Native` when summaries run
+/// Everything `build_summary_client` needs: `provider` and `api_key` are
+/// required for `SummaryHarness::Native` when summaries run
 /// (the config layer enforces that — a missing pair here means summaries
 /// are disabled).
 pub struct SummaryClientConfig {
     pub harness: SummaryHarness,
-    pub command_path: String,
     pub model: String,
     pub provider: Option<SummaryProvider>,
     /// Provider credential. Kept out of Debug output.
     pub api_key: Option<String>,
     /// OAuth credential file for `chatgpt` (`CHATGPT_AUTH_FILE`).
     pub auth_file: Option<PathBuf>,
-    pub allow_unsafe_agent_harness: bool,
     pub retry_policy: RetryPolicy,
     pub command_timeout: Duration,
     pub discord_bot_token: Option<String>,
@@ -1586,22 +1570,17 @@ impl Debug for SummaryClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SummaryClientConfig")
             .field("harness", &self.harness)
-            .field("command_path", &self.command_path)
             .field("model", &self.model)
             .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("auth_file", &self.auth_file)
-            .field(
-                "allow_unsafe_agent_harness",
-                &self.allow_unsafe_agent_harness,
-            )
             .field("retry_policy", &self.retry_policy)
             .field("command_timeout", &self.command_timeout)
             .finish()
     }
 }
 
-/// Build the summary client for the configured harness.
+/// Build the in-process summary client.
 pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient, SummaryError> {
     match config.harness {
         SummaryHarness::Native => {
@@ -1658,14 +1637,6 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
                 Ok(SummaryClient::Disabled)
             }
         }
-        _ => Ok(SummaryClient::Cli(HarnessCliSummaryClient {
-            harness: config.harness,
-            command_path: config.command_path,
-            model: config.model,
-            allow_unsafe_agent_harness: config.allow_unsafe_agent_harness,
-            retry_policy: config.retry_policy,
-            command_timeout: config.command_timeout,
-        })),
     }
 }
 
@@ -2137,15 +2108,13 @@ mod tests {
     }
 
     #[test]
-    fn build_summary_client_dispatches_on_harness() {
+    fn build_summary_client_selects_native_or_disabled() {
         let native = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Native,
-            command_path: String::new(),
             model: "model".to_owned(),
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("key".to_owned()),
             auth_file: None,
-            allow_unsafe_agent_harness: false,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
             discord_bot_token: None,
@@ -2159,12 +2128,10 @@ mod tests {
         // disabled client instead of a startup failure.
         let disabled = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Native,
-            command_path: String::new(),
             model: "model".to_owned(),
             provider: None,
             api_key: Some("key".to_owned()),
             auth_file: None,
-            allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
             discord_bot_token: None,
@@ -2179,12 +2146,10 @@ mod tests {
         // startup-time failure.
         let no_model = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Native,
-            command_path: String::new(),
             model: String::new(),
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("key".to_owned()),
             auth_file: None,
-            allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
             discord_bot_token: None,
@@ -2197,12 +2162,10 @@ mod tests {
         // static access token.
         let chatgpt_oauth = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Native,
-            command_path: String::new(),
             model: "gpt-5.3-codex".to_owned(),
             provider: Some(SummaryProvider::ChatGpt),
             api_key: None,
             auth_file: Some(PathBuf::from("/run/secrets/chatgpt-auth.json")),
-            allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
             discord_bot_token: None,
@@ -2214,12 +2177,10 @@ mod tests {
         // ChatGPT with neither token nor file is partial config.
         let chatgpt_bare = build_summary_client(SummaryClientConfig {
             harness: SummaryHarness::Native,
-            command_path: String::new(),
             model: "gpt-5.3-codex".to_owned(),
             provider: Some(SummaryProvider::ChatGpt),
             api_key: None,
             auth_file: None,
-            allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
             discord_bot_token: None,
@@ -2227,34 +2188,16 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(chatgpt_bare, SummaryClient::Disabled));
-
-        let cli = build_summary_client(SummaryClientConfig {
-            harness: SummaryHarness::Claude,
-            command_path: "/bin/claude".to_owned(),
-            model: "haiku".to_owned(),
-            provider: None,
-            api_key: None,
-            auth_file: None,
-            allow_unsafe_agent_harness: true,
-            retry_policy: RetryPolicy::default(),
-            command_timeout: Duration::from_secs(1),
-            discord_bot_token: None,
-            discord_guild_id: None,
-        })
-        .unwrap();
-        assert!(matches!(cli, SummaryClient::Cli(_)));
     }
 
     #[test]
     fn summary_client_config_debug_redacts_api_key() {
         let config = SummaryClientConfig {
             harness: SummaryHarness::Native,
-            command_path: String::new(),
             model: "model".to_owned(),
             provider: Some(SummaryProvider::OpenCodeGo),
             api_key: Some("super-secret-key".to_owned()),
             auth_file: None,
-            allow_unsafe_agent_harness: true,
             retry_policy: RetryPolicy::default(),
             command_timeout: Duration::from_secs(1),
             discord_bot_token: None,
