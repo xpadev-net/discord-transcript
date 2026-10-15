@@ -1521,7 +1521,7 @@ impl SummaryEngine for SummaryClient {
         }
     }
 
-    /// Dispatch correction to the configured harness.
+    /// Dispatch correction to the native summary client.
     fn correct_transcript(
         &self,
         prompt: &str,
@@ -1529,7 +1529,6 @@ impl SummaryEngine for SummaryClient {
         discord_report_channel_id: Option<&str>,
     ) -> Result<String, SummaryError> {
         match self {
-            Self::Cli(client) => client.correct_transcript(prompt, workdir, None),
             Self::Native(client) => {
                 client.correct_transcript(prompt, workdir, discord_report_channel_id)
             }
