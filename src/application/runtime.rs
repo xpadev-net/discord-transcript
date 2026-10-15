@@ -9851,8 +9851,7 @@ impl ScaffoldHandler {
         let corrected_transcript = if !summary_client.can_run_llm_transcript_correction() {
             info!(
                 meeting_id = %claimed_job.meeting_id,
-                harness = %self.summary_harness,
-                "skipping LLM transcript correction (not supported for argv-based summary harness)"
+                "skipping LLM transcript correction (native output contract is not defined for correction)"
             );
             summary_transcript
         } else {

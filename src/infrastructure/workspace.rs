@@ -807,16 +807,51 @@ fn cleanup_marker_relative_path() -> PathBuf {
 #[cfg(unix)]
 fn initialize_cleanup_marker(agent_root: &Path) -> Result<(), AgentWorkspaceError> {
     let marker = uuid::Uuid::new_v4().to_string();
-    write_new_file_no_symlink(
-        agent_root,
-        &cleanup_marker_relative_path(),
-        marker.as_bytes(),
-    )
+    let mut file = create_cleanup_marker_file(agent_root)?;
+    use std::io::Write;
+    file.write_all(marker.as_bytes())
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: agent_root.join(cleanup_marker_relative_path()),
+            source: err,
+        })
 }
 
 #[cfg(not(unix))]
 fn initialize_cleanup_marker(_agent_root: &Path) -> Result<(), AgentWorkspaceError> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_cleanup_marker_file(agent_root: &Path) -> Result<fs::File, AgentWorkspaceError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let marker_path = agent_root.join(cleanup_marker_relative_path());
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(agent_root)
+        .map_err(|err| AgentWorkspaceError::Io {
+            path: agent_root.to_path_buf(),
+            source: err,
+        })?;
+    let name = CString::new(AGENT_CLEANUP_MARKER_FILENAME).expect("constant has no NUL bytes");
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(AgentWorkspaceError::Io {
+            path: marker_path,
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
 #[cfg(unix)]
@@ -1207,42 +1242,8 @@ pub(crate) fn validate_agent_relative_path(
 }
 
 fn validate_agent_writable_path(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
-    // Workspace materialization writes this reserved marker outside the
-    // model-visible input/output trees. No caller-controlled path reaches
-    // this helper for the marker.
-    if path == Path::new(AGENT_CLEANUP_MARKER_FILENAME) {
-        return Ok(path.to_path_buf());
-    }
     validate_agent_relative_path(path, AGENT_INPUT_DIR)
         .or_else(|_| validate_agent_relative_path(path, AGENT_OUTPUT_DIR))
-}
-
-#[cfg(unix)]
-fn write_new_file_no_symlink(
-    agent_root: &Path,
-    relative_path: &Path,
-    bytes: &[u8],
-) -> Result<(), AgentWorkspaceError> {
-    use std::io::Write;
-
-    let mut file = create_new_file_under_agent_root(agent_root, relative_path)?;
-    file.write_all(bytes)
-        .map_err(|err| AgentWorkspaceError::Io {
-            path: agent_root.join(relative_path),
-            source: err,
-        })
-}
-
-#[cfg(not(unix))]
-fn write_new_file_no_symlink(
-    agent_root: &Path,
-    relative_path: &Path,
-    _bytes: &[u8],
-) -> Result<(), AgentWorkspaceError> {
-    Err(AgentWorkspaceError::InvalidPath {
-        path: agent_root.join(relative_path),
-        reason: "agent workspace materialization requires Unix no-follow write support",
-    })
 }
 
 #[cfg(all(test, unix))]
