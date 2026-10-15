@@ -9880,13 +9880,34 @@ impl ScaffoldHandler {
                         Some(&context_manifest),
                     )
                 });
-            match tokio::task::block_in_place(|| {
-                crate::application::summary::correct_transcript_with_prompt_and_workdir(
-                    &summary_client,
-                    &summary_transcript,
+            match crate::application::summary::append_correction_context_from_workspace(
+                &correction_prompt,
+                &request.workspace,
+            )
+            .and_then(|correction_prompt| {
+                crate::application::summary::persist_enriched_correction_prompt_debug_artifact(
+                    &request.workspace,
                     &correction_prompt,
-                    Some(request.workspace.root()),
-                )
+                );
+                let protected_bodies = retained_summary_context
+                    .as_ref()
+                    .map(|context| {
+                        crate::application::summary::summary_context_leak_bodies_for_workspace(
+                            &request.workspace,
+                            context,
+                        )
+                    })
+                    .unwrap_or_default();
+                tokio::task::block_in_place(|| {
+                    crate::application::summary::correct_transcript_with_discord_context(
+                        &summary_client,
+                        &summary_transcript,
+                        &correction_prompt,
+                        None,
+                        Some(&request.report_channel_id),
+                        &protected_bodies,
+                    )
+                })
             }) {
                 Ok(corrected) => corrected,
                 Err(err) => {

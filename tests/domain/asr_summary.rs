@@ -621,17 +621,16 @@ fn correction_rejects_vc_text_content_changes() {
 }
 
 #[test]
-fn correction_accepts_text_only_changes_and_masks_new_pii() {
+fn correction_rejects_new_unmasked_pii() {
     let original = "[0-1000] alice: contact details";
     let claude = StubClaudeSummaryClient {
         mocked_markdown: "[0-1000] alice: contact alice@example.com".to_owned(),
     };
 
-    let corrected =
-        correct_transcript_with_prompt(&claude, original, "prompt").expect("correction should pass");
+    let err = correct_transcript_with_prompt(&claude, original, "prompt")
+        .expect_err("correction must not introduce unmasked PII");
 
-    assert!(corrected.contains("[EMAIL_1]"));
-    assert!(!corrected.contains("alice@example.com"));
+    assert!(err.to_string().contains("introduced unmasked personal information"));
 }
 
 #[test]
@@ -1244,12 +1243,9 @@ fn materialized_summary_context_manifest_and_prompt_reference_paths_not_bodies()
 
     let correction_prompt =
         build_correction_prompt_with_context("[0-1000] Alice: old codename", Some("en"), Some(&context_manifest));
-    assert!(correction_prompt.contains("context/manifest.json"));
-    assert!(correction_prompt.contains("context/speaker_roster.md"));
-    assert!(correction_prompt.contains("context/domain_knowledge.md"));
-    assert!(correction_prompt.contains("context/user_feedback.md"));
-    assert!(correction_prompt.contains("context/ai_memory.md"));
-    assert!(correction_prompt.contains("context/person_aliases.md"));
+    assert!(correction_prompt.contains("included below as JSON-quoted untrusted data"));
+    assert!(!correction_prompt.contains("context/manifest.json"));
+    assert!(!correction_prompt.contains("context/speaker_roster.md"));
     assert!(correction_prompt.contains("non-authoritative hints"));
     assert!(!correction_prompt.contains(secret_domain_body));
     assert!(!correction_prompt.contains(secret_ai_memory_body));
