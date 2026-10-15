@@ -1207,6 +1207,12 @@ pub(crate) fn validate_agent_relative_path(
 }
 
 fn validate_agent_writable_path(path: &Path) -> Result<PathBuf, AgentWorkspaceError> {
+    // Workspace materialization writes this reserved marker outside the
+    // model-visible input/output trees. No caller-controlled path reaches
+    // this helper for the marker.
+    if path == Path::new(AGENT_CLEANUP_MARKER_FILENAME) {
+        return Ok(path.to_path_buf());
+    }
     validate_agent_relative_path(path, AGENT_INPUT_DIR)
         .or_else(|_| validate_agent_relative_path(path, AGENT_OUTPUT_DIR))
 }
