@@ -96,14 +96,9 @@ impl Display for ChunkStorageBackend {
     }
 }
 
-/// Summary engine selected for app startup. The CLI variants are retained for
-/// the legacy infrastructure adapters, but configuration only accepts native.
+/// The summary engine runs in-process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryHarness {
-    Claude,
-    CursorAgent,
-    OpenCode,
-    /// In-process rig-based agent (`src/infrastructure/agent.rs`); no CLI.
     Native,
 }
 
@@ -112,13 +107,15 @@ impl SummaryHarness {
         let key = "SUMMARY_HARNESS";
         match raw.trim().to_ascii_lowercase().as_str() {
             "native" => Ok(Self::Native),
-            "claude" | "cursor_agent" | "opencode" => Err(ConfigError::InvalidEnv {
-                key,
-                value: format!(
-                    "{} CLI summary harness is retired; unset SUMMARY_HARNESS or set SUMMARY_HARNESS=native and configure SUMMARY_PROVIDER",
-                    raw.trim()
-                ),
-            }),
+            "claude" | "cursor_agent" | "opencode" | "codex" | "codex_cli" => {
+                Err(ConfigError::InvalidEnv {
+                    key,
+                    value: format!(
+                        "{} CLI summary harness has been removed; use SUMMARY_PROVIDER with SUMMARY_MODEL",
+                        raw.trim()
+                    ),
+                })
+            }
             _ => Err(ConfigError::InvalidEnv {
                 key,
                 value: raw.to_owned(),
@@ -128,16 +125,8 @@ impl SummaryHarness {
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Claude => "claude",
-            Self::CursorAgent => "cursor_agent",
-            Self::OpenCode => "opencode",
             Self::Native => "native",
         }
-    }
-
-    /// Whether this harness shells out to a coding CLI (vs the in-process agent).
-    pub const fn is_cli(self) -> bool {
-        !matches!(self, Self::Native)
     }
 }
 
@@ -212,7 +201,6 @@ pub struct AppConfig {
     pub discord_guild_id: String,
     pub whisper_endpoint: String,
     pub summary_harness: SummaryHarness,
-    pub summary_command: String,
     pub summary_model: String,
     /// Provider behind `SUMMARY_HARNESS=native` (`SUMMARY_PROVIDER`).
     pub summary_provider: Option<SummaryProvider>,
@@ -309,24 +297,7 @@ impl AppConfig {
         };
 
         let summary_enabled = optional_env_parse_bool("SUMMARY_ENABLED", true)?;
-        let (summary_command, summary_model) =
-            if summary_enabled && app_role.requires_summary_harness_config() {
-                resolve_summary_settings(
-                    summary_harness,
-                    optional_env("SUMMARY_COMMAND"),
-                    || required_env("CLAUDE_COMMAND"),
-                    optional_env("SUMMARY_MODEL"),
-                    optional_env("CLAUDE_MODEL"),
-                )?
-            } else {
-                disabled_summary_settings(
-                    summary_harness,
-                    optional_env("SUMMARY_COMMAND"),
-                    optional_env("CLAUDE_COMMAND"),
-                    optional_env("SUMMARY_MODEL"),
-                    optional_env("CLAUDE_MODEL"),
-                )
-            };
+        let summary_model = optional_env("SUMMARY_MODEL").unwrap_or_default();
         let (summary_provider, summary_api_key, summary_auth_file) = resolve_summary_provider(
             app_role.requires_summary_harness_config(),
             summary_harness,
@@ -339,7 +310,6 @@ impl AppConfig {
             discord_guild_id,
             whisper_endpoint,
             summary_harness,
-            summary_command,
             summary_model,
             summary_provider,
             summary_api_key,
@@ -442,24 +412,7 @@ impl AppConfig {
         };
 
         let summary_enabled = optional_from_map_parse_bool(values, "SUMMARY_ENABLED", true)?;
-        let (summary_command, summary_model) =
-            if summary_enabled && app_role.requires_summary_harness_config() {
-                resolve_summary_settings(
-                    summary_harness,
-                    optional_from_map(values, "SUMMARY_COMMAND"),
-                    || required_from_map(values, "CLAUDE_COMMAND"),
-                    optional_from_map(values, "SUMMARY_MODEL"),
-                    optional_from_map(values, "CLAUDE_MODEL"),
-                )?
-            } else {
-                disabled_summary_settings(
-                    summary_harness,
-                    optional_from_map(values, "SUMMARY_COMMAND"),
-                    optional_from_map(values, "CLAUDE_COMMAND"),
-                    optional_from_map(values, "SUMMARY_MODEL"),
-                    optional_from_map(values, "CLAUDE_MODEL"),
-                )
-            };
+        let summary_model = optional_from_map(values, "SUMMARY_MODEL").unwrap_or_default();
         let (summary_provider, summary_api_key, summary_auth_file) = resolve_summary_provider(
             app_role.requires_summary_harness_config(),
             summary_harness,
@@ -472,7 +425,6 @@ impl AppConfig {
             discord_guild_id,
             whisper_endpoint,
             summary_harness,
-            summary_command,
             summary_model,
             summary_provider,
             summary_api_key,
@@ -653,53 +605,6 @@ fn parse_database_ssl_mode(value: Option<String>) -> Result<String, ConfigError>
     }
 }
 
-fn resolve_summary_settings(
-    harness: SummaryHarness,
-    summary_command: Option<String>,
-    get_claude_command: impl FnOnce() -> Result<String, ConfigError>,
-    summary_model: Option<String>,
-    claude_model: Option<String>,
-) -> Result<(String, String), ConfigError> {
-    let command = if let Some(c) = summary_command.filter(|s| !s.trim().is_empty()) {
-        c
-    } else if harness == SummaryHarness::Claude {
-        get_claude_command()?
-    } else if harness == SummaryHarness::Native {
-        // The native agent runs in-process; there is no command to resolve.
-        String::new()
-    } else {
-        return Err(ConfigError::MissingEnv {
-            key: "SUMMARY_COMMAND",
-        });
-    };
-
-    let mut model = if matches!(harness, SummaryHarness::OpenCode | SummaryHarness::Native) {
-        summary_model.unwrap_or_default()
-    } else {
-        summary_model.or(claude_model).unwrap_or_default()
-    };
-    if model.trim().is_empty() {
-        model = match harness {
-            SummaryHarness::Claude => "haiku".to_owned(),
-            SummaryHarness::CursorAgent | SummaryHarness::OpenCode | SummaryHarness::Native => {
-                String::new()
-            }
-        };
-    }
-
-    // Only the opencode CLI still requires a model up front. The native
-    // agent treats model like provider credentials: optional-but-preserved,
-    // so an unconfigured worker boots and reports the disabled client per
-    // job instead of failing startup.
-    if harness == SummaryHarness::OpenCode && model.trim().is_empty() {
-        return Err(ConfigError::MissingEnv {
-            key: "SUMMARY_MODEL",
-        });
-    }
-
-    Ok((command, model))
-}
-
 /// Resolve `SUMMARY_PROVIDER` and that provider's credentials for the
 /// native harness: the API key from `<provider>.api_key_env()` and, for
 /// OAuth-backed providers, the credential file from `auth_file_env()`.
@@ -740,35 +645,6 @@ fn resolve_summary_provider(
         .and_then(|provider| provider.auth_file_env())
         .and_then(|env| non_empty(read_env(env)));
     Ok((provider, api_key, auth_file))
-}
-
-fn disabled_summary_settings(
-    harness: SummaryHarness,
-    summary_command: Option<String>,
-    claude_command: Option<String>,
-    summary_model: Option<String>,
-    claude_model: Option<String>,
-) -> (String, String) {
-    let command = summary_command
-        .or_else(|| {
-            if harness == SummaryHarness::Claude {
-                claude_command
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    let mut model = if matches!(harness, SummaryHarness::OpenCode | SummaryHarness::Native) {
-        summary_model.unwrap_or_default()
-    } else {
-        summary_model.or(claude_model).unwrap_or_default()
-    };
-    if model.trim().is_empty() && harness == SummaryHarness::Claude {
-        model = "haiku".to_owned();
-    }
-
-    (command, model)
 }
 
 fn required_env(key: &'static str) -> Result<String, ConfigError> {

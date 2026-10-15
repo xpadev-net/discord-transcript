@@ -1,9 +1,8 @@
 use discord_transcript::application::ai_memory_extraction::materialize_ai_memory_agent_workspace;
 use discord_transcript::application::summary::materialize_summary_agent_workspace;
-use discord_transcript::application::summary::{SummaryRequest, TranscriptManifest};
-use discord_transcript::domain::privacy::MaskingStats;
+use discord_transcript::application::summary::SummaryRequest;
 use discord_transcript::infrastructure::workspace::{
-    AGENT_CURSOR_CONFIG_FILENAME, AGENT_CURSOR_DIR, AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
+    AGENT_INPUT_DIR, AGENT_OUTPUT_DIR,
     AgentWorkspaceBuilder, MeetingWorkspaceLayout,
 };
 use std::path::{Component, Path, PathBuf};
@@ -282,215 +281,8 @@ fn ensure_base_dirs_creates_debug_whisper_dir() {
 
 #[cfg(unix)]
 #[test]
-fn summary_agent_workspace_materializes_only_approved_inputs_and_config() {
+fn summary_agent_workspace_materializes_only_inputs_and_output() {
     let base = unique_temp_dir("summary_agent_workspace");
-    let layout = MeetingWorkspaceLayout::new(&base);
-    let workspace = layout.for_meeting("g", "vc", "m");
-    workspace.ensure_base_dirs().expect("workspace dirs");
-    std::fs::write(workspace.masked_transcript_path(), "masked transcript")
-        .expect("write transcript");
-    let manifest = TranscriptManifest {
-        meeting_id: "m".to_owned(),
-        guild_id: "g".to_owned(),
-        voice_channel_id: "vc".to_owned(),
-        voice_channel_name: None,
-        started_at: None,
-        stopped_at: None,
-        duration_seconds: None,
-        language: Some("en".to_owned()),
-        masked_transcript_path: "transcript/transcript_masked.md".to_owned(),
-        generated_at: "2026-06-07T00:00:00Z".to_owned(),
-        masking_stats: MaskingStats::default(),
-    };
-    std::fs::write(
-        workspace.transcript_manifest_path(),
-        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
-    )
-    .expect("write manifest");
-    std::fs::write(workspace.context_manifest_path(), "{}").expect("write context manifest");
-    std::fs::write(workspace.context_speaker_roster_path(), "# Speakers")
-        .expect("write speaker roster");
-    std::fs::write(workspace.context_summary_template_path(), "template")
-        .expect("write template");
-    std::fs::write(base.join(".env"), "SECRET=1").expect("write env");
-    std::fs::write(workspace.debug_dir().join("summary_prompt.txt"), "debug prompt")
-        .expect("write debug");
-    std::fs::write(workspace.summary_dir().join("summary.md"), "old summary")
-        .expect("write old summary");
-
-    let request = SummaryRequest {
-        meeting_id: "m".to_owned(),
-        guild_id: "g".to_owned(),
-        report_channel_id: "report".to_owned(),
-        voice_channel_id: "vc".to_owned(),
-        voice_channel_name: None,
-        title: None,
-        started_at: None,
-        stopped_at: None,
-        duration_seconds: None,
-        audio_path: String::new(),
-        speaker_audio: Vec::new(),
-        language: Some("en".to_owned()),
-        workspace: workspace.clone(),
-    };
-    let agent_root = workspace.root().join("agent").join("run-1");
-
-    let agent_workspace =
-        materialize_summary_agent_workspace(&request, &agent_root).expect("materialize");
-
-    assert_eq!(agent_workspace.root(), agent_root.as_path());
-    assert_eq!(
-        std::fs::read_to_string(agent_root.join("input/transcript/transcript_masked.md"))
-            .expect("agent transcript"),
-        "masked transcript"
-    );
-    assert!(agent_root.join("input/transcript/manifest.json").is_file());
-    assert!(agent_root.join("input/context/manifest.json").is_file());
-    assert!(agent_root.join("input/context/speaker_roster.md").is_file());
-    assert!(agent_root.join("input/context/summary_template.txt").is_file());
-    assert!(agent_workspace.output_dir().is_dir());
-    assert_eq!(
-        agent_workspace.expected_output_path(),
-        agent_root.join("output/summary.md").as_path()
-    );
-    assert!(agent_workspace.cursor_config_path().is_file());
-    assert!(!agent_root.join(".env").exists());
-    assert!(!agent_root.join("debug").exists());
-    assert!(!agent_root.join("summary").exists());
-    assert!(!agent_root.join("audio").exists());
-
-    let top_level_entries = sorted_relative_files(&agent_root);
-    assert_eq!(
-        top_level_entries,
-        vec![
-            ".claude/mcp_servers.json",
-            ".claude/settings.json",
-            ".cursor/.cleanup-token",
-            ".cursor/cli.json",
-            "input/context/manifest.json",
-            "input/context/speaker_roster.md",
-            "input/context/summary_template.txt",
-            "input/transcript/manifest.json",
-            "input/transcript/transcript_masked.md",
-            "opencode.json",
-        ]
-    );
-
-    let cursor_config = assert_agent_workspace_lockdown_configs(
-        &agent_root,
-        agent_workspace.cursor_config_path(),
-    );
-    assert!(cursor_config.contains("Read(input/transcript/transcript_masked.md)"));
-    assert!(cursor_config.contains("Read(input/context/manifest.json)"));
-    assert!(cursor_config.contains("Write(output/summary.md)"));
-    assert!(!cursor_config.contains(workspace.root().to_string_lossy().as_ref()));
-
-    std::fs::remove_dir_all(&base).ok();
-}
-
-/// Asserts the deny-by-default lockdown config every agent workspace must
-/// materialize: Claude settings deny-list + hook/MCP shutdown, empty MCP
-/// servers, and the opencode permission tree. Returns the cursor cli.json
-/// contents so callers can additionally check harness-specific allow rules.
-fn assert_agent_workspace_lockdown_configs(
-    agent_root: &std::path::Path,
-    cursor_config_path: &std::path::Path,
-) -> String {
-    let claude_settings: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(agent_root.join(".claude/settings.json"))
-            .expect("claude settings"),
-    )
-    .expect("claude settings parses");
-    let claude_permissions = claude_settings["permissions"].as_object().unwrap();
-    assert_eq!(
-        claude_permissions["allow"],
-        serde_json::json!(["Read(./input/**)", "Write(./output/**)"])
-    );
-    let claude_deny = claude_permissions["deny"].as_array().unwrap();
-    for rule in [
-        "Bash",
-        "WebFetch",
-        "WebSearch",
-        "Task",
-        "Edit",
-        "MultiEdit",
-        "NotebookEdit",
-        "Read(../**)",
-        "Read(.env*)",
-        "Read(**/.env*)",
-        "Read(./.cursor/**)",
-        "Read(./.claude/**)",
-        "Read(./opencode.json)",
-        "Write(../**)",
-        "Write(./input/**)",
-        "Write(./.cursor/**)",
-        "Write(./.claude/**)",
-        "Write(./opencode.json)",
-    ] {
-        assert!(
-            claude_deny.iter().any(|entry| entry.as_str() == Some(rule)),
-            "claude deny list must include {rule}: {claude_deny:?}"
-        );
-    }
-    assert_eq!(claude_settings["disableAllHooks"], serde_json::json!(true));
-    assert_eq!(
-        claude_settings["enableAllProjectMcpServers"],
-        serde_json::json!(false)
-    );
-    let claude_mcp: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(agent_root.join(".claude/mcp_servers.json"))
-            .expect("mcp config"),
-    )
-    .expect("mcp config parses");
-    assert!(claude_mcp["mcpServers"].as_object().unwrap().is_empty());
-    let opencode_config: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(agent_root.join("opencode.json")).expect("opencode config"),
-    )
-    .expect("opencode config parses");
-    let permissions = opencode_config["permission"].as_object().unwrap();
-    assert_eq!(permissions["*"], serde_json::json!("deny"));
-    let read_rules = permissions["read"].as_object().unwrap();
-    assert_eq!(read_rules["*"], serde_json::json!("deny"));
-    assert_eq!(read_rules["input/**"], serde_json::json!("allow"));
-    assert_eq!(read_rules["output/**"], serde_json::json!("allow"));
-    let edit_rules = permissions["edit"].as_object().unwrap();
-    assert_eq!(edit_rules["*"], serde_json::json!("deny"));
-    assert_eq!(edit_rules["output/**"], serde_json::json!("allow"));
-    for key in [
-        "bash",
-        "webfetch",
-        "task",
-        "external_directory",
-        "doom_loop",
-    ] {
-        assert_eq!(
-            permissions[key],
-            serde_json::json!("deny"),
-            "{key} must be denied"
-        );
-    }
-    for key in ["read", "glob", "grep"] {
-        assert!(
-            permissions.contains_key(key),
-            "{key} must be present in permission config"
-        );
-    }
-
-    let cursor_config =
-        std::fs::read_to_string(cursor_config_path).expect("cursor config");
-    assert!(cursor_config.contains("Read(.env)"));
-    assert!(cursor_config.contains("Read(.cursor/.cleanup-token)"));
-    assert!(cursor_config.contains("Read(debug/**)"));
-    assert!(cursor_config.contains("Read(../**)"));
-    assert!(cursor_config.contains("Write(input/**)"));
-    assert!(cursor_config.contains("Shell(*)"));
-    cursor_config
-}
-
-#[cfg(unix)]
-#[test]
-fn ai_memory_agent_workspace_materializes_same_lockdown_configs() {
-    let base = unique_temp_dir("ai_memory_agent_workspace");
     let layout = MeetingWorkspaceLayout::new(&base);
     let workspace = layout.for_meeting("g", "vc", "m");
     workspace.ensure_base_dirs().expect("workspace dirs");
@@ -498,48 +290,51 @@ fn ai_memory_agent_workspace_materializes_same_lockdown_configs() {
         .expect("write transcript");
     std::fs::write(workspace.transcript_manifest_path(), "{}").expect("write manifest");
     std::fs::create_dir_all(workspace.summary_dir()).expect("summary dir");
-
     let request = SummaryRequest {
-        meeting_id: "m".to_owned(),
-        guild_id: "g".to_owned(),
-        report_channel_id: "report".to_owned(),
-        voice_channel_id: "vc".to_owned(),
-        voice_channel_name: None,
-        title: None,
-        started_at: None,
-        stopped_at: None,
-        duration_seconds: None,
-        audio_path: String::new(),
-        speaker_audio: Vec::new(),
-        language: Some("en".to_owned()),
-        workspace: workspace.clone(),
+        meeting_id: "m".to_owned(), guild_id: "g".to_owned(),
+        report_channel_id: "report".to_owned(), voice_channel_id: "vc".to_owned(),
+        voice_channel_name: None, title: None, started_at: None, stopped_at: None,
+        duration_seconds: None, audio_path: String::new(), speaker_audio: Vec::new(),
+        language: Some("en".to_owned()), workspace: workspace.clone(),
     };
-    let agent_root = workspace.root().join("agent").join("ai-memory-1");
-
-    let agent_workspace =
-        materialize_ai_memory_agent_workspace(&request, "# summary", &agent_root)
-            .expect("materialize ai memory workspace");
-
-    for lockdown_file in [
-        ".claude/settings.json",
-        ".claude/mcp_servers.json",
-        ".cursor/cli.json",
-        ".cursor/.cleanup-token",
-        "opencode.json",
-    ] {
-        assert!(
-            agent_root.join(lockdown_file).is_file(),
-            "ai memory workspace must materialize {lockdown_file}"
-        );
-    }
+    let agent_root = workspace.root().join("agent/run-1");
+    let agent_workspace = materialize_summary_agent_workspace(&request, &agent_root)
+        .expect("materialize");
+    assert_eq!(agent_workspace.root(), agent_root.as_path());
     assert!(agent_root.join("input/transcript/transcript_masked.md").is_file());
     assert!(agent_workspace.output_dir().is_dir());
-    assert!(agent_workspace.cursor_config_path().is_file());
-    assert_agent_workspace_lockdown_configs(
-        &agent_root,
-        agent_workspace.cursor_config_path(),
-    );
+    assert_eq!(agent_workspace.expected_output_path(), agent_root.join("output/summary.md").as_path());
+    for removed_cli_file in [".claude", ".cursor", "opencode.json"] {
+        assert!(!agent_root.join(removed_cli_file).exists());
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
 
+#[cfg(unix)]
+#[test]
+fn ai_memory_agent_workspace_materializes_without_cli_configs() {
+    let base = unique_temp_dir("ai_memory_agent_workspace");
+    let layout = MeetingWorkspaceLayout::new(&base);
+    let workspace = layout.for_meeting("g", "vc", "m");
+    workspace.ensure_base_dirs().expect("workspace dirs");
+    std::fs::write(workspace.masked_transcript_path(), "masked transcript").expect("transcript");
+    std::fs::write(workspace.transcript_manifest_path(), "{}").expect("manifest");
+    std::fs::create_dir_all(workspace.summary_dir()).expect("summary dir");
+    let request = SummaryRequest {
+        meeting_id: "m".to_owned(), guild_id: "g".to_owned(),
+        report_channel_id: "report".to_owned(), voice_channel_id: "vc".to_owned(),
+        voice_channel_name: None, title: None, started_at: None, stopped_at: None,
+        duration_seconds: None, audio_path: String::new(), speaker_audio: Vec::new(),
+        language: Some("en".to_owned()), workspace: workspace.clone(),
+    };
+    let agent_root = workspace.root().join("agent/ai-memory-1");
+    let agent_workspace = materialize_ai_memory_agent_workspace(&request, "# summary", &agent_root)
+        .expect("materialize ai memory workspace");
+    assert!(agent_workspace.output_dir().is_dir());
+    assert!(agent_root.join("input/transcript/transcript_masked.md").is_file());
+    for removed_cli_file in [".claude", ".cursor", "opencode.json"] {
+        assert!(!agent_root.join(removed_cli_file).exists());
+    }
     std::fs::remove_dir_all(&base).ok();
 }
 
@@ -865,7 +660,7 @@ fn agent_workspace_cleanup_removes_despite_oversized_cleanup_marker() {
         .build()
         .expect("materialize");
     std::fs::write(
-        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        agent_root.join(".cleanup-token"),
         "00000000-0000-0000-0000-000000000000-extra",
     )
     .expect("overwrite cleanup marker");
@@ -897,7 +692,7 @@ fn agent_workspace_cleanup_removes_despite_malformed_cleanup_marker() {
         .build()
         .expect("materialize");
     std::fs::write(
-        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        agent_root.join(".cleanup-token"),
         "00000000-0000-0000-0000-00000000000z",
     )
     .expect("overwrite cleanup marker");
@@ -926,7 +721,7 @@ fn agent_workspace_cleanup_removes_despite_missing_cleanup_marker() {
         .expect("register source")
         .build()
         .expect("materialize");
-    std::fs::remove_file(agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"))
+    std::fs::remove_file(agent_root.join(".cleanup-token"))
         .expect("remove cleanup marker");
 
     agent_workspace
@@ -954,7 +749,7 @@ fn agent_workspace_cleanup_removes_despite_moved_input_dir() {
         .build()
         .expect("materialize");
     std::fs::write(
-        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        agent_root.join(".cleanup-token"),
         "tampered",
     )
     .expect("overwrite cleanup marker");
@@ -991,7 +786,7 @@ fn agent_workspace_cleanup_removes_despite_stripped_skeleton() {
         .build()
         .expect("materialize");
     std::fs::write(
-        agent_root.join(AGENT_CURSOR_DIR).join(".cleanup-token"),
+        agent_root.join(".cleanup-token"),
         "tampered",
     )
     .expect("overwrite cleanup marker");
@@ -1031,38 +826,4 @@ fn agent_workspace_cleanup_missing_root_is_ok() {
     assert!(!agent_root.exists());
     assert!(meeting_root.exists());
     std::fs::remove_dir_all(&base).ok();
-}
-
-fn sorted_relative_files(root: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    collect_relative_files(root, root, &mut files);
-    files.sort();
-    files
-}
-
-fn collect_relative_files(root: &Path, dir: &Path, files: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).expect("read dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.is_dir() {
-            collect_relative_files(root, &path, files);
-        } else {
-            files.push(
-                path.strip_prefix(root)
-                    .expect("relative")
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            );
-        }
-    }
-}
-
-#[test]
-fn agent_workspace_layout_constants_match_expected_boundary() {
-    assert_eq!(AGENT_INPUT_DIR, "input");
-    assert_eq!(AGENT_OUTPUT_DIR, "output");
-    assert_eq!(AGENT_CURSOR_DIR, ".cursor");
-    assert_eq!(AGENT_CURSOR_CONFIG_FILENAME, "cli.json");
 }

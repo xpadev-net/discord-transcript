@@ -530,12 +530,10 @@ async fn run_standalone_worker(config: AppConfig) -> Result<(), Box<dyn std::err
                         };
                         let summary_client = build_summary_client(SummaryClientConfig {
                             harness: config.summary_harness,
-                            command_path: config.summary_command.clone(),
                             model: config.summary_model.clone(),
                             provider: config.summary_provider,
                             api_key: config.summary_api_key.clone(),
                             auth_file: config.summary_auth_file.clone().map(PathBuf::from),
-                            allow_unsafe_agent_harness: false,
                             retry_policy,
                             command_timeout: DEFAULT_COMMAND_TIMEOUT,
                             discord_bot_token,
