@@ -1258,6 +1258,7 @@ mod tests {
     }
 
     fn write_cleanup_marker(agent_root: &Path, marker: &str) {
+        std::fs::create_dir_all(agent_root).expect("agent root");
         std::fs::write(agent_root.join(AGENT_CLEANUP_MARKER_FILENAME), marker)
             .expect("cleanup marker");
     }
