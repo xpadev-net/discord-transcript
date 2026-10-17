@@ -4401,6 +4401,19 @@ impl ScaffoldHandler {
             if row_guild_id != guild_key {
                 continue;
             }
+            if !scheduled_recording_channels_valid(
+                ctx,
+                self.guild_id,
+                creator_id,
+                voice_channel_id,
+                report_channel_id,
+            ) {
+                warn!(
+                    schedule_id,
+                    "scheduled recording channels or permissions are no longer valid"
+                );
+                continue;
+            }
             if count_non_bot_members_in_target_voice(ctx, self.guild_id, voice_channel_id)
                 .unwrap_or(0)
                 < 2
@@ -4415,6 +4428,9 @@ impl ScaffoldHandler {
                     .map_err(|err| err.to_string())?
                     .is_some()
             };
+            if should_skip {
+                continue;
+            }
             let advanced = {
                 let mut service = self.service.lock().await;
                 service.store.executor.execute(
@@ -4422,7 +4438,7 @@ impl ScaffoldHandler {
                     &[schedule_id.clone(), guild_key.clone(), start_at.to_rfc3339()],
                 )?
             };
-            if advanced == 0 || should_skip {
+            if advanced == 0 {
                 continue;
             }
             let meeting_id = format!("scheduled-{}", Uuid::new_v4());
@@ -4447,7 +4463,7 @@ impl ScaffoldHandler {
                         let remaining = (end_at - Utc::now()).to_std().unwrap_or_default();
                         tokio::select! {
                             _ = sleep(remaining) => {
-                                if let Err(err) = handler.stop_recording_for_user(&ctx, handler.guild_id, creator_id.to_string(), UserRole::StartedMeeting, None, StopReason::ScheduledEnd, "scheduled window end").await {
+                                if let Err(err) = handler.stop_recording_for_user(&ctx, handler.guild_id, creator_id.to_string(), UserRole::StartedMeeting, None, Some(meeting_id.clone()), StopReason::ScheduledEnd, "scheduled window end").await {
                                     warn!(meeting_id, error = %err, "scheduled recording end could not stop meeting");
                                 }
                             }
@@ -7770,8 +7786,9 @@ impl ScaffoldHandler {
             false,
         )
         .map_err(|err| err.to_string())?;
-        let inserted = service.store.executor.query_rows(
-            "WITH guild_lock AS MATERIALIZED (SELECT pg_advisory_xact_lock(hashtext($2))), overlaps AS (SELECT EXISTS (SELECT 1 FROM meeting_schedules s, guild_lock WHERE s.guild_id=$2 AND s.active=TRUE AND (((mod(extract(epoch FROM $8::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $8::timestamptz)::bigint,604800)+604800)%604800 < $7))) AS found) INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) SELECT $1,$2,$3,$4,$5,'UTC',$6::time,$7,$8 FROM guild_lock,overlaps WHERE NOT overlaps.found RETURNING id",
+        let inserted = service.store.executor.query_rows_with_advisory_xact_lock(
+            &guild_key,
+            "WITH overlaps AS (SELECT EXISTS (SELECT 1 FROM meeting_schedules s WHERE s.guild_id=$2 AND s.active=TRUE AND (((mod(extract(epoch FROM $8::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $8::timestamptz)::bigint,604800)+604800)%604800 < $7))) AS found) INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) SELECT $1,$2,$3,$4,$5,'UTC',$6::time,$7,$8 FROM overlaps WHERE NOT overlaps.found RETURNING id",
             &[schedule_id.clone(), guild_key.clone(), voice_channel_id.to_string(), command.channel_id.get().to_string(), user_id.to_string(), local_time, duration.to_string(), next_start.clone()],
         )?;
         if inserted.is_empty() {
@@ -7810,8 +7827,9 @@ impl ScaffoldHandler {
             .iter()
             .map(|row| {
                 format!(
-                    "{}: VC {}, {}分",
+                    "{}: {}, VC {}, {}分",
                     row[0].as_deref().unwrap_or("?"),
+                    row[2].as_deref().unwrap_or("?"),
                     row[1].as_deref().unwrap_or("?"),
                     row[3].as_deref().unwrap_or("?").parse::<i64>().unwrap_or(0) / 60
                 )
@@ -8323,6 +8341,7 @@ impl ScaffoldHandler {
             command.user.id.get().to_string(),
             caller_role,
             member_roles,
+            None,
             StopReason::Manual,
             "manual stop",
         )
@@ -8337,6 +8356,7 @@ impl ScaffoldHandler {
         caller_user_id: String,
         caller_role: UserRole,
         member_roles: Option<Vec<String>>,
+        expected_meeting_id: Option<String>,
         reason: StopReason,
         phase: &'static str,
     ) -> Result<String, String> {
@@ -8359,6 +8379,12 @@ impl ScaffoldHandler {
                 .find_active_meeting_by_guild(&guild_key)
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
+            if expected_meeting_id
+                .as_deref()
+                .is_some_and(|expected| expected != meeting.id)
+            {
+                return Err(CommandError::NoActiveMeeting.to_string());
+            }
             let role_grants = match member_roles.as_ref() {
                 Some(member_roles) => service
                     .store
@@ -11869,6 +11895,46 @@ fn count_non_bot_members_in_target_voice(
         }
     }
     Some(non_bot_count)
+}
+
+fn scheduled_recording_channels_valid(
+    ctx: &Context,
+    guild_id: GuildId,
+    creator_id: u64,
+    voice_channel_id: u64,
+    report_channel_id: u64,
+) -> bool {
+    use serenity::all::{ChannelType, Permissions};
+
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return false;
+    };
+    let Some(voice_channel) = guild.channels.get(&ChannelId::new(voice_channel_id)) else {
+        return false;
+    };
+    let Some(report_channel) = guild.channels.get(&ChannelId::new(report_channel_id)) else {
+        return false;
+    };
+    if !matches!(voice_channel.kind, ChannelType::Voice | ChannelType::Stage)
+        || report_channel.kind != ChannelType::Text
+    {
+        return false;
+    }
+    let bot_id = ctx.cache.current_user().id;
+    let Some(bot_member) = guild.members.get(&bot_id) else {
+        return false;
+    };
+    let Some(creator_member) = guild.members.get(&UserId::new(creator_id)) else {
+        return false;
+    };
+    let bot_voice_permissions = guild.user_permissions_in(voice_channel, bot_member);
+    let bot_report_permissions = guild.user_permissions_in(report_channel, bot_member);
+    let creator_voice_permissions = guild.user_permissions_in(voice_channel, creator_member);
+    let creator_report_permissions = guild.user_permissions_in(report_channel, creator_member);
+    bot_voice_permissions.contains(Permissions::CONNECT | Permissions::VIEW_CHANNEL)
+        && bot_report_permissions.contains(Permissions::SEND_MESSAGES | Permissions::VIEW_CHANNEL)
+        && creator_voice_permissions.contains(Permissions::VIEW_CHANNEL)
+        && creator_report_permissions.contains(Permissions::VIEW_CHANNEL)
 }
 
 fn resolve_bot_permissions(

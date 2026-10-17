@@ -456,6 +456,7 @@ pub struct GuildBotTokenRuntimeConfig {
 #[derive(Clone)]
 pub struct WebState {
     pub db: Arc<PgClient>,
+    schedule_write_lock: Arc<Mutex<()>>,
     pub chunk_storage_dir: String,
     pub retention_cleanup_gate: RetentionCleanupGate,
     /// Present iff `CHUNK_STORAGE_BACKEND=s3`: playback endpoints redirect
@@ -510,6 +511,7 @@ impl WebState {
         let summary_job_wakeups = guild_bot_token.summary_job_wakeups;
         Self {
             db,
+            schedule_write_lock: Arc::new(Mutex::new(())),
             chunk_storage_dir,
             recording_objects,
             retention_cleanup_gate,
@@ -933,6 +935,10 @@ pub fn create_router(state: WebState) -> Router {
         .route(
             "/api/guild/schedules",
             get(api_list_guild_schedules).post(api_create_guild_schedule),
+        )
+        .route(
+            "/api/guild/schedule-channels",
+            get(api_list_guild_schedule_channels),
         )
         .route(
             "/api/guild/schedules/{schedule_id}",
@@ -3609,6 +3615,7 @@ struct CurrentUserResponse {
     guild_id: String,
     is_admin: bool,
     can_manage_settings: bool,
+    can_start_recording: bool,
     can_view_admin: bool,
     can_view_usage: bool,
     can_reprocess_meetings: bool,
@@ -7398,6 +7405,7 @@ async fn api_me(
     )
     .await?;
     let can_manage_settings = context.allows(RbacPermission::SettingsManage);
+    let can_start_recording = context.allows(RbacPermission::RecordingStart);
     let can_view_usage = context.allows(RbacPermission::UsageView);
     let can_view_admin = context.allows(RbacPermission::AdminView);
     let can_reprocess_meetings = context.allows(RbacPermission::MeetingReprocess);
@@ -7408,6 +7416,7 @@ async fn api_me(
         guild_id: auth.guild_id.clone(),
         is_admin,
         can_manage_settings,
+        can_start_recording,
         can_view_admin,
         can_view_usage,
         can_reprocess_meetings,
@@ -9398,6 +9407,107 @@ struct GuildScheduleResponse {
     active: bool,
 }
 
+#[derive(Deserialize)]
+struct DiscordGuildScheduleChannel {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    kind: i32,
+    #[serde(default)]
+    permission_overwrites: Vec<DiscordOverwrite>,
+}
+
+#[derive(Debug, Serialize)]
+struct GuildScheduleChannelResponse {
+    id: String,
+    name: String,
+}
+
+async fn visible_guild_schedule_channels(
+    state: &WebState,
+    auth: &AuthConfig,
+    user_id: &str,
+) -> Result<Vec<DiscordGuildScheduleChannel>, StatusCode> {
+    let bot_auth = bot_auth_header_for_guild(state, auth).await?;
+    let (guild_result, channels_result, member_result) = tokio::join!(
+        get_guild_info(state, auth),
+        state
+            .http_client
+            .get(format!(
+                "https://discord.com/api/guilds/{}/channels",
+                auth.guild_id
+            ))
+            .header("Authorization", &bot_auth)
+            .send(),
+        state
+            .http_client
+            .get(format!(
+                "https://discord.com/api/guilds/{}/members/{user_id}",
+                auth.guild_id
+            ))
+            .header("Authorization", &bot_auth)
+            .send(),
+    );
+    let guild = guild_result?;
+    let channels_response = channels_result.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !channels_response.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let channels: Vec<DiscordGuildScheduleChannel> = channels_response
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let member_response = member_result.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !member_response.status().is_success() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let member: DiscordMemberFull = member_response
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(channels
+        .into_iter()
+        .filter(|channel| {
+            compute_channel_permissions(
+                user_id,
+                &guild.owner_id,
+                &auth.guild_id,
+                &member.roles,
+                &guild.roles,
+                &channel.permission_overwrites,
+            ) & VIEW_CHANNEL
+                != 0
+        })
+        .collect())
+}
+
+async fn api_list_guild_schedule_channels(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<Value>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::RecordingStart)
+        .await?;
+    let channels = visible_guild_schedule_channels(&state, auth, &user_id).await?;
+    let mut voice_channels = Vec::new();
+    let mut report_channels = Vec::new();
+    for channel in channels {
+        let response = GuildScheduleChannelResponse {
+            id: channel.id,
+            name: channel.name,
+        };
+        match channel.kind {
+            2 | 13 => voice_channels.push(response),
+            0 => report_channels.push(response),
+            _ => {}
+        }
+    }
+    Ok(Json(json!({
+        "voice_channels": voice_channels,
+        "report_channels": report_channels,
+    })))
+}
+
 async fn api_list_guild_schedules(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
@@ -9418,7 +9528,7 @@ async fn api_list_guild_schedules(
             next_start_at: row.get(3),
             local_start_time: row.get(4),
             timezone: row.get(5),
-            duration_seconds: row.get::<_, i32>(6).max(0) as u32,
+            duration_seconds: u32::try_from(row.get::<_, i64>(6)).unwrap_or(0),
             active: row.get(7),
         })
         .collect();
@@ -9428,6 +9538,7 @@ async fn api_list_guild_schedules(
 async fn api_create_guild_schedule(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
     Json(request): Json<CreateGuildScheduleRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
@@ -9444,43 +9555,104 @@ async fn api_create_guild_schedule(
         Utc::now(),
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
-    if request.voice_channel_id.trim().is_empty()
-        || request.report_channel_id.trim().is_empty()
-        || request.voice_channel_id.len() > 32
-        || request.report_channel_id.len() > 32
+    if !is_discord_snowflake_shaped(&request.voice_channel_id)
+        || !is_discord_snowflake_shaped(&request.report_channel_id)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let schedule_id = Uuid::new_v4().to_string();
-    let duration = i32::try_from(request.duration_seconds).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let start_timestamp = start.to_rfc3339();
-    let inserted = state.db.query_opt(
-        "WITH guild_lock AS MATERIALIZED (SELECT pg_advisory_xact_lock(hashtext($2))), overlaps AS (SELECT EXISTS (SELECT 1 FROM meeting_schedules s, guild_lock WHERE s.guild_id=$2 AND s.active=TRUE AND (((mod(extract(epoch FROM $9::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $9::timestamptz)::bigint,604800)+604800)%604800 < $8))) AS found) INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) SELECT $1,$2,$3,$4,$5,$6,$7::time,$8,$9 FROM guild_lock,overlaps WHERE NOT overlaps.found RETURNING id",
-        &[&schedule_id, &auth.guild_id, &request.voice_channel_id, &request.report_channel_id, &user_id, &request.timezone, &request.local_start_time, &duration, &start_timestamp],
-    ).await.map_err(|err| {
-        if err.code() == Some(&SqlState::INVALID_PARAMETER_VALUE) { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR }
-    })?;
-    if inserted.is_none() {
-        return Err(StatusCode::CONFLICT);
+    let channels = visible_guild_schedule_channels(&state, auth, &user_id).await?;
+    let voice_channel = channels
+        .iter()
+        .find(|channel| channel.id == request.voice_channel_id && matches!(channel.kind, 2 | 13));
+    let report_channel = channels
+        .iter()
+        .find(|channel| channel.id == request.report_channel_id && channel.kind == 0);
+    if voice_channel.is_none() || report_channel.is_none() {
+        return Err(StatusCode::FORBIDDEN);
     }
+    let schedule_id = Uuid::new_v4().to_string();
+    let duration = i64::from(request.duration_seconds);
+    let start_timestamp = start.to_rfc3339();
+    let _local_lock = state.schedule_write_lock.lock().await;
+    state
+        .db
+        .query_one("SELECT pg_advisory_lock(hashtext($1))", &[&auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let create_result = async {
+        let overlaps = state.db.query_one(
+            "SELECT EXISTS (SELECT 1 FROM meeting_schedules s WHERE s.guild_id=$1 AND s.active=TRUE AND (((mod(extract(epoch FROM $2::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $2::timestamptz)::bigint,604800)+604800)%604800 < $3)))",
+            &[&auth.guild_id, &start_timestamp, &duration],
+        ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.get::<_, bool>(0);
+        if overlaps {
+            return Err(StatusCode::CONFLICT);
+        }
+        state.db.execute(
+            "INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) VALUES($1,$2,$3,$4,$5,$6,$7::time,$8,$9)",
+            &[&schedule_id, &auth.guild_id, &request.voice_channel_id, &request.report_channel_id, &user_id, &request.timezone, &request.local_start_time, &duration, &start_timestamp],
+        ).await.map_err(|err| if err.code() == Some(&SqlState::INVALID_PARAMETER_VALUE) { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR })?;
+        Ok::<(), StatusCode>(())
+    }.await;
+    let unlock_result = state
+        .db
+        .query_one("SELECT pg_advisory_unlock(hashtext($1))", &[&auth.guild_id])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    create_result?;
+    unlock_result?;
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id),
+            "meeting_schedule.create",
+            "meeting_schedule",
+            Some(schedule_id.clone()),
+            audit_request_metadata(&headers, "POST", "/api/guild/schedules"),
+            json!({
+                "voice_channel_id": request.voice_channel_id,
+                "report_channel_id": request.report_channel_id,
+                "duration_seconds": request.duration_seconds,
+            }),
+        ),
+    )
+    .await;
     Ok(Json(json!({ "id": schedule_id })))
 }
 
 async fn api_cancel_guild_schedule(
     State(state): State<WebState>,
     Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    headers: HeaderMap,
     Path(schedule_id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::RecordingStart)
         .await?;
-    let changed = state.db.execute(
-        "UPDATE meeting_schedules SET active=FALSE, updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE",
+    let schedule = state.db.query_opt(
+        "UPDATE meeting_schedules SET active=FALSE, updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE RETURNING voice_channel_id,report_channel_id,duration_seconds",
         &[&schedule_id, &auth.guild_id],
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if changed == 0 {
+    let Some(schedule) = schedule else {
         return Err(StatusCode::NOT_FOUND);
-    }
+    };
+    record_audit_event(
+        &state,
+        web_audit_event(
+            Some(auth.guild_id.clone()),
+            Some(user_id),
+            "meeting_schedule.cancel",
+            "meeting_schedule",
+            Some(schedule_id),
+            audit_request_metadata(&headers, "DELETE", "/api/guild/schedules/{schedule_id}"),
+            json!({
+                "voice_channel_id": schedule.get::<_, String>(0),
+                "report_channel_id": schedule.get::<_, String>(1),
+                "duration_seconds": schedule.get::<_, i64>(2),
+            }),
+        ),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14652,6 +14824,7 @@ mod guild_api_tests {
             guild_id: "guild-1".to_owned(),
             is_admin: false,
             can_manage_settings: false,
+            can_start_recording: true,
             can_view_admin: true,
             can_view_usage: false,
             can_reprocess_meetings: false,

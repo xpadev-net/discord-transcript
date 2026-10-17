@@ -85,6 +85,18 @@ pub trait SqlExecutor {
     fn execute(&mut self, sql: &str, params: &[String]) -> Result<u64, String>;
     fn query_active_meeting(&mut self, guild_id: &str) -> Result<Option<StoredMeeting>, String>;
     fn query_rows(&mut self, sql: &str, params: &[String]) -> Result<Vec<SqlRow>, String>;
+    fn query_rows_with_advisory_xact_lock(
+        &mut self,
+        lock_key: &str,
+        sql: &str,
+        params: &[String],
+    ) -> Result<Vec<SqlRow>, String> {
+        self.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            &[lock_key.to_owned()],
+        )?;
+        self.query_rows(sql, params)
+    }
     fn run_migration(&mut self, migration_sql: &str) -> Result<(), String>;
 }
 
@@ -2861,6 +2873,7 @@ enum PgExecutorOperation {
     Execute(String, Vec<String>),
     QueryActiveMeeting(String),
     QueryRows(String, Vec<String>),
+    QueryRowsWithAdvisoryXactLock(String, String, Vec<String>),
     Migration(String),
     Shutdown,
 }
@@ -2969,7 +2982,7 @@ fn pg_executor_worker(
             return;
         }
     };
-    let (client, connection) =
+    let (mut client, connection) =
         match runtime.block_on(tokio_postgres::connect(&connection_str, NoTls)) {
             Ok(connection) => connection,
             Err(error) => {
@@ -3031,6 +3044,34 @@ fn pg_executor_worker(
                     .and_then(|rows| rows.into_iter().map(pg_row_to_optional_strings).collect())
                     .map(PgExecutorResult::Rows)
             }
+            PgExecutorOperation::QueryRowsWithAdvisoryXactLock(lock_key, sql, params) => {
+                let result = async {
+                    let transaction = client
+                        .transaction()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    transaction
+                        .query_one("SELECT pg_advisory_xact_lock(hashtext($1))", &[&lock_key])
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                        .iter()
+                        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+                        .collect();
+                    let rows = transaction
+                        .query(&sql, &bind)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    rows.into_iter()
+                        .map(pg_row_to_optional_strings)
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                runtime.block_on(result).map(PgExecutorResult::Rows)
+            }
             PgExecutorOperation::Migration(sql) => runtime
                 .block_on(client.batch_execute(&sql))
                 .map(|()| PgExecutorResult::Migration)
@@ -3068,6 +3109,24 @@ impl SqlExecutor for PgSqlExecutor {
         ))? {
             PgExecutorResult::Rows(rows) => Ok(rows),
             _ => Err("postgres executor returned an unexpected query response".to_owned()),
+        }
+    }
+
+    fn query_rows_with_advisory_xact_lock(
+        &mut self,
+        lock_key: &str,
+        sql: &str,
+        params: &[String],
+    ) -> Result<Vec<SqlRow>, String> {
+        match self.request(PgExecutorOperation::QueryRowsWithAdvisoryXactLock(
+            lock_key.to_owned(),
+            sql.to_owned(),
+            params.to_vec(),
+        ))? {
+            PgExecutorResult::Rows(rows) => Ok(rows),
+            _ => Err(
+                "postgres executor returned an unexpected transaction query response".to_owned(),
+            ),
         }
     }
 

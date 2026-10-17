@@ -216,6 +216,9 @@ export function App() {
     <>
       <Nav
         canManageSettings={canUseSelectedGuildSettings}
+        canStartRecording={
+          me?.can_start_recording === true && selectedGuildId === me.guild_id
+        }
         canUseAdminViews={canUseCurrentGuildAdminViews}
         canUseUsageAdmin={canUseCurrentGuildUsageAdmin}
         canUseRetentionAdmin={canUseCurrentGuildRetentionAdmin}
@@ -286,7 +289,17 @@ export function App() {
           path="/meetings/:meetingId"
           element={<MeetingPage currentGuildId={me?.guild_id} />}
         />
-        <Route path="/schedules" element={<SchedulesPage />} />
+        <Route
+          path="/schedules"
+          element={
+            me?.can_start_recording === true &&
+            selectedGuildId === me.guild_id ? (
+              <SchedulesPage />
+            ) : (
+              <ForbiddenState message="このギルドの録音開始権限が必要です。" />
+            )
+          }
+        />
         <Route
           path="/admin"
           element={

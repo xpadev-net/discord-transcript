@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS meeting_schedules (
     created_by_user_id TEXT NOT NULL,
     timezone TEXT NOT NULL,
     local_start_time TIME NOT NULL,
-    duration_seconds INTEGER NOT NULL CHECK (duration_seconds BETWEEN 60 AND 86400),
+    duration_seconds BIGINT NOT NULL CHECK (duration_seconds BETWEEN 60 AND 86400),
     next_start_at TIMESTAMPTZ NOT NULL,
     active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

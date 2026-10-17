@@ -16,32 +16,48 @@ type VoiceChannel = { id: string; name: string };
 export function SchedulesPage() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [channels, setChannels] = useState<VoiceChannel[]>([]);
+  const [reportChannels, setReportChannels] = useState<VoiceChannel[]>([]);
   const [voiceChannelId, setVoiceChannelId] = useState("");
   const [reportChannelId, setReportChannelId] = useState("");
   const [startAt, setStartAt] = useState("");
   const [durationHours, setDurationHours] = useState("2");
   const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
-    const [scheduleResponse, channelResponse] = await Promise.all([
-      fetch("/api/guild/schedules"),
-      fetch("/api/guild/meetings"),
-    ]);
-    if (scheduleResponse.ok) {
+    setError("");
+    try {
+      const [scheduleResponse, channelResponse] = await Promise.all([
+        fetch("/api/guild/schedules"),
+        fetch("/api/guild/schedule-channels"),
+      ]);
+      if (!scheduleResponse.ok || !channelResponse.ok) {
+        throw new Error(
+          "録音開始権限とチャンネルへの閲覧権限を確認してください。",
+        );
+      }
       const body = (await scheduleResponse.json()) as { schedules: Schedule[] };
       setSchedules(body.schedules);
-    }
-    if (channelResponse.ok) {
-      const body = (await channelResponse.json()) as {
-        voice_channels?: Array<{ id: string; label: string }>;
+      const channelsBody = (await channelResponse.json()) as {
+        voice_channels?: Array<{ id: string; name: string }>;
+        report_channels?: Array<{ id: string; name: string }>;
       };
-      const available = (body.voice_channels ?? []).map((channel) => ({
+      const available = (channelsBody.voice_channels ?? []).map((channel) => ({
         id: channel.id,
-        name: channel.label,
+        name: channel.name,
       }));
       setChannels(available);
       setVoiceChannelId((current) => current || available[0]?.id || "");
+      const availableReports = channelsBody.report_channels ?? [];
+      setReportChannels(availableReports);
+      setReportChannelId((current) => current || availableReports[0]?.id || "");
+    } catch (loadError) {
+      setError(
+        loadError instanceof Error
+          ? loadError.message
+          : "予約情報を読み込めませんでした。通信状態を確認して再試行してください。",
+      );
     }
   }, []);
 
@@ -53,6 +69,7 @@ export function SchedulesPage() {
     event.preventDefault();
     setBusy(true);
     setMessage("");
+    setError("");
     try {
       const start = new Date(startAt);
       const response = await fetch("/api/guild/schedules", {
@@ -68,10 +85,10 @@ export function SchedulesPage() {
         }),
       });
       if (!response.ok) {
-        setMessage(
+        setError(
           response.status === 409
             ? "同じサーバーに重なる予約があります。"
-            : "予約を作成できませんでした。管理者権限と入力を確認してください。",
+            : "予約を作成できませんでした。録音開始権限と入力を確認してください。",
         );
         return;
       }
@@ -79,21 +96,31 @@ export function SchedulesPage() {
       setMessage("毎週の予約を作成しました。");
       await load();
     } catch {
-      setMessage("予約を作成できませんでした。");
+      setError("予約を作成できませんでした。通信状態を確認してください。");
     } finally {
       setBusy(false);
     }
   }
 
   async function cancelSchedule(id: string) {
-    const response = await fetch(
-      `/api/guild/schedules/${encodeURIComponent(id)}`,
-      { method: "DELETE" },
-    );
-    if (response.ok) {
+    setError("");
+    try {
+      const response = await fetch(
+        `/api/guild/schedules/${encodeURIComponent(id)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) {
+        throw new Error(
+          "予約を取り消せませんでした。録音開始権限を確認してください。",
+        );
+      }
       setSchedules((items) => items.filter((item) => item.id !== id));
-    } else {
-      setMessage("予約を取り消せませんでした。");
+    } catch (cancelError) {
+      setError(
+        cancelError instanceof Error
+          ? cancelError.message
+          : "予約を取り消せませんでした。通信状態を確認してください。",
+      );
     }
   }
 
@@ -109,14 +136,22 @@ export function SchedulesPage() {
         </div>
       </header>
       <section className="settings-section">
-        <h2>予約を追加</h2>
+        <div className="section-heading">
+          <h2>予約を追加</h2>
+          <button type="button" onClick={() => void load()}>
+            一覧を再読み込み
+          </button>
+        </div>
         <form className="settings-form" onSubmit={createSchedule}>
           <label>
             VC
             <select
               required
               value={voiceChannelId}
-              onChange={(event) => setVoiceChannelId(event.target.value)}
+              onChange={(event) => {
+                setError("");
+                setVoiceChannelId(event.target.value);
+              }}
             >
               {channels.map((channel) => (
                 <option key={channel.id} value={channel.id}>
@@ -126,13 +161,21 @@ export function SchedulesPage() {
             </select>
           </label>
           <label>
-            レポート先チャンネルID
-            <input
+            レポート先チャンネル
+            <select
               required
               value={reportChannelId}
-              onChange={(event) => setReportChannelId(event.target.value)}
-              placeholder="DiscordのテキストチャンネルID"
-            />
+              onChange={(event) => {
+                setError("");
+                setReportChannelId(event.target.value);
+              }}
+            >
+              {reportChannels.map((channel) => (
+                <option key={channel.id} value={channel.id}>
+                  {channel.name}
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             最初の開始日時
@@ -140,7 +183,10 @@ export function SchedulesPage() {
               required
               type="datetime-local"
               value={startAt}
-              onChange={(event) => setStartAt(event.target.value)}
+              onChange={(event) => {
+                setError("");
+                setStartAt(event.target.value);
+              }}
             />
           </label>
           <label>
@@ -152,16 +198,25 @@ export function SchedulesPage() {
               max="24"
               step="0.5"
               value={durationHours}
-              onChange={(event) => setDurationHours(event.target.value)}
+              onChange={(event) => {
+                setError("");
+                setDurationHours(event.target.value);
+              }}
             />
           </label>
           <p>
             作成者の端末タイムゾーンで表示します。繰り返し時刻はUTCで固定され、夏時間の補正はありません。
           </p>
-          <button type="submit" disabled={busy || !channels.length || !startAt}>
+          <button
+            type="submit"
+            disabled={
+              busy || !channels.length || !reportChannels.length || !startAt
+            }
+          >
             {busy ? "保存中…" : "毎週の予約を作成"}
           </button>
           {message ? <p role="status">{message}</p> : null}
+          {error ? <p role="alert">{error}</p> : null}
         </form>
       </section>
       <section className="settings-section">
