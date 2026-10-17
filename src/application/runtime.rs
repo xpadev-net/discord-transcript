@@ -84,11 +84,11 @@ use crate::interfaces::web::{
 };
 use chrono::{DateTime, Utc};
 use serenity::all::{
-    ChannelId, CommandDataOptionValue, CommandInteraction, CreateCommand,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateThread,
-    EditInteractionResponse, EditMessage, EditThread, GatewayIntents, Guild, GuildChannel, GuildId,
-    GuildMemberUpdateEvent, Interaction, Member, Message, MessageId, PartialGuild, Ready, Role,
-    RoleId, User, UserId, VoiceState,
+    ChannelId, ChannelType, CommandDataOptionValue, CommandInteraction, CommandOptionType,
+    CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateThread, EditInteractionResponse, EditMessage,
+    EditThread, GatewayIntents, Guild, GuildChannel, GuildId, GuildMemberUpdateEvent, Interaction,
+    Member, Message, MessageId, PartialGuild, Ready, Role, RoleId, User, UserId, VoiceState,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -112,9 +112,13 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 pub const RECORD_START_COMMAND: &str = "record-start";
 pub const RECORD_STOP_COMMAND: &str = "record-stop";
+pub const SCHEDULE_CREATE_COMMAND: &str = "schedule-create";
+pub const SCHEDULE_LIST_COMMAND: &str = "schedule-list";
+pub const SCHEDULE_CANCEL_COMMAND: &str = "schedule-cancel";
 const AUTO_STOP_GRACE_MAX_CACHE_MISS_CHECKS: u32 = 10;
 const DRIVER_DISCONNECT_GRACE_MAX_CACHE_MISS_CHECKS: u32 = 10;
 const RECORDING_STOP_MAX_RETRIES: u32 = 10;
@@ -186,6 +190,18 @@ pub fn slash_command_specs() -> Vec<SlashCommandSpec> {
             name: RECORD_STOP_COMMAND,
             description: "Stop the active recording in this guild",
         },
+        SlashCommandSpec {
+            name: SCHEDULE_CREATE_COMMAND,
+            description: "Create a weekly voice recording schedule",
+        },
+        SlashCommandSpec {
+            name: SCHEDULE_LIST_COMMAND,
+            description: "List active recording schedules",
+        },
+        SlashCommandSpec {
+            name: SCHEDULE_CANCEL_COMMAND,
+            description: "Cancel a recording schedule",
+        },
     ]
 }
 
@@ -195,6 +211,46 @@ pub fn create_serenity_commands() -> Vec<CreateCommand> {
         .map(|spec| match spec.name {
             RECORD_START_COMMAND => CreateCommand::new(spec.name).description(spec.description),
             RECORD_STOP_COMMAND => CreateCommand::new(spec.name).description(spec.description),
+            SCHEDULE_CREATE_COMMAND => CreateCommand::new(spec.name)
+                .description(spec.description)
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Channel,
+                        "voice",
+                        "Voice channel to record",
+                    )
+                    .required(true)
+                    .channel_types(vec![ChannelType::Voice, ChannelType::Stage]),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "start_at",
+                        "First start time in RFC3339 UTC, e.g. 2026-10-20T09:00:00Z",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Integer,
+                        "duration_minutes",
+                        "Recording window length (1-1440 minutes)",
+                    )
+                    .required(true)
+                    .min_int_value(1)
+                    .max_int_value(1440),
+                ),
+            SCHEDULE_CANCEL_COMMAND => CreateCommand::new(spec.name)
+                .description(spec.description)
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "schedule_id",
+                        "Schedule ID",
+                    )
+                    .required(true),
+                ),
+            SCHEDULE_LIST_COMMAND => CreateCommand::new(spec.name).description(spec.description),
             _ => CreateCommand::new(spec.name).description(spec.description),
         })
         .collect()
@@ -3953,6 +4009,7 @@ pub async fn run_bot(
         ssrc_tracker_reset_gate: Arc::new(Mutex::new(())),
         background_spawn_gate: Arc::new(StdMutex::new(())),
         retention_cleanup_loop_started: Arc::new(AtomicBool::new(false)),
+        schedule_loop_started: Arc::new(AtomicBool::new(false)),
         retention_cleanup_gate,
         summary_job_processing_enabled: summary_job_processing_enabled_for_role(config.app_role),
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -4244,6 +4301,7 @@ struct ScaffoldHandler {
     ssrc_tracker_reset_gate: Arc<Mutex<()>>,
     background_spawn_gate: Arc<StdMutex<()>>,
     retention_cleanup_loop_started: Arc<AtomicBool>,
+    schedule_loop_started: Arc<AtomicBool>,
     retention_cleanup_gate: RetentionCleanupGate,
     summary_job_processing_enabled: bool,
     shutting_down: Arc<AtomicBool>,
@@ -4289,6 +4347,136 @@ fn summary_job_processing_enabled_for_role(role: AppRole) -> bool {
 }
 
 impl ScaffoldHandler {
+    async fn run_meeting_schedule_loop(&self, ctx: Context) {
+        loop {
+            if self.shutdown_token.is_cancelled() {
+                break;
+            }
+            if let Err(err) = self.evaluate_meeting_schedules(&ctx).await {
+                warn!(error = %err, "meeting schedule evaluation failed");
+            }
+            tokio::select! {
+                _ = sleep(Duration::from_secs(10)) => {},
+                _ = self.shutdown_token.cancelled() => break,
+            }
+        }
+    }
+
+    async fn evaluate_meeting_schedules(&self, ctx: &Context) -> Result<(), String> {
+        let guild_key = self.guild_id.get().to_string();
+        let rows = {
+            let mut service = self.service.lock().await;
+            service.store.executor.execute(
+                "UPDATE meeting_schedules SET next_start_at = next_start_at + ((floor(extract(epoch FROM (NOW() - (next_start_at + make_interval(secs => duration_seconds)))) / 604800)::integer + 1) * INTERVAL '7 days'), updated_at=NOW() WHERE guild_id=$1 AND active=TRUE AND next_start_at + make_interval(secs => duration_seconds) <= NOW()",
+                std::slice::from_ref(&guild_key),
+            )?;
+            service.store.executor.query_rows(
+                "SELECT id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,to_char(next_start_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),duration_seconds FROM meeting_schedules WHERE guild_id=$1 AND active=TRUE AND next_start_at <= NOW() AND next_start_at + make_interval(secs => duration_seconds) > NOW() ORDER BY next_start_at LIMIT 10",
+                std::slice::from_ref(&guild_key),
+            )?
+        };
+        for row in rows {
+            let value = |index: usize, name: &str| -> Result<String, String> {
+                row.get(index)
+                    .and_then(Clone::clone)
+                    .ok_or_else(|| format!("meeting schedule row missing {name}"))
+            };
+            let schedule_id = value(0, "id")?;
+            let row_guild_id = value(1, "guild_id")?;
+            let voice_channel_id = value(2, "voice_channel_id")?
+                .parse::<u64>()
+                .map_err(|err| format!("invalid scheduled voice channel id: {err}"))?;
+            let report_channel_id = value(3, "report_channel_id")?
+                .parse::<u64>()
+                .map_err(|err| format!("invalid scheduled report channel id: {err}"))?;
+            let creator_id = value(4, "created_by_user_id")?
+                .parse::<u64>()
+                .map_err(|err| format!("invalid schedule creator id: {err}"))?;
+            let start_at = DateTime::parse_from_rfc3339(&value(5, "next_start_at")?)
+                .map_err(|err| format!("invalid schedule timestamp: {err}"))?
+                .with_timezone(&Utc);
+            let duration = value(6, "duration_seconds")?
+                .parse::<i64>()
+                .map_err(|err| format!("invalid schedule duration: {err}"))?;
+            if row_guild_id != guild_key {
+                continue;
+            }
+            if !scheduled_recording_channels_valid(
+                ctx,
+                self.guild_id,
+                creator_id,
+                voice_channel_id,
+                report_channel_id,
+            ) {
+                warn!(
+                    schedule_id,
+                    "scheduled recording channels or permissions are no longer valid"
+                );
+                continue;
+            }
+            if count_non_bot_members_in_target_voice(ctx, self.guild_id, voice_channel_id)
+                .unwrap_or(0)
+                < 2
+            {
+                continue;
+            }
+            let should_skip = {
+                let mut service = self.service.lock().await;
+                service
+                    .store
+                    .find_active_meeting_by_guild(&guild_key)
+                    .map_err(|err| err.to_string())?
+                    .is_some()
+            };
+            if should_skip {
+                continue;
+            }
+            let advanced = {
+                let mut service = self.service.lock().await;
+                service.store.executor.execute(
+                    "UPDATE meeting_schedules SET next_start_at=next_start_at + INTERVAL '7 days', updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE AND next_start_at=$3::timestamptz",
+                    &[schedule_id.clone(), guild_key.clone(), start_at.to_rfc3339()],
+                )?
+            };
+            if advanced == 0 {
+                continue;
+            }
+            let meeting_id = format!("scheduled-{}", Uuid::new_v4());
+            match self
+                .start_recording_in_channel(
+                    ctx,
+                    self.guild_id,
+                    creator_id,
+                    report_channel_id,
+                    meeting_id.clone(),
+                    voice_channel_id,
+                    UserRole::GuildAdmin,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => {
+                    let handler = self.clone();
+                    let ctx = ctx.clone();
+                    let end_at = start_at + chrono::Duration::seconds(duration);
+                    self.spawn_background(async move {
+                        let remaining = (end_at - Utc::now()).to_std().unwrap_or_default();
+                        tokio::select! {
+                            _ = sleep(remaining) => {
+                                if let Err(err) = handler.stop_recording_for_user(&ctx, handler.guild_id, creator_id.to_string(), UserRole::StartedMeeting, None, Some(meeting_id.clone()), StopReason::ScheduledEnd, "scheduled window end").await {
+                                    warn!(meeting_id, error = %err, "scheduled recording end could not stop meeting");
+                                }
+                            }
+                            _ = handler.shutdown_token.cancelled() => {}
+                        }
+                    });
+                }
+                Err(err) => warn!(schedule_id, error = %err, "scheduled recording start failed"),
+            }
+        }
+        Ok(())
+    }
+
     fn whisper_client(
         &self,
         settings: &EffectiveMeetingSettings,
@@ -5148,6 +5336,14 @@ impl EventHandler for ScaffoldHandler {
             .map(|_| ())
         {
             error!(error = %err, "failed to register guild commands");
+        }
+
+        if !self.schedule_loop_started.swap(true, Ordering::AcqRel) {
+            let handler = self.clone();
+            let schedule_ctx = ctx.clone();
+            self.spawn_background(async move {
+                handler.run_meeting_schedule_loop(schedule_ctx).await;
+            });
         }
 
         if try_start_retention_cleanup_loop(&self.retention_cleanup_loop_started) {
@@ -7496,10 +7692,184 @@ impl ScaffoldHandler {
             match command.data.name.as_str() {
                 RECORD_START_COMMAND => self.handle_record_start(ctx, command).await,
                 RECORD_STOP_COMMAND => self.handle_record_stop(ctx, command).await,
+                SCHEDULE_CREATE_COMMAND => self.handle_schedule_create(ctx, command).await,
+                SCHEDULE_LIST_COMMAND => self.handle_schedule_list(ctx, command).await,
+                SCHEDULE_CANCEL_COMMAND => self.handle_schedule_cancel(ctx, command).await,
                 _ => Err("unsupported command".to_owned()),
             }
         })
         .await
+    }
+
+    async fn handle_schedule_create(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+    ) -> Result<String, String> {
+        self.reject_if_shutting_down()?;
+        let get = |name: &str| {
+            command
+                .data
+                .options
+                .iter()
+                .find(|option| option.name == name)
+                .map(|option| &option.value)
+        };
+        let voice_channel_id = match get("voice") {
+            Some(CommandDataOptionValue::Channel(id)) => id.get(),
+            _ => return Err("voice channel is required".to_owned()),
+        };
+        let start_at = match get("start_at") {
+            Some(CommandDataOptionValue::String(value)) => {
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map_err(|_| "start_at must be RFC3339".to_owned())?
+                    .with_timezone(&Utc)
+            }
+            _ => return Err("start_at is required".to_owned()),
+        };
+        let duration = match get("duration_minutes") {
+            Some(CommandDataOptionValue::Integer(value)) if (1..=1440).contains(value) => {
+                (*value as u32) * 60
+            }
+            _ => return Err("duration_minutes must be between 1 and 1440".to_owned()),
+        };
+        let user_id = command.user.id.get();
+        let guild_key = self.guild_id.get().to_string();
+        let caller_role = resolve_command_user_role(
+            ctx,
+            self.guild_id,
+            command.user.id,
+            command.member.as_deref(),
+            &self.bot_admin_user_ids,
+        );
+        let member_roles = resolve_command_member_roles(
+            ctx,
+            self.guild_id,
+            command.user.id,
+            command.member.as_deref(),
+        );
+        let permissions = resolve_bot_permissions(
+            ctx,
+            self.guild_id,
+            Some(voice_channel_id),
+            Some(command.channel_id.get()),
+        );
+        if !permissions.can_connect_voice || !permissions.can_send_messages {
+            return Err("bot needs connect permission in the voice channel and send-message permission in the report channel".to_owned());
+        }
+        let next_start = start_at.to_rfc3339();
+        let schedule_id = Uuid::new_v4().to_string();
+        let local_time = start_at.format("%H:%M").to_string();
+        crate::domain::schedule::validate_schedule_window(
+            "UTC",
+            &local_time,
+            start_at,
+            duration,
+            Utc::now(),
+        )
+        .map_err(str::to_owned)?;
+        let duration = i32::try_from(duration).map_err(|_| "invalid duration".to_owned())?;
+        let mut service = self.service.lock().await;
+        let grants = match member_roles.as_ref() {
+            Some(roles) => service
+                .store
+                .list_rbac_role_grants_for_member_roles(&guild_key, roles)
+                .map_err(|err| err.to_string())?,
+            None => Vec::new(),
+        };
+        authorize_runtime_rbac_permission(
+            RbacPermission::RecordingStart,
+            &guild_key,
+            caller_role,
+            member_roles.as_deref(),
+            &grants,
+            false,
+        )
+        .map_err(|err| err.to_string())?;
+        let inserted = service.store.executor.query_rows_with_advisory_xact_lock(
+            &guild_key,
+            "WITH overlaps AS (SELECT EXISTS (SELECT 1 FROM meeting_schedules s WHERE s.guild_id=$2 AND s.active=TRUE AND (((mod(extract(epoch FROM $8::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $8::timestamptz)::bigint,604800)+604800)%604800 < $7))) AS found) INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) SELECT $1,$2,$3,$4,$5,'UTC',$6::time,$7,$8 FROM overlaps WHERE NOT overlaps.found RETURNING id",
+            &[schedule_id.clone(), guild_key.clone(), voice_channel_id.to_string(), command.channel_id.get().to_string(), user_id.to_string(), local_time, duration.to_string(), next_start.clone()],
+        )?;
+        if inserted.is_empty() {
+            return Err("another schedule overlaps this weekly time window".to_owned());
+        }
+        Ok(format!(
+            "毎週の予約を作成しました: id={schedule_id}, start={next_start}, channel={voice_channel_id}"
+        ))
+    }
+
+    async fn handle_schedule_list(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+    ) -> Result<String, String> {
+        let guild_key = self.guild_id.get().to_string();
+        let user_role = resolve_command_user_role(
+            ctx,
+            self.guild_id,
+            command.user.id,
+            command.member.as_deref(),
+            &self.bot_admin_user_ids,
+        );
+        if !matches!(user_role, UserRole::GuildAdmin | UserRole::BotAdmin) {
+            return Err("schedule list requires guild admin access".to_owned());
+        }
+        let mut service = self.service.lock().await;
+        let rows = service.store.executor.query_rows(
+            "SELECT id,voice_channel_id,to_char(next_start_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),duration_seconds FROM meeting_schedules WHERE guild_id=$1 AND active=TRUE ORDER BY next_start_at LIMIT 20",
+            &[guild_key],
+        )?;
+        if rows.is_empty() {
+            return Ok("有効な予約はありません。".to_owned());
+        }
+        let lines = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}: {}, VC {}, {}分",
+                    row[0].as_deref().unwrap_or("?"),
+                    row[2].as_deref().unwrap_or("?"),
+                    row[1].as_deref().unwrap_or("?"),
+                    row[3].as_deref().unwrap_or("?").parse::<i64>().unwrap_or(0) / 60
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(lines.join("\n"))
+    }
+
+    async fn handle_schedule_cancel(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+    ) -> Result<String, String> {
+        let Some(CommandDataOptionValue::String(schedule_id)) = command
+            .data
+            .options
+            .iter()
+            .find(|option| option.name == "schedule_id")
+            .map(|option| &option.value)
+        else {
+            return Err("schedule_id is required".to_owned());
+        };
+        let guild_key = self.guild_id.get().to_string();
+        let user_id = command.user.id.get().to_string();
+        let caller_role = resolve_command_user_role(
+            ctx,
+            self.guild_id,
+            command.user.id,
+            command.member.as_deref(),
+            &self.bot_admin_user_ids,
+        );
+        let mut service = self.service.lock().await;
+        let changed = service.store.executor.execute(
+            "UPDATE meeting_schedules SET active=FALSE,updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE AND (created_by_user_id=$3 OR $4 IN ('guild_admin','bot_admin'))",
+            &[schedule_id.clone(), guild_key, user_id, (match caller_role { UserRole::GuildAdmin => "guild_admin", UserRole::BotAdmin => "bot_admin", _ => "member" }).to_owned()],
+        )?;
+        if changed == 0 {
+            return Err("schedule not found or you cannot cancel it".to_owned());
+        }
+        Ok(format!("予約を取り消しました: {schedule_id}"))
     }
 
     /// Register voice event handlers on the Call for this guild.
@@ -7537,18 +7907,7 @@ impl ScaffoldHandler {
     ) -> Result<String, String> {
         self.reject_if_shutting_down()?;
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
-        let guild_key = guild_id.get().to_string();
         let voice_channel_id_u64 = resolve_user_voice_channel_id(ctx, guild_id, command.user.id);
-        let voice_channel_name = voice_channel_id_u64
-            .and_then(|channel_id| resolve_voice_channel_name(ctx, guild_id, channel_id));
-
-        let meeting_id = format!("{}-{}", guild_id.get(), command.id.get());
-        let permissions = resolve_bot_permissions(
-            ctx,
-            guild_id,
-            voice_channel_id_u64,
-            Some(command.channel_id.get()),
-        );
         let caller_role = resolve_command_user_role(
             ctx,
             guild_id,
@@ -7560,6 +7919,40 @@ impl ScaffoldHandler {
             resolve_command_member_roles(ctx, guild_id, command.user.id, command.member.as_deref());
         let voice_channel_id_u64 =
             voice_channel_id_u64.ok_or_else(|| CommandError::UserNotInVoice.to_string())?;
+        self.start_recording_in_channel(
+            ctx,
+            guild_id,
+            command.user.id.get(),
+            command.channel_id.get(),
+            format!("{}-{}", guild_id.get(), command.id.get()),
+            voice_channel_id_u64,
+            caller_role,
+            member_roles,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_recording_in_channel(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+        starter_user_id: u64,
+        report_channel_id: u64,
+        meeting_id: String,
+        voice_channel_id_u64: u64,
+        caller_role: UserRole,
+        member_roles: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        self.reject_if_shutting_down()?;
+        let guild_key = guild_id.get().to_string();
+        let voice_channel_name = resolve_voice_channel_name(ctx, guild_id, voice_channel_id_u64);
+        let permissions = resolve_bot_permissions(
+            ctx,
+            guild_id,
+            Some(voice_channel_id_u64),
+            Some(report_channel_id),
+        );
 
         let command_guard = self.command_gate.write().await;
         self.reject_if_shutting_down()?;
@@ -7599,8 +7992,8 @@ impl ScaffoldHandler {
                 &RecordStartRequest {
                     meeting_id: meeting_id.clone(),
                     guild_id: guild_key.clone(),
-                    started_by_user_id: command.user.id.get().to_string(),
-                    command_channel_id: command.channel_id.get().to_string(),
+                    started_by_user_id: starter_user_id.to_string(),
+                    command_channel_id: report_channel_id.to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
                     user_voice_channel_name: voice_channel_name.clone(),
                     permissions,
@@ -7621,8 +8014,8 @@ impl ScaffoldHandler {
                 StartCommandInput {
                     meeting_id: meeting_id.clone(),
                     guild_id: guild_key.clone(),
-                    user_id: command.user.id.get().to_string(),
-                    command_channel_id: command.channel_id.get().to_string(),
+                    user_id: starter_user_id.to_string(),
+                    command_channel_id: report_channel_id.to_string(),
                     user_voice_channel_id: Some(voice_channel_id_u64.to_string()),
                     user_voice_channel_name: voice_channel_name,
                     permissions,
@@ -7907,7 +8300,7 @@ impl ScaffoldHandler {
                 &meeting_id,
                 StatusMessageUpdate::RecordingStarted {
                     voice_channel_id: voice_channel_id_u64,
-                    report_channel_id: command.channel_id.get(),
+                    report_channel_id,
                 },
             )
             .await;
@@ -7933,7 +8326,6 @@ impl ScaffoldHandler {
     ) -> Result<String, String> {
         self.reject_if_shutting_down()?;
         let guild_id = validate_command_guild(command.guild_id, self.guild_id)?;
-        let guild_key = guild_id.get().to_string();
         let caller_role = resolve_command_user_role(
             ctx,
             guild_id,
@@ -7943,7 +8335,33 @@ impl ScaffoldHandler {
         );
         let member_roles =
             resolve_command_member_roles(ctx, guild_id, command.user.id, command.member.as_deref());
-        let caller_user_id = command.user.id.get().to_string();
+        self.stop_recording_for_user(
+            ctx,
+            guild_id,
+            command.user.id.get().to_string(),
+            caller_role,
+            member_roles,
+            None,
+            StopReason::Manual,
+            "manual stop",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stop_recording_for_user(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+        caller_user_id: String,
+        caller_role: UserRole,
+        member_roles: Option<Vec<String>>,
+        expected_meeting_id: Option<String>,
+        reason: StopReason,
+        phase: &'static str,
+    ) -> Result<String, String> {
+        self.reject_if_shutting_down()?;
+        let guild_key = guild_id.get().to_string();
 
         let (
             stop_result,
@@ -7961,6 +8379,12 @@ impl ScaffoldHandler {
                 .find_active_meeting_by_guild(&guild_key)
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| CommandError::NoActiveMeeting.to_string())?;
+            if expected_meeting_id
+                .as_deref()
+                .is_some_and(|expected| expected != meeting.id)
+            {
+                return Err(CommandError::NoActiveMeeting.to_string());
+            }
             let role_grants = match member_roles.as_ref() {
                 Some(member_roles) => service
                     .store
@@ -7990,8 +8414,8 @@ impl ScaffoldHandler {
                 caller_user_id: &caller_user_id,
                 caller_role: internal_caller_role,
                 expected_meeting_id: &authorized_meeting_id,
-                reason: StopReason::Manual,
-                phase: "manual stop",
+                reason,
+                phase,
             };
             let (stop_result, removed_session) = self
                 .prepare_recording_stop_after_teardown(&lifecycle_permit, &request)
@@ -8014,7 +8438,7 @@ impl ScaffoldHandler {
             ctx,
             &guild_key,
             &authorized_meeting_id,
-            "manual stop",
+            phase,
             summary_job_deferred,
             removed_session,
             reset_guard,
@@ -11471,6 +11895,46 @@ fn count_non_bot_members_in_target_voice(
         }
     }
     Some(non_bot_count)
+}
+
+fn scheduled_recording_channels_valid(
+    ctx: &Context,
+    guild_id: GuildId,
+    creator_id: u64,
+    voice_channel_id: u64,
+    report_channel_id: u64,
+) -> bool {
+    use serenity::all::{ChannelType, Permissions};
+
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return false;
+    };
+    let Some(voice_channel) = guild.channels.get(&ChannelId::new(voice_channel_id)) else {
+        return false;
+    };
+    let Some(report_channel) = guild.channels.get(&ChannelId::new(report_channel_id)) else {
+        return false;
+    };
+    if !matches!(voice_channel.kind, ChannelType::Voice | ChannelType::Stage)
+        || report_channel.kind != ChannelType::Text
+    {
+        return false;
+    }
+    let bot_id = ctx.cache.current_user().id;
+    let Some(bot_member) = guild.members.get(&bot_id) else {
+        return false;
+    };
+    let Some(creator_member) = guild.members.get(&UserId::new(creator_id)) else {
+        return false;
+    };
+    let bot_voice_permissions = guild.user_permissions_in(voice_channel, bot_member);
+    let bot_report_permissions = guild.user_permissions_in(report_channel, bot_member);
+    let creator_voice_permissions = guild.user_permissions_in(voice_channel, creator_member);
+    let creator_report_permissions = guild.user_permissions_in(report_channel, creator_member);
+    bot_voice_permissions.contains(Permissions::CONNECT | Permissions::VIEW_CHANNEL)
+        && bot_report_permissions.contains(Permissions::SEND_MESSAGES | Permissions::VIEW_CHANNEL)
+        && creator_voice_permissions.contains(Permissions::VIEW_CHANNEL)
+        && creator_report_permissions.contains(Permissions::VIEW_CHANNEL)
 }
 
 fn resolve_bot_permissions(
@@ -15146,7 +15610,7 @@ mod status_message_tests {
             "u1",
             UserRole::BotAdmin,
             Some("m1"),
-            StopReason::AutoEmpty,
+            StopReason::ScheduledEnd,
             false,
         )
         .expect_err("missing active meeting should be typed as target absence");

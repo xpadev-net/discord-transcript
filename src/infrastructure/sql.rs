@@ -160,6 +160,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: "0035_summary_thread_id",
         sql: include_str!("../../migrations/0035_summary_thread_id.sql"),
     },
+    Migration {
+        version: "0036_meeting_schedules",
+        sql: include_str!("../../migrations/0036_meeting_schedules.sql"),
+    },
+    Migration {
+        version: "0037_scheduled_end_stop_reason",
+        sql: include_str!("../../migrations/0037_scheduled_end_stop_reason.sql"),
+    },
 ];
 
 pub fn sql_literal(value: &str) -> String {
@@ -288,6 +296,10 @@ pub const INCREMENTAL_MIGRATIONS_SQL: &str = concat!(
     include_str!("../../migrations/0034_summary_status_thread.sql"),
     "\n",
     include_str!("../../migrations/0035_summary_thread_id.sql"),
+    "\n",
+    include_str!("../../migrations/0036_meeting_schedules.sql"),
+    "\n",
+    include_str!("../../migrations/0037_scheduled_end_stop_reason.sql"),
 );
 
 pub const REVOKE_SESSION_SQL: &str = r#"

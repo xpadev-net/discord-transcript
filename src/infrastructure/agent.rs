@@ -394,14 +394,19 @@ impl ToolFsInner {
             if start >= previous_end && previous_end > 0 {
                 output.push_str("--\n");
             }
-            for index in start.max(previous_end)..end {
+            for (index, line) in lines
+                .iter()
+                .enumerate()
+                .take(end)
+                .skip(start.max(previous_end))
+            {
                 use std::fmt::Write as _;
-                let kind = if regex.is_match(lines[index]) {
+                let kind = if regex.is_match(line) {
                     "match"
                 } else {
                     "context"
                 };
-                let _ = writeln!(output, "{}:{kind}: {}", index + 1, lines[index]);
+                let _ = writeln!(output, "{}:{kind}: {}", index + 1, line);
                 if output.len() >= MAX_GREP_OUTPUT_BYTES {
                     let mut end = MAX_GREP_OUTPUT_BYTES;
                     while !output.is_char_boundary(end) {
@@ -1689,7 +1694,7 @@ impl NativeAgentSummaryClient {
 /// (provider credentials are not collected in that state).
 #[derive(Debug)]
 pub enum SummaryClient {
-    Native(NativeAgentSummaryClient),
+    Native(Box<NativeAgentSummaryClient>),
     /// Native summary without provider credentials —
     /// only possible when the summary runtime is disabled, so every summary
     /// method reports a configuration error rather than running.
@@ -1836,7 +1841,7 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
                 None => false,
             };
             if configured {
-                Ok(SummaryClient::Native(NativeAgentSummaryClient {
+                Ok(SummaryClient::Native(Box::new(NativeAgentSummaryClient {
                     provider: config.provider.expect("configured implies provider"),
                     model: config.model,
                     api_key: Secret::from(config.api_key.unwrap_or_default()),
@@ -1850,7 +1855,7 @@ pub fn build_summary_client(config: SummaryClientConfig) -> Result<SummaryClient
                         .zip(config.discord_guild_id)
                         .filter(|(token, _)| !token.trim().is_empty())
                         .map(|(token, guild_id)| DiscordToolConfig { token, guild_id }),
-                }))
+                })))
             } else {
                 if config.provider.is_some()
                     || config.api_key.is_some()

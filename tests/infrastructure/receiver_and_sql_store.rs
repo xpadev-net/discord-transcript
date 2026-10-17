@@ -318,7 +318,7 @@ fn schema_constrains_transcript_confidence_to_unit_range() {
     assert!(incremental_schema.contains("NOT VALID"));
     assert_eq!(
         MIGRATIONS.last().expect("latest migration").version,
-        "0035_summary_thread_id"
+        "0037_scheduled_end_stop_reason"
     );
     let live_outbox_migration = MIGRATIONS
         .iter()

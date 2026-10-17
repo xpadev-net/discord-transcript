@@ -11,6 +11,7 @@ import {
   DashboardPage,
 } from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
+import { SchedulesPage } from "./pages/SchedulesPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 const selectedGuildStorageKey = "dt.selectedGuildId";
@@ -215,6 +216,9 @@ export function App() {
     <>
       <Nav
         canManageSettings={canUseSelectedGuildSettings}
+        canStartRecording={
+          me?.can_start_recording === true && selectedGuildId === me.guild_id
+        }
         canUseAdminViews={canUseCurrentGuildAdminViews}
         canUseUsageAdmin={canUseCurrentGuildUsageAdmin}
         canUseRetentionAdmin={canUseCurrentGuildRetentionAdmin}
@@ -284,6 +288,17 @@ export function App() {
         <Route
           path="/meetings/:meetingId"
           element={<MeetingPage currentGuildId={me?.guild_id} />}
+        />
+        <Route
+          path="/schedules"
+          element={
+            me?.can_start_recording === true &&
+            selectedGuildId === me.guild_id ? (
+              <SchedulesPage />
+            ) : (
+              <ForbiddenState message="このギルドの録音開始権限が必要です。" />
+            )
+          }
         />
         <Route
           path="/admin"

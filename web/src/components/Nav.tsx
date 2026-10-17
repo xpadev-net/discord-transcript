@@ -3,6 +3,7 @@ import type { UserGuild } from "../lib/types";
 
 interface NavProps {
   canManageSettings: boolean;
+  canStartRecording: boolean;
   canUseAdminViews: boolean;
   canUseUsageAdmin: boolean;
   canUseRetentionAdmin: boolean;
@@ -29,6 +30,7 @@ function guildOptionLabel(guild: UserGuild): string {
 
 export function Nav({
   canManageSettings,
+  canStartRecording,
   canUseAdminViews,
   canUseUsageAdmin,
   canUseRetentionAdmin,
@@ -72,6 +74,16 @@ export function Nav({
           >
             {"\u4f1a\u8b70\u4e00\u89a7"}
           </NavLink>
+          {canStartRecording ? (
+            <NavLink
+              to="/schedules"
+              className={({ isActive }) =>
+                `app-nav-link${isActive ? " active" : ""}`
+              }
+            >
+              {"会議予約"}
+            </NavLink>
+          ) : null}
           {canManageSettings ? (
             <NavLink
               to={settingsPath}
