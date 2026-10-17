@@ -4471,7 +4471,34 @@ impl ScaffoldHandler {
                         }
                     });
                 }
-                Err(err) => warn!(schedule_id, error = %err, "scheduled recording start failed"),
+                Err(err) => {
+                    // Keep this occurrence due so the next scheduler tick can retry it.
+                    // The compare-and-set prevents overwriting a concurrent edit or cancellation.
+                    let advanced_start_at = start_at + chrono::Duration::days(7);
+                    let restored = {
+                        let mut service = self.service.lock().await;
+                        service.store.executor.execute(
+                            "UPDATE meeting_schedules SET next_start_at=$3::timestamptz, updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE AND next_start_at=$4::timestamptz",
+                            &[
+                                schedule_id.clone(),
+                                guild_key.clone(),
+                                start_at.to_rfc3339(),
+                                advanced_start_at.to_rfc3339(),
+                            ],
+                        )
+                    };
+                    match restored {
+                        Ok(1) => {
+                            warn!(schedule_id, error = %err, "scheduled recording start failed; occurrence will be retried")
+                        }
+                        Ok(_) => {
+                            warn!(schedule_id, error = %err, "scheduled recording start failed; schedule changed before retry could be restored")
+                        }
+                        Err(restore_err) => {
+                            warn!(schedule_id, error = %err, restore_error = %restore_err, "scheduled recording start failed and retry could not be restored")
+                        }
+                    }
+                }
             }
         }
         Ok(())
