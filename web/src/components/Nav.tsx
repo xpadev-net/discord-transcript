@@ -73,7 +73,12 @@ export function Nav({
             {"\u4f1a\u8b70\u4e00\u89a7"}
           </NavLink>
           {canManageSettings ? (
-            <NavLink to="/schedules" className={({ isActive }) => `app-nav-link${isActive ? " active" : ""}`}>
+            <NavLink
+              to="/schedules"
+              className={({ isActive }) =>
+                `app-nav-link${isActive ? " active" : ""}`
+              }
+            >
               {"会議予約"}
             </NavLink>
           ) : null}

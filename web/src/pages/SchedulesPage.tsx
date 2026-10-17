@@ -68,7 +68,11 @@ export function SchedulesPage() {
         }),
       });
       if (!response.ok) {
-        setMessage(response.status === 409 ? "同じサーバーに重なる予約があります。" : "予約を作成できませんでした。管理者権限と入力を確認してください。");
+        setMessage(
+          response.status === 409
+            ? "同じサーバーに重なる予約があります。"
+            : "予約を作成できませんでした。管理者権限と入力を確認してください。",
+        );
         return;
       }
       setStartAt("");
@@ -82,7 +86,10 @@ export function SchedulesPage() {
   }
 
   async function cancelSchedule(id: string) {
-    const response = await fetch(`/api/guild/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const response = await fetch(
+      `/api/guild/schedules/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
     if (response.ok) {
       setSchedules((items) => items.filter((item) => item.id !== id));
     } else {
@@ -93,26 +100,100 @@ export function SchedulesPage() {
   return (
     <main className="page-content">
       <header className="page-header">
-        <div><p className="eyebrow">Recording</p><h1>会議の予約</h1><p>毎週の時間枠を登録します。VCに人間が2人以上いると録音を開始します。</p></div>
+        <div>
+          <p className="eyebrow">Recording</p>
+          <h1>会議の予約</h1>
+          <p>
+            毎週の時間枠を登録します。VCに人間が2人以上いると録音を開始します。
+          </p>
+        </div>
       </header>
       <section className="settings-section">
         <h2>予約を追加</h2>
         <form className="settings-form" onSubmit={createSchedule}>
-          <label>VC<select required value={voiceChannelId} onChange={(event) => setVoiceChannelId(event.target.value)}>{channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label>
-          <label>レポート先チャンネルID<input required value={reportChannelId} onChange={(event) => setReportChannelId(event.target.value)} placeholder="DiscordのテキストチャンネルID" /></label>
-          <label>最初の開始日時<input required type="datetime-local" value={startAt} onChange={(event) => setStartAt(event.target.value)} /></label>
-          <label>時間枠（時間）<input required type="number" min="1" max="24" step="0.5" value={durationHours} onChange={(event) => setDurationHours(event.target.value)} /></label>
-          <p>作成者の端末タイムゾーンで表示します。繰り返し時刻はUTCで固定され、夏時間の補正はありません。</p>
-          <button type="submit" disabled={busy || !channels.length || !startAt}>{busy ? "保存中…" : "毎週の予約を作成"}</button>
+          <label>
+            VC
+            <select
+              required
+              value={voiceChannelId}
+              onChange={(event) => setVoiceChannelId(event.target.value)}
+            >
+              {channels.map((channel) => (
+                <option key={channel.id} value={channel.id}>
+                  {channel.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            レポート先チャンネルID
+            <input
+              required
+              value={reportChannelId}
+              onChange={(event) => setReportChannelId(event.target.value)}
+              placeholder="DiscordのテキストチャンネルID"
+            />
+          </label>
+          <label>
+            最初の開始日時
+            <input
+              required
+              type="datetime-local"
+              value={startAt}
+              onChange={(event) => setStartAt(event.target.value)}
+            />
+          </label>
+          <label>
+            時間枠（時間）
+            <input
+              required
+              type="number"
+              min="1"
+              max="24"
+              step="0.5"
+              value={durationHours}
+              onChange={(event) => setDurationHours(event.target.value)}
+            />
+          </label>
+          <p>
+            作成者の端末タイムゾーンで表示します。繰り返し時刻はUTCで固定され、夏時間の補正はありません。
+          </p>
+          <button type="submit" disabled={busy || !channels.length || !startAt}>
+            {busy ? "保存中…" : "毎週の予約を作成"}
+          </button>
           {message ? <p role="status">{message}</p> : null}
         </form>
       </section>
       <section className="settings-section">
         <h2>有効な予約</h2>
-        {schedules.length ? <ul className="settings-list">{schedules.map((schedule) => <li key={schedule.id}>
-          <div><strong>{new Date(schedule.next_start_at).toLocaleString()}</strong><p>VC: {channels.find((channel) => channel.id === schedule.voice_channel_id)?.name ?? schedule.voice_channel_id} · {schedule.duration_seconds / 3600}時間 · 毎週</p></div>
-          <button type="button" onClick={() => void cancelSchedule(schedule.id)}>取り消す</button>
-        </li>)}</ul> : <p>有効な予約はありません。</p>}
+        {schedules.length ? (
+          <ul className="settings-list">
+            {schedules.map((schedule) => (
+              <li key={schedule.id}>
+                <div>
+                  <strong>
+                    {new Date(schedule.next_start_at).toLocaleString()}
+                  </strong>
+                  <p>
+                    VC:{" "}
+                    {channels.find(
+                      (channel) => channel.id === schedule.voice_channel_id,
+                    )?.name ?? schedule.voice_channel_id}{" "}
+                    · {schedule.duration_seconds / 3600}時間 · 毎週
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void cancelSchedule(schedule.id)}
+                >
+                  取り消す
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>有効な予約はありません。</p>
+        )}
       </section>
     </main>
   );

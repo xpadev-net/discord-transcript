@@ -11,8 +11,8 @@ import {
   DashboardPage,
 } from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
-import { SettingsPage } from "./pages/SettingsPage";
 import { SchedulesPage } from "./pages/SchedulesPage";
+import { SettingsPage } from "./pages/SettingsPage";
 
 const selectedGuildStorageKey = "dt.selectedGuildId";
 
