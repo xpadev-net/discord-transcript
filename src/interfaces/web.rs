@@ -930,6 +930,14 @@ pub fn create_router(state: WebState) -> Router {
         .route("/api/me", get(api_me))
         .route("/api/me/guilds", get(api_me_guilds))
         .route("/api/guild/meetings", get(api_guild_meetings))
+        .route(
+            "/api/guild/schedules",
+            get(api_list_guild_schedules).post(api_create_guild_schedule),
+        )
+        .route(
+            "/api/guild/schedules/{schedule_id}",
+            axum::routing::delete(api_cancel_guild_schedule),
+        )
         .route("/api/guild/jobs", get(routes::api_list_jobs))
         .route(
             "/api/guild/jobs/{job_id}/retry",
@@ -9366,6 +9374,114 @@ async fn api_guild_meetings(
     let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let voice_channel_filter = normalize_guild_meetings_voice_channel_id(&query)?;
     list_guild_meetings_for_auth(&state, &user_id, auth, query, voice_channel_filter).await
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateGuildScheduleRequest {
+    voice_channel_id: String,
+    report_channel_id: String,
+    next_start_at: String,
+    local_start_time: String,
+    timezone: String,
+    duration_seconds: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct GuildScheduleResponse {
+    id: String,
+    voice_channel_id: String,
+    report_channel_id: String,
+    next_start_at: String,
+    local_start_time: String,
+    timezone: String,
+    duration_seconds: u32,
+    active: bool,
+}
+
+async fn api_list_guild_schedules(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+) -> Result<Json<Value>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::RecordingStart)
+        .await?;
+    let rows = state.db.query(
+        "SELECT id, voice_channel_id, report_channel_id, next_start_at::TEXT, local_start_time::TEXT, timezone, duration_seconds, active FROM meeting_schedules WHERE guild_id=$1 AND active=TRUE ORDER BY next_start_at",
+        &[&auth.guild_id],
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let schedules: Vec<GuildScheduleResponse> = rows
+        .into_iter()
+        .map(|row| GuildScheduleResponse {
+            id: row.get(0),
+            voice_channel_id: row.get(1),
+            report_channel_id: row.get(2),
+            next_start_at: row.get(3),
+            local_start_time: row.get(4),
+            timezone: row.get(5),
+            duration_seconds: row.get::<_, i32>(6).max(0) as u32,
+            active: row.get(7),
+        })
+        .collect();
+    Ok(Json(json!({ "schedules": schedules })))
+}
+
+async fn api_create_guild_schedule(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Json(request): Json<CreateGuildScheduleRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::RecordingStart)
+        .await?;
+    let start = DateTime::parse_from_rfc3339(&request.next_start_at)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .with_timezone(&Utc);
+    crate::domain::schedule::validate_schedule_window(
+        &request.timezone,
+        &request.local_start_time,
+        start,
+        request.duration_seconds,
+        Utc::now(),
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if request.voice_channel_id.trim().is_empty()
+        || request.report_channel_id.trim().is_empty()
+        || request.voice_channel_id.len() > 32
+        || request.report_channel_id.len() > 32
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let schedule_id = Uuid::new_v4().to_string();
+    let duration = i32::try_from(request.duration_seconds).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let start_timestamp = start.to_rfc3339();
+    let inserted = state.db.query_opt(
+        "WITH guild_lock AS MATERIALIZED (SELECT pg_advisory_xact_lock(hashtext($2))), overlaps AS (SELECT EXISTS (SELECT 1 FROM meeting_schedules s, guild_lock WHERE s.guild_id=$2 AND s.active=TRUE AND (((mod(extract(epoch FROM $9::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $9::timestamptz)::bigint,604800)+604800)%604800 < $8))) AS found) INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) SELECT $1,$2,$3,$4,$5,$6,$7::time,$8,$9 FROM guild_lock,overlaps WHERE NOT overlaps.found RETURNING id",
+        &[&schedule_id, &auth.guild_id, &request.voice_channel_id, &request.report_channel_id, &user_id, &request.timezone, &request.local_start_time, &duration, &start_timestamp],
+    ).await.map_err(|err| {
+        if err.code() == Some(&SqlState::INVALID_PARAMETER_VALUE) { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR }
+    })?;
+    if inserted.is_none() {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(Json(json!({ "id": schedule_id })))
+}
+
+async fn api_cancel_guild_schedule(
+    State(state): State<WebState>,
+    Extension(AuthUserId(user_id)): Extension<AuthUserId>,
+    Path(schedule_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let auth = state.auth.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    require_current_user_has_rbac_permission(&state, &user_id, RbacPermission::RecordingStart)
+        .await?;
+    let changed = state.db.execute(
+        "UPDATE meeting_schedules SET active=FALSE, updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE",
+        &[&schedule_id, &auth.guild_id],
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if changed == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn api_target_guild_meetings(

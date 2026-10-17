@@ -10,6 +10,7 @@ pub mod plans;
 pub mod privacy;
 pub mod recovery;
 pub mod retention;
+pub mod schedule;
 pub mod speaker;
 pub mod summary_template;
 pub mod transcript;

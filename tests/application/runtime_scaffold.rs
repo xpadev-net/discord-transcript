@@ -1,7 +1,8 @@
 use discord_transcript::application::bot::{BotCommandService, StartCommandInput};
 use discord_transcript::application::command::PermissionSet;
 use discord_transcript::application::runtime::{
-    RECORD_START_COMMAND, RECORD_STOP_COMMAND, RuntimeCommandInput, bot_permissions_from_cache_state,
+    RECORD_START_COMMAND, RECORD_STOP_COMMAND, SCHEDULE_CANCEL_COMMAND, SCHEDULE_CREATE_COMMAND,
+    SCHEDULE_LIST_COMMAND, RuntimeCommandInput, bot_permissions_from_cache_state,
     create_serenity_commands, dispatch_runtime_command, meeting_audio_path, parse_stop_reason,
     run_guild_scoped_command, slash_command_specs, stop_and_enqueue_summary_job,
     validate_command_guild,
@@ -79,12 +80,15 @@ impl JobQueue for FailingEnqueueQueue {
 #[test]
 fn slash_command_specs_match_expected_names() {
     let specs = slash_command_specs();
-    assert_eq!(specs.len(), 2);
+    assert_eq!(specs.len(), 5);
     assert_eq!(specs[0].name, RECORD_START_COMMAND);
     assert_eq!(specs[1].name, RECORD_STOP_COMMAND);
+    assert_eq!(specs[2].name, SCHEDULE_CREATE_COMMAND);
+    assert_eq!(specs[3].name, SCHEDULE_LIST_COMMAND);
+    assert_eq!(specs[4].name, SCHEDULE_CANCEL_COMMAND);
 
     let builders = create_serenity_commands();
-    assert_eq!(builders.len(), 2);
+    assert_eq!(builders.len(), 5);
 }
 
 #[test]

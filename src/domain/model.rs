@@ -43,6 +43,7 @@ impl MeetingStatus {
 pub enum StopReason {
     Manual,
     AutoEmpty,
+    ScheduledEnd,
     ClientDisconnect,
     Error,
 }
@@ -52,6 +53,7 @@ impl StopReason {
         match self {
             Self::Manual => "manual",
             Self::AutoEmpty => "auto_empty",
+            Self::ScheduledEnd => "scheduled_end",
             Self::ClientDisconnect => "client_disconnect",
             Self::Error => "error",
         }
@@ -61,6 +63,7 @@ impl StopReason {
         match value {
             "manual" => Some(Self::Manual),
             "auto_empty" => Some(Self::AutoEmpty),
+            "scheduled_end" => Some(Self::ScheduledEnd),
             "client_disconnect" => Some(Self::ClientDisconnect),
             "error" => Some(Self::Error),
             _ => None,

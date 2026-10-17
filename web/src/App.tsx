@@ -12,6 +12,7 @@ import {
 } from "./pages/DashboardPage";
 import { MeetingPage } from "./pages/MeetingPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { SchedulesPage } from "./pages/SchedulesPage";
 
 const selectedGuildStorageKey = "dt.selectedGuildId";
 
@@ -285,6 +286,7 @@ export function App() {
           path="/meetings/:meetingId"
           element={<MeetingPage currentGuildId={me?.guild_id} />}
         />
+        <Route path="/schedules" element={<SchedulesPage />} />
         <Route
           path="/admin"
           element={

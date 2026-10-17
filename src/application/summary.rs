@@ -2181,7 +2181,7 @@ Files available:\n\
 - {manifest_path}: metadata about the meeting and transcript (including masking counts)\n\
 {context_files}\
 \n\
-Keep speaker attributions by reading the materialized speaker roster when available and using provided names where attribution helps. For TODO, name an owner only when the task is explicitly assigned to them or they explicitly undertake it; the person who mentions a task is not necessarily its owner.\n\
+Keep speaker attributions by reading the materialized speaker roster when available and using provided speaker names where attribution helps. For TODO, name an owner only when the task is explicitly assigned to them or they explicitly undertake it; the person who mentions a task is not necessarily its owner.\n\
 {generated_title_heading_instruction}\
 Then include the exact summary sections below in this order:\n\
 ## Summary\n\
