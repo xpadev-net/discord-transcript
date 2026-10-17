@@ -4372,7 +4372,7 @@ impl ScaffoldHandler {
             )?;
             service.store.executor.query_rows(
                 "SELECT id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,to_char(next_start_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),duration_seconds FROM meeting_schedules WHERE guild_id=$1 AND active=TRUE AND next_start_at <= NOW() AND next_start_at + make_interval(secs => duration_seconds) > NOW() ORDER BY next_start_at LIMIT 10",
-                &[guild_key.clone()],
+                std::slice::from_ref(&guild_key),
             )?
         };
         for row in rows {
@@ -7773,7 +7773,7 @@ impl ScaffoldHandler {
         let inserted = service.store.executor.query_rows(
             "WITH guild_lock AS MATERIALIZED (SELECT pg_advisory_xact_lock(hashtext($2))), overlaps AS (SELECT EXISTS (SELECT 1 FROM meeting_schedules s, guild_lock WHERE s.guild_id=$2 AND s.active=TRUE AND (((mod(extract(epoch FROM $8::timestamptz)::bigint - extract(epoch FROM s.next_start_at)::bigint,604800)+604800)%604800 < s.duration_seconds) OR ((mod(extract(epoch FROM s.next_start_at)::bigint - extract(epoch FROM $8::timestamptz)::bigint,604800)+604800)%604800 < $7))) AS found) INSERT INTO meeting_schedules(id,guild_id,voice_channel_id,report_channel_id,created_by_user_id,timezone,local_start_time,duration_seconds,next_start_at) SELECT $1,$2,$3,$4,$5,'UTC',$6::time,$7,$8 FROM guild_lock,overlaps WHERE NOT overlaps.found RETURNING id",
             &[schedule_id.clone(), guild_key.clone(), voice_channel_id.to_string(), command.channel_id.get().to_string(), user_id.to_string(), local_time, duration.to_string(), next_start.clone()],
-        ).map_err(|err| err)?;
+        )?;
         if inserted.is_empty() {
             return Err("another schedule overlaps this weekly time window".to_owned());
         }
@@ -7802,7 +7802,7 @@ impl ScaffoldHandler {
         let rows = service.store.executor.query_rows(
             "SELECT id,voice_channel_id,to_char(next_start_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),duration_seconds FROM meeting_schedules WHERE guild_id=$1 AND active=TRUE ORDER BY next_start_at LIMIT 20",
             &[guild_key],
-        ).map_err(|err| err)?;
+        )?;
         if rows.is_empty() {
             return Ok("有効な予約はありません。".to_owned());
         }
@@ -7846,8 +7846,8 @@ impl ScaffoldHandler {
         let mut service = self.service.lock().await;
         let changed = service.store.executor.execute(
             "UPDATE meeting_schedules SET active=FALSE,updated_at=NOW() WHERE id=$1 AND guild_id=$2 AND active=TRUE AND (created_by_user_id=$3 OR $4 IN ('guild_admin','bot_admin'))",
-            &[schedule_id.clone(), guild_key, user_id, format!("{}", match caller_role { UserRole::GuildAdmin => "guild_admin", UserRole::BotAdmin => "bot_admin", _ => "member" })],
-        ).map_err(|err| err)?;
+            &[schedule_id.clone(), guild_key, user_id, (match caller_role { UserRole::GuildAdmin => "guild_admin", UserRole::BotAdmin => "bot_admin", _ => "member" }).to_owned()],
+        )?;
         if changed == 0 {
             return Err("schedule not found or you cannot cancel it".to_owned());
         }
@@ -7914,6 +7914,7 @@ impl ScaffoldHandler {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_recording_in_channel(
         &self,
         ctx: &Context,
@@ -8328,6 +8329,7 @@ impl ScaffoldHandler {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stop_recording_for_user(
         &self,
         ctx: &Context,
